@@ -307,7 +307,11 @@ val valueToJS(const Value& v) {
         } else if constexpr (std::is_same_v<T, std::string>) {
             return val(value);
         } else if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
-            return val(typed_memory_view(value.size(), value.data()));
+            // Copy to a proper Uint8Array (typed_memory_view becomes invalid after WASM call)
+            val result = val::global("Uint8Array").new_(value.size());
+            val memView = val(typed_memory_view(value.size(), value.data()));
+            result.call<void>("set", memView);
+            return result;
         } else {
             return val(static_cast<double>(value));
         }

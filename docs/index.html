@@ -708,16 +708,29 @@
                     </div>
                 </div>
                 <div class="demo-panel">
+                    <h4>Schema Structure</h4>
+                    <div id="schemaViz" style="font-family: var(--font-mono); font-size: 12px; background: rgba(0,0,0,0.3); padding: 12px; border-radius: 8px; margin-bottom: 16px;">
+                        <div style="color: var(--accent-cyan); margin-bottom: 8px;">TABLE User (file_id: USER)</div>
+                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 4px;">├─ id: int <span style="color: var(--accent-purple)">(primary key, indexed)</span></div>
+                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 4px;">├─ name: string</div>
+                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 4px;">├─ email: string <span style="color: var(--accent-green)">(indexed)</span></div>
+                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 12px;">└─ age: int</div>
+                        <div style="color: var(--accent-cyan); margin-bottom: 8px;">TABLE Post (file_id: POST)</div>
+                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 4px;">├─ id: int <span style="color: var(--accent-purple)">(primary key, indexed)</span></div>
+                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 4px;">├─ user_id: int <span style="color: var(--accent-green)">(indexed)</span> → User.id</div>
+                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 12px;">└─ title: string</div>
+                        <div style="color: var(--accent-orange); font-size: 11px;">Storage: Sequential FlatBuffer stream at offsets shown in _offset column</div>
+                    </div>
                     <h4>SQL Query</h4>
-                    <input type="text" class="query-input" id="queryInput" placeholder="SELECT * FROM User WHERE age > 25" value="SELECT * FROM User">
+                    <input type="text" class="query-input" id="queryInput" placeholder="SELECT _offset, _data, * FROM User" value="SELECT _offset, _data, id, name, email, age FROM User">
                     <div class="demo-controls">
                         <button class="demo-btn" id="btnQuery" disabled>Run Query</button>
                     </div>
                     <h4>Results</h4>
-                    <div style="overflow-x: auto; max-height: 300px;">
+                    <div style="overflow-x: auto; max-height: 400px;">
                         <table class="results-table" id="resultsTable">
                             <thead>
-                                <tr><th colspan="4">Run a query to see results</th></tr>
+                                <tr><th colspan="6">Run a query to see results</th></tr>
                             </thead>
                             <tbody id="resultsBody"></tbody>
                         </table>
@@ -1058,6 +1071,39 @@ nc -U /tmp/flatsql.sock < stream.fb`
             updateStats();
         }
 
+        function formatCell(col, cell) {
+            if (cell === null || cell === undefined) return '<span style="color: var(--text-muted)">NULL</span>';
+
+            // Format _offset column as hex address
+            if (col === '_offset') {
+                return `<span style="color: var(--accent-purple)">0x${Number(cell).toString(16).padStart(4, '0')}</span>`;
+            }
+
+            // Format _data column as hex bytes
+            if (col === '_data') {
+                // cell might be a typed array view
+                let bytes;
+                if (cell instanceof Uint8Array || ArrayBuffer.isView(cell)) {
+                    bytes = Array.from(cell);
+                } else if (Array.isArray(cell)) {
+                    bytes = cell;
+                } else {
+                    return '<span style="color: var(--text-muted)">[binary]</span>';
+                }
+
+                const hex = bytes.slice(0, 24).map(b => b.toString(16).padStart(2, '0')).join(' ');
+                const suffix = bytes.length > 24 ? `... (${bytes.length} bytes)` : `(${bytes.length} bytes)`;
+                return `<code style="font-size: 10px; color: var(--accent-orange); word-break: break-all;">${hex} ${suffix}</code>`;
+            }
+
+            // Format _rowid
+            if (col === '_rowid') {
+                return `<span style="color: var(--accent-cyan)">#${cell}</span>`;
+            }
+
+            return String(cell);
+        }
+
         function runQuery() {
             const sql = document.getElementById('queryInput').value;
             try {
@@ -1066,13 +1112,17 @@ nc -U /tmp/flatsql.sock < stream.fb`
                 const rows = result.getRows();
 
                 let html = '<thead><tr>';
-                for (const col of cols) html += `<th>${col}</th>`;
+                for (const col of cols) {
+                    // Style special columns differently
+                    const style = col.startsWith('_') ? 'color: var(--accent-green); font-style: italic;' : '';
+                    html += `<th style="${style}">${col}</th>`;
+                }
                 html += '</tr></thead><tbody>';
 
                 for (const row of rows) {
                     html += '<tr>';
-                    for (const cell of row) {
-                        html += `<td>${cell ?? 'NULL'}</td>`;
+                    for (let i = 0; i < row.length; i++) {
+                        html += `<td>${formatCell(cols[i], row[i])}</td>`;
                     }
                     html += '</tr>';
                 }
@@ -1083,6 +1133,7 @@ nc -U /tmp/flatsql.sock < stream.fb`
             } catch (e) {
                 document.getElementById('resultsTable').innerHTML =
                     `<thead><tr><th style="color: #ef4444">Error: ${e.message}</th></tr></thead>`;
+                console.error(e);
             }
         }
 
