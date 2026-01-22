@@ -222,7 +222,8 @@ QueryResult FlatSQLDatabase::executeSelect(const ParsedSQL& parsed) {
         records = tableStore.scanAll();
     }
 
-    // Build result rows
+    // Build result rows using field extractor
+    auto extractor = tableStore.getFieldExtractor();
     for (const auto& record : records) {
         std::vector<Value> row;
         for (const auto& colName : result.columns) {
@@ -230,9 +231,14 @@ QueryResult FlatSQLDatabase::executeSelect(const ParsedSQL& parsed) {
                 row.push_back(static_cast<int64_t>(record.header.sequence));
             } else if (colName == "_offset") {
                 row.push_back(static_cast<int64_t>(record.offset));
+            } else if (colName == "_data") {
+                // Return raw FlatBuffer data
+                row.push_back(record.data);
+            } else if (extractor) {
+                // Use field extractor to get actual value
+                row.push_back(extractor(record.data.data(), record.data.size(), colName));
             } else {
-                // Use field extractor if available
-                row.push_back(std::monostate{});  // null placeholder
+                row.push_back(std::monostate{});  // null if no extractor
             }
         }
         result.rows.push_back(std::move(row));

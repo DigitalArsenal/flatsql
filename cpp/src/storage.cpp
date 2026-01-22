@@ -89,6 +89,7 @@ size_t StreamingFlatBufferStore::ingest(const uint8_t* data, size_t length, Inge
         // Assign sequence and index
         uint64_t seq = nextSequence_++;
         sequenceToOffset_[seq] = storeOffset;
+        offsetToSequence_[storeOffset] = seq;
         recordCount_++;
 
         // Extract file identifier and invoke callback
@@ -129,6 +130,7 @@ uint64_t StreamingFlatBufferStore::ingestOne(const uint8_t* sizePrefixedData, si
     // Assign sequence
     uint64_t seq = nextSequence_++;
     sequenceToOffset_[seq] = storeOffset;
+    offsetToSequence_[storeOffset] = seq;
     recordCount_++;
 
     // Callback
@@ -155,6 +157,7 @@ uint64_t StreamingFlatBufferStore::ingestFlatBuffer(const uint8_t* data, size_t 
     // Assign sequence
     uint64_t seq = nextSequence_++;
     sequenceToOffset_[seq] = storeOffset;
+    offsetToSequence_[storeOffset] = seq;
     recordCount_++;
 
     // Callback
@@ -185,6 +188,7 @@ void StreamingFlatBufferStore::loadAndRebuild(const uint8_t* data, size_t length
 
         uint64_t seq = nextSequence_++;
         sequenceToOffset_[seq] = offset;
+        offsetToSequence_[offset] = seq;
         recordCount_++;
 
         std::string fileId = extractFileId(fbData, fbSize);
@@ -225,12 +229,10 @@ StoredRecord StreamingFlatBufferStore::readRecordAtOffset(uint64_t offset) const
     record.header.dataLength = fbSize;
     record.header.fileId = extractFileId(fbData, fbSize);
 
-    // Find sequence for this offset (reverse lookup)
-    for (const auto& [seq, off] : sequenceToOffset_) {
-        if (off == offset) {
-            record.header.sequence = seq;
-            break;
-        }
+    // Look up sequence in reverse map (O(1) instead of O(n))
+    auto it = offsetToSequence_.find(offset);
+    if (it != offsetToSequence_.end()) {
+        record.header.sequence = it->second;
     }
 
     record.data.resize(fbSize);

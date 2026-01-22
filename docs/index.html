@@ -914,38 +914,12 @@ nc -U /tmp/flatsql.sock < stream.fb`
             return vec;
         }
 
-        function createFlatBuffer(type, id, fields) {
-            // Simplified FlatBuffer creation with file identifier
-            const encoder = new TextEncoder();
-            const parts = [];
-
-            // File identifier at bytes 4-7
-            const fileId = type === 'User' ? 'USER' : 'POST';
-
-            // Simple format: [root offset 4][file_id 4][id 4][...fields]
-            const data = new Uint8Array(256);
-            const view = new DataView(data.buffer);
-            let offset = 0;
-
-            // Root offset (points past header)
-            view.setUint32(offset, 8, true); offset += 4;
-            // File identifier
-            data.set(encoder.encode(fileId), offset); offset += 4;
-            // ID
-            view.setInt32(offset, id, true); offset += 4;
-
-            // Fields
-            for (const [key, val] of Object.entries(fields)) {
-                if (typeof val === 'string') {
-                    const bytes = encoder.encode(val);
-                    view.setUint8(offset, bytes.length); offset += 1;
-                    data.set(bytes, offset); offset += bytes.length;
-                } else if (typeof val === 'number') {
-                    view.setInt32(offset, val, true); offset += 4;
-                }
-            }
-
-            return data.slice(0, offset);
+        // Convert Uint8Array to hex string (first N bytes)
+        function toHexPreview(arr, maxBytes = 32) {
+            const hex = Array.from(arr.slice(0, maxBytes))
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join(' ');
+            return arr.length > maxBytes ? hex + '...' : hex;
         }
 
         function buildStream(buffers) {
@@ -965,17 +939,23 @@ nc -U /tmp/flatsql.sock < stream.fb`
             return result;
         }
 
-        function log(type, id, extra = '') {
+        function log(type, data, values = {}) {
             const container = document.getElementById('streamLog');
             const badge = type === 'User' ? 'user' : 'post';
             const item = document.createElement('div');
             item.className = 'stream-item';
+
+            // Show hex preview and values
+            const hexPreview = data instanceof Uint8Array ? toHexPreview(data, 24) : '';
+            const valuesStr = Object.entries(values).map(([k,v]) => `${k}=${v}`).join(', ');
+
             item.innerHTML = `
                 <span class="stream-badge ${badge}">${type.toUpperCase()}</span>
-                <span style="color: var(--text-secondary)">id=${id} ${extra}</span>
+                <span style="color: var(--text-secondary)">${valuesStr}</span>
+                <div style="font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); margin-top: 4px; word-break: break-all;">${hexPreview}</div>
             `;
             container.insertBefore(item, container.firstChild);
-            if (container.children.length > 50) container.lastChild.remove();
+            if (container.children.length > 30) container.lastChild.remove();
         }
 
         function updateStats() {
@@ -986,14 +966,18 @@ nc -U /tmp/flatsql.sock < stream.fb`
         async function streamUsers(count) {
             const start = performance.now();
             const buffers = [];
+            const userData = [];
 
             for (let i = 0; i < count; i++) {
                 const id = totalRecords + i + 1;
-                buffers.push(createFlatBuffer('User', id, {
-                    name: `User${id}`,
-                    email: `user${id}@test.com`,
-                    age: 20 + (id % 50)
-                }));
+                const name = `User${id}`;
+                const email = `user${id}@test.com`;
+                const age = 20 + (id % 50);
+
+                // Use proper FlatBuffer creation from WASM
+                const fb = flatsql.createTestUser(id, name, email, age);
+                buffers.push(fb);
+                userData.push({ id, name, email, age, fb });
             }
 
             const stream = buildStream(buffers);
@@ -1007,10 +991,17 @@ nc -U /tmp/flatsql.sock < stream.fb`
             const elapsed = performance.now() - start;
             document.getElementById('statRate').textContent = Math.round(count / elapsed * 1000);
 
+            // Log stored records with hex data
             for (let i = 0; i < Math.min(count, 5); i++) {
-                log('User', totalRecords - count + i + 1);
+                const u = userData[i];
+                log('User', u.fb, { id: u.id, name: u.name, age: u.age });
             }
-            if (count > 5) log('User', '...', `+${count - 5} more`);
+            if (count > 5) {
+                const lastItem = document.createElement('div');
+                lastItem.className = 'stream-item';
+                lastItem.innerHTML = `<span style="color: var(--text-muted)">... +${count - 5} more records</span>`;
+                document.getElementById('streamLog').insertBefore(lastItem, document.getElementById('streamLog').firstChild);
+            }
 
             updateStats();
         }
@@ -1018,22 +1009,26 @@ nc -U /tmp/flatsql.sock < stream.fb`
         async function streamMixed() {
             const start = performance.now();
             const buffers = [];
+            const logData = [];
 
             // Interleave users and posts
             for (let i = 0; i < 10; i++) {
                 const userId = totalRecords + i + 1;
-                buffers.push(createFlatBuffer('User', userId, {
-                    name: `User${userId}`,
-                    email: `user${userId}@test.com`,
-                    age: 25 + i
-                }));
+                const name = `User${userId}`;
+                const email = `user${userId}@test.com`;
+                const age = 25 + i;
+
+                const userFb = flatsql.createTestUser(userId, name, email, age);
+                buffers.push(userFb);
+                logData.push({ type: 'User', fb: userFb, values: { id: userId, name, age } });
 
                 for (let j = 0; j < 2; j++) {
                     const postId = i * 2 + j + 1;
-                    buffers.push(createFlatBuffer('Post', postId, {
-                        user_id: userId,
-                        title: `Post ${postId}`
-                    }));
+                    const title = `Post ${postId}`;
+
+                    const postFb = flatsql.createTestPost(postId, userId, title);
+                    buffers.push(postFb);
+                    logData.push({ type: 'Post', fb: postFb, values: { id: postId, user_id: userId, title } });
                 }
             }
 
@@ -1048,8 +1043,17 @@ nc -U /tmp/flatsql.sock < stream.fb`
             const elapsed = performance.now() - start;
             document.getElementById('statRate').textContent = Math.round(30 / elapsed * 1000);
 
-            log('User', totalRecords - 29, '+ 2 posts');
-            log('Post', '...', 'mixed stream');
+            // Log first few records with hex
+            for (let i = 0; i < Math.min(logData.length, 6); i++) {
+                const d = logData[i];
+                log(d.type, d.fb, d.values);
+            }
+            if (logData.length > 6) {
+                const lastItem = document.createElement('div');
+                lastItem.className = 'stream-item';
+                lastItem.innerHTML = `<span style="color: var(--text-muted)">... +${logData.length - 6} more records</span>`;
+                document.getElementById('streamLog').insertBefore(lastItem, document.getElementById('streamLog').firstChild);
+            }
 
             updateStats();
         }
@@ -1087,6 +1091,7 @@ nc -U /tmp/flatsql.sock < stream.fb`
             db = new flatsql.FlatSQLDatabase(schema, 'demo');
             db.registerFileId('USER', 'User');
             db.registerFileId('POST', 'Post');
+            db.enableDemoExtractors();  // Enable field extraction for queries
             totalRecords = 0;
             totalBytes = 0;
             document.getElementById('streamLog').innerHTML =
@@ -1104,6 +1109,7 @@ nc -U /tmp/flatsql.sock < stream.fb`
                 db = new flatsql.FlatSQLDatabase(schema, 'demo');
                 db.registerFileId('USER', 'User');
                 db.registerFileId('POST', 'Post');
+                db.enableDemoExtractors();  // Enable field extraction for queries
 
                 document.getElementById('demoStatus').innerHTML =
                     '<span class="status-dot"></span><span>Ready</span>';

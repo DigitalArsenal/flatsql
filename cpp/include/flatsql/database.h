@@ -49,8 +49,11 @@ public:
     // Field extractor function type - extracts field values from raw FlatBuffer
     using FieldExtractor = std::function<Value(const uint8_t* data, size_t length, const std::string& fieldName)>;
 
-    // Set field extractor (required for indexing)
+    // Set field extractor (required for indexing and queries)
     void setFieldExtractor(FieldExtractor extractor) { fieldExtractor_ = extractor; }
+
+    // Get field extractor
+    FieldExtractor getFieldExtractor() const { return fieldExtractor_; }
 
 private:
     TableDef tableDef_;

@@ -3,7 +3,7 @@
 
 #include "flatsql/types.h"
 #include <functional>
-#include <map>
+#include <unordered_map>
 #include <optional>
 #include <string_view>
 
@@ -97,7 +97,10 @@ private:
     uint64_t nextSequence_ = 1;
 
     // sequence → offset for O(1) lookups
-    std::map<uint64_t, uint64_t> sequenceToOffset_;
+    std::unordered_map<uint64_t, uint64_t> sequenceToOffset_;
+
+    // offset → sequence for reverse lookups (O(1) instead of O(n))
+    std::unordered_map<uint64_t, uint64_t> offsetToSequence_;
 };
 
 // Backwards compatibility alias
