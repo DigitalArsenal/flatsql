@@ -206,6 +206,8 @@ QueryResult FlatSQLDatabase::executeSelect(const ParsedSQL& parsed) {
 
     // Get records
     std::vector<StoredRecord> records;
+    auto extractor = tableStore.getFieldExtractor();
+    bool needsFilter = false;
 
     if (parsed.where.has_value()) {
         const WhereCondition& cond = parsed.where.value();
@@ -215,16 +217,25 @@ QueryResult FlatSQLDatabase::executeSelect(const ParsedSQL& parsed) {
         } else if (cond.hasBetween) {
             records = tableStore.findByRange(cond.column, cond.value, cond.value2);
         } else {
-            // Full scan with filter
+            // Full scan with filter for <, >, <=, >=, !=
             records = tableStore.scanAll();
+            needsFilter = true;
         }
     } else {
         records = tableStore.scanAll();
     }
 
     // Build result rows using field extractor
-    auto extractor = tableStore.getFieldExtractor();
     for (const auto& record : records) {
+        // Apply WHERE filter for non-index operators
+        if (needsFilter && parsed.where.has_value() && extractor) {
+            const WhereCondition& cond = parsed.where.value();
+            Value fieldValue = extractor(record.data.data(), record.data.size(), cond.column);
+            if (!evaluateCondition(fieldValue, cond)) {
+                continue;  // Skip this record
+            }
+        }
+
         std::vector<Value> row;
         for (const auto& colName : result.columns) {
             if (colName == "_rowid") {

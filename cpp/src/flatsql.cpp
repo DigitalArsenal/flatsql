@@ -237,15 +237,20 @@ Value extractUserFieldGeneric(const uint8_t* data, size_t length, const std::str
         uint16_t off = getFieldOffset(1);
         if (off == 0) return std::string();
         uint32_t strOffset = flatbuffers::ReadScalar<uint32_t>(root + off);
-        const char* str = reinterpret_cast<const char*>(root + off + strOffset);
-        return std::string(str);
+        const uint8_t* strPtr = root + off + strOffset;
+        // FlatBuffer string: [uint32 length][char data...]
+        uint32_t strLen = flatbuffers::ReadScalar<uint32_t>(strPtr);
+        const char* str = reinterpret_cast<const char*>(strPtr + 4);
+        return std::string(str, strLen);
     }
     if (fieldName == "email") {
         uint16_t off = getFieldOffset(2);
         if (off == 0) return std::string();
         uint32_t strOffset = flatbuffers::ReadScalar<uint32_t>(root + off);
-        const char* str = reinterpret_cast<const char*>(root + off + strOffset);
-        return std::string(str);
+        const uint8_t* strPtr = root + off + strOffset;
+        uint32_t strLen = flatbuffers::ReadScalar<uint32_t>(strPtr);
+        const char* str = reinterpret_cast<const char*>(strPtr + 4);
+        return std::string(str, strLen);
     }
     if (fieldName == "age") {
         uint16_t off = getFieldOffset(3);
@@ -287,8 +292,10 @@ Value extractPostFieldGeneric(const uint8_t* data, size_t length, const std::str
         uint16_t off = getFieldOffset(2);
         if (off == 0) return std::string();
         uint32_t strOffset = flatbuffers::ReadScalar<uint32_t>(root + off);
-        const char* str = reinterpret_cast<const char*>(root + off + strOffset);
-        return std::string(str);
+        const uint8_t* strPtr = root + off + strOffset;
+        uint32_t strLen = flatbuffers::ReadScalar<uint32_t>(strPtr);
+        const char* str = reinterpret_cast<const char*>(strPtr + 4);
+        return std::string(str, strLen);
     }
 
     return std::monostate{};
