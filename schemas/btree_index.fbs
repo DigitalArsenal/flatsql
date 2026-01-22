@@ -1,0 +1,74 @@
+// B-Tree Index Schema for FlatBuffers-SQLite
+// Indexes are stored as FlatBuffers themselves, enabling zero-copy reads
+
+namespace FlatSQL;
+
+// Represents a key-value pair in a B-tree node
+// The key is stored inline, value is an offset into the data file
+table IndexEntry {
+  // Key can be various types - stored as bytes with type tag
+  key_type: KeyType;
+  key_int: int64;
+  key_float: float64;
+  key_string: string;
+  key_bytes: [ubyte];
+
+  // Offset into the stacked FlatBuffer data file
+  data_offset: uint64;
+  // Length of the FlatBuffer record at this offset
+  data_length: uint32;
+  // Record sequence number (for ordering)
+  sequence: uint64;
+}
+
+enum KeyType : byte {
+  Null = 0,
+  Int = 1,
+  Float = 2,
+  String = 3,
+  Bytes = 4
+}
+
+// A B-tree node (internal or leaf)
+table BTreeNode {
+  // Node ID for reference
+  node_id: uint64;
+  // Is this a leaf node?
+  is_leaf: bool;
+  // Keys and entries (for leaf nodes)
+  entries: [IndexEntry];
+  // Child node IDs (for internal nodes, length = entries.length + 1)
+  children: [uint64];
+  // Parent node ID (0 = root)
+  parent_id: uint64;
+}
+
+// Root structure for a complete B-tree index
+table BTreeIndex {
+  // Index metadata
+  name: string;
+  table_name: string;
+  column_name: string;
+  key_type: KeyType;
+
+  // Tree configuration
+  order: uint32;  // Max children per node
+
+  // Root node ID
+  root_id: uint64;
+
+  // All nodes in the tree (for serialization)
+  nodes: [BTreeNode];
+
+  // Statistics
+  entry_count: uint64;
+  height: uint32;
+}
+
+// Collection of indexes for a table
+table TableIndexes {
+  table_name: string;
+  indexes: [BTreeIndex];
+}
+
+root_type BTreeIndex;

@@ -1,0 +1,101 @@
+// Table Metadata Schema for FlatBuffers-SQLite
+// Stores schema information derived from FlatBuffer IDL or JSON Schema
+
+namespace FlatSQL;
+
+enum ColumnType : byte {
+  Null = 0,
+  Bool = 1,
+  Int8 = 2,
+  Int16 = 3,
+  Int32 = 4,
+  Int64 = 5,
+  UInt8 = 6,
+  UInt16 = 7,
+  UInt32 = 8,
+  UInt64 = 9,
+  Float32 = 10,
+  Float64 = 11,
+  String = 12,
+  Bytes = 13,
+  // Nested types (stored as embedded FlatBuffer)
+  Struct = 14,
+  Table = 15,
+  Vector = 16,
+  Enum = 17
+}
+
+// Column definition within a table
+table ColumnDef {
+  name: string;
+  sql_type: ColumnType;
+  // For nested paths: "address.city" becomes ["address", "city"]
+  flatbuffer_path: [string];
+  // Original FlatBuffer type name
+  fb_type_name: string;
+  // Is this column nullable?
+  nullable: bool = true;
+  // Default value (as JSON string)
+  default_value: string;
+  // Is this a primary key?
+  is_primary_key: bool;
+  // Is this indexed?
+  is_indexed: bool;
+}
+
+// Table definition derived from FlatBuffer schema
+table TableDef {
+  // SQL table name
+  name: string;
+  // Original FlatBuffer table/struct name
+  fb_table_name: string;
+  // Namespace in FlatBuffer schema
+  fb_namespace: string;
+  // Column definitions
+  columns: [ColumnDef];
+  // Primary key column names
+  primary_key: [string];
+  // Created indexes
+  indexes: [string];
+}
+
+// Database metadata - all tables
+table DatabaseSchema {
+  // Database name
+  name: string;
+  // All table definitions
+  tables: [TableDef];
+  // Original FlatBuffer schema source
+  fb_schema_source: string;
+  // Schema version
+  version: uint32;
+}
+
+// Record header for stacked FlatBuffers file
+// This is prepended to each FlatBuffer in the stack
+table RecordHeader {
+  // Sequence number (monotonically increasing)
+  sequence: uint64;
+  // Table this record belongs to
+  table_name: string;
+  // Timestamp (Unix millis)
+  timestamp: uint64;
+  // Length of the following FlatBuffer data
+  data_length: uint32;
+  // Checksum of data (CRC32)
+  checksum: uint32;
+}
+
+// File header for the stacked FlatBuffers data file
+table DataFileHeader {
+  magic: uint32;  // 0x464C5451 = "FLTQ"
+  version: uint32;
+  // Offset to start of data (after this header)
+  data_start_offset: uint64;
+  // Total records
+  record_count: uint64;
+  // Schema reference
+  schema_name: string;
+}
+
+root_type DatabaseSchema;

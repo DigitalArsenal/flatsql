@@ -1,0 +1,24 @@
+{
+  "name": "flatbuffers-sqlite",
+  "version": "0.1.0",
+  "description": "SQLite query engine over FlatBuffer storage",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "flatc-wasm": "file:../flatbuffers/wasm",
+    "sql.js": "^1.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "jest": "^29.7.0",
+    "@types/jest": "^29.5.0",
+    "ts-jest": "^29.1.0"
+  }
+}

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FlatSQL WASM Example</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 { color: #333; }
+        .section {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        pre {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+        button {
+            background: #0066cc;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover { background: #0052a3; }
+        #output {
+            white-space: pre-wrap;
+            font-family: monospace;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 10px 0;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        th { background: #f0f0f0; }
+    </style>
+</head>
+<body>
+    <h1>FlatSQL WASM Example</h1>
+
+    <div class="section">
+        <h2>About</h2>
+        <p>
+            FlatSQL is a SQL query interface over FlatBuffer storage.
+            Data is stored as stacked FlatBuffers that can be read with standard FlatBuffer tools.
+        </p>
+    </div>
+
+    <div class="section">
+        <h2>Demo</h2>
+        <button onclick="runDemo()">Run Demo</button>
+        <button onclick="clearOutput()">Clear</button>
+        <pre id="output">Click "Run Demo" to start...</pre>
+    </div>
+
+    <div class="section">
+        <h2>Query Results</h2>
+        <div id="results"></div>
+    </div>
+
+    <script type="module">
+        import FlatSQLModule from './flatsql.js';
+
+        let db = null;
+        let module = null;
+
+        async function initModule() {
+            if (!module) {
+                log('Loading WASM module...');
+                module = await FlatSQLModule();
+                log('Module loaded!');
+            }
+            return module;
+        }
+
+        function log(msg) {
+            const output = document.getElementById('output');
+            output.textContent += msg + '\n';
+        }
+
+        function clearOutput() {
+            document.getElementById('output').textContent = '';
+            document.getElementById('results').innerHTML = '';
+        }
+
+        function displayTable(result) {
+            const container = document.getElementById('results');
+            const columns = result.getColumns();
+            const rows = result.getRows();
+
+            let html = '<table><thead><tr>';
+            for (const col of columns) {
+                html += `<th>${col}</th>`;
+            }
+            html += '</tr></thead><tbody>';
+
+            for (const row of rows) {
+                html += '<tr>';
+                for (const val of row) {
+                    html += `<td>${val === null ? 'NULL' : val}</td>`;
+                }
+                html += '</tr>';
+            }
+            html += '</tbody></table>';
+
+            container.innerHTML = html;
+        }
+
+        async function runDemo() {
+            clearOutput();
+
+            try {
+                const m = await initModule();
+
+                // Define schema using FlatBuffers IDL
+                const schema = `
+                    table users {
+                        id: int (id);
+                        name: string;
+                        email: string (key);
+                        age: int;
+                    }
+                `;
+
+                log('Creating database with schema...');
+                log(schema);
+
+                db = new m.FlatSQLDatabase(schema, 'demo');
+
+                log('\nTables: ' + JSON.stringify(db.listTables()));
+
+                // Insert some fake FlatBuffer data
+                // In real usage, you'd generate these with flatbuffers
+                log('\nInserting sample records...');
+                const fakeData1 = new Uint8Array([0x10, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0C, 0x00]);
+                const fakeData2 = new Uint8Array([0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0C, 0x00]);
+                const fakeData3 = new Uint8Array([0x18, 0x00, 0x00, 0x00, 0x08, 0x00, 0x0C, 0x00]);
+
+                db.insertRaw('users', fakeData1);
+                db.insertRaw('users', fakeData2);
+                db.insertRaw('users', fakeData3);
+
+                log('Inserted 3 records');
+
+                // Query the database
+                log('\nExecuting: SELECT * FROM users');
+                const result = db.query('SELECT * FROM users');
+
+                log(`\nResult: ${result.getRowCount()} rows`);
+                displayTable(result);
+
+                // Get stats
+                log('\nDatabase stats:');
+                const stats = db.getStats();
+                for (const s of stats) {
+                    log(`  Table: ${s.tableName}`);
+                    log(`  Records: ${s.recordCount}`);
+                    log(`  Indexes: ${JSON.stringify(s.indexes)}`);
+                }
+
+                // Export data
+                log('\nExporting data...');
+                const exported = db.exportData();
+                log(`Exported ${exported.length} bytes`);
+                log('First 16 bytes (hex): ' + Array.from(exported.slice(0, 16))
+                    .map(b => b.toString(16).padStart(2, '0')).join(' '));
+
+                log('\nDemo complete!');
+
+            } catch (e) {
+                log('Error: ' + e.message);
+                console.error(e);
+            }
+        }
+
+        // Make functions available globally
+        window.runDemo = runDemo;
+        window.clearOutput = clearOutput;
+
+        // Auto-init
+        initModule();
+    </script>
+</body>
+</html>
