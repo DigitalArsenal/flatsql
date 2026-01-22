@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FlatSQL Demo - Dual View of FlatBuffer Storage</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+        }
+        h1 {
+            text-align: center;
+            color: #00d9ff;
+            margin-bottom: 10px;
+            font-size: 2em;
+        }
+        .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 30px;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .panel {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .panel h2 {
+            color: #00d9ff;
+            margin-top: 0;
+            font-size: 1.2em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .panel h2::before {
+            content: '';
+            width: 4px;
+            height: 20px;
+            background: #00d9ff;
+            border-radius: 2px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        @media (max-width: 1000px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 15px;
+        }
+        button {
+            background: linear-gradient(135deg, #00d9ff 0%, #0099cc 100%);
+            color: #000;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 20px rgba(0,217,255,0.4);
+        }
+        button:disabled {
+            background: #444;
+            color: #888;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        button.secondary {
+            background: rgba(255,255,255,0.1);
+            color: #e0e0e0;
+        }
+        button.secondary:hover {
+            background: rgba(255,255,255,0.2);
+            box-shadow: none;
+        }
+        input, select {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.2);
+            color: #e0e0e0;
+            padding: 12px 16px;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        input:focus, select:focus {
+            outline: none;
+            border-color: #00d9ff;
+        }
+        input[type="text"] { width: 300px; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        th {
+            background: rgba(0,217,255,0.2);
+            color: #00d9ff;
+            padding: 12px 10px;
+            text-align: left;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+        }
+        td {
+            padding: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+        tr:hover td {
+            background: rgba(0,217,255,0.05);
+        }
+        .table-container {
+            max-height: 400px;
+            overflow-y: auto;
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .stats {
+            display: flex;
+            gap: 30px;
+            margin-bottom: 15px;
+        }
+        .stat {
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 2em;
+            color: #00d9ff;
+            font-weight: 700;
+        }
+        .stat-label {
+            color: #888;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+        .badge {
+            display: inline-block;
+            background: rgba(0,217,255,0.2);
+            color: #00d9ff;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .badge.storage { background: rgba(255,165,0,0.2); color: #ffa500; }
+        .badge.query { background: rgba(0,255,136,0.2); color: #00ff88; }
+        .log {
+            background: rgba(0,0,0,0.4);
+            border-radius: 8px;
+            padding: 15px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .log-entry {
+            margin: 4px 0;
+            display: flex;
+            gap: 10px;
+        }
+        .log-time { color: #666; }
+        .log-msg { color: #e0e0e0; }
+        .log-msg.success { color: #00ff88; }
+        .log-msg.error { color: #ff6b6b; }
+        .schema-preview {
+            background: rgba(0,0,0,0.4);
+            border-radius: 8px;
+            padding: 15px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+            color: #888;
+            white-space: pre;
+        }
+        .schema-preview .keyword { color: #ff79c6; }
+        .schema-preview .type { color: #8be9fd; }
+        .schema-preview .attr { color: #50fa7b; }
+        .memory-viz {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2px;
+            padding: 10px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            max-height: 100px;
+            overflow-y: auto;
+        }
+        .memory-byte {
+            width: 20px;
+            height: 20px;
+            font-size: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0,217,255,0.3);
+            border-radius: 2px;
+            color: #fff;
+        }
+        .memory-byte.header { background: rgba(255,165,0,0.5); }
+        .highlight-row {
+            animation: highlight 1s ease-out;
+        }
+        @keyframes highlight {
+            0% { background: rgba(0,217,255,0.3); }
+            100% { background: transparent; }
+        }
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        .init-status {
+            text-align: center;
+            padding: 10px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .init-status.loading { color: #ffa500; }
+        .init-status.ready { color: #00ff88; }
+        .init-status.error { color: #ff6b6b; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>FlatSQL Browser Demo</h1>
+        <p class="subtitle">Dual views of the same at-rest FlatBuffer storage</p>
+
+        <div class="init-status loading" id="initStatus">Loading WASM modules...</div>
+
+        <!-- Schema Panel -->
+        <div class="panel">
+            <h2>Schema Definition</h2>
+            <div class="schema-preview" id="schemaPreview">
+<span class="keyword">table</span> <span class="type">Product</span> {
+    id: <span class="type">int32</span> <span class="attr">(id: 0)</span>;
+    name: <span class="type">string</span> <span class="attr">(id: 1)</span>;
+    category: <span class="type">string</span> <span class="attr">(id: 2, key)</span>;
+    price: <span class="type">float</span> <span class="attr">(id: 3)</span>;
+    in_stock: <span class="type">bool</span> <span class="attr">(id: 4)</span>;
+}
+            </div>
+        </div>
+
+        <!-- Controls Panel -->
+        <div class="panel">
+            <h2>Data Generation</h2>
+            <div class="controls">
+                <button id="btnGenerate" disabled>Generate Sample Data</button>
+                <button id="btnAdd10" class="secondary" disabled>+ 10 Records</button>
+                <button id="btnAdd100" class="secondary" disabled>+ 100 Records</button>
+                <button id="btnClear" class="secondary" disabled>Clear All</button>
+            </div>
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value" id="totalRecords">0</div>
+                    <div class="stat-label">Total Records</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="storageSize">0</div>
+                    <div class="stat-label">Storage (bytes)</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="queryTime">-</div>
+                    <div class="stat-label">Last Query (ms)</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Dual View Grid -->
+        <div class="grid">
+            <!-- Raw Storage View -->
+            <div class="panel">
+                <h2>
+                    <span class="badge storage">RAW STORAGE</span>
+                    All Records (Direct Memory Read)
+                </h2>
+                <p style="color: #888; font-size: 12px; margin-bottom: 15px;">
+                    Reading FlatBuffers directly from shared memory location - zero deserialization
+                </p>
+                <div class="table-container" id="rawTableContainer">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>RowID</th>
+                                <th>ID</th>
+                                <th>Name</th>
+                                <th>Category</th>
+                                <th>Price</th>
+                                <th>In Stock</th>
+                            </tr>
+                        </thead>
+                        <tbody id="rawTableBody">
+                            <tr><td colspan="6" class="empty-state">No data - click "Generate Sample Data"</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Query Results View -->
+            <div class="panel">
+                <h2>
+                    <span class="badge query">QUERY VIEW</span>
+                    Filtered Results (SQL Query)
+                </h2>
+                <div class="controls" style="margin-bottom: 15px;">
+                    <input type="text" id="queryInput" placeholder="e.g., category = 'Electronics'" value="category = 'Electronics'">
+                    <button id="btnQuery" disabled>Run Query</button>
+                </div>
+                <div style="color: #888; font-size: 12px; margin-bottom: 15px;">
+                    Query: <code id="currentQuery">SELECT * FROM Product WHERE category = 'Electronics'</code>
+                </div>
+                <div class="table-container" id="queryTableContainer">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>RowID</th>
+                                <th>ID</th>
+                                <th>Name</th>
+                                <th>Category</th>
+                                <th>Price</th>
+                                <th>In Stock</th>
+                            </tr>
+                        </thead>
+                        <tbody id="queryTableBody">
+                            <tr><td colspan="6" class="empty-state">Run a query to see filtered results</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Memory Visualization -->
+        <div class="panel">
+            <h2>Binary Storage Visualization</h2>
+            <p style="color: #888; font-size: 12px; margin-bottom: 15px;">
+                Stacked FlatBuffer file format - each record is a complete FlatBuffer readable by standard tools
+            </p>
+            <div class="memory-viz" id="memoryViz">
+                <span style="color: #666;">Storage will be visualized here after data generation</span>
+            </div>
+        </div>
+
+        <!-- Log Panel -->
+        <div class="panel">
+            <h2>Activity Log</h2>
+            <div class="log" id="log"></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import FlatSQLModule from './flatsql.js';
+
+        // Global state
+        let flatsql = null;
+        let db = null;
+        let allRecords = [];
+        let nextId = 1;
+
+        // Helper to convert Uint8Array to WASM VectorUint8
+        function toVec(arr) {
+            const vec = new flatsql.VectorUint8();
+            for (const byte of arr) {
+                vec.push_back(byte);
+            }
+            return vec;
+        }
+
+        // Sample data generators
+        const categories = ['Electronics', 'Books', 'Clothing', 'Food', 'Sports', 'Home'];
+        const adjectives = ['Premium', 'Basic', 'Pro', 'Ultra', 'Mini', 'Mega', 'Super', 'Eco'];
+        const products = ['Widget', 'Gadget', 'Device', 'Tool', 'Kit', 'Pack', 'Set', 'Bundle'];
+
+        function randomProduct() {
+            const adj = adjectives[Math.floor(Math.random() * adjectives.length)];
+            const prod = products[Math.floor(Math.random() * products.length)];
+            return {
+                id: nextId++,
+                name: `${adj} ${prod}`,
+                category: categories[Math.floor(Math.random() * categories.length)],
+                price: Math.round(Math.random() * 1000 * 100) / 100,
+                in_stock: Math.random() > 0.3
+            };
+        }
+
+        // Create a simple FlatBuffer-like binary for a product
+        // This is a simplified representation - in production you'd use flatc-wasm
+        function createProductBinary(product) {
+            const encoder = new TextEncoder();
+            const nameBytes = encoder.encode(product.name);
+            const categoryBytes = encoder.encode(product.category);
+
+            // Simple binary format:
+            // [4 bytes: total size] [4 bytes: id] [1 byte: name len] [name] [1 byte: cat len] [cat] [4 bytes: price as float32] [1 byte: in_stock]
+            const totalSize = 4 + 4 + 1 + nameBytes.length + 1 + categoryBytes.length + 4 + 1;
+            const buffer = new ArrayBuffer(totalSize);
+            const view = new DataView(buffer);
+            const uint8 = new Uint8Array(buffer);
+
+            let offset = 0;
+            view.setUint32(offset, totalSize, true); offset += 4;
+            view.setInt32(offset, product.id, true); offset += 4;
+            view.setUint8(offset, nameBytes.length); offset += 1;
+            uint8.set(nameBytes, offset); offset += nameBytes.length;
+            view.setUint8(offset, categoryBytes.length); offset += 1;
+            uint8.set(categoryBytes, offset); offset += categoryBytes.length;
+            view.setFloat32(offset, product.price, true); offset += 4;
+            view.setUint8(offset, product.in_stock ? 1 : 0);
+
+            return new Uint8Array(buffer);
+        }
+
+        // Parse the binary back to a product object
+        function parseProductBinary(data) {
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const decoder = new TextDecoder();
+
+            let offset = 0;
+            const totalSize = view.getUint32(offset, true); offset += 4;
+            const id = view.getInt32(offset, true); offset += 4;
+            const nameLen = view.getUint8(offset); offset += 1;
+            const name = decoder.decode(data.slice(offset, offset + nameLen)); offset += nameLen;
+            const catLen = view.getUint8(offset); offset += 1;
+            const category = decoder.decode(data.slice(offset, offset + catLen)); offset += catLen;
+            const price = view.getFloat32(offset, true); offset += 4;
+            const in_stock = view.getUint8(offset) === 1;
+
+            return { id, name, category, price, in_stock };
+        }
+
+        // Logging
+        function log(msg, type = 'normal') {
+            const logEl = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="log-time">[${time}]</span><span class="log-msg ${type}">${msg}</span>`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // Initialize
+        async function init() {
+            const statusEl = document.getElementById('initStatus');
+
+            try {
+                log('Loading FlatSQL WASM module...');
+                flatsql = await FlatSQLModule();
+                log('FlatSQL module ready', 'success');
+
+                // Create database
+                const dbSchema = `
+                    table Product {
+                        id: int (id);
+                        name: string;
+                        category: string (key);
+                        price: float;
+                        in_stock: bool;
+                    }
+                `;
+                db = new flatsql.FlatSQLDatabase(dbSchema, 'demo');
+                log('Database created with Product table', 'success');
+
+                // Enable buttons
+                document.getElementById('btnGenerate').disabled = false;
+                document.getElementById('btnAdd10').disabled = false;
+                document.getElementById('btnAdd100').disabled = false;
+                document.getElementById('btnClear').disabled = false;
+                document.getElementById('btnQuery').disabled = false;
+
+                statusEl.textContent = 'Ready! WASM modules loaded successfully.';
+                statusEl.className = 'init-status ready';
+
+            } catch (e) {
+                log(`Initialization error: ${e.message}`, 'error');
+                statusEl.textContent = `Error: ${e.message}`;
+                statusEl.className = 'init-status error';
+                console.error(e);
+            }
+        }
+
+        // Generate initial sample data
+        function generateData() {
+            log('Generating sample data...');
+            clearAll();
+            addRecords(25);
+            log('Sample data generated!', 'success');
+        }
+
+        // Add N records
+        function addRecords(count) {
+            const startTime = performance.now();
+
+            for (let i = 0; i < count; i++) {
+                const product = randomProduct();
+                const binary = createProductBinary(product);
+                // Convert Uint8Array to WASM VectorUint8
+                const vec = toVec(binary);
+                const rowid = db.insertRaw('Product', vec);
+                vec.delete(); // Clean up WASM memory
+                allRecords.push({ rowid, product, binary });
+            }
+
+            const elapsed = (performance.now() - startTime).toFixed(2);
+            log(`Added ${count} records in ${elapsed}ms (${Math.round(count / elapsed * 1000)} rec/sec)`);
+
+            updateStats();
+            refreshRawView();
+            runQuery();
+        }
+
+        // Clear all data
+        function clearAll() {
+            // Recreate database
+            const dbSchema = `
+                table Product {
+                    id: int (id);
+                    name: string;
+                    category: string (key);
+                    price: float;
+                    in_stock: bool;
+                }
+            `;
+            if (db) db.delete();
+            db = new flatsql.FlatSQLDatabase(dbSchema, 'demo');
+            allRecords = [];
+            nextId = 1;
+            updateStats();
+            document.getElementById('rawTableBody').innerHTML =
+                '<tr><td colspan="6" class="empty-state">No data - click "Generate Sample Data"</td></tr>';
+            document.getElementById('queryTableBody').innerHTML =
+                '<tr><td colspan="6" class="empty-state">Run a query to see filtered results</td></tr>';
+            document.getElementById('memoryViz').innerHTML =
+                '<span style="color: #666;">Storage will be visualized here after data generation</span>';
+            log('Database cleared');
+        }
+
+        // Update statistics
+        function updateStats() {
+            document.getElementById('totalRecords').textContent = allRecords.length;
+            // exportData returns a VectorUint8, convert to Uint8Array
+            const exportedVec = db.exportData();
+            const exportedData = new Uint8Array(exportedVec.size());
+            for (let i = 0; i < exportedVec.size(); i++) {
+                exportedData[i] = exportedVec.get(i);
+            }
+            exportedVec.delete();
+            document.getElementById('storageSize').textContent = exportedData.length.toLocaleString();
+            updateMemoryViz(exportedData);
+        }
+
+        // Refresh raw storage view - reads directly from stored binaries
+        function refreshRawView() {
+            const tbody = document.getElementById('rawTableBody');
+
+            if (allRecords.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No data - click "Generate Sample Data"</td></tr>';
+                return;
+            }
+
+            // Read directly from stored FlatBuffers - zero-copy access
+            const rows = allRecords.map(rec => {
+                // Parse the binary directly - simulating direct memory access
+                const product = parseProductBinary(rec.binary);
+                return `
+                    <tr>
+                        <td>${rec.rowid}</td>
+                        <td>${product.id}</td>
+                        <td>${product.name}</td>
+                        <td>${product.category}</td>
+                        <td>$${product.price.toFixed(2)}</td>
+                        <td>${product.in_stock ? '✓' : '✗'}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            tbody.innerHTML = rows;
+        }
+
+        // Run SQL query
+        function runQuery() {
+            const whereClause = document.getElementById('queryInput').value.trim();
+            const sql = whereClause
+                ? `SELECT * FROM Product WHERE ${whereClause}`
+                : 'SELECT * FROM Product';
+
+            document.getElementById('currentQuery').textContent = sql;
+
+            const startTime = performance.now();
+
+            try {
+                const result = db.query(sql);
+                const elapsed = (performance.now() - startTime).toFixed(2);
+                document.getElementById('queryTime').textContent = elapsed;
+
+                const tbody = document.getElementById('queryTableBody');
+                const rowCount = result.getRowCount();
+
+                if (rowCount === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No matching records</td></tr>';
+                    log(`Query returned 0 rows in ${elapsed}ms`);
+                    result.delete();
+                    return;
+                }
+
+                // Get matching records by rowid and parse their FlatBuffers
+                const rows = result.getRows();
+                const matchingRecords = [];
+
+                for (const row of rows) {
+                    const rowid = parseInt(row[0]); // _rowid is first column
+                    const rec = allRecords.find(r => r.rowid === rowid);
+                    if (rec) {
+                        matchingRecords.push(rec);
+                    }
+                }
+
+                const html = matchingRecords.map(rec => {
+                    // Parse the same binary that's in storage
+                    const product = parseProductBinary(rec.binary);
+                    return `
+                        <tr class="highlight-row">
+                            <td>${rec.rowid}</td>
+                            <td>${product.id}</td>
+                            <td>${product.name}</td>
+                            <td>${product.category}</td>
+                            <td>$${product.price.toFixed(2)}</td>
+                            <td>${product.in_stock ? '✓' : '✗'}</td>
+                        </tr>
+                    `;
+                }).join('');
+
+                tbody.innerHTML = html || '<tr><td colspan="6" class="empty-state">No matching records</td></tr>';
+                log(`Query returned ${matchingRecords.length} rows in ${elapsed}ms`, 'success');
+
+                result.delete();
+
+            } catch (e) {
+                log(`Query error: ${e.message}`, 'error');
+                document.getElementById('queryTableBody').innerHTML =
+                    `<tr><td colspan="6" class="empty-state" style="color: #ff6b6b;">Error: ${e.message}</td></tr>`;
+            }
+        }
+
+        // Update memory visualization
+        function updateMemoryViz(data) {
+            const container = document.getElementById('memoryViz');
+            const maxBytes = 200; // Show first N bytes
+            const bytes = data.slice(0, maxBytes);
+
+            let html = '';
+            for (let i = 0; i < bytes.length; i++) {
+                const isHeader = i < 64; // File header is first 64 bytes
+                const hex = bytes[i].toString(16).padStart(2, '0').toUpperCase();
+                html += `<div class="memory-byte ${isHeader ? 'header' : ''}" title="Offset ${i}: 0x${hex}">${hex}</div>`;
+            }
+
+            if (data.length > maxBytes) {
+                html += `<div style="width: 100%; text-align: center; color: #666; padding: 10px;">... ${data.length - maxBytes} more bytes ...</div>`;
+            }
+
+            container.innerHTML = html;
+        }
+
+        // Set up event listeners
+        document.getElementById('btnGenerate').addEventListener('click', generateData);
+        document.getElementById('btnAdd10').addEventListener('click', () => addRecords(10));
+        document.getElementById('btnAdd100').addEventListener('click', () => addRecords(100));
+        document.getElementById('btnClear').addEventListener('click', clearAll);
+        document.getElementById('btnQuery').addEventListener('click', runQuery);
+        document.getElementById('queryInput').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') runQuery();
+        });
+
+        // Initialize on load
+        init();
+    </script>
+</body>
+</html>

@@ -86,6 +86,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
     message(STATUS "WASM build configured")
     message(STATUS "Output: flatsql.js + flatsql.wasm")
 
+    # Post-build: copy WASM files to docs/ for GitHub Pages
+    add_custom_command(TARGET flatsql POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+            $<TARGET_FILE_DIR:flatsql>/flatsql.js
+            $<TARGET_FILE_DIR:flatsql>/flatsql.wasm
+            ${CMAKE_CURRENT_SOURCE_DIR}/../docs/
+        COMMENT "Copying WASM files to docs/ for GitHub Pages"
+    )
+
 else()
     message(STATUS "Native build (for testing and CLI)")
 
