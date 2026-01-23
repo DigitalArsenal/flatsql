@@ -2160,11 +2160,15 @@
 db.<span class="function">registerFileId</span>(<span class="string">"USER"</span>, <span class="string">"User"</span>);
 db.<span class="function">registerFileId</span>(<span class="string">"POST"</span>, <span class="string">"Post"</span>);
 
-<span class="comment">// Stream size-prefixed FlatBuffers</span>
-<span class="keyword">const</span> bytesConsumed = db.<span class="function">ingest</span>(streamData);
+<span class="comment">// Register data sources</span>
+db.<span class="function">registerSource</span>(<span class="string">"satellite-1"</span>);
+db.<span class="function">registerSource</span>(<span class="string">"ground-station"</span>);
 
-<span class="comment">// Query with SQL</span>
-<span class="keyword">const</span> result = db.<span class="function">query</span>(<span class="string">"SELECT * FROM User WHERE age > 25"</span>);</pre>
+<span class="comment">// Stream size-prefixed FlatBuffers to a source</span>
+<span class="keyword">const</span> bytesConsumed = db.<span class="function">ingest</span>(streamData, <span class="string">"satellite-1"</span>);
+
+<span class="comment">// Query with SQL (filter by _source)</span>
+<span class="keyword">const</span> result = db.<span class="function">query</span>(<span class="string">"SELECT * FROM User WHERE _source = 'satellite-1'"</span>);</pre>
         </div>
     </section>
 
@@ -2246,11 +2250,15 @@ db.<span class="function">registerFileId</span>(<span class="string">"POST"</spa
 db.<span class="function">registerFileId</span>(<span class="string">"USER"</span>, <span class="string">"User"</span>);
 db.<span class="function">registerFileId</span>(<span class="string">"POST"</span>, <span class="string">"Post"</span>);
 
-<span class="comment">// Stream size-prefixed FlatBuffers</span>
-<span class="keyword">const</span> bytesConsumed = db.<span class="function">ingest</span>(streamData);
+<span class="comment">// Register data sources</span>
+db.<span class="function">registerSource</span>(<span class="string">"satellite-1"</span>);
+db.<span class="function">registerSource</span>(<span class="string">"ground-station"</span>);
 
-<span class="comment">// Query with SQL</span>
-<span class="keyword">const</span> result = db.<span class="function">query</span>(<span class="string">"SELECT * FROM User WHERE age > 25"</span>);`,
+<span class="comment">// Stream size-prefixed FlatBuffers to a source</span>
+<span class="keyword">const</span> bytesConsumed = db.<span class="function">ingest</span>(streamData, <span class="string">"satellite-1"</span>);
+
+<span class="comment">// Query with SQL (filter by _source)</span>
+<span class="keyword">const</span> result = db.<span class="function">query</span>(<span class="string">"SELECT * FROM User WHERE _source = 'satellite-1'"</span>);`,
             cpp: `<span class="comment">// Create database from schema</span>
 FlatSQLDatabase db = FlatSQLDatabase::<span class="function">fromSchema</span>(schema, <span class="string">"mydb"</span>);
 
@@ -2258,26 +2266,28 @@ FlatSQLDatabase db = FlatSQLDatabase::<span class="function">fromSchema</span>(s
 db.<span class="function">registerFileId</span>(<span class="string">"USER"</span>, <span class="string">"User"</span>);
 db.<span class="function">registerFileId</span>(<span class="string">"POST"</span>, <span class="string">"Post"</span>);
 
-<span class="comment">// Set field extractor for indexing</span>
-db.<span class="function">setFieldExtractor</span>(<span class="string">"User"</span>, extractUserField);
+<span class="comment">// Register data sources</span>
+db.<span class="function">registerSource</span>(<span class="string">"satellite-1"</span>);
+db.<span class="function">registerSource</span>(<span class="string">"ground-station"</span>);
 
-<span class="comment">// Stream ingest - returns bytes consumed</span>
+<span class="comment">// Stream ingest to a source - returns bytes consumed</span>
 <span class="keyword">size_t</span> records;
-<span class="keyword">size_t</span> bytes = db.<span class="function">ingest</span>(data, length, &records);
+<span class="keyword">size_t</span> bytes = db.<span class="function">ingest</span>(data, length, <span class="string">"satellite-1"</span>, &records);
 
-<span class="comment">// Query with SQL</span>
-QueryResult result = db.<span class="function">query</span>(<span class="string">"SELECT * FROM User"</span>);`,
-            cli: `<span class="comment"># Pipe FlatBuffers via stdin</span>
+<span class="comment">// Query with SQL (filter by _source)</span>
+QueryResult result = db.<span class="function">query</span>(<span class="string">"SELECT * FROM User WHERE _source = 'satellite-1'"</span>);`,
+            cli: `<span class="comment"># Pipe FlatBuffers via stdin with source</span>
 cat users.fb | flatsql \\
     --schema app.fbs \\
     --map USER=User \\
     --map POST=Post \\
-    --query <span class="string">'SELECT * FROM User WHERE age > 25'</span> \\
+    --source satellite-1 \\
+    --query <span class="string">'SELECT * FROM User WHERE _source = \\'satellite-1\\''</span> \\
     --stats
 
-<span class="comment"># Export and reload</span>
+<span class="comment"># Query across all sources</span>
 flatsql --schema app.fbs --load data.bin \\
-    --query <span class="string">'SELECT COUNT(*) FROM User'</span>`
+    --query <span class="string">'SELECT _source, COUNT(*) FROM User GROUP BY _source'</span>`
         };
 
         document.querySelectorAll('.code-tab').forEach(tab => {
