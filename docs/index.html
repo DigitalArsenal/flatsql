@@ -5,75 +5,58 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="Digital Arsenal FlatSQL - SQL queries over raw FlatBuffer storage. Zero-copy queries, file identifier routing, real-time indexing.">
     <title>Digital Arsenal FlatSQL</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'><stop offset='0%25' stop-color='%23ffd000'/><stop offset='100%25' stop-color='%23ff8800'/></linearGradient></defs><ellipse cx='50' cy='25' rx='35' ry='12' fill='url(%23g)'/><path d='M15 25v50c0 6.6 15.7 12 35 12s35-5.4 35-12V25' fill='none' stroke='url(%23g)' stroke-width='6'/><ellipse cx='50' cy='75' rx='35' ry='12' fill='none' stroke='url(%23g)' stroke-width='6'/><path d='M55 35L40 55h15L42 80l25-30H52l8-15z' fill='%23000'/></svg>">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><ellipse cx='50' cy='25' rx='35' ry='12' fill='%23fff'/><path d='M15 25v50c0 6.6 15.7 12 35 12s35-5.4 35-12V25' fill='none' stroke='%23fff' stroke-width='6'/><ellipse cx='50' cy='75' rx='35' ry='12' fill='none' stroke='%23fff' stroke-width='6'/><path d='M55 35L40 55h15L42 80l25-30H52l8-15z' fill='%23000'/></svg>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <style>
-        /* Reset & Variables */
+        /* Reset */
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
         :root {
-            --bg-dark: #0a0a0a;
-            --bg-card: rgba(15, 15, 15, 0.9);
-            --glass-bg: rgba(255, 255, 255, 0.03);
-            --glass-border: rgba(255, 255, 255, 0.08);
-            --glass-hover: rgba(255, 255, 255, 0.06);
-
-            --text-primary: #f0f0f0;
-            --text-secondary: rgba(240, 240, 240, 0.6);
-            --text-muted: rgba(240, 240, 240, 0.4);
-
-            --accent-cyan: #ffd000;
-            --accent-purple: #ffaa00;
-            --accent-green: #88cc00;
-            --accent-orange: #ff8800;
-
+            --bg: #000000;
+            --text-primary: #F5F5F7;
+            --text-secondary: rgba(255, 255, 255, 0.8);
+            --text-muted: rgba(134, 134, 139, 1.0);
+            --ui-bg: rgba(42, 42, 45, 0.72);
+            --ui-hover: rgba(66, 66, 69, 0.72);
+            --nav-bg: rgba(22, 22, 23, 1.0);
             --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
-
-            --radius: 16px;
-            --radius-sm: 8px;
         }
 
         html { scroll-behavior: smooth; }
 
         body {
             font-family: var(--font-sans);
-            background: var(--bg-dark);
+            background: var(--bg);
             color: var(--text-primary);
             line-height: 1.6;
             overflow-x: hidden;
             -webkit-font-smoothing: antialiased;
         }
 
-        /* Animated Background */
-        .bg-animation {
+        /* Fixed full-page video background */
+        .page-video-bg {
             position: fixed;
             top: 0;
             left: 0;
             width: 100%;
             height: 100%;
-            z-index: -1;
-            overflow: hidden;
+            object-fit: cover;
+            z-index: -2;
+            opacity: 0.35;
         }
 
-        .bg-animation canvas {
-            width: 100%;
-            height: 100%;
-        }
-
-        .bg-gradient {
+        .page-video-overlay {
             position: fixed;
             top: 0;
             left: 0;
             width: 100%;
             height: 100%;
+            background: linear-gradient(180deg, rgba(0,0,0,0.4) 0%, rgba(0,0,0,0.6) 50%, rgba(0,0,0,0.4) 100%);
             z-index: -1;
-            background:
-                radial-gradient(ellipse 80% 50% at 50% -20%, rgba(255, 208, 0, 0.12), transparent),
-                radial-gradient(ellipse 60% 40% at 80% 50%, rgba(255, 170, 0, 0.08), transparent),
-                radial-gradient(ellipse 50% 30% at 20% 80%, rgba(255, 136, 0, 0.06), transparent);
         }
 
         /* Navigation */
@@ -82,16 +65,15 @@
             top: 0;
             left: 0;
             right: 0;
-            height: 64px;
-            z-index: 1000;
-            background: rgba(10, 10, 15, 0.8);
+            height: 44px;
+            z-index: 9999;
+            background: var(--nav-bg);
             backdrop-filter: blur(20px);
             -webkit-backdrop-filter: blur(20px);
-            border-bottom: 1px solid var(--glass-border);
         }
 
         .nav-content {
-            max-width: 1200px;
+            max-width: 1024px;
             margin: 0 auto;
             height: 100%;
             padding: 0 24px;
@@ -103,22 +85,16 @@
         .logo {
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
             font-weight: 600;
-            font-size: 18px;
+            font-size: 14px;
             color: var(--text-primary);
             text-decoration: none;
         }
 
         .logo-icon {
-            width: 32px;
-            height: 32px;
-            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 18px;
+            width: 20px;
+            height: 20px;
         }
 
         .nav-links {
@@ -129,93 +105,73 @@
         .nav-links a {
             color: var(--text-secondary);
             text-decoration: none;
-            font-size: 14px;
-            font-weight: 500;
-            transition: color 0.2s;
+            font-size: 12px;
+            font-weight: 600;
+            transition: opacity 0.2s;
         }
 
-        .nav-links a:hover { color: var(--text-primary); }
-
-        .nav-actions {
-            display: flex;
-            gap: 12px;
-        }
+        .nav-links a:hover { opacity: 0.6; }
 
         .btn {
             display: inline-flex;
             align-items: center;
             gap: 8px;
-            padding: 10px 20px;
-            border-radius: var(--radius-sm);
-            font-size: 14px;
-            font-weight: 500;
+            padding: 8px 20px;
+            border-radius: 28px;
+            font-size: 12px;
+            font-weight: 600;
             text-decoration: none;
-            transition: all 0.2s;
+            transition: all 0.3s;
             cursor: pointer;
             border: none;
+            background: var(--ui-bg);
+            backdrop-filter: blur(7px);
+            color: #FFFFFF;
         }
 
-        .btn-primary {
-            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
-            color: #000;
+        .btn:hover {
+            background: var(--ui-hover);
         }
 
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 30px rgba(0, 212, 255, 0.3);
-        }
-
-        .btn-secondary {
-            background: var(--glass-bg);
-            color: var(--text-primary);
-            border: 1px solid var(--glass-border);
-        }
-
-        .btn-secondary:hover {
-            background: var(--glass-hover);
-            border-color: rgba(255, 255, 255, 0.15);
+        .btn-large {
+            min-height: 56px;
+            padding: 0 32px;
+            font-size: 14px;
         }
 
         /* Hero Section */
         .hero {
-            min-height: 100vh;
+            min-height: min(1180px, 100vh);
             display: flex;
             flex-direction: column;
-            justify-content: flex-start;
+            justify-content: center;
             align-items: center;
             text-align: center;
-            padding: 180px 24px 80px;
+            padding: 64px 24px;
+            position: relative;
         }
 
-        .hero-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            padding: 6px 16px;
-            background: var(--glass-bg);
-            border: 1px solid var(--glass-border);
-            border-radius: 100px;
-            font-size: 13px;
-            color: var(--accent-cyan);
-            margin-bottom: 24px;
+        .hero-content {
+            position: relative;
+            z-index: 10;
+            max-width: 900px;
         }
 
         .hero h1 {
-            font-size: clamp(48px, 8vw, 80px);
-            font-weight: 700;
-            line-height: 1.1;
+            font-size: clamp(48px, 10vw, 80px);
+            font-weight: 600;
+            line-height: 1.05;
             margin-bottom: 24px;
-            background: linear-gradient(135deg, var(--text-primary) 0%, var(--accent-cyan) 50%, var(--accent-purple) 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
+            color: var(--text-primary);
         }
 
         .hero p {
-            font-size: 20px;
+            font-size: 22px;
+            font-weight: 600;
             color: var(--text-secondary);
             max-width: 600px;
-            margin-bottom: 40px;
+            margin: 0 auto 40px;
+            line-height: 1.4;
         }
 
         .hero-buttons {
@@ -227,91 +183,170 @@
 
         /* Features Grid */
         .features {
-            padding: 80px 24px;
-            max-width: 1200px;
+            padding: 160px 24px;
+            max-width: 1024px;
             margin: 0 auto;
+            position: relative;
         }
 
         .section-title {
             text-align: center;
-            margin-bottom: 60px;
+            margin-bottom: 80px;
         }
 
         .section-title h2 {
-            font-size: 36px;
+            font-size: 56px;
             font-weight: 600;
+            line-height: 1.1;
             margin-bottom: 16px;
+            color: var(--text-primary);
         }
 
         .section-title p {
             color: var(--text-secondary);
-            font-size: 18px;
+            font-size: 22px;
+            font-weight: 600;
         }
 
         .features-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 24px;
         }
 
         .feature-card {
-            background: var(--glass-bg);
-            border: 1px solid var(--glass-border);
-            border-radius: var(--radius);
-            padding: 32px;
-            transition: all 0.3s;
-        }
-
-        .feature-card:hover {
-            background: var(--glass-hover);
-            transform: translateY(-4px);
-            border-color: rgba(255, 255, 255, 0.12);
-        }
-
-        .feature-icon {
-            width: 48px;
-            height: 48px;
-            border-radius: 12px;
+            position: relative;
+            border-radius: 28px;
+            padding: 48px 32px;
+            min-height: 300px;
+            overflow: hidden;
             display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 24px;
-            margin-bottom: 20px;
+            flex-direction: column;
+            justify-content: flex-end;
         }
 
-        .feature-icon.cyan { background: rgba(0, 212, 255, 0.15); }
-        .feature-icon.purple { background: rgba(168, 85, 247, 0.15); }
-        .feature-icon.green { background: rgba(16, 185, 129, 0.15); }
-        .feature-icon.orange { background: rgba(245, 158, 11, 0.15); }
+        .feature-card video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            z-index: 1;
+            opacity: 0.5;
+        }
+
+        .feature-card::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.4);
+            z-index: 2;
+        }
+
+        .feature-card-content {
+            position: relative;
+            z-index: 10;
+        }
 
         .feature-card h3 {
-            font-size: 20px;
+            font-size: 28px;
             font-weight: 600;
             margin-bottom: 12px;
+            color: var(--text-primary);
         }
 
         .feature-card p {
             color: var(--text-secondary);
-            font-size: 15px;
+            font-size: 18px;
+            line-height: 1.5;
+        }
+
+        /* Special treatment for Zero-Copy card - animated grid pattern */
+        .feature-card-highlight {
+            background: linear-gradient(135deg, rgba(255,255,255,0.03) 0%, rgba(255,255,255,0.08) 100%);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .feature-card-highlight::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image:
+                linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+            background-size: 40px 40px;
+            z-index: 1;
+            animation: gridMove 20s linear infinite;
+        }
+
+        @keyframes gridMove {
+            0% { transform: translate(0, 0); }
+            100% { transform: translate(40px, 40px); }
+        }
+
+        .feature-card-highlight::after {
+            background: rgba(0, 0, 0, 0.2);
+        }
+
+        .feature-card-highlight .pulse-ring {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 120px;
+            height: 120px;
+            transform: translate(-50%, -50%);
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            border-radius: 50%;
+            animation: pulseRing 3s ease-out infinite;
+            z-index: 1;
+        }
+
+        .feature-card-highlight .pulse-ring:nth-child(2) {
+            animation-delay: 1s;
+        }
+
+        .feature-card-highlight .pulse-ring:nth-child(3) {
+            animation-delay: 2s;
+        }
+
+        @keyframes pulseRing {
+            0% {
+                width: 80px;
+                height: 80px;
+                opacity: 0.8;
+            }
+            100% {
+                width: 300px;
+                height: 300px;
+                opacity: 0;
+            }
         }
 
         /* Demo Section */
         .demo {
-            padding: 80px 24px;
+            padding: 160px 24px;
             max-width: 1400px;
             margin: 0 auto;
+            position: relative;
         }
 
         .demo-container {
-            background: var(--glass-bg);
-            border: 1px solid var(--glass-border);
-            border-radius: var(--radius);
+            background: rgba(22, 22, 23, 0.8);
+            backdrop-filter: blur(20px);
+            border-radius: 28px;
             overflow: hidden;
         }
 
         .demo-header {
             padding: 20px 24px;
-            border-bottom: 1px solid var(--glass-border);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
             display: flex;
             align-items: center;
             justify-content: space-between;
@@ -326,6 +361,7 @@
         .demo-title h3 {
             font-size: 16px;
             font-weight: 600;
+            color: var(--text-primary);
         }
 
         .demo-status {
@@ -333,14 +369,14 @@
             align-items: center;
             gap: 8px;
             font-size: 13px;
-            color: var(--text-secondary);
+            color: var(--text-muted);
         }
 
         .status-dot {
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: var(--accent-green);
+            background: #FFFFFF;
             animation: pulse 2s infinite;
         }
 
@@ -361,18 +397,26 @@
 
         .demo-panel {
             padding: 24px;
-            border-right: 1px solid var(--glass-border);
         }
 
-        .demo-panel:last-child { border-right: none; }
+        .demo-panel:first-child {
+            border-right: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        @media (max-width: 900px) {
+            .demo-panel:first-child {
+                border-right: none;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            }
+        }
 
         .demo-panel h4 {
-            font-size: 13px;
+            font-size: 14px;
             font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
             color: var(--text-muted);
             margin-bottom: 16px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
 
         .demo-controls {
@@ -383,39 +427,39 @@
         }
 
         .demo-btn {
-            padding: 8px 16px;
+            padding: 10px 18px;
             font-size: 13px;
-            background: rgba(255, 208, 0, 0.1);
-            border: 1px solid rgba(255, 208, 0, 0.3);
-            color: var(--accent-cyan);
-            border-radius: 6px;
+            font-weight: 600;
+            background: var(--ui-bg);
+            backdrop-filter: blur(7px);
+            border: none;
+            color: #FFFFFF;
+            border-radius: 28px;
             cursor: pointer;
             transition: all 0.2s;
         }
 
-        .demo-btn:hover {
-            background: rgba(255, 208, 0, 0.2);
+        .demo-btn:hover:not(:disabled) {
+            background: var(--ui-hover);
         }
 
         .demo-btn:disabled {
-            opacity: 0.5;
+            opacity: 0.36;
             cursor: not-allowed;
         }
 
         .spinner {
             display: none;
-            width: 16px;
-            height: 16px;
-            border: 2px solid rgba(255, 208, 0, 0.3);
-            border-top-color: var(--accent-cyan);
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-top-color: #FFFFFF;
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
             margin-left: 8px;
         }
 
-        .spinner.active {
-            display: inline-block;
-        }
+        .spinner.active { display: inline-block; }
 
         @keyframes spin {
             to { transform: rotate(360deg); }
@@ -432,15 +476,9 @@
             margin-bottom: 20px;
         }
 
-        .stat {
-            text-align: center;
-        }
-
-        .stat-value {
-            font-size: 28px;
-            font-weight: 700;
-            color: var(--accent-cyan);
-            font-family: var(--font-mono);
+        .stat-item {
+            display: flex;
+            flex-direction: column;
         }
 
         .stat-label {
@@ -450,142 +488,151 @@
             letter-spacing: 0.5px;
         }
 
-        .stream-viz {
-            background: rgba(0, 0, 0, 0.3);
-            border-radius: var(--radius-sm);
+        .stat-value {
+            font-size: 24px;
+            font-weight: 600;
+            font-family: var(--font-mono);
+            color: var(--text-primary);
+        }
+
+        .stream-log {
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 12px;
             padding: 16px;
-            height: 200px;
+            max-height: 280px;
             overflow-y: auto;
             font-family: var(--font-mono);
             font-size: 12px;
         }
 
         .stream-item {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            padding: 8px;
-            margin-bottom: 4px;
-            background: rgba(255, 255, 255, 0.02);
-            border-radius: 4px;
-            animation: slideIn 0.3s ease-out;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
         }
 
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateX(-10px); }
-            to { opacity: 1; transform: translateX(0); }
-        }
+        .stream-item:last-child { border-bottom: none; }
 
         .stream-badge {
+            display: inline-block;
             padding: 2px 8px;
             border-radius: 4px;
             font-size: 10px;
             font-weight: 600;
+            text-transform: uppercase;
+            margin-right: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            color: var(--text-primary);
         }
-
-        .stream-badge.user { background: rgba(0, 212, 255, 0.2); color: var(--accent-cyan); }
-        .stream-badge.post { background: rgba(168, 85, 247, 0.2); color: var(--accent-purple); }
 
         .query-input {
             width: 100%;
-            background: rgba(0, 0, 0, 0.3);
-            border: 1px solid var(--glass-border);
-            border-radius: var(--radius-sm);
-            padding: 12px 16px;
+            padding: 14px 18px;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
             color: var(--text-primary);
             font-family: var(--font-mono);
-            font-size: 13px;
+            font-size: 14px;
             margin-bottom: 16px;
         }
 
         .query-input:focus {
             outline: none;
-            border-color: var(--accent-cyan);
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+
+        .query-input::placeholder {
+            color: var(--text-muted);
         }
 
         .results-table {
             width: 100%;
             border-collapse: collapse;
             font-size: 13px;
+            font-family: var(--font-mono);
+        }
+
+        .results-table th, .results-table td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
         }
 
         .results-table th {
-            text-align: left;
-            padding: 12px;
-            background: rgba(0, 0, 0, 0.3);
-            color: var(--accent-cyan);
+            color: var(--text-muted);
             font-weight: 600;
             font-size: 11px;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
         }
 
         .results-table td {
-            padding: 10px 12px;
-            border-bottom: 1px solid var(--glass-border);
-        }
-
-        .results-table tr:hover td {
-            background: rgba(0, 212, 255, 0.05);
+            color: var(--text-secondary);
         }
 
         /* Code Section */
         .code-section {
-            padding: 80px 24px;
-            max-width: 1200px;
+            padding: 160px 24px;
+            max-width: 1024px;
             margin: 0 auto;
+            position: relative;
         }
 
         .code-tabs {
             display: flex;
-            gap: 4px;
-            margin-bottom: 0;
+            gap: 8px;
+            margin-bottom: 24px;
+            justify-content: center;
         }
 
         .code-tab {
-            padding: 12px 24px;
-            background: var(--glass-bg);
-            border: 1px solid var(--glass-border);
-            border-bottom: none;
-            border-radius: var(--radius-sm) var(--radius-sm) 0 0;
-            color: var(--text-secondary);
+            padding: 10px 20px;
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 28px;
+            color: var(--text-muted);
+            font-size: 13px;
+            font-weight: 600;
             cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
             transition: all 0.2s;
         }
 
+        .code-tab:hover {
+            border-color: rgba(255, 255, 255, 0.2);
+            color: var(--text-secondary);
+        }
+
         .code-tab.active {
-            background: rgba(0, 0, 0, 0.4);
-            color: var(--accent-cyan);
+            background: var(--ui-bg);
+            border-color: transparent;
+            color: var(--text-primary);
         }
 
         .code-block {
-            background: rgba(0, 0, 0, 0.4);
-            border: 1px solid var(--glass-border);
-            border-radius: 0 var(--radius-sm) var(--radius-sm) var(--radius-sm);
-            padding: 24px;
+            background: rgba(22, 22, 23, 0.8);
+            backdrop-filter: blur(20px);
+            border-radius: 16px;
+            padding: 32px;
             overflow-x: auto;
         }
 
         .code-block pre {
-            margin: 0;
             font-family: var(--font-mono);
             font-size: 14px;
-            line-height: 1.7;
+            line-height: 1.6;
+            color: var(--text-secondary);
         }
 
-        .code-block .keyword { color: var(--accent-purple); }
-        .code-block .string { color: var(--accent-green); }
+        .code-block .keyword { color: var(--text-primary); }
+        .code-block .string { color: rgba(255, 255, 255, 0.7); }
         .code-block .comment { color: var(--text-muted); }
-        .code-block .function { color: var(--accent-cyan); }
-        .code-block .number { color: var(--accent-orange); }
+        .code-block .function { color: var(--text-primary); }
 
         /* Footer */
         footer {
-            padding: 60px 24px;
+            padding: 64px 24px;
             text-align: center;
-            border-top: 1px solid var(--glass-border);
+            position: relative;
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
         }
 
         footer p {
@@ -594,51 +641,66 @@
         }
 
         footer a {
-            color: var(--accent-cyan);
+            color: var(--text-secondary);
             text-decoration: none;
         }
 
+        footer a:hover {
+            opacity: 0.6;
+        }
+
         /* Responsive */
-        @media (max-width: 768px) {
+        @media (max-width: 734px) {
+            .hero h1 { font-size: 48px; }
+            .hero p { font-size: 18px; }
+            .section-title h2 { font-size: 32px; }
+            .section-title p { font-size: 18px; }
+            .features { padding: 80px 24px; }
+            .demo { padding: 80px 24px; }
+            .code-section { padding: 80px 24px; }
             .nav-links { display: none; }
-            .hero h1 { font-size: 36px; }
-            .features-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
 <body>
-    <div class="bg-gradient"></div>
-    <div class="bg-animation">
-        <canvas id="particleCanvas"></canvas>
-    </div>
+    <!-- Fixed full-page video background -->
+    <video class="page-video-bg" id="pageVideoBg" autoplay loop muted playsinline></video>
+    <div class="page-video-overlay"></div>
 
     <nav>
         <div class="nav-content">
             <a href="#" class="logo">
-                <span class="logo-icon">⚡</span>
-                FlatSQL
+                <svg class="logo-icon" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <ellipse cx="50" cy="25" rx="35" ry="12" fill="#fff"/>
+                    <path d="M15 25v50c0 6.6 15.7 12 35 12s35-5.4 35-12V25" stroke="#fff" stroke-width="6" fill="none"/>
+                    <ellipse cx="50" cy="75" rx="35" ry="12" stroke="#fff" stroke-width="6" fill="none"/>
+                    <path d="M55 35L40 55h15L42 80l25-30H52l8-15z" fill="#000"/>
+                </svg>
+                <span>FlatSQL</span>
             </a>
             <div class="nav-links">
                 <a href="#features">Features</a>
                 <a href="#demo">Demo</a>
                 <a href="#code">Code</a>
-                <a href="JUNCTION_TABLES.html">Docs</a>
+                <a href="https://github.com/DigitalArsenal/flatbuffers" target="_blank">Docs</a>
             </div>
-            <div class="nav-actions">
-                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" class="btn btn-secondary" target="_blank">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
-                    GitHub
-                </a>
-            </div>
+            <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" class="btn" target="_blank">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
+                </svg>
+                GitHub
+            </a>
         </div>
     </nav>
 
     <section class="hero">
-        <h1>Digital Arsenal<br>FlatSQL</h1>
-        <p>SQL queries over raw FlatBuffer storage. Zero conversion, real-time indexing, pure streaming.</p>
-        <div class="hero-buttons">
-            <a href="#demo" class="btn btn-primary">Try Live Demo</a>
-            <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" class="btn btn-secondary" target="_blank">View Source</a>
+        <div class="hero-content">
+            <h1>Digital Arsenal<br>FlatSQL</h1>
+            <p>SQL queries over raw FlatBuffer storage. Zero conversion, real-time indexing, pure streaming.</p>
+            <div class="hero-buttons">
+                <a href="#demo" class="btn btn-large">Try Live Demo</a>
+                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" class="btn btn-large" target="_blank">View Source</a>
+            </div>
         </div>
     </section>
 
@@ -649,51 +711,49 @@
         </div>
         <div class="features-grid">
             <div class="feature-card">
-                <div class="feature-icon cyan">📡</div>
-                <h3>Raw Streaming Ingest</h3>
-                <p>Pipe size-prefixed FlatBuffers directly to the engine. File identifiers route to tables automatically.</p>
+                <video autoplay loop muted playsinline class="feature-video"></video>
+                <div class="feature-card-content">
+                    <h3>Raw Streaming Ingest</h3>
+                    <p>Pipe size-prefixed FlatBuffers directly to the engine. File identifiers route to tables automatically.</p>
+                </div>
             </div>
             <div class="feature-card">
-                <div class="feature-icon purple">🗂️</div>
-                <h3>File ID Routing</h3>
-                <p>Each FlatBuffer's 4-byte identifier (bytes 4-7) routes it to the correct table. No external metadata needed.</p>
+                <video autoplay loop muted playsinline class="feature-video"></video>
+                <div class="feature-card-content">
+                    <h3>File ID Routing</h3>
+                    <p>Each FlatBuffer's 4-byte identifier routes it to the correct table. No external metadata needed.</p>
+                </div>
             </div>
             <div class="feature-card">
-                <div class="feature-icon green">⚡</div>
-                <h3>Inline Index Building</h3>
-                <p>B-tree indexes built during streaming ingest. No separate indexing phase. Query immediately.</p>
+                <video autoplay loop muted playsinline class="feature-video"></video>
+                <div class="feature-card-content">
+                    <h3>Inline Index Building</h3>
+                    <p>B-tree indexes built during streaming ingest. No separate indexing phase. Query immediately.</p>
+                </div>
             </div>
-            <div class="feature-card">
-                <div class="feature-icon orange">🔌</div>
-                <h3>Unix Socket Support</h3>
-                <p>Stream FlatBuffers over Unix domain sockets. Perfect for IPC between processes.</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon cyan">🌐</div>
-                <h3>WASM + Native</h3>
-                <p>Same code runs in browsers via WebAssembly and natively via CLI. Pipe to stdin or call from JavaScript.</p>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon purple">💾</div>
-                <h3>Zero-Copy Storage</h3>
-                <p>FlatBuffers stored as-is. Export the raw stream and reload with indexes rebuilt on the fly.</p>
+            <div class="feature-card feature-card-highlight">
+                <div class="pulse-ring"></div>
+                <div class="pulse-ring"></div>
+                <div class="pulse-ring"></div>
+                <div class="feature-card-content">
+                    <h3>Zero-Copy Access</h3>
+                    <p>Direct pointer access to FlatBuffer data. No deserialization. Maximum performance.</p>
+                </div>
             </div>
         </div>
     </section>
 
     <section class="demo" id="demo">
         <div class="section-title">
-            <h2>Live Demo</h2>
-            <p>Stream FlatBuffers and query them in real-time</p>
+            <h2>Interactive Demo</h2>
+            <p>Stream FlatBuffers and query with SQL in real-time.</p>
         </div>
         <div class="demo-container">
             <div class="demo-header">
                 <div class="demo-title">
-                    <span>⚡</span>
-                    <h3>FlatSQL Interactive</h3>
+                    <h3>FlatSQL Engine</h3>
                 </div>
                 <div class="demo-status" id="demoStatus">
-                    <span class="status-dot"></span>
                     <span>Loading WASM...</span>
                 </div>
             </div>
@@ -707,47 +767,31 @@
                         <button class="demo-btn" id="btnClear" disabled>Clear</button>
                     </div>
                     <div class="stats-row">
-                        <div class="stat">
-                            <div class="stat-value" id="statRecords">0</div>
-                            <div class="stat-label">Records</div>
+                        <div class="stat-item">
+                            <span class="stat-label">Records</span>
+                            <span class="stat-value" id="statRecords">0</span>
                         </div>
-                        <div class="stat">
-                            <div class="stat-value" id="statBytes">0</div>
-                            <div class="stat-label">Bytes</div>
+                        <div class="stat-item">
+                            <span class="stat-label">Bytes</span>
+                            <span class="stat-value" id="statBytes">0</span>
                         </div>
-                        <div class="stat">
-                            <div class="stat-value" id="statRate">-</div>
-                            <div class="stat-label">Rec/sec</div>
+                        <div class="stat-item">
+                            <span class="stat-label">Rate/sec</span>
+                            <span class="stat-value" id="statRate">-</span>
                         </div>
                     </div>
-                    <h4>Stream Log</h4>
-                    <div class="stream-viz" id="streamLog">
-                        <div style="color: var(--text-muted); text-align: center; padding: 40px;">
-                            Click a button to start streaming FlatBuffers
-                        </div>
+                    <div class="stream-log" id="streamLog">
+                        <div style="color: var(--text-muted); text-align: center; padding: 40px;">Stream data to see activity</div>
                     </div>
                 </div>
                 <div class="demo-panel">
-                    <h4>Schema Structure</h4>
-                    <div id="schemaViz" style="font-family: var(--font-mono); font-size: 12px; background: rgba(0,0,0,0.3); padding: 12px; border-radius: 8px; margin-bottom: 16px;">
-                        <div style="color: var(--accent-cyan); margin-bottom: 8px;">TABLE User (file_id: USER)</div>
-                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 4px;">├─ id: int <span style="color: var(--accent-purple)">(primary key, indexed)</span></div>
-                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 4px;">├─ name: string</div>
-                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 4px;">├─ email: string <span style="color: var(--accent-green)">(indexed)</span></div>
-                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 12px;">└─ age: int</div>
-                        <div style="color: var(--accent-cyan); margin-bottom: 8px;">TABLE Post (file_id: POST)</div>
-                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 4px;">├─ id: int <span style="color: var(--accent-purple)">(primary key, indexed)</span></div>
-                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 4px;">├─ user_id: int <span style="color: var(--accent-green)">(indexed)</span> → User.id</div>
-                        <div style="color: var(--text-secondary); padding-left: 16px; margin-bottom: 12px;">└─ title: string</div>
-                        <div style="color: var(--accent-orange); font-size: 11px;">Storage: Sequential FlatBuffer stream at offsets shown in _offset column</div>
-                    </div>
                     <h4>SQL Query</h4>
-                    <input type="text" class="query-input" id="queryInput" placeholder="SELECT _offset, _data, * FROM User" value="SELECT _offset, _data, id, name, email, age FROM User">
+                    <input type="text" class="query-input" id="queryInput" placeholder="SELECT * FROM User" value="SELECT _offset, _data, id, name, email, age FROM User">
                     <div class="demo-controls">
                         <button class="demo-btn" id="btnQuery" disabled>Run Query<span class="spinner" id="querySpinner"></span></button>
                     </div>
                     <h4>Results</h4>
-                    <div style="overflow-x: auto; max-height: 400px;">
+                    <div style="overflow-x: auto; max-height: 300px;">
                         <table class="results-table" id="resultsTable">
                             <thead>
                                 <tr><th colspan="6">Run a query to see results</th></tr>
@@ -772,7 +816,7 @@
         </div>
         <div class="code-block">
             <pre id="codeContent"><span class="comment">// Create database from schema</span>
-<span class="keyword">const</span> db = <span class="keyword">new</span> FlatSQL.<span class="function">FlatSQLDatabase</span>(schema);
+<span class="keyword">const</span> db = <span class="keyword">new</span> FlatSQLDatabase(schema, <span class="string">"mydb"</span>);
 
 <span class="comment">// Register file identifiers for routing</span>
 db.<span class="function">registerFileId</span>(<span class="string">"USER"</span>, <span class="string">"User"</span>);
@@ -781,89 +825,58 @@ db.<span class="function">registerFileId</span>(<span class="string">"POST"</spa
 <span class="comment">// Stream size-prefixed FlatBuffers</span>
 <span class="keyword">const</span> bytesConsumed = db.<span class="function">ingest</span>(streamData);
 
-<span class="comment">// Or ingest a single FlatBuffer</span>
-<span class="keyword">const</span> rowid = db.<span class="function">ingestOne</span>(flatbuffer);
-
 <span class="comment">// Query with SQL</span>
-<span class="keyword">const</span> result = db.<span class="function">query</span>(<span class="string">"SELECT * FROM User WHERE age > 25"</span>);
-</pre>
+<span class="keyword">const</span> result = db.<span class="function">query</span>(<span class="string">"SELECT * FROM User WHERE age > 25"</span>);</pre>
         </div>
     </section>
 
     <footer>
-        <p>Built with FlatBuffers + WebAssembly | <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite">GitHub</a></p>
+        <p>Built with <a href="https://github.com/digitalarsenal/flatbuffers">FlatBuffers</a> and <a href="https://sqlite.org/">SQLite</a>.</p>
+        <p style="margin-top: 8px;"><a href="mailto:tj@digitalarsenal.io">tj@digitalarsenal.io</a></p>
     </footer>
 
     <script>
-        // Particle animation
-        const canvas = document.getElementById('particleCanvas');
-        const ctx = canvas.getContext('2d');
-        let particles = [];
+        // Video URLs for backgrounds
+        const videoUrls = [
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/90bb1b34646b81b3b63e5a854ea00da3/manifest/video.m3u8",
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/df176a2fb2ea2b64bd21ae1c10d3af6a/manifest/video.m3u8",
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/12a9780eeb1ea015801a5f55cf2e9d3d/manifest/video.m3u8",
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/964cb3eddff1a67e3772aac9a7aceea2/manifest/video.m3u8",
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/dd17599dfa77f41517133fa7a4967535/manifest/video.m3u8",
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/408ad52e3f15bc8f01ae69d194a8cf3a/manifest/video.m3u8",
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/e923e67d71fed3e0853ec57f0348451e/manifest/video.m3u8",
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/136a8a211c6c3b1cc1fd7b1c7d836c58/manifest/video.m3u8",
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/c9ddd33ac3d964e5d33b31ce849e8f95/manifest/video.m3u8",
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/257c7359efd4b4aaebcc03aa8fc78a36/manifest/video.m3u8",
+            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/697945ca6b876878dba3b23fbd2f1561/manifest/video.m3u8"
+        ];
 
-        function resize() {
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
+        function getRandomVideo() {
+            return videoUrls[Math.floor(Math.random() * videoUrls.length)];
         }
 
-        function createParticles() {
-            particles = [];
-            const count = Math.floor((canvas.width * canvas.height) / 15000);
-            for (let i = 0; i < count; i++) {
-                particles.push({
-                    x: Math.random() * canvas.width,
-                    y: Math.random() * canvas.height,
-                    vx: (Math.random() - 0.5) * 0.3,
-                    vy: (Math.random() - 0.5) * 0.3,
-                    size: Math.random() * 2 + 0.5,
-                    opacity: Math.random() * 0.5 + 0.1
-                });
+        function loadHlsVideo(videoElement, url) {
+            if (Hls.isSupported()) {
+                const hls = new Hls();
+                hls.loadSource(url);
+                hls.attachMedia(videoElement);
+            } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
+                videoElement.src = url;
             }
         }
 
-        function animate() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        // Load fixed page background video
+        loadHlsVideo(document.getElementById('pageVideoBg'), videoUrls[3]);
 
-            particles.forEach(p => {
-                p.x += p.vx;
-                p.y += p.vy;
-
-                if (p.x < 0) p.x = canvas.width;
-                if (p.x > canvas.width) p.x = 0;
-                if (p.y < 0) p.y = canvas.height;
-                if (p.y > canvas.height) p.y = 0;
-
-                ctx.beginPath();
-                ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-                ctx.fillStyle = `rgba(0, 212, 255, ${p.opacity})`;
-                ctx.fill();
-            });
-
-            // Draw connections
-            particles.forEach((p1, i) => {
-                particles.slice(i + 1).forEach(p2 => {
-                    const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-                    if (dist < 100) {
-                        ctx.beginPath();
-                        ctx.moveTo(p1.x, p1.y);
-                        ctx.lineTo(p2.x, p2.y);
-                        ctx.strokeStyle = `rgba(0, 212, 255, ${0.1 * (1 - dist / 100)})`;
-                        ctx.stroke();
-                    }
-                });
-            });
-
-            requestAnimationFrame(animate);
-        }
-
-        resize();
-        createParticles();
-        animate();
-        window.addEventListener('resize', () => { resize(); createParticles(); });
+        // Load feature card videos (skip cards without video elements)
+        document.querySelectorAll('.feature-video').forEach(video => {
+            loadHlsVideo(video, getRandomVideo());
+        });
 
         // Code tabs
         const codeExamples = {
             js: `<span class="comment">// Create database from schema</span>
-<span class="keyword">const</span> db = <span class="keyword">new</span> FlatSQL.<span class="function">FlatSQLDatabase</span>(schema);
+<span class="keyword">const</span> db = <span class="keyword">new</span> FlatSQLDatabase(schema, <span class="string">"mydb"</span>);
 
 <span class="comment">// Register file identifiers for routing</span>
 db.<span class="function">registerFileId</span>(<span class="string">"USER"</span>, <span class="string">"User"</span>);
@@ -871,9 +884,6 @@ db.<span class="function">registerFileId</span>(<span class="string">"POST"</spa
 
 <span class="comment">// Stream size-prefixed FlatBuffers</span>
 <span class="keyword">const</span> bytesConsumed = db.<span class="function">ingest</span>(streamData);
-
-<span class="comment">// Or ingest a single FlatBuffer</span>
-<span class="keyword">const</span> rowid = db.<span class="function">ingestOne</span>(flatbuffer);
 
 <span class="comment">// Query with SQL</span>
 <span class="keyword">const</span> result = db.<span class="function">query</span>(<span class="string">"SELECT * FROM User WHERE age > 25"</span>);`,
@@ -903,10 +913,7 @@ cat users.fb | flatsql \\
 
 <span class="comment"># Export and reload</span>
 flatsql --schema app.fbs --load data.bin \\
-    --query <span class="string">'SELECT COUNT(*) FROM User'</span>
-
-<span class="comment"># Stream over Unix socket</span>
-nc -U /tmp/flatsql.sock < stream.fb`
+    --query <span class="string">'SELECT COUNT(*) FROM User'</span>`
         };
 
         document.querySelectorAll('.code-tab').forEach(tab => {
@@ -926,7 +933,6 @@ nc -U /tmp/flatsql.sock < stream.fb`
         let totalRecords = 0;
         let totalBytes = 0;
 
-        // Send message to worker and return promise
         function sendToWorker(action, params = {}) {
             return new Promise((resolve, reject) => {
                 const id = messageId++;
@@ -935,7 +941,6 @@ nc -U /tmp/flatsql.sock < stream.fb`
             });
         }
 
-        // Convert array to hex string (first N bytes)
         function toHexPreview(arr, maxBytes = 32) {
             const bytes = Array.isArray(arr) ? arr : Array.from(arr);
             const hex = bytes.slice(0, maxBytes)
@@ -946,7 +951,6 @@ nc -U /tmp/flatsql.sock < stream.fb`
 
         function log(type, data, values = {}) {
             const container = document.getElementById('streamLog');
-            const badge = type === 'User' ? 'user' : 'post';
             const item = document.createElement('div');
             item.className = 'stream-item';
 
@@ -954,7 +958,7 @@ nc -U /tmp/flatsql.sock < stream.fb`
             const valuesStr = Object.entries(values).map(([k,v]) => `${k}=${v}`).join(', ');
 
             item.innerHTML = `
-                <span class="stream-badge ${badge}">${type.toUpperCase()}</span>
+                <span class="stream-badge">${type.toUpperCase()}</span>
                 <span style="color: var(--text-secondary)">${valuesStr}</span>
                 <div style="font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); margin-top: 4px; word-break: break-all;">${hexPreview}</div>
             `;
@@ -963,8 +967,8 @@ nc -U /tmp/flatsql.sock < stream.fb`
         }
 
         function updateStats() {
-            document.getElementById('statRecords').textContent = totalRecords;
-            document.getElementById('statBytes').textContent = totalBytes;
+            document.getElementById('statRecords').textContent = totalRecords.toLocaleString();
+            document.getElementById('statBytes').textContent = totalBytes.toLocaleString();
         }
 
         function setButtonsEnabled(enabled) {
@@ -986,9 +990,8 @@ nc -U /tmp/flatsql.sock < stream.fb`
                 totalBytes += result.bytes;
 
                 const elapsed = performance.now() - start;
-                document.getElementById('statRate').textContent = Math.round(count / elapsed * 1000);
+                document.getElementById('statRate').textContent = Math.round(count / elapsed * 1000).toLocaleString();
 
-                // Log sample records
                 for (const u of result.samples) {
                     log('User', u.fb, { id: u.id, name: u.name, age: u.age });
                 }
@@ -1018,9 +1021,8 @@ nc -U /tmp/flatsql.sock < stream.fb`
                 totalBytes += result.bytes;
 
                 const elapsed = performance.now() - start;
-                document.getElementById('statRate').textContent = Math.round(result.count / elapsed * 1000);
+                document.getElementById('statRate').textContent = Math.round(result.count / elapsed * 1000).toLocaleString();
 
-                // Log sample records
                 for (const d of result.samples) {
                     log(d.type, d.fb, { id: d.id, ...(d.userId ? { user_id: d.userId } : {}) });
                 }
@@ -1043,7 +1045,7 @@ nc -U /tmp/flatsql.sock < stream.fb`
             if (cell === null || cell === undefined) return '<span style="color: var(--text-muted)">NULL</span>';
 
             if (col === '_offset') {
-                return `<span style="color: var(--accent-purple)">0x${Number(cell).toString(16).padStart(4, '0')}</span>`;
+                return `<span style="color: var(--text-secondary)">0x${Number(cell).toString(16).padStart(4, '0')}</span>`;
             }
 
             if (col === '_data') {
@@ -1052,11 +1054,11 @@ nc -U /tmp/flatsql.sock < stream.fb`
 
                 const hex = bytes.slice(0, 24).map(b => b.toString(16).padStart(2, '0')).join(' ');
                 const suffix = bytes.length > 24 ? `... (${bytes.length} bytes)` : `(${bytes.length} bytes)`;
-                return `<code style="font-size: 10px; color: var(--accent-orange); word-break: break-all;">${hex} ${suffix}</code>`;
+                return `<code style="font-size: 10px; color: var(--text-muted); word-break: break-all;">${hex} ${suffix}</code>`;
             }
 
             if (col === '_rowid') {
-                return `<span style="color: var(--accent-cyan)">#${cell}</span>`;
+                return `<span style="color: var(--text-secondary)">#${cell}</span>`;
             }
 
             return String(cell);
@@ -1078,7 +1080,7 @@ nc -U /tmp/flatsql.sock < stream.fb`
 
                 let html = '<thead><tr>';
                 for (const col of cols) {
-                    const style = col.startsWith('_') ? 'color: var(--accent-green); font-style: italic;' : '';
+                    const style = col.startsWith('_') ? 'font-style: italic;' : '';
                     html += `<th style="${style}">${col}</th>`;
                 }
                 html += '</tr></thead><tbody>';
@@ -1095,7 +1097,7 @@ nc -U /tmp/flatsql.sock < stream.fb`
                 document.getElementById('resultsTable').innerHTML = html;
             } catch (e) {
                 document.getElementById('resultsTable').innerHTML =
-                    `<thead><tr><th style="color: #ef4444">Error: ${e}</th></tr></thead>`;
+                    `<thead><tr><th style="color: rgba(255,255,255,0.5)">Error: ${e}</th></tr></thead>`;
                 console.error(e);
             } finally {
                 btn.classList.remove('loading');
@@ -1123,13 +1125,10 @@ nc -U /tmp/flatsql.sock < stream.fb`
             }
         }
 
-        // Initialize worker
         async function init() {
             try {
-                // Create worker
                 worker = new Worker(new URL('./flatsql-worker.js', import.meta.url), { type: 'module' });
 
-                // Handle worker messages
                 worker.onmessage = (e) => {
                     const { id, success, result, error } = e.data;
                     const callback = pendingCallbacks.get(id);
@@ -1146,14 +1145,13 @@ nc -U /tmp/flatsql.sock < stream.fb`
                 worker.onerror = (e) => {
                     console.error('Worker error:', e);
                     document.getElementById('demoStatus').innerHTML =
-                        `<span style="color: #ef4444">Worker error</span>`;
+                        `<span style="color: var(--text-muted)">Worker error</span>`;
                 };
 
-                // Initialize the worker
                 await sendToWorker('init');
 
                 document.getElementById('demoStatus').innerHTML =
-                    '<span class="status-dot"></span><span>Ready (Worker)</span>';
+                    '<span class="status-dot"></span><span>Ready</span>';
 
                 setButtonsEnabled(true);
 
@@ -1168,7 +1166,7 @@ nc -U /tmp/flatsql.sock < stream.fb`
 
             } catch (e) {
                 document.getElementById('demoStatus').innerHTML =
-                    `<span style="color: #ef4444">Error: ${e}</span>`;
+                    `<span style="color: var(--text-muted)">Error: ${e}</span>`;
                 console.error(e);
             }
         }
