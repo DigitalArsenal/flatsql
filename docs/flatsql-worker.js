@@ -53,8 +53,19 @@ async function init() {
 function query(sql) {
     const result = db.query(sql);
     const cols = result.getColumns();
-    const rows = result.getRows();
+    const rawRows = result.getRows();
     result.delete();
+
+    // Convert any Uint8Array values to regular arrays for postMessage compatibility
+    const rows = rawRows.map(row =>
+        row.map(cell => {
+            if (cell instanceof Uint8Array) {
+                return Array.from(cell);
+            }
+            return cell;
+        })
+    );
+
     return { columns: cols, rows: rows };
 }
 
