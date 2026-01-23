@@ -233,6 +233,21 @@ else()
         ${SQLITE_DIR}
     )
 
+    # Advanced MPE (Minimum Propagatable Element) benchmark - NOT part of CI
+    # Tests large-scale performance with realistic space catalog data
+    # Usage: ./flatsql_mpe_benchmark [record_count]
+    #        Default: 1M records, can test up to 500M+
+    add_executable(flatsql_mpe_benchmark test/mpe_benchmark.cpp)
+    target_link_libraries(flatsql_mpe_benchmark PRIVATE flatsql_lib)
+    target_include_directories(flatsql_mpe_benchmark PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/schemas
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+    )
+    # Optimize for benchmark
+    target_compile_options(flatsql_mpe_benchmark PRIVATE -O3)
+
     enable_testing()
     add_test(NAME FlatSQLTest COMMAND flatsql_test)
     add_test(NAME FlatSQLIntegrationTest COMMAND flatsql_integration_test)
