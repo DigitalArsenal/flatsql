@@ -19,6 +19,14 @@ export async function initFlatSQL(moduleFactory) {
         ingest: Module.cwrap('flatsql_ingest', 'number', ['number', 'number', 'number']),
         ingestOne: Module.cwrap('flatsql_ingest_one', 'number', ['number', 'number', 'number']),
 
+        // Source-aware ingestion
+        registerSource: Module.cwrap('flatsql_register_source', null, ['number', 'string']),
+        createUnifiedViews: Module.cwrap('flatsql_create_unified_views', null, ['number']),
+        ingestWithSource: Module.cwrap('flatsql_ingest_with_source', 'number', ['number', 'number', 'number', 'string']),
+        ingestOneWithSource: Module.cwrap('flatsql_ingest_one_with_source', 'number', ['number', 'number', 'number', 'string']),
+        getSourcesCount: Module.cwrap('flatsql_get_sources_count', 'number', ['number']),
+        getSourceName: Module.cwrap('flatsql_get_source_name', 'string', ['number']),
+
         // Query execution
         query: Module.cwrap('flatsql_query', 'number', ['number', 'string']),
         getError: Module.cwrap('flatsql_get_error', 'string', []),
@@ -100,21 +108,53 @@ export class FlatSQLDatabase {
         api.enableDemoExtractors(this._handle);
     }
 
-    // Ingest data from Uint8Array
-    ingest(data) {
+    // Ingest data from Uint8Array (routes to base tables)
+    ingest(data, source = null) {
         const ptr = Module._malloc(data.length);
         Module.HEAPU8.set(data, ptr);
-        const count = api.ingest(this._handle, ptr, data.length);
+        let count;
+        if (source) {
+            count = api.ingestWithSource(this._handle, ptr, data.length, source);
+        } else {
+            count = api.ingest(this._handle, ptr, data.length);
+        }
         Module._free(ptr);
         return count;
     }
 
-    ingestOne(data) {
+    ingestOne(data, source = null) {
         const ptr = Module._malloc(data.length);
         Module.HEAPU8.set(data, ptr);
-        const count = api.ingestOne(this._handle, ptr, data.length);
+        let count;
+        if (source) {
+            count = api.ingestOneWithSource(this._handle, ptr, data.length, source);
+        } else {
+            count = api.ingestOne(this._handle, ptr, data.length);
+        }
         Module._free(ptr);
         return count;
+    }
+
+    // Register a named data source for source-aware ingestion
+    // Creates source-specific tables: User@siteA, Post@siteA, etc.
+    registerSource(sourceName) {
+        api.registerSource(this._handle, sourceName);
+    }
+
+    // Create unified views for cross-source queries
+    // Must be called after registering all sources and file IDs
+    createUnifiedViews() {
+        api.createUnifiedViews(this._handle);
+    }
+
+    // List registered sources
+    listSources() {
+        const count = api.getSourcesCount(this._handle);
+        const sources = [];
+        for (let i = 0; i < count; i++) {
+            sources.push(api.getSourceName(i));
+        }
+        return sources;
     }
 
     query(sql) {

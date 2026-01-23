@@ -219,6 +219,7 @@ std::string g_lastError;
 std::vector<uint8_t> g_exportBuffer;
 std::vector<uint8_t> g_testBuffer;
 std::vector<FlatSQLDatabase::TableStats> g_statsBuffer;
+std::vector<std::string> g_sourcesBuffer;
 
 }  // anonymous namespace
 
@@ -257,6 +258,31 @@ double flatsql_ingest(void* handle, const uint8_t* data, size_t length) {
 EMSCRIPTEN_KEEPALIVE
 double flatsql_ingest_one(void* handle, const uint8_t* data, size_t length) {
     return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->ingestOne(data, length));
+}
+
+// Source-aware ingestion
+EMSCRIPTEN_KEEPALIVE
+void flatsql_register_source(void* handle, const char* sourceName) {
+    try {
+        static_cast<FlatSQLDatabase*>(handle)->registerSource(sourceName);
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+void flatsql_create_unified_views(void* handle) {
+    static_cast<FlatSQLDatabase*>(handle)->createUnifiedViews();
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_ingest_with_source(void* handle, const uint8_t* data, size_t length, const char* source) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->ingestWithSource(data, length, source));
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_ingest_one_with_source(void* handle, const uint8_t* data, size_t length, const char* source) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->ingestOneWithSource(data, length, source));
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -427,6 +453,19 @@ double flatsql_get_deleted_count(void* handle, const char* tableName) {
 EMSCRIPTEN_KEEPALIVE
 void flatsql_clear_tombstones(void* handle, const char* tableName) {
     static_cast<FlatSQLDatabase*>(handle)->clearTombstones(tableName);
+}
+
+// Source listing
+EMSCRIPTEN_KEEPALIVE
+int flatsql_get_sources_count(void* handle) {
+    g_sourcesBuffer = static_cast<FlatSQLDatabase*>(handle)->listSources();
+    return static_cast<int>(g_sourcesBuffer.size());
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* flatsql_get_source_name(int index) {
+    if (index < 0 || index >= static_cast<int>(g_sourcesBuffer.size())) return "";
+    return g_sourcesBuffer[index].c_str();
 }
 
 }  // extern "C"

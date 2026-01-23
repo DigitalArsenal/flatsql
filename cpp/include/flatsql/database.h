@@ -215,15 +215,57 @@ public:
     // ==================== Multi-Source API ====================
 
     /**
-     * Register a data source with automatic _source column tagging.
+     * Register a named data source for source-aware ingestion.
      *
-     * @param sourceName  Unique identifier (becomes virtual table name)
-     * @param store       Pointer to this source's FlatBuffer storage
-     * @param schema      Table schema (columns, types, indexes)
-     * @param fileId      File identifier for routing
-     * @param extractor   Callback to extract field values from FlatBuffers
+     * Creates source-specific tables: User@siteA, Post@siteA, etc.
+     * Source tables have the same schema as base tables plus a virtual _source column.
+     *
+     * @param sourceName  Unique identifier (e.g., "siteA", "satellite-1")
      */
-    void registerSource(
+    void registerSource(const std::string& sourceName);
+
+    /**
+     * Get list of registered source names.
+     */
+    std::vector<std::string> listSources() const;
+
+    /**
+     * Create unified views for cross-source queries.
+     *
+     * Creates views like "User" that UNION ALL User@siteA, User@siteB, etc.
+     * Call this after registering all sources and before querying.
+     */
+    void createUnifiedViews();
+
+    /**
+     * Ingest data with explicit source tagging.
+     *
+     * Routes to source-specific tables (e.g., User@siteA).
+     * Source must be registered with registerSource() first.
+     *
+     * @param data   Size-prefixed FlatBuffer stream
+     * @param length Stream length
+     * @param source Source name (must be registered)
+     * @param recordsIngested Optional output for record count
+     * @return Bytes consumed
+     */
+    size_t ingestWithSource(const uint8_t* data, size_t length,
+                            const std::string& source,
+                            size_t* recordsIngested = nullptr);
+
+    /**
+     * Ingest a single FlatBuffer with source tagging.
+     *
+     * @param flatbuffer FlatBuffer data (no size prefix)
+     * @param length Data length
+     * @param source Source name (must be registered)
+     * @return Sequence number
+     */
+    uint64_t ingestOneWithSource(const uint8_t* flatbuffer, size_t length,
+                                  const std::string& source);
+
+    // Legacy multi-source API (external storage)
+    void registerExternalSource(
         const std::string& sourceName,
         StreamingFlatBufferStore* store,
         const TableDef& schema,
@@ -231,21 +273,10 @@ public:
         TableStore::FieldExtractor extractor
     );
 
-    /**
-     * Create a unified view combining multiple sources with same schema.
-     *
-     * @param viewName     Name for the unified view
-     * @param sourceNames  List of registered source names to include
-     */
     void createUnifiedView(
         const std::string& viewName,
         const std::vector<std::string>& sourceNames
     );
-
-    /**
-     * Get list of registered source names.
-     */
-    std::vector<std::string> listSources() const;
 
     // ==================== Delete Support ====================
 
@@ -273,16 +304,38 @@ private:
     void onIngest(std::string_view fileId, const uint8_t* data, size_t length,
                   uint64_t sequence, uint64_t offset);
 
+    // Callback for source-aware ingest - routes to source-specific table
+    void onIngestWithSource(std::string_view fileId, const uint8_t* data, size_t length,
+                            uint64_t sequence, uint64_t offset, const std::string& source);
+
     // Initialize SQLite engine with registered tables
     void initializeSQLiteEngine();
 
     // Re-register a table with SQLite after extractor is set
     void updateSQLiteTable(const std::string& tableName);
 
+    // Create a source-specific table (e.g., User@siteA)
+    void createSourceTable(const std::string& baseTableName, const std::string& source);
+
+    // Get source table name (e.g., "User" + "siteA" -> "User@siteA")
+    static std::string getSourceTableName(const std::string& baseTable, const std::string& source) {
+        return baseTable + "@" + source;
+    }
+
+    // Parse source from table name (e.g., "User@siteA" -> "siteA")
+    static std::string parseSourceFromTableName(const std::string& tableName) {
+        auto pos = tableName.find('@');
+        return pos != std::string::npos ? tableName.substr(pos + 1) : "";
+    }
+
     DatabaseSchema schema_;
     StreamingFlatBufferStore storage_;
     std::map<std::string, std::unique_ptr<TableStore>> tables_;
     std::map<std::string, std::string> fileIdToTable_;  // file_id -> table name
+
+    // Source tracking
+    std::vector<std::string> registeredSources_;        // List of registered source names
+    std::map<std::string, std::string> sourceFileIdToTable_;  // "source:fileId" -> "table@source"
 
     // SQLite engine for query execution
     std::unique_ptr<SQLiteEngine> sqliteEngine_;

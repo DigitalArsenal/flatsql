@@ -60,7 +60,21 @@ function randomProvider(id) {
     return emailProviders[id % emailProviders.length];
 }
 
-function streamUsers(count, startId, source = 'local') {
+function registerSource(sourceName) {
+    db.registerSource(sourceName);
+    return { success: true, source: sourceName };
+}
+
+function createUnifiedViews() {
+    db.createUnifiedViews();
+    return { success: true };
+}
+
+function listSources() {
+    return db.listSources();
+}
+
+function streamUsers(count, startId, source = null) {
     const buffers = [];
     const userData = [];
 
@@ -81,6 +95,7 @@ function streamUsers(count, startId, source = 'local') {
     return {
         count: count,
         bytes: stream.length,
+        source: source,
         samples: userData.slice(0, 5)
     };
 }
@@ -110,6 +125,15 @@ self.onmessage = async function(e) {
                 break;
             case 'streamUsers':
                 result = streamUsers(params.count, params.startId, params.source);
+                break;
+            case 'registerSource':
+                result = registerSource(params.sourceName);
+                break;
+            case 'createUnifiedViews':
+                result = createUnifiedViews();
+                break;
+            case 'listSources':
+                result = listSources();
                 break;
             case 'clear':
                 result = clearAll();

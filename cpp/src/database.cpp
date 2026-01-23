@@ -409,7 +409,127 @@ std::vector<FlatSQLDatabase::TableStats> FlatSQLDatabase::getStats() const {
 
 // ==================== Multi-Source API ====================
 
-void FlatSQLDatabase::registerSource(
+void FlatSQLDatabase::registerSource(const std::string& sourceName) {
+    // Check if source already registered
+    for (const auto& s : registeredSources_) {
+        if (s == sourceName) {
+            throw std::runtime_error("Source already registered: " + sourceName);
+        }
+    }
+
+    registeredSources_.push_back(sourceName);
+
+    // Create source-specific tables for each base table
+    for (const auto& tableDef : schema_.tables) {
+        createSourceTable(tableDef.name, sourceName);
+    }
+}
+
+void FlatSQLDatabase::createSourceTable(const std::string& baseTableName, const std::string& source) {
+    std::string sourceTableName = getSourceTableName(baseTableName, source);
+
+    // Get base table definition
+    auto baseIt = tables_.find(baseTableName);
+    if (baseIt == tables_.end()) {
+        return;
+    }
+
+    // Get base table def
+    const TableDef& baseDef = baseIt->second->getTableDef();
+
+    // Create source table with same schema
+    tables_[sourceTableName] = std::make_unique<TableStore>(baseDef, storage_);
+
+    // Copy file ID registration for source-specific routing
+    std::string fileId = baseIt->second->getFileId();
+    if (!fileId.empty()) {
+        std::string sourceKey = source + ":" + fileId;
+        sourceFileIdToTable_[sourceKey] = sourceTableName;
+        tables_[sourceTableName]->setFileId(fileId);
+
+        // Copy field extractor from base table
+        auto extractor = baseIt->second->getFieldExtractor();
+        if (extractor) {
+            tables_[sourceTableName]->setFieldExtractor(extractor);
+        }
+
+        auto fastExtractor = baseIt->second->getFastFieldExtractor();
+        if (fastExtractor) {
+            tables_[sourceTableName]->setFastFieldExtractor(fastExtractor);
+        }
+
+        auto batchExtractor = baseIt->second->getBatchExtractor();
+        if (batchExtractor) {
+            tables_[sourceTableName]->setBatchExtractor(batchExtractor);
+        }
+    }
+}
+
+std::vector<std::string> FlatSQLDatabase::listSources() const {
+    return registeredSources_;
+}
+
+void FlatSQLDatabase::createUnifiedViews() {
+    if (registeredSources_.empty()) {
+        return;
+    }
+
+    // For each base table, create a unified view
+    for (const auto& tableDef : schema_.tables) {
+        std::vector<std::string> sourceTableNames;
+        for (const auto& source : registeredSources_) {
+            std::string sourceTableName = getSourceTableName(tableDef.name, source);
+            if (tables_.count(sourceTableName)) {
+                // Make sure source table is registered with SQLite
+                updateSQLiteTable(sourceTableName);
+                sourceTableNames.push_back(sourceTableName);
+            }
+        }
+
+        if (!sourceTableNames.empty()) {
+            // Create unified view with base table name
+            sqliteEngine_->createUnifiedView(tableDef.name, sourceTableNames);
+        }
+    }
+}
+
+void FlatSQLDatabase::onIngestWithSource(std::string_view fileId, const uint8_t* data, size_t length,
+                                          uint64_t sequence, uint64_t offset, const std::string& source) {
+    // Route to source-specific table
+    std::string sourceKey = source + ":" + std::string(fileId);
+    auto mapIt = sourceFileIdToTable_.find(sourceKey);
+    if (mapIt == sourceFileIdToTable_.end()) {
+        // Unknown source:fileId combination - skip
+        return;
+    }
+
+    auto tableIt = tables_.find(mapIt->second);
+    if (tableIt != tables_.end()) {
+        tableIt->second->onIngest(data, length, sequence, offset);
+    }
+}
+
+size_t FlatSQLDatabase::ingestWithSource(const uint8_t* data, size_t length,
+                                          const std::string& source,
+                                          size_t* recordsIngested) {
+    return storage_.ingest(data, length,
+        [this, &source](std::string_view fileId, const uint8_t* data, size_t len,
+               uint64_t seq, uint64_t offset) {
+            onIngestWithSource(fileId, data, len, seq, offset, source);
+        }, recordsIngested);
+}
+
+uint64_t FlatSQLDatabase::ingestOneWithSource(const uint8_t* flatbuffer, size_t length,
+                                               const std::string& source) {
+    return storage_.ingestFlatBuffer(flatbuffer, length,
+        [this, &source](std::string_view fileId, const uint8_t* data, size_t len,
+               uint64_t seq, uint64_t offset) {
+            onIngestWithSource(fileId, data, len, seq, offset, source);
+        });
+}
+
+// Legacy multi-source API (external storage)
+void FlatSQLDatabase::registerExternalSource(
     const std::string& sourceName,
     StreamingFlatBufferStore* store,
     const TableDef& schema,
@@ -434,10 +554,6 @@ void FlatSQLDatabase::createUnifiedView(
     const std::vector<std::string>& sourceNames
 ) {
     sqliteEngine_->createUnifiedView(viewName, sourceNames);
-}
-
-std::vector<std::string> FlatSQLDatabase::listSources() const {
-    return sqliteEngine_->listSources();
 }
 
 // ==================== Delete Support ====================

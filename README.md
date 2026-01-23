@@ -328,6 +328,82 @@ const result = db.query('SELECT * FROM User WHERE age > 25');
 const data = db.exportData();  // Returns Uint8Array
 ```
 
+## Multi-Source Queries
+
+FlatSQL supports federating multiple data sources with the same schema. Each source gets its own set of tables, and you can query them individually or across all sources.
+
+### Use Case
+
+Imagine you have multiple satellites streaming telemetry data with the same schema:
+
+```javascript
+// Register sources
+db.registerSource('satellite-1');
+db.registerSource('satellite-2');
+db.registerSource('ground-station');
+
+// Register file IDs and extractors (must be done after registerSource)
+db.registerFileId('TELE', 'Telemetry');
+db.enableDemoExtractors();
+
+// Create unified views (call once after all sources registered)
+db.createUnifiedViews();
+
+// Ingest from different sources
+db.ingest(satellite1Stream, 'satellite-1');
+db.ingest(satellite2Stream, 'satellite-2');
+db.ingest(groundStream, 'ground-station');
+
+// Query a specific source
+db.query('SELECT * FROM "Telemetry@satellite-1" WHERE signal > 50');
+
+// Query across all sources (unified view)
+db.query('SELECT * FROM Telemetry WHERE timestamp > 1000');
+```
+
+### Table Naming Convention
+
+- **Source-specific tables**: `TableName@sourceName` (e.g., `User@siteA`, `Telemetry@satellite-1`)
+- **Unified views**: `TableName` (e.g., `User`, `Telemetry`) - combines all source tables
+
+### API
+
+#### db.registerSource(sourceName)
+
+Register a named data source. Creates source-specific tables for all schema tables.
+
+```typescript
+db.registerSource('siteA');
+db.registerSource('siteB');
+```
+
+#### db.createUnifiedViews()
+
+Create unified views for cross-source queries. Call after registering all sources and file IDs.
+
+```typescript
+db.createUnifiedViews();
+```
+
+#### db.ingest(data, source)
+
+Ingest data with source tagging. Routes to source-specific tables.
+
+```typescript
+db.ingest(streamA, 'siteA');  // Goes to User@siteA, Post@siteA, etc.
+db.ingest(streamB, 'siteB');  // Goes to User@siteB, Post@siteB, etc.
+db.ingest(streamC);           // Goes to base tables (User, Post)
+```
+
+#### db.listSources()
+
+Get list of registered source names.
+
+```typescript
+const sources = db.listSources();
+// ['siteA', 'siteB']
+```
+
 ## License
 
 Apache 2.0

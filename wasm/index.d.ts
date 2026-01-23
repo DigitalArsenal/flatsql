@@ -28,13 +28,17 @@ export interface FlatSQLDatabase {
   /**
    * Ingest a stream of size-prefixed FlatBuffers
    * Format: [4-byte size LE][FlatBuffer][4-byte size LE][FlatBuffer]...
+   * @param data Stream of size-prefixed FlatBuffers
+   * @param source Optional source name (requires registerSource() first)
    */
-  ingest(data: Uint8Array, source?: string): number;
+  ingest(data: Uint8Array, source?: string | null): number;
 
   /**
    * Ingest a single FlatBuffer (without size prefix)
+   * @param data FlatBuffer data
+   * @param source Optional source name (requires registerSource() first)
    */
-  ingestOne(data: Uint8Array): number;
+  ingestOne(data: Uint8Array, source?: string | null): number;
 
   /**
    * Execute a SQL query
@@ -55,6 +59,43 @@ export interface FlatSQLDatabase {
    * Get statistics for all tables
    */
   getStats(): TableStats[];
+
+  // ==================== Multi-Source API ====================
+
+  /**
+   * Register a named data source for source-aware ingestion.
+   * Creates source-specific tables: User@siteA, Post@siteA, etc.
+   *
+   * @example
+   * db.registerSource('siteA');
+   * db.registerSource('siteB');
+   * db.createUnifiedViews();
+   *
+   * // Now ingest to specific sources
+   * db.ingest(streamA, 'siteA');
+   * db.ingest(streamB, 'siteB');
+   *
+   * // Query specific source
+   * db.query('SELECT * FROM "User@siteA"');
+   *
+   * // Query all sources (unified view)
+   * db.query('SELECT * FROM User');
+   */
+  registerSource(sourceName: string): void;
+
+  /**
+   * Create unified views for cross-source queries.
+   * Call this after registering all sources and file IDs.
+   * Creates views like "User" that combine User@siteA, User@siteB, etc.
+   */
+  createUnifiedViews(): void;
+
+  /**
+   * List registered source names
+   */
+  listSources(): string[];
+
+  // ==================== Delete Support ====================
 
   /**
    * Mark a record as deleted by table name and row ID
