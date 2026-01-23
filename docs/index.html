@@ -562,6 +562,46 @@
             color: #4ade80;
         }
 
+        .source-dropdown {
+            padding: 10px 16px;
+            min-height: 44px;
+            background: var(--ui-bg);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 12px;
+            color: var(--text-primary);
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            -webkit-appearance: none;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23999' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            padding-right: 36px;
+            min-width: 160px;
+        }
+
+        .source-dropdown:hover:not(:disabled) {
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+
+        .source-dropdown:focus {
+            outline: none;
+            border-color: rgba(96, 165, 250, 0.5);
+        }
+
+        .source-dropdown:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .source-dropdown option {
+            background: #1a1a1a;
+            color: var(--text-primary);
+            padding: 8px;
+        }
+
         .query-examples {
             display: flex;
             align-items: center;
@@ -2004,16 +2044,17 @@
             </div>
             <div class="demo-body">
                 <div class="demo-panel">
-                    <h4>Streaming Ingest</h4>
-                    <!-- Source selector disabled until WASM is rebuilt with multi-source support -->
-                    <!--
+                    <h4>Multi-Source Streaming</h4>
                     <div class="source-selector">
-                        <span style="color: var(--text-muted); font-size: 12px; margin-right: 8px;">Source:</span>
-                        <button class="source-btn active" data-source="local">Local</button>
-                        <button class="source-btn" data-source="cloud">Cloud</button>
-                        <button class="source-btn" data-source="peer">Peer</button>
+                        <label for="sourceSelect" style="color: var(--text-muted); font-size: 13px; margin-right: 10px;">Data Source:</label>
+                        <select id="sourceSelect" class="source-dropdown" disabled>
+                            <option value="satellite-1">Satellite 1</option>
+                            <option value="satellite-2">Satellite 2</option>
+                            <option value="ground-station">Ground Station</option>
+                            <option value="aircraft">Aircraft</option>
+                            <option value="ship">Ship</option>
+                        </select>
                     </div>
-                    -->
                     <div class="demo-controls">
                         <button class="demo-btn" id="btnStream1k" disabled>Stream 1,000</button>
                         <button class="demo-btn" id="btnStream10k" disabled>Stream 10,000</button>
@@ -2041,10 +2082,10 @@
                     <h4>SQL Query</h4>
                     <div class="query-examples">
                         <span class="query-examples-label">Try:</span>
-                        <button class="query-example-btn" data-query="SELECT id, name, email, age FROM User LIMIT 50">All Users</button>
-                        <button class="query-example-btn" data-query="SELECT id, name, email FROM User WHERE email LIKE '%gmail%' LIMIT 50">Gmail</button>
-                        <button class="query-example-btn" data-query="SELECT id, name, email FROM User WHERE age > 40 LIMIT 50">Age > 40</button>
-                        <button class="query-example-btn" data-query="SELECT COUNT(*) as total FROM User">Count</button>
+                        <button class="query-example-btn" data-query="SELECT _source, id, name, email, age FROM User LIMIT 50">All Sources</button>
+                        <button class="query-example-btn" data-query="SELECT _source, COUNT(*) as count FROM User GROUP BY _source">By Source</button>
+                        <button class="query-example-btn" data-query="SELECT id, name, email FROM &quot;User@satellite-1&quot; LIMIT 20">Satellite 1</button>
+                        <button class="query-example-btn" data-query="SELECT _source, id, name FROM User WHERE age > 40 LIMIT 30">Age > 40</button>
                     </div>
                     <input type="text" class="query-input" id="queryInput" placeholder="SELECT * FROM User WHERE email LIKE '%gmail%' LIMIT 50" value="SELECT id, name, email, age FROM User">
                     <div class="demo-controls">
@@ -2265,18 +2306,23 @@ flatsql --schema app.fbs --load data.bin \\
         let totalRecords = 0;
         let totalBytes = 0;
         let useWorker = true;
-        let currentSource = null;  // Set to null until multi-source WASM is ready
+        let currentSource = 'satellite-1';  // Default to first source
 
         // Pagination state
         let currentResults = null;
         let currentPage = 0;
         const rowsPerPage = 50;
 
+        // The 5 data sources for multi-source demo
+        const sources = ['satellite-1', 'satellite-2', 'ground-station', 'aircraft', 'ship'];
+
         // Source colors for visual distinction
         const sourceColors = {
-            local: '#4ade80',
-            cloud: '#60a5fa',
-            peer: '#fbbf24'
+            'satellite-1': '#4ade80',
+            'satellite-2': '#60a5fa',
+            'ground-station': '#fbbf24',
+            'aircraft': '#f472b6',
+            'ship': '#a78bfa'
         };
 
         // Main thread fallback (uses same C API)
@@ -2339,9 +2385,14 @@ flatsql --schema app.fbs --load data.bin \\
                 const { initFlatSQL } = await import('./flatsql-api.js');
                 flatsql = await initFlatSQL(FlatSQLModule);
                 db = flatsql.createDatabase(schema, 'demo');
+                // Register all sources first
+                for (const src of sources) {
+                    db.registerSource(src);
+                }
                 db.registerFileId('USER', 'User');
                 db.registerFileId('POST', 'Post');
                 db.enableDemoExtractors();
+                db.createUnifiedViews();
             }
 
             switch (action) {
@@ -2352,7 +2403,7 @@ flatsql --schema app.fbs --load data.bin \\
                     return db.query(params.sql);
 
                 case 'streamUsers': {
-                    const { count, startId, source = 'local' } = params;
+                    const { count, startId, source } = params;
                     const buffers = [];
                     const userData = [];
                     for (let i = 0; i < count; i++) {
@@ -2622,6 +2673,11 @@ flatsql --schema app.fbs --load data.bin \\
                 };
 
                 await execute('init');
+                // Register all sources
+                for (const src of sources) {
+                    await execute('registerSource', { sourceName: src });
+                }
+                await execute('createUnifiedViews');
                 mode = 'Worker';
             } catch (e) {
                 // Fall back to main thread
@@ -2633,6 +2689,13 @@ flatsql --schema app.fbs --load data.bin \\
 
             document.getElementById('demoStatus').innerHTML =
                 `<span class="status-dot"></span><span>Ready (${mode})</span>`;
+
+            // Enable source dropdown
+            const sourceSelect = document.getElementById('sourceSelect');
+            sourceSelect.disabled = false;
+            sourceSelect.addEventListener('change', () => {
+                currentSource = sourceSelect.value;
+            });
 
             setButtonsEnabled(true);
 
@@ -2664,15 +2727,6 @@ flatsql --schema app.fbs --load data.bin \\
             document.getElementById('queryInput').addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') runQuery();
             });
-
-            // Source selector buttons (disabled until WASM rebuilt with multi-source)
-            // document.querySelectorAll('.source-btn').forEach(btn => {
-            //     addTapHandler(btn, () => {
-            //         document.querySelectorAll('.source-btn').forEach(b => b.classList.remove('active'));
-            //         btn.classList.add('active');
-            //         currentSource = btn.dataset.source;
-            //     });
-            // });
 
             // Query example buttons
             document.querySelectorAll('.query-example-btn').forEach(btn => {

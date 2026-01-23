@@ -62,6 +62,9 @@ function randomProvider(id) {
 
 function registerSource(sourceName) {
     db.registerSource(sourceName);
+    if (!registeredSources.includes(sourceName)) {
+        registeredSources.push(sourceName);
+    }
     return { success: true, source: sourceName };
 }
 
@@ -100,12 +103,22 @@ function streamUsers(count, startId, source = null) {
     };
 }
 
+// Track registered sources for clear operation
+let registeredSources = [];
+
 function clearAll() {
     if (db) db.destroy();
     db = flatsql.createDatabase(schema, 'demo');
+    // Re-register all sources
+    for (const src of registeredSources) {
+        db.registerSource(src);
+    }
     db.registerFileId('USER', 'User');
     db.registerFileId('POST', 'Post');
     db.enableDemoExtractors();
+    if (registeredSources.length > 0) {
+        db.createUnifiedViews();
+    }
     return { success: true };
 }
 

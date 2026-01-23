@@ -364,7 +364,22 @@ db.query('SELECT * FROM Telemetry WHERE timestamp > 1000');
 ### Table Naming Convention
 
 - **Source-specific tables**: `TableName@sourceName` (e.g., `User@siteA`, `Telemetry@satellite-1`)
-- **Unified views**: `TableName` (e.g., `User`, `Telemetry`) - combines all source tables
+- **Unified views**: `TableName` (e.g., `User`, `Telemetry`) - combines all source tables with a `_source` column
+
+### The _source Column
+
+Unified views include a `_source` column that identifies which source each row came from:
+
+```sql
+-- See source for each record
+SELECT _source, id, name FROM User LIMIT 10;
+
+-- Count records by source
+SELECT _source, COUNT(*) as count FROM User GROUP BY _source;
+
+-- Filter by source in unified view
+SELECT * FROM User WHERE _source = 'satellite-1';
+```
 
 ### API
 
