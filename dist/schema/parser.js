@@ -1,6 +1,89 @@
 // Schema parser for FlatBuffers IDL and JSON Schema
 // Converts to internal table definitions
 import { SQLColumnType, fbTypeToSQL } from './types.js';
+// Security: Maximum schema source size to prevent DoS
+const MAX_SCHEMA_SIZE = 1024 * 1024; // 1MB
+// Security: Forbidden keys that could enable prototype pollution
+const FORBIDDEN_KEYS = ['__proto__', 'constructor', 'prototype'];
+/**
+ * Safe JSON parse that prevents prototype pollution attacks.
+ * Throws if the input contains dangerous keys or is too large.
+ */
+function safeJSONParse(source) {
+    if (source.length > MAX_SCHEMA_SIZE) {
+        throw new Error(`Schema source exceeds maximum size of ${MAX_SCHEMA_SIZE} bytes`);
+    }
+    // Check for prototype pollution attempts in the raw string
+    for (const key of FORBIDDEN_KEYS) {
+        if (source.includes(`"${key}"`)) {
+            throw new Error(`Schema contains forbidden key: ${key}`);
+        }
+    }
+    const parsed = JSON.parse(source);
+    // Recursively validate the parsed object
+    validateObject(parsed, 0);
+    return parsed;
+}
+/**
+ * Recursively validate an object for dangerous patterns.
+ * Limits nesting depth to prevent stack overflow.
+ */
+function validateObject(obj, depth) {
+    const MAX_DEPTH = 50;
+    if (depth > MAX_DEPTH) {
+        throw new Error(`Schema nesting depth exceeds maximum of ${MAX_DEPTH}`);
+    }
+    if (obj === null || typeof obj !== 'object') {
+        return;
+    }
+    if (Array.isArray(obj)) {
+        for (const item of obj) {
+            validateObject(item, depth + 1);
+        }
+        return;
+    }
+    for (const key of Object.keys(obj)) {
+        if (FORBIDDEN_KEYS.includes(key)) {
+            throw new Error(`Schema contains forbidden key: ${key}`);
+        }
+        validateObject(obj[key], depth + 1);
+    }
+}
+/**
+ * Type guard to check if a value is a valid JSON Schema object.
+ */
+function isValidJSONSchema(value) {
+    if (value === null || typeof value !== 'object') {
+        return false;
+    }
+    const obj = value;
+    // If type is present, it must be a string
+    if (obj.type !== undefined && typeof obj.type !== 'string') {
+        return false;
+    }
+    // If title is present, it must be a string
+    if (obj.title !== undefined && typeof obj.title !== 'string') {
+        return false;
+    }
+    // If properties is present, it must be an object
+    if (obj.properties !== undefined && (typeof obj.properties !== 'object' || obj.properties === null)) {
+        return false;
+    }
+    return true;
+}
+/**
+ * Type guard to check if a value is a valid property definition.
+ */
+function isValidPropertyDef(value) {
+    if (value === null || typeof value !== 'object') {
+        return false;
+    }
+    const obj = value;
+    if (obj.type !== undefined && typeof obj.type !== 'string') {
+        return false;
+    }
+    return true;
+}
 // Parse FlatBuffer IDL schema
 export function parseFlatBufferIDL(source) {
     const result = {
@@ -94,9 +177,15 @@ export function parseFlatBufferIDL(source) {
     }
     return result;
 }
-// Parse JSON Schema
+// Parse JSON Schema with security validation
 export function parseJSONSchema(source) {
-    const schema = JSON.parse(source);
+    // Security: Use safe JSON parse to prevent prototype pollution
+    const rawSchema = safeJSONParse(source);
+    // Security: Validate schema structure
+    if (!isValidJSONSchema(rawSchema)) {
+        throw new Error('Invalid JSON Schema: expected an object with valid structure');
+    }
+    const schema = rawSchema;
     const result = {
         tables: [],
         enums: new Map(),
@@ -105,7 +194,17 @@ export function parseJSONSchema(source) {
     if (schema.type === 'object' && schema.properties) {
         const tableName = schema.title || 'Root';
         const fields = [];
-        for (const [propName, propDef] of Object.entries(schema.properties)) {
+        // Security: Use Object.keys instead of Object.entries to avoid prototype chain
+        const propNames = Object.keys(schema.properties);
+        for (const propName of propNames) {
+            // Security: Skip any forbidden keys that might have slipped through
+            if (FORBIDDEN_KEYS.includes(propName)) {
+                continue;
+            }
+            const propDef = schema.properties[propName];
+            if (!isValidPropertyDef(propDef)) {
+                continue; // Skip invalid property definitions
+            }
             const prop = propDef;
             let type = 'string';
             let isVector = false;
@@ -130,8 +229,9 @@ export function parseJSONSchema(source) {
                 type = propName;
             }
             // Handle enums
-            if (prop.enum) {
-                result.enums.set(propName + 'Enum', prop.enum);
+            if (prop.enum && Array.isArray(prop.enum)) {
+                const enumValues = prop.enum.filter((v) => typeof v === 'string');
+                result.enums.set(propName + 'Enum', enumValues);
                 type = propName + 'Enum';
             }
             fields.push({
@@ -151,15 +251,32 @@ export function parseJSONSchema(source) {
         result.rootType = tableName;
     }
     // Handle definitions (sub-schemas)
-    if (schema.definitions || schema.$defs) {
-        const defs = schema.definitions || schema.$defs;
-        for (const [defName, defSchema] of Object.entries(defs)) {
+    const defs = schema.definitions || schema.$defs;
+    if (defs && typeof defs === 'object') {
+        const defNames = Object.keys(defs);
+        for (const defName of defNames) {
+            // Security: Skip forbidden keys
+            if (FORBIDDEN_KEYS.includes(defName)) {
+                continue;
+            }
+            const defSchema = defs[defName];
+            if (!isValidJSONSchema(defSchema)) {
+                continue;
+            }
             const def = defSchema;
             if (def.type === 'object' && def.properties) {
                 const fields = [];
-                for (const [propName, propDef] of Object.entries(def.properties)) {
+                const defPropNames = Object.keys(def.properties);
+                for (const propName of defPropNames) {
+                    if (FORBIDDEN_KEYS.includes(propName)) {
+                        continue;
+                    }
+                    const propDef = def.properties[propName];
+                    if (!isValidPropertyDef(propDef)) {
+                        continue;
+                    }
                     const prop = propDef;
-                    let type = jsonTypeToFB(prop.type);
+                    let type = jsonTypeToFB(prop.type || 'string');
                     const isVector = prop.type === 'array';
                     if (isVector) {
                         type = jsonTypeToFB(prop.items?.type || 'string');
@@ -260,6 +377,10 @@ export function toDBSchema(parsed, schemaName, source) {
 }
 // Auto-detect and parse schema
 export function parseSchema(source, name = 'default') {
+    // Security: Check size limit for all schema types
+    if (source.length > MAX_SCHEMA_SIZE) {
+        throw new Error(`Schema source exceeds maximum size of ${MAX_SCHEMA_SIZE} bytes`);
+    }
     const trimmed = source.trim();
     // Try to detect if it's JSON
     if (trimmed.startsWith('{')) {

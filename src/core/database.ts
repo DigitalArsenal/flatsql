@@ -6,6 +6,12 @@ import { StackedFlatBufferStore } from '../storage/index.js';
 import { DatabaseSchema, TableDef, parseSchema } from '../schema/index.js';
 import { BTree } from '../btree/index.js';
 
+// Security: Maximum SQL query length to prevent ReDoS attacks
+const MAX_SQL_LENGTH = 10000;
+
+// Security: Maximum queries per second (0 = unlimited)
+const DEFAULT_RATE_LIMIT = 0;
+
 export interface QueryResult {
   columns: string[];
   rows: any[][];
@@ -19,16 +25,30 @@ export interface FlatBufferAccessor {
   buildBuffer(tableName: string, fields: Record<string, any>): Uint8Array;
 }
 
+export interface DatabaseOptions {
+  /** Maximum SQL query length (default: 10000) */
+  maxSqlLength?: number;
+  /** Maximum queries per second, 0 for unlimited (default: 0) */
+  rateLimit?: number;
+}
+
 export class FlatSQLDatabase {
   private schema: DatabaseSchema;
   private storage: StackedFlatBufferStore;
   private tables: Map<string, TableStore> = new Map();
   private accessor: FlatBufferAccessor;
 
-  constructor(schema: DatabaseSchema, accessor: FlatBufferAccessor) {
+  // Security: Configuration options
+  private maxSqlLength: number;
+  private rateLimit: number;
+  private queryTimestamps: number[] = [];
+
+  constructor(schema: DatabaseSchema, accessor: FlatBufferAccessor, options: DatabaseOptions = {}) {
     this.schema = schema;
     this.storage = new StackedFlatBufferStore(schema.name);
     this.accessor = accessor;
+    this.maxSqlLength = options.maxSqlLength ?? MAX_SQL_LENGTH;
+    this.rateLimit = options.rateLimit ?? DEFAULT_RATE_LIMIT;
 
     // Initialize table stores
     for (const tableDef of schema.tables) {
@@ -42,9 +62,14 @@ export class FlatSQLDatabase {
   }
 
   // Create database from schema source (IDL or JSON Schema)
-  static fromSchema(source: string, accessor: FlatBufferAccessor, name: string = 'default'): FlatSQLDatabase {
+  static fromSchema(
+    source: string,
+    accessor: FlatBufferAccessor,
+    name: string = 'default',
+    options: DatabaseOptions = {}
+  ): FlatSQLDatabase {
     const schema = parseSchema(source, name);
-    return new FlatSQLDatabase(schema, accessor);
+    return new FlatSQLDatabase(schema, accessor, options);
   }
 
   // Insert a record (as JSON that will be converted to FlatBuffer)
@@ -82,6 +107,16 @@ export class FlatSQLDatabase {
   //           SELECT columns FROM table WHERE column BETWEEN min AND max
   //           SELECT * FROM table
   query(sql: string): QueryResult {
+    // Security: Check SQL length to prevent ReDoS
+    if (sql.length > this.maxSqlLength) {
+      throw new Error(`SQL query exceeds maximum length of ${this.maxSqlLength} characters`);
+    }
+
+    // Security: Rate limiting
+    if (this.rateLimit > 0) {
+      this.enforceRateLimit();
+    }
+
     const parsed = this.parseSQL(sql);
 
     if (parsed.type !== 'SELECT') {
@@ -183,7 +218,8 @@ export class FlatSQLDatabase {
       };
     }
 
-    throw new Error(`Cannot parse SQL: ${sql}`);
+    // Security: Don't expose SQL in error message (could contain sensitive data)
+    throw new Error('SQL parse error: unsupported query syntax');
   }
 
   private parseValue(str: string): any {
@@ -194,8 +230,18 @@ export class FlatSQLDatabase {
       return str.slice(1, -1);
     }
 
-    // Number
-    if (/^-?\d+(\.\d+)?$/.test(str)) {
+    // Integer (check for BigInt needs)
+    if (/^-?\d+$/.test(str)) {
+      const num = BigInt(str);
+      // Security: Use BigInt for values exceeding safe integer range
+      if (num > BigInt(Number.MAX_SAFE_INTEGER) || num < BigInt(Number.MIN_SAFE_INTEGER)) {
+        return num;
+      }
+      return Number(str);
+    }
+
+    // Float
+    if (/^-?\d+\.\d+$/.test(str)) {
       return parseFloat(str);
     }
 
@@ -207,6 +253,21 @@ export class FlatSQLDatabase {
     if (str.toLowerCase() === 'null') return null;
 
     return str;
+  }
+
+  // Security: Rate limiting enforcement
+  private enforceRateLimit(): void {
+    const now = Date.now();
+    const windowMs = 1000; // 1 second window
+
+    // Remove timestamps older than the window
+    this.queryTimestamps = this.queryTimestamps.filter(ts => now - ts < windowMs);
+
+    if (this.queryTimestamps.length >= this.rateLimit) {
+      throw new Error(`Rate limit exceeded: maximum ${this.rateLimit} queries per second`);
+    }
+
+    this.queryTimestamps.push(now);
   }
 
   private evaluateCondition(value: any, operator: string, target: any): boolean {

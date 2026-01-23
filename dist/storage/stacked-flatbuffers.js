@@ -5,6 +5,10 @@ import { MAGIC, VERSION, crc32 } from './types.js';
 // Header sizes (fixed layout for easy seeking)
 const FILE_HEADER_SIZE = 64; // Padded for alignment
 const RECORD_HEADER_SIZE = 48; // Fixed size record header
+// Security: Default maximum storage size (1GB)
+const DEFAULT_MAX_STORAGE_SIZE = 1024 * 1024 * 1024;
+// Security: Warning threshold (80% of max)
+const WARNING_THRESHOLD = 0.8;
 export class StackedFlatBufferStore {
     data;
     dataView;
@@ -14,8 +18,19 @@ export class StackedFlatBufferStore {
     schemaName;
     // Index of records by offset for quick lookup
     recordIndex = new Map();
-    constructor(schemaName, initialCapacity = 1024 * 1024) {
+    // Security: Storage limits
+    maxSize;
+    warningEmitted = false;
+    onStorageWarning;
+    constructor(schemaName, options = {}) {
+        // Support legacy signature: constructor(schemaName, initialCapacity)
+        const opts = typeof options === 'number'
+            ? { initialCapacity: options }
+            : options;
         this.schemaName = schemaName;
+        this.maxSize = opts.maxSize ?? DEFAULT_MAX_STORAGE_SIZE;
+        this.onStorageWarning = opts.onStorageWarning;
+        const initialCapacity = opts.initialCapacity ?? 1024 * 1024;
         this.data = new Uint8Array(initialCapacity);
         this.dataView = new DataView(this.data.buffer);
         this.writeOffset = BigInt(FILE_HEADER_SIZE);
@@ -44,10 +59,29 @@ export class StackedFlatBufferStore {
         const totalNeeded = Number(this.writeOffset) + needed;
         if (totalNeeded <= this.data.length)
             return;
+        // Security: Check if we would exceed max size
+        if (this.maxSize > 0 && totalNeeded > this.maxSize) {
+            throw new Error(`Storage size limit exceeded: requested ${totalNeeded} bytes, ` +
+                `maximum is ${this.maxSize} bytes`);
+        }
         // Grow by doubling
         let newSize = this.data.length * 2;
         while (newSize < totalNeeded) {
             newSize *= 2;
+        }
+        // Security: Cap at max size
+        if (this.maxSize > 0 && newSize > this.maxSize) {
+            newSize = this.maxSize;
+        }
+        // Security: Emit warning when approaching limit
+        if (this.maxSize > 0 && !this.warningEmitted) {
+            const threshold = this.maxSize * WARNING_THRESHOLD;
+            if (newSize >= threshold) {
+                this.warningEmitted = true;
+                if (this.onStorageWarning) {
+                    this.onStorageWarning(newSize, this.maxSize);
+                }
+            }
         }
         const newData = new Uint8Array(newSize);
         newData.set(this.data);
@@ -144,7 +178,7 @@ export class StackedFlatBufferStore {
         return this.data.slice(0, Number(this.writeOffset));
     }
     // Load from existing data
-    static fromData(data) {
+    static fromData(data, options = {}) {
         const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
         // Verify magic
         const magic = view.getUint32(0, true);
@@ -159,7 +193,10 @@ export class StackedFlatBufferStore {
         const nameBytes = data.slice(24, 64);
         const nullIdx = nameBytes.indexOf(0);
         const schemaName = new TextDecoder().decode(nameBytes.slice(0, nullIdx >= 0 ? nullIdx : nameBytes.length));
-        const store = new StackedFlatBufferStore(schemaName, data.length);
+        const store = new StackedFlatBufferStore(schemaName, {
+            ...options,
+            initialCapacity: data.length,
+        });
         store.data.set(data);
         store.dataView = new DataView(store.data.buffer);
         // Rebuild index by scanning records
@@ -191,6 +228,26 @@ export class StackedFlatBufferStore {
     }
     getSchemaName() {
         return this.schemaName;
+    }
+    // Security: Get current storage size
+    getCurrentSize() {
+        return Number(this.writeOffset);
+    }
+    // Security: Get maximum storage size (0 = unlimited)
+    getMaxSize() {
+        return this.maxSize;
+    }
+    // Security: Get storage usage as a percentage (0-100)
+    getUsagePercent() {
+        if (this.maxSize === 0)
+            return 0;
+        return (Number(this.writeOffset) / this.maxSize) * 100;
+    }
+    // Security: Check if storage is near capacity (>80%)
+    isNearCapacity() {
+        if (this.maxSize === 0)
+            return false;
+        return Number(this.writeOffset) >= this.maxSize * WARNING_THRESHOLD;
     }
 }
 //# sourceMappingURL=stacked-flatbuffers.js.map
