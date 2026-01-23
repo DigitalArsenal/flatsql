@@ -34,15 +34,15 @@ jobs:
 
     - name: Configure CMake
       working-directory: cpp
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
 
     - name: Build
       working-directory: cpp
-      run: cmake --build build --config Release -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+      run: cmake --build build --config Debug -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
     - name: Run Tests
       working-directory: cpp/build
-      run: ctest --output-on-failure -C Release
+      run: ctest --output-on-failure -C Debug
 
   build-wasm:
     runs-on: ubuntu-latest
