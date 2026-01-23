@@ -110,6 +110,7 @@
             width: 100%;
             border-collapse: collapse;
             font-size: 13px;
+            border: 1px solid rgba(255,255,255,0.2);
         }
         th {
             background: rgba(0,217,255,0.2);
@@ -236,6 +237,27 @@
         .init-status.loading { color: #ffa500; }
         .init-status.ready { color: #00ff88; }
         .init-status.error { color: #ff6b6b; }
+
+        /* Dark themed scrollbars with rounded ends */
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+        ::-webkit-scrollbar-track {
+            background: rgba(0,0,0,0.3);
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255,255,255,0.2);
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        * {
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255,255,255,0.2) rgba(0,0,0,0.3);
+        }
     </style>
 </head>
 <body>
@@ -318,7 +340,7 @@
             <div class="panel">
                 <h2>
                     <span class="badge query">QUERY VIEW</span>
-                    Filtered Results (SQL Query)
+                    Filtered (SQL Query)
                 </h2>
                 <div class="controls" style="margin-bottom: 15px;">
                     <input type="text" id="queryInput" placeholder="e.g., category = 'Electronics'" value="category = 'Electronics'">
