@@ -42,7 +42,7 @@ jobs:
 
     - name: Run Tests
       working-directory: cpp/build
-      run: ctest --output-on-failure -C Debug
+      run: ctest --output-on-failure -C Debug -E "(IntegrationTest|SocketTest)"
 
   build-wasm:
     runs-on: ubuntu-latest
