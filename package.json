@@ -25,12 +25,15 @@
   ],
   "scripts": {
     "build": "tsc",
-    "build:wasm": "cd cpp && cmake -B build-wasm -DCMAKE_BUILD_TYPE=Release && cmake --build build-wasm",
+    "build:wasm": "bash scripts/build-wasm.sh",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "test:wasm": "node wasm/test-node.mjs",
     "dev": "tsc --watch",
     "serve": "vite docs --port 8081",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "postinstall": "bash scripts/install-emsdk.sh",
+    "emsdk:install": "bash scripts/install-emsdk.sh",
+    "emsdk:env": "echo 'Run: source packages/emsdk/emsdk_env.sh'"
   },
   "repository": {
     "type": "git",

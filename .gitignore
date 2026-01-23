@@ -3,14 +3,21 @@ node_modules/
 
 # Build outputs
 build-wasm/
+dist/
 cpp/build/
 cpp/build-wasm/
+cpp/build-release/
+cpp/build-test/
 cpp/.emsdk/
 cpp/.cache/
+
+# Local packages
+packages/emsdk/
 
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 
