@@ -530,8 +530,9 @@
         .source-selector {
             display: flex;
             align-items: center;
-            gap: 6px;
-            margin-bottom: 12px;
+            gap: 12px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
         }
 
         .source-btn {
@@ -580,6 +581,8 @@
             background-position: right 12px center;
             padding-right: 36px;
             min-width: 160px;
+            position: relative;
+            z-index: 10;
         }
 
         .source-dropdown:hover:not(:disabled) {
@@ -2046,7 +2049,7 @@
                 <div class="demo-panel">
                     <h4>Multi-Source Streaming</h4>
                     <div class="source-selector">
-                        <label for="sourceSelect" style="color: var(--text-muted); font-size: 13px; margin-right: 10px;">Data Source:</label>
+                        <label for="sourceSelect" style="color: var(--text-muted); font-size: 13px;">Source:</label>
                         <select id="sourceSelect" class="source-dropdown" disabled>
                             <option value="satellite-1">Satellite 1</option>
                             <option value="satellite-2">Satellite 2</option>
@@ -2054,8 +2057,6 @@
                             <option value="aircraft">Aircraft</option>
                             <option value="ship">Ship</option>
                         </select>
-                    </div>
-                    <div class="demo-controls">
                         <button class="demo-btn" id="btnStream1k" disabled>Stream 1,000</button>
                         <button class="demo-btn" id="btnStream10k" disabled>Stream 10,000</button>
                         <button class="demo-btn" id="btnClear" disabled>Clear</button>
@@ -2385,18 +2386,21 @@ flatsql --schema app.fbs --load data.bin \\
                 const { initFlatSQL } = await import('./flatsql-api.js');
                 flatsql = await initFlatSQL(FlatSQLModule);
                 db = flatsql.createDatabase(schema, 'demo');
-                // Register all sources first
-                for (const src of sources) {
-                    db.registerSource(src);
-                }
                 db.registerFileId('USER', 'User');
                 db.registerFileId('POST', 'Post');
                 db.enableDemoExtractors();
-                db.createUnifiedViews();
             }
 
             switch (action) {
                 case 'init':
+                    return { success: true };
+
+                case 'registerSource':
+                    db.registerSource(params.sourceName);
+                    return { success: true, source: params.sourceName };
+
+                case 'createUnifiedViews':
+                    db.createUnifiedViews();
                     return { success: true };
 
                 case 'query':
@@ -2447,18 +2451,19 @@ flatsql --schema app.fbs --load data.bin \\
             return bytes.length > maxBytes ? hex + '...' : hex;
         }
 
-        function log(type, data, values = {}, source = 'local') {
+        function log(type, data, values = {}, source = null) {
             const container = document.getElementById('streamLog');
             const item = document.createElement('div');
             item.className = 'stream-item';
 
             const hexPreview = Array.isArray(data) ? toHexPreview(data, 24) : '';
             const valuesStr = Object.entries(values).map(([k,v]) => `${k}=${v}`).join(', ');
-            const sourceColor = sourceColors[source] || '#86868b';
+            const sourceColor = source ? (sourceColors[source] || '#86868b') : '#86868b';
+            const sourceLabel = source || 'local';
 
             item.innerHTML = `
                 <span class="stream-badge">${type.toUpperCase()}</span>
-                <span class="source-tag" style="background: ${sourceColor}20; color: ${sourceColor}; padding: 2px 6px; border-radius: 4px; font-size: 9px; font-weight: 600; margin-left: 6px;">${source}</span>
+                <span class="source-tag" style="background: ${sourceColor}20; color: ${sourceColor}; padding: 2px 6px; border-radius: 4px; font-size: 9px; font-weight: 600; margin-left: 6px;">${sourceLabel}</span>
                 <span style="color: var(--text-secondary); margin-left: 8px;">${valuesStr}</span>
                 <div style="font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); margin-top: 4px; word-break: break-all;">${hexPreview}</div>
             `;
@@ -2498,7 +2503,9 @@ flatsql --schema app.fbs --load data.bin \\
                 if (count > 5) {
                     const lastItem = document.createElement('div');
                     lastItem.className = 'stream-item';
-                    lastItem.innerHTML = `<span style="color: var(--text-muted)">... +${count - 5} more from <span style="color: ${sourceColors[source]}">${source}</span></span>`;
+                    const sourceLabel = source || 'local';
+                    const sourceColor = source ? (sourceColors[source] || '#86868b') : '#86868b';
+                    lastItem.innerHTML = `<span style="color: var(--text-muted)">... +${count - 5} more from <span style="color: ${sourceColor}">${sourceLabel}</span></span>`;
                     document.getElementById('streamLog').insertBefore(lastItem, document.getElementById('streamLog').firstChild);
                 }
 
@@ -2673,11 +2680,6 @@ flatsql --schema app.fbs --load data.bin \\
                 };
 
                 await execute('init');
-                // Register all sources
-                for (const src of sources) {
-                    await execute('registerSource', { sourceName: src });
-                }
-                await execute('createUnifiedViews');
                 mode = 'Worker';
             } catch (e) {
                 // Fall back to main thread
@@ -2687,15 +2689,33 @@ flatsql --schema app.fbs --load data.bin \\
                 await execute('init');
             }
 
+            // Try to enable multi-source (may not be available in current WASM)
+            let multiSourceEnabled = false;
+            try {
+                for (const src of sources) {
+                    await execute('registerSource', { sourceName: src });
+                }
+                await execute('createUnifiedViews');
+                multiSourceEnabled = true;
+            } catch (e) {
+                console.warn('Multi-source not available:', e.message);
+                currentSource = null;  // Fall back to base tables
+            }
+
             document.getElementById('demoStatus').innerHTML =
                 `<span class="status-dot"></span><span>Ready (${mode})</span>`;
 
-            // Enable source dropdown
+            // Enable source dropdown only if multi-source is available
             const sourceSelect = document.getElementById('sourceSelect');
-            sourceSelect.disabled = false;
-            sourceSelect.addEventListener('change', () => {
-                currentSource = sourceSelect.value;
-            });
+            if (multiSourceEnabled) {
+                sourceSelect.disabled = false;
+                sourceSelect.addEventListener('change', () => {
+                    currentSource = sourceSelect.value;
+                });
+            } else {
+                sourceSelect.disabled = true;
+                sourceSelect.title = 'Multi-source requires WASM rebuild';
+            }
 
             setButtonsEnabled(true);
 
