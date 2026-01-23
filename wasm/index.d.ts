@@ -159,11 +159,76 @@ export interface FlatSQL {
    * Create a test Post FlatBuffer (for demos)
    */
   createTestPost(id: number, userId: number, title: string): Uint8Array;
+
+  /**
+   * Check if WASM was loaded with integrity verification
+   */
+  wasIntegrityVerified(): boolean;
 }
 
 /**
- * Initialize FlatSQL WASM module
+ * Options for initializing FlatSQL with integrity verification
  */
-export function initFlatSQL(moduleFactory?: any): Promise<FlatSQL>;
+export interface InitOptions {
+  /**
+   * Expected SHA-384 hash of the WASM binary (base64 encoded)
+   * If provided, the WASM will be verified against this hash before loading
+   */
+  integrity?: string;
+
+  /**
+   * Custom path to WASM files directory
+   * Default: same directory as index.js
+   */
+  wasmPath?: string;
+
+  /**
+   * Skip integrity verification (not recommended for production)
+   * Default: false
+   */
+  skipIntegrityCheck?: boolean;
+
+  /**
+   * Fail if integrity cannot be verified (no hash available)
+   * Default: false
+   */
+  requireIntegrity?: boolean;
+
+  /**
+   * Custom Emscripten module factory function
+   * Default: built-in FlatSQLModule
+   */
+  moduleFactory?: () => Promise<any>;
+}
+
+/**
+ * Initialize FlatSQL WASM module with optional integrity verification
+ *
+ * @example
+ * // Basic usage (auto-loads integrity.json if available)
+ * const flatsql = await initFlatSQL();
+ *
+ * @example
+ * // With explicit integrity hash
+ * const flatsql = await initFlatSQL({
+ *   integrity: 'base64-hash-here',
+ *   requireIntegrity: true
+ * });
+ *
+ * @example
+ * // Skip integrity check (development only)
+ * const flatsql = await initFlatSQL({ skipIntegrityCheck: true });
+ *
+ * @example
+ * // Legacy API (still supported)
+ * const flatsql = await initFlatSQL(customModuleFactory);
+ */
+export function initFlatSQL(options?: InitOptions | (() => Promise<any>)): Promise<FlatSQL>;
+
+/**
+ * Check if WASM was loaded with integrity verification
+ * Can be called before or after initFlatSQL
+ */
+export function wasIntegrityVerified(): boolean;
 
 export default initFlatSQL;

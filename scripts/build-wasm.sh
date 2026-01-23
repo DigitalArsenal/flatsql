@@ -40,7 +40,37 @@ cmake --build build-wasm --config Release
 echo "Copying WASM files to wasm/..."
 cp build-wasm/flatsql.js build-wasm/flatsql.wasm "$PROJECT_ROOT/wasm/"
 
+# Generate integrity hash for WASM file (SHA-384, base64 encoded)
+echo "Generating integrity hash..."
+WASM_FILE="$PROJECT_ROOT/wasm/flatsql.wasm"
+WASM_SIZE=$(wc -c < "$WASM_FILE" | tr -d ' ')
+
+# Generate SHA-384 hash (compatible with SRI)
+if command -v shasum &> /dev/null; then
+    WASM_HASH=$(shasum -a 384 "$WASM_FILE" | cut -d' ' -f1 | xxd -r -p | base64)
+elif command -v sha384sum &> /dev/null; then
+    WASM_HASH=$(sha384sum "$WASM_FILE" | cut -d' ' -f1 | xxd -r -p | base64)
+else
+    echo "Warning: No sha384 command found, skipping integrity hash generation"
+    WASM_HASH=""
+fi
+
+# Write integrity file
+if [ -n "$WASM_HASH" ]; then
+    cat > "$PROJECT_ROOT/wasm/integrity.json" << EOF
+{
+  "algorithm": "sha384",
+  "hash": "$WASM_HASH",
+  "sri": "sha384-$WASM_HASH",
+  "size": $WASM_SIZE,
+  "generatedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+    echo "Integrity hash written to wasm/integrity.json"
+    echo "  SRI: sha384-$WASM_HASH"
+fi
+
 echo ""
 echo "WASM build complete!"
 echo "Output files:"
-ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm"
+ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm" "$PROJECT_ROOT/wasm/integrity.json" 2>/dev/null || ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm"

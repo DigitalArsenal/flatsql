@@ -6,13 +6,200 @@ import FlatSQLModule from './flatsql.js';
 let Module = null;
 let api = null;
 
+// Security: Track if integrity was verified
+let integrityVerified = false;
+
 /**
- * Initialize the FlatSQL WASM module
- * @param {any} moduleFactory - Optional module factory (defaults to FlatSQLModule)
- * @returns {Promise<FlatSQL>}
+ * Compute SHA-384 hash of data and return as base64
+ * Works in both Node.js and browser environments
+ * @param {ArrayBuffer} data
+ * @returns {Promise<string>}
  */
-export async function initFlatSQL(moduleFactory) {
-    Module = await (moduleFactory || FlatSQLModule)();
+async function computeSHA384(data) {
+    if (typeof crypto !== 'undefined' && crypto.subtle) {
+        // Browser or Node.js 18+
+        const hashBuffer = await crypto.subtle.digest('SHA-384', data);
+        const hashArray = new Uint8Array(hashBuffer);
+        // Convert to base64
+        if (typeof btoa !== 'undefined') {
+            return btoa(String.fromCharCode(...hashArray));
+        } else {
+            return Buffer.from(hashArray).toString('base64');
+        }
+    } else {
+        // Node.js fallback using dynamic import
+        const cryptoModule = await import('crypto');
+        const hash = cryptoModule.createHash('sha384');
+        hash.update(Buffer.from(data));
+        return hash.digest('base64');
+    }
+}
+
+/**
+ * Verify WASM binary integrity
+ * @param {ArrayBuffer} wasmBinary - The WASM binary data
+ * @param {string} expectedHash - Expected SHA-384 hash (base64)
+ * @returns {Promise<boolean>}
+ */
+async function verifyWASMIntegrity(wasmBinary, expectedHash) {
+    const computedHash = await computeSHA384(wasmBinary);
+    return computedHash === expectedHash;
+}
+
+/**
+ * Load integrity.json if available
+ * @param {string} [basePath] - Base path for integrity.json
+ * @returns {Promise<{hash: string, sri: string, size: number} | null>}
+ */
+async function loadIntegrityFile(basePath = '') {
+    try {
+        if (typeof fetch !== 'undefined') {
+            // Browser or Node.js with fetch
+            const url = basePath ? `${basePath}/integrity.json` : new URL('./integrity.json', import.meta.url).href;
+            const response = await fetch(url);
+            if (response.ok) {
+                return await response.json();
+            }
+        } else {
+            // Node.js fallback
+            const fs = await import('fs');
+            const path = await import('path');
+            const url = await import('url');
+            const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
+            const integrityPath = path.join(__dirname, 'integrity.json');
+            if (fs.existsSync(integrityPath)) {
+                return JSON.parse(fs.readFileSync(integrityPath, 'utf8'));
+            }
+        }
+    } catch (e) {
+        // Integrity file not available - this is OK in development
+    }
+    return null;
+}
+
+/**
+ * @typedef {Object} InitOptions
+ * @property {string} [integrity] - Expected SHA-384 hash for WASM verification (base64)
+ * @property {string} [wasmPath] - Custom path to WASM files directory
+ * @property {boolean} [skipIntegrityCheck] - Skip integrity verification (not recommended for production)
+ * @property {boolean} [requireIntegrity] - Fail if integrity cannot be verified (default: false)
+ * @property {function} [moduleFactory] - Custom Emscripten module factory
+ */
+
+/**
+ * Initialize the FlatSQL WASM module with optional integrity verification
+ * @param {function|InitOptions} [moduleFactoryOrOptions] - Module factory or initialization options
+ * @returns {Promise<FlatSQL>}
+ *
+ * @example
+ * // Basic usage (auto-loads integrity.json if available)
+ * const flatsql = await initFlatSQL();
+ *
+ * @example
+ * // With explicit integrity hash
+ * const flatsql = await initFlatSQL({
+ *   integrity: 'base64-hash-here',
+ *   requireIntegrity: true
+ * });
+ *
+ * @example
+ * // Skip integrity check (development only)
+ * const flatsql = await initFlatSQL({ skipIntegrityCheck: true });
+ */
+export async function initFlatSQL(moduleFactoryOrOptions) {
+    let moduleFactory = FlatSQLModule;
+    let options = {};
+
+    // Parse arguments - support both legacy and new API
+    if (moduleFactoryOrOptions) {
+        if (typeof moduleFactoryOrOptions === 'function') {
+            // Legacy: moduleFactory passed directly
+            moduleFactory = moduleFactoryOrOptions;
+        } else if (typeof moduleFactoryOrOptions === 'object') {
+            // New: options object
+            options = moduleFactoryOrOptions;
+            if (options.moduleFactory) {
+                moduleFactory = options.moduleFactory;
+            }
+        }
+    }
+
+    // Determine expected integrity hash
+    let expectedIntegrity = options.integrity || null;
+
+    // Load integrity file if no explicit integrity provided
+    if (!expectedIntegrity && !options.skipIntegrityCheck) {
+        const integrityData = await loadIntegrityFile(options.wasmPath);
+        if (integrityData) {
+            expectedIntegrity = integrityData.hash;
+        }
+    }
+
+    // Check if integrity is required but not available
+    if (options.requireIntegrity && !expectedIntegrity) {
+        throw new Error(
+            'WASM integrity verification required but no integrity hash available. ' +
+            'Ensure integrity.json exists or pass integrity option.'
+        );
+    }
+
+    // Create module configuration
+    const moduleConfig = {};
+
+    // If we have an expected hash, use custom WASM instantiation with verification
+    if (expectedIntegrity && !options.skipIntegrityCheck) {
+        moduleConfig.instantiateWasm = async (imports, successCallback) => {
+            try {
+                // Determine WASM path
+                let wasmUrl;
+                if (options.wasmPath) {
+                    wasmUrl = `${options.wasmPath}/flatsql.wasm`;
+                } else {
+                    wasmUrl = new URL('./flatsql.wasm', import.meta.url).href;
+                }
+
+                // Fetch WASM binary
+                let wasmBinary;
+                if (typeof fetch !== 'undefined') {
+                    const response = await fetch(wasmUrl);
+                    if (!response.ok) {
+                        throw new Error(`Failed to fetch WASM: ${response.status}`);
+                    }
+                    wasmBinary = await response.arrayBuffer();
+                } else {
+                    // Node.js fallback
+                    const fs = await import('fs');
+                    const path = await import('path');
+                    const url = await import('url');
+                    const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
+                    const wasmPath = path.join(__dirname, 'flatsql.wasm');
+                    wasmBinary = fs.readFileSync(wasmPath).buffer;
+                }
+
+                // Verify integrity
+                const isValid = await verifyWASMIntegrity(wasmBinary, expectedIntegrity);
+                if (!isValid) {
+                    throw new Error(
+                        'WASM integrity check failed: hash mismatch. ' +
+                        'The WASM binary may have been tampered with or corrupted.'
+                    );
+                }
+
+                // Mark as verified
+                integrityVerified = true;
+
+                // Instantiate verified WASM
+                const result = await WebAssembly.instantiate(wasmBinary, imports);
+                successCallback(result.instance);
+                return result.instance.exports;
+            } catch (error) {
+                throw new Error(`WASM integrity verification failed: ${error.message}`);
+            }
+        };
+    }
+
+    // Initialize module
+    Module = await moduleFactory(moduleConfig);
 
     // Wrap C functions using cwrap
     api = {
@@ -73,6 +260,14 @@ export async function initFlatSQL(moduleFactory) {
     return new FlatSQL();
 }
 
+/**
+ * Check if WASM was loaded with integrity verification
+ * @returns {boolean}
+ */
+export function wasIntegrityVerified() {
+    return integrityVerified;
+}
+
 // High-level FlatSQL API class
 export class FlatSQL {
     createDatabase(schema, dbName = 'default') {
@@ -91,6 +286,14 @@ export class FlatSQL {
         const ptr = api.createTestPost(id, userId, title);
         const size = api.testBufferSize();
         return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
+    }
+
+    /**
+     * Check if WASM was loaded with integrity verification
+     * @returns {boolean}
+     */
+    wasIntegrityVerified() {
+        return integrityVerified;
     }
 }
 
