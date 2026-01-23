@@ -1,5 +1,5 @@
 {
-  "name": "@digitalarsenal/flatsql",
+  "name": "flatsql",
   "version": "0.2.0",
   "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
   "type": "module",
@@ -72,5 +72,8 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
