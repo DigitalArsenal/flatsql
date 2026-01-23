@@ -151,51 +151,58 @@
             position: relative;
         }
 
-        /* Hero Badges */
+        /* Hero License & Contact */
+        .hero-license {
+            font-size: 18px;
+            color: var(--text-secondary);
+            margin-bottom: 24px;
+        }
+
+        .hero-license a {
+            color: var(--text-primary);
+            text-decoration: underline;
+            text-underline-offset: 3px;
+        }
+
+        .hero-license a:hover {
+            color: #4ade80;
+        }
+
+        .hero-contact {
+            font-size: 14px;
+            color: var(--text-muted);
+            margin-bottom: 32px;
+        }
+
+        .hero-contact a {
+            color: var(--text-muted);
+            text-decoration: none;
+        }
+
+        .hero-contact a:hover {
+            color: var(--text-secondary);
+        }
+
+        /* Hero Badges - shields.io style */
         .hero-badges {
             display: flex;
-            gap: 12px;
-            margin-bottom: 32px;
+            gap: 8px;
+            margin-bottom: 20px;
             flex-wrap: wrap;
             justify-content: center;
         }
 
-        .hero-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 6px 14px;
-            background: rgba(255, 255, 255, 0.06);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 20px;
-            font-size: 12px;
-            color: var(--text-secondary);
-            text-decoration: none;
-            transition: all 0.2s;
+        .hero-badges a {
+            display: inline-block;
+            transition: opacity 0.2s;
         }
 
-        .hero-badge:hover {
-            background: rgba(255, 255, 255, 0.1);
-            border-color: rgba(255, 255, 255, 0.2);
+        .hero-badges a:hover {
+            opacity: 0.8;
         }
 
-        .hero-badge svg {
-            width: 14px;
-            height: 14px;
-        }
-
-        .hero-badge.license {
-            color: #4ade80;
-            border-color: rgba(74, 222, 128, 0.3);
-        }
-
-        .hero-badge.ci {
-            color: #60a5fa;
-            border-color: rgba(96, 165, 250, 0.3);
-        }
-
-        .hero-badge img {
-            height: 18px;
+        .hero-badges img {
+            height: 20px;
         }
 
         /* Scroll Indicator */
@@ -1556,22 +1563,28 @@
 
     <section class="hero">
         <div class="hero-content">
-            <!-- Badges -->
-            <div class="hero-badges">
-                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite/actions" class="hero-badge ci" target="_blank">
-                    <img src="https://github.com/DigitalArsenal/flatbuffers-sqlite/actions/workflows/ci.yml/badge.svg" alt="CI Status">
-                </a>
-                <span class="hero-badge license">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-                    </svg>
-                    Apache 2.0
-                </span>
-                <span class="hero-badge">Free &amp; Open Source</span>
-            </div>
-
             <h1>Digital Arsenal<br>FlatSQL</h1>
             <p>SQL queries over raw FlatBuffer storage. Zero conversion, real-time indexing, pure streaming.</p>
+
+            <!-- License line -->
+            <p class="hero-license"><a href="https://github.com/DigitalArsenal/flatbuffers-sqlite/blob/main/LICENSE" target="_blank">Apache 2.0</a> licensed, free and open source.</p>
+
+            <!-- Shields.io badges -->
+            <div class="hero-badges">
+                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite/actions" target="_blank">
+                    <img src="https://img.shields.io/github/actions/workflow/status/DigitalArsenal/flatbuffers-sqlite/ci.yml?logo=github&label=CI" alt="CI">
+                </a>
+                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite/stargazers" target="_blank">
+                    <img src="https://img.shields.io/github/stars/DigitalArsenal/flatbuffers-sqlite?logo=github" alt="Stars">
+                </a>
+                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite/network/members" target="_blank">
+                    <img src="https://img.shields.io/github/forks/DigitalArsenal/flatbuffers-sqlite?logo=github" alt="Forks">
+                </a>
+            </div>
+
+            <!-- Contact -->
+            <p class="hero-contact"><a href="mailto:tj@digitalarsenal.io">tj@digitalarsenal.io</a></p>
+
             <div class="hero-buttons">
                 <a href="#demo" class="btn btn-large">Try Live Demo</a>
                 <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" class="btn btn-large" target="_blank">View Source</a>
