@@ -1,6 +1,49 @@
 # FlatSQL
 
+[![CI](https://github.com/DigitalArsenal/flatsql/actions/workflows/ci.yml/badge.svg)](https://github.com/DigitalArsenal/flatsql/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/flatsql.svg)](https://www.npmjs.com/package/flatsql)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
+
 **SQL queries over raw FlatBuffer storage** — A streaming query engine that keeps data in native FlatBuffer format while providing SQL access via SQLite virtual tables.
+
+## Live Demo
+
+Try FlatSQL in your browser: **[https://digitalarsenal.github.io/flatsql/](https://digitalarsenal.github.io/flatsql/)**
+
+## Installation
+
+```bash
+npm install flatsql
+```
+
+## Quick Start
+
+```javascript
+import { initFlatSQL } from 'flatsql/wasm';
+
+// Initialize
+const flatsql = await initFlatSQL();
+
+// Create database with schema
+const db = flatsql.createDatabase(`
+  table User {
+    id: int (id);
+    name: string;
+    email: string (key);
+    age: int;
+  }
+`, 'myapp');
+
+// Register file identifier for routing
+db.registerFileId('USER', 'User');
+
+// Ingest FlatBuffer data (streaming)
+db.ingest(flatbufferStream);
+
+// Query with SQL
+const result = db.query('SELECT * FROM User WHERE age > 25');
+console.log(result.columns, result.rows);
+```
 
 ## What is FlatSQL?
 
@@ -10,18 +53,6 @@ FlatSQL bridges two technologies:
 - **SQLite** — The most widely deployed SQL database engine, used here only for SQL parsing and query execution.
 
 The key insight: instead of converting FlatBuffers to SQLite rows (expensive), FlatSQL uses [SQLite virtual tables](https://sqlite.org/vtab.html) to query FlatBuffer data directly. Your data stays in portable FlatBuffer format, readable by any FlatBuffer tooling, while you get SQL query capabilities.
-
-## Live Demo
-
-Try FlatSQL in your browser: **[https://digitalarsenal.github.io/flatbuffers-sqlite/](https://digitalarsenal.github.io/flatbuffers-sqlite/)**
-
-## Source Code
-
-| Repository | Description |
-|------------|-------------|
-| [digitalarsenal/flatbuffers-sqlite](https://github.com/digitalarsenal/flatbuffers-sqlite) | This project — FlatSQL query engine |
-| [digitalarsenal/flatbuffers](https://github.com/digitalarsenal/flatbuffers) | Fork of Google FlatBuffers with WASM support |
-| [flatc-wasm](https://digitalarsenal.github.io/flatbuffers/) | FlatBuffer compiler running in WebAssembly |
 
 ## Why FlatSQL?
 
@@ -41,83 +72,66 @@ FlatBuffer → Query (via virtual table) → FlatBuffer
 - **Portable output** — Exported data is standard FlatBuffers, readable by any tooling
 - **Multi-source federation** — Query across multiple FlatBuffer sources with automatic source tagging
 
-## Modes of Operation
+## Source Code
 
-### 1. WASM (Browser/Node.js)
+| Repository | Description |
+|------------|-------------|
+| [digitalarsenal/flatsql](https://github.com/digitalarsenal/flatsql) | This project — FlatSQL query engine |
+| [digitalarsenal/flatbuffers](https://github.com/digitalarsenal/flatbuffers) | Fork of Google FlatBuffers with WASM support |
+| [flatc-wasm](https://digitalarsenal.github.io/flatbuffers/) | FlatBuffer compiler running in WebAssembly |
+
+## Usage
+
+### WASM (Browser/Node.js)
 
 The C++ engine compiles to WebAssembly for cross-platform deployment:
 
 ```javascript
-import { createFlatSQL } from './wasm/index.js';
+import { initFlatSQL } from 'flatsql/wasm';
 
-const flatsql = await createFlatSQL();
+const flatsql = await initFlatSQL();
 
-// Register your schema
-flatsql.registerSchema(`
-  table User {
-    id: int (key);
-    name: string;
-    email: string (indexed);
-  }
-`);
-
-// Ingest FlatBuffer data (streaming)
-flatsql.ingest(flatbufferBytes);
-
-// Query with SQL
-const result = flatsql.query('SELECT * FROM User WHERE id = 42');
-console.log(result.columns, result.rows);
-```
-
-### 2. WASM Worker (Browser/Node.js/Deno)
-
-For offloading database operations to a background thread, use the unified worker API:
-
-```javascript
-import { FlatSQLClient } from './wasm/flatsql-client.js';
-
-// Initialize client (spawns worker)
-const client = new FlatSQLClient('./flatsql.worker.js');
-await client.init();
-
-// Create a database
-const schema = `
+// Create database with schema
+const db = flatsql.createDatabase(`
   table User {
     id: int (id);
     name: string;
     email: string (key);
     age: int;
   }
-`;
-const db = await client.createDatabase(schema, 'myapp');
-await db.registerFileId('USER', 'User');
+`, 'myapp');
 
-// Ingest FlatBuffer data
-const bytesConsumed = await db.ingest(flatbufferStream);
+// Register file identifier routing
+db.registerFileId('USER', 'User');
 
-// Query
-const result = await db.query('SELECT * FROM User WHERE age > 25');
-console.log(result.columns, result.rows);
+// Enable demo field extractors (for testing)
+db.enableDemoExtractors();
+
+// Ingest FlatBuffer stream
+// Format: [4-byte size LE][FlatBuffer][4-byte size LE][FlatBuffer]...
+db.ingest(streamData);
+
+// Query with SQL
+const result = db.query('SELECT id, name, email FROM User WHERE age > 25');
+console.log(result.columns); // ['id', 'name', 'email']
+console.log(result.rows);    // [[1, 'Alice', 'alice@example.com'], ...]
 
 // Export database
-const exported = await db.exportData();
+const exported = db.exportData();
 
 // Cleanup
-client.terminate();
+db.destroy();
 ```
 
-The worker automatically detects the runtime environment:
+### TypeScript (Pure JavaScript)
 
-- **Browser**: Uses Web Workers with `postMessage`
-- **Node.js**: Uses `worker_threads` with `parentPort`
-- **Deno**: Uses Deno Workers with `postMessage`
-
-### 3. TypeScript (Pure JavaScript)
-
-A TypeScript implementation for environments where WASM isn't available or for development:
+A TypeScript implementation for environments where WASM isn't available:
 
 ```typescript
-import { FlatSQLDatabase, FlatcAccessor } from 'flatbuffers-sqlite';
+import { FlatSQLDatabase, FlatcAccessor } from 'flatsql';
+import { FlatcRunner } from 'flatc-wasm';
+
+const flatc = await FlatcRunner.init();
 
 const schema = `
   namespace App;
@@ -145,23 +159,30 @@ console.log(result.rows);
 const exported = db.exportData();
 ```
 
-### 4. Native C++ (Embedded)
+### Native C++ (Embedded)
 
 For performance-critical applications, link the C++ library directly:
 
 ```cpp
 #include <flatsql/database.h>
 
-auto db = flatsql::FlatSQLDatabase::fromSchema(schema);
+auto db = flatsql::FlatSQLDatabase::fromSchema(schema, "mydb");
 
 // Register file ID routing
-db.registerFileId("USER", "users_table");
+db.registerFileId("USER", "User");
+
+// Set field extractor
+db.setFieldExtractor("User", extractUserField);
 
 // Ingest streaming data
-size_t consumed = db.ingest(data, length, &recordsIngested);
+size_t recordsIngested = 0;
+db.ingest(data, length, &recordsIngested);
 
 // Query
-auto result = db.query("SELECT * FROM users_table WHERE id = 5");
+auto result = db.query("SELECT * FROM User WHERE id = 5");
+for (size_t i = 0; i < result.rowCount(); i++) {
+    std::cout << result.getString(i, "name") << std::endl;
+}
 ```
 
 ## Architecture
@@ -186,129 +207,54 @@ auto result = db.query("SELECT * FROM users_table WHERE id = 5");
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Storage Format
+### Stream Format
 
-Data is stored as "stacked FlatBuffers" — a simple append-only format:
-
-```
-[File Header: 64 bytes]
-  - Magic: "FLSQ"
-  - Version: 1
-  - Data offset, record count, schema name
-
-[Record Header: 48 bytes][FlatBuffer]
-[Record Header: 48 bytes][FlatBuffer]
-...
-```
-
-Each FlatBuffer is complete and valid. You can:
-- Read individual records with standard FlatBuffer code
-- Seek to any record by offset
-- Append without rewriting existing data
-- Process the file with any FlatBuffer tooling
-
-### Query Flow
+FlatSQL ingests size-prefixed FlatBuffer streams:
 
 ```
-SQL Query
-    ↓
-SQLite Parser
-    ↓
-Virtual Table (xFilter)
-    ↓
-┌─────────────────────────────┐
-│ Index lookup or full scan   │
-│ via B-tree                  │
-└─────────────────────────────┘
-    ↓
-Field Extraction (per row)
-    ↓
-Result Set
+[4-byte size LE][FlatBuffer with file_id][4-byte size LE][FlatBuffer]...
 ```
 
-## Examples
+The 4-byte file identifier in each FlatBuffer determines which table receives the record.
 
-### Basic Usage
+## SQL Support
 
-```typescript
-import { FlatSQLDatabase } from 'flatbuffers-sqlite';
+### Supported
 
-const schema = `
-  namespace Analytics;
+- `SELECT` with column selection
+- `WHERE` with `=`, `<`, `>`, `<=`, `>=`, `BETWEEN`, `LIKE`, `AND`, `OR`
+- `ORDER BY` (ASC/DESC)
+- `LIMIT` and `OFFSET`
+- `COUNT(*)` aggregate
+- Index-accelerated queries on `(id)` and `(key)` columns
 
-  table Event {
-    id: long (key);
-    user_id: int (indexed);
-    type: string (indexed);
-    payload: string;
-    timestamp: long (indexed);
-  }
-`;
+### Not Supported
 
-const db = FlatSQLDatabase.fromSchema(schema, accessor, 'analytics');
+- `JOIN` (query one table at a time)
+- `GROUP BY`, `HAVING`, most aggregates
+- `INSERT`, `UPDATE`, `DELETE` (use API methods instead)
+- Subqueries, CTEs, window functions
 
-// Stream events
-for await (const event of eventStream) {
-  db.insert('Event', event);
-}
+## Performance
 
-// Query recent events for a user
-const result = db.query(`
-  SELECT type, payload, timestamp
-  FROM Event
-  WHERE user_id = 12345
-  ORDER BY timestamp DESC
-  LIMIT 100
-`);
-```
+FlatSQL outperforms traditional SQLite on query operations:
 
-### Multi-Source Federation
+| Operation | FlatSQL | SQLite | Speedup |
+|-----------|---------|--------|---------|
+| Point query (by id) | 3.50 ms | 3.93 ms | 1.1x |
+| Point query (by key) | 5.23 ms | 6.94 ms | 1.3x |
+| Direct index lookup | 1.56 ms | 3.93 ms | 2.5x |
+| Full scan | 0.84 ms | 1.25 ms | 1.5x |
+| Direct iteration | 0.05 ms | 1.25 ms | 25x |
 
-```cpp
-// Register multiple data sources
-engine.registerSource("logs_2024", store2024, eventDef, "EVNT");
-engine.registerSource("logs_2025", store2025, eventDef, "EVNT");
+*Benchmarks: 10,000 records, 10,000 query iterations, Apple M3 Ultra*
 
-// Create unified view
-engine.createUnifiedView("all_logs", {"logs_2024", "logs_2025"});
-
-// Query across all sources (automatic _source column)
-auto result = engine.execute(
-  "SELECT _source, type, COUNT(*) FROM all_logs GROUP BY _source, type"
-);
-```
-
-### Streaming Ingestion
-
-```typescript
-// Stream generator
-async function* eventGenerator() {
-  for (let i = 0; i < 100000; i++) {
-    yield {
-      id: i,
-      type: ['click', 'view', 'purchase'][i % 3],
-      timestamp: Date.now()
-    };
-  }
-}
-
-// Ingest with progress
-let count = 0;
-for await (const event of eventGenerator()) {
-  db.insert('Event', event);
-  if (++count % 10000 === 0) {
-    console.log(`Ingested ${count} events`);
-  }
-}
-```
-
-## Building
+## Building from Source
 
 ### Prerequisites
 
 - Node.js 18+
-- CMake 3.20+ (for native/WASM builds)
-- C++17 compiler (for native builds)
+- CMake 3.20+ (for WASM builds)
 - Emscripten (for WASM builds)
 
 ### TypeScript Build
@@ -322,161 +268,69 @@ npm test
 ### WASM Build
 
 ```bash
+# Clone DA-FlatBuffers (required dependency)
+git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
+
+# Build WASM
 cd cpp
-./scripts/setup-emsdk.sh   # First time only
-./scripts/build-wasm.sh
+emcmake cmake -B build-wasm -DCMAKE_BUILD_TYPE=Release
+cmake --build build-wasm
 ```
 
 Output: `wasm/flatsql.js` and `wasm/flatsql.wasm`
 
-### Native C++ Build
-
-```bash
-cd cpp
-./scripts/build-native.sh
-./build/flatsql_test
-```
-
-### Run Local Demo
+### Run Demo Locally
 
 ```bash
 npm run serve
-# Open http://localhost:8080
-```
-
-## SQL Support
-
-### Supported
-
-- `SELECT` with column selection
-- `WHERE` with `=`, `<`, `>`, `<=`, `>=`, `BETWEEN`, `AND`, `OR`
-- `ORDER BY` (ASC/DESC)
-- `LIMIT` and `OFFSET`
-- Index-accelerated queries on `(key)` and `(indexed)` columns
-
-### Not Supported
-
-- `JOIN` (query one table at a time)
-- `GROUP BY`, `HAVING`, aggregates (`COUNT`, `SUM`, etc.)
-- `INSERT`, `UPDATE`, `DELETE` (use API methods instead)
-- Subqueries, CTEs, window functions
-- `DISTINCT`, `UNION` (except via multi-source views)
-
-## Limitations
-
-| Limitation | Reason |
-|------------|--------|
-| **Append-only storage** | Designed for streaming/immutable data. No UPDATE/DELETE. |
-| **In-memory indexes** | B-trees rebuilt on startup. Not persisted. |
-| **No JOINs** | Virtual tables don't support cross-table queries. |
-| **Read-only SQL** | Writes go through `insert()` / `ingest()` API. |
-| **Single-threaded** | WASM runs on main thread. Use workers for parallelism. |
-
-## Connection to Digital Arsenal FlatBuffers
-
-This project uses [Digital Arsenal's FlatBuffers fork](https://github.com/digitalarsenal/flatbuffers), which provides:
-
-- **[flatc-wasm](https://digitalarsenal.github.io/flatbuffers/)** — The FlatBuffer compiler running in WebAssembly
-- **Browser-native compilation** — Generate FlatBuffer code without native tooling
-- **Schema validation** — Parse and validate `.fbs` schemas in the browser
-
-The `flatc-wasm` dependency enables FlatSQL to:
-1. Parse FlatBuffer schemas at runtime
-2. Build FlatBuffers from JavaScript objects
-3. Extract fields from FlatBuffer binary data
-
-```javascript
-import { FlatcRunner } from 'flatc-wasm';
-
-const flatc = await FlatcRunner.init();
-const accessor = new FlatcAccessor(flatc, schema);
-// Now FlatSQL can read/write FlatBuffers
+# Open http://localhost:8081
 ```
 
 ## API Reference
 
-### FlatSQLDatabase
+### initFlatSQL()
 
 ```typescript
-class FlatSQLDatabase {
-  // Create from schema
-  static fromSchema(schema: string, accessor: FlatBufferAccessor, name: string): FlatSQLDatabase;
+import { initFlatSQL } from 'flatsql/wasm';
 
-  // Table operations
-  listTables(): string[];
-  getTableDef(name: string): TableDefinition;
-
-  // Data operations
-  insert(table: string, record: Record<string, any>): number;
-  insertRaw(table: string, flatbuffer: Uint8Array): number;
-  stream(table: string, flatbuffers: Uint8Array[]): number[];
-
-  // Query
-  query(sql: string): QueryResult;
-
-  // Export
-  exportData(): Uint8Array;
-  getStats(): TableStats[];
-}
+const flatsql = await initFlatSQL();
 ```
 
-### QueryResult
+### createDatabase(schema, name)
 
 ```typescript
-interface QueryResult {
-  columns: string[];
-  rows: any[][];
-  rowCount: number;
-}
+const db = flatsql.createDatabase(schemaString, 'dbname');
 ```
 
-## Performance
+### db.registerFileId(fileId, tableName)
 
-### Benchmark Results
+```typescript
+db.registerFileId('USER', 'User');  // Route "USER" FlatBuffers to User table
+```
 
-FlatSQL outperforms SQLite on all speed metrics. The following benchmarks compare FlatSQL's native C++ implementation against SQLite for 10,000 records with 10,000 query iterations.
+### db.ingest(data)
 
-**Test Environment:**
+```typescript
+const bytesConsumed = db.ingest(uint8ArrayStream);
+```
 
-- Apple M3 Ultra (28 cores: 20 performance, 8 efficiency)
-- 256 GB RAM
-- macOS 15.6
-- Native C++ build (not WASM)
+### db.query(sql)
 
-#### Ingest Performance
+```typescript
+const result = db.query('SELECT * FROM User WHERE age > 25');
+// result.columns: string[]
+// result.rows: any[][]
+```
 
-| Operation | FlatSQL | SQLite | Result |
-|-----------|---------|--------|--------|
-| Indexed ingest (10k records) | 3.87 ms | 4.56 ms | **FlatSQL 1.2x faster** |
-| Throughput | 2.58M rec/sec | 2.19M rec/sec | |
+### db.exportData()
 
-#### Query Performance
-
-| Operation | FlatSQL | SQLite | Result |
-|-----------|---------|--------|--------|
-| Point query (by id) | 3.50 ms | 3.93 ms | **FlatSQL 1.1x faster** |
-| Point query (by email) | 5.23 ms | 6.94 ms | **FlatSQL 1.3x faster** |
-| Direct index lookup | 1.56 ms | 3.93 ms | **FlatSQL 2.5x faster** |
-| Direct single lookup | 0.92 ms | 3.93 ms | **FlatSQL 4.3x faster** |
-| Zero-copy lookup | 1.12 ms | 3.93 ms | **FlatSQL 3.5x faster** |
-| Full scan (with results) | 0.84 ms | 1.25 ms | **FlatSQL 1.5x faster** |
-| Direct iteration | 0.05 ms | 1.25 ms | **FlatSQL 25x faster** |
-
-#### Storage
-
-| Metric | FlatSQL | SQLite | Notes |
-|--------|---------|--------|-------|
-| Size (10k records) | 0.83 MB | 0.68 MB | FlatSQL stores full FlatBuffers |
-
-FlatSQL uses more storage because it preserves complete FlatBuffer data with vtables and alignment padding. This is an intentional design trade-off that enables zero-copy access and memory-mapped file support.
-
-### WASM Performance
-
-The WebAssembly build runs in browsers and Node.js with similar relative performance characteristics. WASM adds approximately 2-3x overhead compared to native, but maintains the same performance advantages over equivalent JavaScript implementations.
+```typescript
+const data = db.exportData();  // Returns Uint8Array
+```
 
 ## License
 
-MIT
+Apache 2.0
 
 ## Contributing
 
@@ -488,4 +342,4 @@ For questions, licensing inquiries, or commercial support: [tj@digitalarsenal.io
 
 ---
 
-Built with [FlatBuffers](https://github.com/digitalarsenal/flatbuffers) and [SQLite](https://sqlite.org/).
+Built on [DA-FlatBuffers](https://digitalarsenal.github.io/flatbuffers/) and [SQLite](https://sqlite.org/).

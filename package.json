@@ -1,18 +1,62 @@
 {
-  "name": "flatbuffers-sqlite",
+  "name": "flatsql",
   "version": "0.1.0",
-  "description": "SQLite query engine over FlatBuffer storage",
+  "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./wasm": {
+      "types": "./wasm/index.d.ts",
+      "import": "./wasm/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "wasm/*.js",
+    "wasm/*.wasm",
+    "wasm/*.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
+    "build:wasm": "cd cpp && cmake -B build-wasm -DCMAKE_BUILD_TYPE=Release && cmake --build build-wasm",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "test:wasm": "node wasm/test-node.mjs",
     "dev": "tsc --watch",
-    "serve": "vite docs --port 8081"
+    "serve": "vite docs --port 8081",
+    "prepublishOnly": "npm run build"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DigitalArsenal/flatsql.git"
+  },
+  "homepage": "https://digitalarsenal.github.io/flatsql/",
+  "bugs": {
+    "url": "https://github.com/DigitalArsenal/flatsql/issues"
+  },
+  "keywords": [
+    "flatbuffers",
+    "sqlite",
+    "sql",
+    "database",
+    "streaming",
+    "binary",
+    "zero-copy",
+    "wasm",
+    "webassembly",
+    "query",
+    "virtual-table"
+  ],
+  "author": "Digital Arsenal <tj@digitalarsenal.io>",
+  "license": "Apache-2.0",
   "dependencies": {
-    "flatc-wasm": "file:../flatbuffers/wasm",
+    "flatc-wasm": "^26.1.14",
     "sql.js": "^1.10.0"
   },
   "devDependencies": {
@@ -22,5 +66,8 @@
     "@types/jest": "^29.5.0",
     "ts-jest": "^29.1.0",
     "vite": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
