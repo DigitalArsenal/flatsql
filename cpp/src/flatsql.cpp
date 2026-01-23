@@ -304,25 +304,37 @@ Value extractPostFieldGeneric(const uint8_t* data, size_t length, const std::str
 // ==================== JavaScript Wrappers ====================
 
 // JavaScript-friendly wrapper for Value
+// Note: Using explicit type checks instead of std::visit with generic lambda
+// to avoid function table issues in web workers (embind compatibility)
 val valueToJS(const Value& v) {
-    return std::visit([](const auto& value) -> val {
-        using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, std::monostate>) {
-            return val::null();
-        } else if constexpr (std::is_same_v<T, bool>) {
-            return val(value);
-        } else if constexpr (std::is_same_v<T, std::string>) {
-            return val(value);
-        } else if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
-            // Copy to a proper Uint8Array (typed_memory_view becomes invalid after WASM call)
-            val result = val::global("Uint8Array").new_(value.size());
-            val memView = val(typed_memory_view(value.size(), value.data()));
-            result.call<void>("set", memView);
-            return result;
-        } else {
-            return val(static_cast<double>(value));
-        }
-    }, v);
+    if (std::holds_alternative<std::monostate>(v)) {
+        return val::null();
+    }
+    if (std::holds_alternative<bool>(v)) {
+        return val(std::get<bool>(v));
+    }
+    if (std::holds_alternative<int32_t>(v)) {
+        return val(static_cast<double>(std::get<int32_t>(v)));
+    }
+    if (std::holds_alternative<int64_t>(v)) {
+        return val(static_cast<double>(std::get<int64_t>(v)));
+    }
+    if (std::holds_alternative<double>(v)) {
+        return val(std::get<double>(v));
+    }
+    if (std::holds_alternative<std::string>(v)) {
+        return val(std::get<std::string>(v));
+    }
+    if (std::holds_alternative<std::vector<uint8_t>>(v)) {
+        const auto& data = std::get<std::vector<uint8_t>>(v);
+        // Copy to a proper Uint8Array (typed_memory_view becomes invalid after WASM call)
+        val result = val::global("Uint8Array").new_(data.size());
+        val memView = val(typed_memory_view(data.size(), data.data()));
+        result.call<void>("set", memView);
+        return result;
+    }
+    // Fallback for any other numeric types
+    return val::null();
 }
 
 // JavaScript-friendly wrapper for QueryResult

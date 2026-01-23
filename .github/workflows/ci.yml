@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential
+
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        brew install cmake
+
+    - name: Clone FlatBuffers
+      run: |
+        git clone --depth 1 https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
+
+    - name: Configure CMake
+      working-directory: cpp
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      working-directory: cpp
+      run: cmake --build build --config Release -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+    - name: Run Tests
+      working-directory: cpp/build
+      run: ctest --output-on-failure -C Release
+
+  build-wasm:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Emscripten
+      uses: mymindstorm/setup-emsdk@v14
+      with:
+        version: '3.1.50'
+
+    - name: Clone FlatBuffers
+      run: |
+        git clone --depth 1 https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
+
+    - name: Configure WASM Build
+      working-directory: cpp
+      run: emcmake cmake -B build-wasm -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build WASM
+      working-directory: cpp
+      run: cmake --build build-wasm --config Release
+
+    - name: Verify WASM Output
+      run: |
+        ls -la cpp/build-wasm/flatsql.js cpp/build-wasm/flatsql.wasm
+        echo "WASM build successful!"

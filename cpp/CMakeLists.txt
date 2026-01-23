@@ -33,10 +33,10 @@ set(FLATSQL_LIB_SOURCES
     src/sqlite_engine.cpp
 )
 
-# Sources for WASM build (includes bindings)
+# Sources for WASM build - C API (no embind, worker-compatible)
 set(FLATSQL_WASM_SOURCES
     ${FLATSQL_LIB_SOURCES}
-    src/flatsql.cpp
+    src/flatsql_capi.cpp
 )
 
 set(FLATSQL_HEADERS
@@ -84,6 +84,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
     )
 
     # Emscripten link flags for WASM output
+    # Using C API exports (no embind) for worker compatibility
     set_target_properties(flatsql PROPERTIES
         SUFFIX ".js"
         LINK_FLAGS "\
@@ -91,8 +92,26 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             -s EXPORT_ES6=1 \
             -s MODULARIZE=1 \
             -s EXPORT_NAME='FlatSQL' \
-            -s EXPORTED_FUNCTIONS='[\"_malloc\", \"_free\"]' \
-            -s EXPORTED_RUNTIME_METHODS='[\"ccall\", \"cwrap\", \"UTF8ToString\", \"stringToUTF8\", \"lengthBytesUTF8\"]' \
+            -s EXPORTED_FUNCTIONS='[ \
+                \"_malloc\", \"_free\", \
+                \"_flatsql_create_db\", \"_flatsql_destroy_db\", \
+                \"_flatsql_register_file_id\", \"_flatsql_enable_demo_extractors\", \
+                \"_flatsql_ingest\", \"_flatsql_ingest_one\", \
+                \"_flatsql_query\", \"_flatsql_get_error\", \
+                \"_flatsql_result_column_count\", \"_flatsql_result_row_count\", \
+                \"_flatsql_result_column_name\", \"_flatsql_result_cell_type\", \
+                \"_flatsql_result_cell_number\", \"_flatsql_result_cell_string\", \
+                \"_flatsql_result_cell_blob\", \"_flatsql_result_cell_blob_size\", \
+                \"_flatsql_export_data\", \"_flatsql_export_size\", \
+                \"_flatsql_load_and_rebuild\", \
+                \"_flatsql_create_test_user\", \"_flatsql_create_test_post\", \
+                \"_flatsql_test_buffer_size\", \
+                \"_flatsql_get_stats_count\", \"_flatsql_get_stat_table_name\", \
+                \"_flatsql_get_stat_file_id\", \"_flatsql_get_stat_record_count\", \
+                \"_flatsql_mark_deleted\", \"_flatsql_get_deleted_count\", \
+                \"_flatsql_clear_tombstones\" \
+            ]' \
+            -s EXPORTED_RUNTIME_METHODS='[\"ccall\", \"cwrap\", \"UTF8ToString\", \"stringToUTF8\", \"lengthBytesUTF8\", \"HEAPU8\"]' \
             -s ALLOW_MEMORY_GROWTH=1 \
             -s INITIAL_MEMORY=16777216 \
             -s STACK_SIZE=1048576 \
@@ -101,8 +120,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             -s ENVIRONMENT='web,worker,node' \
             -s SINGLE_FILE=0 \
             -s ALLOW_TABLE_GROWTH=1 \
+            -s EMULATE_FUNCTION_POINTER_CASTS=1 \
             -fexceptions \
-            --bind \
+            -s DISABLE_EXCEPTION_CATCHING=0 \
         "
     )
 

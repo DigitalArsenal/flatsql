@@ -141,14 +141,95 @@
 
         /* Hero Section */
         .hero {
-            min-height: min(1180px, 100vh);
+            min-height: 100vh;
             display: flex;
             flex-direction: column;
             justify-content: center;
             align-items: center;
             text-align: center;
-            padding: 64px 24px;
+            padding: 60px 24px 100px;
             position: relative;
+        }
+
+        /* Hero Badges */
+        .hero-badges {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 32px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-decoration: none;
+            transition: all 0.2s;
+        }
+
+        .hero-badge:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .hero-badge svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        .hero-badge.license {
+            color: #4ade80;
+            border-color: rgba(74, 222, 128, 0.3);
+        }
+
+        .hero-badge.ci {
+            color: #60a5fa;
+            border-color: rgba(96, 165, 250, 0.3);
+        }
+
+        .hero-badge img {
+            height: 18px;
+        }
+
+        /* Scroll Indicator */
+        .scroll-indicator {
+            position: absolute;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-muted);
+            font-size: 12px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            opacity: 0.7;
+            transition: opacity 0.3s;
+            cursor: pointer;
+        }
+
+        .scroll-indicator:hover {
+            opacity: 1;
+        }
+
+        .scroll-arrow {
+            width: 24px;
+            height: 24px;
+            animation: bounceArrow 2s ease-in-out infinite;
+        }
+
+        @keyframes bounceArrow {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(8px); }
         }
 
         .hero-content {
@@ -183,7 +264,7 @@
 
         /* Features Grid */
         .features {
-            padding: 160px 24px;
+            padding: 120px 24px;
             max-width: 1024px;
             margin: 0 auto;
             position: relative;
@@ -209,26 +290,20 @@
         }
 
         .features-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            display: flex;
+            flex-wrap: wrap;
             gap: 24px;
-            justify-items: center;
+            justify-content: center;
         }
 
         .features-grid .feature-card {
-            width: 100%;
-            max-width: 320px;
-        }
-
-        @media (max-width: 900px) {
-            .features-grid {
-                grid-template-columns: repeat(2, 1fr);
-            }
+            width: 320px;
+            flex-shrink: 0;
         }
 
         @media (max-width: 600px) {
-            .features-grid {
-                grid-template-columns: 1fr;
+            .features-grid .feature-card {
+                width: 100%;
             }
         }
 
@@ -350,7 +425,7 @@
 
         /* Demo Section */
         .demo {
-            padding: 160px 24px;
+            padding: 120px 24px;
             max-width: 1400px;
             margin: 0 auto;
             position: relative;
@@ -427,6 +502,68 @@
                 border-right: none;
                 border-bottom: 1px solid rgba(255, 255, 255, 0.08);
             }
+        }
+
+        .source-selector {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 12px;
+        }
+
+        .source-btn {
+            padding: 4px 12px;
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 14px;
+            color: var(--text-muted);
+            font-size: 11px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .source-btn:hover {
+            border-color: rgba(255, 255, 255, 0.3);
+            color: var(--text-secondary);
+        }
+
+        .source-btn.active {
+            background: rgba(74, 222, 128, 0.15);
+            border-color: rgba(74, 222, 128, 0.3);
+            color: #4ade80;
+        }
+
+        .query-examples {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+
+        .query-examples-label {
+            color: var(--text-muted);
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .query-example-btn {
+            padding: 8px 16px;
+            background: rgba(96, 165, 250, 0.1);
+            border: 1px solid rgba(96, 165, 250, 0.25);
+            border-radius: 20px;
+            color: #60a5fa;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .query-example-btn:hover {
+            background: rgba(96, 165, 250, 0.2);
+            border-color: rgba(96, 165, 250, 0.5);
+            color: #93c5fd;
         }
 
         .demo-panel h4 {
@@ -588,9 +725,635 @@
             color: var(--text-secondary);
         }
 
+        /* Schema Panel */
+        .schema-panel {
+            margin-top: 32px;
+            background: rgba(22, 22, 23, 0.8);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            overflow: hidden;
+        }
+
+        .schema-header {
+            padding: 16px 24px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .schema-header h4 {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin: 0;
+        }
+
+        .schema-note {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .schema-note a {
+            color: #60a5fa;
+            text-decoration: none;
+        }
+
+        .schema-note a:hover {
+            text-decoration: underline;
+        }
+
+        .schema-code {
+            margin: 0;
+            padding: 20px 24px;
+            background: rgba(0, 0, 0, 0.3);
+            font-family: var(--font-mono);
+            font-size: 12px;
+            line-height: 1.6;
+            color: var(--text-secondary);
+            overflow-x: auto;
+        }
+
+        .schema-code .json-key {
+            color: #4ade80;
+        }
+
+        .schema-code .json-string {
+            color: #fbbf24;
+        }
+
+        .schema-code .json-bool,
+        .schema-code .json-number {
+            color: #60a5fa;
+        }
+
+        /* Overview Section */
+        .overview {
+            padding: 120px 24px;
+            max-width: 1400px;
+            margin: 0 auto;
+            position: relative;
+        }
+
+        /* Why FlatSQL Block */
+        .why-block {
+            background: linear-gradient(135deg, rgba(74, 222, 128, 0.08) 0%, rgba(96, 165, 250, 0.08) 50%, rgba(251, 191, 36, 0.08) 100%);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 24px;
+            padding: 48px;
+            margin-bottom: 48px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .why-block::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, #4ade80, #60a5fa, #fbbf24);
+        }
+
+        .why-block-header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .why-block-header h3 {
+            font-size: 28px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+        }
+
+        .why-block-header p {
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        /* Data Sources Row */
+        .data-sources {
+            display: flex;
+            justify-content: center;
+            gap: 32px;
+            margin-bottom: 40px;
+            flex-wrap: wrap;
+        }
+
+        .data-source {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .data-source-icon {
+            width: 56px;
+            height: 56px;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s;
+        }
+
+        .data-source-icon svg {
+            width: 28px;
+            height: 28px;
+            color: var(--text-secondary);
+        }
+
+        .data-source:hover .data-source-icon {
+            background: rgba(74, 222, 128, 0.15);
+            border-color: rgba(74, 222, 128, 0.3);
+        }
+
+        .data-source:hover .data-source-icon svg {
+            color: #4ade80;
+        }
+
+        .data-source-label {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        /* Comparison Flow */
+        .comparison-flow {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            gap: 24px;
+            align-items: center;
+            margin-bottom: 40px;
+        }
+
+        @media (max-width: 800px) {
+            .comparison-flow {
+                grid-template-columns: 1fr;
+                gap: 16px;
+            }
+            .comparison-vs {
+                transform: rotate(90deg);
+            }
+        }
+
+        .comparison-box {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 16px;
+            padding: 24px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .comparison-box.traditional {
+            border-color: rgba(239, 68, 68, 0.3);
+        }
+
+        .comparison-box.flatsql {
+            border-color: rgba(74, 222, 128, 0.3);
+        }
+
+        .comparison-box h4 {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .comparison-box.traditional h4 {
+            color: #ef4444;
+        }
+
+        .comparison-box.flatsql h4 {
+            color: #4ade80;
+        }
+
+        .comparison-steps {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .comparison-step {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .comparison-step-num {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 10px;
+            font-weight: 600;
+            flex-shrink: 0;
+        }
+
+        .comparison-box.traditional .comparison-step-num {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+        }
+
+        .comparison-box.flatsql .comparison-step-num {
+            background: rgba(74, 222, 128, 0.2);
+            color: #4ade80;
+        }
+
+        .comparison-vs {
+            width: 48px;
+            height: 48px;
+            background: var(--ui-bg);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--text-muted);
+            flex-shrink: 0;
+        }
+
+        /* Why Text */
+        .why-text {
+            text-align: center;
+            max-width: 800px;
+            margin: 0 auto 40px;
+        }
+
+        .why-text p {
+            color: var(--text-secondary);
+            font-size: 15px;
+            line-height: 1.7;
+        }
+
+        .why-text strong {
+            color: var(--text-primary);
+        }
+
+        /* Use Cases */
+        .use-cases {
+            display: flex;
+            justify-content: center;
+            gap: 40px;
+            flex-wrap: wrap;
+        }
+
+        .use-case {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 20px;
+            background: rgba(255, 255, 255, 0.04);
+            border-radius: 28px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .use-case-icon {
+            width: 32px;
+            height: 32px;
+            background: rgba(96, 165, 250, 0.15);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .use-case-icon svg {
+            width: 18px;
+            height: 18px;
+            color: #60a5fa;
+        }
+
+        .use-case-label {
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .overview-content {
+            margin-top: 0;
+        }
+
+        .overview-row {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 24px;
+        }
+
+        @media (max-width: 1000px) {
+            .overview-row {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .overview-card {
+            background: var(--ui-bg);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            padding: 32px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .overview-card-header {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-bottom: 24px;
+        }
+
+        .overview-card-icon {
+            width: 44px;
+            height: 44px;
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .overview-card-icon svg {
+            width: 22px;
+            height: 22px;
+            color: var(--text-secondary);
+        }
+
+        .overview-card-icon.green {
+            background: rgba(74, 222, 128, 0.15);
+        }
+
+        .overview-card-icon.green svg {
+            color: #4ade80;
+        }
+
+        .overview-card-icon.blue {
+            background: rgba(96, 165, 250, 0.15);
+        }
+
+        .overview-card-icon.blue svg {
+            color: #60a5fa;
+        }
+
+        .overview-card-icon.amber {
+            background: rgba(251, 191, 36, 0.15);
+        }
+
+        .overview-card-icon.amber svg {
+            color: #fbbf24;
+        }
+
+        .overview-card h3 {
+            font-size: 20px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin: 0;
+        }
+
+        .overview-card p {
+            color: var(--text-secondary);
+            font-size: 14px;
+            line-height: 1.6;
+            margin-bottom: 12px;
+        }
+
+        .overview-card ul {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        .overview-card li {
+            color: var(--text-secondary);
+            font-size: 14px;
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            line-height: 1.5;
+        }
+
+        .overview-card li:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+
+        .overview-card li:first-child {
+            padding-top: 0;
+        }
+
+        .overview-card li strong {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        /* Architecture Diagram - Full Width */
+        .arch-card {
+            background: var(--ui-bg);
+            backdrop-filter: blur(20px);
+            border-radius: 20px;
+            padding: 48px 40px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            margin-bottom: 32px;
+        }
+
+        .arch-card h3 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 40px;
+            color: var(--text-primary);
+            text-align: center;
+        }
+
+        .arch-flow {
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            gap: 0;
+        }
+
+        .arch-stage {
+            flex: 1;
+            max-width: 200px;
+            text-align: center;
+        }
+
+        .arch-icon {
+            width: 72px;
+            height: 72px;
+            margin: 0 auto 16px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .arch-icon svg {
+            width: 32px;
+            height: 32px;
+            color: var(--text-secondary);
+        }
+
+        .arch-icon.highlight {
+            background: rgba(74, 222, 128, 0.15);
+            border-color: rgba(74, 222, 128, 0.3);
+        }
+
+        .arch-icon.highlight svg {
+            color: #4ade80;
+        }
+
+        .arch-stage-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 6px;
+        }
+
+        .arch-stage-desc {
+            font-size: 12px;
+            color: var(--text-muted);
+            line-height: 1.4;
+            padding: 0 8px;
+        }
+
+        .arch-arrow-wrapper {
+            display: flex;
+            align-items: center;
+            height: 72px;
+            padding: 0 4px;
+        }
+
+        .arch-arrow {
+            color: var(--text-muted);
+            font-size: 28px;
+            opacity: 0.4;
+        }
+
+        @media (max-width: 900px) {
+            .arch-flow {
+                flex-direction: column;
+                align-items: center;
+                gap: 8px;
+            }
+            .arch-arrow-wrapper {
+                height: auto;
+                transform: rotate(90deg);
+            }
+            .arch-stage {
+                max-width: 280px;
+            }
+        }
+
+        .arch-box-label {
+            font-size: 10px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+
+        .arch-box-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .arch-arrow {
+            color: var(--text-muted);
+            font-size: 20px;
+        }
+
+        /* Benchmark Bars */
+        .benchmark-item {
+            margin-bottom: 20px;
+        }
+
+        .benchmark-label {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .benchmark-label span:first-child {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .benchmark-label span:last-child {
+            font-size: 12px;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+        }
+
+        .benchmark-bar {
+            height: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            overflow: hidden;
+            display: flex;
+            gap: 2px;
+        }
+
+        .benchmark-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s ease;
+        }
+
+        .benchmark-fill.flatsql {
+            background: linear-gradient(90deg, #4ade80, #22c55e);
+        }
+
+        .benchmark-fill.sqlite {
+            background: linear-gradient(90deg, #60a5fa, #3b82f6);
+        }
+
+        .benchmark-legend {
+            display: flex;
+            gap: 24px;
+            margin-top: 20px;
+            justify-content: center;
+        }
+
+        .benchmark-legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .benchmark-legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 3px;
+        }
+
+        .benchmark-legend-dot.flatsql {
+            background: #22c55e;
+        }
+
+        .benchmark-legend-dot.sqlite {
+            background: #3b82f6;
+        }
+
         /* Code Section */
         .code-section {
-            padding: 160px 24px;
+            padding: 120px 24px;
             max-width: 1024px;
             margin: 0 auto;
             position: relative;
@@ -648,24 +1411,100 @@
 
         /* Footer */
         footer {
-            padding: 64px 24px;
+            padding: 80px 24px 40px;
             text-align: center;
             position: relative;
             border-top: 1px solid rgba(255, 255, 255, 0.05);
         }
 
-        footer p {
-            color: var(--text-muted);
-            font-size: 14px;
+        .footer-content {
+            max-width: 600px;
+            margin: 0 auto;
         }
 
-        footer a {
+        .footer-brand {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 16px;
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .footer-logo {
+            width: 28px;
+            height: 28px;
+            color: var(--text-primary);
+        }
+
+        .footer-tagline {
+            color: var(--text-muted);
+            font-size: 14px;
+            margin-bottom: 24px;
+        }
+
+        .footer-tagline a {
             color: var(--text-secondary);
             text-decoration: none;
         }
 
-        footer a:hover {
-            opacity: 0.6;
+        .footer-tagline a:hover {
+            color: var(--text-primary);
+        }
+
+        .footer-badges {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+        }
+
+        .footer-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            background: rgba(74, 222, 128, 0.08);
+            border: 1px solid rgba(74, 222, 128, 0.2);
+            border-radius: 20px;
+            font-size: 12px;
+            color: #4ade80;
+            text-decoration: none;
+        }
+
+        .footer-badge svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        .footer-contact {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            margin-bottom: 32px;
+            flex-wrap: wrap;
+        }
+
+        .footer-contact a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        .footer-contact a:hover {
+            color: var(--text-primary);
+        }
+
+        .footer-divider {
+            color: var(--text-muted);
+        }
+
+        .footer-copyright {
+            color: var(--text-muted);
+            font-size: 12px;
         }
 
         /* Responsive */
@@ -674,9 +1513,11 @@
             .hero p { font-size: 18px; }
             .section-title h2 { font-size: 32px; }
             .section-title p { font-size: 18px; }
-            .features { padding: 80px 24px; }
-            .demo { padding: 80px 24px; }
-            .code-section { padding: 80px 24px; }
+            .hero { padding: 100px 24px 60px; }
+            .features { padding: 60px 24px; }
+            .overview { padding: 60px 24px; }
+            .demo { padding: 60px 24px; }
+            .code-section { padding: 60px 24px; }
             .nav-links { display: none; }
         }
     </style>
@@ -699,6 +1540,7 @@
             </a>
             <div class="nav-links">
                 <a href="#features">Features</a>
+                <a href="#overview">Overview</a>
                 <a href="#demo">Demo</a>
                 <a href="#code">Code</a>
                 <a href="https://github.com/DigitalArsenal/flatbuffers" target="_blank">Docs</a>
@@ -714,6 +1556,20 @@
 
     <section class="hero">
         <div class="hero-content">
+            <!-- Badges -->
+            <div class="hero-badges">
+                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite/actions" class="hero-badge ci" target="_blank">
+                    <img src="https://github.com/DigitalArsenal/flatbuffers-sqlite/actions/workflows/ci.yml/badge.svg" alt="CI Status">
+                </a>
+                <span class="hero-badge license">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    </svg>
+                    Apache 2.0
+                </span>
+                <span class="hero-badge">Free &amp; Open Source</span>
+            </div>
+
             <h1>Digital Arsenal<br>FlatSQL</h1>
             <p>SQL queries over raw FlatBuffer storage. Zero conversion, real-time indexing, pure streaming.</p>
             <div class="hero-buttons">
@@ -721,12 +1577,20 @@
                 <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" class="btn btn-large" target="_blank">View Source</a>
             </div>
         </div>
+
+        <!-- Scroll Indicator -->
+        <a href="#features" class="scroll-indicator">
+            <span>Scroll</span>
+            <svg class="scroll-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 5v14M19 12l-7 7-7-7"/>
+            </svg>
+        </a>
     </section>
 
     <section class="features" id="features">
         <div class="section-title">
             <h2>Built for Streaming</h2>
-            <p>No conversion. No serialization overhead. Just raw bytes flowing through.</p>
+            <p>No parsing. No conversion. Binary data arrives ready to query.</p>
         </div>
         <div class="features-grid">
             <div class="feature-card">
@@ -762,6 +1626,322 @@
         </div>
     </section>
 
+    <section class="overview" id="overview">
+        <div class="section-title">
+            <h2>Overview</h2>
+            <p>A database built for the real-time, decentralized web.</p>
+        </div>
+
+        <div class="why-block">
+            <div class="why-block-header">
+                <h3>Why FlatSQL?</h3>
+                <p>Modern apps receive data from everywhere</p>
+            </div>
+
+            <!-- Data Sources -->
+            <div class="data-sources">
+                <div class="data-source">
+                    <div class="data-source-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2a3 3 0 0 0-3 3v4a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                            <line x1="12" y1="19" x2="12" y2="22"/>
+                        </svg>
+                    </div>
+                    <span class="data-source-label">Sensors</span>
+                </div>
+                <div class="data-source">
+                    <div class="data-source-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="6" cy="6" r="3"/>
+                            <circle cx="18" cy="6" r="3"/>
+                            <circle cx="6" cy="18" r="3"/>
+                            <circle cx="18" cy="18" r="3"/>
+                            <line x1="9" y1="6" x2="15" y2="6"/>
+                            <line x1="6" y1="9" x2="6" y2="15"/>
+                            <line x1="18" y1="9" x2="18" y2="15"/>
+                            <line x1="9" y1="18" x2="15" y2="18"/>
+                        </svg>
+                    </div>
+                    <span class="data-source-label">P2P Networks</span>
+                </div>
+                <div class="data-source">
+                    <div class="data-source-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+                            <line x1="8" y1="21" x2="16" y2="21"/>
+                            <line x1="12" y1="17" x2="12" y2="21"/>
+                        </svg>
+                    </div>
+                    <span class="data-source-label">Edge Devices</span>
+                </div>
+                <div class="data-source">
+                    <div class="data-source-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>
+                        </svg>
+                    </div>
+                    <span class="data-source-label">Cloud APIs</span>
+                </div>
+                <div class="data-source">
+                    <div class="data-source-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+                        </svg>
+                    </div>
+                    <span class="data-source-label">Streams</span>
+                </div>
+            </div>
+
+            <!-- Comparison -->
+            <div class="comparison-flow">
+                <div class="comparison-box traditional">
+                    <h4>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <line x1="15" y1="9" x2="9" y2="15"/>
+                            <line x1="9" y1="9" x2="15" y2="15"/>
+                        </svg>
+                        Traditional Database
+                    </h4>
+                    <div class="comparison-steps">
+                        <div class="comparison-step"><span class="comparison-step-num">1</span> Receive binary data</div>
+                        <div class="comparison-step"><span class="comparison-step-num">2</span> Parse to objects</div>
+                        <div class="comparison-step"><span class="comparison-step-num">3</span> Convert to SQL types</div>
+                        <div class="comparison-step"><span class="comparison-step-num">4</span> Insert rows</div>
+                        <div class="comparison-step"><span class="comparison-step-num">5</span> Query → serialize back</div>
+                    </div>
+                </div>
+                <div class="comparison-vs">VS</div>
+                <div class="comparison-box flatsql">
+                    <h4>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                            <polyline points="22 4 12 14.01 9 11.01"/>
+                        </svg>
+                        FlatSQL
+                    </h4>
+                    <div class="comparison-steps">
+                        <div class="comparison-step"><span class="comparison-step-num">1</span> Receive binary data</div>
+                        <div class="comparison-step"><span class="comparison-step-num">2</span> Store as-is</div>
+                        <div class="comparison-step"><span class="comparison-step-num">3</span> Query directly</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Why Text -->
+            <div class="why-text">
+                <p>FlatSQL keeps data in its <strong>native FlatBuffer format</strong>, routes it by source, and queries it with SQL. Ideal for <strong>isomorphic applications</strong> where the same code runs in browsers, workers, and servers—all sharing the same binary protocol.</p>
+            </div>
+
+            <!-- Use Cases -->
+            <div class="use-cases">
+                <div class="use-case">
+                    <div class="use-case-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                            <path d="M2 17l10 5 10-5"/>
+                            <path d="M2 12l10 5 10-5"/>
+                        </svg>
+                    </div>
+                    <span class="use-case-label">Distributed IoT</span>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+                            <circle cx="9" cy="7" r="4"/>
+                            <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+                            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                        </svg>
+                    </div>
+                    <span class="use-case-label">Collaborative Editing</span>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="20" x2="18" y2="10"/>
+                            <line x1="12" y1="20" x2="12" y2="4"/>
+                            <line x1="6" y1="20" x2="6" y2="14"/>
+                        </svg>
+                    </div>
+                    <span class="use-case-label">Real-time Analytics</span>
+                </div>
+                <div class="use-case">
+                    <div class="use-case-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <line x1="2" y1="12" x2="22" y2="12"/>
+                            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                        </svg>
+                    </div>
+                    <span class="use-case-label">Edge Computing</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="overview-content">
+            <!-- Full-width Architecture Diagram -->
+            <div class="arch-card">
+                <h3>Data Flow Architecture</h3>
+                <div class="arch-flow">
+                    <div class="arch-stage">
+                        <div class="arch-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                <polyline points="14 2 14 8 20 8"/>
+                                <line x1="16" y1="13" x2="8" y2="13"/>
+                                <line x1="16" y1="17" x2="8" y2="17"/>
+                            </svg>
+                        </div>
+                        <div class="arch-stage-title">FlatBuffers</div>
+                        <div class="arch-stage-desc">Size-prefixed binary data streams in via stdin, socket, or API</div>
+                    </div>
+                    <div class="arch-arrow-wrapper"><span class="arch-arrow">→</span></div>
+                    <div class="arch-stage">
+                        <div class="arch-icon highlight">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="3"/>
+                                <path d="M12 1v6m0 6v10"/>
+                                <path d="M21 12h-6m-6 0H1"/>
+                            </svg>
+                        </div>
+                        <div class="arch-stage-title">File ID Router</div>
+                        <div class="arch-stage-desc">4-byte identifier routes each buffer to the correct table</div>
+                    </div>
+                    <div class="arch-arrow-wrapper"><span class="arch-arrow">→</span></div>
+                    <div class="arch-stage">
+                        <div class="arch-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                                <path d="M2 17l10 5 10-5"/>
+                                <path d="M2 12l10 5 10-5"/>
+                            </svg>
+                        </div>
+                        <div class="arch-stage-title">B-Tree Storage</div>
+                        <div class="arch-stage-desc">Append-only storage with inline index updates</div>
+                    </div>
+                    <div class="arch-arrow-wrapper"><span class="arch-arrow">→</span></div>
+                    <div class="arch-stage">
+                        <div class="arch-icon highlight">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <ellipse cx="12" cy="5" rx="9" ry="3"/>
+                                <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+                                <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+                            </svg>
+                        </div>
+                        <div class="arch-stage-title">SQLite VTable</div>
+                        <div class="arch-stage-desc">SQL interface with zero-copy field extraction</div>
+                    </div>
+                    <div class="arch-arrow-wrapper"><span class="arch-arrow">→</span></div>
+                    <div class="arch-stage">
+                        <div class="arch-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="16 18 22 12 16 6"/>
+                                <polyline points="8 6 2 12 8 18"/>
+                            </svg>
+                        </div>
+                        <div class="arch-stage-title">Query Results</div>
+                        <div class="arch-stage-desc">Direct pointer access to FlatBuffer fields</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Three columns below -->
+            <div class="overview-row">
+                <div class="overview-card">
+                    <div class="overview-card-header">
+                        <div class="overview-card-icon green">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"/>
+                                <path d="M9 12l2 2 4-4"/>
+                            </svg>
+                        </div>
+                        <h3>Design Decisions</h3>
+                    </div>
+                    <ul>
+                        <li><strong>Zero Deserialization</strong> — Data stays in FlatBuffer format, extracted on-demand</li>
+                        <li><strong>Source Routing</strong> — Same schema, multiple sources; query by <code>_source</code> field</li>
+                        <li><strong>Append-Only</strong> — Optimized for streaming; no write amplification</li>
+                        <li><strong>SQLite VTable</strong> — Full SQL without data copying</li>
+                    </ul>
+                </div>
+
+                <div class="overview-card">
+                    <div class="overview-card-header">
+                        <div class="overview-card-icon blue">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M18 20V10"/>
+                                <path d="M12 20V4"/>
+                                <path d="M6 20v-6"/>
+                            </svg>
+                        </div>
+                        <h3>Benchmarks vs SQLite</h3>
+                    </div>
+                    <div class="benchmark-item">
+                        <div class="benchmark-label">
+                            <span>Ingest</span>
+                            <span>2.5x faster</span>
+                        </div>
+                        <div class="benchmark-bar">
+                            <div class="benchmark-fill flatsql" style="width: 100%;"></div>
+                            <div class="benchmark-fill sqlite" style="width: 40%;"></div>
+                        </div>
+                    </div>
+                    <div class="benchmark-item">
+                        <div class="benchmark-label">
+                            <span>Point Query</span>
+                            <span>1.8x faster</span>
+                        </div>
+                        <div class="benchmark-bar">
+                            <div class="benchmark-fill flatsql" style="width: 100%;"></div>
+                            <div class="benchmark-fill sqlite" style="width: 55%;"></div>
+                        </div>
+                    </div>
+                    <div class="benchmark-item">
+                        <div class="benchmark-label">
+                            <span>Zero-Copy</span>
+                            <span>8x faster</span>
+                        </div>
+                        <div class="benchmark-bar">
+                            <div class="benchmark-fill flatsql" style="width: 100%;"></div>
+                            <div class="benchmark-fill sqlite" style="width: 12%;"></div>
+                        </div>
+                    </div>
+                    <div class="benchmark-legend">
+                        <div class="benchmark-legend-item">
+                            <div class="benchmark-legend-dot flatsql"></div>
+                            <span>FlatSQL</span>
+                        </div>
+                        <div class="benchmark-legend-item">
+                            <div class="benchmark-legend-dot sqlite"></div>
+                            <span>SQLite</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="overview-card">
+                    <div class="overview-card-header">
+                        <div class="overview-card-icon amber">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                                <line x1="12" y1="9" x2="12" y2="13"/>
+                                <line x1="12" y1="17" x2="12.01" y2="17"/>
+                            </svg>
+                        </div>
+                        <h3>Trade-offs</h3>
+                    </div>
+                    <ul>
+                        <li><strong>Larger Storage</strong> — 2-3x vs columnar (uncompressed for zero-copy)</li>
+                        <li><strong>Append-Only</strong> — No updates; use delete + re-insert</li>
+                        <li><strong>Schema Required</strong> — Must register field extractors</li>
+                        <li><strong>In-Memory</strong> — Disk persistence via export/import</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
     <section class="demo" id="demo">
         <div class="section-title">
             <h2>Interactive Demo</h2>
@@ -779,10 +1959,15 @@
             <div class="demo-body">
                 <div class="demo-panel">
                     <h4>Streaming Ingest</h4>
+                    <div class="source-selector">
+                        <span style="color: var(--text-muted); font-size: 12px; margin-right: 8px;">Source:</span>
+                        <button class="source-btn active" data-source="local">Local</button>
+                        <button class="source-btn" data-source="cloud">Cloud</button>
+                        <button class="source-btn" data-source="peer">Peer</button>
+                    </div>
                     <div class="demo-controls">
                         <button class="demo-btn" id="btnStream1k" disabled>Stream 1,000</button>
                         <button class="demo-btn" id="btnStream10k" disabled>Stream 10,000</button>
-                        <button class="demo-btn" id="btnStreamMixed" disabled>Mixed Stream</button>
                         <button class="demo-btn" id="btnClear" disabled>Clear</button>
                     </div>
                     <div class="stats-row">
@@ -805,21 +1990,73 @@
                 </div>
                 <div class="demo-panel">
                     <h4>SQL Query</h4>
-                    <input type="text" class="query-input" id="queryInput" placeholder="SELECT * FROM User" value="SELECT _offset, _data, id, name, email, age FROM User">
+                    <div class="query-examples">
+                        <span class="query-examples-label">Try:</span>
+                        <button class="query-example-btn" data-query="SELECT id, name, email, age FROM User LIMIT 50">All Users</button>
+                        <button class="query-example-btn" data-query="SELECT id, name, email FROM User WHERE email LIKE '%gmail%' LIMIT 50">Gmail</button>
+                        <button class="query-example-btn" data-query="SELECT id, name, email FROM User WHERE age > 40 LIMIT 50">Age > 40</button>
+                        <button class="query-example-btn" data-query="SELECT COUNT(*) as total FROM User">Count</button>
+                    </div>
+                    <input type="text" class="query-input" id="queryInput" placeholder="SELECT * FROM User WHERE email LIKE '%gmail%' LIMIT 50" value="SELECT id, name, email, age FROM User">
                     <div class="demo-controls">
                         <button class="demo-btn" id="btnQuery" disabled>Run Query<span class="spinner" id="querySpinner"></span></button>
+                        <span id="queryTime" style="color: var(--text-muted); font-size: 12px; margin-left: 12px;"></span>
                     </div>
-                    <h4>Results</h4>
-                    <div style="overflow-x: auto; max-height: 300px;">
-                        <table class="results-table" id="resultsTable">
-                            <thead>
-                                <tr><th colspan="6">Run a query to see results</th></tr>
-                            </thead>
-                            <tbody id="resultsBody"></tbody>
-                        </table>
+                    <div id="resultsSection" style="display: none;">
+                        <h4>Results</h4>
+                        <div style="overflow-x: auto; max-height: 300px;">
+                            <table class="results-table" id="resultsTable">
+                                <thead></thead>
+                                <tbody id="resultsBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div id="pagination" style="display: none; margin-top: 12px; align-items: center; gap: 12px; justify-content: center;">
+                        <button class="demo-btn" id="btnPrevPage" style="padding: 6px 12px; font-size: 12px;">← Prev</button>
+                        <span id="pageInfo" style="color: var(--text-muted); font-size: 12px;"></span>
+                        <button class="demo-btn" id="btnNextPage" style="padding: 6px 12px; font-size: 12px;">Next →</button>
                     </div>
                 </div>
             </div>
+        </div>
+
+        <div class="schema-panel">
+            <div class="schema-header">
+                <h4>JSON Schema IDL with x-flatbuffers Extensions</h4>
+                <span class="schema-note">Generated by <a href="https://digitalarsenal.github.io/flatbuffers/" target="_blank">DA-Flatbuffers</a> — used to initialize FlatSQL</span>
+            </div>
+            <pre class="schema-code"><code>{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  <span class="json-key">"x-flatbuffers"</span>: {
+    "namespace": <span class="json-string">"demo"</span>,
+    "root_type": <span class="json-string">"demo_User"</span>,
+    "file_ident": <span class="json-string">"USER"</span>
+  },
+  "definitions": {
+    "demo_User": {
+      "type": "object",
+      <span class="json-key">"x-flatbuffers"</span>: { "type": <span class="json-string">"table"</span> },
+      "properties": {
+        "id": {
+          "type": "integer",
+          <span class="json-key">"x-flatbuffers"</span>: { "id": <span class="json-bool">0</span>, "base_type": <span class="json-string">"int32"</span> }
+        },
+        "name": {
+          "type": "string",
+          <span class="json-key">"x-flatbuffers"</span>: { "id": <span class="json-bool">1</span> }
+        },
+        "email": {
+          "type": "string",
+          <span class="json-key">"x-flatbuffers"</span>: { "id": <span class="json-bool">2</span>, "key": <span class="json-bool">true</span> }
+        },
+        "age": {
+          "type": "integer",
+          <span class="json-key">"x-flatbuffers"</span>: { "id": <span class="json-bool">3</span>, "base_type": <span class="json-string">"int32"</span> }
+        }
+      }
+    }
+  }
+}</code></pre>
         </div>
     </section>
 
@@ -850,8 +2087,34 @@ db.<span class="function">registerFileId</span>(<span class="string">"POST"</spa
     </section>
 
     <footer>
-        <p>Built with <a href="https://github.com/digitalarsenal/flatbuffers">FlatBuffers</a> and <a href="https://sqlite.org/">SQLite</a>.</p>
-        <p style="margin-top: 8px;"><a href="mailto:tj@digitalarsenal.io">tj@digitalarsenal.io</a></p>
+        <div class="footer-content">
+            <div class="footer-brand">
+                <svg class="footer-logo" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <ellipse cx="50" cy="25" rx="35" ry="12" fill="currentColor"/>
+                    <path d="M15 25v50c0 6.6 15.7 12 35 12s35-5.4 35-12V25" stroke="currentColor" stroke-width="6" fill="none"/>
+                    <ellipse cx="50" cy="75" rx="35" ry="12" stroke="currentColor" stroke-width="6" fill="none"/>
+                </svg>
+                <span>FlatSQL</span>
+            </div>
+            <p class="footer-tagline">Built with <a href="https://github.com/digitalarsenal/flatbuffers">DA-FlatBuffers</a> and <a href="https://sqlite.org/">SQLite</a></p>
+            <div class="footer-badges">
+                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite/blob/main/LICENSE" class="footer-badge">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                    </svg>
+                    Apache 2.0 License
+                </a>
+                <span class="footer-badge">Free &amp; Open Source</span>
+            </div>
+            <div class="footer-contact">
+                <a href="mailto:tj@digitalarsenal.io">tj@digitalarsenal.io</a>
+                <span class="footer-divider">·</span>
+                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" target="_blank">GitHub</a>
+                <span class="footer-divider">·</span>
+                <a href="https://digitalarsenal.io" target="_blank">Digital Arsenal</a>
+            </div>
+        </div>
+        <p class="footer-copyright">© 2025 Digital Arsenal, Inc.</p>
     </footer>
 
     <script>
@@ -874,28 +2137,22 @@ db.<span class="function">registerFileId</span>(<span class="string">"POST"</spa
             return videoUrls[Math.floor(Math.random() * videoUrls.length)];
         }
 
-        function loadHlsVideo(videoElement, url, slowMode = false) {
-            const setSlowPlayback = () => {
-                if (slowMode) videoElement.playbackRate = 0.1;
-            };
-
+        function loadHlsVideo(videoElement, url) {
             if (Hls.isSupported()) {
                 const hls = new Hls();
                 hls.loadSource(url);
                 hls.attachMedia(videoElement);
-                hls.on(Hls.Events.MANIFEST_PARSED, setSlowPlayback);
             } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
                 videoElement.src = url;
-                videoElement.addEventListener('loadedmetadata', setSlowPlayback);
             }
         }
 
-        // Load fixed page background video (slow)
-        loadHlsVideo(document.getElementById('pageVideoBg'), videoUrls[3], true);
+        // Load fixed page background video
+        loadHlsVideo(document.getElementById('pageVideoBg'), videoUrls[3]);
 
-        // Load feature card videos (slow)
+        // Load feature card videos
         document.querySelectorAll('.feature-video').forEach(video => {
-            loadHlsVideo(video, getRandomVideo(), true);
+            loadHlsVideo(video, getRandomVideo());
         });
 
         // Code tabs
@@ -951,12 +2208,62 @@ flatsql --schema app.fbs --load data.bin \\
     </script>
 
     <script type="module">
-        // Demo functionality using Web Worker for responsive UI
+        // Demo functionality - Worker mode with C API (no embind)
+        // Falls back to main thread if worker fails
         let worker = null;
         let messageId = 0;
         let pendingCallbacks = new Map();
         let totalRecords = 0;
         let totalBytes = 0;
+        let useWorker = true;
+        let currentSource = 'local';
+
+        // Pagination state
+        let currentResults = null;
+        let currentPage = 0;
+        const rowsPerPage = 50;
+
+        // Source colors for visual distinction
+        const sourceColors = {
+            local: '#4ade80',
+            cloud: '#60a5fa',
+            peer: '#fbbf24'
+        };
+
+        // Main thread fallback (uses same C API)
+        let flatsql = null;
+        let db = null;
+
+        const schema = `
+            table User {
+                id: int (id);
+                name: string;
+                email: string (key);
+                age: int;
+            }
+            table Post {
+                id: int (id);
+                user_id: int (key);
+                title: string;
+            }
+        `;
+
+        function buildStream(buffers) {
+            const parts = [];
+            for (const buf of buffers) {
+                const size = new Uint8Array(4);
+                new DataView(size.buffer).setUint32(0, buf.length, true);
+                parts.push(size, buf);
+            }
+            const total = parts.reduce((s, p) => s + p.length, 0);
+            const result = new Uint8Array(total);
+            let offset = 0;
+            for (const p of parts) {
+                result.set(p, offset);
+                offset += p.length;
+            }
+            return result;
+        }
 
         function sendToWorker(action, params = {}) {
             return new Promise((resolve, reject) => {
@@ -964,6 +2271,72 @@ flatsql --schema app.fbs --load data.bin \\
                 pendingCallbacks.set(id, { resolve, reject });
                 worker.postMessage({ id, action, params });
             });
+        }
+
+        const emailProviders = [
+            'gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'icloud.com',
+            'protonmail.com', 'aol.com', 'zoho.com', 'fastmail.com', 'tutanota.com',
+            'yandex.com', 'mail.com', 'gmx.com', 'hey.com', 'pm.me'
+        ];
+
+        function randomProvider(id) {
+            return emailProviders[id % emailProviders.length];
+        }
+
+        // Main thread fallback execution
+        async function executeMainThread(action, params = {}) {
+            if (!flatsql) {
+                const FlatSQLModule = (await import('./flatsql.js')).default;
+                const { initFlatSQL } = await import('./flatsql-api.js');
+                flatsql = await initFlatSQL(FlatSQLModule);
+                db = flatsql.createDatabase(schema, 'demo');
+                db.registerFileId('USER', 'User');
+                db.registerFileId('POST', 'Post');
+                db.enableDemoExtractors();
+            }
+
+            switch (action) {
+                case 'init':
+                    return { success: true };
+
+                case 'query':
+                    return db.query(params.sql);
+
+                case 'streamUsers': {
+                    const { count, startId, source = 'local' } = params;
+                    const buffers = [];
+                    const userData = [];
+                    for (let i = 0; i < count; i++) {
+                        const id = startId + i + 1;
+                        const email = `user${id}@${randomProvider(id)}`;
+                        const fb = flatsql.createTestUser(id, `User${id}`, email, 20 + (id % 50));
+                        buffers.push(fb);
+                        userData.push({ id, name: `User${id}`, email, age: 20 + (id % 50), fb: Array.from(fb) });
+                    }
+                    const stream = buildStream(buffers);
+                    db.ingest(stream, source);
+                    return { count, bytes: stream.length, samples: userData.slice(0, 5) };
+                }
+
+                case 'clear':
+                    if (db) db.destroy();
+                    db = flatsql.createDatabase(schema, 'demo');
+                    db.registerFileId('USER', 'User');
+                    db.registerFileId('POST', 'Post');
+                    db.enableDemoExtractors();
+                    return { success: true };
+
+                default:
+                    throw new Error(`Unknown action: ${action}`);
+            }
+        }
+
+        async function execute(action, params = {}) {
+            if (useWorker && worker) {
+                return sendToWorker(action, params);
+            } else {
+                return executeMainThread(action, params);
+            }
         }
 
         function toHexPreview(arr, maxBytes = 32) {
@@ -974,17 +2347,19 @@ flatsql --schema app.fbs --load data.bin \\
             return bytes.length > maxBytes ? hex + '...' : hex;
         }
 
-        function log(type, data, values = {}) {
+        function log(type, data, values = {}, source = 'local') {
             const container = document.getElementById('streamLog');
             const item = document.createElement('div');
             item.className = 'stream-item';
 
             const hexPreview = Array.isArray(data) ? toHexPreview(data, 24) : '';
             const valuesStr = Object.entries(values).map(([k,v]) => `${k}=${v}`).join(', ');
+            const sourceColor = sourceColors[source] || '#86868b';
 
             item.innerHTML = `
                 <span class="stream-badge">${type.toUpperCase()}</span>
-                <span style="color: var(--text-secondary)">${valuesStr}</span>
+                <span class="source-tag" style="background: ${sourceColor}20; color: ${sourceColor}; padding: 2px 6px; border-radius: 4px; font-size: 9px; font-weight: 600; margin-left: 6px;">${source}</span>
+                <span style="color: var(--text-secondary); margin-left: 8px;">${valuesStr}</span>
                 <div style="font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); margin-top: 4px; word-break: break-all;">${hexPreview}</div>
             `;
             container.insertBefore(item, container.firstChild);
@@ -999,7 +2374,6 @@ flatsql --schema app.fbs --load data.bin \\
         function setButtonsEnabled(enabled) {
             document.getElementById('btnStream1k').disabled = !enabled;
             document.getElementById('btnStream10k').disabled = !enabled;
-            document.getElementById('btnStreamMixed').disabled = !enabled;
             document.getElementById('btnClear').disabled = !enabled;
             document.getElementById('btnQuery').disabled = !enabled;
         }
@@ -1007,9 +2381,10 @@ flatsql --schema app.fbs --load data.bin \\
         async function streamUsers(count) {
             setButtonsEnabled(false);
             const start = performance.now();
+            const source = currentSource;
 
             try {
-                const result = await sendToWorker('streamUsers', { count, startId: totalRecords });
+                const result = await execute('streamUsers', { count, startId: totalRecords, source });
 
                 totalRecords += result.count;
                 totalBytes += result.bytes;
@@ -1018,12 +2393,12 @@ flatsql --schema app.fbs --load data.bin \\
                 document.getElementById('statRate').textContent = Math.round(count / elapsed * 1000).toLocaleString();
 
                 for (const u of result.samples) {
-                    log('User', u.fb, { id: u.id, name: u.name, age: u.age });
+                    log('User', u.fb, { id: u.id, name: u.name, age: u.age }, source);
                 }
                 if (count > 5) {
                     const lastItem = document.createElement('div');
                     lastItem.className = 'stream-item';
-                    lastItem.innerHTML = `<span style="color: var(--text-muted)">... +${count - 5} more records</span>`;
+                    lastItem.innerHTML = `<span style="color: var(--text-muted)">... +${count - 5} more from <span style="color: ${sourceColors[source]}">${source}</span></span>`;
                     document.getElementById('streamLog').insertBefore(lastItem, document.getElementById('streamLog').firstChild);
                 }
 
@@ -1035,36 +2410,6 @@ flatsql --schema app.fbs --load data.bin \\
             }
         }
 
-        async function streamMixed() {
-            setButtonsEnabled(false);
-            const start = performance.now();
-
-            try {
-                const result = await sendToWorker('streamMixed', { startId: totalRecords });
-
-                totalRecords += result.count;
-                totalBytes += result.bytes;
-
-                const elapsed = performance.now() - start;
-                document.getElementById('statRate').textContent = Math.round(result.count / elapsed * 1000).toLocaleString();
-
-                for (const d of result.samples) {
-                    log(d.type, d.fb, { id: d.id, ...(d.userId ? { user_id: d.userId } : {}) });
-                }
-                if (result.count > 8) {
-                    const lastItem = document.createElement('div');
-                    lastItem.className = 'stream-item';
-                    lastItem.innerHTML = `<span style="color: var(--text-muted)">... +${result.count - 8} more records</span>`;
-                    document.getElementById('streamLog').insertBefore(lastItem, document.getElementById('streamLog').firstChild);
-                }
-
-                updateStats();
-            } catch (e) {
-                console.error('Stream error:', e);
-            } finally {
-                setButtonsEnabled(true);
-            }
-        }
 
         function formatCell(col, cell) {
             if (cell === null || cell === undefined) return '<span style="color: var(--text-muted)">NULL</span>';
@@ -1089,6 +2434,61 @@ flatsql --schema app.fbs --load data.bin \\
             return String(cell);
         }
 
+        function renderResultsPage() {
+            if (!currentResults) return;
+
+            const cols = currentResults.columns;
+            const rows = currentResults.rows;
+            const totalPages = Math.ceil(rows.length / rowsPerPage);
+            const startIdx = currentPage * rowsPerPage;
+            const endIdx = Math.min(startIdx + rowsPerPage, rows.length);
+            const pageRows = rows.slice(startIdx, endIdx);
+
+            let html = '<thead><tr>';
+            for (const col of cols) {
+                const style = col.startsWith('_') ? 'font-style: italic;' : '';
+                html += `<th style="${style}">${col}</th>`;
+            }
+            html += '</tr></thead><tbody>';
+
+            for (const row of pageRows) {
+                html += '<tr>';
+                for (let i = 0; i < row.length; i++) {
+                    html += `<td>${formatCell(cols[i], row[i])}</td>`;
+                }
+                html += '</tr>';
+            }
+            html += '</tbody>';
+
+            document.getElementById('resultsSection').style.display = 'block';
+            document.getElementById('resultsTable').innerHTML = html;
+
+            // Update pagination controls
+            const pagination = document.getElementById('pagination');
+            if (rows.length > rowsPerPage) {
+                pagination.style.display = 'flex';
+                document.getElementById('pageInfo').textContent = `Page ${currentPage + 1} of ${totalPages} (${startIdx + 1}-${endIdx} of ${rows.length.toLocaleString()})`;
+                document.getElementById('btnPrevPage').disabled = currentPage === 0;
+                document.getElementById('btnNextPage').disabled = currentPage >= totalPages - 1;
+            } else {
+                pagination.style.display = 'none';
+            }
+        }
+
+        function prevPage() {
+            if (currentPage > 0) {
+                currentPage--;
+                renderResultsPage();
+            }
+        }
+
+        function nextPage() {
+            if (currentResults && currentPage < Math.ceil(currentResults.rows.length / rowsPerPage) - 1) {
+                currentPage++;
+                renderResultsPage();
+            }
+        }
+
         async function runQuery() {
             const sql = document.getElementById('queryInput').value;
             const btn = document.getElementById('btnQuery');
@@ -1098,31 +2498,24 @@ flatsql --schema app.fbs --load data.bin \\
             spinner.classList.add('active');
             setButtonsEnabled(false);
 
+            const start = performance.now();
+
             try {
-                const result = await sendToWorker('query', { sql });
-                const cols = result.columns;
-                const rows = result.rows;
+                const result = await execute('query', { sql });
+                const elapsed = performance.now() - start;
 
-                let html = '<thead><tr>';
-                for (const col of cols) {
-                    const style = col.startsWith('_') ? 'font-style: italic;' : '';
-                    html += `<th style="${style}">${col}</th>`;
-                }
-                html += '</tr></thead><tbody>';
+                currentResults = result;
+                currentPage = 0;
 
-                for (const row of rows) {
-                    html += '<tr>';
-                    for (let i = 0; i < row.length; i++) {
-                        html += `<td>${formatCell(cols[i], row[i])}</td>`;
-                    }
-                    html += '</tr>';
-                }
-                html += '</tbody>';
+                const timeStr = elapsed < 1 ? `${elapsed.toFixed(2)}ms` : `${(elapsed / 1000).toFixed(3)}s`;
+                document.getElementById('queryTime').textContent = `${result.rows.length.toLocaleString()} row${result.rows.length !== 1 ? 's' : ''} in ${timeStr}`;
 
-                document.getElementById('resultsTable').innerHTML = html;
+                renderResultsPage();
             } catch (e) {
+                document.getElementById('resultsSection').style.display = 'block';
                 document.getElementById('resultsTable').innerHTML =
                     `<thead><tr><th style="color: rgba(255,255,255,0.5)">Error: ${e}</th></tr></thead>`;
+                document.getElementById('pagination').style.display = 'none';
                 console.error(e);
             } finally {
                 btn.classList.remove('loading');
@@ -1134,13 +2527,17 @@ flatsql --schema app.fbs --load data.bin \\
         async function clearAll() {
             setButtonsEnabled(false);
             try {
-                await sendToWorker('clear');
+                await execute('clear');
                 totalRecords = 0;
                 totalBytes = 0;
+                currentResults = null;
+                currentPage = 0;
                 document.getElementById('streamLog').innerHTML =
                     '<div style="color: var(--text-muted); text-align: center; padding: 40px;">Cleared</div>';
-                document.getElementById('resultsTable').innerHTML =
-                    '<thead><tr><th colspan="4">Run a query to see results</th></tr></thead>';
+                document.getElementById('resultsSection').style.display = 'none';
+                document.getElementById('resultsTable').innerHTML = '';
+                document.getElementById('pagination').style.display = 'none';
+                document.getElementById('queryTime').textContent = '';
                 updateStats();
                 document.getElementById('statRate').textContent = '-';
             } catch (e) {
@@ -1151,7 +2548,10 @@ flatsql --schema app.fbs --load data.bin \\
         }
 
         async function init() {
+            let mode = 'Main';
+
             try {
+                // Try worker first
                 worker = new Worker(new URL('./flatsql-worker.js', import.meta.url), { type: 'module' });
 
                 worker.onmessage = (e) => {
@@ -1162,41 +2562,64 @@ flatsql --schema app.fbs --load data.bin \\
                         if (success) {
                             callback.resolve(result);
                         } else {
-                            callback.reject(error);
+                            callback.reject(new Error(error));
                         }
                     }
                 };
 
                 worker.onerror = (e) => {
                     console.error('Worker error:', e);
-                    document.getElementById('demoStatus').innerHTML =
-                        `<span style="color: var(--text-muted)">Worker error</span>`;
+                    useWorker = false;
                 };
 
-                await sendToWorker('init');
-
-                document.getElementById('demoStatus').innerHTML =
-                    '<span class="status-dot"></span><span>Ready</span>';
-
-                setButtonsEnabled(true);
-
-                document.getElementById('btnStream1k').onclick = () => streamUsers(1000);
-                document.getElementById('btnStream10k').onclick = () => streamUsers(10000);
-                document.getElementById('btnStreamMixed').onclick = streamMixed;
-                document.getElementById('btnClear').onclick = clearAll;
-                document.getElementById('btnQuery').onclick = runQuery;
-                document.getElementById('queryInput').onkeypress = (e) => {
-                    if (e.key === 'Enter') runQuery();
-                };
-
+                await execute('init');
+                mode = 'Worker';
             } catch (e) {
-                document.getElementById('demoStatus').innerHTML =
-                    `<span style="color: var(--text-muted)">Error: ${e}</span>`;
-                console.error(e);
+                // Fall back to main thread
+                console.warn('Worker failed, using main thread:', e.message);
+                useWorker = false;
+                worker = null;
+                await execute('init');
             }
+
+            document.getElementById('demoStatus').innerHTML =
+                `<span class="status-dot"></span><span>Ready (${mode})</span>`;
+
+            setButtonsEnabled(true);
+
+            document.getElementById('btnStream1k').onclick = () => streamUsers(1000);
+            document.getElementById('btnStream10k').onclick = () => streamUsers(10000);
+            document.getElementById('btnClear').onclick = clearAll;
+            document.getElementById('btnQuery').onclick = runQuery;
+            document.getElementById('btnPrevPage').onclick = prevPage;
+            document.getElementById('btnNextPage').onclick = nextPage;
+            document.getElementById('queryInput').onkeypress = (e) => {
+                if (e.key === 'Enter') runQuery();
+            };
+
+            // Source selector buttons
+            document.querySelectorAll('.source-btn').forEach(btn => {
+                btn.onclick = () => {
+                    document.querySelectorAll('.source-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    currentSource = btn.dataset.source;
+                };
+            });
+
+            // Query example buttons
+            document.querySelectorAll('.query-example-btn').forEach(btn => {
+                btn.onclick = () => {
+                    document.getElementById('queryInput').value = btn.dataset.query;
+                    runQuery();
+                };
+            });
         }
 
-        init();
+        init().catch(e => {
+            document.getElementById('demoStatus').innerHTML =
+                `<span style="color: var(--text-muted)">Error: ${e}</span>`;
+            console.error(e);
+        });
     </script>
 </body>
 </html>

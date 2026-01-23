@@ -1,5 +1,6 @@
-// FlatSQL Web Worker - Handles database operations off the main thread
+// FlatSQL Web Worker - Uses C API (no embind) for worker compatibility
 import FlatSQLModule from './flatsql.js';
+import { initFlatSQL } from './flatsql-api.js';
 
 let flatsql = null;
 let db = null;
@@ -17,12 +18,6 @@ const schema = `
         title: string;
     }
 `;
-
-function toVec(arr) {
-    const vec = new flatsql.VectorUint8();
-    for (const byte of arr) vec.push_back(byte);
-    return vec;
-}
 
 function buildStream(buffers) {
     const parts = [];
@@ -42,8 +37,8 @@ function buildStream(buffers) {
 }
 
 async function init() {
-    flatsql = await FlatSQLModule();
-    db = new flatsql.FlatSQLDatabase(schema, 'demo');
+    flatsql = await initFlatSQL(FlatSQLModule);
+    db = flatsql.createDatabase(schema, 'demo');
     db.registerFileId('USER', 'User');
     db.registerFileId('POST', 'Post');
     db.enableDemoExtractors();
@@ -52,31 +47,27 @@ async function init() {
 
 function query(sql) {
     const result = db.query(sql);
-    const cols = result.getColumns();
-    const rawRows = result.getRows();
-    result.delete();
-
-    // Convert any Uint8Array values to regular arrays for postMessage compatibility
-    const rows = rawRows.map(row =>
-        row.map(cell => {
-            if (cell instanceof Uint8Array) {
-                return Array.from(cell);
-            }
-            return cell;
-        })
-    );
-
-    return { columns: cols, rows: rows };
+    return { columns: result.columns, rows: result.rows };
 }
 
-function streamUsers(count, startId) {
+const emailProviders = [
+    'gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'icloud.com',
+    'protonmail.com', 'aol.com', 'zoho.com', 'fastmail.com', 'tutanota.com',
+    'yandex.com', 'mail.com', 'gmx.com', 'hey.com', 'pm.me'
+];
+
+function randomProvider(id) {
+    return emailProviders[id % emailProviders.length];
+}
+
+function streamUsers(count, startId, source = 'local') {
     const buffers = [];
     const userData = [];
 
     for (let i = 0; i < count; i++) {
         const id = startId + i + 1;
         const name = `User${id}`;
-        const email = `user${id}@test.com`;
+        const email = `user${id}@${randomProvider(id)}`;
         const age = 20 + (id % 50);
 
         const fb = flatsql.createTestUser(id, name, email, age);
@@ -85,9 +76,7 @@ function streamUsers(count, startId) {
     }
 
     const stream = buildStream(buffers);
-    const vec = toVec(stream);
-    db.ingest(vec);
-    vec.delete();
+    db.ingest(stream, source);
 
     return {
         count: count,
@@ -96,39 +85,9 @@ function streamUsers(count, startId) {
     };
 }
 
-function streamMixed(startId) {
-    const buffers = [];
-    const logData = [];
-
-    for (let i = 0; i < 10; i++) {
-        const userId = startId + i + 1;
-        const userFb = flatsql.createTestUser(userId, `MixedUser${userId}`, `mixed${userId}@test.com`, 25 + i);
-        buffers.push(userFb);
-        logData.push({ type: 'User', id: userId, fb: Array.from(userFb) });
-
-        for (let j = 0; j < 3; j++) {
-            const postId = userId * 100 + j;
-            const postFb = flatsql.createTestPost(postId, userId, `Post ${postId} by user ${userId}`);
-            buffers.push(postFb);
-            logData.push({ type: 'Post', id: postId, userId, fb: Array.from(postFb) });
-        }
-    }
-
-    const stream = buildStream(buffers);
-    const vec = toVec(stream);
-    db.ingest(vec);
-    vec.delete();
-
-    return {
-        count: buffers.length,
-        bytes: stream.length,
-        samples: logData.slice(0, 8)
-    };
-}
-
 function clearAll() {
-    if (db) db.delete();
-    db = new flatsql.FlatSQLDatabase(schema, 'demo');
+    if (db) db.destroy();
+    db = flatsql.createDatabase(schema, 'demo');
     db.registerFileId('USER', 'User');
     db.registerFileId('POST', 'Post');
     db.enableDemoExtractors();
@@ -150,10 +109,7 @@ self.onmessage = async function(e) {
                 result = query(params.sql);
                 break;
             case 'streamUsers':
-                result = streamUsers(params.count, params.startId);
-                break;
-            case 'streamMixed':
-                result = streamMixed(params.startId);
+                result = streamUsers(params.count, params.startId, params.source);
                 break;
             case 'clear':
                 result = clearAll();
