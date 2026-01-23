@@ -100,6 +100,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             -s FILESYSTEM=0 \
             -s ENVIRONMENT='web,worker,node' \
             -s SINGLE_FILE=0 \
+            -s ALLOW_TABLE_GROWTH=1 \
             -fexceptions \
             --bind \
         "

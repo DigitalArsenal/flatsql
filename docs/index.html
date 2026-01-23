@@ -210,8 +210,26 @@
 
         .features-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            grid-template-columns: repeat(3, 1fr);
             gap: 24px;
+            justify-items: center;
+        }
+
+        .features-grid .feature-card {
+            width: 100%;
+            max-width: 320px;
+        }
+
+        @media (max-width: 900px) {
+            .features-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 600px) {
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
         }
 
         .feature-card {
@@ -223,6 +241,7 @@
             display: flex;
             flex-direction: column;
             justify-content: flex-end;
+            border: 1px solid rgba(255, 255, 255, 0.15);
         }
 
         .feature-card video {
@@ -283,7 +302,7 @@
                 linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
             background-size: 40px 40px;
             z-index: 1;
-            animation: gridMove 20s linear infinite;
+            animation: gridMove 200s linear infinite;
         }
 
         @keyframes gridMove {
@@ -304,16 +323,16 @@
             transform: translate(-50%, -50%);
             border: 2px solid rgba(255, 255, 255, 0.2);
             border-radius: 50%;
-            animation: pulseRing 3s ease-out infinite;
+            animation: pulseRing 30s ease-out infinite;
             z-index: 1;
         }
 
         .feature-card-highlight .pulse-ring:nth-child(2) {
-            animation-delay: 1s;
+            animation-delay: 10s;
         }
 
         .feature-card-highlight .pulse-ring:nth-child(3) {
-            animation-delay: 2s;
+            animation-delay: 20s;
         }
 
         @keyframes pulseRing {
@@ -855,22 +874,28 @@ db.<span class="function">registerFileId</span>(<span class="string">"POST"</spa
             return videoUrls[Math.floor(Math.random() * videoUrls.length)];
         }
 
-        function loadHlsVideo(videoElement, url) {
+        function loadHlsVideo(videoElement, url, slowMode = false) {
+            const setSlowPlayback = () => {
+                if (slowMode) videoElement.playbackRate = 0.1;
+            };
+
             if (Hls.isSupported()) {
                 const hls = new Hls();
                 hls.loadSource(url);
                 hls.attachMedia(videoElement);
+                hls.on(Hls.Events.MANIFEST_PARSED, setSlowPlayback);
             } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
                 videoElement.src = url;
+                videoElement.addEventListener('loadedmetadata', setSlowPlayback);
             }
         }
 
-        // Load fixed page background video
-        loadHlsVideo(document.getElementById('pageVideoBg'), videoUrls[3]);
+        // Load fixed page background video (slow)
+        loadHlsVideo(document.getElementById('pageVideoBg'), videoUrls[3], true);
 
-        // Load feature card videos (skip cards without video elements)
+        // Load feature card videos (slow)
         document.querySelectorAll('.feature-video').forEach(video => {
-            loadHlsVideo(video, getRandomVideo());
+            loadHlsVideo(video, getRandomVideo(), true);
         });
 
         // Code tabs
