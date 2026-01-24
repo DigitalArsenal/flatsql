@@ -9,7 +9,6 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <style>
         /* Reset */
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -2205,41 +2204,36 @@ db.<span class="function">registerSource</span>(<span class="string">"ground-sta
     </footer>
 
     <script>
-        // Video URLs for backgrounds
+        // Local video files for backgrounds
         const videoUrls = [
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/90bb1b34646b81b3b63e5a854ea00da3/manifest/video.m3u8",
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/df176a2fb2ea2b64bd21ae1c10d3af6a/manifest/video.m3u8",
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/12a9780eeb1ea015801a5f55cf2e9d3d/manifest/video.m3u8",
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/964cb3eddff1a67e3772aac9a7aceea2/manifest/video.m3u8",
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/dd17599dfa77f41517133fa7a4967535/manifest/video.m3u8",
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/408ad52e3f15bc8f01ae69d194a8cf3a/manifest/video.m3u8",
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/e923e67d71fed3e0853ec57f0348451e/manifest/video.m3u8",
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/136a8a211c6c3b1cc1fd7b1c7d836c58/manifest/video.m3u8",
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/c9ddd33ac3d964e5d33b31ce849e8f95/manifest/video.m3u8",
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/257c7359efd4b4aaebcc03aa8fc78a36/manifest/video.m3u8",
-            "https://customer-cbeadsgr09pnsezs.cloudflarestream.com/697945ca6b876878dba3b23fbd2f1561/manifest/video.m3u8"
+            "videos/video1.mp4",
+            "videos/video2.mp4",
+            "videos/video3.mp4",
+            "videos/video4.mp4",
+            "videos/video5.mp4",
+            "videos/video6.mp4",
+            "videos/video7.mp4",
+            "videos/video8.mp4",
+            "videos/video9.mp4",
+            "videos/video10.mp4",
+            "videos/video11.mp4"
         ];
 
         function getRandomVideo() {
             return videoUrls[Math.floor(Math.random() * videoUrls.length)];
         }
 
-        function loadHlsVideo(videoElement, url) {
-            if (Hls.isSupported()) {
-                const hls = new Hls();
-                hls.loadSource(url);
-                hls.attachMedia(videoElement);
-            } else if (videoElement.canPlayType('application/vnd.apple.mpegurl')) {
-                videoElement.src = url;
-            }
+        function loadVideo(videoElement, url) {
+            videoElement.src = url;
+            videoElement.load();
         }
 
         // Load fixed page background video
-        loadHlsVideo(document.getElementById('pageVideoBg'), videoUrls[3]);
+        loadVideo(document.getElementById('pageVideoBg'), videoUrls[3]);
 
         // Load feature card videos
         document.querySelectorAll('.feature-video').forEach(video => {
-            loadHlsVideo(video, getRandomVideo());
+            loadVideo(video, getRandomVideo());
         });
 
         // Code tabs
