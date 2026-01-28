@@ -1,0 +1,375 @@
+// Wallet Schema for Space Data Network
+// Defines HD wallet storage structures for key management
+//
+// Security Note: Private keys and seeds should be encrypted before storage
+// using AES-256-GCM with a key derived from user passphrase via Argon2.
+
+namespace sdn.wallet;
+
+// Declare custom attributes for indexing
+attribute "index";
+
+// =============================================================================
+// Enums
+// =============================================================================
+
+/// Source of wallet creation
+enum WalletSource : byte {
+  /// Software-generated mnemonic
+  SOFTWARE = 0,
+  /// Imported from hardware wallet
+  HARDWARE = 1,
+  /// Imported from external source (mnemonic or private key)
+  IMPORTED = 2,
+  /// Watch-only wallet (public keys only)
+  WATCH_ONLY = 3
+}
+
+/// Network environment
+enum Network : byte {
+  MAINNET = 0,
+  TESTNET = 1,
+  DEVNET = 2
+}
+
+/// Key purpose within BIP-44 derivation
+enum KeyPurpose : byte {
+  /// Ed25519 signing key (change index 0)
+  SIGNING = 0,
+  /// X25519 encryption key (change index 1)
+  ENCRYPTION = 1,
+  /// Generic derivation (master key)
+  DERIVATION = 2
+}
+
+/// Transaction status
+enum TransactionStatus : byte {
+  PENDING = 0,
+  CONFIRMED = 1,
+  FAILED = 2,
+  CANCELLED = 3
+}
+
+/// Key algorithm
+enum KeyAlgorithm : byte {
+  ED25519 = 0,
+  X25519 = 1,
+  SECP256K1 = 2,
+  P256 = 3
+}
+
+// =============================================================================
+// Tables
+// =============================================================================
+
+/// Master wallet containing encrypted seed
+table Wallet {
+  /// Unique wallet identifier (UUID)
+  id: string (key);
+
+  /// User-friendly wallet name
+  name: string;
+
+  /// How the wallet was created
+  source: WalletSource;
+
+  /// Encrypted seed (AES-256-GCM encrypted 64-byte seed)
+  /// Format: [12-byte nonce][encrypted data][16-byte auth tag]
+  encrypted_seed: [ubyte];
+
+  /// BIP-32 master fingerprint (first 4 bytes of master public key hash)
+  /// Used to identify the wallet without exposing keys
+  master_fingerprint: uint32;
+
+  /// Argon2 salt for key derivation (16 bytes)
+  /// Used with user passphrase to derive encryption key
+  kdf_salt: [ubyte];
+
+  /// Argon2 parameters
+  kdf_iterations: uint32 = 3;
+  kdf_memory_kb: uint32 = 65536;
+  kdf_parallelism: uint32 = 4;
+
+  /// Creation timestamp (Unix milliseconds)
+  created_at: int64;
+
+  /// Last modified timestamp
+  modified_at: int64;
+
+  /// Wallet metadata (JSON)
+  metadata: string;
+
+  /// Soft delete flag
+  deleted: bool = false;
+}
+
+/// Derived account within a wallet
+table Account {
+  /// Unique account identifier (UUID)
+  id: string (key);
+
+  /// Parent wallet ID
+  wallet_id: string (index);
+
+  /// BIP-44 purpose (44 for standard)
+  purpose: uint32 = 44;
+
+  /// SLIP-44 coin type (9999 for SDN)
+  coin_type: uint32 = 9999;
+
+  /// Account index (hardened)
+  account_index: uint32;
+
+  /// Full derivation path (e.g., "m/44'/9999'/0'")
+  derivation_path: string;
+
+  /// Compressed public key (33 bytes for secp256k1, 32 for Ed25519)
+  public_key: [ubyte];
+
+  /// Key purpose
+  key_purpose: KeyPurpose;
+
+  /// Key algorithm
+  algorithm: KeyAlgorithm = ED25519;
+
+  /// Network this account is for
+  network: Network = MAINNET;
+
+  /// Account name/label
+  name: string;
+
+  /// Creation timestamp
+  created_at: int64;
+
+  /// Is this the default account?
+  is_default: bool = false;
+
+  /// Soft delete flag
+  deleted: bool = false;
+}
+
+/// Individual address derived from an account
+table Address {
+  /// Unique address identifier (UUID)
+  id: string (key);
+
+  /// Parent account ID
+  account_id: string (index);
+
+  /// The address string (format depends on network/coin)
+  address: string (index);
+
+  /// Change index (0 = external, 1 = internal/change)
+  change: uint32 = 0;
+
+  /// Address index within change level
+  address_index: uint32;
+
+  /// Full derivation path
+  derivation_path: string;
+
+  /// Public key for this address (32 bytes for Ed25519)
+  public_key: [ubyte];
+
+  /// Address label/name
+  label: string;
+
+  /// Creation timestamp
+  created_at: int64;
+
+  /// Last used timestamp
+  last_used_at: int64;
+
+  /// Is this address used (has received transactions)?
+  is_used: bool = false;
+
+  /// Soft delete flag
+  deleted: bool = false;
+}
+
+/// Transaction record
+table Transaction {
+  /// Unique transaction identifier (UUID)
+  id: string (key);
+
+  /// Associated wallet ID
+  wallet_id: string (index);
+
+  /// Network transaction hash
+  tx_hash: string (index);
+
+  /// Network
+  network: Network;
+
+  /// Transaction amount as string (to preserve precision)
+  amount: string;
+
+  /// Source address
+  from_address: string;
+
+  /// Destination address
+  to_address: string;
+
+  /// Transaction status
+  status: TransactionStatus;
+
+  /// Block number (0 if pending)
+  block_number: uint64;
+
+  /// Block timestamp (0 if pending)
+  block_timestamp: int64;
+
+  /// Gas/fee used
+  fee: string;
+
+  /// Transaction nonce
+  nonce: uint64;
+
+  /// Transaction data/memo (hex encoded if binary)
+  data: string;
+
+  /// Creation timestamp (when we recorded it)
+  created_at: int64;
+
+  /// Last status update
+  updated_at: int64;
+
+  /// Transaction metadata (JSON)
+  metadata: string;
+}
+
+/// Peer identity (libp2p peer derived from wallet)
+table PeerIdentity {
+  /// Unique identifier (UUID)
+  id: string (key);
+
+  /// Associated account ID (the signing key account)
+  account_id: string (index);
+
+  /// libp2p Peer ID string
+  peer_id: string (index);
+
+  /// Signing public key (Ed25519, 32 bytes)
+  signing_public_key: [ubyte];
+
+  /// Encryption public key (X25519, 32 bytes)
+  encryption_public_key: [ubyte];
+
+  /// Account index used for this identity
+  account_index: uint32;
+
+  /// Derivation paths
+  signing_key_path: string;
+  encryption_key_path: string;
+
+  /// Is this the active/primary identity?
+  is_active: bool = false;
+
+  /// Creation timestamp
+  created_at: int64;
+
+  /// Last used timestamp
+  last_used_at: int64;
+
+  /// Identity metadata (JSON)
+  metadata: string;
+}
+
+/// Wallet backup record
+table WalletBackup {
+  /// Unique backup identifier (UUID)
+  id: string (key);
+
+  /// Associated wallet ID
+  wallet_id: string (index);
+
+  /// Backup timestamp
+  backup_at: int64;
+
+  /// Backup format version
+  format_version: uint32 = 1;
+
+  /// Encrypted backup data (full wallet export)
+  encrypted_data: [ubyte];
+
+  /// Checksum of unencrypted data (for verification)
+  checksum: string;
+
+  /// Backup location/description
+  location: string;
+
+  /// Was this backup verified (restored and checked)?
+  verified: bool = false;
+
+  /// Verification timestamp
+  verified_at: int64;
+}
+
+/// Key derivation cache (for performance)
+table DerivedKeyCache {
+  /// Unique identifier (hash of path + wallet fingerprint)
+  id: string (key);
+
+  /// Wallet master fingerprint
+  wallet_fingerprint: uint32 (index);
+
+  /// Full derivation path
+  derivation_path: string (index);
+
+  /// Cached public key
+  public_key: [ubyte];
+
+  /// Chain code (for further derivation)
+  chain_code: [ubyte];
+
+  /// Key algorithm
+  algorithm: KeyAlgorithm;
+
+  /// Cache timestamp
+  cached_at: int64;
+
+  /// Cache expiry timestamp (0 = never expires)
+  expires_at: int64;
+}
+
+// =============================================================================
+// Root Types
+// =============================================================================
+
+/// Root table for wallet storage file
+table WalletStore {
+  /// Store version
+  version: uint32 = 1;
+
+  /// All wallets
+  wallets: [Wallet];
+
+  /// All accounts
+  accounts: [Account];
+
+  /// All addresses
+  addresses: [Address];
+
+  /// Recent transactions
+  transactions: [Transaction];
+
+  /// Peer identities
+  peer_identities: [PeerIdentity];
+
+  /// Backups
+  backups: [WalletBackup];
+
+  /// Key cache
+  key_cache: [DerivedKeyCache];
+
+  /// Store creation timestamp
+  created_at: int64;
+
+  /// Store last modified timestamp
+  modified_at: int64;
+}
+
+root_type WalletStore;
+
+file_identifier "SDNW";
+file_extension "wallet";
