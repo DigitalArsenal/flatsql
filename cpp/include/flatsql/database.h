@@ -6,6 +6,7 @@
 #include "flatsql/sqlite_index.h"
 #include "flatsql/schema_parser.h"
 #include "flatsql/sqlite_engine.h"
+#include "flatbuffers/encryption.h"
 #include <set>
 
 namespace flatsql {
@@ -309,6 +310,69 @@ public:
      */
     void clearTombstones(const std::string& tableName);
 
+    // ==================== Encryption API ====================
+
+    /**
+     * Set the encryption key for field-level FlatBuffer decryption.
+     * Fields marked with (encrypted) in the schema will be transparently
+     * decrypted when read through SQL queries.
+     *
+     * @param key     32-byte AES-256 key
+     * @param keySize Must be 32
+     */
+    void setEncryptionKey(const uint8_t* key, size_t keySize);
+
+    /**
+     * Check if encryption is enabled.
+     */
+    bool isEncrypted() const { return encryptionCtx_ != nullptr; }
+
+    /**
+     * Get the encryption context (for vtab layer).
+     */
+    const flatbuffers::EncryptionContext* getEncryptionContext() const {
+        return encryptionCtx_.get();
+    }
+
+    /**
+     * Check if any table has encrypted fields.
+     */
+    bool hasEncryptedFields() const;
+
+    // ==================== HMAC Authentication ====================
+
+    /**
+     * Enable HMAC verification on ingest.
+     * When enabled, ingestOne() will reject buffers that fail HMAC verification.
+     * Requires an encryption key to be set first.
+     *
+     * @param enabled  true to enable, false to disable
+     */
+    void setHMACVerification(bool enabled);
+
+    /**
+     * Check if HMAC verification is enabled.
+     */
+    bool isHMACVerificationEnabled() const { return hmacEnabled_; }
+
+    /**
+     * Compute HMAC-SHA256 for a FlatBuffer.
+     * @param buffer    FlatBuffer data
+     * @param length    Buffer length
+     * @param outMAC    Output: 32-byte HMAC (caller must provide 32 bytes)
+     * @return true on success
+     */
+    bool computeHMAC(const uint8_t* buffer, size_t length, uint8_t* outMAC) const;
+
+    /**
+     * Verify HMAC-SHA256 for a FlatBuffer.
+     * @param buffer    FlatBuffer data
+     * @param length    Buffer length
+     * @param mac       32-byte HMAC to verify
+     * @return true if MAC is valid
+     */
+    bool verifyHMAC(const uint8_t* buffer, size_t length, const uint8_t* mac) const;
+
 private:
     // Callback for streaming ingest - routes to correct table and builds indexes
     void onIngest(std::string_view fileId, const uint8_t* data, size_t length,
@@ -353,6 +417,12 @@ private:
 
     // Track which tables have been registered with SQLite
     std::set<std::string> sqliteRegisteredTables_;
+
+    // Encryption
+    std::unique_ptr<flatbuffers::EncryptionContext> encryptionCtx_;
+
+    // HMAC verification
+    bool hmacEnabled_ = false;
 };
 
 }  // namespace flatsql

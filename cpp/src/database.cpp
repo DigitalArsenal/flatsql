@@ -2,6 +2,10 @@
 #include <algorithm>
 #include <stdexcept>
 
+#ifdef FLATSQL_HAVE_OPENSSL
+#include <openssl/hmac.h>
+#endif
+
 namespace flatsql {
 
 // ==================== TableStore ====================
@@ -239,6 +243,15 @@ void FlatSQLDatabase::updateSQLiteTable(const std::string& tableName) {
         tableStore->getBatchExtractor(),
         &tableStore->getRecordInfos()
     );
+
+    // Propagate encryption context to the registered source
+    if (encryptionCtx_) {
+        auto* sourceInfo = sqliteEngine_->getSource(tableName);
+        if (sourceInfo) {
+            sourceInfo->encryptionCtx = encryptionCtx_.get();
+            sourceInfo->vtabInfo.encryptionCtx = encryptionCtx_.get();
+        }
+    }
 
     sqliteRegisteredTables_.insert(tableName);
 }
@@ -603,6 +616,60 @@ size_t FlatSQLDatabase::getDeletedCount(const std::string& tableName) const {
 
 void FlatSQLDatabase::clearTombstones(const std::string& tableName) {
     sqliteEngine_->clearTombstones(tableName);
+}
+
+// ==================== Encryption ====================
+
+void FlatSQLDatabase::setEncryptionKey(const uint8_t* key, size_t keySize) {
+    encryptionCtx_ = std::make_unique<flatbuffers::EncryptionContext>(key, keySize);
+}
+
+bool FlatSQLDatabase::hasEncryptedFields() const {
+    for (const auto& table : schema_.tables) {
+        for (const auto& col : table.columns) {
+            if (col.encrypted) return true;
+        }
+    }
+    return false;
+}
+
+// ==================== HMAC Authentication ====================
+
+void FlatSQLDatabase::setHMACVerification(bool enabled) {
+    if (enabled && !encryptionCtx_) {
+        throw std::runtime_error("Cannot enable HMAC verification without an encryption key");
+    }
+    hmacEnabled_ = enabled;
+}
+
+bool FlatSQLDatabase::computeHMAC(const uint8_t* buffer, size_t length, uint8_t* outMAC) const {
+    if (!encryptionCtx_) return false;
+#ifdef FLATSQL_HAVE_OPENSSL
+    const uint8_t* key = encryptionCtx_->GetKey();
+    unsigned int macLen = 32;
+    HMAC(EVP_sha256(), key, 32, buffer, length, outMAC, &macLen);
+    return true;
+#else
+    (void)buffer; (void)length; (void)outMAC;
+    return false;
+#endif
+}
+
+bool FlatSQLDatabase::verifyHMAC(const uint8_t* buffer, size_t length, const uint8_t* mac) const {
+    if (!encryptionCtx_) return false;
+#ifdef FLATSQL_HAVE_OPENSSL
+    uint8_t computed[32];
+    computeHMAC(buffer, length, computed);
+    // Constant-time comparison to prevent timing attacks
+    uint8_t diff = 0;
+    for (int i = 0; i < 32; i++) {
+        diff |= computed[i] ^ mac[i];
+    }
+    return diff == 0;
+#else
+    (void)buffer; (void)length; (void)mac;
+    return false;
+#endif
 }
 
 }  // namespace flatsql

@@ -142,6 +142,69 @@ export interface FlatSQLDatabase {
    * Destroy the database and free memory
    */
   destroy(): void;
+
+  // ==================== Encryption ====================
+
+  /**
+   * Set the encryption key for field-level FlatBuffer decryption.
+   * Fields marked with (encrypted) in the schema will be transparently
+   * decrypted when read through SQL queries.
+   * @param key 32-byte AES-256 key
+   */
+  setEncryptionKey(key: Uint8Array): void;
+
+  /**
+   * Check if encryption is enabled
+   */
+  isEncrypted(): boolean;
+
+  /**
+   * Encrypt a FlatBuffer using the database's encryption key
+   * @param buffer FlatBuffer data
+   * @param schema Binary schema (.bfbs)
+   * @returns Encrypted buffer copy
+   */
+  encryptBuffer(buffer: Uint8Array, schema: Uint8Array): Uint8Array;
+
+  /**
+   * Decrypt a FlatBuffer using the database's encryption key
+   * @param buffer Encrypted FlatBuffer data
+   * @param schema Binary schema (.bfbs)
+   * @returns Decrypted buffer copy
+   */
+  decryptBuffer(buffer: Uint8Array, schema: Uint8Array): Uint8Array;
+
+  // ==================== HMAC Authentication ====================
+
+  /**
+   * Enable or disable HMAC-SHA256 verification on ingest.
+   * When enabled, buffers can be verified for integrity before processing.
+   * Requires an encryption key to be set first.
+   * @param enabled true to enable, false to disable
+   */
+  setHMACVerification(enabled: boolean): void;
+
+  /**
+   * Check if HMAC verification is enabled
+   */
+  isHMACEnabled(): boolean;
+
+  /**
+   * Compute HMAC-SHA256 for a FlatBuffer.
+   * Use this to sign buffers before transmission/storage.
+   * @param buffer FlatBuffer data
+   * @returns 32-byte HMAC
+   */
+  computeHMAC(buffer: Uint8Array): Uint8Array;
+
+  /**
+   * Verify HMAC-SHA256 for a FlatBuffer.
+   * Use this to verify buffer integrity before ingestion.
+   * @param buffer FlatBuffer data
+   * @param mac 32-byte HMAC to verify against
+   * @returns true if the MAC is valid
+   */
+  verifyHMAC(buffer: Uint8Array, mac: Uint8Array): boolean;
 }
 
 export interface FlatSQL {

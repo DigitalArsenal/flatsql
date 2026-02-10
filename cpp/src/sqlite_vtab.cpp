@@ -1,8 +1,60 @@
 #include "flatsql/sqlite_vtab.h"
+#include "flatbuffers/encryption.h"
 #include <cstring>
 #include <sstream>
 
 namespace flatsql {
+
+// Decrypt a column value in-place using the FlatBuffer field-level encryption scheme
+static void decryptColumnValue(Value& value,
+                                const flatbuffers::EncryptionContext& ctx,
+                                uint16_t fieldId) {
+    if (auto* s = std::get_if<std::string>(&value)) {
+        if (!s->empty()) {
+            flatbuffers::DecryptString(
+                reinterpret_cast<uint8_t*>(s->data()),
+                s->size(), ctx, fieldId);
+        }
+    } else if (auto* i64 = std::get_if<int64_t>(&value)) {
+        flatbuffers::DecryptScalar(
+            reinterpret_cast<uint8_t*>(i64), sizeof(int64_t), ctx, fieldId);
+    } else if (auto* i32 = std::get_if<int32_t>(&value)) {
+        flatbuffers::DecryptScalar(
+            reinterpret_cast<uint8_t*>(i32), sizeof(int32_t), ctx, fieldId);
+    } else if (auto* d = std::get_if<double>(&value)) {
+        flatbuffers::DecryptScalar(
+            reinterpret_cast<uint8_t*>(d), sizeof(double), ctx, fieldId);
+    } else if (auto* f = std::get_if<float>(&value)) {
+        flatbuffers::DecryptScalar(
+            reinterpret_cast<uint8_t*>(f), sizeof(float), ctx, fieldId);
+    } else if (auto* u64 = std::get_if<uint64_t>(&value)) {
+        flatbuffers::DecryptScalar(
+            reinterpret_cast<uint8_t*>(u64), sizeof(uint64_t), ctx, fieldId);
+    } else if (auto* u32 = std::get_if<uint32_t>(&value)) {
+        flatbuffers::DecryptScalar(
+            reinterpret_cast<uint8_t*>(u32), sizeof(uint32_t), ctx, fieldId);
+    } else if (auto* i16 = std::get_if<int16_t>(&value)) {
+        flatbuffers::DecryptScalar(
+            reinterpret_cast<uint8_t*>(i16), sizeof(int16_t), ctx, fieldId);
+    } else if (auto* u16 = std::get_if<uint16_t>(&value)) {
+        flatbuffers::DecryptScalar(
+            reinterpret_cast<uint8_t*>(u16), sizeof(uint16_t), ctx, fieldId);
+    } else if (auto* i8 = std::get_if<int8_t>(&value)) {
+        flatbuffers::DecryptScalar(
+            reinterpret_cast<uint8_t*>(i8), sizeof(int8_t), ctx, fieldId);
+    } else if (auto* u8val = std::get_if<uint8_t>(&value)) {
+        flatbuffers::DecryptScalar(
+            reinterpret_cast<uint8_t*>(u8val), sizeof(uint8_t), ctx, fieldId);
+    } else if (auto* blob = std::get_if<std::vector<uint8_t>>(&value)) {
+        if (!blob->empty()) {
+            uint8_t key[flatbuffers::kEncryptionKeySize];
+            uint8_t iv[flatbuffers::kEncryptionIVSize];
+            ctx.DeriveFieldKey(fieldId, key);
+            ctx.DeriveFieldIV(fieldId, iv);
+            flatbuffers::DecryptBytes(blob->data(), blob->size(), key, iv);
+        }
+    }
+}
 
 // Static module instance
 sqlite3_module FlatBufferVTabModule::module_ = {
@@ -127,6 +179,7 @@ int FlatBufferVTabModule::xConnect(sqlite3* db, void* pAux, int argc, const char
     vtab->indexes = info->indexes;
     vtab->tombstones = info->tombstones;
     vtab->sourceRecordInfos = info->sourceRecordInfos;
+    vtab->encryptionCtx = info->encryptionCtx;
     vtab->sourceColumnIndex = static_cast<int>(tableDef.columns.size());  // _source is first virtual column
 
     *ppVTab = vtab;
@@ -680,8 +733,9 @@ int FlatBufferVTabModule::xColumn(sqlite3_vtab_cursor* pCursor, sqlite3_context*
     FlatBufferCursor* cursor = static_cast<FlatBufferCursor*>(pCursor);
 
     // Fast path: regular column with fast extractor (most common case)
-    // Uses cached values to minimize pointer chases
-    if (N >= 0 && N < cursor->numRealColumns && cursor->currentData && cursor->cachedFastExtractor) {
+    // Skip fast path when encryption is active - must go through cache for decryption
+    if (N >= 0 && N < cursor->numRealColumns && cursor->currentData
+        && cursor->cachedFastExtractor && !cursor->vtab->encryptionCtx) {
         if (cursor->cachedFastExtractor(cursor->currentData, cursor->currentLength, N, ctx)) {
             return SQLITE_OK;
         }
@@ -729,6 +783,18 @@ int FlatBufferVTabModule::xColumn(sqlite3_vtab_cursor* pCursor, sqlite3_context*
             cursor->columnCache[i] = vtab->extractor(cursor->currentData, cursor->currentLength,
                                                       vtab->tableDef->columns[i].name);
         }
+
+        // Decrypt encrypted columns if encryption context is present
+        if (vtab->encryptionCtx) {
+            for (int i = 0; i < numRealColumns; i++) {
+                if (vtab->tableDef->columns[i].encrypted) {
+                    decryptColumnValue(cursor->columnCache[i],
+                                       *vtab->encryptionCtx,
+                                       vtab->tableDef->columns[i].fieldId);
+                }
+            }
+        }
+
         cursor->cacheValid = true;
     }
 

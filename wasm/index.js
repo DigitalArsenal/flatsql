@@ -255,6 +255,18 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
         markDeleted: Module.cwrap('flatsql_mark_deleted', null, ['number', 'string', 'number']),
         getDeletedCount: Module.cwrap('flatsql_get_deleted_count', 'number', ['number', 'string']),
         clearTombstones: Module.cwrap('flatsql_clear_tombstones', null, ['number', 'string']),
+
+        // Encryption
+        setEncryptionKey: Module.cwrap('flatsql_set_encryption_key', 'number', ['number', 'number', 'number']),
+        isEncrypted: Module.cwrap('flatsql_is_encrypted', 'number', ['number']),
+        encryptBuffer: Module.cwrap('flatsql_encrypt_buffer', 'number', ['number', 'number', 'number', 'number', 'number']),
+        decryptBuffer: Module.cwrap('flatsql_decrypt_buffer', 'number', ['number', 'number', 'number', 'number', 'number']),
+
+        // HMAC Authentication
+        setHMACVerification: Module.cwrap('flatsql_set_hmac_verification', 'number', ['number', 'number']),
+        isHMACEnabled: Module.cwrap('flatsql_is_hmac_enabled', 'number', ['number']),
+        computeHMAC: Module.cwrap('flatsql_compute_hmac', 'number', ['number', 'number', 'number', 'number']),
+        verifyHMAC: Module.cwrap('flatsql_verify_hmac', 'number', ['number', 'number', 'number', 'number']),
     };
 
     return new FlatSQL();
@@ -457,6 +469,120 @@ export class FlatSQLDatabase {
 
     clearTombstones(tableName) {
         api.clearTombstones(this._handle, tableName);
+    }
+
+    // ==================== Encryption API ====================
+
+    /**
+     * Set the encryption key for field-level FlatBuffer decryption.
+     * @param {Uint8Array} key - 32-byte AES-256 key
+     */
+    setEncryptionKey(key) {
+        const ptr = Module._malloc(key.length);
+        Module.HEAPU8.set(key, ptr);
+        const result = api.setEncryptionKey(this._handle, ptr, key.length);
+        Module._free(ptr);
+        if (!result) throw new Error(api.getError());
+    }
+
+    /**
+     * Check if encryption is enabled.
+     * @returns {boolean}
+     */
+    isEncrypted() {
+        return api.isEncrypted(this._handle) !== 0;
+    }
+
+    /**
+     * Encrypt a FlatBuffer in-place using the database's encryption key.
+     * @param {Uint8Array} buffer - FlatBuffer data
+     * @param {Uint8Array} schema - Binary schema (.bfbs)
+     * @returns {Uint8Array} Encrypted buffer (copy)
+     */
+    encryptBuffer(buffer, schema) {
+        const bufPtr = Module._malloc(buffer.length);
+        Module.HEAPU8.set(buffer, bufPtr);
+        const schemaPtr = Module._malloc(schema.length);
+        Module.HEAPU8.set(schema, schemaPtr);
+        const result = api.encryptBuffer(this._handle, bufPtr, buffer.length, schemaPtr, schema.length);
+        const encrypted = new Uint8Array(Module.HEAPU8.buffer, bufPtr, buffer.length).slice();
+        Module._free(bufPtr);
+        Module._free(schemaPtr);
+        if (!result) throw new Error(api.getError());
+        return encrypted;
+    }
+
+    /**
+     * Decrypt a FlatBuffer in-place using the database's encryption key.
+     * @param {Uint8Array} buffer - Encrypted FlatBuffer data
+     * @param {Uint8Array} schema - Binary schema (.bfbs)
+     * @returns {Uint8Array} Decrypted buffer (copy)
+     */
+    decryptBuffer(buffer, schema) {
+        const bufPtr = Module._malloc(buffer.length);
+        Module.HEAPU8.set(buffer, bufPtr);
+        const schemaPtr = Module._malloc(schema.length);
+        Module.HEAPU8.set(schema, schemaPtr);
+        const result = api.decryptBuffer(this._handle, bufPtr, buffer.length, schemaPtr, schema.length);
+        const decrypted = new Uint8Array(Module.HEAPU8.buffer, bufPtr, buffer.length).slice();
+        Module._free(bufPtr);
+        Module._free(schemaPtr);
+        if (!result) throw new Error(api.getError());
+        return decrypted;
+    }
+
+    // ==================== HMAC Authentication API ====================
+
+    /**
+     * Enable or disable HMAC verification on ingest.
+     * Requires an encryption key to be set first.
+     * @param {boolean} enabled
+     */
+    setHMACVerification(enabled) {
+        const result = api.setHMACVerification(this._handle, enabled ? 1 : 0);
+        if (!result) throw new Error(api.getError());
+    }
+
+    /**
+     * Check if HMAC verification is enabled.
+     * @returns {boolean}
+     */
+    isHMACEnabled() {
+        return api.isHMACEnabled(this._handle) !== 0;
+    }
+
+    /**
+     * Compute HMAC-SHA256 for a FlatBuffer.
+     * @param {Uint8Array} buffer - FlatBuffer data
+     * @returns {Uint8Array} 32-byte HMAC
+     */
+    computeHMAC(buffer) {
+        const bufPtr = Module._malloc(buffer.length);
+        Module.HEAPU8.set(buffer, bufPtr);
+        const macPtr = Module._malloc(32);
+        const result = api.computeHMAC(this._handle, bufPtr, buffer.length, macPtr);
+        const mac = new Uint8Array(Module.HEAPU8.buffer, macPtr, 32).slice();
+        Module._free(bufPtr);
+        Module._free(macPtr);
+        if (!result) throw new Error('HMAC computation failed - is encryption key set?');
+        return mac;
+    }
+
+    /**
+     * Verify HMAC-SHA256 for a FlatBuffer.
+     * @param {Uint8Array} buffer - FlatBuffer data
+     * @param {Uint8Array} mac - 32-byte HMAC to verify
+     * @returns {boolean} true if valid
+     */
+    verifyHMAC(buffer, mac) {
+        const bufPtr = Module._malloc(buffer.length);
+        Module.HEAPU8.set(buffer, bufPtr);
+        const macPtr = Module._malloc(32);
+        Module.HEAPU8.set(mac, macPtr);
+        const result = api.verifyHMAC(this._handle, bufPtr, buffer.length, macPtr);
+        Module._free(bufPtr);
+        Module._free(macPtr);
+        return result !== 0;
     }
 }
 

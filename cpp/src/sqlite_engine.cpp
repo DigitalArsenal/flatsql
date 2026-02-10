@@ -1,7 +1,17 @@
 #include "flatsql/sqlite_engine.h"
+#include "flatsql/geo_functions.h"
 #include <sstream>
 #include <stdexcept>
 #include <cctype>
+
+// sqlean extension init functions (C linkage)
+extern "C" {
+    int math_init(sqlite3* db);
+    int stats_init(sqlite3* db);
+    int text_init(sqlite3* db);
+    int uuid_init(sqlite3* db);
+    int fuzzy_init(sqlite3* db);
+}
 
 namespace flatsql {
 
@@ -36,6 +46,16 @@ SQLiteEngine::SQLiteEngine() : db_(nullptr) {
         db_ = nullptr;
         throw std::runtime_error("Failed to open SQLite database: " + error);
     }
+
+    // Register custom geo/spatial functions
+    registerGeoFunctions(db_);
+
+    // Register sqlean extensions
+    math_init(db_);
+    stats_init(db_);
+    text_init(db_);
+    uuid_init(db_);
+    fuzzy_init(db_);
 }
 
 SQLiteEngine::~SQLiteEngine() {

@@ -69,6 +69,8 @@ struct ColumnDef {
     bool nullable = true;
     bool indexed = false;
     bool primaryKey = false;
+    bool encrypted = false;         // Field uses FlatBuffer field-level encryption
+    uint16_t fieldId = 0;           // FlatBuffer field ID (for encryption key derivation)
     std::optional<Value> defaultValue;
 };
 

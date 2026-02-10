@@ -3,6 +3,7 @@
 
 #include "flatsql/database.h"
 #include <flatbuffers/flatbuffers.h>
+#include <flatbuffers/encryption.h>
 #include <cstring>
 #include <vector>
 #include <string>
@@ -521,6 +522,94 @@ EMSCRIPTEN_KEEPALIVE
 double flatsql_get_storage_size(void* handle) {
     auto* db = static_cast<FlatSQLDatabase*>(handle);
     return static_cast<double>(db->getStorage().getDataSize());
+}
+
+// ==================== Encryption API ====================
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_set_encryption_key(void* handle, const uint8_t* key, int keySize) {
+    try {
+        auto* db = static_cast<FlatSQLDatabase*>(handle);
+        db->setEncryptionKey(key, static_cast<size_t>(keySize));
+        return 1;
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_is_encrypted(void* handle) {
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    return db->isEncrypted() ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_encrypt_buffer(void* handle, uint8_t* buffer, int bufferSize,
+                            const uint8_t* schema, int schemaSize) {
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    auto* ctx = db->getEncryptionContext();
+    if (!ctx) {
+        g_lastError = "No encryption key set";
+        return 0;
+    }
+    auto result = flatbuffers::EncryptBuffer(buffer, static_cast<size_t>(bufferSize),
+                                              schema, static_cast<size_t>(schemaSize), *ctx);
+    if (!result.ok()) {
+        g_lastError = result.message;
+        return 0;
+    }
+    return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_decrypt_buffer(void* handle, uint8_t* buffer, int bufferSize,
+                            const uint8_t* schema, int schemaSize) {
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    auto* ctx = db->getEncryptionContext();
+    if (!ctx) {
+        g_lastError = "No encryption key set";
+        return 0;
+    }
+    auto result = flatbuffers::DecryptBuffer(buffer, static_cast<size_t>(bufferSize),
+                                              schema, static_cast<size_t>(schemaSize), *ctx);
+    if (!result.ok()) {
+        g_lastError = result.message;
+        return 0;
+    }
+    return 1;
+}
+
+// ==================== HMAC Authentication API ====================
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_set_hmac_verification(void* handle, int enabled) {
+    try {
+        auto* db = static_cast<FlatSQLDatabase*>(handle);
+        db->setHMACVerification(enabled != 0);
+        return 1;
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_is_hmac_enabled(void* handle) {
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    return db->isHMACVerificationEnabled() ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_compute_hmac(void* handle, const uint8_t* buffer, int bufferSize, uint8_t* outMAC) {
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    return db->computeHMAC(buffer, static_cast<size_t>(bufferSize), outMAC) ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_verify_hmac(void* handle, const uint8_t* buffer, int bufferSize, const uint8_t* mac) {
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    return db->verifyHMAC(buffer, static_cast<size_t>(bufferSize), mac) ? 1 : 0;
 }
 
 }  // extern "C"

@@ -8,6 +8,8 @@
 #include <functional>
 #include <unordered_set>
 
+namespace flatbuffers { class EncryptionContext; }
+
 namespace flatsql {
 
 // Forward declarations
@@ -61,6 +63,9 @@ struct FlatBufferVTab : public sqlite3_vtab {
     // Source-specific record infos (for multi-source routing)
     // When set, uses these instead of store->getRecordInfoVector(fileId)
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos;
+
+    // Encryption context for field-level decryption (not owned, may be nullptr)
+    const flatbuffers::EncryptionContext* encryptionCtx;
 };
 
 /**
@@ -187,6 +192,8 @@ struct VTabCreateInfo {
     // Source-specific record infos (for multi-source routing)
     // When set, uses these instead of store->getRecordInfoVector(fileId)
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos = nullptr;
+    // Encryption context for field-level decryption (not owned)
+    const flatbuffers::EncryptionContext* encryptionCtx = nullptr;
 };
 
 }  // namespace flatsql

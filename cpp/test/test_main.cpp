@@ -1,6 +1,7 @@
 #include "flatsql/database.h"
 #include "flatsql/junction.h"
 #include "flatsql/sqlite_index.h"
+#include "flatbuffers/encryption.h"
 #include <sqlite3.h>
 #include <iostream>
 #include <cassert>
@@ -555,6 +556,166 @@ void testJunctionManager() {
     std::cout << "Junction manager tests passed!" << std::endl;
 }
 
+void testSqleanExtensions() {
+    std::cout << "Testing sqlean extensions..." << std::endl;
+
+    // Create a database to get the engine with registered functions
+    std::string schema = R"(
+        table dummy {
+            id: int (id);
+            name: string;
+        }
+    )";
+    FlatSQLDatabase db = FlatSQLDatabase::fromSchema(schema, "sqlean_test");
+
+    // Test math functions
+    {
+        QueryResult r = db.query("SELECT sqrt(4), ceil(3.14), floor(3.14), pi()");
+        assert(r.rowCount() == 1);
+        assert(r.columnCount() == 4);
+        double sqrtVal = std::get<double>(r.rows[0][0]);
+        assert(sqrtVal == 2.0);
+        double ceilVal = std::get<double>(r.rows[0][1]);
+        assert(ceilVal == 4.0);
+        double floorVal = std::get<double>(r.rows[0][2]);
+        assert(floorVal == 3.0);
+        double piVal = std::get<double>(r.rows[0][3]);
+        assert(piVal > 3.14 && piVal < 3.15);
+        std::cout << "  math: sqrt(4)=" << sqrtVal << " ceil(3.14)=" << ceilVal
+                  << " floor(3.14)=" << floorVal << " pi()=" << piVal << std::endl;
+    }
+
+    // Test text functions
+    {
+        QueryResult r = db.query("SELECT text_upper('hello'), text_lower('WORLD'), text_length('test')");
+        assert(r.rowCount() == 1);
+        std::string upper = std::get<std::string>(r.rows[0][0]);
+        std::string lower = std::get<std::string>(r.rows[0][1]);
+        int64_t length = std::get<int64_t>(r.rows[0][2]);
+        assert(upper == "HELLO");
+        assert(lower == "world");
+        assert(length == 4);
+        std::cout << "  text: upper='hello'->" << upper << " lower='WORLD'->" << lower
+                  << " length('test')=" << length << std::endl;
+    }
+
+    // Test fuzzy functions
+    {
+        QueryResult r = db.query("SELECT fuzzy_leven('kitten', 'sitting')");
+        assert(r.rowCount() == 1);
+        int64_t dist = std::get<int64_t>(r.rows[0][0]);
+        assert(dist == 3);
+        std::cout << "  fuzzy: leven('kitten','sitting')=" << dist << std::endl;
+    }
+
+    // Test geo functions
+    {
+        // Distance from NYC to DC (~328 km)
+        QueryResult r = db.query("SELECT geo_distance(40.7128, -74.0060, 38.9072, -77.0369)");
+        assert(r.rowCount() == 1);
+        double dist = std::get<double>(r.rows[0][0]);
+        assert(dist > 300 && dist < 350);
+        std::cout << "  geo: NYC->DC distance=" << dist << " km" << std::endl;
+    }
+
+    std::cout << "sqlean and geo extension tests passed!" << std::endl;
+}
+
+void testEncryptionRoundTrip() {
+    std::cout << "Testing encryption round-trip..." << std::endl;
+
+    // Create a 32-byte test key
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = static_cast<uint8_t>(i + 1);
+
+    flatbuffers::EncryptionContext ctx(key, 32);
+    assert(ctx.IsValid());
+
+    // Test scalar round-trip (int64)
+    {
+        int64_t original = 123456789LL;
+        int64_t value = original;
+        flatbuffers::EncryptScalar(reinterpret_cast<uint8_t*>(&value), sizeof(value), ctx, 1);
+        assert(value != original);  // Should be different after encryption
+        flatbuffers::DecryptScalar(reinterpret_cast<uint8_t*>(&value), sizeof(value), ctx, 1);
+        assert(value == original);  // Should be back to original
+        std::cout << "  scalar int64 round-trip: OK" << std::endl;
+    }
+
+    // Test scalar round-trip (double)
+    {
+        double original = 3.14159265358979;
+        double value = original;
+        flatbuffers::EncryptScalar(reinterpret_cast<uint8_t*>(&value), sizeof(value), ctx, 2);
+        assert(value != original);
+        flatbuffers::DecryptScalar(reinterpret_cast<uint8_t*>(&value), sizeof(value), ctx, 2);
+        assert(value == original);
+        std::cout << "  scalar double round-trip: OK" << std::endl;
+    }
+
+    // Test string round-trip
+    {
+        std::string original = "Hello, encrypted world!";
+        std::string value = original;
+        flatbuffers::EncryptString(reinterpret_cast<uint8_t*>(value.data()), value.size(), ctx, 3);
+        assert(value != original);
+        flatbuffers::DecryptString(reinterpret_cast<uint8_t*>(value.data()), value.size(), ctx, 3);
+        assert(value == original);
+        std::cout << "  string round-trip: OK" << std::endl;
+    }
+
+    // Test blob round-trip
+    {
+        std::vector<uint8_t> original = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE};
+        std::vector<uint8_t> value = original;
+        uint8_t fieldKey[32], fieldIV[16];
+        ctx.DeriveFieldKey(4, fieldKey);
+        ctx.DeriveFieldIV(4, fieldIV);
+        flatbuffers::EncryptBytes(value.data(), value.size(), fieldKey, fieldIV);
+        assert(value != original);
+        flatbuffers::DecryptBytes(value.data(), value.size(), fieldKey, fieldIV);
+        assert(value == original);
+        std::cout << "  blob round-trip: OK" << std::endl;
+    }
+
+    // Test HMAC authentication via FlatSQLDatabase
+    {
+        std::string schema = R"(
+            table dummy {
+                id: int (id);
+            }
+        )";
+        FlatSQLDatabase db = FlatSQLDatabase::fromSchema(schema, "hmac_test");
+        db.setEncryptionKey(key, 32);
+
+        std::vector<uint8_t> buffer = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        uint8_t mac[32];
+        bool computed = db.computeHMAC(buffer.data(), buffer.size(), mac);
+        if (computed) {
+            // Verify should succeed with original data
+            assert(db.verifyHMAC(buffer.data(), buffer.size(), mac));
+
+            // Tamper with the buffer
+            buffer[0] = 99;
+            assert(!db.verifyHMAC(buffer.data(), buffer.size(), mac));
+            std::cout << "  HMAC authentication: OK" << std::endl;
+        } else {
+            std::cout << "  HMAC authentication: SKIPPED (no OpenSSL)" << std::endl;
+        }
+    }
+
+    // Test different field IDs produce different ciphertexts
+    {
+        int64_t val1 = 42, val2 = 42;
+        flatbuffers::EncryptScalar(reinterpret_cast<uint8_t*>(&val1), sizeof(val1), ctx, 10);
+        flatbuffers::EncryptScalar(reinterpret_cast<uint8_t*>(&val2), sizeof(val2), ctx, 20);
+        assert(val1 != val2);  // Same plaintext, different field IDs -> different ciphertext
+        std::cout << "  field ID isolation: OK" << std::endl;
+    }
+
+    std::cout << "Encryption round-trip tests passed!" << std::endl;
+}
+
 int main() {
     std::cout << "=== FlatSQL Test Suite ===" << std::endl;
     std::cout << std::endl;
@@ -568,6 +729,8 @@ int main() {
         testSchemaAnalyzer();
         testCycleDetection();
         testJunctionManager();
+        testSqleanExtensions();
+        testEncryptionRoundTrip();
 
         std::cout << std::endl;
         std::cout << "=== All tests passed! ===" << std::endl;

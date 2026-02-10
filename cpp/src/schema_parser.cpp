@@ -108,6 +108,9 @@ DatabaseSchema SchemaParser::parseIDL(const std::string& idl, const std::string&
                     attrs.find("index") != std::string::npos) {
                     col.indexed = true;
                 }
+                if (attrs.find("encrypted") != std::string::npos) {
+                    col.encrypted = true;
+                }
                 // Remove attributes from type
                 typeStr = std::regex_replace(typeStr, attrRegex, "");
                 typeStr = trim(typeStr);
@@ -121,6 +124,11 @@ DatabaseSchema SchemaParser::parseIDL(const std::string& idl, const std::string&
             }
 
             fieldsRemaining = fieldMatch.suffix().str();
+        }
+
+        // Assign field IDs based on position (maps to FlatBuffer vtable indices)
+        for (size_t i = 0; i < tableDef.columns.size(); i++) {
+            tableDef.columns[i].fieldId = static_cast<uint16_t>(i);
         }
 
         schema.tables.push_back(tableDef);

@@ -28,6 +28,8 @@ struct SourceInfo {
     VTabCreateInfo vtabInfo;                      // Info passed to xCreate
     // Source-specific record infos pointer (for multi-source routing)
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos = nullptr;
+    // Encryption context (not owned)
+    const flatbuffers::EncryptionContext* encryptionCtx = nullptr;
 };
 
 /**
