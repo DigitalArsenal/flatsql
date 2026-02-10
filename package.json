@@ -59,7 +59,7 @@
   "author": "Digital Arsenal <tj@digitalarsenal.io>",
   "license": "Apache-2.0",
   "dependencies": {
-    "flatc-wasm": "^26.1.17",
+    "flatc-wasm": "^26.1.15",
     "sql.js": "^1.10.0"
   },
   "devDependencies": {
