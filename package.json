@@ -1,6 +1,6 @@
 {
   "name": "flatsql",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
   "type": "module",
   "main": "dist/index.js",
