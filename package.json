@@ -1,6 +1,6 @@
 {
   "name": "flatsql",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
   "type": "module",
   "main": "dist/index.js",
@@ -36,7 +36,6 @@
     "dev": "tsc --watch",
     "serve": "vite docs --port 8081",
     "prepublishOnly": "npm run build",
-    "postinstall": "bash scripts/install-emsdk.sh",
     "emsdk:install": "bash scripts/install-emsdk.sh",
     "emsdk:env": "echo 'Run: source packages/emsdk/emsdk_env.sh'",
     "test:wasi": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasi.test.ts"
