@@ -38,7 +38,8 @@
     "prepublishOnly": "npm run build",
     "postinstall": "bash scripts/install-emsdk.sh",
     "emsdk:install": "bash scripts/install-emsdk.sh",
-    "emsdk:env": "echo 'Run: source packages/emsdk/emsdk_env.sh'"
+    "emsdk:env": "echo 'Run: source packages/emsdk/emsdk_env.sh'",
+    "test:wasi": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasi.test.ts"
   },
   "repository": {
     "type": "git",

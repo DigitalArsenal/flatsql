@@ -105,6 +105,9 @@ jobs:
         run: npm test
         continue-on-error: true
 
+      - name: Run WASI tests
+        run: npm run test:wasi
+
       - name: Verify package
         run: npm pack --dry-run
 
