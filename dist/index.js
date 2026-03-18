@@ -4,6 +4,7 @@ export * from './btree/index.js';
 export * from './storage/index.js';
 export * from './schema/index.js';
 export * from './core/index.js';
+export * from './cluster/index.js';
 export * from './flatbuffer-accessor.js';
 // Re-export main types for convenience
 export { FlatSQLDatabase } from './core/database.js';

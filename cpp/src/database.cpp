@@ -124,22 +124,28 @@ std::vector<std::string> TableStore::getIndexNames() const {
 
 // ==================== FlatSQLDatabase ====================
 
-FlatSQLDatabase::FlatSQLDatabase(const DatabaseSchema& schema)
-    : schema_(schema) {
+FlatSQLDatabase::FlatSQLDatabase(const DatabaseSchema& schema, RuntimeOptions options)
+    : schema_(schema)
+    , storage_(options.sharedStore ? std::move(options.sharedStore)
+                                   : std::make_shared<StreamingFlatBufferStore>())
+    , accessMutex_(options.accessMutex ? std::move(options.accessMutex)
+                                       : std::make_shared<std::shared_mutex>()) {
 
     // Initialize SQLite engine first (we need its db handle for indexes)
-    sqliteEngine_ = std::make_unique<SQLiteEngine>();
+    sqliteEngine_ = std::make_unique<SQLiteEngine>(options.sqlite);
 
     // Initialize table stores with SQLite db handle for indexes
     for (const auto& tableDef : schema_.tables) {
         tables_[tableDef.name] = std::make_unique<TableStore>(
-            tableDef, storage_, sqliteEngine_->getDb());
+            tableDef, *storage_, sqliteEngine_->getDb());
     }
 }
 
-FlatSQLDatabase FlatSQLDatabase::fromSchema(const std::string& source, const std::string& dbName) {
+FlatSQLDatabase FlatSQLDatabase::fromSchema(const std::string& source,
+                                            const std::string& dbName,
+                                            RuntimeOptions options) {
     DatabaseSchema schema = SchemaParser::parse(source, dbName);
-    return FlatSQLDatabase(schema);
+    return FlatSQLDatabase(schema, std::move(options));
 }
 
 void FlatSQLDatabase::registerFileId(const std::string& fileId, const std::string& tableName) {
@@ -169,27 +175,33 @@ void FlatSQLDatabase::onIngest(std::string_view fileId, const uint8_t* data, siz
 }
 
 size_t FlatSQLDatabase::ingest(const uint8_t* data, size_t length, size_t* recordsIngested) {
-    return storage_.ingest(data, length,
+    std::unique_lock lock(*accessMutex_);
+    IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
+    return storage_->ingest(data, length,
         [this](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
             onIngest(fileId, data, len, seq, offset);
-        }, recordsIngested);
+        }, recordsIngested, profile);
 }
 
 uint64_t FlatSQLDatabase::ingestOne(const uint8_t* flatbuffer, size_t length) {
-    return storage_.ingestFlatBuffer(flatbuffer, length,
+    std::unique_lock lock(*accessMutex_);
+    IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
+    return storage_->ingestFlatBuffer(flatbuffer, length,
         [this](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
             onIngest(fileId, data, len, seq, offset);
-        });
+        }, profile);
 }
 
 void FlatSQLDatabase::loadAndRebuild(const uint8_t* data, size_t length) {
-    storage_.loadAndRebuild(data, length,
+    std::unique_lock lock(*accessMutex_);
+    IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
+    storage_->loadAndRebuild(data, length,
         [this](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
             onIngest(fileId, data, len, seq, offset);
-        });
+        }, profile);
 }
 
 void FlatSQLDatabase::initializeSQLiteEngine() {
@@ -231,17 +243,19 @@ void FlatSQLDatabase::updateSQLiteTable(const std::string& tableName) {
     }
 
     // Register with SQLite engine
-    // Pass source-specific record infos for multi-source routing
+    // Base tables should read record infos from the shared store so that
+    // independent reader connections observe writer progress.
+    const bool isSourceTable = tableName.find('@') != std::string::npos;
     sqliteEngine_->registerSource(
         tableName,
-        &storage_,
+        storage_.get(),
         &tableStore->getTableDef(),
         tableStore->getFileId(),
         tableStore->getFieldExtractor(),
         indexes,
         tableStore->getFastFieldExtractor(),
         tableStore->getBatchExtractor(),
-        &tableStore->getRecordInfos()
+        isSourceTable ? &tableStore->getRecordInfos() : nullptr
     );
 
     // Propagate encryption context to the registered source
@@ -257,44 +271,57 @@ void FlatSQLDatabase::updateSQLiteTable(const std::string& tableName) {
 }
 
 QueryResult FlatSQLDatabase::query(const std::string& sql) {
-    // Ensure SQLite engine is initialized
-    initializeSQLiteEngine();
+    if (!sqliteInitialized_) {
+        std::unique_lock initLock(*accessMutex_);
+        initializeSQLiteEngine();
+        return sqliteEngine_->execute(sql);
+    }
 
-    // Execute via SQLite
+    std::shared_lock lock(*accessMutex_);
     return sqliteEngine_->execute(sql);
 }
 
 QueryResult FlatSQLDatabase::query(const std::string& sql, const std::vector<Value>& params) {
-    // Ensure SQLite engine is initialized
-    initializeSQLiteEngine();
+    if (!sqliteInitialized_) {
+        std::unique_lock initLock(*accessMutex_);
+        initializeSQLiteEngine();
+        return sqliteEngine_->execute(sql, params);
+    }
 
-    // Execute via SQLite with parameters
+    std::shared_lock lock(*accessMutex_);
     return sqliteEngine_->execute(sql, params);
 }
 
 QueryResult FlatSQLDatabase::query(const std::string& sql, int64_t param) {
-    // Ensure SQLite engine is initialized
-    initializeSQLiteEngine();
-
     // Use thread-local reusable vector for single-param queries
     static thread_local std::vector<Value> singleParam(1);
     singleParam[0] = param;
 
-    // Execute via SQLite with single parameter
+    if (!sqliteInitialized_) {
+        std::unique_lock initLock(*accessMutex_);
+        initializeSQLiteEngine();
+        return sqliteEngine_->execute(sql, singleParam);
+    }
+
+    std::shared_lock lock(*accessMutex_);
     return sqliteEngine_->execute(sql, singleParam);
 }
 
 size_t FlatSQLDatabase::queryCount(const std::string& sql, const std::vector<Value>& params) {
-    // Ensure SQLite engine is initialized
-    initializeSQLiteEngine();
+    if (!sqliteInitialized_) {
+        std::unique_lock initLock(*accessMutex_);
+        initializeSQLiteEngine();
+        return sqliteEngine_->executeAndCount(sql, params);
+    }
 
-    // Execute via SQLite without building QueryResult
+    std::shared_lock lock(*accessMutex_);
     return sqliteEngine_->executeAndCount(sql, params);
 }
 
 std::vector<StoredRecord> FlatSQLDatabase::findByIndex(const std::string& tableName,
                                                         const std::string& column,
                                                         const Value& value) {
+    std::shared_lock lock(*accessMutex_);
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         return {};
@@ -306,6 +333,7 @@ bool FlatSQLDatabase::findOneByIndex(const std::string& tableName,
                                       const std::string& column,
                                       const Value& value,
                                       StoredRecord& result) {
+    std::shared_lock lock(*accessMutex_);
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         return false;
@@ -335,6 +363,7 @@ const uint8_t* FlatSQLDatabase::findRawByIndex(const std::string& tableName,
                                                 const Value& value,
                                                 uint32_t* outLength,
                                                 uint64_t* outSequence) {
+    std::shared_lock lock(*accessMutex_);
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         return nullptr;
@@ -353,7 +382,7 @@ const uint8_t* FlatSQLDatabase::findRawByIndex(const std::string& tableName,
             if (outSequence) {
                 *outSequence = seq;
             }
-            return storage_.getDataAtOffset(offset, outLength);
+            return storage_->getDataAtOffset(offset, outLength);
         }
         return nullptr;
     }
@@ -366,7 +395,7 @@ const uint8_t* FlatSQLDatabase::findRawByIndex(const std::string& tableName,
             if (outSequence) {
                 *outSequence = seq;
             }
-            return storage_.getDataAtOffset(offset, outLength);
+            return storage_->getDataAtOffset(offset, outLength);
         }
         return nullptr;
     }
@@ -377,7 +406,7 @@ const uint8_t* FlatSQLDatabase::findRawByIndex(const std::string& tableName,
         if (outSequence) {
             *outSequence = entry.sequence;
         }
-        return storage_.getDataAtOffset(entry.dataOffset, outLength);
+        return storage_->getDataAtOffset(entry.dataOffset, outLength);
     }
 
     return nullptr;
@@ -442,6 +471,7 @@ const TableDef* FlatSQLDatabase::getTableDef(const std::string& tableName) const
 }
 
 std::vector<FlatSQLDatabase::TableStats> FlatSQLDatabase::getStats() const {
+    std::shared_lock lock(*accessMutex_);
     std::vector<TableStats> stats;
     for (const auto& [name, store] : tables_) {
         TableStats ts;
@@ -457,6 +487,7 @@ std::vector<FlatSQLDatabase::TableStats> FlatSQLDatabase::getStats() const {
 // ==================== Multi-Source API ====================
 
 void FlatSQLDatabase::registerSource(const std::string& sourceName) {
+    std::unique_lock lock(*accessMutex_);
     // Check if source already registered
     for (const auto& s : registeredSources_) {
         if (s == sourceName) {
@@ -486,7 +517,7 @@ void FlatSQLDatabase::createSourceTable(const std::string& baseTableName, const 
 
     // Create source table with same schema (share the same sqlite db for indexes)
     tables_[sourceTableName] = std::make_unique<TableStore>(
-        baseDef, storage_, sqliteEngine_->getDb());
+        baseDef, *storage_, sqliteEngine_->getDb());
 
     // Copy file ID registration for source-specific routing
     std::string fileId = baseIt->second->getFileId();
@@ -518,6 +549,7 @@ std::vector<std::string> FlatSQLDatabase::listSources() const {
 }
 
 void FlatSQLDatabase::createUnifiedViews() {
+    std::unique_lock lock(*accessMutex_);
     if (registeredSources_.empty()) {
         return;
     }
@@ -560,20 +592,24 @@ void FlatSQLDatabase::onIngestWithSource(std::string_view fileId, const uint8_t*
 size_t FlatSQLDatabase::ingestWithSource(const uint8_t* data, size_t length,
                                           const std::string& source,
                                           size_t* recordsIngested) {
-    return storage_.ingest(data, length,
+    std::unique_lock lock(*accessMutex_);
+    IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
+    return storage_->ingest(data, length,
         [this, &source](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
             onIngestWithSource(fileId, data, len, seq, offset, source);
-        }, recordsIngested);
+        }, recordsIngested, profile);
 }
 
 uint64_t FlatSQLDatabase::ingestOneWithSource(const uint8_t* flatbuffer, size_t length,
                                                const std::string& source) {
-    return storage_.ingestFlatBuffer(flatbuffer, length,
+    std::unique_lock lock(*accessMutex_);
+    IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
+    return storage_->ingestFlatBuffer(flatbuffer, length,
         [this, &source](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
             onIngestWithSource(fileId, data, len, seq, offset, source);
-        });
+        }, profile);
 }
 
 // Legacy multi-source API (external storage)
@@ -607,14 +643,17 @@ void FlatSQLDatabase::createUnifiedView(
 // ==================== Delete Support ====================
 
 void FlatSQLDatabase::markDeleted(const std::string& tableName, uint64_t sequence) {
+    std::unique_lock lock(*accessMutex_);
     sqliteEngine_->markDeleted(tableName, sequence);
 }
 
 size_t FlatSQLDatabase::getDeletedCount(const std::string& tableName) const {
+    std::shared_lock lock(*accessMutex_);
     return sqliteEngine_->getDeletedCount(tableName);
 }
 
 void FlatSQLDatabase::clearTombstones(const std::string& tableName) {
+    std::unique_lock lock(*accessMutex_);
     sqliteEngine_->clearTombstones(tableName);
 }
 

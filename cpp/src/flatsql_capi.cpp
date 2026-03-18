@@ -247,8 +247,14 @@ void flatsql_register_file_id(void* handle, const char* fileId, const char* tabl
 EMSCRIPTEN_KEEPALIVE
 void flatsql_enable_demo_extractors(void* handle) {
     auto* db = static_cast<FlatSQLDatabase*>(handle);
-    db->setFieldExtractor("User", extractUserFieldGeneric);
-    db->setFieldExtractor("Post", extractPostFieldGeneric);
+    try {
+        db->setFieldExtractor("User", extractUserFieldGeneric);
+    } catch (const std::exception&) {
+    }
+    try {
+        db->setFieldExtractor("Post", extractPostFieldGeneric);
+    } catch (const std::exception&) {
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -439,6 +445,36 @@ EMSCRIPTEN_KEEPALIVE
 double flatsql_get_stat_record_count(int index) {
     if (index < 0 || index >= static_cast<int>(g_statsBuffer.size())) return 0;
     return static_cast<double>(g_statsBuffer[index].recordCount);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void flatsql_reset_ingest_profile(void* handle) {
+    static_cast<FlatSQLDatabase*>(handle)->resetIngestProfile();
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_get_ingest_profile_record_count(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getIngestProfile().recordCount);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_get_ingest_profile_byte_count(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getIngestProfile().byteCount);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_get_ingest_profile_decode_nanos(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getIngestProfile().decodeNanos);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_get_ingest_profile_append_nanos(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getIngestProfile().appendNanos);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_get_ingest_profile_index_nanos(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getIngestProfile().indexNanos);
 }
 
 EMSCRIPTEN_KEEPALIVE

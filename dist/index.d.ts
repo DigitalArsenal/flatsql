@@ -2,6 +2,7 @@ export * from './btree/index.js';
 export * from './storage/index.js';
 export * from './schema/index.js';
 export * from './core/index.js';
+export * from './cluster/index.js';
 export * from './flatbuffer-accessor.js';
 export { FlatSQLDatabase, QueryResult, FlatBufferAccessor } from './core/database.js';
 export { TableStore, TableRecord } from './core/table-store.js';

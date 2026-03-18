@@ -9,6 +9,22 @@
 
 namespace flatsql {
 
+struct IngestProfile {
+    uint64_t recordCount = 0;
+    uint64_t byteCount = 0;
+    uint64_t decodeNanos = 0;
+    uint64_t appendNanos = 0;
+    uint64_t indexNanos = 0;
+
+    void reset() {
+        recordCount = 0;
+        byteCount = 0;
+        decodeNanos = 0;
+        appendNanos = 0;
+        indexNanos = 0;
+    }
+};
+
 /**
  * Streaming FlatBuffer storage.
  *
@@ -42,16 +58,20 @@ public:
     // Calls callback for each complete FlatBuffer ingested
     // Returns number of bytes consumed (for buffer management)
     // Sets recordsProcessed to number of complete FlatBuffers processed
-    size_t ingest(const uint8_t* data, size_t length, IngestCallback callback, size_t* recordsProcessed = nullptr);
+    size_t ingest(const uint8_t* data, size_t length, IngestCallback callback,
+                  size_t* recordsProcessed = nullptr, IngestProfile* profile = nullptr);
 
     // Ingest a single size-prefixed FlatBuffer, returns sequence
-    uint64_t ingestOne(const uint8_t* sizePrefixedData, size_t length, IngestCallback callback);
+    uint64_t ingestOne(const uint8_t* sizePrefixedData, size_t length,
+                       IngestCallback callback, IngestProfile* profile = nullptr);
 
     // Ingest a single FlatBuffer (without size prefix), returns sequence
-    uint64_t ingestFlatBuffer(const uint8_t* data, size_t length, IngestCallback callback);
+    uint64_t ingestFlatBuffer(const uint8_t* data, size_t length,
+                              IngestCallback callback, IngestProfile* profile = nullptr);
 
     // Load existing stream data and rebuild via callback
-    void loadAndRebuild(const uint8_t* data, size_t length, IngestCallback callback);
+    void loadAndRebuild(const uint8_t* data, size_t length,
+                        IngestCallback callback, IngestProfile* profile = nullptr);
 
     // Read raw FlatBuffer at offset (returns pointer into storage, no copy)
     const uint8_t* getDataAtOffset(uint64_t offset, uint32_t* outLength) const;

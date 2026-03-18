@@ -1,8 +1,11 @@
 #include "flatsql/storage.h"
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
 namespace flatsql {
+
+using ProfileClock = std::chrono::steady_clock;
 
 // CRC32 implementation (IEEE polynomial) - kept for potential future use
 static uint32_t computeCRC32(const uint8_t* data, size_t length) {
@@ -65,11 +68,13 @@ std::string StreamingFlatBufferStore::extractFileId(const uint8_t* flatbuffer, s
                        FILE_IDENTIFIER_LENGTH);
 }
 
-size_t StreamingFlatBufferStore::ingest(const uint8_t* data, size_t length, IngestCallback callback, size_t* recordsProcessed) {
+size_t StreamingFlatBufferStore::ingest(const uint8_t* data, size_t length, IngestCallback callback,
+                                        size_t* recordsProcessed, IngestProfile* profile) {
     size_t records = 0;
     size_t offset = 0;
 
     while (offset + SIZE_PREFIX_LENGTH <= length) {
+        const auto decodeStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
         // Read size prefix
         uint32_t fbSize = readLE32(data + offset);
 
@@ -79,8 +84,14 @@ size_t StreamingFlatBufferStore::ingest(const uint8_t* data, size_t length, Inge
         }
 
         const uint8_t* fbData = data + offset + SIZE_PREFIX_LENGTH;
+        if (profile) {
+            profile->decodeNanos += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - decodeStart).count()
+            );
+        }
 
         // Store with size prefix
+        const auto appendStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
         uint64_t storeOffset = writeOffset_;
         ensureCapacity(SIZE_PREFIX_LENGTH + fbSize);
         std::memcpy(&data_[writeOffset_], data + offset, SIZE_PREFIX_LENGTH + fbSize);
@@ -95,9 +106,25 @@ size_t StreamingFlatBufferStore::ingest(const uint8_t* data, size_t length, Inge
         // Extract file identifier and build file ID index
         std::string fileId = extractFileId(fbData, fbSize);
         indexRecord(fileId, storeOffset);
+        if (profile) {
+            profile->appendNanos += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - appendStart).count()
+            );
+        }
 
         if (callback) {
+            const auto indexStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
             callback(fileId, fbData, fbSize, seq, storeOffset);
+            if (profile) {
+                profile->indexNanos += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - indexStart).count()
+                );
+            }
+        }
+
+        if (profile) {
+            profile->recordCount++;
+            profile->byteCount += fbSize;
         }
 
         offset += SIZE_PREFIX_LENGTH + fbSize;
@@ -111,19 +138,26 @@ size_t StreamingFlatBufferStore::ingest(const uint8_t* data, size_t length, Inge
 }
 
 uint64_t StreamingFlatBufferStore::ingestOne(const uint8_t* sizePrefixedData, size_t length,
-                                              IngestCallback callback) {
+                                             IngestCallback callback, IngestProfile* profile) {
     if (length < SIZE_PREFIX_LENGTH) {
         throw std::runtime_error("Data too small for size prefix");
     }
 
+    const auto decodeStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
     uint32_t fbSize = readLE32(sizePrefixedData);
     if (length < SIZE_PREFIX_LENGTH + fbSize) {
         throw std::runtime_error("Incomplete FlatBuffer data");
     }
 
     const uint8_t* fbData = sizePrefixedData + SIZE_PREFIX_LENGTH;
+    if (profile) {
+        profile->decodeNanos += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - decodeStart).count()
+        );
+    }
 
     // Store
+    const auto appendStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
     uint64_t storeOffset = writeOffset_;
     ensureCapacity(SIZE_PREFIX_LENGTH + fbSize);
     std::memcpy(&data_[writeOffset_], sizePrefixedData, SIZE_PREFIX_LENGTH + fbSize);
@@ -138,17 +172,40 @@ uint64_t StreamingFlatBufferStore::ingestOne(const uint8_t* sizePrefixedData, si
     // Build file ID index
     std::string fileId = extractFileId(fbData, fbSize);
     indexRecord(fileId, storeOffset);
+    if (profile) {
+        profile->appendNanos += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - appendStart).count()
+        );
+    }
 
     if (callback) {
+        const auto indexStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
         callback(fileId, fbData, fbSize, seq, storeOffset);
+        if (profile) {
+            profile->indexNanos += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - indexStart).count()
+            );
+        }
+    }
+
+    if (profile) {
+        profile->recordCount++;
+        profile->byteCount += fbSize;
     }
 
     return seq;
 }
 
 uint64_t StreamingFlatBufferStore::ingestFlatBuffer(const uint8_t* data, size_t length,
-                                                     IngestCallback callback) {
+                                                    IngestCallback callback, IngestProfile* profile) {
     // Store with size prefix
+    const auto decodeStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+    if (profile) {
+        profile->decodeNanos += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - decodeStart).count()
+        );
+    }
+    const auto appendStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
     uint64_t storeOffset = writeOffset_;
     ensureCapacity(SIZE_PREFIX_LENGTH + length);
 
@@ -167,16 +224,32 @@ uint64_t StreamingFlatBufferStore::ingestFlatBuffer(const uint8_t* data, size_t 
     // Build file ID index
     std::string fileId = extractFileId(data, length);
     indexRecord(fileId, storeOffset);
+    if (profile) {
+        profile->appendNanos += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - appendStart).count()
+        );
+    }
 
     if (callback) {
+        const auto indexStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
         callback(fileId, data, length, seq, storeOffset);
+        if (profile) {
+            profile->indexNanos += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - indexStart).count()
+            );
+        }
+    }
+
+    if (profile) {
+        profile->recordCount++;
+        profile->byteCount += length;
     }
 
     return seq;
 }
 
 void StreamingFlatBufferStore::loadAndRebuild(const uint8_t* data, size_t length,
-                                               IngestCallback callback) {
+                                              IngestCallback callback, IngestProfile* profile) {
     // Copy all data
     ensureCapacity(length);
     std::memcpy(data_.data(), data, length);
@@ -184,6 +257,7 @@ void StreamingFlatBufferStore::loadAndRebuild(const uint8_t* data, size_t length
     // Scan through and rebuild indexes
     size_t offset = 0;
     while (offset + SIZE_PREFIX_LENGTH <= length) {
+        const auto decodeStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
         uint32_t fbSize = readLE32(data + offset);
 
         if (offset + SIZE_PREFIX_LENGTH + fbSize > length) {
@@ -191,6 +265,11 @@ void StreamingFlatBufferStore::loadAndRebuild(const uint8_t* data, size_t length
         }
 
         const uint8_t* fbData = data + offset + SIZE_PREFIX_LENGTH;
+        if (profile) {
+            profile->decodeNanos += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - decodeStart).count()
+            );
+        }
 
         uint64_t seq = nextSequence_++;
         sequenceToOffset_[seq] = offset;
@@ -201,7 +280,18 @@ void StreamingFlatBufferStore::loadAndRebuild(const uint8_t* data, size_t length
         indexRecord(fileId, offset);
 
         if (callback) {
+            const auto indexStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
             callback(fileId, fbData, fbSize, seq, offset);
+            if (profile) {
+                profile->indexNanos += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(ProfileClock::now() - indexStart).count()
+                );
+            }
+        }
+
+        if (profile) {
+            profile->recordCount++;
+            profile->byteCount += fbSize;
         }
 
         offset += SIZE_PREFIX_LENGTH + fbSize;

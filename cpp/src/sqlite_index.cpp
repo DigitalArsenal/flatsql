@@ -1,9 +1,34 @@
 #include "flatsql/sqlite_index.h"
+#include <chrono>
 #include <stdexcept>
 #include <cstring>
 #include <algorithm>
+#include <thread>
 
 namespace flatsql {
+
+static bool isBusyResult(int rc) {
+    return rc == SQLITE_BUSY || rc == SQLITE_LOCKED;
+}
+
+static int stepWithRetry(sqlite3* db, sqlite3_stmt* stmt) {
+    int rc = SQLITE_OK;
+    int delayMs = 1;
+
+    for (int attempt = 0; attempt <= 8; attempt++) {
+        rc = sqlite3_step(stmt);
+        if (!isBusyResult(rc)) {
+            return rc;
+        }
+        if (attempt == 8) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        delayMs = std::min(delayMs * 2, 32);
+    }
+
+    throw std::runtime_error("SQLite index busy/locked after retries: " + std::string(sqlite3_errmsg(db)));
+}
 
 // Helper to convert Value to int64 for comparison (optimized with get_if)
 // Order by frequency: int32_t most common in FlatBuffers, then int64_t
@@ -358,7 +383,7 @@ void SqliteIndex::insert(const Value& key, uint64_t dataOffset, uint32_t dataLen
     sqlite3_bind_int(insertStmt_, 3, static_cast<int>(dataLength));
     sqlite3_bind_int64(insertStmt_, 4, static_cast<int64_t>(sequence));
 
-    int rc = sqlite3_step(insertStmt_);
+    int rc = stepWithRetry(db_, insertStmt_);
     if (rc != SQLITE_DONE) {
         throw std::runtime_error("Failed to insert index entry: " +
             std::string(sqlite3_errmsg(db_)));
@@ -374,8 +399,13 @@ std::vector<IndexEntry> SqliteIndex::search(const Value& key) const {
     sqlite3_clear_bindings(searchStmt_);
     bindKey(searchStmt_, 1, key);
 
-    while (sqlite3_step(searchStmt_) == SQLITE_ROW) {
+    int rc;
+    while ((rc = stepWithRetry(db_, searchStmt_)) == SQLITE_ROW) {
         results.push_back(extractEntry(searchStmt_));
+    }
+
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error("Failed to search index: " + std::string(sqlite3_errmsg(db_)));
     }
 
     return results;
@@ -386,9 +416,13 @@ bool SqliteIndex::searchFirst(const Value& key, IndexEntry& result) const {
     sqlite3_clear_bindings(searchFirstStmt_);
     bindKey(searchFirstStmt_, 1, key);
 
-    if (sqlite3_step(searchFirstStmt_) == SQLITE_ROW) {
+    int rc = stepWithRetry(db_, searchFirstStmt_);
+    if (rc == SQLITE_ROW) {
         result = extractEntry(searchFirstStmt_);
         return true;
+    }
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error("Failed to search first index entry: " + std::string(sqlite3_errmsg(db_)));
     }
 
     return false;
@@ -399,12 +433,16 @@ bool SqliteIndex::searchFirstString(const std::string& key, uint64_t& outOffset,
     // Bind string directly - no variant dispatch
     sqlite3_bind_text(searchFirstStmt_, 1, key.c_str(), static_cast<int>(key.size()), SQLITE_STATIC);
 
-    if (sqlite3_step(searchFirstStmt_) == SQLITE_ROW) {
+    int rc = stepWithRetry(db_, searchFirstStmt_);
+    if (rc == SQLITE_ROW) {
         // Extract only what we need - skip key extraction entirely
         outOffset = static_cast<uint64_t>(sqlite3_column_int64(searchFirstStmt_, 1));
         outLength = static_cast<uint32_t>(sqlite3_column_int(searchFirstStmt_, 2));
         outSequence = static_cast<uint64_t>(sqlite3_column_int64(searchFirstStmt_, 3));
         return true;
+    }
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error("Failed to search string index entry: " + std::string(sqlite3_errmsg(db_)));
     }
 
     return false;
@@ -415,12 +453,16 @@ bool SqliteIndex::searchFirstInt64(int64_t key, uint64_t& outOffset, uint32_t& o
     // Bind int64 directly - no variant dispatch
     sqlite3_bind_int64(searchFirstStmt_, 1, key);
 
-    if (sqlite3_step(searchFirstStmt_) == SQLITE_ROW) {
+    int rc = stepWithRetry(db_, searchFirstStmt_);
+    if (rc == SQLITE_ROW) {
         // Extract only what we need - skip key extraction entirely
         outOffset = static_cast<uint64_t>(sqlite3_column_int64(searchFirstStmt_, 1));
         outLength = static_cast<uint32_t>(sqlite3_column_int(searchFirstStmt_, 2));
         outSequence = static_cast<uint64_t>(sqlite3_column_int64(searchFirstStmt_, 3));
         return true;
+    }
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error("Failed to search int64 index entry: " + std::string(sqlite3_errmsg(db_)));
     }
 
     return false;
@@ -434,8 +476,13 @@ std::vector<IndexEntry> SqliteIndex::range(const Value& minKey, const Value& max
     bindKey(rangeStmt_, 1, minKey);
     bindKey(rangeStmt_, 2, maxKey);
 
-    while (sqlite3_step(rangeStmt_) == SQLITE_ROW) {
+    int rc;
+    while ((rc = stepWithRetry(db_, rangeStmt_)) == SQLITE_ROW) {
         results.push_back(extractEntry(rangeStmt_));
+    }
+
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error("Failed to range-scan index: " + std::string(sqlite3_errmsg(db_)));
     }
 
     return results;
@@ -446,8 +493,13 @@ std::vector<IndexEntry> SqliteIndex::all() const {
 
     sqlite3_reset(allStmt_);
 
-    while (sqlite3_step(allStmt_) == SQLITE_ROW) {
+    int rc;
+    while ((rc = stepWithRetry(db_, allStmt_)) == SQLITE_ROW) {
         results.push_back(extractEntry(allStmt_));
+    }
+
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error("Failed to scan index: " + std::string(sqlite3_errmsg(db_)));
     }
 
     return results;
@@ -456,7 +508,7 @@ std::vector<IndexEntry> SqliteIndex::all() const {
 void SqliteIndex::clear() {
     sqlite3_reset(clearStmt_);
 
-    int rc = sqlite3_step(clearStmt_);
+    int rc = stepWithRetry(db_, clearStmt_);
     if (rc != SQLITE_DONE) {
         throw std::runtime_error("Failed to clear index: " +
             std::string(sqlite3_errmsg(db_)));

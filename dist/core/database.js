@@ -82,10 +82,27 @@ export class FlatSQLDatabase {
         let records;
         if (parsed.where) {
             if (parsed.where.operator === '=') {
-                records = tableStore.findByIndex(parsed.where.column, parsed.where.value);
+                if (tableStore.hasIndex(parsed.where.column)) {
+                    records = tableStore.findByIndex(parsed.where.column, parsed.where.value);
+                }
+                else {
+                    // Fallback to scan when filter column is not indexed.
+                    records = tableStore.scanAll().filter(record => {
+                        const value = record.fields.get(parsed.where.column);
+                        return this.evaluateCondition(value, '=', parsed.where.value);
+                    });
+                }
             }
             else if (parsed.where.operator === 'BETWEEN') {
-                records = tableStore.findByRange(parsed.where.column, parsed.where.minValue, parsed.where.maxValue);
+                if (tableStore.hasIndex(parsed.where.column)) {
+                    records = tableStore.findByRange(parsed.where.column, parsed.where.minValue, parsed.where.maxValue);
+                }
+                else {
+                    records = tableStore.scanAll().filter(record => {
+                        const value = record.fields.get(parsed.where.column);
+                        return value >= parsed.where.minValue && value <= parsed.where.maxValue;
+                    });
+                }
             }
             else {
                 // Full scan with filter

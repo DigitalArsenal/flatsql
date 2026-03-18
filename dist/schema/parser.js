@@ -71,9 +71,6 @@ function isValidJSONSchema(value) {
     }
     return true;
 }
-/**
- * Type guard to check if a value is a valid property definition.
- */
 function isValidPropertyDef(value) {
     if (value === null || typeof value !== 'object') {
         return false;
@@ -82,7 +79,45 @@ function isValidPropertyDef(value) {
     if (obj.type !== undefined && typeof obj.type !== 'string') {
         return false;
     }
+    if (obj.items !== undefined) {
+        if (typeof obj.items !== 'object' || obj.items === null) {
+            return false;
+        }
+        const items = obj.items;
+        if (items.type !== undefined && typeof items.type !== 'string') {
+            return false;
+        }
+    }
+    if (obj.$ref !== undefined && typeof obj.$ref !== 'string') {
+        return false;
+    }
     return true;
+}
+const REF_PATTERN = /^#\/(?:(?:definitions)|(?:\$defs))\/(.+)$/;
+function parseJsonRef(ref) {
+    const match = REF_PATTERN.exec(ref);
+    return match ? match[1] : null;
+}
+function applyJoinTables(parsed, joinRefs) {
+    const seen = new Set();
+    for (const ref of joinRefs) {
+        const target = ref.targetTable;
+        if (!target)
+            continue;
+        const joinName = `${ref.fromTable}_${target}_join`;
+        if (seen.has(joinName))
+            continue;
+        seen.add(joinName);
+        parsed.tables.push({
+            name: joinName,
+            namespace: '',
+            fields: [
+                { name: `${ref.fromTable}RowId`, type: 'uint64', isVector: false, defaultValue: undefined, attributes: ['required'] },
+                { name: `${target}RowId`, type: 'uint64', isVector: false, defaultValue: undefined, attributes: ['required'] },
+            ],
+            isStruct: false,
+        });
+    }
 }
 // Parse FlatBuffer IDL schema
 export function parseFlatBufferIDL(source) {
@@ -115,22 +150,37 @@ export function parseFlatBufferIDL(source) {
             continue;
         }
         // Enum
-        const enumMatch = line.match(/^enum\s+(\w+)\s*:\s*\w+\s*\{/);
+        const enumMatch = line.match(/^enum\s+(\w+)\s*:\s*\w+\s*\{(.*)$/);
         if (enumMatch) {
             const enumName = enumMatch[1];
             const values = [];
-            i++;
-            while (i < lines.length) {
-                const enumLine = lines[i].trim();
-                if (enumLine === '}') {
+            const addEnumValues = (chunk) => {
+                for (const part of chunk.split(',')) {
+                    const token = part
+                        .replace(/\/\/.*$/, '')
+                        .trim()
+                        .split('=')[0]
+                        .trim();
+                    if (/^\w+$/.test(token)) {
+                        values.push(token);
+                    }
+                }
+            };
+            // Handle both single-line and multi-line enum bodies.
+            let remainder = enumMatch[2] ?? '';
+            while (true) {
+                const closeIndex = remainder.indexOf('}');
+                if (closeIndex >= 0) {
+                    addEnumValues(remainder.slice(0, closeIndex));
                     i++;
                     break;
                 }
-                const valueMatch = enumLine.match(/^(\w+)/);
-                if (valueMatch) {
-                    values.push(valueMatch[1]);
-                }
+                addEnumValues(remainder);
                 i++;
+                if (i >= lines.length) {
+                    break;
+                }
+                remainder = lines[i].trim();
             }
             result.enums.set(enumName, values);
             continue;
@@ -190,6 +240,7 @@ export function parseJSONSchema(source) {
         tables: [],
         enums: new Map(),
     };
+    const joinReferences = [];
     // Handle top-level object as a table
     if (schema.type === 'object' && schema.properties) {
         const tableName = schema.title || 'Root';
@@ -208,6 +259,10 @@ export function parseJSONSchema(source) {
             const prop = propDef;
             let type = 'string';
             let isVector = false;
+            let refTarget = null;
+            if (typeof prop.$ref === 'string') {
+                refTarget = parseJsonRef(prop.$ref);
+            }
             if (prop.type === 'integer') {
                 type = 'int64';
             }
@@ -228,18 +283,27 @@ export function parseJSONSchema(source) {
                 // Nested object - will be stored as BLOB (serialized FlatBuffer)
                 type = propName;
             }
+            if (refTarget) {
+                type = 'uint64';
+                isVector = false;
+                joinReferences.push({ fromTable: tableName, columnName: propName, targetTable: refTarget });
+            }
             // Handle enums
             if (prop.enum && Array.isArray(prop.enum)) {
                 const enumValues = prop.enum.filter((v) => typeof v === 'string');
                 result.enums.set(propName + 'Enum', enumValues);
                 type = propName + 'Enum';
             }
+            const attributes = prop.required ? ['required'] : [];
+            if (refTarget) {
+                attributes.push('indexed');
+            }
             fields.push({
                 name: propName,
                 type,
                 isVector,
                 defaultValue: prop.default,
-                attributes: prop.required ? ['required'] : [],
+                attributes,
             });
         }
         result.tables.push({
@@ -277,15 +341,30 @@ export function parseJSONSchema(source) {
                     }
                     const prop = propDef;
                     let type = jsonTypeToFB(prop.type || 'string');
-                    const isVector = prop.type === 'array';
+                    let isVector = prop.type === 'array';
+                    let refTarget = null;
                     if (isVector) {
                         type = jsonTypeToFB(prop.items?.type || 'string');
+                    }
+                    if (typeof prop.$ref === 'string') {
+                        const parsedRef = parseJsonRef(prop.$ref);
+                        if (parsedRef) {
+                            refTarget = parsedRef;
+                            type = 'uint64';
+                            isVector = false;
+                            joinReferences.push({ fromTable: defName, columnName: propName, targetTable: refTarget });
+                        }
+                    }
+                    const attributes = [];
+                    if (refTarget) {
+                        attributes.push('indexed');
                     }
                     fields.push({
                         name: propName,
                         type,
                         isVector,
                         defaultValue: prop.default,
+                        attributes,
                     });
                 }
                 result.tables.push({
@@ -297,6 +376,7 @@ export function parseJSONSchema(source) {
             }
         }
     }
+    applyJoinTables(result, joinReferences);
     return result;
 }
 function jsonTypeToFB(jsonType) {

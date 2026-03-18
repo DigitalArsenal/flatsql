@@ -23,6 +23,7 @@ export declare class TableStore {
     private extractFields;
     getTableDef(): TableDef;
     getIndexNames(): string[];
+    hasIndex(columnName: string): boolean;
     getRecordCount(): bigint;
 }
 //# sourceMappingURL=table-store.d.ts.map

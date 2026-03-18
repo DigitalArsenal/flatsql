@@ -14,6 +14,14 @@ export interface TableStats {
   recordCount: number;
 }
 
+export interface IngestProfile {
+  recordCount: number;
+  byteCount: number;
+  decodeNanos: number;
+  appendNanos: number;
+  indexNanos: number;
+}
+
 export interface FlatSQLDatabase {
   /**
    * Register a file identifier to route FlatBuffers to a table
@@ -32,6 +40,14 @@ export interface FlatSQLDatabase {
    * @param source Optional source name (requires registerSource() first)
    */
   ingest(data: Uint8Array, source?: string | null): number;
+
+  /**
+   * Ingest many raw FlatBuffers through the native bulk-stream path.
+   * Each buffer is wrapped as a size-prefixed record before transfer.
+   * @param buffers FlatBuffers without size prefixes
+   * @param source Optional source name (requires registerSource() first)
+   */
+  ingestBuffers(buffers: Uint8Array[], source?: string | null): number;
 
   /**
    * Ingest a single FlatBuffer (without size prefix)
@@ -59,6 +75,16 @@ export interface FlatSQLDatabase {
    * Get statistics for all tables
    */
   getStats(): TableStats[];
+
+  /**
+   * Reset native ingest profile counters for this database handle.
+   */
+  resetIngestProfile(): void;
+
+  /**
+   * Read native ingest profile counters collected during prior ingest calls.
+   */
+  getIngestProfile(): IngestProfile;
 
   // ==================== Multi-Source API ====================
 

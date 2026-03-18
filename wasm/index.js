@@ -250,6 +250,12 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
         getStatTableName: Module.cwrap('flatsql_get_stat_table_name', 'string', ['number']),
         getStatFileId: Module.cwrap('flatsql_get_stat_file_id', 'string', ['number']),
         getStatRecordCount: Module.cwrap('flatsql_get_stat_record_count', 'number', ['number']),
+        resetIngestProfile: Module.cwrap('flatsql_reset_ingest_profile', null, ['number']),
+        getIngestProfileRecordCount: Module.cwrap('flatsql_get_ingest_profile_record_count', 'number', ['number']),
+        getIngestProfileByteCount: Module.cwrap('flatsql_get_ingest_profile_byte_count', 'number', ['number']),
+        getIngestProfileDecodeNanos: Module.cwrap('flatsql_get_ingest_profile_decode_nanos', 'number', ['number']),
+        getIngestProfileAppendNanos: Module.cwrap('flatsql_get_ingest_profile_append_nanos', 'number', ['number']),
+        getIngestProfileIndexNanos: Module.cwrap('flatsql_get_ingest_profile_index_nanos', 'number', ['number']),
 
         // Delete support
         markDeleted: Module.cwrap('flatsql_mark_deleted', null, ['number', 'string', 'number']),
@@ -278,6 +284,33 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
  */
 export function wasIntegrityVerified() {
     return integrityVerified;
+}
+
+function withHeapBytes(data, callback) {
+    const ptr = Module._malloc(data.length);
+    try {
+        Module.HEAPU8.set(data, ptr);
+        return callback(ptr);
+    } finally {
+        Module._free(ptr);
+    }
+}
+
+function buildSizePrefixedStream(buffers) {
+    let total = 0;
+    for (const buffer of buffers) {
+        total += 4 + buffer.length;
+    }
+
+    const stream = new Uint8Array(total);
+    let offset = 0;
+    for (const buffer of buffers) {
+        new DataView(stream.buffer, offset, 4).setUint32(0, buffer.length, true);
+        offset += 4;
+        stream.set(buffer, offset);
+        offset += buffer.length;
+    }
+    return stream;
 }
 
 // High-level FlatSQL API class
@@ -332,29 +365,26 @@ export class FlatSQLDatabase {
 
     // Ingest data from Uint8Array (routes to base tables or source tables)
     ingest(data, source = null) {
-        const ptr = Module._malloc(data.length);
-        Module.HEAPU8.set(data, ptr);
-        let count;
-        if (source) {
-            count = api.ingestWithSource(this._handle, ptr, data.length, source);
-        } else {
-            count = api.ingest(this._handle, ptr, data.length);
-        }
-        Module._free(ptr);
-        return count;
+        return withHeapBytes(data, (ptr) => {
+            if (source) {
+                return api.ingestWithSource(this._handle, ptr, data.length, source);
+            }
+            return api.ingest(this._handle, ptr, data.length);
+        });
+    }
+
+    // Ingest many FlatBuffers via the native bulk stream path.
+    ingestBuffers(buffers, source = null) {
+        return this.ingest(buildSizePrefixedStream(buffers), source);
     }
 
     ingestOne(data, source = null) {
-        const ptr = Module._malloc(data.length);
-        Module.HEAPU8.set(data, ptr);
-        let count;
-        if (source) {
-            count = api.ingestOneWithSource(this._handle, ptr, data.length, source);
-        } else {
-            count = api.ingestOne(this._handle, ptr, data.length);
-        }
-        Module._free(ptr);
-        return count;
+        return withHeapBytes(data, (ptr) => {
+            if (source) {
+                return api.ingestOneWithSource(this._handle, ptr, data.length, source);
+            }
+            return api.ingestOne(this._handle, ptr, data.length);
+        });
     }
 
     // Register a named data source for source-aware ingestion
@@ -457,6 +487,20 @@ export class FlatSQLDatabase {
             });
         }
         return stats;
+    }
+
+    resetIngestProfile() {
+        api.resetIngestProfile(this._handle);
+    }
+
+    getIngestProfile() {
+        return {
+            recordCount: api.getIngestProfileRecordCount(this._handle),
+            byteCount: api.getIngestProfileByteCount(this._handle),
+            decodeNanos: api.getIngestProfileDecodeNanos(this._handle),
+            appendNanos: api.getIngestProfileAppendNanos(this._handle),
+            indexNanos: api.getIngestProfileIndexNanos(this._handle),
+        };
     }
 
     markDeleted(tableName, sequence) {

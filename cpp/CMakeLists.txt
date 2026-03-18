@@ -169,6 +169,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_test_buffer_size\", \
                 \"_flatsql_get_stats_count\", \"_flatsql_get_stat_table_name\", \
                 \"_flatsql_get_stat_file_id\", \"_flatsql_get_stat_record_count\", \
+                \"_flatsql_reset_ingest_profile\", \"_flatsql_get_ingest_profile_record_count\", \
+                \"_flatsql_get_ingest_profile_byte_count\", \"_flatsql_get_ingest_profile_decode_nanos\", \
+                \"_flatsql_get_ingest_profile_append_nanos\", \"_flatsql_get_ingest_profile_index_nanos\", \
                 \"_flatsql_mark_deleted\", \"_flatsql_get_deleted_count\", \
                 \"_flatsql_clear_tombstones\", \
                 \"_flatsql_get_flatbuffer_by_id\", \"_flatsql_get_flatbuffer_by_email\", \
@@ -242,6 +245,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_test_buffer_size\", \
                 \"_flatsql_get_stats_count\", \"_flatsql_get_stat_table_name\", \
                 \"_flatsql_get_stat_file_id\", \"_flatsql_get_stat_record_count\", \
+                \"_flatsql_reset_ingest_profile\", \"_flatsql_get_ingest_profile_record_count\", \
+                \"_flatsql_get_ingest_profile_byte_count\", \"_flatsql_get_ingest_profile_decode_nanos\", \
+                \"_flatsql_get_ingest_profile_append_nanos\", \"_flatsql_get_ingest_profile_index_nanos\", \
                 \"_flatsql_mark_deleted\", \"_flatsql_get_deleted_count\", \
                 \"_flatsql_clear_tombstones\", \
                 \"_flatsql_get_flatbuffer_by_id\", \"_flatsql_get_flatbuffer_by_email\", \
@@ -283,14 +289,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
 
 else()
     message(STATUS "Native build (for testing and CLI)")
+    find_package(Threads REQUIRED)
 
     # SQLite static library (from amalgamation)
     add_library(sqlite3 STATIC ${SQLITE_DIR}/sqlite3.c)
     target_include_directories(sqlite3 PUBLIC ${SQLITE_DIR})
     target_compile_definitions(sqlite3 PRIVATE
-        SQLITE_THREADSAFE=0
+        SQLITE_THREADSAFE=1
         SQLITE_OMIT_LOAD_EXTENSION=1
-        SQLITE_OMIT_WAL=1
         SQLITE_OMIT_DEPRECATED=1
         SQLITE_DQS=0
         SQLITE_ENABLE_RTREE=1
@@ -309,7 +315,7 @@ else()
         ${SQLITE_DIR}
         ${SQLEAN_DIR}
     )
-    target_link_libraries(flatsql_lib PUBLIC sqlite3)
+    target_link_libraries(flatsql_lib PUBLIC sqlite3 Threads::Threads)
     if(OpenSSL_FOUND)
         target_link_libraries(flatsql_lib PUBLIC OpenSSL::Crypto)
         target_include_directories(flatsql_lib PUBLIC ${OPENSSL_INCLUDE_DIR})
@@ -371,6 +377,16 @@ else()
     add_executable(flatsql_roundtrip_test test/roundtrip_test.cpp)
     target_link_libraries(flatsql_roundtrip_test PRIVATE flatsql_lib)
     target_include_directories(flatsql_roundtrip_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/schemas
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+    )
+
+    # Native cluster validation harness
+    add_executable(flatsql_cluster_validation test/cluster_validation_test.cpp)
+    target_link_libraries(flatsql_cluster_validation PRIVATE flatsql_lib)
+    target_include_directories(flatsql_cluster_validation PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/schemas
         ${FLATBUFFERS_INCLUDE_DIR}

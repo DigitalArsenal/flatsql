@@ -99,19 +99,36 @@ function isValidJSONSchema(value: unknown): value is {
 /**
  * Type guard to check if a value is a valid property definition.
  */
-function isValidPropertyDef(value: unknown): value is {
+interface JSONSchemaProperty {
   type?: string;
   enum?: unknown[];
   items?: { type?: string };
   default?: unknown;
   required?: boolean;
-} {
+  $ref?: string;
+}
+
+function isValidPropertyDef(value: unknown): value is JSONSchemaProperty {
   if (value === null || typeof value !== 'object') {
     return false;
   }
   const obj = value as Record<string, unknown>;
 
   if (obj.type !== undefined && typeof obj.type !== 'string') {
+    return false;
+  }
+
+  if (obj.items !== undefined) {
+    if (typeof obj.items !== 'object' || obj.items === null) {
+      return false;
+    }
+    const items = obj.items as Record<string, unknown>;
+    if (items.type !== undefined && typeof items.type !== 'string') {
+      return false;
+    }
+  }
+
+  if (obj.$ref !== undefined && typeof obj.$ref !== 'string') {
     return false;
   }
 
@@ -137,6 +154,41 @@ interface ParsedSchema {
   tables: FBTable[];
   enums: Map<string, string[]>;
   rootType?: string;
+}
+
+interface JoinReference {
+  fromTable: string;
+  columnName: string;
+  targetTable: string;
+}
+
+const REF_PATTERN = /^#\/(?:(?:definitions)|(?:\$defs))\/(.+)$/;
+
+function parseJsonRef(ref: string): string | null {
+  const match = REF_PATTERN.exec(ref);
+  return match ? match[1] : null;
+}
+
+function applyJoinTables(parsed: ParsedSchema, joinRefs: JoinReference[]): void {
+  const seen = new Set<string>();
+
+  for (const ref of joinRefs) {
+    const target = ref.targetTable;
+    if (!target) continue;
+    const joinName = `${ref.fromTable}_${target}_join`;
+    if (seen.has(joinName)) continue;
+    seen.add(joinName);
+
+    parsed.tables.push({
+      name: joinName,
+      namespace: '',
+      fields: [
+        { name: `${ref.fromTable}RowId`, type: 'uint64', isVector: false, defaultValue: undefined, attributes: ['required'] },
+        { name: `${target}RowId`, type: 'uint64', isVector: false, defaultValue: undefined, attributes: ['required'] },
+      ],
+      isStruct: false,
+    });
+  }
 }
 
 // Parse FlatBuffer IDL schema
@@ -280,6 +332,7 @@ export function parseJSONSchema(source: string): ParsedSchema {
     tables: [],
     enums: new Map(),
   };
+  const joinReferences: JoinReference[] = [];
 
   // Handle top-level object as a table
   if (schema.type === 'object' && schema.properties) {
@@ -299,9 +352,14 @@ export function parseJSONSchema(source: string): ParsedSchema {
         continue; // Skip invalid property definitions
       }
 
-      const prop = propDef;
+      const prop = propDef as JSONSchemaProperty;
       let type = 'string';
       let isVector = false;
+      let refTarget: string | null = null;
+
+      if (typeof prop.$ref === 'string') {
+        refTarget = parseJsonRef(prop.$ref);
+      }
 
       if (prop.type === 'integer') {
         type = 'int64';
@@ -319,6 +377,12 @@ export function parseJSONSchema(source: string): ParsedSchema {
         type = propName;
       }
 
+      if (refTarget) {
+        type = 'uint64';
+        isVector = false;
+        joinReferences.push({ fromTable: tableName, columnName: propName, targetTable: refTarget });
+      }
+
       // Handle enums
       if (prop.enum && Array.isArray(prop.enum)) {
         const enumValues = prop.enum.filter((v): v is string => typeof v === 'string');
@@ -326,12 +390,17 @@ export function parseJSONSchema(source: string): ParsedSchema {
         type = propName + 'Enum';
       }
 
+      const attributes = prop.required ? ['required'] : [];
+      if (refTarget) {
+        attributes.push('indexed');
+      }
+
       fields.push({
         name: propName,
         type,
         isVector,
         defaultValue: prop.default,
-        attributes: prop.required ? ['required'] : [],
+        attributes,
       });
     }
 
@@ -374,12 +443,28 @@ export function parseJSONSchema(source: string): ParsedSchema {
             continue;
           }
 
-          const prop = propDef;
+          const prop = propDef as JSONSchemaProperty;
           let type = jsonTypeToFB(prop.type || 'string');
-          const isVector = prop.type === 'array';
+          let isVector = prop.type === 'array';
+          let refTarget: string | null = null;
 
           if (isVector) {
             type = jsonTypeToFB(prop.items?.type || 'string');
+          }
+
+          if (typeof prop.$ref === 'string') {
+            const parsedRef = parseJsonRef(prop.$ref);
+            if (parsedRef) {
+              refTarget = parsedRef;
+              type = 'uint64';
+              isVector = false;
+              joinReferences.push({ fromTable: defName, columnName: propName, targetTable: refTarget });
+            }
+          }
+
+          const attributes = [];
+          if (refTarget) {
+            attributes.push('indexed');
           }
 
           fields.push({
@@ -387,6 +472,7 @@ export function parseJSONSchema(source: string): ParsedSchema {
             type,
             isVector,
             defaultValue: prop.default,
+            attributes,
           });
         }
 
@@ -399,6 +485,8 @@ export function parseJSONSchema(source: string): ParsedSchema {
       }
     }
   }
+
+  applyJoinTables(result, joinReferences);
 
   return result;
 }

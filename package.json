@@ -1,6 +1,6 @@
 {
   "name": "flatsql",
-  "version": "0.3.9",
+  "version": "0.4.0",
   "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
   "type": "module",
   "main": "dist/index.js",
@@ -32,13 +32,18 @@
     "build": "tsc",
     "build:wasm": "bash scripts/build-wasm.sh",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
-    "test:wasm": "node wasm/test-node.mjs",
+    "test:wasm": "node wasm/test-bulk-ingest.mjs",
     "dev": "tsc --watch",
     "serve": "vite docs --port 8081",
+    "bench": "node bench/flatsql-perf.mjs",
+    "bench:perf": "node bench/flatsql-perf.mjs",
+    "bench:perf:profile": "node bench/flatsql-perf.mjs --profile",
     "prepublishOnly": "npm run build",
     "emsdk:install": "bash scripts/install-emsdk.sh",
     "emsdk:env": "echo 'Run: source packages/emsdk/emsdk_env.sh'",
-    "test:wasi": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasi.test.ts"
+    "test:wasi": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasi.test.ts",
+    "test:cluster": "bash scripts/cluster-validation.sh",
+    "test:cluster:smoke": "bash scripts/cluster-validation.sh --duration=5 --stretch-duration=5 --readers=4 --stretch-readers=6"
   },
   "repository": {
     "type": "git",

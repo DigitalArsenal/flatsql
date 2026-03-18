@@ -142,6 +142,9 @@ export class TableStore {
     getIndexNames() {
         return Array.from(this.indexes.keys());
     }
+    hasIndex(columnName) {
+        return this.indexes.has(columnName);
+    }
     getRecordCount() {
         const index = this.indexes.get('_rowid');
         if (index) {

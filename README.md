@@ -72,6 +72,15 @@ FlatBuffer → Query (via virtual table) → FlatBuffer
 - **Portable output** — Exported data is standard FlatBuffers, readable by any tooling
 - **Multi-source federation** — Query across multiple FlatBuffer sources with automatic source tagging
 
+## Runtime Choices & Performance Gates
+
+- Production should prefer the SQLite-backed native/WASM path (`initFlatSQL` → `FlatSQL` → `createDatabase`). The pure TypeScript `FlatSQLDatabase` is preserved only as an explicit fallback/reference implementation for environments that cannot load the WASM module.
+- Use `db.ingestBuffers([...])` on the WASM path when your input is already a set of raw FlatBuffers. It feeds the native bulk-stream ingest path instead of looping through `ingestOne(...)`.
+- Run `npm run bench` (alias `npm run bench:perf`) as the single-command benchmark matrix for FlatSQL JS vs FlatSQL WASM. Use `npm run bench:perf:profile` to print the WASM ingest phase breakdown (`pack`, `decode`, `append`, `index`, `verify`) alongside the gate table.
+  Profiling mode is diagnostic and includes instrumentation overhead; use the non-profile benchmark for merge-gate decisions.
+- Run `npm run test:cluster` for the native WAL-backed cluster validation workload, or `npm run test:cluster:smoke` for the short preflight run.
+
+
 ## Source Code
 
 | Repository | Description |
@@ -110,6 +119,12 @@ db.enableDemoExtractors();
 // Ingest FlatBuffer stream
 // Format: [4-byte size LE][FlatBuffer][4-byte size LE][FlatBuffer]...
 db.ingest(streamData);
+
+// Or ingest pre-built FlatBuffers directly through the bulk path.
+db.ingestBuffers([
+  flatsql.createTestUser(1, 'Alice', 'alice@example.com', 30),
+  flatsql.createTestUser(2, 'Bob', 'bob@example.com', 25),
+]);
 
 // Query with SQL
 const result = db.query('SELECT id, name, email FROM User WHERE age > 25');
@@ -159,6 +174,19 @@ console.log(result.rows);
 const exported = db.exportData();
 ```
 
+### Cluster Runtime Detection
+
+Use the runtime guard helpers before attempting browser cluster mode:
+
+```typescript
+import { detectClusterEnvironment, isClusterModeSupported } from 'flatsql';
+
+const env = detectClusterEnvironment();
+if (!isClusterModeSupported(env)) {
+  throw new Error('Cluster mode unsupported on this runtime');
+}
+```
+
 ### Native C++ (Embedded)
 
 For performance-critical applications, link the C++ library directly:
@@ -206,6 +234,11 @@ for (size_t i = 0; i < result.rowCount(); i++) {
 │  └──────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## Schema Joins & References
+
+- JSON schemas that reference other definitions now produce explicit ``From_Target_join`` tables with `{FromRowId, TargetRowId}` columns.
+- This keeps referenced schemas in the same normalized storage layer so queries can `JOIN` the virtual tables instead of embedding opaque JSON blobs.
 
 ### Stream Format
 

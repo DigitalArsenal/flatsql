@@ -11,6 +11,14 @@
 
 namespace flatsql {
 
+struct SQLiteConnectionOptions {
+    std::string path = ":memory:";
+    bool enableWal = false;
+    int busyTimeoutMs = 250;
+    int maxBusyRetries = 8;
+    int busyBackoffMs = 1;
+};
+
 /**
  * Source registration for multi-source queries.
  * Holds all data for a single FlatBuffer data source.
@@ -43,7 +51,7 @@ struct SourceInfo {
  */
 class SQLiteEngine {
 public:
-    SQLiteEngine();
+    explicit SQLiteEngine(SQLiteConnectionOptions options = {});
     ~SQLiteEngine();
 
     // Non-copyable
@@ -185,6 +193,7 @@ private:
     SourceInfo* findSourceCaseInsensitive(const std::string& lowerTableName);
 
     sqlite3* db_;
+    SQLiteConnectionOptions options_;
     std::map<std::string, std::unique_ptr<SourceInfo>> sources_;
 
     // Statement cache for frequently executed queries

@@ -7,7 +7,10 @@
 #include "flatsql/schema_parser.h"
 #include "flatsql/sqlite_engine.h"
 #include "flatbuffers/encryption.h"
+#include <atomic>
 #include <set>
+#include <memory>
+#include <shared_mutex>
 
 namespace flatsql {
 
@@ -113,11 +116,19 @@ private:
  */
 class FlatSQLDatabase {
 public:
+    struct RuntimeOptions {
+        std::shared_ptr<StreamingFlatBufferStore> sharedStore;
+        std::shared_ptr<std::shared_mutex> accessMutex;
+        SQLiteConnectionOptions sqlite;
+    };
+
     // Create from schema
-    explicit FlatSQLDatabase(const DatabaseSchema& schema);
+    explicit FlatSQLDatabase(const DatabaseSchema& schema, RuntimeOptions options = {});
 
     // Create from schema source (IDL or JSON)
-    static FlatSQLDatabase fromSchema(const std::string& source, const std::string& dbName = "default");
+    static FlatSQLDatabase fromSchema(const std::string& source,
+                                      const std::string& dbName = "default",
+                                      RuntimeOptions options = {});
 
     // Register a file identifier -> table mapping
     // Call this before ingesting to enable routing
@@ -175,6 +186,7 @@ public:
     // Returns count of records iterated
     template<typename Callback>
     size_t iterateAll(const std::string& tableName, Callback&& callback) const {
+        std::shared_lock lock(*accessMutex_);
         auto it = tables_.find(tableName);
         if (it == tables_.end()) {
             return 0;
@@ -182,7 +194,7 @@ public:
 
         const std::string& fileId = it->second->getFileId();
         size_t count = 0;
-        storage_.iterateRefsByFileId(fileId, [&](const StreamingFlatBufferStore::RecordRef& ref) {
+        storage_->iterateRefsByFileId(fileId, [&](const StreamingFlatBufferStore::RecordRef& ref) {
             callback(ref.data, ref.length, ref.sequence);
             count++;
             return true;
@@ -191,7 +203,7 @@ public:
     }
 
     // Get storage for direct access
-    const StreamingFlatBufferStore& getStorage() const { return storage_; }
+    const StreamingFlatBufferStore& getStorage() const { return *storage_; }
 
     // Set field extractor for a table (required for indexing and queries)
     void setFieldExtractor(const std::string& tableName, TableStore::FieldExtractor extractor);
@@ -203,7 +215,10 @@ public:
     void setBatchExtractor(const std::string& tableName, TableStore::BatchExtractor extractor);
 
     // Get raw storage data (for export)
-    std::vector<uint8_t> exportData() const { return storage_.exportData(); }
+    std::vector<uint8_t> exportData() const {
+        std::shared_lock lock(*accessMutex_);
+        return storage_->exportData();
+    }
 
     // Get schema
     const DatabaseSchema& getSchema() const { return schema_; }
@@ -222,6 +237,16 @@ public:
         std::vector<std::string> indexes;
     };
     std::vector<TableStats> getStats() const;
+
+    // Get/reset internal ingest profile counters.
+    IngestProfile getIngestProfile() {
+        ingestProfileEnabled_ = false;
+        return ingestProfile_;
+    }
+    void resetIngestProfile() {
+        ingestProfile_.reset();
+        ingestProfileEnabled_ = true;
+    }
 
     // ==================== Multi-Source API ====================
 
@@ -403,7 +428,8 @@ private:
     }
 
     DatabaseSchema schema_;
-    StreamingFlatBufferStore storage_;
+    std::shared_ptr<StreamingFlatBufferStore> storage_;
+    std::shared_ptr<std::shared_mutex> accessMutex_;
     std::map<std::string, std::unique_ptr<TableStore>> tables_;
     std::map<std::string, std::string> fileIdToTable_;  // file_id -> table name
 
@@ -413,7 +439,7 @@ private:
 
     // SQLite engine for query execution
     std::unique_ptr<SQLiteEngine> sqliteEngine_;
-    bool sqliteInitialized_ = false;
+    std::atomic<bool> sqliteInitialized_{false};
 
     // Track which tables have been registered with SQLite
     std::set<std::string> sqliteRegisteredTables_;
@@ -423,6 +449,9 @@ private:
 
     // HMAC verification
     bool hmacEnabled_ = false;
+
+    IngestProfile ingestProfile_;
+    bool ingestProfileEnabled_ = false;
 };
 
 }  // namespace flatsql

@@ -1,7 +1,10 @@
 #include "flatsql/sqlite_engine.h"
 #include "flatsql/geo_functions.h"
+#include <algorithm>
+#include <chrono>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <cctype>
 
 // sqlean extension init functions (C linkage)
@@ -38,13 +41,59 @@ static std::string normalizeSQL(const std::string& sql) {
     return result;
 }
 
-SQLiteEngine::SQLiteEngine() : db_(nullptr) {
-    int rc = sqlite3_open(":memory:", &db_);
+static bool isBusyResult(int rc) {
+    return rc == SQLITE_BUSY || rc == SQLITE_LOCKED;
+}
+
+static int stepWithRetry(sqlite3* db, sqlite3_stmt* stmt, const SQLiteConnectionOptions& options) {
+    int rc = SQLITE_OK;
+    int delayMs = std::max(1, options.busyBackoffMs);
+
+    for (int attempt = 0; attempt <= options.maxBusyRetries; attempt++) {
+        rc = sqlite3_step(stmt);
+        if (!isBusyResult(rc)) {
+            return rc;
+        }
+        if (attempt == options.maxBusyRetries) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        delayMs = std::min(delayMs * 2, 32);
+    }
+
+    throw std::runtime_error("SQLite busy/locked after retries: " + std::string(sqlite3_errmsg(db)));
+}
+
+static void execOrThrow(sqlite3* db, const char* sql) {
+    char* errMsg = nullptr;
+    int rc = sqlite3_exec(db, sql, nullptr, nullptr, &errMsg);
+    if (rc != SQLITE_OK) {
+        std::string error = errMsg ? errMsg : sqlite3_errmsg(db);
+        sqlite3_free(errMsg);
+        throw std::runtime_error(error);
+    }
+}
+
+SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
+    : db_(nullptr)
+    , options_(std::move(options)) {
+    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
+    int rc = sqlite3_open_v2(options_.path.c_str(), &db_, flags, nullptr);
     if (rc != SQLITE_OK) {
         std::string error = sqlite3_errmsg(db_);
         sqlite3_close(db_);
         db_ = nullptr;
         throw std::runtime_error("Failed to open SQLite database: " + error);
+    }
+
+    sqlite3_extended_result_codes(db_, 1);
+    if (options_.busyTimeoutMs > 0) {
+        sqlite3_busy_timeout(db_, options_.busyTimeoutMs);
+    }
+
+    if (options_.enableWal && options_.path != ":memory:") {
+        execOrThrow(db_, "PRAGMA journal_mode=WAL");
+        execOrThrow(db_, "PRAGMA synchronous=NORMAL");
     }
 
     // Register custom geo/spatial functions
@@ -104,7 +153,9 @@ sqlite3_stmt* SQLiteEngine::getOrPrepareStmt(const std::string& sql) const {
 }
 
 SQLiteEngine::SQLiteEngine(SQLiteEngine&& other) noexcept
-    : db_(other.db_), sources_(std::move(other.sources_)) {
+    : db_(other.db_)
+    , options_(std::move(other.options_))
+    , sources_(std::move(other.sources_)) {
     other.db_ = nullptr;
 }
 
@@ -114,6 +165,7 @@ SQLiteEngine& SQLiteEngine::operator=(SQLiteEngine&& other) noexcept {
             sqlite3_close(db_);
         }
         db_ = other.db_;
+        options_ = std::move(other.options_);
         sources_ = std::move(other.sources_);
         other.db_ = nullptr;
     }
@@ -177,7 +229,7 @@ void SQLiteEngine::registerSource(
 
     // Create the virtual table
     std::ostringstream sql;
-    sql << "CREATE VIRTUAL TABLE \"" << sourceName << "\" USING \"" << sourceName << "\"()";
+    sql << "CREATE VIRTUAL TABLE temp.\"" << sourceName << "\" USING \"" << sourceName << "\"()";
 
     char* errMsg = nullptr;
     rc = sqlite3_exec(db_, sql.str().c_str(), nullptr, nullptr, &errMsg);
@@ -232,13 +284,13 @@ void SQLiteEngine::createUnifiedView(
 
     // Drop existing table/view if it exists (base virtual table or old view)
     {
-        std::string dropSql = "DROP TABLE IF EXISTS \"" + viewName + "\"";
+        std::string dropSql = "DROP TABLE IF EXISTS temp.\"" + viewName + "\"";
         char* errMsg = nullptr;
         sqlite3_exec(db_, dropSql.c_str(), nullptr, nullptr, &errMsg);
         sqlite3_free(errMsg);  // Ignore errors
     }
     {
-        std::string dropSql = "DROP VIEW IF EXISTS \"" + viewName + "\"";
+        std::string dropSql = "DROP VIEW IF EXISTS temp.\"" + viewName + "\"";
         char* errMsg = nullptr;
         sqlite3_exec(db_, dropSql.c_str(), nullptr, nullptr, &errMsg);
         sqlite3_free(errMsg);  // Ignore errors
@@ -246,7 +298,7 @@ void SQLiteEngine::createUnifiedView(
 
     // Build UNION ALL view with _source column
     std::ostringstream sql;
-    sql << "CREATE VIEW \"" << viewName << "\" AS ";
+    sql << "CREATE TEMP VIEW \"" << viewName << "\" AS ";
 
     bool first = true;
     for (const auto& name : sourceNames) {
@@ -323,7 +375,7 @@ QueryResult SQLiteEngine::execute(const std::string& sql, const std::vector<Valu
 
     // Fetch rows - optimized to reduce allocations
     int rc;
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    while ((rc = stepWithRetry(db_, stmt, options_)) == SQLITE_ROW) {
         result.rows.emplace_back();
         std::vector<Value>& row = result.rows.back();
         row.resize(numCols);
@@ -393,7 +445,7 @@ size_t SQLiteEngine::executeAndCount(const std::string& sql, const std::vector<V
     size_t rowCount = 0;
     int numCols = sqlite3_column_count(stmt);
     int rc;
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    while ((rc = stepWithRetry(db_, stmt, options_)) == SQLITE_ROW) {
         rowCount++;
         // Read all columns to trigger xColumn callbacks
         for (int i = 0; i < numCols; i++) {
@@ -415,6 +467,10 @@ size_t SQLiteEngine::executeAndCount(const std::string& sql, const std::vector<V
                     break;
             }
         }
+    }
+
+    if (rc != SQLITE_DONE) {
+        throw std::runtime_error("SQL execution error: " + std::string(sqlite3_errmsg(db_)));
     }
 
     return rowCount;
