@@ -85,6 +85,7 @@ set(FLATSQL_LIB_SOURCES
     src/sqlite_vtab.cpp
     src/sqlite_engine.cpp
     src/geo_functions.cpp
+    src/geo_geometry.cpp
     ${FLATBUFFERS_ENCRYPTION_SOURCES}
     ${SQLEAN_SOURCES}
 )
@@ -104,6 +105,7 @@ set(FLATSQL_HEADERS
     include/flatsql/types.h
     include/flatsql/sqlite_vtab.h
     include/flatsql/sqlite_engine.h
+    include/flatsql/geo_geometry.h
 )
 
 # Emscripten/WASM configuration
@@ -275,8 +277,58 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             ${CMAKE_CURRENT_SOURCE_DIR}/../docs/
         COMMENT "Copying flatsql-wasi.wasm to docs/"
     )
+    # Space Data Module (SDM) — standalone spatial engine WASM
+    # Compliant with https://github.com/DigitalArsenal/space-data-module-sdk
+    set(SDM_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/../sdm/sdm_entry.cpp
+        src/geo_geometry.cpp
+    )
+
+    add_executable(flatsql_sdm ${SDM_SOURCES})
+
+    target_include_directories(flatsql_sdm PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../sdm
+    )
+
+    set_target_properties(flatsql_sdm PROPERTIES
+        OUTPUT_NAME "flatsql-spatial"
+        SUFFIX ".wasm"
+        LINK_FLAGS "\
+            -s WASM=1 \
+            -s STANDALONE_WASM=1 \
+            --no-entry \
+            -s EXPORTED_FUNCTIONS='[ \
+                \"_malloc\", \"_free\", \
+                \"_plugin_get_manifest\", \"_plugin_get_manifest_size\", \
+                \"_sdm_get_input_buffer\", \"_sdm_set_input_length\", \
+                \"_sdm_get_output_buffer\", \"_sdm_get_output_length\", \
+                \"_compute_distance\", \"_compute_bearing\", \
+                \"_point_in_polygon\", \
+                \"_polygon_intersection\", \"_polygon_union\", \
+                \"_compute_voronoi\", \"_compute_delaunay\", \
+                \"_transform_to_ecef\", \"_transform_from_ecef\", \
+                \"_spatial_query\" \
+            ]' \
+            -s ALLOW_MEMORY_GROWTH=1 \
+            -s INITIAL_MEMORY=4194304 \
+            -s STACK_SIZE=524288 \
+            -s FILESYSTEM=0 \
+            -s ALLOW_TABLE_GROWTH=1 \
+            -fexceptions \
+            -s DISABLE_EXCEPTION_CATCHING=0 \
+        "
+    )
+
+    add_custom_command(TARGET flatsql_sdm POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE_DIR:flatsql_sdm>/flatsql-spatial.wasm
+            ${CMAKE_CURRENT_SOURCE_DIR}/../sdm/
+        COMMENT "Copying flatsql-spatial.wasm to sdm/"
+    )
+
     message(STATUS "WASM build configured")
-    message(STATUS "Output: flatsql.js + flatsql.wasm + flatsql-wasi.wasm")
+    message(STATUS "Output: flatsql.js + flatsql.wasm + flatsql-wasi.wasm + flatsql-spatial.wasm (SDM)")
 
     # Post-build: copy WASM files to docs/ for GitHub Pages
     add_custom_command(TARGET flatsql POST_BUILD
@@ -408,9 +460,29 @@ else()
     # Optimize for benchmark
     target_compile_options(flatsql_mpe_benchmark PRIVATE -O3)
 
+    # Spatial extensions benchmark
+    add_executable(flatsql_geo_benchmark test/geo_benchmark.cpp)
+    target_link_libraries(flatsql_geo_benchmark PRIVATE flatsql_lib)
+    target_include_directories(flatsql_geo_benchmark PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+    )
+    target_compile_options(flatsql_geo_benchmark PRIVATE -O3)
+
+    # Spatial extensions test
+    add_executable(flatsql_geo_test test/test_geo.cpp)
+    target_link_libraries(flatsql_geo_test PRIVATE flatsql_lib)
+    target_include_directories(flatsql_geo_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+    )
+
     enable_testing()
     add_test(NAME FlatSQLTest COMMAND flatsql_test)
     add_test(NAME FlatSQLIntegrationTest COMMAND flatsql_integration_test)
     add_test(NAME FlatSQLSocketTest COMMAND flatsql_socket_test)
     add_test(NAME FlatSQLRoundTripTest COMMAND flatsql_roundtrip_test)
+    add_test(NAME FlatSQLGeoTest COMMAND flatsql_geo_test)
 endif()

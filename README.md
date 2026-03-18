@@ -250,6 +250,106 @@ FlatSQL ingests size-prefixed FlatBuffer streams:
 
 The 4-byte file identifier in each FlatBuffer determines which table receives the record.
 
+## Spatial Extensions
+
+FlatSQL includes a full spatial computation engine with SpatiaLite-compatible functions, polygon boolean operations, Voronoi/Delaunay tessellation, and coordinate transforms.
+
+### Spatial SQL Functions
+
+| Category | Functions |
+|----------|-----------|
+| **Point ops** | `geo_distance`, `geo_bearing`, `geo_destination`, `geo_midpoint`, `geo_area_bbox`, `geo_within_radius`, `geo_bbox_contains` |
+| **Geohash** | `geo_geohash_encode`, `geo_geohash_decode_lat`, `geo_geohash_decode_lon` |
+| **Geometry I/O** | `geo_from_text` (WKT→blob), `geo_as_text` (blob→WKT), `geo_from_geojson`, `geo_as_geojson` |
+| **Predicates** | `geo_contains` (point-in-polygon, ray casting with hole support) |
+| **Boolean ops** | `geo_intersection`, `geo_union`, `geo_difference`, `geo_sym_difference`, `geo_buffer` |
+| **Analysis** | `geo_area_geom`, `geo_centroid`, `geo_length_geom`, `geo_envelope`, `geo_convex_hull` |
+| **Voronoi/Delaunay** | `geo_voronoi`, `geo_delaunay` |
+| **Coord transforms** | `geo_to_ecef` (WGS84→ECEF), `geo_from_ecef` (ECEF→WGS84) |
+
+### Examples
+
+```sql
+-- Distance between NYC and DC (~328 km)
+SELECT geo_distance(40.7128, -74.0060, 38.9072, -77.0369);
+
+-- Bearing from NYC to LA
+SELECT geo_bearing(40.7128, -74.0060, 34.0522, -118.2437);
+
+-- Geohash encode/decode
+SELECT geo_geohash_encode(42.6, -5.6, 5);  -- 'ezs42'
+
+-- Point-in-polygon
+SELECT geo_contains('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))', 5, 5);  -- 1
+
+-- Polygon intersection (accepts WKT or blob)
+SELECT geo_as_text(geo_intersection(
+  'POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))',
+  'POLYGON((5 5, 15 5, 15 15, 5 15, 5 5))'
+));
+
+-- WGS84 to ECEF coordinate transform
+SELECT geo_to_ecef(48.8566, 2.3522, 35);  -- '4200952.xxx,172458.xxx,4780111.xxx'
+
+-- Voronoi diagram
+SELECT geo_as_text(geo_voronoi(
+  'MULTIPOINT((0 0), (10 0), (10 10), (0 10))',
+  'POLYGON((-5 -5, 15 -5, 15 15, -5 15, -5 -5))'
+));
+```
+
+### R-Tree Spatial Indexing
+
+FlatSQL automatically creates R-Tree shadow tables for spatial columns during ingest. Spatial columns are detected by:
+- **Convention**: columns named `latitude`/`lat` + `longitude`/`lon`/`lng`
+- **Schema attribute**: fields marked with `(spatial)` in FlatBuffers IDL
+
+```sql
+-- R-Tree pre-filter + precise radius check (72x faster than full scan)
+SELECT p.* FROM points p
+INNER JOIN _rtree_points r ON p.rowid = r.id
+WHERE r.minLat >= 36.2 AND r.maxLat <= 45.2
+  AND r.minLon >= -80 AND r.maxLon <= -68
+  AND geo_within_radius(40.7, -74.0, p.lat, p.lon, 500) = 1;
+```
+
+### Spatial Performance
+
+| Operation | Throughput | Latency |
+|-----------|-----------|---------|
+| Point operations (distance, bearing) | 733K–1.07M ops/sec | ~1 µs |
+| Geohash encode/decode | 631K–746K ops/sec | ~1.4 µs |
+| Point-in-polygon | 127K–255K ops/sec | ~4 µs |
+| Polygon intersection | 81K ops/sec | ~12 µs |
+| Voronoi (4 sites) | 34K ops/sec | ~29 µs |
+| Coordinate transforms | 556K–609K ops/sec | ~1.7 µs |
+| R-Tree bbox query (10K records) | 77K ops/sec | ~13 µs |
+| R-Tree vs full scan speedup | **58–72x** | |
+
+### Space Data Module (SDM)
+
+FlatSQL Spatial is also available as a standalone WASM module compliant with the [Space Data Module SDK](https://github.com/DigitalArsenal/space-data-module-sdk):
+
+```javascript
+import { initSpatialSDM } from 'flatsql/sdm';
+
+const sdm = await initSpatialSDM();
+
+// Read the embedded manifest
+console.log(sdm.getManifest().pluginId);
+// → 'com.digitalarsenal.flatsql.spatial'
+
+// Compute distance
+const km = sdm.computeDistance(40.7128, -74.006, 38.9072, -77.0369);
+
+// Point-in-polygon
+const inside = sdm.pointInPolygon('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))', 5, 5);
+
+// Coordinate transform
+const ecef = sdm.toECEF(48.8566, 2.3522, 35);
+const back = sdm.fromECEF(ecef.x, ecef.y, ecef.z);
+```
+
 ## SQL Support
 
 ### Supported

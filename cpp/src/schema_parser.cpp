@@ -111,6 +111,9 @@ DatabaseSchema SchemaParser::parseIDL(const std::string& idl, const std::string&
                 if (attrs.find("encrypted") != std::string::npos) {
                     col.encrypted = true;
                 }
+                if (attrs.find("spatial") != std::string::npos) {
+                    col.spatial = true;
+                }
                 // Remove attributes from type
                 typeStr = std::regex_replace(typeStr, attrRegex, "");
                 typeStr = trim(typeStr);

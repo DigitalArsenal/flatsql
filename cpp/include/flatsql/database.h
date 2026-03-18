@@ -99,6 +99,18 @@ private:
 
     // Per-table record tracking (for source-specific tables)
     std::vector<StreamingFlatBufferStore::FileRecordInfo> recordInfos_;
+
+    // R-Tree spatial index support
+    struct SpatialIndexDef {
+        std::string latColumn;   // latitude / y column
+        std::string lonColumn;   // longitude / x column
+        std::string rtreeName;   // name of R-Tree virtual table
+    };
+    std::vector<SpatialIndexDef> spatialIndexes_;
+    sqlite3_stmt* rtreeInsertStmt_ = nullptr;   // cached insert statement
+
+    void createSpatialIndexes();
+    void insertIntoRTree(const SpatialIndexDef& si, const uint8_t* data, size_t length, uint64_t sequence);
 };
 
 /**
