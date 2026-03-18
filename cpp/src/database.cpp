@@ -20,6 +20,109 @@ TableStore::TableStore(const TableDef& tableDef, StreamingFlatBufferStore& stora
                 indexDb_, tableDef_.name, col.name, col.type);
         }
     }
+
+    // Create R-Tree spatial indexes
+    createSpatialIndexes();
+}
+
+void TableStore::createSpatialIndexes() {
+    // Strategy 1: Explicit (spatial) attribute with pairing
+    // Strategy 2: Convention-based detection (lat/latitude + lon/longitude)
+
+    // Collect spatial columns marked with attribute
+    std::vector<size_t> spatialCols;
+    for (size_t i = 0; i < tableDef_.columns.size(); i++) {
+        if (tableDef_.columns[i].spatial) {
+            spatialCols.push_back(i);
+        }
+    }
+
+    // If explicit spatial columns found, pair them
+    if (spatialCols.size() >= 2) {
+        // Take first two spatial columns as lat/lon pair
+        SpatialIndexDef si;
+        si.latColumn = tableDef_.columns[spatialCols[0]].name;
+        si.lonColumn = tableDef_.columns[spatialCols[1]].name;
+        si.rtreeName = "_rtree_" + tableDef_.name;
+        spatialIndexes_.push_back(si);
+    }
+
+    // Convention-based: detect lat/lon column pairs
+    if (spatialIndexes_.empty()) {
+        auto findCol = [&](const std::vector<std::string>& names) -> std::string {
+            for (const auto& col : tableDef_.columns) {
+                std::string lower = col.name;
+                for (auto& c : lower) c = std::tolower(c);
+                for (const auto& n : names) {
+                    if (lower == n) return col.name;
+                }
+            }
+            return "";
+        };
+
+        std::string latCol = findCol({"latitude", "lat"});
+        std::string lonCol = findCol({"longitude", "lon", "lng"});
+        if (!latCol.empty() && !lonCol.empty()) {
+            SpatialIndexDef si;
+            si.latColumn = latCol;
+            si.lonColumn = lonCol;
+            si.rtreeName = "_rtree_" + tableDef_.name;
+            spatialIndexes_.push_back(si);
+        }
+    }
+
+    // Create R-Tree virtual tables in SQLite
+    for (const auto& si : spatialIndexes_) {
+        std::string sql = "CREATE VIRTUAL TABLE IF NOT EXISTS \"" + si.rtreeName +
+                          "\" USING rtree(id, minLat, maxLat, minLon, maxLon)";
+        char* errMsg = nullptr;
+        int rc = sqlite3_exec(indexDb_, sql.c_str(), nullptr, nullptr, &errMsg);
+        if (rc != SQLITE_OK) {
+            // Non-fatal: log and continue without R-Tree
+            sqlite3_free(errMsg);
+            continue;
+        }
+    }
+}
+
+void TableStore::insertIntoRTree(const SpatialIndexDef& si, const uint8_t* data, size_t length, uint64_t sequence) {
+    if (!fieldExtractor_) return;
+
+    Value latVal = fieldExtractor_(data, length, si.latColumn);
+    Value lonVal = fieldExtractor_(data, length, si.lonColumn);
+
+    // Extract doubles from Value variant
+    double lat = 0, lon = 0;
+    bool valid = true;
+
+    auto toDouble = [](const Value& v, double& out) -> bool {
+        return std::visit([&out](const auto& val) -> bool {
+            using T = std::decay_t<decltype(val)>;
+            if constexpr (std::is_same_v<T, double>) { out = val; return true; }
+            else if constexpr (std::is_same_v<T, float>) { out = static_cast<double>(val); return true; }
+            else if constexpr (std::is_same_v<T, int32_t>) { out = static_cast<double>(val); return true; }
+            else if constexpr (std::is_same_v<T, int64_t>) { out = static_cast<double>(val); return true; }
+            else if constexpr (std::is_same_v<T, std::monostate>) { return false; }
+            else { return false; }
+        }, v);
+    };
+
+    valid = toDouble(latVal, lat) && toDouble(lonVal, lon);
+    if (!valid) return;
+
+    std::string sql = "INSERT INTO \"" + si.rtreeName + "\" VALUES(?, ?, ?, ?, ?)";
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(indexDb_, sql.c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) return;
+
+    sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(sequence));
+    sqlite3_bind_double(stmt, 2, lat);  // minLat
+    sqlite3_bind_double(stmt, 3, lat);  // maxLat (point = equal)
+    sqlite3_bind_double(stmt, 4, lon);  // minLon
+    sqlite3_bind_double(stmt, 5, lon);  // maxLon
+
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
 }
 
 void TableStore::onIngest(const uint8_t* data, size_t length, uint64_t sequence, uint64_t offset) {
@@ -39,6 +142,11 @@ void TableStore::onIngest(const uint8_t* data, size_t length, uint64_t sequence,
     for (auto& [colName, index] : indexes_) {
         Value key = fieldExtractor_(data, length, colName);
         index->insert(key, offset, static_cast<uint32_t>(length), sequence);
+    }
+
+    // Populate R-Tree spatial indexes
+    for (const auto& si : spatialIndexes_) {
+        insertIntoRTree(si, data, length, sequence);
     }
 }
 

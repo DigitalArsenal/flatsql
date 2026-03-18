@@ -1,0 +1,402 @@
+{
+  "pluginId": "com.digitalarsenal.flatsql.spatial",
+  "name": "FlatSQL Spatial Engine",
+  "version": "0.4.1",
+  "pluginFamily": "analysis",
+  "description": "SpatiaLite-compatible spatial computation engine for space data processing. Provides geodesic calculations, polygon boolean operations, Voronoi/Delaunay tessellation, coordinate transforms, and R-Tree spatial indexing over FlatBuffer storage.",
+  "capabilities": [],
+  "externalInterfaces": [],
+  "methods": [
+    {
+      "methodId": "compute_distance",
+      "displayName": "Compute Distance",
+      "description": "Haversine distance between two WGS84 lat/lon points (km)",
+      "inputPorts": [
+        {
+          "portId": "coordinates",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialQuery.fbs", "fileIdentifier": "SPQR" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "outputPorts": [
+        {
+          "portId": "result",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialResult.fbs", "fileIdentifier": "SPRS" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "maxBatch": 1000,
+      "drainPolicy": "drain-to-empty"
+    },
+    {
+      "methodId": "compute_bearing",
+      "displayName": "Compute Bearing",
+      "description": "Forward azimuth between two WGS84 points (degrees 0-360)",
+      "inputPorts": [
+        {
+          "portId": "coordinates",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialQuery.fbs", "fileIdentifier": "SPQR" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "outputPorts": [
+        {
+          "portId": "result",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialResult.fbs", "fileIdentifier": "SPRS" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "maxBatch": 1000,
+      "drainPolicy": "drain-to-empty"
+    },
+    {
+      "methodId": "point_in_polygon",
+      "displayName": "Point in Polygon",
+      "description": "Test if a WGS84 point is inside a polygon geometry",
+      "inputPorts": [
+        {
+          "portId": "geometry",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialQuery.fbs", "fileIdentifier": "SPQR" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "outputPorts": [
+        {
+          "portId": "result",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialResult.fbs", "fileIdentifier": "SPRS" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "maxBatch": 1000,
+      "drainPolicy": "drain-to-empty"
+    },
+    {
+      "methodId": "polygon_intersection",
+      "displayName": "Polygon Intersection",
+      "description": "Compute intersection of two polygon geometries",
+      "inputPorts": [
+        {
+          "portId": "geometries",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialQuery.fbs", "fileIdentifier": "SPQR" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 2,
+          "required": true
+        }
+      ],
+      "outputPorts": [
+        {
+          "portId": "result",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialResult.fbs", "fileIdentifier": "SPRS" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "maxBatch": 100,
+      "drainPolicy": "drain-to-empty"
+    },
+    {
+      "methodId": "polygon_union",
+      "displayName": "Polygon Union",
+      "description": "Compute union of two polygon geometries",
+      "inputPorts": [
+        {
+          "portId": "geometries",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialQuery.fbs", "fileIdentifier": "SPQR" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 2,
+          "required": true
+        }
+      ],
+      "outputPorts": [
+        {
+          "portId": "result",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialResult.fbs", "fileIdentifier": "SPRS" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "maxBatch": 100,
+      "drainPolicy": "drain-to-empty"
+    },
+    {
+      "methodId": "compute_voronoi",
+      "displayName": "Voronoi Diagram",
+      "description": "Compute Voronoi diagram from multipoint geometry within bounds",
+      "inputPorts": [
+        {
+          "portId": "geometries",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialQuery.fbs", "fileIdentifier": "SPQR" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 2,
+          "required": true
+        }
+      ],
+      "outputPorts": [
+        {
+          "portId": "result",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialResult.fbs", "fileIdentifier": "SPRS" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "maxBatch": 10,
+      "drainPolicy": "single-shot"
+    },
+    {
+      "methodId": "compute_delaunay",
+      "displayName": "Delaunay Triangulation",
+      "description": "Compute Delaunay triangulation from multipoint geometry",
+      "inputPorts": [
+        {
+          "portId": "geometries",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialQuery.fbs", "fileIdentifier": "SPQR" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "outputPorts": [
+        {
+          "portId": "result",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialResult.fbs", "fileIdentifier": "SPRS" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "maxBatch": 10,
+      "drainPolicy": "single-shot"
+    },
+    {
+      "methodId": "transform_to_ecef",
+      "displayName": "WGS84 to ECEF",
+      "description": "Transform WGS84 geodetic coordinates to ECEF",
+      "inputPorts": [
+        {
+          "portId": "coordinates",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialQuery.fbs", "fileIdentifier": "SPQR" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "outputPorts": [
+        {
+          "portId": "result",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialResult.fbs", "fileIdentifier": "SPRS" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "maxBatch": 10000,
+      "drainPolicy": "drain-to-empty"
+    },
+    {
+      "methodId": "transform_from_ecef",
+      "displayName": "ECEF to WGS84",
+      "description": "Transform ECEF coordinates to WGS84 geodetic",
+      "inputPorts": [
+        {
+          "portId": "coordinates",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialQuery.fbs", "fileIdentifier": "SPQR" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "outputPorts": [
+        {
+          "portId": "result",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialResult.fbs", "fileIdentifier": "SPRS" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "maxBatch": 10000,
+      "drainPolicy": "drain-to-empty"
+    },
+    {
+      "methodId": "spatial_query",
+      "displayName": "Spatial SQL Query",
+      "description": "Execute an arbitrary spatial SQL query using the FlatSQL engine",
+      "inputPorts": [
+        {
+          "portId": "query",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialQuery.fbs", "fileIdentifier": "SPQR" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "outputPorts": [
+        {
+          "portId": "result",
+          "acceptedTypeSets": [
+            {
+              "setId": "spatial",
+              "allowedTypes": [
+                { "schemaName": "SpatialResult.fbs", "fileIdentifier": "SPRS" }
+              ]
+            }
+          ],
+          "minStreams": 1,
+          "maxStreams": 1,
+          "required": true
+        }
+      ],
+      "maxBatch": 1,
+      "drainPolicy": "single-shot"
+    }
+  ],
+  "runtimeTargets": ["NODE", "BROWSER", "WASI"]
+}

@@ -1,6 +1,6 @@
 {
   "name": "flatsql",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
   "type": "module",
   "main": "dist/index.js",
@@ -18,13 +18,22 @@
       "types": "./wasm/wasi.d.ts",
       "import": "./wasm/wasi.js"
     },
-    "./wasi.wasm": "./wasm/flatsql-wasi.wasm"
+    "./wasi.wasm": "./wasm/flatsql-wasi.wasm",
+    "./sdm": {
+      "types": "./sdm/index.d.ts",
+      "import": "./sdm/index.js"
+    },
+    "./sdm.wasm": "./sdm/flatsql-spatial.wasm"
   },
   "files": [
     "dist",
     "wasm/*.js",
     "wasm/*.wasm",
     "wasm/*.d.ts",
+    "sdm/*.js",
+    "sdm/*.wasm",
+    "sdm/*.d.ts",
+    "sdm/*.json",
     "README.md",
     "LICENSE"
   ],
@@ -64,7 +73,13 @@
     "wasm",
     "webassembly",
     "query",
-    "virtual-table"
+    "virtual-table",
+    "spatial",
+    "geospatial",
+    "voronoi",
+    "delaunay",
+    "rtree",
+    "space-data-module"
   ],
   "author": "Digital Arsenal <tj@digitalarsenal.io>",
   "license": "Apache-2.0",
