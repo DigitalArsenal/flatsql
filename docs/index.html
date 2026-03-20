@@ -2294,26 +2294,26 @@ flatsql --schema app.fbs --load data.bin \\
         });
     </script>
 
+    <script src="./sql-wasm.js"></script>
+
     <script type="module">
-        // Demo functionality - Worker mode with C API (no embind)
-        // Falls back to main thread if worker fails
-        let worker = null;
-        let messageId = 0;
-        let pendingCallbacks = new Map();
+        let flatsql = null;
+        let SQL = null;
+        let demoDb = null;
+        let runtimePromise = null;
         let totalRecords = 0;
         let totalBytes = 0;
-        let useWorker = true;
-        let currentSource = 'satellite-1';  // Default to first source
+        let currentSource = 'satellite-1';
+        let nextRowId = 1;
+        let nextOffset = 0;
 
         // Pagination state
         let currentResults = null;
         let currentPage = 0;
         const rowsPerPage = 50;
 
-        // The 5 data sources for multi-source demo
         const sources = ['satellite-1', 'satellite-2', 'ground-station', 'aircraft', 'ship'];
 
-        // Source colors for visual distinction
         const sourceColors = {
             'satellite-1': '#4ade80',
             'satellite-2': '#60a5fa',
@@ -2321,49 +2321,6 @@ flatsql --schema app.fbs --load data.bin \\
             'aircraft': '#f472b6',
             'ship': '#a78bfa'
         };
-
-        // Main thread fallback (uses same C API)
-        let flatsql = null;
-        let db = null;
-
-        const schema = `
-            table User {
-                id: int (id);
-                name: string;
-                email: string (key);
-                age: int;
-            }
-            table Post {
-                id: int (id);
-                user_id: int (key);
-                title: string;
-            }
-        `;
-
-        function buildStream(buffers) {
-            const parts = [];
-            for (const buf of buffers) {
-                const size = new Uint8Array(4);
-                new DataView(size.buffer).setUint32(0, buf.length, true);
-                parts.push(size, buf);
-            }
-            const total = parts.reduce((s, p) => s + p.length, 0);
-            const result = new Uint8Array(total);
-            let offset = 0;
-            for (const p of parts) {
-                result.set(p, offset);
-                offset += p.length;
-            }
-            return result;
-        }
-
-        function sendToWorker(action, params = {}) {
-            return new Promise((resolve, reject) => {
-                const id = messageId++;
-                pendingCallbacks.set(id, { resolve, reject });
-                worker.postMessage({ id, action, params });
-            });
-        }
 
         const emailProviders = [
             'gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'icloud.com',
@@ -2375,68 +2332,70 @@ flatsql --schema app.fbs --load data.bin \\
             return emailProviders[id % emailProviders.length];
         }
 
-        // Main thread fallback execution
-        async function executeMainThread(action, params = {}) {
-            if (!flatsql) {
-                const FlatSQLModule = (await import('./flatsql.js')).default;
-                const { initFlatSQL } = await import('./flatsql-api.js');
-                flatsql = await initFlatSQL(FlatSQLModule);
-                db = flatsql.createDatabase(schema, 'demo');
-                db.registerFileId('USER', 'User');
-                db.registerFileId('POST', 'Post');
-                db.enableDemoExtractors();
+        function createDemoDatabase() {
+            if (demoDb) {
+                demoDb.close();
             }
 
-            switch (action) {
-                case 'init':
-                    return { success: true };
+            demoDb = new SQL.Database();
+            demoDb.run(`
+                CREATE TABLE "User" (
+                    id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    age INTEGER NOT NULL,
+                    _source TEXT,
+                    _rowid INTEGER PRIMARY KEY,
+                    _offset INTEGER NOT NULL,
+                    _data BLOB NOT NULL
+                );
+                CREATE INDEX idx_user_id ON "User"(id);
+                CREATE INDEX idx_user_email ON "User"(email);
+                CREATE INDEX idx_user_age ON "User"(age);
+                CREATE INDEX idx_user_source ON "User"(_source);
 
-                case 'registerSource':
-                    db.registerSource(params.sourceName);
-                    return { success: true, source: params.sourceName };
+                CREATE TABLE "Post" (
+                    id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    _source TEXT,
+                    _rowid INTEGER PRIMARY KEY,
+                    _offset INTEGER NOT NULL,
+                    _data BLOB NOT NULL
+                );
+            `);
 
-                case 'createUnifiedViews':
-                    db.createUnifiedViews();
-                    return { success: true };
-
-                case 'query':
-                    return db.query(params.sql);
-
-                case 'streamUsers': {
-                    const { count, startId, source } = params;
-                    const buffers = [];
-                    const userData = [];
-                    for (let i = 0; i < count; i++) {
-                        const id = startId + i + 1;
-                        const email = `user${id}@${randomProvider(id)}`;
-                        const fb = flatsql.createTestUser(id, `User${id}`, email, 20 + (id % 50));
-                        buffers.push(fb);
-                        userData.push({ id, name: `User${id}`, email, age: 20 + (id % 50), fb: Array.from(fb) });
-                    }
-                    const stream = buildStream(buffers);
-                    db.ingest(stream, source);
-                    return { count, bytes: stream.length, samples: userData.slice(0, 5) };
-                }
-
-                case 'clear':
-                    if (db) db.destroy();
-                    db = flatsql.createDatabase(schema, 'demo');
-                    db.registerFileId('USER', 'User');
-                    db.registerFileId('POST', 'Post');
-                    db.enableDemoExtractors();
-                    return { success: true };
-
-                default:
-                    throw new Error(`Unknown action: ${action}`);
-            }
+            nextRowId = 1;
+            nextOffset = 0;
         }
 
-        async function execute(action, params = {}) {
-            if (useWorker && worker) {
-                return sendToWorker(action, params);
-            } else {
-                return executeMainThread(action, params);
+        async function ensureDemoRuntime() {
+            if (runtimePromise) {
+                return runtimePromise;
             }
+
+            runtimePromise = (async () => {
+                if (!window.initSqlJs) {
+                    throw new Error('sql.js runtime not available');
+                }
+
+                const [{ initFlatSQL }, { default: FlatSQLModule }, sqlJs] = await Promise.all([
+                    import('./flatsql-api.js'),
+                    import('./flatsql.js'),
+                    window.initSqlJs({
+                        locateFile: (file) => new URL(`./${file}`, import.meta.url).href
+                    })
+                ]);
+
+                flatsql = await initFlatSQL(FlatSQLModule);
+                SQL = sqlJs;
+                createDemoDatabase();
+            })().catch((error) => {
+                runtimePromise = null;
+                throw error;
+            });
+
+            return runtimePromise;
         }
 
         function toHexPreview(arr, maxBytes = 32) {
@@ -2453,7 +2412,7 @@ flatsql --schema app.fbs --load data.bin \\
             item.className = 'stream-item';
 
             const hexPreview = Array.isArray(data) ? toHexPreview(data, 24) : '';
-            const valuesStr = Object.entries(values).map(([k,v]) => `${k}=${v}`).join(', ');
+            const valuesStr = Object.entries(values).map(([k, v]) => `${k}=${v}`).join(', ');
             const sourceColor = source ? (sourceColors[source] || '#86868b') : '#86868b';
             const sourceLabel = source || 'local';
 
@@ -2477,6 +2436,28 @@ flatsql --schema app.fbs --load data.bin \\
             document.getElementById('btnStream10k').disabled = !enabled;
             document.getElementById('btnClear').disabled = !enabled;
             document.getElementById('btnQuery').disabled = !enabled;
+            document.getElementById('sourceSelect').disabled = !enabled;
+        }
+
+        async function executeQuery(sql) {
+            await ensureDemoRuntime();
+
+            if (!/^\s*select\b/i.test(sql)) {
+                throw new Error('Demo is read-only. Only SELECT queries are supported.');
+            }
+
+            const resultSets = demoDb.exec(sql);
+            if (!resultSets.length) {
+                return { columns: [], rows: [] };
+            }
+
+            const [result] = resultSets;
+            return {
+                columns: result.columns,
+                rows: result.values.map((row) =>
+                    row.map((cell) => cell instanceof Uint8Array ? Array.from(cell) : cell)
+                )
+            };
         }
 
         async function streamUsers(count) {
@@ -2485,24 +2466,63 @@ flatsql --schema app.fbs --load data.bin \\
             const source = currentSource;
 
             try {
-                const result = await execute('streamUsers', { count, startId: totalRecords, source });
+                await ensureDemoRuntime();
 
-                totalRecords += result.count;
-                totalBytes += result.bytes;
+                const insert = demoDb.prepare(`
+                    INSERT INTO "User" (id, name, email, age, _source, _rowid, _offset, _data)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                `);
+
+                const samples = [];
+                let batchBytes = 0;
+
+                demoDb.run('BEGIN');
+                try {
+                    for (let i = 0; i < count; i++) {
+                        const id = totalRecords + i + 1;
+                        const name = `User${id}`;
+                        const email = `user${id}@${randomProvider(id)}`;
+                        const age = 20 + (id % 50);
+                        const fb = flatsql.createTestUser(id, name, email, age);
+                        const offset = nextOffset + batchBytes;
+
+                        insert.run([id, name, email, age, source, nextRowId++, offset, fb]);
+                        batchBytes += 4 + fb.length;
+
+                        if (samples.length < 5) {
+                            samples.push({ id, name, email, age, fb: Array.from(fb) });
+                        }
+                    }
+                    demoDb.run('COMMIT');
+                } catch (error) {
+                    demoDb.run('ROLLBACK');
+                    throw error;
+                } finally {
+                    insert.free();
+                }
+
+                totalRecords += count;
+                totalBytes += batchBytes;
+                nextOffset += batchBytes;
 
                 const elapsed = performance.now() - start;
-                document.getElementById('statRate').textContent = Math.round(count / elapsed * 1000).toLocaleString();
+                document.getElementById('statRate').textContent =
+                    Math.round(count / elapsed * 1000).toLocaleString();
 
-                for (const u of result.samples) {
-                    log('User', u.fb, { id: u.id, name: u.name, age: u.age }, source);
+                for (const user of samples) {
+                    log('User', user.fb, { id: user.id, name: user.name, age: user.age }, source);
                 }
                 if (count > 5) {
                     const lastItem = document.createElement('div');
                     lastItem.className = 'stream-item';
                     const sourceLabel = source || 'local';
                     const sourceColor = source ? (sourceColors[source] || '#86868b') : '#86868b';
-                    lastItem.innerHTML = `<span style="color: var(--text-muted)">... +${count - 5} more from <span style="color: ${sourceColor}">${sourceLabel}</span></span>`;
-                    document.getElementById('streamLog').insertBefore(lastItem, document.getElementById('streamLog').firstChild);
+                    lastItem.innerHTML =
+                        `<span style="color: var(--text-muted)">... +${count - 5} more from <span style="color: ${sourceColor}">${sourceLabel}</span></span>`;
+                    document.getElementById('streamLog').insertBefore(
+                        lastItem,
+                        document.getElementById('streamLog').firstChild
+                    );
                 }
 
                 updateStats();
@@ -2513,7 +2533,6 @@ flatsql --schema app.fbs --load data.bin \\
             }
         }
 
-
         function formatCell(col, cell) {
             if (cell === null || cell === undefined) return '<span style="color: var(--text-muted)">NULL</span>';
 
@@ -2522,7 +2541,7 @@ flatsql --schema app.fbs --load data.bin \\
             }
 
             if (col === '_data') {
-                let bytes = Array.isArray(cell) ? cell : (cell instanceof Uint8Array ? Array.from(cell) : null);
+                const bytes = Array.isArray(cell) ? cell : (cell instanceof Uint8Array ? Array.from(cell) : null);
                 if (!bytes) return '<span style="color: var(--text-muted)">[binary]</span>';
 
                 const hex = bytes.slice(0, 24).map(b => b.toString(16).padStart(2, '0')).join(' ');
@@ -2566,11 +2585,11 @@ flatsql --schema app.fbs --load data.bin \\
             document.getElementById('resultsSection').style.display = 'block';
             document.getElementById('resultsTable').innerHTML = html;
 
-            // Update pagination controls
             const pagination = document.getElementById('pagination');
             if (rows.length > rowsPerPage) {
                 pagination.style.display = 'flex';
-                document.getElementById('pageInfo').textContent = `Page ${currentPage + 1} of ${totalPages} (${startIdx + 1}-${endIdx} of ${rows.length.toLocaleString()})`;
+                document.getElementById('pageInfo').textContent =
+                    `Page ${currentPage + 1} of ${totalPages} (${startIdx + 1}-${endIdx} of ${rows.length.toLocaleString()})`;
                 document.getElementById('btnPrevPage').disabled = currentPage === 0;
                 document.getElementById('btnNextPage').disabled = currentPage >= totalPages - 1;
             } else {
@@ -2604,14 +2623,15 @@ flatsql --schema app.fbs --load data.bin \\
             const start = performance.now();
 
             try {
-                const result = await execute('query', { sql });
+                const result = await executeQuery(sql);
                 const elapsed = performance.now() - start;
 
                 currentResults = result;
                 currentPage = 0;
 
                 const timeStr = elapsed < 1 ? `${elapsed.toFixed(2)}ms` : `${(elapsed / 1000).toFixed(3)}s`;
-                document.getElementById('queryTime').textContent = `${result.rows.length.toLocaleString()} row${result.rows.length !== 1 ? 's' : ''} in ${timeStr}`;
+                document.getElementById('queryTime').textContent =
+                    `${result.rows.length.toLocaleString()} row${result.rows.length !== 1 ? 's' : ''} in ${timeStr}`;
 
                 renderResultsPage();
             } catch (e) {
@@ -2630,7 +2650,8 @@ flatsql --schema app.fbs --load data.bin \\
         async function clearAll() {
             setButtonsEnabled(false);
             try {
-                await execute('clear');
+                await ensureDemoRuntime();
+                createDemoDatabase();
                 totalRecords = 0;
                 totalBytes = 0;
                 currentResults = null;
@@ -2641,8 +2662,8 @@ flatsql --schema app.fbs --load data.bin \\
                 document.getElementById('resultsTable').innerHTML = '';
                 document.getElementById('pagination').style.display = 'none';
                 document.getElementById('queryTime').textContent = '';
-                updateStats();
                 document.getElementById('statRate').textContent = '-';
+                updateStats();
             } catch (e) {
                 console.error('Clear error:', e);
             } finally {
@@ -2651,72 +2672,20 @@ flatsql --schema app.fbs --load data.bin \\
         }
 
         async function init() {
-            let mode = 'Main';
+            await ensureDemoRuntime();
 
-            try {
-                // Try worker first
-                worker = new Worker(new URL('./flatsql-worker.js', import.meta.url), { type: 'module' });
-
-                worker.onmessage = (e) => {
-                    const { id, success, result, error } = e.data;
-                    const callback = pendingCallbacks.get(id);
-                    if (callback) {
-                        pendingCallbacks.delete(id);
-                        if (success) {
-                            callback.resolve(result);
-                        } else {
-                            callback.reject(new Error(error));
-                        }
-                    }
-                };
-
-                worker.onerror = (e) => {
-                    console.error('Worker error:', e);
-                    useWorker = false;
-                };
-
-                await execute('init');
-                mode = 'Worker';
-            } catch (e) {
-                // Fall back to main thread
-                console.warn('Worker failed, using main thread:', e.message);
-                useWorker = false;
-                worker = null;
-                await execute('init');
-            }
-
-            // Try to enable multi-source (may not be available in current WASM)
-            let multiSourceEnabled = false;
-            try {
-                for (const src of sources) {
-                    await execute('registerSource', { sourceName: src });
-                }
-                await execute('createUnifiedViews');
-                multiSourceEnabled = true;
-            } catch (e) {
-                console.warn('Multi-source not available:', e.message);
-                currentSource = null;  // Fall back to base tables
-            }
+            const sourceSelect = document.getElementById('sourceSelect');
+            sourceSelect.disabled = false;
+            sourceSelect.addEventListener('change', () => {
+                currentSource = sourceSelect.value;
+            });
 
             document.getElementById('demoStatus').innerHTML =
-                `<span class="status-dot"></span><span>Ready (${mode})</span>`;
+                '<span class="status-dot"></span><span>Ready (WASM + SQL.js)</span>';
 
-            // Enable source dropdown only if multi-source is available
-            const sourceSelect = document.getElementById('sourceSelect');
-            if (multiSourceEnabled) {
-                sourceSelect.disabled = false;
-                sourceSelect.addEventListener('change', () => {
-                    currentSource = sourceSelect.value;
-                });
-            } else {
-                sourceSelect.disabled = true;
-                sourceSelect.title = 'Multi-source requires WASM rebuild';
-            }
-
+            updateStats();
             setButtonsEnabled(true);
 
-            // Use addEventListener for better mobile support
-            // Track touch to prevent double-firing on mobile
             const addTapHandler = (el, handler) => {
                 let lastTouchTime = 0;
                 el.addEventListener('touchend', (e) => {
@@ -2727,7 +2696,6 @@ flatsql --schema app.fbs --load data.bin \\
                     }
                 }, { passive: false });
                 el.addEventListener('click', (e) => {
-                    // Ignore click if it came right after a touch (within 500ms)
                     if (!el.disabled && Date.now() - lastTouchTime > 500) {
                         handler(e);
                     }
@@ -2744,7 +2712,6 @@ flatsql --schema app.fbs --load data.bin \\
                 if (e.key === 'Enter') runQuery();
             });
 
-            // Query example buttons
             document.querySelectorAll('.query-example-btn').forEach(btn => {
                 addTapHandler(btn, () => {
                     document.getElementById('queryInput').value = btn.dataset.query;
