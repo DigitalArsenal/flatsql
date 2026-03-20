@@ -29,7 +29,7 @@ export interface FlatSQLDatabase {
   registerFileId(fileId: string, tableName: string): void;
 
   /**
-   * Enable demo field extractors for User and Post tables
+   * Enable built-in demo field extractors for User, Post, MPE, and Telemetry tables
    */
   enableDemoExtractors(): void;
 
@@ -248,6 +248,35 @@ export interface FlatSQL {
    * Create a test Post FlatBuffer (for demos)
    */
   createTestPost(id: number, userId: number, title: string): Uint8Array;
+
+  /**
+   * Create a test CCSDS OMM / MPE FlatBuffer (for demos)
+   */
+  createTestMPE(
+    entityId: string,
+    epoch: number,
+    meanMotion: number,
+    eccentricity: number,
+    inclination: number,
+    raOfAscNode: number,
+    argOfPericenter: number,
+    meanAnomaly: number,
+    bstar: number,
+    meanElementTheory?: number
+  ): Uint8Array;
+
+  /**
+   * Create a test CCSDS-style telemetry FlatBuffer (for demos)
+   */
+  createTestTelemetry(
+    packetId: number,
+    spacecraft: string,
+    subsystem: string,
+    mode: string,
+    temperatureC: number,
+    signalDb: number,
+    timestampS: number
+  ): Uint8Array;
 
   /**
    * Check if WASM was loaded with integrity verification

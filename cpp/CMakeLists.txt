@@ -168,6 +168,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_export_data\", \"_flatsql_export_size\", \
                 \"_flatsql_load_and_rebuild\", \
                 \"_flatsql_create_test_user\", \"_flatsql_create_test_post\", \
+                \"_flatsql_create_test_mpe\", \"_flatsql_create_test_telemetry\", \
                 \"_flatsql_test_buffer_size\", \
                 \"_flatsql_get_stats_count\", \"_flatsql_get_stat_table_name\", \
                 \"_flatsql_get_stat_file_id\", \"_flatsql_get_stat_record_count\", \
@@ -244,6 +245,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_export_data\", \"_flatsql_export_size\", \
                 \"_flatsql_load_and_rebuild\", \
                 \"_flatsql_create_test_user\", \"_flatsql_create_test_post\", \
+                \"_flatsql_create_test_mpe\", \"_flatsql_create_test_telemetry\", \
                 \"_flatsql_test_buffer_size\", \
                 \"_flatsql_get_stats_count\", \"_flatsql_get_stat_table_name\", \
                 \"_flatsql_get_stat_file_id\", \"_flatsql_get_stat_record_count\", \

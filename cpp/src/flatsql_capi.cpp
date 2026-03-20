@@ -4,6 +4,7 @@
 #include "flatsql/database.h"
 #include <flatbuffers/flatbuffers.h>
 #include <flatbuffers/encryption.h>
+#include "../schemas/mpe_schema_generated.h"
 #include <cstring>
 #include <vector>
 #include <string>
@@ -135,6 +136,120 @@ std::vector<uint8_t> createPostFlatBufferInternal(int32_t id, int32_t userId, co
     return fb;
 }
 
+std::vector<uint8_t> createMPEFlatBufferInternal(const std::string& entityId,
+                                                 double epoch,
+                                                 double meanMotion,
+                                                 double eccentricity,
+                                                 double inclination,
+                                                 double raOfAscNode,
+                                                 double argOfPericenter,
+                                                 double meanAnomaly,
+                                                 double bstar,
+                                                 int32_t meanElementTheory) {
+    flatbuffers::FlatBufferBuilder builder(256);
+    auto mpeRecord = mpe::CreateMPEDirect(
+        builder,
+        entityId.c_str(),
+        epoch,
+        meanMotion,
+        eccentricity,
+        inclination,
+        raOfAscNode,
+        argOfPericenter,
+        meanAnomaly,
+        bstar,
+        static_cast<mpe::meanElementTheory>(meanElementTheory)
+    );
+    builder.Finish(mpeRecord, "$MPE");
+    const uint8_t* buf = builder.GetBufferPointer();
+    const size_t size = builder.GetSize();
+    return std::vector<uint8_t>(buf, buf + size);
+}
+
+std::vector<uint8_t> createTelemetryFlatBufferInternal(int32_t packetId,
+                                                       const std::string& spacecraft,
+                                                       const std::string& subsystem,
+                                                       const std::string& mode,
+                                                       int32_t temperatureC,
+                                                       int32_t signalDb,
+                                                       int32_t timestampS) {
+    std::vector<uint8_t> fb;
+
+    fb.resize(4);
+    fb.push_back('T'); fb.push_back('E'); fb.push_back('L'); fb.push_back('E');
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t vtableStart = fb.size();
+    writeU16(fb, 18);
+    writeU16(fb, 32);
+    writeU16(fb, 4);
+    writeU16(fb, 8);
+    writeU16(fb, 12);
+    writeU16(fb, 16);
+    writeU16(fb, 20);
+    writeU16(fb, 24);
+    writeU16(fb, 28);
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t tableStart = fb.size();
+    int32_t vtableOffset = static_cast<int32_t>(tableStart - vtableStart);
+    writeI32(fb, vtableOffset);
+    writeI32(fb, packetId);
+    writeU32(fb, 0);  // spacecraft offset placeholder
+    writeU32(fb, 0);  // subsystem offset placeholder
+    writeU32(fb, 0);  // mode offset placeholder
+    writeI32(fb, temperatureC);
+    writeI32(fb, signalDb);
+    writeI32(fb, timestampS);
+
+    size_t spacecraftFieldPos = tableStart + 8;
+    size_t subsystemFieldPos = tableStart + 12;
+    size_t modeFieldPos = tableStart + 16;
+
+    size_t actualSpacecraftPos = fb.size();
+    writeU32(fb, static_cast<uint32_t>(spacecraft.size()));
+    for (char c : spacecraft) fb.push_back(static_cast<uint8_t>(c));
+    fb.push_back(0);
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t actualSubsystemPos = fb.size();
+    writeU32(fb, static_cast<uint32_t>(subsystem.size()));
+    for (char c : subsystem) fb.push_back(static_cast<uint8_t>(c));
+    fb.push_back(0);
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t actualModePos = fb.size();
+    writeU32(fb, static_cast<uint32_t>(mode.size()));
+    for (char c : mode) fb.push_back(static_cast<uint8_t>(c));
+    fb.push_back(0);
+
+    uint32_t spacecraftRelOffset = static_cast<uint32_t>(actualSpacecraftPos - spacecraftFieldPos);
+    fb[spacecraftFieldPos] = spacecraftRelOffset & 0xFF;
+    fb[spacecraftFieldPos + 1] = (spacecraftRelOffset >> 8) & 0xFF;
+    fb[spacecraftFieldPos + 2] = (spacecraftRelOffset >> 16) & 0xFF;
+    fb[spacecraftFieldPos + 3] = (spacecraftRelOffset >> 24) & 0xFF;
+
+    uint32_t subsystemRelOffset = static_cast<uint32_t>(actualSubsystemPos - subsystemFieldPos);
+    fb[subsystemFieldPos] = subsystemRelOffset & 0xFF;
+    fb[subsystemFieldPos + 1] = (subsystemRelOffset >> 8) & 0xFF;
+    fb[subsystemFieldPos + 2] = (subsystemRelOffset >> 16) & 0xFF;
+    fb[subsystemFieldPos + 3] = (subsystemRelOffset >> 24) & 0xFF;
+
+    uint32_t modeRelOffset = static_cast<uint32_t>(actualModePos - modeFieldPos);
+    fb[modeFieldPos] = modeRelOffset & 0xFF;
+    fb[modeFieldPos + 1] = (modeRelOffset >> 8) & 0xFF;
+    fb[modeFieldPos + 2] = (modeRelOffset >> 16) & 0xFF;
+    fb[modeFieldPos + 3] = (modeRelOffset >> 24) & 0xFF;
+
+    uint32_t rootOffset = static_cast<uint32_t>(tableStart);
+    fb[0] = rootOffset & 0xFF;
+    fb[1] = (rootOffset >> 8) & 0xFF;
+    fb[2] = (rootOffset >> 16) & 0xFF;
+    fb[3] = (rootOffset >> 24) & 0xFF;
+
+    return fb;
+}
+
 uint16_t getFieldOffset(const uint8_t* vtable, uint16_t vtableSize, int fieldIndex) {
     size_t vtableEntry = 4 + fieldIndex * 2;
     if (vtableEntry + 2 > vtableSize) return 0;
@@ -214,6 +329,69 @@ Value extractPostFieldGeneric(const uint8_t* data, size_t length, const std::str
     return std::monostate{};
 }
 
+Value extractMPEFieldGeneric(const uint8_t* data, size_t length, const std::string& fieldName) {
+    (void)length;
+    auto mpeRecord = mpe::GetMPE(data);
+    if (!mpeRecord) return std::monostate{};
+
+    if (fieldName == "ENTITY_ID") {
+        if (mpeRecord->ENTITY_ID()) {
+            return std::string(mpeRecord->ENTITY_ID()->c_str(), mpeRecord->ENTITY_ID()->size());
+        }
+        return std::string();
+    }
+    if (fieldName == "EPOCH") return mpeRecord->EPOCH();
+    if (fieldName == "MEAN_MOTION") return mpeRecord->MEAN_MOTION();
+    if (fieldName == "ECCENTRICITY") return mpeRecord->ECCENTRICITY();
+    if (fieldName == "INCLINATION") return mpeRecord->INCLINATION();
+    if (fieldName == "RA_OF_ASC_NODE") return mpeRecord->RA_OF_ASC_NODE();
+    if (fieldName == "ARG_OF_PERICENTER") return mpeRecord->ARG_OF_PERICENTER();
+    if (fieldName == "MEAN_ANOMALY") return mpeRecord->MEAN_ANOMALY();
+    if (fieldName == "BSTAR") return mpeRecord->BSTAR();
+    if (fieldName == "MEAN_ELEMENT_THEORY") {
+        return static_cast<int32_t>(mpeRecord->MEAN_ELEMENT_THEORY());
+    }
+
+    return std::monostate{};
+}
+
+Value extractTelemetryFieldGeneric(const uint8_t* data, size_t length, const std::string& fieldName) {
+    (void)length;
+    if (!data) return std::monostate{};
+
+    uint32_t rootOffset = flatbuffers::ReadScalar<uint32_t>(data);
+    const uint8_t* root = data + rootOffset;
+    int32_t vtableOffset = flatbuffers::ReadScalar<int32_t>(root);
+    const uint8_t* vtable = root - vtableOffset;
+    uint16_t vtableSize = flatbuffers::ReadScalar<uint16_t>(vtable);
+
+    auto readString = [&](int fieldIndex) -> Value {
+        uint16_t off = getFieldOffset(vtable, vtableSize, fieldIndex);
+        if (off == 0) return std::string();
+        uint32_t strOffset = flatbuffers::ReadScalar<uint32_t>(root + off);
+        const uint8_t* strPtr = root + off + strOffset;
+        uint32_t strLen = flatbuffers::ReadScalar<uint32_t>(strPtr);
+        const char* str = reinterpret_cast<const char*>(strPtr + 4);
+        return std::string(str, strLen);
+    };
+
+    auto readInt = [&](int fieldIndex) -> Value {
+        uint16_t off = getFieldOffset(vtable, vtableSize, fieldIndex);
+        if (off == 0) return static_cast<int32_t>(0);
+        return static_cast<int32_t>(flatbuffers::ReadScalar<int32_t>(root + off));
+    };
+
+    if (fieldName == "packet_id") return readInt(0);
+    if (fieldName == "spacecraft") return readString(1);
+    if (fieldName == "subsystem") return readString(2);
+    if (fieldName == "mode") return readString(3);
+    if (fieldName == "temperature_c") return readInt(4);
+    if (fieldName == "signal_db") return readInt(5);
+    if (fieldName == "timestamp_s") return readInt(6);
+
+    return std::monostate{};
+}
+
 // Global state for result handling
 QueryResult g_lastResult;
 std::string g_lastError;
@@ -253,6 +431,14 @@ void flatsql_enable_demo_extractors(void* handle) {
     }
     try {
         db->setFieldExtractor("Post", extractPostFieldGeneric);
+    } catch (const std::exception&) {
+    }
+    try {
+        db->setFieldExtractor("MPE", extractMPEFieldGeneric);
+    } catch (const std::exception&) {
+    }
+    try {
+        db->setFieldExtractor("Telemetry", extractTelemetryFieldGeneric);
     } catch (const std::exception&) {
     }
 }
@@ -420,6 +606,48 @@ int flatsql_test_buffer_size() {
 EMSCRIPTEN_KEEPALIVE
 const uint8_t* flatsql_create_test_post(int32_t id, int32_t userId, const char* title) {
     g_testBuffer = createPostFlatBufferInternal(id, userId, title);
+    return g_testBuffer.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+const uint8_t* flatsql_create_test_mpe(const char* entityId,
+                                       double epoch,
+                                       double meanMotion,
+                                       double eccentricity,
+                                       double inclination,
+                                       double raOfAscNode,
+                                       double argOfPericenter,
+                                       double meanAnomaly,
+                                       double bstar,
+                                       int32_t meanElementTheory) {
+    g_testBuffer = createMPEFlatBufferInternal(entityId,
+                                               epoch,
+                                               meanMotion,
+                                               eccentricity,
+                                               inclination,
+                                               raOfAscNode,
+                                               argOfPericenter,
+                                               meanAnomaly,
+                                               bstar,
+                                               meanElementTheory);
+    return g_testBuffer.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+const uint8_t* flatsql_create_test_telemetry(int32_t packetId,
+                                             const char* spacecraft,
+                                             const char* subsystem,
+                                             const char* mode,
+                                             int32_t temperatureC,
+                                             int32_t signalDb,
+                                             int32_t timestampS) {
+    g_testBuffer = createTelemetryFlatBufferInternal(packetId,
+                                                     spacecraft,
+                                                     subsystem,
+                                                     mode,
+                                                     temperatureC,
+                                                     signalDb,
+                                                     timestampS);
     return g_testBuffer.data();
 }
 

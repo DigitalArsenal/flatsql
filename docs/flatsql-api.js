@@ -49,6 +49,8 @@ export async function initFlatSQL(moduleFactory) {
         // Test helpers
         createTestUser: Module.cwrap('flatsql_create_test_user', 'number', ['number', 'string', 'string', 'number']),
         createTestPost: Module.cwrap('flatsql_create_test_post', 'number', ['number', 'number', 'string']),
+        createTestMPE: Module.cwrap('flatsql_create_test_mpe', 'number', ['string', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'number']),
+        createTestTelemetry: Module.cwrap('flatsql_create_test_telemetry', 'number', ['number', 'string', 'string', 'string', 'number', 'number', 'number']),
         testBufferSize: Module.cwrap('flatsql_test_buffer_size', 'number', []),
 
         // Stats
@@ -90,6 +92,30 @@ export class FlatSQL {
 
     createTestPost(id, userId, title) {
         const ptr = api.createTestPost(id, userId, title);
+        const size = api.testBufferSize();
+        return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
+    }
+
+    createTestMPE(entityId, epoch, meanMotion, eccentricity, inclination,
+                  raOfAscNode, argOfPericenter, meanAnomaly, bstar, meanElementTheory = 0) {
+        const ptr = api.createTestMPE(
+            entityId,
+            epoch,
+            meanMotion,
+            eccentricity,
+            inclination,
+            raOfAscNode,
+            argOfPericenter,
+            meanAnomaly,
+            bstar,
+            meanElementTheory
+        );
+        const size = api.testBufferSize();
+        return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
+    }
+
+    createTestTelemetry(packetId, spacecraft, subsystem, mode, temperatureC, signalDb, timestampS) {
+        const ptr = api.createTestTelemetry(packetId, spacecraft, subsystem, mode, temperatureC, signalDb, timestampS);
         const size = api.testBufferSize();
         return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
     }
