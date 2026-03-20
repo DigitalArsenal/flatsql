@@ -1,5 +1,6 @@
 #include "flatsql/database.h"
 #include <algorithm>
+#include <mutex>
 #include <stdexcept>
 
 #ifdef FLATSQL_HAVE_OPENSSL

@@ -12,6 +12,8 @@ on:
         default: "false"
         type: boolean
 
+# Publish `flatsql` to npm only from GitHub Actions via OIDC trusted publishing.
+# Do not attempt local `npm publish` for this package from developer machines.
 # Required for NPM provenance / trusted publishing
 permissions:
   contents: write

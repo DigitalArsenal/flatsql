@@ -1344,9 +1344,11 @@ bool testRepeatedExportImport() {
         }
     )";
 
-    // Use unique_ptr to properly manage database lifecycle
-    // FlatSQLDatabase move semantics are problematic due to SQLite vtable pointers
-    auto db = std::make_unique<FlatSQLDatabase>(FlatSQLDatabase::fromSchema(schema, "repeat_test"));
+    // Use unique_ptr to properly manage database lifecycle.
+    // Construct from a parsed schema so the test does not depend on moving
+    // FlatSQLDatabase, which intentionally owns non-movable SQLite state.
+    auto parsedSchema = SchemaParser::parse(schema, "repeat_test");
+    auto db = std::make_unique<FlatSQLDatabase>(parsedSchema);
     db->registerFileId("USER", "User");
     db->setFieldExtractor("User", extractUserField);
     db->setBatchExtractor("User", batchExtractUser);
@@ -1367,7 +1369,8 @@ bool testRepeatedExportImport() {
         // Destroy old database before creating new one
         db.reset();
 
-        db = std::make_unique<FlatSQLDatabase>(FlatSQLDatabase::fromSchema(schema, "repeat_reload" + std::to_string(cycle)));
+        parsedSchema = SchemaParser::parse(schema, "repeat_reload" + std::to_string(cycle));
+        db = std::make_unique<FlatSQLDatabase>(parsedSchema);
         db->registerFileId("USER", "User");
         db->setFieldExtractor("User", extractUserField);
         db->setBatchExtractor("User", batchExtractUser);

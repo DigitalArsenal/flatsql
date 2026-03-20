@@ -12,7 +12,6 @@
 
 #include "sdm_manifest.h"
 #include "../cpp/include/flatsql/geo_geometry.h"
-#include "../cpp/include/flatsql/geo_functions.h"
 
 #include <cmath>
 #include <cstring>
