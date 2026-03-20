@@ -94,7 +94,7 @@ private:
     std::map<std::string, std::unique_ptr<SqliteIndex>> indexes_;
     uint64_t recordCount_ = 0;
     FieldExtractor fieldExtractor_;
-    FastFieldExtractor fastFieldExtractor_;
+    FastFieldExtractor fastFieldExtractor_ = nullptr;
     BatchExtractor batchExtractor_ = nullptr;
 
     // Per-table record tracking (for source-specific tables)

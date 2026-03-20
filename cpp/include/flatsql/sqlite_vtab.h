@@ -48,24 +48,24 @@ struct VTabIndexInfo {
  * Extends sqlite3_vtab with FlatBuffer-specific data.
  */
 struct FlatBufferVTab : public sqlite3_vtab {
-    StreamingFlatBufferStore* store;        // FlatBuffer storage (not owned)
-    const TableDef* tableDef;               // Schema (not owned)
+    StreamingFlatBufferStore* store = nullptr;        // FlatBuffer storage (not owned)
+    const TableDef* tableDef = nullptr;               // Schema (not owned)
     std::string sourceName;                 // Source name for _source column
     std::string fileId;                     // File identifier for routing
     FieldExtractor extractor;               // Extracts values from FlatBuffers
-    FastFieldExtractor fastExtractor;       // Optional fast path that writes directly to SQLite
+    FastFieldExtractor fastExtractor = nullptr;       // Optional fast path that writes directly to SQLite
     std::unordered_map<std::string, SqliteIndex*> indexes;  // Column name -> SQLite index (not owned)
-    std::unordered_set<uint64_t>* tombstones; // Deleted sequences (not owned, may be nullptr)
+    std::unordered_set<uint64_t>* tombstones = nullptr; // Deleted sequences (not owned, may be nullptr)
 
     // Column index for virtual _source column (-1 if not enabled)
-    int sourceColumnIndex;
+    int sourceColumnIndex = -1;
 
     // Source-specific record infos (for multi-source routing)
     // When set, uses these instead of store->getRecordInfoVector(fileId)
-    const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos;
+    const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos = nullptr;
 
     // Encryption context for field-level decryption (not owned, may be nullptr)
-    const flatbuffers::EncryptionContext* encryptionCtx;
+    const flatbuffers::EncryptionContext* encryptionCtx = nullptr;
 };
 
 /**
@@ -181,14 +181,14 @@ private:
  * Contains all information needed to set up a virtual table.
  */
 struct VTabCreateInfo {
-    StreamingFlatBufferStore* store;
-    const TableDef* tableDef;
+    StreamingFlatBufferStore* store = nullptr;
+    const TableDef* tableDef = nullptr;
     std::string sourceName;
     std::string fileId;
     FieldExtractor extractor;
-    FastFieldExtractor fastExtractor;
+    FastFieldExtractor fastExtractor = nullptr;
     std::unordered_map<std::string, SqliteIndex*> indexes;
-    std::unordered_set<uint64_t>* tombstones;
+    std::unordered_set<uint64_t>* tombstones = nullptr;
     // Source-specific record infos (for multi-source routing)
     // When set, uses these instead of store->getRecordInfoVector(fileId)
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos = nullptr;

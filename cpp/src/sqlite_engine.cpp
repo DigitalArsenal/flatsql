@@ -183,6 +183,9 @@ void SQLiteEngine::registerSource(
     BatchExtractor batchExtractor,
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos
 ) {
+    const std::string moduleName =
+        "__flatsql_module_" + std::to_string(reinterpret_cast<uintptr_t>(this)) + "_" +
+        std::to_string(reinterpret_cast<uintptr_t>(tableDef));
     if (sources_.count(sourceName)) {
         throw std::runtime_error("Source already registered: " + sourceName);
     }
@@ -216,7 +219,7 @@ void SQLiteEngine::registerSource(
     // Register the virtual table module with this source's info
     int rc = sqlite3_create_module_v2(
         db_,
-        sourceName.c_str(),
+        moduleName.c_str(),
         FlatBufferVTabModule::getModule(),
         &infoPtr->vtabInfo,
         nullptr  // No destructor - we manage lifetime
@@ -227,9 +230,10 @@ void SQLiteEngine::registerSource(
         throw std::runtime_error("Failed to create SQLite module: " + std::string(sqlite3_errmsg(db_)));
     }
 
-    // Create the virtual table
+    // TEMP schema DDL can hang in the WASM/SQLite build, so keep virtual tables
+    // in the main schema and reserve TEMP only for caller-managed objects.
     std::ostringstream sql;
-    sql << "CREATE VIRTUAL TABLE temp.\"" << sourceName << "\" USING \"" << sourceName << "\"()";
+    sql << "CREATE VIRTUAL TABLE \"" << sourceName << "\" USING \"" << moduleName << "\"()";
 
     char* errMsg = nullptr;
     rc = sqlite3_exec(db_, sql.str().c_str(), nullptr, nullptr, &errMsg);
@@ -282,15 +286,17 @@ void SQLiteEngine::createUnifiedView(
         }
     }
 
-    // Drop existing table/view if it exists (base virtual table or old view)
+    // Replace the base virtual table name with a unified view in the main schema.
+    // TEMP schema DDL can hang in the WASM/SQLite build, so keep all runtime objects
+    // in the same schema.
     {
-        std::string dropSql = "DROP TABLE IF EXISTS temp.\"" + viewName + "\"";
+        std::string dropSql = "DROP TABLE IF EXISTS \"" + viewName + "\"";
         char* errMsg = nullptr;
         sqlite3_exec(db_, dropSql.c_str(), nullptr, nullptr, &errMsg);
         sqlite3_free(errMsg);  // Ignore errors
     }
     {
-        std::string dropSql = "DROP VIEW IF EXISTS temp.\"" + viewName + "\"";
+        std::string dropSql = "DROP VIEW IF EXISTS \"" + viewName + "\"";
         char* errMsg = nullptr;
         sqlite3_exec(db_, dropSql.c_str(), nullptr, nullptr, &errMsg);
         sqlite3_free(errMsg);  // Ignore errors
@@ -298,7 +304,7 @@ void SQLiteEngine::createUnifiedView(
 
     // Build UNION ALL view with _source column
     std::ostringstream sql;
-    sql << "CREATE TEMP VIEW \"" << viewName << "\" AS ";
+    sql << "CREATE VIEW \"" << viewName << "\" AS ";
 
     bool first = true;
     for (const auto& name : sourceNames) {

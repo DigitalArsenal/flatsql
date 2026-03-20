@@ -25,11 +25,11 @@ struct SQLiteConnectionOptions {
  */
 struct SourceInfo {
     std::string name;
-    StreamingFlatBufferStore* store;              // Not owned
-    const TableDef* tableDef;                     // Not owned
+    StreamingFlatBufferStore* store = nullptr;    // Not owned
+    const TableDef* tableDef = nullptr;           // Not owned
     std::string fileId;
     FieldExtractor extractor;
-    FastFieldExtractor fastExtractor;
+    FastFieldExtractor fastExtractor = nullptr;
     BatchExtractor batchExtractor = nullptr;      // Optional batch extractor
     std::unordered_map<std::string, SqliteIndex*> indexes;  // Not owned
     std::unordered_set<uint64_t> tombstones;      // Owned - deleted sequences
