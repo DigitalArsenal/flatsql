@@ -9,7 +9,7 @@ import {
 } from '../schema/index.js';
 import {
   demoExtractors,
-  extractArtifactFields,
+  extractArtifactFieldValues,
   type ArtifactFieldExtractor,
 } from './demo-extractors.js';
 import type {
@@ -81,52 +81,39 @@ function applyPerformanceProfile(db: DatabaseSync, profile: ArtifactPerformanceP
   return 'BEGIN EXCLUSIVE';
 }
 
-interface PreparedInsert {
-  readonly columnName: string;
-  readonly keyType: SQLColumnType;
-  readonly statement: ReturnType<DatabaseSync['prepare']>;
-  readonly entries: PendingInsert[];
-  ordered: boolean;
-  lastKey?: unknown;
+interface TablePlan {
+  readonly table: TableDef;
+  readonly extractor: ArtifactFieldExtractor;
+  readonly fieldNames: string[];
+  readonly emitRow: (fieldValues: unknown[], recordOffset: number, recordLength: number, sequence: number) => void;
+}
+
+function createRowEmitter(
+  statement: ReturnType<DatabaseSync['prepare']>,
+  fieldCount: number
+): (fieldValues: unknown[], recordOffset: number, recordLength: number, sequence: number) => void {
+  switch (fieldCount) {
+    case 1:
+      return (fieldValues, recordOffset, recordLength, sequence) =>
+        statement.run(fieldValues[0], recordOffset, recordLength, sequence);
+    case 2:
+      return (fieldValues, recordOffset, recordLength, sequence) =>
+        statement.run(fieldValues[0], fieldValues[1], recordOffset, recordLength, sequence);
+    case 3:
+      return (fieldValues, recordOffset, recordLength, sequence) =>
+        statement.run(fieldValues[0], fieldValues[1], fieldValues[2], recordOffset, recordLength, sequence);
+    case 4:
+      return (fieldValues, recordOffset, recordLength, sequence) =>
+        statement.run(fieldValues[0], fieldValues[1], fieldValues[2], fieldValues[3], recordOffset, recordLength, sequence);
+    default:
+      return (fieldValues, recordOffset, recordLength, sequence) =>
+        statement.run(...fieldValues, recordOffset, recordLength, sequence);
+  }
 }
 
 interface IngestPlan {
-  readonly extractor: ArtifactFieldExtractor;
-  readonly fieldNames: string[];
-  readonly inserts: PreparedInsert[];
-}
-
-interface PendingInsert {
-  readonly key: unknown;
-  readonly recordOffset: number;
-  readonly recordLength: number;
-  readonly sequence: number;
-}
-
-function compareKeys(left: unknown, right: unknown, keyType: SQLColumnType): number {
-  if (left === right) {
-    return 0;
-  }
-
-  if (left == null) {
-    return -1;
-  }
-
-  if (right == null) {
-    return 1;
-  }
-
-  switch (keyType) {
-    case SQLColumnType.INTEGER:
-    case SQLColumnType.REAL:
-      return Number(left) - Number(right);
-    case SQLColumnType.TEXT:
-      return String(left) < String(right) ? -1 : 1;
-    case SQLColumnType.BLOB:
-      return Buffer.compare(Buffer.from(left as Uint8Array), Buffer.from(right as Uint8Array));
-    default:
-      return String(left) < String(right) ? -1 : 1;
-  }
+  readonly tablePlans: Map<string, TablePlan>;
+  readonly touchedTables: Set<string>;
 }
 
 export class FlatSQLArtifactBuilder {
@@ -173,56 +160,39 @@ export class FlatSQLArtifactBuilder {
 
   ingestBuffers(buffers: Uint8Array[], options: ArtifactIngestOptions = {}): ArtifactIngestResult {
     let currentOffset = options.startOffset ?? 0;
-    const plans = new Map<string, IngestPlan>();
-
-    for (let index = 0; index < buffers.length; index++) {
-      const buffer = buffers[index];
-      const fileId = readFileId(buffer);
-      const tableName = this.fileIdToTable.get(fileId);
-      if (!tableName) {
-        throw new Error(`No table registered for file identifier ${fileId}`);
-      }
-
-      let plan = plans.get(tableName);
-      if (!plan) {
-        plan = this.createIngestPlan(tableName);
-        plans.set(tableName, plan);
-      }
-
-      const recordOffset = options.offsets?.[index] ?? currentOffset;
-      const recordLength = buffer.length;
-      const extractedFields = extractArtifactFields(plan.extractor, buffer, plan.fieldNames);
-
-      for (const insert of plan.inserts) {
-        const key = extractedFields[insert.columnName];
-        if (insert.ordered && insert.lastKey !== undefined && compareKeys(insert.lastKey, key, insert.keyType) > 0) {
-          insert.ordered = false;
-        }
-        insert.lastKey = key;
-        insert.entries.push({
-          key,
-          recordOffset,
-          recordLength,
-          sequence: this.sequence,
-        });
-      }
-
-      this.sequence += 1;
-      currentOffset = recordOffset + recordLength;
-    }
+    const plan = this.createIngestPlan();
 
     withTransaction(this.db, this.beginTransactionSql, () => {
-      for (const plan of plans.values()) {
-        for (const insert of plan.inserts) {
-          if (!insert.ordered) {
-            insert.entries.sort(
-              (left, right) => compareKeys(left.key, right.key, insert.keyType) || left.sequence - right.sequence
-            );
-          }
+      for (let index = 0; index < buffers.length; index++) {
+        const buffer = buffers[index];
+        const fileId = readFileId(buffer);
+        const tableName = this.fileIdToTable.get(fileId);
+        if (!tableName) {
+          throw new Error(`No table registered for file identifier ${fileId}`);
+        }
 
-          for (const entry of insert.entries) {
-            insert.statement.run(entry.key, entry.recordOffset, entry.recordLength, entry.sequence);
-          }
+        const tablePlan = plan.tablePlans.get(tableName);
+        if (!tablePlan) {
+          throw new Error(`Table ${tableName} is not present in the parsed schema`);
+        }
+
+        if (!plan.touchedTables.has(tableName)) {
+          this.dropCoveringIndexes(tablePlan.table);
+          plan.touchedTables.add(tableName);
+        }
+
+        const recordOffset = options.offsets?.[index] ?? currentOffset;
+        const rowValues = extractArtifactFieldValues(tablePlan.extractor, buffer, tablePlan.fieldNames);
+        tablePlan.emitRow(rowValues, recordOffset, buffer.length, this.sequence);
+
+        this.sequence += 1;
+        currentOffset = recordOffset + buffer.length;
+      }
+
+      for (const tableName of plan.touchedTables) {
+        const tablePlan = plan.tablePlans.get(tableName);
+        if (tablePlan) {
+          this.createCoveringIndexes(tablePlan.table);
         }
       }
     });
@@ -250,19 +220,28 @@ export class FlatSQLArtifactBuilder {
 
   private createIndexTables(): void {
     for (const table of this.schema.tables) {
-      for (const column of table.columns) {
-        if (!column.isIndexed || column.name.startsWith('_')) {
-          continue;
-        }
+      const indexedColumns = table.columns.filter((column) => column.isIndexed && !column.name.startsWith('_'));
+      if (indexedColumns.length === 0) {
+        continue;
+      }
 
-        this.db.exec(
-          `CREATE TABLE IF NOT EXISTS "${this.indexTableName(table.name, column.name)}" (
-            key ${toSqliteType(column)} NOT NULL,
+      const columnDefinitions = indexedColumns
+        .map((column) => `"${column.name}" ${toSqliteType(column)} NOT NULL`)
+        .join(',\n            ');
+      this.db.exec(
+        `CREATE TABLE IF NOT EXISTS "${this.recordTableName(table.name)}" (
+            ${columnDefinitions},
             data_offset INTEGER NOT NULL,
             data_length INTEGER NOT NULL,
-            sequence INTEGER NOT NULL,
-            PRIMARY KEY (key, sequence)
-          ) WITHOUT ROWID`
+            sequence INTEGER NOT NULL
+          )`
+      );
+
+      for (const column of indexedColumns) {
+        this.db.exec(
+          `CREATE VIEW IF NOT EXISTS "${this.indexTableName(table.name, column.name)}" AS
+           SELECT "${column.name}" AS key, data_offset, data_length, sequence
+           FROM "${this.recordTableName(table.name)}"`
         );
       }
     }
@@ -272,33 +251,71 @@ export class FlatSQLArtifactBuilder {
     return `_idx_${tableName}_${columnName}`;
   }
 
-  private createIngestPlan(tableName: string): IngestPlan {
-    const extractor = this.extractors.get(tableName);
-    if (!extractor) {
-      throw new Error(`No field extractor registered for table ${tableName}`);
-    }
+  private recordTableName(tableName: string): string {
+    return `_rows_${tableName}`;
+  }
 
-    const table = this.tableByName.get(tableName);
-    if (!table) {
-      throw new Error(`Table ${tableName} is not present in the parsed schema`);
+  private coveringIndexName(tableName: string, columnName: string): string {
+    return `_cov_${tableName}_${columnName}`;
+  }
+
+  private createCoveringIndexes(table: TableDef): void {
+    for (const column of table.columns) {
+      if (!column.isIndexed || column.name.startsWith('_')) {
+        continue;
+      }
+
+      this.db.exec(
+        `CREATE INDEX "${this.coveringIndexName(table.name, column.name)}"
+         ON "${this.recordTableName(table.name)}" ("${column.name}", sequence, data_offset, data_length)`
+      );
+    }
+  }
+
+  private dropCoveringIndexes(table: TableDef): void {
+    for (const column of table.columns) {
+      if (!column.isIndexed || column.name.startsWith('_')) {
+        continue;
+      }
+
+      this.db.exec(`DROP INDEX IF EXISTS "${this.coveringIndexName(table.name, column.name)}"`);
+    }
+  }
+
+  private createIngestPlan(): IngestPlan {
+    const tablePlans = new Map<string, TablePlan>();
+
+    for (const [tableName, table] of this.tableByName.entries()) {
+      const extractor = this.extractors.get(tableName);
+      if (!extractor) {
+        continue;
+      }
+
+      const fieldNames = table.columns
+        .filter((column) => column.isIndexed && !column.name.startsWith('_'))
+        .map((column) => column.name);
+      if (fieldNames.length === 0) {
+        continue;
+      }
+
+      const placeholders = fieldNames.map(() => '?').join(', ');
+      tablePlans.set(tableName, {
+        table,
+        extractor,
+        fieldNames,
+        emitRow: createRowEmitter(
+          this.db.prepare(
+          `INSERT INTO "${this.recordTableName(table.name)}" (${fieldNames.map((fieldName) => `"${fieldName}"`).join(', ')}, data_offset, data_length, sequence)
+           VALUES (${placeholders}, ?, ?, ?)`
+          ),
+          fieldNames.length
+        ),
+      });
     }
 
     return {
-      extractor,
-      fieldNames: table.columns
-        .filter((column) => column.isIndexed && !column.name.startsWith('_'))
-        .map((column) => column.name),
-      inserts: table.columns
-        .filter((column) => column.isIndexed && !column.name.startsWith('_'))
-        .map((column) => ({
-          columnName: column.name,
-          keyType: column.sqlType,
-          entries: [],
-          ordered: true,
-          statement: this.db.prepare(
-            `INSERT INTO "${this.indexTableName(table.name, column.name)}" (key, data_offset, data_length, sequence) VALUES (?, ?, ?, ?)`
-          ),
-        })),
+      tablePlans,
+      touchedTables: new Set<string>(),
     };
   }
 }

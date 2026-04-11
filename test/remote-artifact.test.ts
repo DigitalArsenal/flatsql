@@ -106,7 +106,9 @@ describe('remote artifact builder', () => {
     const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
       sqlitePath,
     });
-    const initialMaster = builder.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name");
+    const initialMaster = builder.query(
+      "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY type, name"
+    );
 
     builder.registerFileId('USER', 'User');
     builder.enableDemoExtractors();
@@ -117,12 +119,14 @@ describe('remote artifact builder', () => {
       ],
       { sourceName: 'users.bin', startOffset: 4096 }
     );
-    expect(initialMaster.rows).toContainEqual(['_idx_User_email']);
+    expect(initialMaster.rows).toContainEqual(['view', '_idx_User_email']);
     builder.close();
 
     const reopened = FlatSQLArtifactBuilder.fromSchema(schema, { sqlitePath });
-    const master = reopened.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name");
-    expect(master.rows).toContainEqual(['_idx_User_email']);
+    const master = reopened.query(
+      "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY type, name"
+    );
+    expect(master.rows).toContainEqual(['view', '_idx_User_email']);
     const result = reopened.query('SELECT key, data_offset, data_length, sequence FROM "_idx_User_email" ORDER BY key');
 
     expect(result.rows).toEqual([
@@ -196,6 +200,44 @@ describe('remote artifact builder', () => {
     builder.close();
   });
 
+  test('artifact builder uses ordered field values when extractor provides them', async () => {
+    const sqlitePath = join(tempDir, 'users-ordered-values.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+    const calls = {
+      values: 0,
+      fields: 0,
+    };
+
+    builder.registerFileId('USER', 'User');
+    builder.setFieldExtractor('User', {
+      getField(_data: Uint8Array, fieldName: string) {
+        return fieldName === 'id' ? 1 : 'shared@example.com';
+      },
+      getFieldValues(_data: Uint8Array, fieldNames: string[]) {
+        calls.values += 1;
+        return fieldNames.map((fieldName) => (fieldName === 'id' ? 1 : 'shared@example.com'));
+      },
+      getFields(_data: Uint8Array, fieldNames: string[]) {
+        calls.fields += 1;
+        return Object.fromEntries(
+          fieldNames.map((fieldName) => [fieldName, fieldName === 'id' ? 1 : 'shared@example.com'])
+        );
+      },
+    });
+
+    builder.ingestBuffers(
+      [createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30)],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    expect(calls.values).toBe(1);
+    expect(calls.fields).toBe(0);
+
+    builder.close();
+  });
+
   test('artifact worker builds sqlite artifact via worker thread', async () => {
     const sqlitePath = join(tempDir, 'users-worker.sqlite');
     const client = new FlatSQLArtifactWorkerClient();
@@ -217,15 +259,19 @@ describe('remote artifact builder', () => {
     );
 
     expect(result.transportMode).toBe('clone');
-    const workerQuery = await builder.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name");
-    expect(workerQuery.rows).toContainEqual(['_idx_User_email']);
+    const workerQuery = await builder.query(
+      "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY type, name"
+    );
+    expect(workerQuery.rows).toContainEqual(['view', '_idx_User_email']);
 
     await builder.close();
     await client.close();
 
     const reopened = FlatSQLArtifactBuilder.fromSchema(schema, { sqlitePath });
-    const master = reopened.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name");
-    expect(master.rows).toContainEqual(['_idx_User_email']);
+    const master = reopened.query(
+      "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY type, name"
+    );
+    expect(master.rows).toContainEqual(['view', '_idx_User_email']);
     const query = reopened.query('SELECT key FROM "_idx_User_email" ORDER BY key');
     expect(query.rows).toEqual([['alice@example.com'], ['bob@example.com']]);
     reopened.close();

@@ -19,6 +19,10 @@ export declare class FlatSQLArtifactBuilder {
     close(): void;
     private createIndexTables;
     private indexTableName;
+    private recordTableName;
+    private coveringIndexName;
+    private createCoveringIndexes;
+    private dropCoveringIndexes;
     private createIngestPlan;
 }
 //# sourceMappingURL=builder.d.ts.map

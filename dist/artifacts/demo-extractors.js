@@ -48,6 +48,13 @@ function createMappedExtractor(fieldReaders) {
                 return [fieldName, reader ? reader(cursor) : null];
             }));
         },
+        getFieldValues(data, fieldNames) {
+            const cursor = createCursor(data);
+            return fieldNames.map((fieldName) => {
+                const reader = fieldReaders[fieldName];
+                return reader ? reader(cursor) : null;
+            });
+        },
     };
 }
 export function extractArtifactField(extractor, data, fieldName) {
@@ -58,6 +65,16 @@ export function extractArtifactFields(extractor, data, fieldNames) {
         return extractor.getFields(data, fieldNames);
     }
     return Object.fromEntries(fieldNames.map((fieldName) => [fieldName, extractArtifactField(extractor, data, fieldName)]));
+}
+export function extractArtifactFieldValues(extractor, data, fieldNames) {
+    if (typeof extractor !== 'function' && extractor.getFieldValues) {
+        return extractor.getFieldValues(data, fieldNames);
+    }
+    if (typeof extractor !== 'function' && extractor.getFields) {
+        const fields = extractor.getFields(data, fieldNames);
+        return fieldNames.map((fieldName) => fields[fieldName]);
+    }
+    return fieldNames.map((fieldName) => extractArtifactField(extractor, data, fieldName));
 }
 export const demoExtractors = {
     User: createMappedExtractor({

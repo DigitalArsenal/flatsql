@@ -2,6 +2,7 @@ const decoder = new TextDecoder();
 
 export interface ArtifactRecordExtractor {
   getField(data: Uint8Array, fieldName: string): unknown;
+  getFieldValues?(data: Uint8Array, fieldNames: string[]): unknown[];
   getFields?(data: Uint8Array, fieldNames: string[]): Record<string, unknown>;
 }
 
@@ -71,6 +72,13 @@ function createMappedExtractor(fieldReaders: Record<string, (cursor: FlatBufferC
         })
       );
     },
+    getFieldValues(data: Uint8Array, fieldNames: string[]): unknown[] {
+      const cursor = createCursor(data);
+      return fieldNames.map((fieldName) => {
+        const reader = fieldReaders[fieldName];
+        return reader ? reader(cursor) : null;
+      });
+    },
   };
 }
 
@@ -88,6 +96,23 @@ export function extractArtifactFields(
   }
 
   return Object.fromEntries(fieldNames.map((fieldName) => [fieldName, extractArtifactField(extractor, data, fieldName)]));
+}
+
+export function extractArtifactFieldValues(
+  extractor: ArtifactFieldExtractor,
+  data: Uint8Array,
+  fieldNames: string[]
+): unknown[] {
+  if (typeof extractor !== 'function' && extractor.getFieldValues) {
+    return extractor.getFieldValues(data, fieldNames);
+  }
+
+  if (typeof extractor !== 'function' && extractor.getFields) {
+    const fields = extractor.getFields(data, fieldNames);
+    return fieldNames.map((fieldName) => fields[fieldName]);
+  }
+
+  return fieldNames.map((fieldName) => extractArtifactField(extractor, data, fieldName));
 }
 
 export const demoExtractors: Record<string, ArtifactFieldExtractor> = {

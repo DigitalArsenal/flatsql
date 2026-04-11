@@ -63,6 +63,13 @@ function createMappedExtractor(fieldReaders) {
         })
       );
     },
+    getFieldValues(data, fieldNames) {
+      const cursor = createCursor(data);
+      return fieldNames.map((fieldName) => {
+        const reader = fieldReaders[fieldName];
+        return reader ? reader(cursor) : null;
+      });
+    },
   };
 }
 
@@ -72,6 +79,14 @@ function extractFields(extractor, data, fieldNames) {
   }
 
   return Object.fromEntries(fieldNames.map((fieldName) => [fieldName, extractor.getField(data, fieldName)]));
+}
+
+function extractFieldValues(extractor, data, fieldNames) {
+  if (extractor.getFieldValues) {
+    return extractor.getFieldValues(data, fieldNames);
+  }
+
+  return fieldNames.map((fieldName) => extractor.getField(data, fieldName));
 }
 
 const demoExtractors = {
@@ -99,30 +114,12 @@ function indexTableName(tableName, columnName) {
   return `_idx_${tableName}_${columnName}`;
 }
 
-function compareKeys(left, right, keyType) {
-  if (left === right) {
-    return 0;
-  }
+function recordTableName(tableName) {
+  return `_rows_${tableName}`;
+}
 
-  if (left == null) {
-    return -1;
-  }
-
-  if (right == null) {
-    return 1;
-  }
-
-  switch (keyType) {
-    case 'INTEGER':
-    case 'REAL':
-      return Number(left) - Number(right);
-    case 'TEXT':
-      return String(left) < String(right) ? -1 : 1;
-    case 'BLOB':
-      return Buffer.compare(Buffer.from(left), Buffer.from(right));
-    default:
-      return String(left) < String(right) ? -1 : 1;
-  }
+function coveringIndexName(tableName, columnName) {
+  return `_cov_${tableName}_${columnName}`;
 }
 
 function withTransaction(db, beginSql, operation) {
@@ -158,6 +155,26 @@ function applyPerformanceProfile(db, profile) {
   return 'BEGIN EXCLUSIVE';
 }
 
+function createRowEmitter(statement, fieldCount) {
+  switch (fieldCount) {
+    case 1:
+      return (fieldValues, recordOffset, recordLength, sequence) =>
+        statement.run(fieldValues[0], recordOffset, recordLength, sequence);
+    case 2:
+      return (fieldValues, recordOffset, recordLength, sequence) =>
+        statement.run(fieldValues[0], fieldValues[1], recordOffset, recordLength, sequence);
+    case 3:
+      return (fieldValues, recordOffset, recordLength, sequence) =>
+        statement.run(fieldValues[0], fieldValues[1], fieldValues[2], recordOffset, recordLength, sequence);
+    case 4:
+      return (fieldValues, recordOffset, recordLength, sequence) =>
+        statement.run(fieldValues[0], fieldValues[1], fieldValues[2], fieldValues[3], recordOffset, recordLength, sequence);
+    default:
+      return (fieldValues, recordOffset, recordLength, sequence) =>
+        statement.run(...fieldValues, recordOffset, recordLength, sequence);
+  }
+}
+
 function createBuilder({ builderId, schema, performanceProfile = 'fast', sqlitePath }) {
   const db = new DatabaseSync(sqlitePath);
   const state = {
@@ -171,19 +188,25 @@ function createBuilder({ builderId, schema, performanceProfile = 'fast', sqliteP
   };
 
   for (const table of schema.tables) {
-    for (const column of table.columns) {
-      if (!column.isIndexed || column.name.startsWith('_')) {
-        continue;
-      }
+    const indexedColumns = table.columns.filter((column) => column.isIndexed && !column.name.startsWith('_'));
+    if (indexedColumns.length === 0) {
+      continue;
+    }
 
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS "${recordTableName(table.name)}" (
+        ${indexedColumns.map((column) => `"${column.name}" ${sqliteType(column)} NOT NULL`).join(',\n        ')},
+        data_offset INTEGER NOT NULL,
+        data_length INTEGER NOT NULL,
+        sequence INTEGER NOT NULL
+      )`
+    );
+
+    for (const column of indexedColumns) {
       db.exec(
-        `CREATE TABLE IF NOT EXISTS "${indexTableName(table.name, column.name)}" (
-          key ${sqliteType(column)} NOT NULL,
-          data_offset INTEGER NOT NULL,
-          data_length INTEGER NOT NULL,
-          sequence INTEGER NOT NULL,
-          PRIMARY KEY (key, sequence)
-        ) WITHOUT ROWID`
+        `CREATE VIEW IF NOT EXISTS "${indexTableName(table.name, column.name)}" AS
+         SELECT "${column.name}" AS key, data_offset, data_length, sequence
+         FROM "${recordTableName(table.name)}"`
       );
     }
   }
@@ -226,54 +249,57 @@ function ingestRecords(state, buffers, options, transportMode) {
         }
 
         plan = {
+          table,
           extractor,
           fieldNames: table.columns
             .filter((column) => column.isIndexed && !column.name.startsWith('_'))
             .map((column) => column.name),
-          inserts: table.columns
-            .filter((column) => column.isIndexed && !column.name.startsWith('_'))
-            .map((column) => ({
-              columnName: column.name,
-              keyType: column.sqlType,
-              entries: [],
-              ordered: true,
-              statement: state.db.prepare(
-                `INSERT INTO "${indexTableName(table.name, column.name)}" (key, data_offset, data_length, sequence) VALUES (?, ?, ?, ?)`
-              ),
-            })),
+          emitRow: createRowEmitter(
+            state.db.prepare(
+            `INSERT INTO "${recordTableName(table.name)}" (${table.columns
+              .filter((column) => column.isIndexed && !column.name.startsWith('_'))
+              .map((column) => `"${column.name}"`)
+              .join(', ')}, data_offset, data_length, sequence)
+             VALUES (${table.columns
+               .filter((column) => column.isIndexed && !column.name.startsWith('_'))
+               .map(() => '?')
+               .join(', ')}, ?, ?, ?)`
+            ),
+            table.columns.filter((column) => column.isIndexed && !column.name.startsWith('_')).length
+          ),
+          droppedIndexes: false,
         };
         plans.set(tableName, plan);
       }
 
-      const recordOffset = options?.offsets?.[index] ?? currentOffset;
-      const extractedFields = extractFields(plan.extractor, buffer, plan.fieldNames);
-      for (const insert of plan.inserts) {
-        const key = extractedFields[insert.columnName];
-        if (insert.ordered && insert.lastKey !== undefined && compareKeys(insert.lastKey, key, insert.keyType) > 0) {
-          insert.ordered = false;
+      if (!plan.droppedIndexes) {
+        for (const column of plan.table.columns) {
+          if (!column.isIndexed || column.name.startsWith('_')) {
+            continue;
+          }
+          state.db.exec(`DROP INDEX IF EXISTS "${coveringIndexName(plan.table.name, column.name)}"`);
         }
-        insert.lastKey = key;
-        insert.entries.push({
-          key,
-          recordOffset,
-          recordLength: buffer.length,
-          sequence: state.sequence,
-        });
+        plan.droppedIndexes = true;
       }
+
+      const recordOffset = options?.offsets?.[index] ?? currentOffset;
+      const rowValues = extractFieldValues(plan.extractor, buffer, plan.fieldNames);
+      plan.emitRow(rowValues, recordOffset, buffer.length, state.sequence);
 
       state.sequence += 1;
       currentOffset = recordOffset + buffer.length;
     }
 
     for (const plan of plans.values()) {
-      for (const insert of plan.inserts) {
-        if (!insert.ordered) {
-          insert.entries.sort((left, right) => compareKeys(left.key, right.key, insert.keyType) || left.sequence - right.sequence);
+      for (const column of plan.table.columns) {
+        if (!column.isIndexed || column.name.startsWith('_')) {
+          continue;
         }
 
-        for (const entry of insert.entries) {
-          insert.statement.run(entry.key, entry.recordOffset, entry.recordLength, entry.sequence);
-        }
+        state.db.exec(
+          `CREATE INDEX "${coveringIndexName(plan.table.name, column.name)}"
+           ON "${recordTableName(plan.table.name)}" ("${column.name}", sequence, data_offset, data_length)`
+        );
       }
     }
   });
