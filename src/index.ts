@@ -7,6 +7,7 @@ export * from './schema/index.js';
 export * from './core/index.js';
 export * from './cluster/index.js';
 export * from './flatbuffer-accessor.js';
+export * from './artifacts/index.js';
 
 // Re-export main types for convenience
 export { FlatSQLDatabase, QueryResult, FlatBufferAccessor } from './core/database.js';

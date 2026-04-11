@@ -2,20 +2,22 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a worker-backed artifact builder that persists FlatSQL SQLite index pages to disk while preserving the current default in-memory behavior.
+**Goal:** Add a worker-backed artifact builder that persists SQLite index pages to disk while preserving the current default FlatSQL behavior.
 
-**Architecture:** Expose an optional file-backed SQLite path through the C and WASM APIs, add a dedicated artifact-builder wrapper plus worker protocol, and verify artifact persistence by reopening and querying the generated SQLite index tables.
+**Architecture:** Implement the artifact path on the TypeScript/Node side using `node:sqlite`, add a dedicated artifact-builder wrapper plus worker protocol, and verify artifact persistence by reopening and querying the generated SQLite index tables.
 
-**Tech Stack:** C++, SQLite, Emscripten C API bindings, JavaScript worker_threads/Web Workers, Jest
+**Tech Stack:** TypeScript, Node `worker_threads`, Node `node:sqlite`, Jest
 
 ---
 
-### Task 1: Expose File-Backed SQLite Options
+### Task 1: Add Direct Artifact Builder
 
 **Files:**
-- Modify: `cpp/src/flatsql_capi.cpp`
-- Modify: `wasm/index.js`
-- Modify: `wasm/index.d.ts`
+- Create: `src/artifacts/builder.ts`
+- Create: `src/artifacts/demo-extractors.ts`
+- Create: `src/artifacts/types.ts`
+- Create: `src/artifacts/index.ts`
+- Modify: `src/index.ts`
 - Test: `test/remote-artifact.test.ts`
 
 - [ ] **Step 1: Write the failing API test**
@@ -31,53 +33,16 @@ test('createArtifactBuilder persists index tables to sqlitePath', async () => {
 Run: `npm test -- --runInBand --runTestsByPath test/remote-artifact.test.ts`
 Expected: FAIL because the new artifact API does not exist yet
 
-- [ ] **Step 3: Add a C API entry point that accepts an optional SQLite path**
+- [ ] **Step 3: Add a direct artifact builder**
 
-Implement a new `flatsql_create_db_with_options(...)` path that maps to `FlatSQLDatabase::fromSchema(..., RuntimeOptions{ .sqlite.path = sqlitePath })`.
-
-- [ ] **Step 4: Add a WASM/JS wrapper for the new create path**
-
-Implement `FlatSQL.createDatabase(schema, name, options?)` and a new `FlatSQL.createArtifactBuilder(schema, name, options)` helper that requires `sqlitePath`.
-
-- [ ] **Step 5: Re-run the targeted test**
-
-Run: `npm test -- --runInBand --runTestsByPath test/remote-artifact.test.ts`
-Expected: FAIL later in the flow because worker/artifact behavior is still missing
-
-### Task 2: Add Artifact Builder Wrapper
-
-**Files:**
-- Modify: `wasm/index.js`
-- Modify: `wasm/index.d.ts`
-- Test: `test/remote-artifact.test.ts`
-
-- [ ] **Step 1: Extend the test to ingest buffers and reopen the artifact**
-
-```ts
-expect(reopened.query('SELECT key FROM "_idx_User_email" ORDER BY key').rows).toEqual([
-  ['alice@example.com'],
-  ['bob@example.com'],
-]);
-```
-
-- [ ] **Step 2: Run the targeted test and verify it fails for the missing wrapper behavior**
-
-Run: `npm test -- --runInBand --runTestsByPath test/remote-artifact.test.ts`
-Expected: FAIL because `createArtifactBuilder` does not implement the artifact workflow yet
-
-- [ ] **Step 3: Implement `FlatSQLArtifactBuilder`**
-
-Add a thin wrapper that:
-- creates a file-backed database
-- exposes `registerFileId`, `enableDemoExtractors`, `ingestBuffers`, `query`, and `destroy`
-- rejects creation without `sqlitePath`
+Implement `FlatSQLArtifactBuilder.fromSchema(schema, { sqlitePath })` using `node:sqlite`.
 
 - [ ] **Step 4: Re-run the targeted test**
 
 Run: `npm test -- --runInBand --runTestsByPath test/remote-artifact.test.ts`
-Expected: PASS for the direct artifact build case
+Expected: PASS for the direct artifact build case and FAIL later in the flow because the worker path is still missing
 
-### Task 3: Add Worker Artifact Client And Protocol
+### Task 2: Add Worker Artifact Client And Protocol
 
 **Files:**
 - Create: `wasm/flatsql-artifact.worker.js`
@@ -114,7 +79,7 @@ Implement a dedicated worker protocol with methods for:
 Run: `npm test -- --runInBand --runTestsByPath test/remote-artifact.test.ts`
 Expected: PASS for worker clone transport
 
-### Task 4: Add SharedArrayBuffer Transport
+### Task 3: Add SharedArrayBuffer Transport
 
 **Files:**
 - Modify: `wasm/flatsql-artifact.worker.js`
@@ -147,7 +112,7 @@ Implement:
 Run: `npm test -- --runInBand --runTestsByPath test/remote-artifact.test.ts`
 Expected: PASS for SAB transport in Node
 
-### Task 5: Verify Regressions
+### Task 4: Verify Regressions
 
 **Files:**
 - Test: `test/remote-artifact.test.ts`
@@ -165,6 +130,6 @@ Expected: PASS
 - [ ] **Step 3: Commit the feature branch changes**
 
 ```bash
-git add cpp/src/flatsql_capi.cpp wasm/index.js wasm/index.d.ts wasm/flatsql-artifact.worker.js wasm/flatsql-artifact-client.js test/remote-artifact.test.ts docs/superpowers/specs/2026-04-11-remote-artifact-worker-design.md docs/superpowers/plans/2026-04-11-remote-artifact-worker.md
+git add src/artifacts src/index.ts wasm/flatsql-artifact.worker.js test/remote-artifact.test.ts docs/superpowers/specs/2026-04-11-remote-artifact-worker-design.md docs/superpowers/plans/2026-04-11-remote-artifact-worker.md
 git commit -m "feat: add worker-backed remote artifact builder"
 ```

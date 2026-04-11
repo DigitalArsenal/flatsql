@@ -25,30 +25,37 @@ This branch does not implement:
 
 ## Design
 
-### 1. File-Backed SQLite Runtime Option
+### 1. File-Backed Artifact Runtime
 
-Expose a new runtime option from the JS/WASM API down to the C API so callers can create a FlatSQL database with a file-backed SQLite index database instead of the default `:memory:` connection.
+For this branch, the artifact path lives in the TypeScript/Node runtime rather than the current WASM runtime.
+
+Reason:
+
+- the checked-in WASM build currently disables the Emscripten filesystem
+- the local rebuild toolchain needed to change that is not available in this checkout
+
+v1 therefore uses Node's built-in `node:sqlite` module to create real SQLite artifact files on disk.
 
 Requirements:
 
-- The option must be optional and preserve current behavior when omitted.
-- Existing query/index behavior must continue to work for in-memory mode.
-- Artifact builders will use this option to persist SQLite index pages to disk.
+- Default FlatSQL behavior remains unchanged.
+- Artifact building is explicit and opt-in.
+- The artifact path writes real SQLite pages to a caller-provided `sqlitePath`.
 
 ### 2. Artifact Builder API
 
-Add a new high-level API beside the existing FlatSQL database API:
+Add a new high-level API beside the existing FlatSQL database API on the TypeScript side:
 
 - `FlatSQL.createArtifactBuilder(...)`
 - `FlatSQLArtifactBuilder`
 
 Responsibilities:
 
-- create a database with a file-backed SQLite connection
+- create an artifact builder backed by `node:sqlite`
 - register file IDs and demo extractors
 - ingest FlatBuffers in batches
 - expose build/query helpers for artifact validation
-- avoid exposing FlatSQL storage export as part of the artifact workflow
+- avoid exposing FlatSQL stacked-storage export as part of the artifact workflow
 
 This keeps the artifact mode generic and opt-in rather than changing normal database usage.
 
@@ -64,7 +71,7 @@ Responsibilities:
 - create and own artifact-builder handles in the worker
 - accept batch ingest requests
 - return transport mode and build results
-- keep SQLite work off the main thread
+- keep SQLite work off the main thread/process
 
 Transport:
 
@@ -78,7 +85,7 @@ The generated artifact is the SQLite file at the provided `sqlitePath`.
 
 v1 guarantees:
 
-- FlatSQL index tables such as `_idx_<table>_<column>` are persisted.
+- artifact index tables such as `_idx_<table>_<column>` are persisted.
 - Those tables can be reopened in a later process using the same schema and `sqlitePath`.
 - Indexed lookups remain queryable through SQLite SQL against the artifact file.
 
@@ -91,8 +98,8 @@ v1 does not yet guarantee that the artifact alone is sufficient for full virtual
    - `shared-array-buffer` when supported
    - `clone` otherwise
 3. Caller streams FlatBuffer batches to the worker.
-4. Worker ingests batches into a file-backed FlatSQL database.
-5. SQLite persists index pages to the artifact file while FlatSQL keeps its existing in-process behavior unchanged.
+4. Worker ingests batches into a file-backed artifact builder.
+5. SQLite persists index pages to the artifact file while FlatSQL's existing database/runtime behavior remains unchanged.
 6. Tests reopen the artifact file and validate index contents.
 
 ## Error Handling
@@ -106,7 +113,7 @@ v1 does not yet guarantee that the artifact alone is sufficient for full virtual
 
 Add coverage for:
 
-- creating a file-backed SQLite FlatSQL database from the WASM API
+- creating a file-backed SQLite artifact from the TypeScript/Node API
 - persisting index tables across destroy/reopen cycles
 - worker artifact build using structured-clone transport
 - worker artifact build using `SharedArrayBuffer` transport when available in Node
@@ -116,4 +123,4 @@ Add coverage for:
 - external locator-aware artifact rows for remote source reconstruction
 - remote fetch abstractions for local file, HTTP range, and IPFS readers
 - query federation across multiple artifacts
-- optional WASM pthread builds where the runtime and build pipeline support them
+- optional WASM filesystem + pthread builds where the runtime and build pipeline support them
