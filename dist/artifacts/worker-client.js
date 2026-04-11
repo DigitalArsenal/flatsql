@@ -1,24 +1,7 @@
 import { Worker } from 'node:worker_threads';
 import { parseSchema } from '../schema/index.js';
+import { sizePrefixedByteLength, writeSizePrefixedStream, } from './transport.js';
 const schemaCache = new Map();
-function sizePrefixedByteLength(buffers) {
-    let totalLength = 0;
-    for (const buffer of buffers) {
-        totalLength += 4 + buffer.length;
-    }
-    return totalLength;
-}
-function writeSizePrefixedStream(target, buffers) {
-    let offset = 0;
-    const view = new DataView(target.buffer, target.byteOffset, target.byteLength);
-    for (const buffer of buffers) {
-        view.setUint32(offset, buffer.length, true);
-        offset += 4;
-        target.set(buffer, offset);
-        offset += buffer.length;
-    }
-    return offset;
-}
 function supportsSharedArrayBuffer() {
     return typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined';
 }

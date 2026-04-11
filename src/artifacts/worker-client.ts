@@ -1,6 +1,10 @@
 import { Worker } from 'node:worker_threads';
 
 import { parseSchema, type DatabaseSchema } from '../schema/index.js';
+import {
+  sizePrefixedByteLength,
+  writeSizePrefixedStream,
+} from './transport.js';
 import type {
   ArtifactBuilderOptions,
   ArtifactIngestOptions,
@@ -22,26 +26,6 @@ interface WorkerMessage {
   success?: boolean;
   result?: any;
   error?: string;
-}
-
-function sizePrefixedByteLength(buffers: Uint8Array[]): number {
-  let totalLength = 0;
-  for (const buffer of buffers) {
-    totalLength += 4 + buffer.length;
-  }
-  return totalLength;
-}
-
-function writeSizePrefixedStream(target: Uint8Array, buffers: Uint8Array[]): number {
-  let offset = 0;
-  const view = new DataView(target.buffer, target.byteOffset, target.byteLength);
-  for (const buffer of buffers) {
-    view.setUint32(offset, buffer.length, true);
-    offset += 4;
-    target.set(buffer, offset);
-    offset += buffer.length;
-  }
-  return offset;
 }
 
 function supportsSharedArrayBuffer(): boolean {

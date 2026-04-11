@@ -8,6 +8,7 @@ export declare class FlatSQLArtifactBuilder {
     private readonly tableByName;
     private readonly fileIdToTable;
     private readonly extractors;
+    private readonly queryCache;
     private sequence;
     static fromSchema(source: string, options: ArtifactBuilderOptions): FlatSQLArtifactBuilder;
     constructor(schema: DatabaseSchema, options: ArtifactBuilderOptions);

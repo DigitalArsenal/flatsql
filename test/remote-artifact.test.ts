@@ -1,5 +1,5 @@
 import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { parseSchema } from '../src/schema/index.js';
@@ -7,6 +7,10 @@ import {
   FlatSQLArtifactBuilder,
   FlatSQLArtifactWorkerClient,
 } from '../src/artifacts/index.js';
+import {
+  decodeSizePrefixedStream,
+  writeSizePrefixedStream,
+} from '../src/artifacts/transport.js';
 
 const schema = `
   table User {
@@ -16,6 +20,8 @@ const schema = `
     age: int;
   }
 `;
+
+const expectedFastThreads = Math.min(4, Math.max(2, availableParallelism()));
 
 function writeU32(bytes: number[], value: number): void {
   bytes.push(value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff);
@@ -145,8 +151,10 @@ describe('remote artifact builder', () => {
 
     expect(builder.query('PRAGMA journal_mode').rows).toEqual([['off']]);
     expect(builder.query('PRAGMA synchronous').rows).toEqual([[0]]);
-    expect(builder.query('PRAGMA page_size').rows).toEqual([[16384]]);
-    expect(builder.query('PRAGMA threads').rows).toEqual([[2]]);
+    expect(builder.query('PRAGMA page_size').rows).toEqual([[32768]]);
+    expect(builder.query('PRAGMA threads').rows).toEqual([[expectedFastThreads]]);
+    expect(builder.query('PRAGMA cache_size').rows).toEqual([[-131072]]);
+    expect(builder.query('PRAGMA mmap_size').rows).toEqual([[268435456]]);
 
     builder.close();
   });
@@ -160,7 +168,7 @@ describe('remote artifact builder', () => {
 
     expect(builder.query('PRAGMA journal_mode').rows).toEqual([['delete']]);
     expect(builder.query('PRAGMA synchronous').rows).toEqual([[2]]);
-    expect(builder.query('PRAGMA page_size').rows).toEqual([[16384]]);
+    expect(builder.query('PRAGMA page_size').rows).toEqual([[32768]]);
 
     builder.close();
   });
@@ -362,6 +370,38 @@ describe('remote artifact builder', () => {
     builder.close();
   });
 
+  test('artifact builder reuses prepared select statements for repeated identical queries', async () => {
+    const sqlitePath = join(tempDir, 'users-query-cache.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+
+    builder.registerFileId('USER', 'User');
+    builder.enableDemoExtractors();
+    builder.ingestBuffers(
+      [
+        createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30),
+        createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25),
+      ],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    const db = (builder as any).db;
+    const originalPrepare = db.prepare.bind(db);
+    let prepareCalls = 0;
+    db.prepare = ((sql: string) => {
+      prepareCalls += 1;
+      return originalPrepare(sql);
+    }) as typeof db.prepare;
+
+    const sql = 'SELECT key FROM "_idx_User_email" WHERE key = \'alice@example.com\'';
+    expect(builder.query(sql).rows).toEqual([['alice@example.com']]);
+    expect(builder.query(sql).rows).toEqual([['alice@example.com']]);
+    expect(prepareCalls).toBe(1);
+
+    builder.close();
+  });
+
   test('artifact worker builds sqlite artifact via worker thread', async () => {
     const sqlitePath = join(tempDir, 'users-worker.sqlite');
     const client = new FlatSQLArtifactWorkerClient();
@@ -418,10 +458,16 @@ describe('remote artifact builder', () => {
       rows: [[0]],
     });
     await expect(builder.query('PRAGMA page_size')).resolves.toMatchObject({
-      rows: [[16384]],
+      rows: [[32768]],
     });
     await expect(builder.query('PRAGMA threads')).resolves.toMatchObject({
-      rows: [[2]],
+      rows: [[expectedFastThreads]],
+    });
+    await expect(builder.query('PRAGMA cache_size')).resolves.toMatchObject({
+      rows: [[-131072]],
+    });
+    await expect(builder.query('PRAGMA mmap_size')).resolves.toMatchObject({
+      rows: [[268435456]],
     });
 
     await builder.close();
@@ -449,6 +495,22 @@ describe('remote artifact builder', () => {
 
     await builder.close();
     await client.close();
+  });
+
+  test('size-prefixed decoding returns shared views instead of copied buffers', async () => {
+    const stream = new Uint8Array(new SharedArrayBuffer(15));
+    writeSizePrefixedStream(stream, [
+      Uint8Array.from([1, 2, 3]),
+      Uint8Array.from([4, 5, 6, 7]),
+    ]);
+
+    const decoded = decodeSizePrefixedStream(stream);
+    expect(decoded).toHaveLength(2);
+    expect(Array.from(decoded[0])).toEqual([1, 2, 3]);
+    expect(Array.from(decoded[1])).toEqual([4, 5, 6, 7]);
+
+    stream[4] = 99;
+    expect(decoded[0][0]).toBe(99);
   });
 
   test('artifact builder rolls back the whole ingest batch on error', async () => {

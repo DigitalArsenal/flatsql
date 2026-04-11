@@ -1,3 +1,4 @@
+import { availableParallelism } from 'node:os';
 import { DatabaseSync, type SQLiteColumnMetadata } from 'node:sqlite';
 
 import {
@@ -38,8 +39,25 @@ function toSqliteType(column: ColumnDef): string {
 
 const decoder = new TextDecoder();
 const INSERT_BATCH_SIZE = 64;
-const DEFAULT_PAGE_SIZE = 16384;
+const DEFAULT_PAGE_SIZE = 32768;
+const DEFAULT_MMAP_SIZE = 268435456;
+const DEFAULT_CACHE_SIZE = -131072;
+const DEFAULT_THREAD_COUNT = Math.min(4, Math.max(2, availableParallelism()));
 const schemaCache = new Map<string, DatabaseSchema>();
+
+function isCacheableQuerySql(sql: string): boolean {
+  const trimmed = sql.trimStart();
+  if (trimmed.length === 0) {
+    return false;
+  }
+
+  const upper = trimmed.toUpperCase();
+  if (upper.startsWith('SELECT') || upper.startsWith('WITH')) {
+    return true;
+  }
+
+  return upper.startsWith('PRAGMA') && !trimmed.includes('=');
+}
 
 function readFileId(data: Uint8Array): string {
   if (data.length < 8) {
@@ -97,7 +115,8 @@ function withTransaction<T>(db: DatabaseSync, beginSql: string, operation: () =>
 
 function applyPerformanceProfile(db: DatabaseSync, profile: ArtifactPerformanceProfile): string {
   db.exec(`PRAGMA page_size = ${DEFAULT_PAGE_SIZE}`);
-  db.exec('PRAGMA threads = 2');
+  db.exec(`PRAGMA threads = ${DEFAULT_THREAD_COUNT}`);
+  db.exec(`PRAGMA mmap_size = ${DEFAULT_MMAP_SIZE}`);
 
   if (profile === 'safe') {
     db.exec('PRAGMA journal_mode = DELETE');
@@ -109,7 +128,7 @@ function applyPerformanceProfile(db: DatabaseSync, profile: ArtifactPerformanceP
   db.exec('PRAGMA synchronous = OFF');
   db.exec('PRAGMA locking_mode = EXCLUSIVE');
   db.exec('PRAGMA temp_store = MEMORY');
-  db.exec('PRAGMA cache_size = -65536');
+  db.exec(`PRAGMA cache_size = ${DEFAULT_CACHE_SIZE}`);
   return 'BEGIN EXCLUSIVE';
 }
 
@@ -229,6 +248,10 @@ export class FlatSQLArtifactBuilder {
   private readonly tableByName = new Map<string, TableDef>();
   private readonly fileIdToTable = new Map<number, string>();
   private readonly extractors = new Map<string, ArtifactFieldExtractor>();
+  private readonly queryCache = new Map<string, {
+    statement: ReturnType<DatabaseSync['prepare']>;
+    columns: string[];
+  }>();
   private sequence = 1;
 
   static fromSchema(source: string, options: ArtifactBuilderOptions): FlatSQLArtifactBuilder {
@@ -273,6 +296,7 @@ export class FlatSQLArtifactBuilder {
   ingestBuffers(buffers: Uint8Array[], options: ArtifactIngestOptions = {}): ArtifactIngestResult {
     let currentOffset = options.startOffset ?? 0;
     const plan = this.createIngestPlan();
+    this.queryCache.clear();
 
     withTransaction(this.db, this.beginTransactionSql, () => {
       for (let index = 0; index < buffers.length; index++) {
@@ -314,20 +338,31 @@ export class FlatSQLArtifactBuilder {
   }
 
   query(sql: string): ArtifactQueryResult {
-    const statement = this.db.prepare(sql);
-    const columns = statement.columns().map((column: SQLiteColumnMetadata) => column.name);
-    const rows = statement
+    const cacheable = isCacheableQuerySql(sql);
+    let cached = cacheable ? this.queryCache.get(sql) : undefined;
+
+    if (!cached) {
+      const statement = this.db.prepare(sql);
+      const columns = statement.columns().map((column: SQLiteColumnMetadata) => column.name);
+      cached = { statement, columns };
+      if (cacheable) {
+        this.queryCache.set(sql, cached);
+      }
+    }
+
+    const rows = cached.statement
       .all()
-      .map((row: Record<string, unknown>) => normalizeRow(row, columns));
+      .map((row: Record<string, unknown>) => normalizeRow(row, cached!.columns));
 
     return {
-      columns,
+      columns: [...cached.columns],
       rows,
       rowCount: rows.length,
     };
   }
 
   close(): void {
+    this.queryCache.clear();
     this.db.close();
   }
 

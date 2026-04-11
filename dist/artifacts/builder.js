@@ -1,3 +1,4 @@
+import { availableParallelism } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { parseSchema, SQLColumnType, } from '../schema/index.js';
 import { createArtifactFieldAppender, createArtifactFieldValueReader, demoExtractors, } from './demo-extractors.js';
@@ -17,8 +18,22 @@ function toSqliteType(column) {
 }
 const decoder = new TextDecoder();
 const INSERT_BATCH_SIZE = 64;
-const DEFAULT_PAGE_SIZE = 16384;
+const DEFAULT_PAGE_SIZE = 32768;
+const DEFAULT_MMAP_SIZE = 268435456;
+const DEFAULT_CACHE_SIZE = -131072;
+const DEFAULT_THREAD_COUNT = Math.min(4, Math.max(2, availableParallelism()));
 const schemaCache = new Map();
+function isCacheableQuerySql(sql) {
+    const trimmed = sql.trimStart();
+    if (trimmed.length === 0) {
+        return false;
+    }
+    const upper = trimmed.toUpperCase();
+    if (upper.startsWith('SELECT') || upper.startsWith('WITH')) {
+        return true;
+    }
+    return upper.startsWith('PRAGMA') && !trimmed.includes('=');
+}
 function readFileId(data) {
     if (data.length < 8) {
         throw new Error('FlatBuffer payload is too short to contain a file identifier');
@@ -65,7 +80,8 @@ function withTransaction(db, beginSql, operation) {
 }
 function applyPerformanceProfile(db, profile) {
     db.exec(`PRAGMA page_size = ${DEFAULT_PAGE_SIZE}`);
-    db.exec('PRAGMA threads = 2');
+    db.exec(`PRAGMA threads = ${DEFAULT_THREAD_COUNT}`);
+    db.exec(`PRAGMA mmap_size = ${DEFAULT_MMAP_SIZE}`);
     if (profile === 'safe') {
         db.exec('PRAGMA journal_mode = DELETE');
         db.exec('PRAGMA synchronous = FULL');
@@ -75,7 +91,7 @@ function applyPerformanceProfile(db, profile) {
     db.exec('PRAGMA synchronous = OFF');
     db.exec('PRAGMA locking_mode = EXCLUSIVE');
     db.exec('PRAGMA temp_store = MEMORY');
-    db.exec('PRAGMA cache_size = -65536');
+    db.exec(`PRAGMA cache_size = ${DEFAULT_CACHE_SIZE}`);
     return 'BEGIN EXCLUSIVE';
 }
 function createArgumentAppender(fieldCount) {
@@ -153,6 +169,7 @@ export class FlatSQLArtifactBuilder {
     tableByName = new Map();
     fileIdToTable = new Map();
     extractors = new Map();
+    queryCache = new Map();
     sequence = 1;
     static fromSchema(source, options) {
         const schemaName = options.name ?? 'artifact';
@@ -190,6 +207,7 @@ export class FlatSQLArtifactBuilder {
     ingestBuffers(buffers, options = {}) {
         let currentOffset = options.startOffset ?? 0;
         const plan = this.createIngestPlan();
+        this.queryCache.clear();
         withTransaction(this.db, this.beginTransactionSql, () => {
             for (let index = 0; index < buffers.length; index++) {
                 const buffer = buffers[index];
@@ -223,18 +241,27 @@ export class FlatSQLArtifactBuilder {
         return { recordCount: buffers.length };
     }
     query(sql) {
-        const statement = this.db.prepare(sql);
-        const columns = statement.columns().map((column) => column.name);
-        const rows = statement
+        const cacheable = isCacheableQuerySql(sql);
+        let cached = cacheable ? this.queryCache.get(sql) : undefined;
+        if (!cached) {
+            const statement = this.db.prepare(sql);
+            const columns = statement.columns().map((column) => column.name);
+            cached = { statement, columns };
+            if (cacheable) {
+                this.queryCache.set(sql, cached);
+            }
+        }
+        const rows = cached.statement
             .all()
-            .map((row) => normalizeRow(row, columns));
+            .map((row) => normalizeRow(row, cached.columns));
         return {
-            columns,
+            columns: [...cached.columns],
             rows,
             rowCount: rows.length,
         };
     }
     close() {
+        this.queryCache.clear();
         this.db.close();
     }
     createIndexTables() {

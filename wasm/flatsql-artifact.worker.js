@@ -1,10 +1,28 @@
+import { availableParallelism } from 'node:os';
 import { parentPort } from 'node:worker_threads';
 import { DatabaseSync } from 'node:sqlite';
 
 const decoder = new TextDecoder();
 const builders = new Map();
 const INSERT_BATCH_SIZE = 64;
-const DEFAULT_PAGE_SIZE = 16384;
+const DEFAULT_PAGE_SIZE = 32768;
+const DEFAULT_MMAP_SIZE = 268435456;
+const DEFAULT_CACHE_SIZE = -131072;
+const DEFAULT_THREAD_COUNT = Math.min(4, Math.max(2, availableParallelism()));
+
+function isCacheableQuerySql(sql) {
+  const trimmed = sql.trimStart();
+  if (trimmed.length === 0) {
+    return false;
+  }
+
+  const upper = trimmed.toUpperCase();
+  if (upper.startsWith('SELECT') || upper.startsWith('WITH')) {
+    return true;
+  }
+
+  return upper.startsWith('PRAGMA') && !trimmed.includes('=');
+}
 
 function sqliteType(column) {
   return column.sqlType ?? 'BLOB';
@@ -347,7 +365,8 @@ function withTransaction(db, beginSql, operation) {
 
 function applyPerformanceProfile(db, profile) {
   db.exec(`PRAGMA page_size = ${DEFAULT_PAGE_SIZE}`);
-  db.exec('PRAGMA threads = 2');
+  db.exec(`PRAGMA threads = ${DEFAULT_THREAD_COUNT}`);
+  db.exec(`PRAGMA mmap_size = ${DEFAULT_MMAP_SIZE}`);
 
   if (profile === 'safe') {
     db.exec('PRAGMA journal_mode = DELETE');
@@ -359,7 +378,7 @@ function applyPerformanceProfile(db, profile) {
   db.exec('PRAGMA synchronous = OFF');
   db.exec('PRAGMA locking_mode = EXCLUSIVE');
   db.exec('PRAGMA temp_store = MEMORY');
-  db.exec('PRAGMA cache_size = -65536');
+  db.exec(`PRAGMA cache_size = ${DEFAULT_CACHE_SIZE}`);
   return 'BEGIN EXCLUSIVE';
 }
 
@@ -454,6 +473,7 @@ function createBuilder({ builderId, schema, performanceProfile = 'fast', sqliteP
     tableByName: new Map(schema.tables.map((table) => [table.name, table])),
     fileIdToTable: new Map(),
     extractors: new Map(),
+    queryCache: new Map(),
     sequence: 1,
   };
 
@@ -496,6 +516,7 @@ function getBuilder(builderId) {
 function ingestRecords(state, buffers, options, transportMode) {
   let currentOffset = options?.startOffset ?? 0;
   const plans = new Map();
+  state.queryCache.clear();
 
   withTransaction(state.db, state.beginTransactionSql, () => {
     for (let index = 0; index < buffers.length; index++) {
@@ -591,7 +612,7 @@ function decodeSizePrefixedStream(sharedBuffer, byteLength) {
   while (offset < stream.byteLength) {
     const size = view.getUint32(offset, true);
     offset += 4;
-    buffers.push(stream.slice(offset, offset + size));
+    buffers.push(stream.subarray(offset, offset + size));
     offset += size;
   }
 
@@ -625,13 +646,24 @@ const methods = {
   },
   query({ builderId, sql }) {
     const builder = getBuilder(builderId);
-    const statement = builder.db.prepare(sql);
-    const columns = statement.columns().map((column) => column.name);
-    const rows = normalizeRows(statement.all(), columns);
-    return { columns, rows, rowCount: rows.length };
+    const cacheable = isCacheableQuerySql(sql);
+    let cached = cacheable ? builder.queryCache.get(sql) : undefined;
+
+    if (!cached) {
+      const statement = builder.db.prepare(sql);
+      const columns = statement.columns().map((column) => column.name);
+      cached = { statement, columns };
+      if (cacheable) {
+        builder.queryCache.set(sql, cached);
+      }
+    }
+
+    const rows = normalizeRows(cached.statement.all(), cached.columns);
+    return { columns: [...cached.columns], rows, rowCount: rows.length };
   },
   closeBuilder({ builderId }) {
     const builder = getBuilder(builderId);
+    builder.queryCache.clear();
     builder.db.close();
     builders.delete(builderId);
     return { ok: true };
