@@ -88,11 +88,30 @@ function indexTableName(tableName, columnName) {
   return `_idx_${tableName}_${columnName}`;
 }
 
+function withTransaction(db, operation) {
+  let started = false;
+
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    started = true;
+    const result = operation();
+    db.exec('COMMIT');
+    started = false;
+    return result;
+  } catch (error) {
+    if (started) {
+      db.exec('ROLLBACK');
+    }
+    throw error;
+  }
+}
+
 function createBuilder({ builderId, schema, sqlitePath }) {
   const db = new DatabaseSync(sqlitePath);
   const state = {
     schema,
     db,
+    tableByName: new Map(schema.tables.map((table) => [table.name, table])),
     fileIdToTable: new Map(),
     extractors: new Map(),
     sequence: 1,
@@ -130,37 +149,52 @@ function getBuilder(builderId) {
 
 function ingestRecords(state, buffers, options, transportMode) {
   let currentOffset = options?.startOffset ?? 0;
+  const plans = new Map();
 
-  for (let index = 0; index < buffers.length; index++) {
-    const buffer = buffers[index];
-    const fileId = readFileId(buffer);
-    const tableName = state.fileIdToTable.get(fileId);
-    if (!tableName) {
-      throw new Error(`No table registered for file identifier ${fileId}`);
-    }
-    const extractor = state.extractors.get(tableName);
-    if (!extractor) {
-      throw new Error(`No field extractor registered for table ${tableName}`);
-    }
-    const table = state.schema.tables.find((candidate) => candidate.name === tableName);
-    if (!table) {
-      throw new Error(`Table ${tableName} is not present in the parsed schema`);
-    }
-
-    const recordOffset = options?.offsets?.[index] ?? currentOffset;
-    for (const column of table.columns) {
-      if (!column.isIndexed || column.name.startsWith('_')) {
-        continue;
+  withTransaction(state.db, () => {
+    for (let index = 0; index < buffers.length; index++) {
+      const buffer = buffers[index];
+      const fileId = readFileId(buffer);
+      const tableName = state.fileIdToTable.get(fileId);
+      if (!tableName) {
+        throw new Error(`No table registered for file identifier ${fileId}`);
       }
 
-      state.db
-        .prepare(`INSERT INTO "${indexTableName(table.name, column.name)}" (key, data_offset, data_length, sequence) VALUES (?, ?, ?, ?)`)
-        .run(extractor(buffer, column.name), recordOffset, buffer.length, state.sequence);
-    }
+      let plan = plans.get(tableName);
+      if (!plan) {
+        const extractor = state.extractors.get(tableName);
+        if (!extractor) {
+          throw new Error(`No field extractor registered for table ${tableName}`);
+        }
 
-    state.sequence += 1;
-    currentOffset = recordOffset + buffer.length;
-  }
+        const table = state.tableByName.get(tableName);
+        if (!table) {
+          throw new Error(`Table ${tableName} is not present in the parsed schema`);
+        }
+
+        plan = {
+          extractor,
+          inserts: table.columns
+            .filter((column) => column.isIndexed && !column.name.startsWith('_'))
+            .map((column) => ({
+              columnName: column.name,
+              statement: state.db.prepare(
+                `INSERT INTO "${indexTableName(table.name, column.name)}" (key, data_offset, data_length, sequence) VALUES (?, ?, ?, ?)`
+              ),
+            })),
+        };
+        plans.set(tableName, plan);
+      }
+
+      const recordOffset = options?.offsets?.[index] ?? currentOffset;
+      for (const insert of plan.inserts) {
+        insert.statement.run(plan.extractor(buffer, insert.columnName), recordOffset, buffer.length, state.sequence);
+      }
+
+      state.sequence += 1;
+      currentOffset = recordOffset + buffer.length;
+    }
+  });
 
   return {
     recordCount: buffers.length,

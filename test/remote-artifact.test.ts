@@ -75,6 +75,18 @@ function createUserFlatBuffer(id: number, name: string, email: string, age: numb
   return Uint8Array.from(fb);
 }
 
+function withFileId(buffer: Uint8Array, fileId: string): Uint8Array {
+  if (fileId.length !== 4) {
+    throw new Error('FlatBuffer file identifiers must be four characters');
+  }
+
+  const copy = Uint8Array.from(buffer);
+  for (let index = 0; index < 4; index++) {
+    copy[4 + index] = fileId.charCodeAt(index);
+  }
+  return copy;
+}
+
 describe('remote artifact builder', () => {
   let tempDir: string;
 
@@ -174,6 +186,61 @@ describe('remote artifact builder', () => {
     );
 
     expect(result.transportMode).toBe('shared-array-buffer');
+
+    await builder.close();
+    await client.close();
+  });
+
+  test('artifact builder rolls back the whole ingest batch on error', async () => {
+    const sqlitePath = join(tempDir, 'users-rollback.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+
+    builder.registerFileId('USER', 'User');
+    builder.enableDemoExtractors();
+
+    expect(() =>
+      builder.ingestBuffers(
+        [
+          createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30),
+          withFileId(createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25), 'FAIL'),
+        ],
+        { sourceName: 'users.bin', startOffset: 0 }
+      )
+    ).toThrow('No table registered for file identifier FAIL');
+
+    const result = builder.query('SELECT key FROM "_idx_User_email" ORDER BY key');
+    expect(result.rows).toEqual([]);
+
+    builder.close();
+  });
+
+  test('artifact worker rolls back the whole ingest batch on error', async () => {
+    const sqlitePath = join(tempDir, 'users-worker-rollback.sqlite');
+    const client = new FlatSQLArtifactWorkerClient();
+    await client.init();
+
+    const builder = await client.createBuilder(schema, {
+      sqlitePath,
+      preferSharedArrayBuffer: false,
+    });
+
+    await builder.registerFileId('USER', 'User');
+    await builder.enableDemoExtractors();
+
+    await expect(
+      builder.ingestBuffers(
+        [
+          createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30),
+          withFileId(createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25), 'FAIL'),
+        ],
+        { sourceName: 'users.bin', startOffset: 0 }
+      )
+    ).rejects.toThrow('No table registered for file identifier FAIL');
+
+    const result = await builder.query('SELECT key FROM "_idx_User_email" ORDER BY key');
+    expect(result.rows).toEqual([]);
 
     await builder.close();
     await client.close();

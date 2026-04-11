@@ -1,6 +1,12 @@
 import { DatabaseSync, type SQLiteColumnMetadata } from 'node:sqlite';
 
-import { parseSchema, SQLColumnType, type ColumnDef, type DatabaseSchema } from '../schema/index.js';
+import {
+  parseSchema,
+  SQLColumnType,
+  type ColumnDef,
+  type DatabaseSchema,
+  type TableDef,
+} from '../schema/index.js';
 import { demoExtractors, type ArtifactFieldExtractor } from './demo-extractors.js';
 import type {
   ArtifactBuilderOptions,
@@ -35,9 +41,38 @@ function normalizeRow(row: Record<string, unknown>, columns: string[]): any[] {
   return columns.map((column) => row[column]);
 }
 
+function withTransaction<T>(db: DatabaseSync, operation: () => T): T {
+  let started = false;
+
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    started = true;
+    const result = operation();
+    db.exec('COMMIT');
+    started = false;
+    return result;
+  } catch (error) {
+    if (started) {
+      db.exec('ROLLBACK');
+    }
+    throw error;
+  }
+}
+
+interface PreparedInsert {
+  readonly columnName: string;
+  readonly statement: ReturnType<DatabaseSync['prepare']>;
+}
+
+interface IngestPlan {
+  readonly extractor: ArtifactFieldExtractor;
+  readonly inserts: PreparedInsert[];
+}
+
 export class FlatSQLArtifactBuilder {
   private readonly schema: DatabaseSchema;
   private readonly db: DatabaseSync;
+  private readonly tableByName = new Map<string, TableDef>();
   private readonly fileIdToTable = new Map<string, string>();
   private readonly extractors = new Map<string, ArtifactFieldExtractor>();
   private sequence = 1;
@@ -54,6 +89,9 @@ export class FlatSQLArtifactBuilder {
 
     this.schema = schema;
     this.db = new DatabaseSync(options.sqlitePath);
+    for (const table of schema.tables) {
+      this.tableByName.set(table.name, table);
+    }
     this.createIndexTables();
   }
 
@@ -73,42 +111,34 @@ export class FlatSQLArtifactBuilder {
 
   ingestBuffers(buffers: Uint8Array[], options: ArtifactIngestOptions = {}): ArtifactIngestResult {
     let currentOffset = options.startOffset ?? 0;
+    const plans = new Map<string, IngestPlan>();
 
-    for (let index = 0; index < buffers.length; index++) {
-      const buffer = buffers[index];
-      const fileId = readFileId(buffer);
-      const tableName = this.fileIdToTable.get(fileId);
-      if (!tableName) {
-        throw new Error(`No table registered for file identifier ${fileId}`);
-      }
-
-      const extractor = this.extractors.get(tableName);
-      if (!extractor) {
-        throw new Error(`No field extractor registered for table ${tableName}`);
-      }
-
-      const table = this.schema.tables.find((candidate) => candidate.name === tableName);
-      if (!table) {
-        throw new Error(`Table ${tableName} is not present in the parsed schema`);
-      }
-
-      const recordOffset = options.offsets?.[index] ?? currentOffset;
-      const recordLength = buffer.length;
-
-      for (const column of table.columns) {
-        if (!column.isIndexed || column.name.startsWith('_')) {
-          continue;
+    withTransaction(this.db, () => {
+      for (let index = 0; index < buffers.length; index++) {
+        const buffer = buffers[index];
+        const fileId = readFileId(buffer);
+        const tableName = this.fileIdToTable.get(fileId);
+        if (!tableName) {
+          throw new Error(`No table registered for file identifier ${fileId}`);
         }
 
-        const statement = this.db.prepare(
-          `INSERT INTO "${this.indexTableName(table.name, column.name)}" (key, data_offset, data_length, sequence) VALUES (?, ?, ?, ?)`
-        );
-        statement.run(extractor(buffer, column.name), recordOffset, recordLength, this.sequence);
-      }
+        let plan = plans.get(tableName);
+        if (!plan) {
+          plan = this.createIngestPlan(tableName);
+          plans.set(tableName, plan);
+        }
 
-      this.sequence += 1;
-      currentOffset = recordOffset + recordLength;
-    }
+        const recordOffset = options.offsets?.[index] ?? currentOffset;
+        const recordLength = buffer.length;
+
+        for (const insert of plan.inserts) {
+          insert.statement.run(plan.extractor(buffer, insert.columnName), recordOffset, recordLength, this.sequence);
+        }
+
+        this.sequence += 1;
+        currentOffset = recordOffset + recordLength;
+      }
+    });
 
     return { recordCount: buffers.length };
   }
@@ -153,5 +183,29 @@ export class FlatSQLArtifactBuilder {
 
   private indexTableName(tableName: string, columnName: string): string {
     return `_idx_${tableName}_${columnName}`;
+  }
+
+  private createIngestPlan(tableName: string): IngestPlan {
+    const extractor = this.extractors.get(tableName);
+    if (!extractor) {
+      throw new Error(`No field extractor registered for table ${tableName}`);
+    }
+
+    const table = this.tableByName.get(tableName);
+    if (!table) {
+      throw new Error(`Table ${tableName} is not present in the parsed schema`);
+    }
+
+    return {
+      extractor,
+      inserts: table.columns
+        .filter((column) => column.isIndexed && !column.name.startsWith('_'))
+        .map((column) => ({
+          columnName: column.name,
+          statement: this.db.prepare(
+            `INSERT INTO "${this.indexTableName(table.name, column.name)}" (key, data_offset, data_length, sequence) VALUES (?, ?, ?, ?)`
+          ),
+        })),
+    };
   }
 }

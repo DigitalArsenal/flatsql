@@ -4,6 +4,7 @@ import type { ArtifactBuilderOptions, ArtifactIngestOptions, ArtifactIngestResul
 export declare class FlatSQLArtifactBuilder {
     private readonly schema;
     private readonly db;
+    private readonly tableByName;
     private readonly fileIdToTable;
     private readonly extractors;
     private sequence;
@@ -17,5 +18,6 @@ export declare class FlatSQLArtifactBuilder {
     close(): void;
     private createIndexTables;
     private indexTableName;
+    private createIngestPlan;
 }
 //# sourceMappingURL=builder.d.ts.map
