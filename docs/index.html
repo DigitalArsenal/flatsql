@@ -2045,6 +2045,7 @@
                         <span id="datasetHint" style="color: var(--text-muted); font-size: 12px;"></span>
                         <button class="demo-btn" id="btnStream1k" disabled>Stream 1,000</button>
                         <button class="demo-btn" id="btnStream10k" disabled>Stream 10,000</button>
+                        <button class="demo-btn" id="btnStream100k" disabled>Stream 100,000</button>
                         <button class="demo-btn" id="btnClear" disabled>Clear</button>
                     </div>
                     <div class="stats-row">
@@ -2478,6 +2479,7 @@ flatsql --schema app.fbs --load data.bin \\
             document.getElementById('datasetSelect').disabled = !enabled;
             document.getElementById('btnStream1k').disabled = !enabled;
             document.getElementById('btnStream10k').disabled = !enabled;
+            document.getElementById('btnStream100k').disabled = !enabled;
             document.getElementById('btnClear').disabled = !enabled;
             document.getElementById('btnQuery').disabled = !enabled;
         }
@@ -2728,6 +2730,7 @@ flatsql --schema app.fbs --load data.bin \\
 
             attachTapHandler(document.getElementById('btnStream1k'), () => streamRecords(1000));
             attachTapHandler(document.getElementById('btnStream10k'), () => streamRecords(10000));
+            attachTapHandler(document.getElementById('btnStream100k'), () => streamRecords(100000));
             attachTapHandler(document.getElementById('btnClear'), clearAll);
             attachTapHandler(document.getElementById('btnQuery'), runQuery);
             attachTapHandler(document.getElementById('btnPrevPage'), prevPage);
