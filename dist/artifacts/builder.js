@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { parseSchema, SQLColumnType, } from '../schema/index.js';
-import { createArtifactFieldValueReader, demoExtractors, } from './demo-extractors.js';
+import { createArtifactFieldAppender, createArtifactFieldValueReader, demoExtractors, } from './demo-extractors.js';
 function toSqliteType(column) {
     switch (column.sqlType) {
         case SQLColumnType.INTEGER:
@@ -29,7 +29,10 @@ function readFileIdCode(data) {
     if (data.length < 8) {
         throw new Error('FlatBuffer payload is too short to contain a file identifier');
     }
-    return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(4, true);
+    return (data[4] |
+        (data[5] << 8) |
+        (data[6] << 16) |
+        (data[7] << 24)) >>> 0;
 }
 function encodeFileId(fileId) {
     if (fileId.length !== 4) {
@@ -132,6 +135,14 @@ function createBatchedRowWriter(db, recordTableName, fieldNames) {
                 flushRows();
             }
         },
+        writeCompiledRow(appendFieldValues, data, recordOffset, recordLength, sequence) {
+            appendFieldValues(pendingArgs, data);
+            pendingArgs.push(recordOffset, recordLength, sequence);
+            pendingRowCount += 1;
+            if (pendingRowCount === INSERT_BATCH_SIZE) {
+                flushRows();
+            }
+        },
         flushRows,
     };
 }
@@ -197,8 +208,7 @@ export class FlatSQLArtifactBuilder {
                     plan.touchedTables.add(tableName);
                 }
                 const recordOffset = options.offsets?.[index] ?? currentOffset;
-                const rowValues = tablePlan.extractRowValues(buffer);
-                tablePlan.writeRow(rowValues, recordOffset, buffer.length, this.sequence);
+                tablePlan.writeRecord(buffer, recordOffset, buffer.length, this.sequence);
                 this.sequence += 1;
                 currentOffset = recordOffset + buffer.length;
             }
@@ -290,10 +300,13 @@ export class FlatSQLArtifactBuilder {
             }
             const recordTableName = this.recordTableName(table.name);
             const rowWriter = createBatchedRowWriter(this.db, recordTableName, fieldNames);
+            const compiledAppender = createArtifactFieldAppender(extractor, fieldNames);
+            const extractRowValues = compiledAppender ? null : createArtifactFieldValueReader(extractor, fieldNames);
             tablePlans.set(tableName, {
                 table,
-                extractRowValues: createArtifactFieldValueReader(extractor, fieldNames),
-                writeRow: rowWriter.writeRow,
+                writeRecord: compiledAppender
+                    ? (data, recordOffset, recordLength, sequence) => rowWriter.writeCompiledRow(compiledAppender, data, recordOffset, recordLength, sequence)
+                    : (data, recordOffset, recordLength, sequence) => rowWriter.writeRow(extractRowValues(data), recordOffset, recordLength, sequence),
                 flushRows: rowWriter.flushRows,
             });
         }

@@ -8,6 +8,7 @@ import {
   type TableDef,
 } from '../schema/index.js';
 import {
+  createArtifactFieldAppender,
   createArtifactFieldValueReader,
   demoExtractors,
   type ArtifactFieldExtractor,
@@ -51,7 +52,12 @@ function readFileIdCode(data: Uint8Array): number {
   if (data.length < 8) {
     throw new Error('FlatBuffer payload is too short to contain a file identifier');
   }
-  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(4, true);
+  return (
+    data[4] |
+    (data[5] << 8) |
+    (data[6] << 16) |
+    (data[7] << 24)
+  ) >>> 0;
 }
 
 function encodeFileId(fileId: string): number {
@@ -109,8 +115,7 @@ function applyPerformanceProfile(db: DatabaseSync, profile: ArtifactPerformanceP
 
 interface TablePlan {
   readonly table: TableDef;
-  readonly extractRowValues: (data: Uint8Array) => unknown[];
-  readonly writeRow: (fieldValues: unknown[], recordOffset: number, recordLength: number, sequence: number) => void;
+  readonly writeRecord: (data: Uint8Array, recordOffset: number, recordLength: number, sequence: number) => void;
   readonly flushRows: () => void;
 }
 
@@ -150,7 +155,17 @@ function createBatchedRowWriter(
   db: DatabaseSync,
   recordTableName: string,
   fieldNames: string[]
-): Pick<TablePlan, 'writeRow' | 'flushRows'> {
+): {
+  writeRow: (fieldValues: unknown[], recordOffset: number, recordLength: number, sequence: number) => void;
+  writeCompiledRow: (
+    appendFieldValues: (pendingArgs: unknown[], data: Uint8Array) => void,
+    data: Uint8Array,
+    recordOffset: number,
+    recordLength: number,
+    sequence: number
+  ) => void;
+  flushRows: () => void;
+} {
   const fullStatement = db.prepare(buildInsertSql(recordTableName, fieldNames, INSERT_BATCH_SIZE));
   const partialStatements = new Map<number, ReturnType<DatabaseSync['prepare']>>();
   const appendArgs = createArgumentAppender(fieldNames.length);
@@ -183,6 +198,15 @@ function createBatchedRowWriter(
   return {
     writeRow(fieldValues, recordOffset, recordLength, sequence): void {
       appendArgs(pendingArgs, fieldValues, recordOffset, recordLength, sequence);
+      pendingRowCount += 1;
+
+      if (pendingRowCount === INSERT_BATCH_SIZE) {
+        flushRows();
+      }
+    },
+    writeCompiledRow(appendFieldValues, data, recordOffset, recordLength, sequence): void {
+      appendFieldValues(pendingArgs, data);
+      pendingArgs.push(recordOffset, recordLength, sequence);
       pendingRowCount += 1;
 
       if (pendingRowCount === INSERT_BATCH_SIZE) {
@@ -271,8 +295,7 @@ export class FlatSQLArtifactBuilder {
         }
 
         const recordOffset = options.offsets?.[index] ?? currentOffset;
-        const rowValues = tablePlan.extractRowValues(buffer);
-        tablePlan.writeRow(rowValues, recordOffset, buffer.length, this.sequence);
+        tablePlan.writeRecord(buffer, recordOffset, buffer.length, this.sequence);
 
         this.sequence += 1;
         currentOffset = recordOffset + buffer.length;
@@ -390,10 +413,20 @@ export class FlatSQLArtifactBuilder {
 
       const recordTableName = this.recordTableName(table.name);
       const rowWriter = createBatchedRowWriter(this.db, recordTableName, fieldNames);
+      const compiledAppender = createArtifactFieldAppender(extractor, fieldNames);
+      const extractRowValues = compiledAppender ? null : createArtifactFieldValueReader(extractor, fieldNames);
       tablePlans.set(tableName, {
         table,
-        extractRowValues: createArtifactFieldValueReader(extractor, fieldNames),
-        writeRow: rowWriter.writeRow,
+        writeRecord: compiledAppender
+          ? (data, recordOffset, recordLength, sequence) =>
+              rowWriter.writeCompiledRow(compiledAppender, data, recordOffset, recordLength, sequence)
+          : (data, recordOffset, recordLength, sequence) =>
+              rowWriter.writeRow(
+                extractRowValues!(data),
+                recordOffset,
+                recordLength,
+                sequence
+              ),
         flushRows: rowWriter.flushRows,
       });
     }

@@ -1,20 +1,23 @@
 import { Worker } from 'node:worker_threads';
 import { parseSchema } from '../schema/index.js';
 const schemaCache = new Map();
-function buildSizePrefixedStream(buffers) {
+function sizePrefixedByteLength(buffers) {
     let totalLength = 0;
     for (const buffer of buffers) {
         totalLength += 4 + buffer.length;
     }
-    const stream = new Uint8Array(totalLength);
+    return totalLength;
+}
+function writeSizePrefixedStream(target, buffers) {
     let offset = 0;
+    const view = new DataView(target.buffer, target.byteOffset, target.byteLength);
     for (const buffer of buffers) {
-        new DataView(stream.buffer, offset, 4).setUint32(0, buffer.length, true);
+        view.setUint32(offset, buffer.length, true);
         offset += 4;
-        stream.set(buffer, offset);
+        target.set(buffer, offset);
         offset += buffer.length;
     }
-    return stream;
+    return offset;
 }
 function supportsSharedArrayBuffer() {
     return typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined';
@@ -117,13 +120,13 @@ export class FlatSQLArtifactWorkerBuilder {
     async ingestBuffers(buffers, options = {}) {
         const canUseShared = this.preferSharedArrayBuffer && supportsSharedArrayBuffer();
         if (canUseShared) {
-            const stream = buildSizePrefixedStream(buffers);
-            const sharedBuffer = new SharedArrayBuffer(stream.byteLength);
-            new Uint8Array(sharedBuffer).set(stream);
+            const byteLength = sizePrefixedByteLength(buffers);
+            const sharedBuffer = new SharedArrayBuffer(byteLength);
+            writeSizePrefixedStream(new Uint8Array(sharedBuffer), buffers);
             return await this.client.call('ingestShared', {
                 builderId: this.builderId,
                 sharedBuffer,
-                byteLength: stream.byteLength,
+                byteLength,
                 options,
             });
         }

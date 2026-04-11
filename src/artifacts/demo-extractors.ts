@@ -2,6 +2,7 @@ const decoder = new TextDecoder();
 
 export interface ArtifactRecordExtractor {
   getField(data: Uint8Array, fieldName: string): unknown;
+  compileFieldAppender?(fieldNames: string[]): (pendingArgs: unknown[], data: Uint8Array) => void;
   compileFieldValues?(fieldNames: string[]): (data: Uint8Array) => unknown[];
   getFieldValues?(data: Uint8Array, fieldNames: string[]): unknown[];
   getFields?(data: Uint8Array, fieldNames: string[]): Record<string, unknown>;
@@ -9,7 +10,7 @@ export interface ArtifactRecordExtractor {
 
 export type ArtifactFieldExtractor = ((data: Uint8Array, fieldName: string) => unknown) | ArtifactRecordExtractor;
 
-interface FlatBufferCursor {
+interface FlatBufferState {
   readonly data: Uint8Array;
   readonly view: DataView;
   readonly root: number;
@@ -17,7 +18,12 @@ interface FlatBufferCursor {
   readonly vtableSize: number;
 }
 
-function createCursor(data: Uint8Array): FlatBufferCursor {
+interface FlatBufferFieldDescriptor {
+  readonly kind: 'int32' | 'string';
+  readonly index: number;
+}
+
+function createState(data: Uint8Array): FlatBufferState {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const root = view.getUint32(0, true);
   const vtable = root - view.getInt32(root, true);
@@ -30,105 +36,232 @@ function createCursor(data: Uint8Array): FlatBufferCursor {
   };
 }
 
-function getFieldOffset(cursor: FlatBufferCursor, fieldIndex: number): number {
-  const entryOffset = cursor.vtable + 4 + fieldIndex * 2;
-  if (entryOffset + 2 > cursor.vtable + cursor.vtableSize) {
+function getFieldOffset(view: DataView, vtable: number, vtableSize: number, fieldIndex: number): number {
+  const entryOffset = vtable + 4 + fieldIndex * 2;
+  if (entryOffset + 2 > vtable + vtableSize) {
     return 0;
   }
-  return cursor.view.getUint16(entryOffset, true);
+  return view.getUint16(entryOffset, true);
 }
 
-function readInt32Field(cursor: FlatBufferCursor, fieldIndex: number): number {
-  const fieldOffset = getFieldOffset(cursor, fieldIndex);
-  return fieldOffset === 0 ? 0 : cursor.view.getInt32(cursor.root + fieldOffset, true);
+function readInt32Field(
+  view: DataView,
+  root: number,
+  vtable: number,
+  vtableSize: number,
+  fieldIndex: number
+): number {
+  const fieldOffset = getFieldOffset(view, vtable, vtableSize, fieldIndex);
+  return fieldOffset === 0 ? 0 : view.getInt32(root + fieldOffset, true);
 }
 
-function readStringField(cursor: FlatBufferCursor, fieldIndex: number): string {
-  const fieldOffset = getFieldOffset(cursor, fieldIndex);
+function readStringField(
+  data: Uint8Array,
+  view: DataView,
+  root: number,
+  vtable: number,
+  vtableSize: number,
+  fieldIndex: number
+): string {
+  const fieldOffset = getFieldOffset(view, vtable, vtableSize, fieldIndex);
   if (fieldOffset === 0) {
     return '';
   }
 
-  const relative = cursor.view.getUint32(cursor.root + fieldOffset, true);
-  const stringStart = cursor.root + fieldOffset + relative;
-  const stringLength = cursor.view.getUint32(stringStart, true);
-  return decoder.decode(cursor.data.subarray(stringStart + 4, stringStart + 4 + stringLength));
+  const relative = view.getUint32(root + fieldOffset, true);
+  const stringStart = root + fieldOffset + relative;
+  const stringLength = view.getUint32(stringStart, true);
+  return decoder.decode(data.subarray(stringStart + 4, stringStart + 4 + stringLength));
 }
 
-function createMappedExtractor(fieldReaders: Record<string, (cursor: FlatBufferCursor) => unknown>): ArtifactRecordExtractor {
+function readDescriptorValue(state: FlatBufferState, descriptor: FlatBufferFieldDescriptor): unknown {
+  if (descriptor.kind === 'int32') {
+    return readInt32Field(state.view, state.root, state.vtable, state.vtableSize, descriptor.index);
+  }
+
+  return readStringField(state.data, state.view, state.root, state.vtable, state.vtableSize, descriptor.index);
+}
+
+function readDescriptorValueDirect(
+  data: Uint8Array,
+  view: DataView,
+  root: number,
+  vtable: number,
+  vtableSize: number,
+  descriptor: FlatBufferFieldDescriptor
+): unknown {
+  if (descriptor.kind === 'int32') {
+    return readInt32Field(view, root, vtable, vtableSize, descriptor.index);
+  }
+
+  return readStringField(data, view, root, vtable, vtableSize, descriptor.index);
+}
+
+function createMappedExtractor(fieldDescriptors: Record<string, FlatBufferFieldDescriptor>): ArtifactRecordExtractor {
   return {
     getField(data: Uint8Array, fieldName: string): unknown {
-      const reader = fieldReaders[fieldName];
-      if (!reader) {
+      const descriptor = fieldDescriptors[fieldName];
+      if (!descriptor) {
         return null;
       }
-      return reader(createCursor(data));
+      return readDescriptorValue(createState(data), descriptor);
     },
-    compileFieldValues(fieldNames: string[]): (data: Uint8Array) => unknown[] {
-      const readers = fieldNames.map((fieldName) => fieldReaders[fieldName] ?? null);
+    compileFieldAppender(fieldNames: string[]): (pendingArgs: unknown[], data: Uint8Array) => void {
+      const descriptors = fieldNames.map((fieldName) => fieldDescriptors[fieldName] ?? null);
 
-      switch (readers.length) {
+      switch (descriptors.length) {
         case 1: {
-          const [reader0] = readers;
-          return (data: Uint8Array): unknown[] => {
-            const cursor = createCursor(data);
-            return [reader0 ? reader0(cursor) : null];
+          const [descriptor0] = descriptors;
+          return (pendingArgs: unknown[], data: Uint8Array): void => {
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const root = view.getUint32(0, true);
+            const vtable = root - view.getInt32(root, true);
+            const vtableSize = view.getUint16(vtable, true);
+            pendingArgs.push(
+              descriptor0 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor0) : null
+            );
           };
         }
         case 2: {
-          const [reader0, reader1] = readers;
+          const [descriptor0, descriptor1] = descriptors;
+          return (pendingArgs: unknown[], data: Uint8Array): void => {
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const root = view.getUint32(0, true);
+            const vtable = root - view.getInt32(root, true);
+            const vtableSize = view.getUint16(vtable, true);
+            pendingArgs.push(
+              descriptor0 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor0) : null,
+              descriptor1 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor1) : null
+            );
+          };
+        }
+        case 3: {
+          const [descriptor0, descriptor1, descriptor2] = descriptors;
+          return (pendingArgs: unknown[], data: Uint8Array): void => {
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const root = view.getUint32(0, true);
+            const vtable = root - view.getInt32(root, true);
+            const vtableSize = view.getUint16(vtable, true);
+            pendingArgs.push(
+              descriptor0 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor0) : null,
+              descriptor1 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor1) : null,
+              descriptor2 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor2) : null
+            );
+          };
+        }
+        case 4: {
+          const [descriptor0, descriptor1, descriptor2, descriptor3] = descriptors;
+          return (pendingArgs: unknown[], data: Uint8Array): void => {
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const root = view.getUint32(0, true);
+            const vtable = root - view.getInt32(root, true);
+            const vtableSize = view.getUint16(vtable, true);
+            pendingArgs.push(
+              descriptor0 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor0) : null,
+              descriptor1 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor1) : null,
+              descriptor2 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor2) : null,
+              descriptor3 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor3) : null
+            );
+          };
+        }
+        default:
+          return (pendingArgs: unknown[], data: Uint8Array): void => {
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const root = view.getUint32(0, true);
+            const vtable = root - view.getInt32(root, true);
+            const vtableSize = view.getUint16(vtable, true);
+            for (const descriptor of descriptors) {
+              pendingArgs.push(
+                descriptor ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor) : null
+              );
+            }
+          };
+      }
+    },
+    compileFieldValues(fieldNames: string[]): (data: Uint8Array) => unknown[] {
+      const descriptors = fieldNames.map((fieldName) => fieldDescriptors[fieldName] ?? null);
+
+      switch (descriptors.length) {
+        case 1: {
+          const [descriptor0] = descriptors;
           return (data: Uint8Array): unknown[] => {
-            const cursor = createCursor(data);
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const root = view.getUint32(0, true);
+            const vtable = root - view.getInt32(root, true);
+            const vtableSize = view.getUint16(vtable, true);
             return [
-              reader0 ? reader0(cursor) : null,
-              reader1 ? reader1(cursor) : null,
+              descriptor0 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor0) : null
+            ];
+          };
+        }
+        case 2: {
+          const [descriptor0, descriptor1] = descriptors;
+          return (data: Uint8Array): unknown[] => {
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const root = view.getUint32(0, true);
+            const vtable = root - view.getInt32(root, true);
+            const vtableSize = view.getUint16(vtable, true);
+            return [
+              descriptor0 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor0) : null,
+              descriptor1 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor1) : null,
             ];
           };
         }
         case 3: {
-          const [reader0, reader1, reader2] = readers;
+          const [descriptor0, descriptor1, descriptor2] = descriptors;
           return (data: Uint8Array): unknown[] => {
-            const cursor = createCursor(data);
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const root = view.getUint32(0, true);
+            const vtable = root - view.getInt32(root, true);
+            const vtableSize = view.getUint16(vtable, true);
             return [
-              reader0 ? reader0(cursor) : null,
-              reader1 ? reader1(cursor) : null,
-              reader2 ? reader2(cursor) : null,
+              descriptor0 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor0) : null,
+              descriptor1 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor1) : null,
+              descriptor2 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor2) : null,
             ];
           };
         }
         case 4: {
-          const [reader0, reader1, reader2, reader3] = readers;
+          const [descriptor0, descriptor1, descriptor2, descriptor3] = descriptors;
           return (data: Uint8Array): unknown[] => {
-            const cursor = createCursor(data);
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const root = view.getUint32(0, true);
+            const vtable = root - view.getInt32(root, true);
+            const vtableSize = view.getUint16(vtable, true);
             return [
-              reader0 ? reader0(cursor) : null,
-              reader1 ? reader1(cursor) : null,
-              reader2 ? reader2(cursor) : null,
-              reader3 ? reader3(cursor) : null,
+              descriptor0 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor0) : null,
+              descriptor1 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor1) : null,
+              descriptor2 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor2) : null,
+              descriptor3 ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor3) : null,
             ];
           };
         }
         default:
           return (data: Uint8Array): unknown[] => {
-            const cursor = createCursor(data);
-            return readers.map((reader) => (reader ? reader(cursor) : null));
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const root = view.getUint32(0, true);
+            const vtable = root - view.getInt32(root, true);
+            const vtableSize = view.getUint16(vtable, true);
+            return descriptors.map((descriptor) =>
+              descriptor ? readDescriptorValueDirect(data, view, root, vtable, vtableSize, descriptor) : null
+            );
           };
       }
     },
     getFields(data: Uint8Array, fieldNames: string[]): Record<string, unknown> {
-      const cursor = createCursor(data);
+      const state = createState(data);
       return Object.fromEntries(
         fieldNames.map((fieldName) => {
-          const reader = fieldReaders[fieldName];
-          return [fieldName, reader ? reader(cursor) : null];
+          const descriptor = fieldDescriptors[fieldName];
+          return [fieldName, descriptor ? readDescriptorValue(state, descriptor) : null];
         })
       );
     },
     getFieldValues(data: Uint8Array, fieldNames: string[]): unknown[] {
-      const cursor = createCursor(data);
+      const state = createState(data);
       return fieldNames.map((fieldName) => {
-        const reader = fieldReaders[fieldName];
-        return reader ? reader(cursor) : null;
+        const descriptor = fieldDescriptors[fieldName];
+        return descriptor ? readDescriptorValue(state, descriptor) : null;
       });
     },
   };
@@ -178,16 +311,27 @@ export function createArtifactFieldValueReader(
   return (data: Uint8Array): unknown[] => extractArtifactFieldValues(extractor, data, fieldNames);
 }
 
+export function createArtifactFieldAppender(
+  extractor: ArtifactFieldExtractor,
+  fieldNames: string[]
+): ((pendingArgs: unknown[], data: Uint8Array) => void) | null {
+  if (typeof extractor !== 'function' && extractor.compileFieldAppender) {
+    return extractor.compileFieldAppender(fieldNames);
+  }
+
+  return null;
+}
+
 export const demoExtractors: Record<string, ArtifactFieldExtractor> = {
   User: createMappedExtractor({
-    id: (cursor) => readInt32Field(cursor, 0),
-    name: (cursor) => readStringField(cursor, 1),
-    email: (cursor) => readStringField(cursor, 2),
-    age: (cursor) => readInt32Field(cursor, 3),
+    id: { kind: 'int32', index: 0 },
+    name: { kind: 'string', index: 1 },
+    email: { kind: 'string', index: 2 },
+    age: { kind: 'int32', index: 3 },
   }),
   Post: createMappedExtractor({
-    id: (cursor) => readInt32Field(cursor, 0),
-    user_id: (cursor) => readInt32Field(cursor, 1),
-    title: (cursor) => readStringField(cursor, 2),
+    id: { kind: 'int32', index: 0 },
+    user_id: { kind: 'int32', index: 1 },
+    title: { kind: 'string', index: 2 },
   }),
 };

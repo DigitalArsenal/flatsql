@@ -289,6 +289,56 @@ describe('remote artifact builder', () => {
     builder.close();
   });
 
+  test('artifact builder prefers compiled field appenders when available', async () => {
+    const sqlitePath = join(tempDir, 'users-compiled-appender.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+    const calls = {
+      compileAppender: 0,
+      compileValues: 0,
+      values: 0,
+    };
+
+    builder.registerFileId('USER', 'User');
+    builder.setFieldExtractor('User', {
+      getField(_data: Uint8Array, fieldName: string) {
+        return fieldName === 'id' ? 1 : 'shared@example.com';
+      },
+      compileFieldAppender(fieldNames: string[]) {
+        calls.compileAppender += 1;
+        return (pendingArgs: unknown[]) => {
+          for (const fieldName of fieldNames) {
+            pendingArgs.push(fieldName === 'id' ? 1 : 'shared@example.com');
+          }
+        };
+      },
+      compileFieldValues(fieldNames: string[]) {
+        calls.compileValues += 1;
+        return (_data: Uint8Array) =>
+          fieldNames.map((fieldName) => (fieldName === 'id' ? 1 : 'shared@example.com'));
+      },
+      getFieldValues(_data: Uint8Array, fieldNames: string[]) {
+        calls.values += 1;
+        return fieldNames.map((fieldName) => (fieldName === 'id' ? 1 : 'shared@example.com'));
+      },
+    });
+
+    builder.ingestBuffers(
+      [
+        createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30),
+        createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25),
+      ],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    expect(calls.compileAppender).toBe(1);
+    expect(calls.compileValues).toBe(0);
+    expect(calls.values).toBe(0);
+
+    builder.close();
+  });
+
   test('artifact builder preserves all rows across internal write batches', async () => {
     const sqlitePath = join(tempDir, 'users-batched-ingest.sqlite');
     const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
