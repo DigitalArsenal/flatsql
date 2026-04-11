@@ -1,8 +1,11 @@
 import type { DatabaseSchema } from '../schema/index.js';
 
+export type ArtifactPerformanceProfile = 'fast' | 'safe';
+
 export interface ArtifactBuilderOptions {
   sqlitePath: string;
   name?: string;
+  performanceProfile?: ArtifactPerformanceProfile;
 }
 
 export interface ArtifactIngestOptions {

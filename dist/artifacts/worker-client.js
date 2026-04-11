@@ -67,6 +67,7 @@ export class FlatSQLArtifactWorkerClient {
         await this.call('createBuilder', {
             builderId,
             schema,
+            performanceProfile: options.performanceProfile ?? 'fast',
             sqlitePath: options.sqlitePath,
         });
         return new FlatSQLArtifactWorkerBuilder(this, builderId, schema, options);

@@ -4,6 +4,7 @@ import type { ArtifactBuilderOptions, ArtifactIngestOptions, ArtifactIngestResul
 export declare class FlatSQLArtifactBuilder {
     private readonly schema;
     private readonly db;
+    private readonly beginTransactionSql;
     private readonly tableByName;
     private readonly fileIdToTable;
     private readonly extractors;

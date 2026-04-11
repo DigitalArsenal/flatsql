@@ -8,73 +8,84 @@ function sqliteType(column) {
   return column.sqlType ?? 'BLOB';
 }
 
-function getFieldOffset(data, fieldIndex) {
+function createCursor(data) {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const root = view.getUint32(0, true);
-  const vtableOffset = view.getInt32(root, true);
-  const vtable = root - vtableOffset;
-  const vtableSize = view.getUint16(vtable, true);
-  const entryOffset = vtable + 4 + fieldIndex * 2;
-  if (entryOffset + 2 > vtable + vtableSize) {
-    return 0;
-  }
-  return view.getUint16(entryOffset, true);
+  const vtable = root - view.getInt32(root, true);
+  return {
+    data,
+    view,
+    root,
+    vtable,
+    vtableSize: view.getUint16(vtable, true),
+  };
 }
 
-function readStringField(data, fieldIndex) {
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const root = view.getUint32(0, true);
-  const fieldOffset = getFieldOffset(data, fieldIndex);
+function getFieldOffset(cursor, fieldIndex) {
+  const entryOffset = cursor.vtable + 4 + fieldIndex * 2;
+  if (entryOffset + 2 > cursor.vtable + cursor.vtableSize) {
+    return 0;
+  }
+  return cursor.view.getUint16(entryOffset, true);
+}
+
+function readInt32Field(cursor, fieldIndex) {
+  const fieldOffset = getFieldOffset(cursor, fieldIndex);
+  return fieldOffset === 0 ? 0 : cursor.view.getInt32(cursor.root + fieldOffset, true);
+}
+
+function readStringField(cursor, fieldIndex) {
+  const fieldOffset = getFieldOffset(cursor, fieldIndex);
   if (fieldOffset === 0) {
     return '';
   }
-  const relative = view.getUint32(root + fieldOffset, true);
-  const stringStart = root + fieldOffset + relative;
-  const stringLength = view.getUint32(stringStart, true);
-  return decoder.decode(data.subarray(stringStart + 4, stringStart + 4 + stringLength));
+  const relative = cursor.view.getUint32(cursor.root + fieldOffset, true);
+  const stringStart = cursor.root + fieldOffset + relative;
+  const stringLength = cursor.view.getUint32(stringStart, true);
+  return decoder.decode(cursor.data.subarray(stringStart + 4, stringStart + 4 + stringLength));
+}
+
+function createMappedExtractor(fieldReaders) {
+  return {
+    getField(data, fieldName) {
+      const reader = fieldReaders[fieldName];
+      if (!reader) {
+        return null;
+      }
+      return reader(createCursor(data));
+    },
+    getFields(data, fieldNames) {
+      const cursor = createCursor(data);
+      return Object.fromEntries(
+        fieldNames.map((fieldName) => {
+          const reader = fieldReaders[fieldName];
+          return [fieldName, reader ? reader(cursor) : null];
+        })
+      );
+    },
+  };
+}
+
+function extractFields(extractor, data, fieldNames) {
+  if (extractor.getFields) {
+    return extractor.getFields(data, fieldNames);
+  }
+
+  return Object.fromEntries(fieldNames.map((fieldName) => [fieldName, extractor.getField(data, fieldName)]));
 }
 
 const demoExtractors = {
-  User(data, fieldName) {
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const root = view.getUint32(0, true);
-
-    switch (fieldName) {
-      case 'id': {
-        const fieldOffset = getFieldOffset(data, 0);
-        return fieldOffset === 0 ? 0 : view.getInt32(root + fieldOffset, true);
-      }
-      case 'name':
-        return readStringField(data, 1);
-      case 'email':
-        return readStringField(data, 2);
-      case 'age': {
-        const fieldOffset = getFieldOffset(data, 3);
-        return fieldOffset === 0 ? 0 : view.getInt32(root + fieldOffset, true);
-      }
-      default:
-        return null;
-    }
-  },
-  Post(data, fieldName) {
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const root = view.getUint32(0, true);
-
-    switch (fieldName) {
-      case 'id': {
-        const fieldOffset = getFieldOffset(data, 0);
-        return fieldOffset === 0 ? 0 : view.getInt32(root + fieldOffset, true);
-      }
-      case 'user_id': {
-        const fieldOffset = getFieldOffset(data, 1);
-        return fieldOffset === 0 ? 0 : view.getInt32(root + fieldOffset, true);
-      }
-      case 'title':
-        return readStringField(data, 2);
-      default:
-        return null;
-    }
-  },
+  User: createMappedExtractor({
+    id: (cursor) => readInt32Field(cursor, 0),
+    name: (cursor) => readStringField(cursor, 1),
+    email: (cursor) => readStringField(cursor, 2),
+    age: (cursor) => readInt32Field(cursor, 3),
+  }),
+  Post: createMappedExtractor({
+    id: (cursor) => readInt32Field(cursor, 0),
+    user_id: (cursor) => readInt32Field(cursor, 1),
+    title: (cursor) => readStringField(cursor, 2),
+  }),
 };
 
 function readFileId(data) {
@@ -88,11 +99,37 @@ function indexTableName(tableName, columnName) {
   return `_idx_${tableName}_${columnName}`;
 }
 
-function withTransaction(db, operation) {
+function compareKeys(left, right, keyType) {
+  if (left === right) {
+    return 0;
+  }
+
+  if (left == null) {
+    return -1;
+  }
+
+  if (right == null) {
+    return 1;
+  }
+
+  switch (keyType) {
+    case 'INTEGER':
+    case 'REAL':
+      return Number(left) - Number(right);
+    case 'TEXT':
+      return String(left) < String(right) ? -1 : 1;
+    case 'BLOB':
+      return Buffer.compare(Buffer.from(left), Buffer.from(right));
+    default:
+      return String(left) < String(right) ? -1 : 1;
+  }
+}
+
+function withTransaction(db, beginSql, operation) {
   let started = false;
 
   try {
-    db.exec('BEGIN IMMEDIATE');
+    db.exec(beginSql);
     started = true;
     const result = operation();
     db.exec('COMMIT');
@@ -106,11 +143,27 @@ function withTransaction(db, operation) {
   }
 }
 
-function createBuilder({ builderId, schema, sqlitePath }) {
+function applyPerformanceProfile(db, profile) {
+  if (profile === 'safe') {
+    db.exec('PRAGMA journal_mode = DELETE');
+    db.exec('PRAGMA synchronous = FULL');
+    return 'BEGIN IMMEDIATE';
+  }
+
+  db.exec('PRAGMA journal_mode = OFF');
+  db.exec('PRAGMA synchronous = OFF');
+  db.exec('PRAGMA locking_mode = EXCLUSIVE');
+  db.exec('PRAGMA temp_store = MEMORY');
+  db.exec('PRAGMA cache_size = -65536');
+  return 'BEGIN EXCLUSIVE';
+}
+
+function createBuilder({ builderId, schema, performanceProfile = 'fast', sqlitePath }) {
   const db = new DatabaseSync(sqlitePath);
   const state = {
     schema,
     db,
+    beginTransactionSql: applyPerformanceProfile(db, performanceProfile),
     tableByName: new Map(schema.tables.map((table) => [table.name, table])),
     fileIdToTable: new Map(),
     extractors: new Map(),
@@ -151,7 +204,7 @@ function ingestRecords(state, buffers, options, transportMode) {
   let currentOffset = options?.startOffset ?? 0;
   const plans = new Map();
 
-  withTransaction(state.db, () => {
+  withTransaction(state.db, state.beginTransactionSql, () => {
     for (let index = 0; index < buffers.length; index++) {
       const buffer = buffers[index];
       const fileId = readFileId(buffer);
@@ -174,10 +227,16 @@ function ingestRecords(state, buffers, options, transportMode) {
 
         plan = {
           extractor,
+          fieldNames: table.columns
+            .filter((column) => column.isIndexed && !column.name.startsWith('_'))
+            .map((column) => column.name),
           inserts: table.columns
             .filter((column) => column.isIndexed && !column.name.startsWith('_'))
             .map((column) => ({
               columnName: column.name,
+              keyType: column.sqlType,
+              entries: [],
+              ordered: true,
               statement: state.db.prepare(
                 `INSERT INTO "${indexTableName(table.name, column.name)}" (key, data_offset, data_length, sequence) VALUES (?, ?, ?, ?)`
               ),
@@ -187,12 +246,35 @@ function ingestRecords(state, buffers, options, transportMode) {
       }
 
       const recordOffset = options?.offsets?.[index] ?? currentOffset;
+      const extractedFields = extractFields(plan.extractor, buffer, plan.fieldNames);
       for (const insert of plan.inserts) {
-        insert.statement.run(plan.extractor(buffer, insert.columnName), recordOffset, buffer.length, state.sequence);
+        const key = extractedFields[insert.columnName];
+        if (insert.ordered && insert.lastKey !== undefined && compareKeys(insert.lastKey, key, insert.keyType) > 0) {
+          insert.ordered = false;
+        }
+        insert.lastKey = key;
+        insert.entries.push({
+          key,
+          recordOffset,
+          recordLength: buffer.length,
+          sequence: state.sequence,
+        });
       }
 
       state.sequence += 1;
       currentOffset = recordOffset + buffer.length;
+    }
+
+    for (const plan of plans.values()) {
+      for (const insert of plan.inserts) {
+        if (!insert.ordered) {
+          insert.entries.sort((left, right) => compareKeys(left.key, right.key, insert.keyType) || left.sequence - right.sequence);
+        }
+
+        for (const entry of insert.entries) {
+          insert.statement.run(entry.key, entry.recordOffset, entry.recordLength, entry.sequence);
+        }
+      }
     }
   });
 

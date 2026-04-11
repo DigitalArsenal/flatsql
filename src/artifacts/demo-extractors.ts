@@ -1,80 +1,105 @@
-export type ArtifactFieldExtractor = (data: Uint8Array, fieldName: string) => unknown;
+const decoder = new TextDecoder();
 
-function readUint32(data: Uint8Array, offset: number): number {
-  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(offset, true);
+export interface ArtifactRecordExtractor {
+  getField(data: Uint8Array, fieldName: string): unknown;
+  getFields?(data: Uint8Array, fieldNames: string[]): Record<string, unknown>;
 }
 
-function readInt32(data: Uint8Array, offset: number): number {
-  return new DataView(data.buffer, data.byteOffset, data.byteLength).getInt32(offset, true);
+export type ArtifactFieldExtractor = ((data: Uint8Array, fieldName: string) => unknown) | ArtifactRecordExtractor;
+
+interface FlatBufferCursor {
+  readonly data: Uint8Array;
+  readonly view: DataView;
+  readonly root: number;
+  readonly vtable: number;
+  readonly vtableSize: number;
 }
 
-function getFieldOffset(data: Uint8Array, fieldIndex: number): number {
-  const rootOffset = readUint32(data, 0);
-  const root = rootOffset;
-  const vtableOffset = readInt32(data, root);
-  const vtable = root - vtableOffset;
-  const vtableSize = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(vtable, true);
-  const entryOffset = vtable + 4 + fieldIndex * 2;
-  if (entryOffset + 2 > vtable + vtableSize) {
+function createCursor(data: Uint8Array): FlatBufferCursor {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const root = view.getUint32(0, true);
+  const vtable = root - view.getInt32(root, true);
+  return {
+    data,
+    view,
+    root,
+    vtable,
+    vtableSize: view.getUint16(vtable, true),
+  };
+}
+
+function getFieldOffset(cursor: FlatBufferCursor, fieldIndex: number): number {
+  const entryOffset = cursor.vtable + 4 + fieldIndex * 2;
+  if (entryOffset + 2 > cursor.vtable + cursor.vtableSize) {
     return 0;
   }
-  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint16(entryOffset, true);
+  return cursor.view.getUint16(entryOffset, true);
 }
 
-function readStringField(data: Uint8Array, fieldIndex: number): string {
-  const rootOffset = readUint32(data, 0);
-  const root = rootOffset;
-  const fieldOffset = getFieldOffset(data, fieldIndex);
+function readInt32Field(cursor: FlatBufferCursor, fieldIndex: number): number {
+  const fieldOffset = getFieldOffset(cursor, fieldIndex);
+  return fieldOffset === 0 ? 0 : cursor.view.getInt32(cursor.root + fieldOffset, true);
+}
+
+function readStringField(cursor: FlatBufferCursor, fieldIndex: number): string {
+  const fieldOffset = getFieldOffset(cursor, fieldIndex);
   if (fieldOffset === 0) {
     return '';
   }
 
-  const relative = readUint32(data, root + fieldOffset);
-  const stringStart = root + fieldOffset + relative;
-  const stringLength = readUint32(data, stringStart);
-  const stringBytes = data.subarray(stringStart + 4, stringStart + 4 + stringLength);
-  return new TextDecoder().decode(stringBytes);
+  const relative = cursor.view.getUint32(cursor.root + fieldOffset, true);
+  const stringStart = cursor.root + fieldOffset + relative;
+  const stringLength = cursor.view.getUint32(stringStart, true);
+  return decoder.decode(cursor.data.subarray(stringStart + 4, stringStart + 4 + stringLength));
+}
+
+function createMappedExtractor(fieldReaders: Record<string, (cursor: FlatBufferCursor) => unknown>): ArtifactRecordExtractor {
+  return {
+    getField(data: Uint8Array, fieldName: string): unknown {
+      const reader = fieldReaders[fieldName];
+      if (!reader) {
+        return null;
+      }
+      return reader(createCursor(data));
+    },
+    getFields(data: Uint8Array, fieldNames: string[]): Record<string, unknown> {
+      const cursor = createCursor(data);
+      return Object.fromEntries(
+        fieldNames.map((fieldName) => {
+          const reader = fieldReaders[fieldName];
+          return [fieldName, reader ? reader(cursor) : null];
+        })
+      );
+    },
+  };
+}
+
+export function extractArtifactField(extractor: ArtifactFieldExtractor, data: Uint8Array, fieldName: string): unknown {
+  return typeof extractor === 'function' ? extractor(data, fieldName) : extractor.getField(data, fieldName);
+}
+
+export function extractArtifactFields(
+  extractor: ArtifactFieldExtractor,
+  data: Uint8Array,
+  fieldNames: string[]
+): Record<string, unknown> {
+  if (typeof extractor !== 'function' && extractor.getFields) {
+    return extractor.getFields(data, fieldNames);
+  }
+
+  return Object.fromEntries(fieldNames.map((fieldName) => [fieldName, extractArtifactField(extractor, data, fieldName)]));
 }
 
 export const demoExtractors: Record<string, ArtifactFieldExtractor> = {
-  User(data, fieldName) {
-    const rootOffset = readUint32(data, 0);
-    const root = rootOffset;
-
-    switch (fieldName) {
-      case 'id': {
-        const fieldOffset = getFieldOffset(data, 0);
-        return fieldOffset === 0 ? 0 : readInt32(data, root + fieldOffset);
-      }
-      case 'name':
-        return readStringField(data, 1);
-      case 'email':
-        return readStringField(data, 2);
-      case 'age': {
-        const fieldOffset = getFieldOffset(data, 3);
-        return fieldOffset === 0 ? 0 : readInt32(data, root + fieldOffset);
-      }
-      default:
-        return null;
-    }
-  },
-  Post(data, fieldName) {
-    const rootOffset = readUint32(data, 0);
-    const root = rootOffset;
-
-    switch (fieldName) {
-      case 'id': {
-        const fieldOffset = getFieldOffset(data, 0);
-        return fieldOffset === 0 ? 0 : readInt32(data, root + fieldOffset);
-      }
-      case 'user_id': {
-        const fieldOffset = getFieldOffset(data, 1);
-        return fieldOffset === 0 ? 0 : readInt32(data, root + fieldOffset);
-      }
-      case 'title':
-        return readStringField(data, 2);
-      default:
-        return null;
-    }
-  },
+  User: createMappedExtractor({
+    id: (cursor) => readInt32Field(cursor, 0),
+    name: (cursor) => readStringField(cursor, 1),
+    email: (cursor) => readStringField(cursor, 2),
+    age: (cursor) => readInt32Field(cursor, 3),
+  }),
+  Post: createMappedExtractor({
+    id: (cursor) => readInt32Field(cursor, 0),
+    user_id: (cursor) => readInt32Field(cursor, 1),
+    title: (cursor) => readStringField(cursor, 2),
+  }),
 };

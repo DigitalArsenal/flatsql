@@ -7,11 +7,16 @@ import {
   type DatabaseSchema,
   type TableDef,
 } from '../schema/index.js';
-import { demoExtractors, type ArtifactFieldExtractor } from './demo-extractors.js';
+import {
+  demoExtractors,
+  extractArtifactFields,
+  type ArtifactFieldExtractor,
+} from './demo-extractors.js';
 import type {
   ArtifactBuilderOptions,
   ArtifactIngestOptions,
   ArtifactIngestResult,
+  ArtifactPerformanceProfile,
   ArtifactQueryResult,
 } from './types.js';
 
@@ -30,22 +35,24 @@ function toSqliteType(column: ColumnDef): string {
   }
 }
 
+const decoder = new TextDecoder();
+
 function readFileId(data: Uint8Array): string {
   if (data.length < 8) {
     throw new Error('FlatBuffer payload is too short to contain a file identifier');
   }
-  return new TextDecoder().decode(data.subarray(4, 8));
+  return decoder.decode(data.subarray(4, 8));
 }
 
 function normalizeRow(row: Record<string, unknown>, columns: string[]): any[] {
   return columns.map((column) => row[column]);
 }
 
-function withTransaction<T>(db: DatabaseSync, operation: () => T): T {
+function withTransaction<T>(db: DatabaseSync, beginSql: string, operation: () => T): T {
   let started = false;
 
   try {
-    db.exec('BEGIN IMMEDIATE');
+    db.exec(beginSql);
     started = true;
     const result = operation();
     db.exec('COMMIT');
@@ -59,19 +66,73 @@ function withTransaction<T>(db: DatabaseSync, operation: () => T): T {
   }
 }
 
+function applyPerformanceProfile(db: DatabaseSync, profile: ArtifactPerformanceProfile): string {
+  if (profile === 'safe') {
+    db.exec('PRAGMA journal_mode = DELETE');
+    db.exec('PRAGMA synchronous = FULL');
+    return 'BEGIN IMMEDIATE';
+  }
+
+  db.exec('PRAGMA journal_mode = OFF');
+  db.exec('PRAGMA synchronous = OFF');
+  db.exec('PRAGMA locking_mode = EXCLUSIVE');
+  db.exec('PRAGMA temp_store = MEMORY');
+  db.exec('PRAGMA cache_size = -65536');
+  return 'BEGIN EXCLUSIVE';
+}
+
 interface PreparedInsert {
   readonly columnName: string;
+  readonly keyType: SQLColumnType;
   readonly statement: ReturnType<DatabaseSync['prepare']>;
+  readonly entries: PendingInsert[];
+  ordered: boolean;
+  lastKey?: unknown;
 }
 
 interface IngestPlan {
   readonly extractor: ArtifactFieldExtractor;
+  readonly fieldNames: string[];
   readonly inserts: PreparedInsert[];
+}
+
+interface PendingInsert {
+  readonly key: unknown;
+  readonly recordOffset: number;
+  readonly recordLength: number;
+  readonly sequence: number;
+}
+
+function compareKeys(left: unknown, right: unknown, keyType: SQLColumnType): number {
+  if (left === right) {
+    return 0;
+  }
+
+  if (left == null) {
+    return -1;
+  }
+
+  if (right == null) {
+    return 1;
+  }
+
+  switch (keyType) {
+    case SQLColumnType.INTEGER:
+    case SQLColumnType.REAL:
+      return Number(left) - Number(right);
+    case SQLColumnType.TEXT:
+      return String(left) < String(right) ? -1 : 1;
+    case SQLColumnType.BLOB:
+      return Buffer.compare(Buffer.from(left as Uint8Array), Buffer.from(right as Uint8Array));
+    default:
+      return String(left) < String(right) ? -1 : 1;
+  }
 }
 
 export class FlatSQLArtifactBuilder {
   private readonly schema: DatabaseSchema;
   private readonly db: DatabaseSync;
+  private readonly beginTransactionSql: string;
   private readonly tableByName = new Map<string, TableDef>();
   private readonly fileIdToTable = new Map<string, string>();
   private readonly extractors = new Map<string, ArtifactFieldExtractor>();
@@ -89,6 +150,7 @@ export class FlatSQLArtifactBuilder {
 
     this.schema = schema;
     this.db = new DatabaseSync(options.sqlitePath);
+    this.beginTransactionSql = applyPerformanceProfile(this.db, options.performanceProfile ?? 'fast');
     for (const table of schema.tables) {
       this.tableByName.set(table.name, table);
     }
@@ -113,30 +175,55 @@ export class FlatSQLArtifactBuilder {
     let currentOffset = options.startOffset ?? 0;
     const plans = new Map<string, IngestPlan>();
 
-    withTransaction(this.db, () => {
-      for (let index = 0; index < buffers.length; index++) {
-        const buffer = buffers[index];
-        const fileId = readFileId(buffer);
-        const tableName = this.fileIdToTable.get(fileId);
-        if (!tableName) {
-          throw new Error(`No table registered for file identifier ${fileId}`);
+    for (let index = 0; index < buffers.length; index++) {
+      const buffer = buffers[index];
+      const fileId = readFileId(buffer);
+      const tableName = this.fileIdToTable.get(fileId);
+      if (!tableName) {
+        throw new Error(`No table registered for file identifier ${fileId}`);
+      }
+
+      let plan = plans.get(tableName);
+      if (!plan) {
+        plan = this.createIngestPlan(tableName);
+        plans.set(tableName, plan);
+      }
+
+      const recordOffset = options.offsets?.[index] ?? currentOffset;
+      const recordLength = buffer.length;
+      const extractedFields = extractArtifactFields(plan.extractor, buffer, plan.fieldNames);
+
+      for (const insert of plan.inserts) {
+        const key = extractedFields[insert.columnName];
+        if (insert.ordered && insert.lastKey !== undefined && compareKeys(insert.lastKey, key, insert.keyType) > 0) {
+          insert.ordered = false;
         }
+        insert.lastKey = key;
+        insert.entries.push({
+          key,
+          recordOffset,
+          recordLength,
+          sequence: this.sequence,
+        });
+      }
 
-        let plan = plans.get(tableName);
-        if (!plan) {
-          plan = this.createIngestPlan(tableName);
-          plans.set(tableName, plan);
-        }
+      this.sequence += 1;
+      currentOffset = recordOffset + recordLength;
+    }
 
-        const recordOffset = options.offsets?.[index] ?? currentOffset;
-        const recordLength = buffer.length;
-
+    withTransaction(this.db, this.beginTransactionSql, () => {
+      for (const plan of plans.values()) {
         for (const insert of plan.inserts) {
-          insert.statement.run(plan.extractor(buffer, insert.columnName), recordOffset, recordLength, this.sequence);
-        }
+          if (!insert.ordered) {
+            insert.entries.sort(
+              (left, right) => compareKeys(left.key, right.key, insert.keyType) || left.sequence - right.sequence
+            );
+          }
 
-        this.sequence += 1;
-        currentOffset = recordOffset + recordLength;
+          for (const entry of insert.entries) {
+            insert.statement.run(entry.key, entry.recordOffset, entry.recordLength, entry.sequence);
+          }
+        }
       }
     });
 
@@ -198,10 +285,16 @@ export class FlatSQLArtifactBuilder {
 
     return {
       extractor,
+      fieldNames: table.columns
+        .filter((column) => column.isIndexed && !column.name.startsWith('_'))
+        .map((column) => column.name),
       inserts: table.columns
         .filter((column) => column.isIndexed && !column.name.startsWith('_'))
         .map((column) => ({
           columnName: column.name,
+          keyType: column.sqlType,
+          entries: [],
+          ordered: true,
           statement: this.db.prepare(
             `INSERT INTO "${this.indexTableName(table.name, column.name)}" (key, data_offset, data_length, sequence) VALUES (?, ?, ?, ?)`
           ),

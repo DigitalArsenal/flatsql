@@ -133,6 +133,69 @@ describe('remote artifact builder', () => {
     reopened.close();
   });
 
+  test('artifact builder defaults to fast sqlite pragmas', async () => {
+    const sqlitePath = join(tempDir, 'users-fast-pragmas.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+
+    expect(builder.query('PRAGMA journal_mode').rows).toEqual([['off']]);
+    expect(builder.query('PRAGMA synchronous').rows).toEqual([[0]]);
+
+    builder.close();
+  });
+
+  test('artifact builder can opt into safe sqlite pragmas', async () => {
+    const sqlitePath = join(tempDir, 'users-safe-pragmas.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+      performanceProfile: 'safe',
+    });
+
+    expect(builder.query('PRAGMA journal_mode').rows).toEqual([['delete']]);
+    expect(builder.query('PRAGMA synchronous').rows).toEqual([[2]]);
+
+    builder.close();
+  });
+
+  test('artifact builder uses batch extractor once per record when available', async () => {
+    const sqlitePath = join(tempDir, 'users-batch-extractor.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+    const calls = {
+      field: 0,
+      fields: 0,
+    };
+
+    builder.registerFileId('USER', 'User');
+    builder.setFieldExtractor('User', {
+      getField(_data: Uint8Array, fieldName: string) {
+        calls.field += 1;
+        return fieldName === 'id' ? 1 : 'shared@example.com';
+      },
+      getFields(_data: Uint8Array, fieldNames: string[]) {
+        calls.fields += 1;
+        return Object.fromEntries(
+          fieldNames.map((fieldName) => [fieldName, fieldName === 'id' ? 1 : 'shared@example.com'])
+        );
+      },
+    });
+
+    builder.ingestBuffers(
+      [
+        createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30),
+        createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25),
+      ],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    expect(calls.fields).toBe(2);
+    expect(calls.field).toBe(0);
+
+    builder.close();
+  });
+
   test('artifact worker builds sqlite artifact via worker thread', async () => {
     const sqlitePath = join(tempDir, 'users-worker.sqlite');
     const client = new FlatSQLArtifactWorkerClient();
@@ -166,6 +229,27 @@ describe('remote artifact builder', () => {
     const query = reopened.query('SELECT key FROM "_idx_User_email" ORDER BY key');
     expect(query.rows).toEqual([['alice@example.com'], ['bob@example.com']]);
     reopened.close();
+  });
+
+  test('artifact worker defaults to fast sqlite pragmas', async () => {
+    const sqlitePath = join(tempDir, 'users-worker-fast-pragmas.sqlite');
+    const client = new FlatSQLArtifactWorkerClient();
+    await client.init();
+
+    const builder = await client.createBuilder(schema, {
+      sqlitePath,
+      preferSharedArrayBuffer: false,
+    });
+
+    await expect(builder.query('PRAGMA journal_mode')).resolves.toMatchObject({
+      rows: [['off']],
+    });
+    await expect(builder.query('PRAGMA synchronous')).resolves.toMatchObject({
+      rows: [[0]],
+    });
+
+    await builder.close();
+    await client.close();
   });
 
   test('artifact worker uses shared-array-buffer transport when supported', async () => {
