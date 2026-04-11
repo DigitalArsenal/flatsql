@@ -2,8 +2,91 @@ import { Worker } from 'node:worker_threads';
 import { parseSchema } from '../schema/index.js';
 import { sizePrefixedByteLength, writeSizePrefixedStream, } from './transport.js';
 const schemaCache = new Map();
+const VOLATILE_QUERY_PATTERNS = [
+    /\bRANDOM\s*\(/i,
+    /\bCHANGES\s*\(/i,
+    /\bTOTAL_CHANGES\s*\(/i,
+    /\bLAST_INSERT_ROWID\s*\(/i,
+    /\bCURRENT_(TIME|DATE|TIMESTAMP)\b/i,
+    /\bDATE\s*\(/i,
+    /\bTIME\s*\(/i,
+    /\bDATETIME\s*\(/i,
+    /\bJULIANDAY\s*\(/i,
+    /\bUNIXEPOCH\s*\(/i,
+    /\bSTRFTIME\s*\(/i,
+];
 function supportsSharedArrayBuffer() {
     return typeof SharedArrayBuffer !== 'undefined' && typeof Atomics !== 'undefined';
+}
+function isCacheableQuerySql(sql) {
+    const trimmed = sql.trimStart();
+    if (trimmed.length === 0) {
+        return false;
+    }
+    const upper = trimmed.toUpperCase();
+    if (upper.startsWith('SELECT') || upper.startsWith('WITH')) {
+        return true;
+    }
+    return upper.startsWith('PRAGMA') && !trimmed.includes('=');
+}
+function isResultCacheableQuerySql(sql) {
+    return isCacheableQuerySql(sql) && !VOLATILE_QUERY_PATTERNS.some((pattern) => pattern.test(sql));
+}
+function cloneQueryResult(result) {
+    return {
+        columns: [...result.columns],
+        rows: result.rows.map((row) => [...row]),
+        rowCount: result.rowCount,
+    };
+}
+function encodeCacheValue(value) {
+    if (value === null) {
+        return 'l';
+    }
+    switch (typeof value) {
+        case 'string':
+            return `s:${value.length}:${value}`;
+        case 'number':
+            return `n:${Object.is(value, -0) ? '-0' : String(value)}`;
+        case 'bigint':
+            return `i:${value.toString()}`;
+        case 'boolean':
+            return value ? 'b:1' : 'b:0';
+        case 'undefined':
+            return 'u';
+        default:
+            return null;
+    }
+}
+function buildResultCacheKey(sql, params) {
+    if (!isResultCacheableQuerySql(sql)) {
+        return null;
+    }
+    if (params === undefined) {
+        return sql;
+    }
+    if (Array.isArray(params)) {
+        const encoded = params.map(encodeCacheValue);
+        if (encoded.some((value) => value === null)) {
+            return null;
+        }
+        return `${sql}\u0000a:${encoded.join('\u0001')}`;
+    }
+    const prototype = Object.getPrototypeOf(params);
+    if (prototype !== Object.prototype && prototype !== null) {
+        return null;
+    }
+    const namedParams = params;
+    const encodedEntries = [];
+    const keys = Object.keys(namedParams).sort();
+    for (const key of keys) {
+        const encodedValue = encodeCacheValue(namedParams[key]);
+        if (encodedValue === null) {
+            return null;
+        }
+        encodedEntries.push(`${key}\u0002${encodedValue}`);
+    }
+    return `${sql}\u0000o:${encodedEntries.join('\u0001')}`;
 }
 export class FlatSQLArtifactWorkerClient {
     workerPath;
@@ -88,6 +171,7 @@ export class FlatSQLArtifactWorkerBuilder {
     builderId;
     schema;
     preferSharedArrayBuffer;
+    queryResultCache = new Map();
     constructor(client, builderId, schema, options) {
         this.client = client;
         this.builderId = builderId;
@@ -101,6 +185,7 @@ export class FlatSQLArtifactWorkerBuilder {
         await this.client.call('enableDemoExtractors', { builderId: this.builderId });
     }
     async ingestBuffers(buffers, options = {}) {
+        this.queryResultCache.clear();
         const canUseShared = this.preferSharedArrayBuffer && supportsSharedArrayBuffer();
         if (canUseShared) {
             const byteLength = sizePrefixedByteLength(buffers);
@@ -119,10 +204,62 @@ export class FlatSQLArtifactWorkerBuilder {
             options,
         });
     }
-    async query(sql) {
-        return await this.client.call('query', { builderId: this.builderId, sql });
+    async query(sql, params) {
+        const resultCacheKey = buildResultCacheKey(sql, params);
+        const cached = resultCacheKey ? this.queryResultCache.get(resultCacheKey) : undefined;
+        if (cached) {
+            return cloneQueryResult(cached);
+        }
+        const result = await this.client.call('query', { builderId: this.builderId, sql, params });
+        if (resultCacheKey) {
+            this.queryResultCache.set(resultCacheKey, result);
+            return cloneQueryResult(result);
+        }
+        return result;
+    }
+    async queryMany(queries) {
+        if (queries.length === 0) {
+            return [];
+        }
+        const results = new Array(queries.length);
+        const uncachedQueries = [];
+        const uncachedIndices = [];
+        const uncachedCacheKeys = [];
+        for (let index = 0; index < queries.length; index += 1) {
+            const query = queries[index];
+            const resultCacheKey = buildResultCacheKey(query.sql, query.params);
+            const cached = resultCacheKey ? this.queryResultCache.get(resultCacheKey) : undefined;
+            if (cached) {
+                results[index] = cloneQueryResult(cached);
+                continue;
+            }
+            uncachedQueries.push(query);
+            uncachedIndices.push(index);
+            uncachedCacheKeys.push(resultCacheKey);
+        }
+        if (uncachedQueries.length === 0) {
+            return results;
+        }
+        const freshResults = await this.client.call('queryMany', {
+            builderId: this.builderId,
+            queries: uncachedQueries,
+        });
+        for (let index = 0; index < freshResults.length; index += 1) {
+            const result = freshResults[index];
+            const resultIndex = uncachedIndices[index];
+            const resultCacheKey = uncachedCacheKeys[index];
+            if (resultCacheKey) {
+                this.queryResultCache.set(resultCacheKey, result);
+                results[resultIndex] = cloneQueryResult(result);
+            }
+            else {
+                results[resultIndex] = result;
+            }
+        }
+        return results;
     }
     async close() {
+        this.queryResultCache.clear();
         await this.client.call('closeBuilder', { builderId: this.builderId });
     }
 }

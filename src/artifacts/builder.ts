@@ -17,6 +17,8 @@ import {
 import type {
   ArtifactBuilderOptions,
   ArtifactIngestOptions,
+  ArtifactQueryParams,
+  ArtifactQuerySpec,
   ArtifactIngestResult,
   ArtifactPerformanceProfile,
   ArtifactQueryResult,
@@ -44,10 +46,23 @@ const DEFAULT_MMAP_SIZE = 268435456;
 const DEFAULT_CACHE_SIZE = -131072;
 const DEFAULT_THREAD_COUNT = Math.min(4, Math.max(2, availableParallelism()));
 const schemaCache = new Map<string, DatabaseSchema>();
+const VOLATILE_QUERY_PATTERNS = [
+  /\bRANDOM\s*\(/i,
+  /\bCHANGES\s*\(/i,
+  /\bTOTAL_CHANGES\s*\(/i,
+  /\bLAST_INSERT_ROWID\s*\(/i,
+  /\bCURRENT_(TIME|DATE|TIMESTAMP)\b/i,
+  /\bDATE\s*\(/i,
+  /\bTIME\s*\(/i,
+  /\bDATETIME\s*\(/i,
+  /\bJULIANDAY\s*\(/i,
+  /\bUNIXEPOCH\s*\(/i,
+  /\bSTRFTIME\s*\(/i,
+];
 
 type QueryStatement = ReturnType<DatabaseSync['prepare']> & {
   setReturnArrays?: (enabled: boolean) => unknown;
-  all: () => unknown[];
+  all: (...params: unknown[]) => unknown[];
 };
 
 function isCacheableQuerySql(sql: string): boolean {
@@ -64,8 +79,101 @@ function isCacheableQuerySql(sql: string): boolean {
   return upper.startsWith('PRAGMA') && !trimmed.includes('=');
 }
 
+function isResultCacheableQuerySql(sql: string): boolean {
+  return isCacheableQuerySql(sql) && !VOLATILE_QUERY_PATTERNS.some((pattern) => pattern.test(sql));
+}
+
 function normalizeRow(row: Record<string, unknown>, columns: string[]): any[] {
   return columns.map((column) => row[column]);
+}
+
+function cloneQueryResult(result: ArtifactQueryResult): ArtifactQueryResult {
+  return {
+    columns: [...result.columns],
+    rows: result.rows.map((row) => [...row]),
+    rowCount: result.rowCount,
+  };
+}
+
+function encodeCacheValue(value: unknown): string | null {
+  if (value === null) {
+    return 'l';
+  }
+
+  switch (typeof value) {
+    case 'string':
+      return `s:${value.length}:${value}`;
+    case 'number':
+      return `n:${Object.is(value, -0) ? '-0' : String(value)}`;
+    case 'bigint':
+      return `i:${value.toString()}`;
+    case 'boolean':
+      return value ? 'b:1' : 'b:0';
+    case 'undefined':
+      return 'u';
+    default:
+      return null;
+  }
+}
+
+function buildResultCacheKey(sql: string, params: ArtifactQueryParams | undefined): string | null {
+  if (!isResultCacheableQuerySql(sql)) {
+    return null;
+  }
+
+  if (params === undefined) {
+    return sql;
+  }
+
+  if (Array.isArray(params)) {
+    const encoded = params.map(encodeCacheValue);
+    if (encoded.some((value) => value === null)) {
+      return null;
+    }
+    return `${sql}\u0000a:${encoded.join('\u0001')}`;
+  }
+
+  const prototype = Object.getPrototypeOf(params);
+  if (prototype !== Object.prototype && prototype !== null) {
+    return null;
+  }
+
+  const namedParams = params as Record<string, unknown>;
+  const encodedEntries: string[] = [];
+  const keys = Object.keys(namedParams).sort();
+  for (const key of keys) {
+    const encodedValue = encodeCacheValue(namedParams[key]);
+    if (encodedValue === null) {
+      return null;
+    }
+    encodedEntries.push(`${key}\u0002${encodedValue}`);
+  }
+  return `${sql}\u0000o:${encodedEntries.join('\u0001')}`;
+}
+
+function executeStatementAll(statement: QueryStatement, params: ArtifactQueryParams | undefined): unknown[] {
+  if (params === undefined) {
+    return statement.all();
+  }
+
+  if (Array.isArray(params)) {
+    switch (params.length) {
+      case 0:
+        return statement.all();
+      case 1:
+        return statement.all(params[0]);
+      case 2:
+        return statement.all(params[0], params[1]);
+      case 3:
+        return statement.all(params[0], params[1], params[2]);
+      case 4:
+        return statement.all(params[0], params[1], params[2], params[3]);
+      default:
+        return statement.all(...params);
+    }
+  }
+
+  return statement.all(params);
 }
 
 function readFileId(data: Uint8Array): string {
@@ -258,6 +366,7 @@ export class FlatSQLArtifactBuilder {
     columns: string[];
     arrayMode: boolean;
   }>();
+  private readonly queryResultCache = new Map<string, ArtifactQueryResult>();
   private sequence = 1;
 
   static fromSchema(source: string, options: ArtifactBuilderOptions): FlatSQLArtifactBuilder {
@@ -303,6 +412,7 @@ export class FlatSQLArtifactBuilder {
     let currentOffset = options.startOffset ?? 0;
     const plan = this.createIngestPlan();
     this.queryCache.clear();
+    this.queryResultCache.clear();
 
     withTransaction(this.db, this.beginTransactionSql, () => {
       for (let index = 0; index < buffers.length; index++) {
@@ -343,7 +453,13 @@ export class FlatSQLArtifactBuilder {
     return { recordCount: buffers.length };
   }
 
-  query(sql: string): ArtifactQueryResult {
+  query(sql: string, params?: ArtifactQueryParams): ArtifactQueryResult {
+    const resultCacheKey = buildResultCacheKey(sql, params);
+    const cachedResult = resultCacheKey ? this.queryResultCache.get(resultCacheKey) : undefined;
+    if (cachedResult) {
+      return cloneQueryResult(cachedResult);
+    }
+
     const cacheable = isCacheableQuerySql(sql);
     let cached = cacheable ? this.queryCache.get(sql) : undefined;
 
@@ -360,20 +476,31 @@ export class FlatSQLArtifactBuilder {
       }
     }
 
-    const rawRows = cached.statement.all();
+    const rawRows = executeStatementAll(cached.statement, params);
     const rows = cached.arrayMode
       ? (rawRows as unknown as any[][])
       : (rawRows as Record<string, unknown>[]).map((row) => normalizeRow(row, cached!.columns));
 
-    return {
+    const result = {
       columns: [...cached.columns],
       rows,
       rowCount: rows.length,
     };
+
+    if (resultCacheKey) {
+      this.queryResultCache.set(resultCacheKey, result);
+    }
+
+    return resultCacheKey ? cloneQueryResult(result) : result;
+  }
+
+  queryMany(queries: readonly ArtifactQuerySpec[]): ArtifactQueryResult[] {
+    return queries.map(({ sql, params }) => this.query(sql, params));
   }
 
   close(): void {
     this.queryCache.clear();
+    this.queryResultCache.clear();
     this.db.close();
   }
 

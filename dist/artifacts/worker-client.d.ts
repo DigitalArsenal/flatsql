@@ -1,5 +1,5 @@
 import { type DatabaseSchema } from '../schema/index.js';
-import type { ArtifactIngestOptions, ArtifactIngestResult, ArtifactWorkerBuilderOptions } from './types.js';
+import type { ArtifactIngestOptions, ArtifactIngestResult, ArtifactQueryParams, ArtifactQuerySpec, ArtifactQueryResult, ArtifactWorkerBuilderOptions } from './types.js';
 export declare class FlatSQLArtifactWorkerClient {
     private readonly workerPath;
     private worker;
@@ -16,15 +16,13 @@ export declare class FlatSQLArtifactWorkerBuilder {
     private readonly builderId;
     private readonly schema;
     private readonly preferSharedArrayBuffer;
+    private readonly queryResultCache;
     constructor(client: FlatSQLArtifactWorkerClient, builderId: string, schema: DatabaseSchema, options: ArtifactWorkerBuilderOptions);
     registerFileId(fileId: string, tableName: string): Promise<void>;
     enableDemoExtractors(): Promise<void>;
     ingestBuffers(buffers: Uint8Array[], options?: ArtifactIngestOptions): Promise<ArtifactIngestResult>;
-    query(sql: string): Promise<{
-        columns: string[];
-        rows: any[][];
-        rowCount: number;
-    }>;
+    query(sql: string, params?: ArtifactQueryParams): Promise<ArtifactQueryResult>;
+    queryMany(queries: readonly ArtifactQuerySpec[]): Promise<ArtifactQueryResult[]>;
     close(): Promise<void>;
 }
 //# sourceMappingURL=worker-client.d.ts.map

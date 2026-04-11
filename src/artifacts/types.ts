@@ -20,6 +20,13 @@ export interface ArtifactQueryResult {
   rowCount: number;
 }
 
+export type ArtifactQueryParams = readonly unknown[] | Record<string, unknown>;
+
+export interface ArtifactQuerySpec {
+  sql: string;
+  params?: ArtifactQueryParams;
+}
+
 export type ArtifactTransportMode = 'clone' | 'shared-array-buffer';
 
 export interface ArtifactIngestResult {

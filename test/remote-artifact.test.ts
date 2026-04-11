@@ -403,6 +403,39 @@ describe('remote artifact builder', () => {
     builder.close();
   });
 
+  test('artifact builder reuses prepared parameterized queries across changing values', async () => {
+    const sqlitePath = join(tempDir, 'users-query-params.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+
+    builder.registerFileId('USER', 'User');
+    builder.enableDemoExtractors();
+    builder.ingestBuffers(
+      [
+        createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30),
+        createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25),
+      ],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    const db = (builder as any).db;
+    const originalPrepare = db.prepare.bind(db);
+    let prepareCalls = 0;
+    db.prepare = ((sql: string) => {
+      prepareCalls += 1;
+      return originalPrepare(sql);
+    }) as typeof db.prepare;
+
+    const sql = 'SELECT key FROM "_idx_User_email" WHERE key = ?';
+    expect(builder.query(sql, ['alice@example.com']).rows).toEqual([['alice@example.com']]);
+    expect(builder.query(sql, ['bob@example.com']).rows).toEqual([['bob@example.com']]);
+    expect(builder.query(sql, ['alice@example.com']).rows).toEqual([['alice@example.com']]);
+    expect(prepareCalls).toBe(1);
+
+    builder.close();
+  });
+
   test('artifact builder prepares read queries in array-return mode', async () => {
     const sqlitePath = join(tempDir, 'users-query-arrays.sqlite');
     const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
@@ -435,6 +468,77 @@ describe('remote artifact builder', () => {
       ['alice@example.com'],
     ]);
     expect(setReturnArraysCalls).toBe(1);
+
+    builder.close();
+  });
+
+  test('artifact builder caches identical read query results until ingest invalidates them', async () => {
+    const sqlitePath = join(tempDir, 'users-query-results.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+
+    builder.registerFileId('USER', 'User');
+    builder.enableDemoExtractors();
+    builder.ingestBuffers(
+      [createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30)],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    const db = (builder as any).db;
+    const originalPrepare = db.prepare.bind(db);
+    let allCalls = 0;
+    db.prepare = ((sql: string) => {
+      const statement = originalPrepare(sql);
+      const originalAll = statement.all.bind(statement);
+      statement.all = (() => {
+        allCalls += 1;
+        return originalAll();
+      }) as typeof statement.all;
+      return statement;
+    }) as typeof db.prepare;
+
+    const sql = 'SELECT COUNT(*) FROM "_idx_User_email"';
+    expect(builder.query(sql).rows).toEqual([[1]]);
+    expect(builder.query(sql).rows).toEqual([[1]]);
+    expect(allCalls).toBe(1);
+
+    builder.ingestBuffers(
+      [createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25)],
+      { sourceName: 'users.bin', startOffset: 64 }
+    );
+
+    expect(builder.query(sql).rows).toEqual([[2]]);
+    expect(allCalls).toBe(2);
+
+    builder.close();
+  });
+
+  test('artifact builder batches parameterized queries across changing values', async () => {
+    const sqlitePath = join(tempDir, 'users-query-batch.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+
+    builder.registerFileId('USER', 'User');
+    builder.enableDemoExtractors();
+    builder.ingestBuffers(
+      [
+        createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30),
+        createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25),
+      ],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    expect(
+      builder.queryMany([
+        { sql: 'SELECT key FROM "_idx_User_email" WHERE key = ?', params: ['alice@example.com'] },
+        { sql: 'SELECT key FROM "_idx_User_email" WHERE key = ?', params: ['bob@example.com'] },
+      ])
+    ).toEqual([
+      { columns: ['key'], rows: [['alice@example.com']], rowCount: 1 },
+      { columns: ['key'], rows: [['bob@example.com']], rowCount: 1 },
+    ]);
 
     builder.close();
   });
@@ -529,6 +633,141 @@ describe('remote artifact builder', () => {
     );
 
     expect(result.transportMode).toBe('shared-array-buffer');
+
+    await builder.close();
+    await client.close();
+  });
+
+  test('artifact worker caches identical read query results until ingest invalidates them', async () => {
+    const sqlitePath = join(tempDir, 'users-worker-query-results.sqlite');
+    const client = new FlatSQLArtifactWorkerClient();
+    await client.init();
+
+    const builder = await client.createBuilder(schema, {
+      sqlitePath,
+      preferSharedArrayBuffer: false,
+    });
+
+    await builder.registerFileId('USER', 'User');
+    await builder.enableDemoExtractors();
+    await builder.ingestBuffers(
+      [createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30)],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    const originalCall = (client as any).call.bind(client);
+    let queryCalls = 0;
+    (client as any).call = async (method: string, params: Record<string, unknown>) => {
+      if (method === 'query') {
+        queryCalls += 1;
+      }
+      return await originalCall(method, params);
+    };
+
+    const sql = 'SELECT COUNT(*) FROM "_idx_User_email"';
+    await expect(builder.query(sql)).resolves.toMatchObject({ rows: [[1]] });
+    await expect(builder.query(sql)).resolves.toMatchObject({ rows: [[1]] });
+    expect(queryCalls).toBe(1);
+
+    await builder.ingestBuffers(
+      [createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25)],
+      { sourceName: 'users.bin', startOffset: 64 }
+    );
+
+    await expect(builder.query(sql)).resolves.toMatchObject({ rows: [[2]] });
+    expect(queryCalls).toBe(2);
+
+    await builder.close();
+    await client.close();
+  });
+
+  test('artifact worker caches parameterized read results by sql and params', async () => {
+    const sqlitePath = join(tempDir, 'users-worker-query-params.sqlite');
+    const client = new FlatSQLArtifactWorkerClient();
+    await client.init();
+
+    const builder = await client.createBuilder(schema, {
+      sqlitePath,
+      preferSharedArrayBuffer: false,
+    });
+
+    await builder.registerFileId('USER', 'User');
+    await builder.enableDemoExtractors();
+    await builder.ingestBuffers(
+      [
+        createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30),
+        createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25),
+      ],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    const originalCall = (client as any).call.bind(client);
+    let queryCalls = 0;
+    (client as any).call = async (method: string, params: Record<string, unknown>) => {
+      if (method === 'query') {
+        queryCalls += 1;
+      }
+      return await originalCall(method, params);
+    };
+
+    const sql = 'SELECT key FROM "_idx_User_email" WHERE key = ?';
+    await expect(builder.query(sql, ['alice@example.com'])).resolves.toMatchObject({
+      rows: [['alice@example.com']],
+    });
+    await expect(builder.query(sql, ['alice@example.com'])).resolves.toMatchObject({
+      rows: [['alice@example.com']],
+    });
+    await expect(builder.query(sql, ['bob@example.com'])).resolves.toMatchObject({
+      rows: [['bob@example.com']],
+    });
+    await expect(builder.query(sql, ['bob@example.com'])).resolves.toMatchObject({
+      rows: [['bob@example.com']],
+    });
+    expect(queryCalls).toBe(2);
+
+    await builder.close();
+    await client.close();
+  });
+
+  test('artifact worker batches parameterized queries through one client call', async () => {
+    const sqlitePath = join(tempDir, 'users-worker-query-batch.sqlite');
+    const client = new FlatSQLArtifactWorkerClient();
+    await client.init();
+
+    const builder = await client.createBuilder(schema, {
+      sqlitePath,
+      preferSharedArrayBuffer: false,
+    });
+
+    await builder.registerFileId('USER', 'User');
+    await builder.enableDemoExtractors();
+    await builder.ingestBuffers(
+      [
+        createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30),
+        createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25),
+      ],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    const originalCall = (client as any).call.bind(client);
+    let queryManyCalls = 0;
+    (client as any).call = async (method: string, params: Record<string, unknown>) => {
+      if (method === 'queryMany') {
+        queryManyCalls += 1;
+      }
+      return await originalCall(method, params);
+    };
+
+    await expect(
+      builder.queryMany([
+        { sql: 'SELECT key FROM "_idx_User_email" WHERE key = ?', params: ['alice@example.com'] },
+        { sql: 'SELECT key FROM "_idx_User_email" WHERE key = ?', params: ['bob@example.com'] },
+      ])
+    ).resolves.toEqual([
+      { columns: ['key'], rows: [['alice@example.com']], rowCount: 1 },
+      { columns: ['key'], rows: [['bob@example.com']], rowCount: 1 },
+    ]);
+    expect(queryManyCalls).toBe(1);
 
     await builder.close();
     await client.close();

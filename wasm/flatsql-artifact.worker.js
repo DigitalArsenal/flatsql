@@ -24,6 +24,53 @@ function isCacheableQuerySql(sql) {
   return upper.startsWith('PRAGMA') && !trimmed.includes('=');
 }
 
+function executeStatementAll(statement, params) {
+  if (params === undefined) {
+    return statement.all();
+  }
+
+  if (Array.isArray(params)) {
+    switch (params.length) {
+      case 0:
+        return statement.all();
+      case 1:
+        return statement.all(params[0]);
+      case 2:
+        return statement.all(params[0], params[1]);
+      case 3:
+        return statement.all(params[0], params[1], params[2]);
+      case 4:
+        return statement.all(params[0], params[1], params[2], params[3]);
+      default:
+        return statement.all(...params);
+    }
+  }
+
+  return statement.all(params);
+}
+
+function runQuery(builder, sql, params) {
+  const cacheable = isCacheableQuerySql(sql);
+  let cached = cacheable ? builder.queryCache.get(sql) : undefined;
+
+  if (!cached) {
+    const statement = builder.db.prepare(sql);
+    const arrayMode = typeof statement.setReturnArrays === 'function';
+    if (arrayMode) {
+      statement.setReturnArrays(true);
+    }
+    const columns = statement.columns().map((column) => column.name);
+    cached = { statement, columns, arrayMode };
+    if (cacheable) {
+      builder.queryCache.set(sql, cached);
+    }
+  }
+
+  const rawRows = executeStatementAll(cached.statement, params);
+  const rows = cached.arrayMode ? rawRows : normalizeRows(rawRows, cached.columns);
+  return { columns: [...cached.columns], rows, rowCount: rows.length };
+}
+
 function sqliteType(column) {
   return column.sqlType ?? 'BLOB';
 }
@@ -733,27 +780,13 @@ const methods = {
       transportMode: 'shared-array-buffer',
     };
   },
-  query({ builderId, sql }) {
+  query({ builderId, sql, params }) {
     const builder = getBuilder(builderId);
-    const cacheable = isCacheableQuerySql(sql);
-    let cached = cacheable ? builder.queryCache.get(sql) : undefined;
-
-    if (!cached) {
-      const statement = builder.db.prepare(sql);
-      const arrayMode = typeof statement.setReturnArrays === 'function';
-      if (arrayMode) {
-        statement.setReturnArrays(true);
-      }
-      const columns = statement.columns().map((column) => column.name);
-      cached = { statement, columns, arrayMode };
-      if (cacheable) {
-        builder.queryCache.set(sql, cached);
-      }
-    }
-
-    const rawRows = cached.statement.all();
-    const rows = cached.arrayMode ? rawRows : normalizeRows(rawRows, cached.columns);
-    return { columns: [...cached.columns], rows, rowCount: rows.length };
+    return runQuery(builder, sql, params);
+  },
+  queryMany({ builderId, queries }) {
+    const builder = getBuilder(builderId);
+    return queries.map(({ sql, params }) => runQuery(builder, sql, params));
   },
   closeBuilder({ builderId }) {
     const builder = getBuilder(builderId);
