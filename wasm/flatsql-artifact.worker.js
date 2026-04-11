@@ -603,20 +603,20 @@ function ingestRecords(state, buffers, options, transportMode) {
   };
 }
 
-function decodeSizePrefixedStream(sharedBuffer, byteLength) {
-  const stream = new Uint8Array(sharedBuffer, 0, byteLength);
+function forEachSizePrefixedBuffer(stream, visitor) {
   const view = new DataView(stream.buffer, stream.byteOffset, stream.byteLength);
-  const buffers = [];
   let offset = 0;
+  let index = 0;
 
   while (offset < stream.byteLength) {
     const size = view.getUint32(offset, true);
     offset += 4;
-    buffers.push(stream.subarray(offset, offset + size));
+    visitor(stream.subarray(offset, offset + size), index);
     offset += size;
+    index += 1;
   }
 
-  return buffers;
+  return index;
 }
 
 function normalizeRows(rows, columns) {
@@ -642,7 +642,96 @@ const methods = {
   },
   ingestShared({ builderId, sharedBuffer, byteLength, options }) {
     const builder = getBuilder(builderId);
-    return ingestRecords(builder, decodeSizePrefixedStream(sharedBuffer, byteLength), options, 'shared-array-buffer');
+    let currentOffset = options?.startOffset ?? 0;
+    const plans = new Map();
+    const stream = new Uint8Array(sharedBuffer, 0, byteLength);
+    let recordCount = 0;
+
+    builder.queryCache.clear();
+
+    withTransaction(builder.db, builder.beginTransactionSql, () => {
+      forEachSizePrefixedBuffer(stream, (buffer, index) => {
+        const fileIdCode = readFileIdCode(buffer);
+        const tableName = builder.fileIdToTable.get(fileIdCode);
+        if (!tableName) {
+          const fileId = readFileId(buffer);
+          throw new Error(`No table registered for file identifier ${fileId}`);
+        }
+
+        let plan = plans.get(tableName);
+        if (!plan) {
+          const extractor = builder.extractors.get(tableName);
+          if (!extractor) {
+            throw new Error(`No field extractor registered for table ${tableName}`);
+          }
+
+          const table = builder.tableByName.get(tableName);
+          if (!table) {
+            throw new Error(`Table ${tableName} is not present in the parsed schema`);
+          }
+
+          plan = {
+            table,
+            fieldNames: table.columns
+              .filter((column) => column.isIndexed && !column.name.startsWith('_'))
+              .map((column) => column.name),
+            writeRecord: null,
+            ...createBatchedRowWriter(
+              builder.db,
+              table.name,
+              table.columns
+                .filter((column) => column.isIndexed && !column.name.startsWith('_'))
+                .map((column) => column.name)
+            ),
+            droppedIndexes: false,
+          };
+          const compiledAppender = createFieldAppender(extractor, plan.fieldNames);
+          const extractRowValues = compiledAppender ? null : createFieldValueReader(extractor, plan.fieldNames);
+          plan.writeRecord = compiledAppender
+            ? (data, recordOffset, recordLength, sequence) =>
+                plan.writeCompiledRow(compiledAppender, data, recordOffset, recordLength, sequence)
+            : (data, recordOffset, recordLength, sequence) =>
+                plan.writeRow(extractRowValues(data), recordOffset, recordLength, sequence);
+          plans.set(tableName, plan);
+        }
+
+        if (!plan.droppedIndexes) {
+          for (const column of plan.table.columns) {
+            if (!column.isIndexed || column.name.startsWith('_')) {
+              continue;
+            }
+            builder.db.exec(`DROP INDEX IF EXISTS "${coveringIndexName(plan.table.name, column.name)}"`);
+          }
+          plan.droppedIndexes = true;
+        }
+
+        const recordOffset = options?.offsets?.[index] ?? currentOffset;
+        plan.writeRecord(buffer, recordOffset, buffer.length, builder.sequence);
+
+        builder.sequence += 1;
+        currentOffset = recordOffset + buffer.length;
+        recordCount = index + 1;
+      });
+
+      for (const plan of plans.values()) {
+        plan.flushRows();
+        for (const column of plan.table.columns) {
+          if (!column.isIndexed || column.name.startsWith('_')) {
+            continue;
+          }
+
+          builder.db.exec(
+            `CREATE INDEX "${coveringIndexName(plan.table.name, column.name)}"
+             ON "${recordTableName(plan.table.name)}" ("${column.name}", sequence, data_offset, data_length)`
+          );
+        }
+      }
+    });
+
+    return {
+      recordCount,
+      transportMode: 'shared-array-buffer',
+    };
   },
   query({ builderId, sql }) {
     const builder = getBuilder(builderId);

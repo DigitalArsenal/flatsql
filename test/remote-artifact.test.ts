@@ -8,6 +8,7 @@ import {
   FlatSQLArtifactWorkerClient,
 } from '../src/artifacts/index.js';
 import {
+  forEachSizePrefixedBuffer,
   decodeSizePrefixedStream,
   writeSizePrefixedStream,
 } from '../src/artifacts/transport.js';
@@ -511,6 +512,27 @@ describe('remote artifact builder', () => {
 
     stream[4] = 99;
     expect(decoded[0][0]).toBe(99);
+  });
+
+  test('size-prefixed iteration visits shared views without materializing buffer arrays', async () => {
+    const stream = new Uint8Array(new SharedArrayBuffer(15));
+    writeSizePrefixedStream(stream, [
+      Uint8Array.from([1, 2, 3]),
+      Uint8Array.from([4, 5, 6, 7]),
+    ]);
+
+    const visited: Uint8Array[] = [];
+    const count = forEachSizePrefixedBuffer(stream, (buffer) => {
+      visited.push(buffer);
+    });
+
+    expect(count).toBe(2);
+    expect(visited).toHaveLength(2);
+    expect(Array.from(visited[0])).toEqual([1, 2, 3]);
+    expect(Array.from(visited[1])).toEqual([4, 5, 6, 7]);
+
+    stream[11] = 42;
+    expect(visited[1][0]).toBe(42);
   });
 
   test('artifact builder rolls back the whole ingest batch on error', async () => {

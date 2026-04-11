@@ -18,17 +18,30 @@ export function writeSizePrefixedStream(target: Uint8Array, buffers: Uint8Array[
   return offset;
 }
 
-export function decodeSizePrefixedStream(stream: Uint8Array): Uint8Array[] {
+export function forEachSizePrefixedBuffer(
+  stream: Uint8Array,
+  visitor: (buffer: Uint8Array, index: number) => void
+): number {
   const view = new DataView(stream.buffer, stream.byteOffset, stream.byteLength);
-  const buffers: Uint8Array[] = [];
   let offset = 0;
+  let index = 0;
 
   while (offset < stream.byteLength) {
     const size = view.getUint32(offset, true);
     offset += 4;
-    buffers.push(stream.subarray(offset, offset + size));
+    visitor(stream.subarray(offset, offset + size), index);
     offset += size;
+    index += 1;
   }
+
+  return index;
+}
+
+export function decodeSizePrefixedStream(stream: Uint8Array): Uint8Array[] {
+  const buffers: Uint8Array[] = [];
+  forEachSizePrefixedBuffer(stream, (buffer) => {
+    buffers.push(buffer);
+  });
 
   return buffers;
 }

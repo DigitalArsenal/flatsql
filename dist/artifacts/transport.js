@@ -16,16 +16,24 @@ export function writeSizePrefixedStream(target, buffers) {
     }
     return offset;
 }
-export function decodeSizePrefixedStream(stream) {
+export function forEachSizePrefixedBuffer(stream, visitor) {
     const view = new DataView(stream.buffer, stream.byteOffset, stream.byteLength);
-    const buffers = [];
     let offset = 0;
+    let index = 0;
     while (offset < stream.byteLength) {
         const size = view.getUint32(offset, true);
         offset += 4;
-        buffers.push(stream.subarray(offset, offset + size));
+        visitor(stream.subarray(offset, offset + size), index);
         offset += size;
+        index += 1;
     }
+    return index;
+}
+export function decodeSizePrefixedStream(stream) {
+    const buffers = [];
+    forEachSizePrefixedBuffer(stream, (buffer) => {
+        buffers.push(buffer);
+    });
     return buffers;
 }
 //# sourceMappingURL=transport.js.map
