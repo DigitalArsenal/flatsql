@@ -2,6 +2,7 @@ const decoder = new TextDecoder();
 
 export interface ArtifactRecordExtractor {
   getField(data: Uint8Array, fieldName: string): unknown;
+  compileFieldValues?(fieldNames: string[]): (data: Uint8Array) => unknown[];
   getFieldValues?(data: Uint8Array, fieldNames: string[]): unknown[];
   getFields?(data: Uint8Array, fieldNames: string[]): Record<string, unknown>;
 }
@@ -63,6 +64,57 @@ function createMappedExtractor(fieldReaders: Record<string, (cursor: FlatBufferC
       }
       return reader(createCursor(data));
     },
+    compileFieldValues(fieldNames: string[]): (data: Uint8Array) => unknown[] {
+      const readers = fieldNames.map((fieldName) => fieldReaders[fieldName] ?? null);
+
+      switch (readers.length) {
+        case 1: {
+          const [reader0] = readers;
+          return (data: Uint8Array): unknown[] => {
+            const cursor = createCursor(data);
+            return [reader0 ? reader0(cursor) : null];
+          };
+        }
+        case 2: {
+          const [reader0, reader1] = readers;
+          return (data: Uint8Array): unknown[] => {
+            const cursor = createCursor(data);
+            return [
+              reader0 ? reader0(cursor) : null,
+              reader1 ? reader1(cursor) : null,
+            ];
+          };
+        }
+        case 3: {
+          const [reader0, reader1, reader2] = readers;
+          return (data: Uint8Array): unknown[] => {
+            const cursor = createCursor(data);
+            return [
+              reader0 ? reader0(cursor) : null,
+              reader1 ? reader1(cursor) : null,
+              reader2 ? reader2(cursor) : null,
+            ];
+          };
+        }
+        case 4: {
+          const [reader0, reader1, reader2, reader3] = readers;
+          return (data: Uint8Array): unknown[] => {
+            const cursor = createCursor(data);
+            return [
+              reader0 ? reader0(cursor) : null,
+              reader1 ? reader1(cursor) : null,
+              reader2 ? reader2(cursor) : null,
+              reader3 ? reader3(cursor) : null,
+            ];
+          };
+        }
+        default:
+          return (data: Uint8Array): unknown[] => {
+            const cursor = createCursor(data);
+            return readers.map((reader) => (reader ? reader(cursor) : null));
+          };
+      }
+    },
     getFields(data: Uint8Array, fieldNames: string[]): Record<string, unknown> {
       const cursor = createCursor(data);
       return Object.fromEntries(
@@ -113,6 +165,17 @@ export function extractArtifactFieldValues(
   }
 
   return fieldNames.map((fieldName) => extractArtifactField(extractor, data, fieldName));
+}
+
+export function createArtifactFieldValueReader(
+  extractor: ArtifactFieldExtractor,
+  fieldNames: string[]
+): (data: Uint8Array) => unknown[] {
+  if (typeof extractor !== 'function' && extractor.compileFieldValues) {
+    return extractor.compileFieldValues(fieldNames);
+  }
+
+  return (data: Uint8Array): unknown[] => extractArtifactFieldValues(extractor, data, fieldNames);
 }
 
 export const demoExtractors: Record<string, ArtifactFieldExtractor> = {

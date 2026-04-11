@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { parseSchema, SQLColumnType, } from '../schema/index.js';
-import { demoExtractors, extractArtifactFieldValues, } from './demo-extractors.js';
+import { createArtifactFieldValueReader, demoExtractors, } from './demo-extractors.js';
 function toSqliteType(column) {
     switch (column.sqlType) {
         case SQLColumnType.INTEGER:
@@ -16,11 +16,29 @@ function toSqliteType(column) {
     }
 }
 const decoder = new TextDecoder();
+const INSERT_BATCH_SIZE = 64;
+const DEFAULT_PAGE_SIZE = 16384;
+const schemaCache = new Map();
 function readFileId(data) {
     if (data.length < 8) {
         throw new Error('FlatBuffer payload is too short to contain a file identifier');
     }
     return decoder.decode(data.subarray(4, 8));
+}
+function readFileIdCode(data) {
+    if (data.length < 8) {
+        throw new Error('FlatBuffer payload is too short to contain a file identifier');
+    }
+    return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(4, true);
+}
+function encodeFileId(fileId) {
+    if (fileId.length !== 4) {
+        throw new Error('FlatBuffer file identifiers must be four characters');
+    }
+    return (fileId.charCodeAt(0) |
+        (fileId.charCodeAt(1) << 8) |
+        (fileId.charCodeAt(2) << 16) |
+        (fileId.charCodeAt(3) << 24)) >>> 0;
 }
 function normalizeRow(row, columns) {
     return columns.map((column) => row[column]);
@@ -43,6 +61,8 @@ function withTransaction(db, beginSql, operation) {
     }
 }
 function applyPerformanceProfile(db, profile) {
+    db.exec(`PRAGMA page_size = ${DEFAULT_PAGE_SIZE}`);
+    db.exec('PRAGMA threads = 2');
     if (profile === 'safe') {
         db.exec('PRAGMA journal_mode = DELETE');
         db.exec('PRAGMA synchronous = FULL');
@@ -55,19 +75,65 @@ function applyPerformanceProfile(db, profile) {
     db.exec('PRAGMA cache_size = -65536');
     return 'BEGIN EXCLUSIVE';
 }
-function createRowEmitter(statement, fieldCount) {
+function createArgumentAppender(fieldCount) {
     switch (fieldCount) {
         case 1:
-            return (fieldValues, recordOffset, recordLength, sequence) => statement.run(fieldValues[0], recordOffset, recordLength, sequence);
+            return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) => pendingArgs.push(fieldValues[0], recordOffset, recordLength, sequence);
         case 2:
-            return (fieldValues, recordOffset, recordLength, sequence) => statement.run(fieldValues[0], fieldValues[1], recordOffset, recordLength, sequence);
+            return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) => pendingArgs.push(fieldValues[0], fieldValues[1], recordOffset, recordLength, sequence);
         case 3:
-            return (fieldValues, recordOffset, recordLength, sequence) => statement.run(fieldValues[0], fieldValues[1], fieldValues[2], recordOffset, recordLength, sequence);
+            return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) => pendingArgs.push(fieldValues[0], fieldValues[1], fieldValues[2], recordOffset, recordLength, sequence);
         case 4:
-            return (fieldValues, recordOffset, recordLength, sequence) => statement.run(fieldValues[0], fieldValues[1], fieldValues[2], fieldValues[3], recordOffset, recordLength, sequence);
+            return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) => pendingArgs.push(fieldValues[0], fieldValues[1], fieldValues[2], fieldValues[3], recordOffset, recordLength, sequence);
         default:
-            return (fieldValues, recordOffset, recordLength, sequence) => statement.run(...fieldValues, recordOffset, recordLength, sequence);
+            return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) => {
+                for (let index = 0; index < fieldValues.length; index += 1) {
+                    pendingArgs.push(fieldValues[index]);
+                }
+                pendingArgs.push(recordOffset, recordLength, sequence);
+            };
     }
+}
+function buildInsertSql(recordTableName, fieldNames, rowCount) {
+    const columnNames = [...fieldNames.map((fieldName) => `"${fieldName}"`), 'data_offset', 'data_length', 'sequence'].join(', ');
+    const valueTuple = `(${Array.from({ length: fieldNames.length + 3 }, () => '?').join(', ')})`;
+    return `INSERT INTO "${recordTableName}" (${columnNames}) VALUES ${Array.from({ length: rowCount }, () => valueTuple).join(', ')}`;
+}
+function createBatchedRowWriter(db, recordTableName, fieldNames) {
+    const fullStatement = db.prepare(buildInsertSql(recordTableName, fieldNames, INSERT_BATCH_SIZE));
+    const partialStatements = new Map();
+    const appendArgs = createArgumentAppender(fieldNames.length);
+    let pendingArgs = [];
+    let pendingRowCount = 0;
+    function statementFor(rowCount) {
+        if (rowCount === INSERT_BATCH_SIZE) {
+            return fullStatement;
+        }
+        let statement = partialStatements.get(rowCount);
+        if (!statement) {
+            statement = db.prepare(buildInsertSql(recordTableName, fieldNames, rowCount));
+            partialStatements.set(rowCount, statement);
+        }
+        return statement;
+    }
+    function flushRows() {
+        if (pendingRowCount === 0) {
+            return;
+        }
+        statementFor(pendingRowCount).run(...pendingArgs);
+        pendingArgs = [];
+        pendingRowCount = 0;
+    }
+    return {
+        writeRow(fieldValues, recordOffset, recordLength, sequence) {
+            appendArgs(pendingArgs, fieldValues, recordOffset, recordLength, sequence);
+            pendingRowCount += 1;
+            if (pendingRowCount === INSERT_BATCH_SIZE) {
+                flushRows();
+            }
+        },
+        flushRows,
+    };
 }
 export class FlatSQLArtifactBuilder {
     schema;
@@ -78,7 +144,13 @@ export class FlatSQLArtifactBuilder {
     extractors = new Map();
     sequence = 1;
     static fromSchema(source, options) {
-        const schema = parseSchema(source, options.name ?? 'artifact');
+        const schemaName = options.name ?? 'artifact';
+        const cacheKey = `${schemaName}\u0000${source}`;
+        let schema = schemaCache.get(cacheKey);
+        if (!schema) {
+            schema = parseSchema(source, schemaName);
+            schemaCache.set(cacheKey, schema);
+        }
         return new FlatSQLArtifactBuilder(schema, options);
     }
     constructor(schema, options) {
@@ -94,7 +166,7 @@ export class FlatSQLArtifactBuilder {
         this.createIndexTables();
     }
     registerFileId(fileId, tableName) {
-        this.fileIdToTable.set(fileId, tableName);
+        this.fileIdToTable.set(encodeFileId(fileId), tableName);
     }
     setFieldExtractor(tableName, extractor) {
         this.extractors.set(tableName, extractor);
@@ -110,9 +182,10 @@ export class FlatSQLArtifactBuilder {
         withTransaction(this.db, this.beginTransactionSql, () => {
             for (let index = 0; index < buffers.length; index++) {
                 const buffer = buffers[index];
-                const fileId = readFileId(buffer);
-                const tableName = this.fileIdToTable.get(fileId);
+                const fileIdCode = readFileIdCode(buffer);
+                const tableName = this.fileIdToTable.get(fileIdCode);
                 if (!tableName) {
+                    const fileId = readFileId(buffer);
                     throw new Error(`No table registered for file identifier ${fileId}`);
                 }
                 const tablePlan = plan.tablePlans.get(tableName);
@@ -124,14 +197,15 @@ export class FlatSQLArtifactBuilder {
                     plan.touchedTables.add(tableName);
                 }
                 const recordOffset = options.offsets?.[index] ?? currentOffset;
-                const rowValues = extractArtifactFieldValues(tablePlan.extractor, buffer, tablePlan.fieldNames);
-                tablePlan.emitRow(rowValues, recordOffset, buffer.length, this.sequence);
+                const rowValues = tablePlan.extractRowValues(buffer);
+                tablePlan.writeRow(rowValues, recordOffset, buffer.length, this.sequence);
                 this.sequence += 1;
                 currentOffset = recordOffset + buffer.length;
             }
             for (const tableName of plan.touchedTables) {
                 const tablePlan = plan.tablePlans.get(tableName);
                 if (tablePlan) {
+                    tablePlan.flushRows();
                     this.createCoveringIndexes(tablePlan.table);
                 }
             }
@@ -214,13 +288,13 @@ export class FlatSQLArtifactBuilder {
             if (fieldNames.length === 0) {
                 continue;
             }
-            const placeholders = fieldNames.map(() => '?').join(', ');
+            const recordTableName = this.recordTableName(table.name);
+            const rowWriter = createBatchedRowWriter(this.db, recordTableName, fieldNames);
             tablePlans.set(tableName, {
                 table,
-                extractor,
-                fieldNames,
-                emitRow: createRowEmitter(this.db.prepare(`INSERT INTO "${this.recordTableName(table.name)}" (${fieldNames.map((fieldName) => `"${fieldName}"`).join(', ')}, data_offset, data_length, sequence)
-           VALUES (${placeholders}, ?, ?, ?)`), fieldNames.length),
+                extractRowValues: createArtifactFieldValueReader(extractor, fieldNames),
+                writeRow: rowWriter.writeRow,
+                flushRows: rowWriter.flushRows,
             });
         }
         return {

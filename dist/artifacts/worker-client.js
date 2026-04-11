@@ -1,5 +1,6 @@
 import { Worker } from 'node:worker_threads';
 import { parseSchema } from '../schema/index.js';
+const schemaCache = new Map();
 function buildSizePrefixedStream(buffers) {
     let totalLength = 0;
     for (const buffer of buffers) {
@@ -62,7 +63,13 @@ export class FlatSQLArtifactWorkerClient {
         });
     }
     async createBuilder(schemaSource, options) {
-        const schema = parseSchema(schemaSource, options.name ?? 'artifact');
+        const schemaName = options.name ?? 'artifact';
+        const cacheKey = `${schemaName}\u0000${schemaSource}`;
+        let schema = schemaCache.get(cacheKey);
+        if (!schema) {
+            schema = parseSchema(schemaSource, schemaName);
+            schemaCache.set(cacheKey, schema);
+        }
         const builderId = `artifact_${this.nextId++}`;
         await this.call('createBuilder', {
             builderId,

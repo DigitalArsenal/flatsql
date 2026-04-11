@@ -3,6 +3,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 const decoder = new TextDecoder();
 const builders = new Map();
+const INSERT_BATCH_SIZE = 64;
+const DEFAULT_PAGE_SIZE = 16384;
 
 function sqliteType(column) {
   return column.sqlType ?? 'BLOB';
@@ -54,6 +56,57 @@ function createMappedExtractor(fieldReaders) {
       }
       return reader(createCursor(data));
     },
+    compileFieldValues(fieldNames) {
+      const readers = fieldNames.map((fieldName) => fieldReaders[fieldName] ?? null);
+
+      switch (readers.length) {
+        case 1: {
+          const [reader0] = readers;
+          return (data) => {
+            const cursor = createCursor(data);
+            return [reader0 ? reader0(cursor) : null];
+          };
+        }
+        case 2: {
+          const [reader0, reader1] = readers;
+          return (data) => {
+            const cursor = createCursor(data);
+            return [
+              reader0 ? reader0(cursor) : null,
+              reader1 ? reader1(cursor) : null,
+            ];
+          };
+        }
+        case 3: {
+          const [reader0, reader1, reader2] = readers;
+          return (data) => {
+            const cursor = createCursor(data);
+            return [
+              reader0 ? reader0(cursor) : null,
+              reader1 ? reader1(cursor) : null,
+              reader2 ? reader2(cursor) : null,
+            ];
+          };
+        }
+        case 4: {
+          const [reader0, reader1, reader2, reader3] = readers;
+          return (data) => {
+            const cursor = createCursor(data);
+            return [
+              reader0 ? reader0(cursor) : null,
+              reader1 ? reader1(cursor) : null,
+              reader2 ? reader2(cursor) : null,
+              reader3 ? reader3(cursor) : null,
+            ];
+          };
+        }
+        default:
+          return (data) => {
+            const cursor = createCursor(data);
+            return readers.map((reader) => (reader ? reader(cursor) : null));
+          };
+      }
+    },
     getFields(data, fieldNames) {
       const cursor = createCursor(data);
       return Object.fromEntries(
@@ -82,11 +135,23 @@ function extractFields(extractor, data, fieldNames) {
 }
 
 function extractFieldValues(extractor, data, fieldNames) {
+  if (extractor.compileFieldValues) {
+    return extractor.compileFieldValues(fieldNames)(data);
+  }
+
   if (extractor.getFieldValues) {
     return extractor.getFieldValues(data, fieldNames);
   }
 
   return fieldNames.map((fieldName) => extractor.getField(data, fieldName));
+}
+
+function createFieldValueReader(extractor, fieldNames) {
+  if (extractor.compileFieldValues) {
+    return extractor.compileFieldValues(fieldNames);
+  }
+
+  return (data) => extractFieldValues(extractor, data, fieldNames);
 }
 
 const demoExtractors = {
@@ -108,6 +173,26 @@ function readFileId(data) {
     throw new Error('FlatBuffer payload is too short to contain a file identifier');
   }
   return decoder.decode(data.subarray(4, 8));
+}
+
+function readFileIdCode(data) {
+  if (data.length < 8) {
+    throw new Error('FlatBuffer payload is too short to contain a file identifier');
+  }
+  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(4, true);
+}
+
+function encodeFileId(fileId) {
+  if (fileId.length !== 4) {
+    throw new Error('FlatBuffer file identifiers must be four characters');
+  }
+
+  return (
+    fileId.charCodeAt(0) |
+    (fileId.charCodeAt(1) << 8) |
+    (fileId.charCodeAt(2) << 16) |
+    (fileId.charCodeAt(3) << 24)
+  ) >>> 0;
 }
 
 function indexTableName(tableName, columnName) {
@@ -141,6 +226,9 @@ function withTransaction(db, beginSql, operation) {
 }
 
 function applyPerformanceProfile(db, profile) {
+  db.exec(`PRAGMA page_size = ${DEFAULT_PAGE_SIZE}`);
+  db.exec('PRAGMA threads = 2');
+
   if (profile === 'safe') {
     db.exec('PRAGMA journal_mode = DELETE');
     db.exec('PRAGMA synchronous = FULL');
@@ -155,24 +243,77 @@ function applyPerformanceProfile(db, profile) {
   return 'BEGIN EXCLUSIVE';
 }
 
-function createRowEmitter(statement, fieldCount) {
+function createArgumentAppender(fieldCount) {
   switch (fieldCount) {
     case 1:
-      return (fieldValues, recordOffset, recordLength, sequence) =>
-        statement.run(fieldValues[0], recordOffset, recordLength, sequence);
+      return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) =>
+        pendingArgs.push(fieldValues[0], recordOffset, recordLength, sequence);
     case 2:
-      return (fieldValues, recordOffset, recordLength, sequence) =>
-        statement.run(fieldValues[0], fieldValues[1], recordOffset, recordLength, sequence);
+      return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) =>
+        pendingArgs.push(fieldValues[0], fieldValues[1], recordOffset, recordLength, sequence);
     case 3:
-      return (fieldValues, recordOffset, recordLength, sequence) =>
-        statement.run(fieldValues[0], fieldValues[1], fieldValues[2], recordOffset, recordLength, sequence);
+      return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) =>
+        pendingArgs.push(fieldValues[0], fieldValues[1], fieldValues[2], recordOffset, recordLength, sequence);
     case 4:
-      return (fieldValues, recordOffset, recordLength, sequence) =>
-        statement.run(fieldValues[0], fieldValues[1], fieldValues[2], fieldValues[3], recordOffset, recordLength, sequence);
+      return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) =>
+        pendingArgs.push(fieldValues[0], fieldValues[1], fieldValues[2], fieldValues[3], recordOffset, recordLength, sequence);
     default:
-      return (fieldValues, recordOffset, recordLength, sequence) =>
-        statement.run(...fieldValues, recordOffset, recordLength, sequence);
+      return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) => {
+        for (let index = 0; index < fieldValues.length; index += 1) {
+          pendingArgs.push(fieldValues[index]);
+        }
+        pendingArgs.push(recordOffset, recordLength, sequence);
+      };
   }
+}
+
+function buildInsertSql(tableName, fieldNames, rowCount) {
+  const columnNames = [...fieldNames.map((fieldName) => `"${fieldName}"`), 'data_offset', 'data_length', 'sequence'].join(', ');
+  const valueTuple = `(${Array.from({ length: fieldNames.length + 3 }, () => '?').join(', ')})`;
+  return `INSERT INTO "${recordTableName(tableName)}" (${columnNames}) VALUES ${Array.from({ length: rowCount }, () => valueTuple).join(', ')}`;
+}
+
+function createBatchedRowWriter(db, tableName, fieldNames) {
+  const fullStatement = db.prepare(buildInsertSql(tableName, fieldNames, INSERT_BATCH_SIZE));
+  const partialStatements = new Map();
+  const appendArgs = createArgumentAppender(fieldNames.length);
+  let pendingArgs = [];
+  let pendingRowCount = 0;
+
+  function statementFor(rowCount) {
+    if (rowCount === INSERT_BATCH_SIZE) {
+      return fullStatement;
+    }
+
+    let statement = partialStatements.get(rowCount);
+    if (!statement) {
+      statement = db.prepare(buildInsertSql(tableName, fieldNames, rowCount));
+      partialStatements.set(rowCount, statement);
+    }
+    return statement;
+  }
+
+  function flushRows() {
+    if (pendingRowCount === 0) {
+      return;
+    }
+
+    statementFor(pendingRowCount).run(...pendingArgs);
+    pendingArgs = [];
+    pendingRowCount = 0;
+  }
+
+  return {
+    writeRow(fieldValues, recordOffset, recordLength, sequence) {
+      appendArgs(pendingArgs, fieldValues, recordOffset, recordLength, sequence);
+      pendingRowCount += 1;
+
+      if (pendingRowCount === INSERT_BATCH_SIZE) {
+        flushRows();
+      }
+    },
+    flushRows,
+  };
 }
 
 function createBuilder({ builderId, schema, performanceProfile = 'fast', sqlitePath }) {
@@ -230,9 +371,10 @@ function ingestRecords(state, buffers, options, transportMode) {
   withTransaction(state.db, state.beginTransactionSql, () => {
     for (let index = 0; index < buffers.length; index++) {
       const buffer = buffers[index];
-      const fileId = readFileId(buffer);
-      const tableName = state.fileIdToTable.get(fileId);
+      const fileIdCode = readFileIdCode(buffer);
+      const tableName = state.fileIdToTable.get(fileIdCode);
       if (!tableName) {
+        const fileId = readFileId(buffer);
         throw new Error(`No table registered for file identifier ${fileId}`);
       }
 
@@ -250,22 +392,21 @@ function ingestRecords(state, buffers, options, transportMode) {
 
         plan = {
           table,
-          extractor,
           fieldNames: table.columns
             .filter((column) => column.isIndexed && !column.name.startsWith('_'))
             .map((column) => column.name),
-          emitRow: createRowEmitter(
-            state.db.prepare(
-            `INSERT INTO "${recordTableName(table.name)}" (${table.columns
+          extractRowValues: createFieldValueReader(
+            extractor,
+            table.columns
               .filter((column) => column.isIndexed && !column.name.startsWith('_'))
-              .map((column) => `"${column.name}"`)
-              .join(', ')}, data_offset, data_length, sequence)
-             VALUES (${table.columns
-               .filter((column) => column.isIndexed && !column.name.startsWith('_'))
-               .map(() => '?')
-               .join(', ')}, ?, ?, ?)`
-            ),
-            table.columns.filter((column) => column.isIndexed && !column.name.startsWith('_')).length
+              .map((column) => column.name)
+          ),
+          ...createBatchedRowWriter(
+            state.db,
+            table.name,
+            table.columns
+              .filter((column) => column.isIndexed && !column.name.startsWith('_'))
+              .map((column) => column.name)
           ),
           droppedIndexes: false,
         };
@@ -283,14 +424,15 @@ function ingestRecords(state, buffers, options, transportMode) {
       }
 
       const recordOffset = options?.offsets?.[index] ?? currentOffset;
-      const rowValues = extractFieldValues(plan.extractor, buffer, plan.fieldNames);
-      plan.emitRow(rowValues, recordOffset, buffer.length, state.sequence);
+      const rowValues = plan.extractRowValues(buffer);
+      plan.writeRow(rowValues, recordOffset, buffer.length, state.sequence);
 
       state.sequence += 1;
       currentOffset = recordOffset + buffer.length;
     }
 
     for (const plan of plans.values()) {
+      plan.flushRows();
       for (const column of plan.table.columns) {
         if (!column.isIndexed || column.name.startsWith('_')) {
           continue;
@@ -333,7 +475,7 @@ function normalizeRows(rows, columns) {
 const methods = {
   createBuilder,
   registerFileId({ builderId, fileId, tableName }) {
-    getBuilder(builderId).fileIdToTable.set(fileId, tableName);
+    getBuilder(builderId).fileIdToTable.set(encodeFileId(fileId), tableName);
     return { ok: true };
   },
   enableDemoExtractors({ builderId }) {

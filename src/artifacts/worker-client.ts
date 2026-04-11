@@ -9,6 +9,8 @@ import type {
   ArtifactWorkerBuilderOptions,
 } from './types.js';
 
+const schemaCache = new Map<string, DatabaseSchema>();
+
 interface PendingCall {
   resolve: (value: any) => void;
   reject: (error: Error) => void;
@@ -95,7 +97,13 @@ export class FlatSQLArtifactWorkerClient {
   }
 
   async createBuilder(schemaSource: string, options: ArtifactWorkerBuilderOptions): Promise<FlatSQLArtifactWorkerBuilder> {
-    const schema = parseSchema(schemaSource, options.name ?? 'artifact');
+    const schemaName = options.name ?? 'artifact';
+    const cacheKey = `${schemaName}\u0000${schemaSource}`;
+    let schema = schemaCache.get(cacheKey);
+    if (!schema) {
+      schema = parseSchema(schemaSource, schemaName);
+      schemaCache.set(cacheKey, schema);
+    }
     const builderId = `artifact_${this.nextId++}`;
     await this.call('createBuilder', {
       builderId,

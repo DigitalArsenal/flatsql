@@ -41,6 +41,56 @@ function createMappedExtractor(fieldReaders) {
             }
             return reader(createCursor(data));
         },
+        compileFieldValues(fieldNames) {
+            const readers = fieldNames.map((fieldName) => fieldReaders[fieldName] ?? null);
+            switch (readers.length) {
+                case 1: {
+                    const [reader0] = readers;
+                    return (data) => {
+                        const cursor = createCursor(data);
+                        return [reader0 ? reader0(cursor) : null];
+                    };
+                }
+                case 2: {
+                    const [reader0, reader1] = readers;
+                    return (data) => {
+                        const cursor = createCursor(data);
+                        return [
+                            reader0 ? reader0(cursor) : null,
+                            reader1 ? reader1(cursor) : null,
+                        ];
+                    };
+                }
+                case 3: {
+                    const [reader0, reader1, reader2] = readers;
+                    return (data) => {
+                        const cursor = createCursor(data);
+                        return [
+                            reader0 ? reader0(cursor) : null,
+                            reader1 ? reader1(cursor) : null,
+                            reader2 ? reader2(cursor) : null,
+                        ];
+                    };
+                }
+                case 4: {
+                    const [reader0, reader1, reader2, reader3] = readers;
+                    return (data) => {
+                        const cursor = createCursor(data);
+                        return [
+                            reader0 ? reader0(cursor) : null,
+                            reader1 ? reader1(cursor) : null,
+                            reader2 ? reader2(cursor) : null,
+                            reader3 ? reader3(cursor) : null,
+                        ];
+                    };
+                }
+                default:
+                    return (data) => {
+                        const cursor = createCursor(data);
+                        return readers.map((reader) => (reader ? reader(cursor) : null));
+                    };
+            }
+        },
         getFields(data, fieldNames) {
             const cursor = createCursor(data);
             return Object.fromEntries(fieldNames.map((fieldName) => {
@@ -75,6 +125,12 @@ export function extractArtifactFieldValues(extractor, data, fieldNames) {
         return fieldNames.map((fieldName) => fields[fieldName]);
     }
     return fieldNames.map((fieldName) => extractArtifactField(extractor, data, fieldName));
+}
+export function createArtifactFieldValueReader(extractor, fieldNames) {
+    if (typeof extractor !== 'function' && extractor.compileFieldValues) {
+        return extractor.compileFieldValues(fieldNames);
+    }
+    return (data) => extractArtifactFieldValues(extractor, data, fieldNames);
 }
 export const demoExtractors = {
     User: createMappedExtractor({

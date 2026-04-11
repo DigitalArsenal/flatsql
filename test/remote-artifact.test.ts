@@ -145,6 +145,8 @@ describe('remote artifact builder', () => {
 
     expect(builder.query('PRAGMA journal_mode').rows).toEqual([['off']]);
     expect(builder.query('PRAGMA synchronous').rows).toEqual([[0]]);
+    expect(builder.query('PRAGMA page_size').rows).toEqual([[16384]]);
+    expect(builder.query('PRAGMA threads').rows).toEqual([[2]]);
 
     builder.close();
   });
@@ -158,6 +160,7 @@ describe('remote artifact builder', () => {
 
     expect(builder.query('PRAGMA journal_mode').rows).toEqual([['delete']]);
     expect(builder.query('PRAGMA synchronous').rows).toEqual([[2]]);
+    expect(builder.query('PRAGMA page_size').rows).toEqual([[16384]]);
 
     builder.close();
   });
@@ -238,6 +241,77 @@ describe('remote artifact builder', () => {
     builder.close();
   });
 
+  test('artifact builder compiles field value extraction once per table when available', async () => {
+    const sqlitePath = join(tempDir, 'users-compiled-values.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+    const calls = {
+      compile: 0,
+      values: 0,
+      fields: 0,
+    };
+
+    builder.registerFileId('USER', 'User');
+    builder.setFieldExtractor('User', {
+      getField(_data: Uint8Array, fieldName: string) {
+        return fieldName === 'id' ? 1 : 'shared@example.com';
+      },
+      compileFieldValues(fieldNames: string[]) {
+        calls.compile += 1;
+        return (_data: Uint8Array) =>
+          fieldNames.map((fieldName) => (fieldName === 'id' ? 1 : 'shared@example.com'));
+      },
+      getFieldValues(_data: Uint8Array, fieldNames: string[]) {
+        calls.values += 1;
+        return fieldNames.map((fieldName) => (fieldName === 'id' ? 1 : 'shared@example.com'));
+      },
+      getFields(_data: Uint8Array, fieldNames: string[]) {
+        calls.fields += 1;
+        return Object.fromEntries(
+          fieldNames.map((fieldName) => [fieldName, fieldName === 'id' ? 1 : 'shared@example.com'])
+        );
+      },
+    });
+
+    builder.ingestBuffers(
+      [
+        createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30),
+        createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25),
+      ],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    expect(calls.compile).toBe(1);
+    expect(calls.values).toBe(0);
+    expect(calls.fields).toBe(0);
+
+    builder.close();
+  });
+
+  test('artifact builder preserves all rows across internal write batches', async () => {
+    const sqlitePath = join(tempDir, 'users-batched-ingest.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+
+    builder.registerFileId('USER', 'User');
+    builder.enableDemoExtractors();
+
+    const buffers = Array.from({ length: 70 }, (_, index) =>
+      createUserFlatBuffer(index + 1, `User ${index + 1}`, `user${index + 1}@example.com`, 20 + (index % 10))
+    );
+
+    builder.ingestBuffers(buffers, { sourceName: 'users.bin', startOffset: 512 });
+
+    const result = builder.query(
+      'SELECT COUNT(*), MIN(sequence), MAX(sequence) FROM "_idx_User_email"'
+    );
+    expect(result.rows).toEqual([[70, 1, 70]]);
+
+    builder.close();
+  });
+
   test('artifact worker builds sqlite artifact via worker thread', async () => {
     const sqlitePath = join(tempDir, 'users-worker.sqlite');
     const client = new FlatSQLArtifactWorkerClient();
@@ -292,6 +366,12 @@ describe('remote artifact builder', () => {
     });
     await expect(builder.query('PRAGMA synchronous')).resolves.toMatchObject({
       rows: [[0]],
+    });
+    await expect(builder.query('PRAGMA page_size')).resolves.toMatchObject({
+      rows: [[16384]],
+    });
+    await expect(builder.query('PRAGMA threads')).resolves.toMatchObject({
+      rows: [[2]],
     });
 
     await builder.close();

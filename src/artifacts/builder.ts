@@ -8,8 +8,8 @@ import {
   type TableDef,
 } from '../schema/index.js';
 import {
+  createArtifactFieldValueReader,
   demoExtractors,
-  extractArtifactFieldValues,
   type ArtifactFieldExtractor,
 } from './demo-extractors.js';
 import type {
@@ -36,12 +36,35 @@ function toSqliteType(column: ColumnDef): string {
 }
 
 const decoder = new TextDecoder();
+const INSERT_BATCH_SIZE = 64;
+const DEFAULT_PAGE_SIZE = 16384;
+const schemaCache = new Map<string, DatabaseSchema>();
 
 function readFileId(data: Uint8Array): string {
   if (data.length < 8) {
     throw new Error('FlatBuffer payload is too short to contain a file identifier');
   }
   return decoder.decode(data.subarray(4, 8));
+}
+
+function readFileIdCode(data: Uint8Array): number {
+  if (data.length < 8) {
+    throw new Error('FlatBuffer payload is too short to contain a file identifier');
+  }
+  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(4, true);
+}
+
+function encodeFileId(fileId: string): number {
+  if (fileId.length !== 4) {
+    throw new Error('FlatBuffer file identifiers must be four characters');
+  }
+
+  return (
+    fileId.charCodeAt(0) |
+    (fileId.charCodeAt(1) << 8) |
+    (fileId.charCodeAt(2) << 16) |
+    (fileId.charCodeAt(3) << 24)
+  ) >>> 0;
 }
 
 function normalizeRow(row: Record<string, unknown>, columns: string[]): any[] {
@@ -67,6 +90,9 @@ function withTransaction<T>(db: DatabaseSync, beginSql: string, operation: () =>
 }
 
 function applyPerformanceProfile(db: DatabaseSync, profile: ArtifactPerformanceProfile): string {
+  db.exec(`PRAGMA page_size = ${DEFAULT_PAGE_SIZE}`);
+  db.exec('PRAGMA threads = 2');
+
   if (profile === 'safe') {
     db.exec('PRAGMA journal_mode = DELETE');
     db.exec('PRAGMA synchronous = FULL');
@@ -83,32 +109,88 @@ function applyPerformanceProfile(db: DatabaseSync, profile: ArtifactPerformanceP
 
 interface TablePlan {
   readonly table: TableDef;
-  readonly extractor: ArtifactFieldExtractor;
-  readonly fieldNames: string[];
-  readonly emitRow: (fieldValues: unknown[], recordOffset: number, recordLength: number, sequence: number) => void;
+  readonly extractRowValues: (data: Uint8Array) => unknown[];
+  readonly writeRow: (fieldValues: unknown[], recordOffset: number, recordLength: number, sequence: number) => void;
+  readonly flushRows: () => void;
 }
 
-function createRowEmitter(
-  statement: ReturnType<DatabaseSync['prepare']>,
+function createArgumentAppender(
   fieldCount: number
-): (fieldValues: unknown[], recordOffset: number, recordLength: number, sequence: number) => void {
+): (pendingArgs: unknown[], fieldValues: unknown[], recordOffset: number, recordLength: number, sequence: number) => void {
   switch (fieldCount) {
     case 1:
-      return (fieldValues, recordOffset, recordLength, sequence) =>
-        statement.run(fieldValues[0], recordOffset, recordLength, sequence);
+      return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) =>
+        pendingArgs.push(fieldValues[0], recordOffset, recordLength, sequence);
     case 2:
-      return (fieldValues, recordOffset, recordLength, sequence) =>
-        statement.run(fieldValues[0], fieldValues[1], recordOffset, recordLength, sequence);
+      return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) =>
+        pendingArgs.push(fieldValues[0], fieldValues[1], recordOffset, recordLength, sequence);
     case 3:
-      return (fieldValues, recordOffset, recordLength, sequence) =>
-        statement.run(fieldValues[0], fieldValues[1], fieldValues[2], recordOffset, recordLength, sequence);
+      return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) =>
+        pendingArgs.push(fieldValues[0], fieldValues[1], fieldValues[2], recordOffset, recordLength, sequence);
     case 4:
-      return (fieldValues, recordOffset, recordLength, sequence) =>
-        statement.run(fieldValues[0], fieldValues[1], fieldValues[2], fieldValues[3], recordOffset, recordLength, sequence);
+      return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) =>
+        pendingArgs.push(fieldValues[0], fieldValues[1], fieldValues[2], fieldValues[3], recordOffset, recordLength, sequence);
     default:
-      return (fieldValues, recordOffset, recordLength, sequence) =>
-        statement.run(...fieldValues, recordOffset, recordLength, sequence);
+      return (pendingArgs, fieldValues, recordOffset, recordLength, sequence) => {
+        for (let index = 0; index < fieldValues.length; index += 1) {
+          pendingArgs.push(fieldValues[index]);
+        }
+        pendingArgs.push(recordOffset, recordLength, sequence);
+      };
   }
+}
+
+function buildInsertSql(recordTableName: string, fieldNames: string[], rowCount: number): string {
+  const columnNames = [...fieldNames.map((fieldName) => `"${fieldName}"`), 'data_offset', 'data_length', 'sequence'].join(', ');
+  const valueTuple = `(${Array.from({ length: fieldNames.length + 3 }, () => '?').join(', ')})`;
+  return `INSERT INTO "${recordTableName}" (${columnNames}) VALUES ${Array.from({ length: rowCount }, () => valueTuple).join(', ')}`;
+}
+
+function createBatchedRowWriter(
+  db: DatabaseSync,
+  recordTableName: string,
+  fieldNames: string[]
+): Pick<TablePlan, 'writeRow' | 'flushRows'> {
+  const fullStatement = db.prepare(buildInsertSql(recordTableName, fieldNames, INSERT_BATCH_SIZE));
+  const partialStatements = new Map<number, ReturnType<DatabaseSync['prepare']>>();
+  const appendArgs = createArgumentAppender(fieldNames.length);
+  let pendingArgs: unknown[] = [];
+  let pendingRowCount = 0;
+
+  function statementFor(rowCount: number): ReturnType<DatabaseSync['prepare']> {
+    if (rowCount === INSERT_BATCH_SIZE) {
+      return fullStatement;
+    }
+
+    let statement = partialStatements.get(rowCount);
+    if (!statement) {
+      statement = db.prepare(buildInsertSql(recordTableName, fieldNames, rowCount));
+      partialStatements.set(rowCount, statement);
+    }
+    return statement;
+  }
+
+  function flushRows(): void {
+    if (pendingRowCount === 0) {
+      return;
+    }
+
+    statementFor(pendingRowCount).run(...pendingArgs);
+    pendingArgs = [];
+    pendingRowCount = 0;
+  }
+
+  return {
+    writeRow(fieldValues, recordOffset, recordLength, sequence): void {
+      appendArgs(pendingArgs, fieldValues, recordOffset, recordLength, sequence);
+      pendingRowCount += 1;
+
+      if (pendingRowCount === INSERT_BATCH_SIZE) {
+        flushRows();
+      }
+    },
+    flushRows,
+  };
 }
 
 interface IngestPlan {
@@ -121,12 +203,18 @@ export class FlatSQLArtifactBuilder {
   private readonly db: DatabaseSync;
   private readonly beginTransactionSql: string;
   private readonly tableByName = new Map<string, TableDef>();
-  private readonly fileIdToTable = new Map<string, string>();
+  private readonly fileIdToTable = new Map<number, string>();
   private readonly extractors = new Map<string, ArtifactFieldExtractor>();
   private sequence = 1;
 
   static fromSchema(source: string, options: ArtifactBuilderOptions): FlatSQLArtifactBuilder {
-    const schema = parseSchema(source, options.name ?? 'artifact');
+    const schemaName = options.name ?? 'artifact';
+    const cacheKey = `${schemaName}\u0000${source}`;
+    let schema = schemaCache.get(cacheKey);
+    if (!schema) {
+      schema = parseSchema(source, schemaName);
+      schemaCache.set(cacheKey, schema);
+    }
     return new FlatSQLArtifactBuilder(schema, options);
   }
 
@@ -145,7 +233,7 @@ export class FlatSQLArtifactBuilder {
   }
 
   registerFileId(fileId: string, tableName: string): void {
-    this.fileIdToTable.set(fileId, tableName);
+    this.fileIdToTable.set(encodeFileId(fileId), tableName);
   }
 
   setFieldExtractor(tableName: string, extractor: ArtifactFieldExtractor): void {
@@ -165,9 +253,10 @@ export class FlatSQLArtifactBuilder {
     withTransaction(this.db, this.beginTransactionSql, () => {
       for (let index = 0; index < buffers.length; index++) {
         const buffer = buffers[index];
-        const fileId = readFileId(buffer);
-        const tableName = this.fileIdToTable.get(fileId);
+        const fileIdCode = readFileIdCode(buffer);
+        const tableName = this.fileIdToTable.get(fileIdCode);
         if (!tableName) {
+          const fileId = readFileId(buffer);
           throw new Error(`No table registered for file identifier ${fileId}`);
         }
 
@@ -182,8 +271,8 @@ export class FlatSQLArtifactBuilder {
         }
 
         const recordOffset = options.offsets?.[index] ?? currentOffset;
-        const rowValues = extractArtifactFieldValues(tablePlan.extractor, buffer, tablePlan.fieldNames);
-        tablePlan.emitRow(rowValues, recordOffset, buffer.length, this.sequence);
+        const rowValues = tablePlan.extractRowValues(buffer);
+        tablePlan.writeRow(rowValues, recordOffset, buffer.length, this.sequence);
 
         this.sequence += 1;
         currentOffset = recordOffset + buffer.length;
@@ -192,6 +281,7 @@ export class FlatSQLArtifactBuilder {
       for (const tableName of plan.touchedTables) {
         const tablePlan = plan.tablePlans.get(tableName);
         if (tablePlan) {
+          tablePlan.flushRows();
           this.createCoveringIndexes(tablePlan.table);
         }
       }
@@ -298,18 +388,13 @@ export class FlatSQLArtifactBuilder {
         continue;
       }
 
-      const placeholders = fieldNames.map(() => '?').join(', ');
+      const recordTableName = this.recordTableName(table.name);
+      const rowWriter = createBatchedRowWriter(this.db, recordTableName, fieldNames);
       tablePlans.set(tableName, {
         table,
-        extractor,
-        fieldNames,
-        emitRow: createRowEmitter(
-          this.db.prepare(
-          `INSERT INTO "${this.recordTableName(table.name)}" (${fieldNames.map((fieldName) => `"${fieldName}"`).join(', ')}, data_offset, data_length, sequence)
-           VALUES (${placeholders}, ?, ?, ?)`
-          ),
-          fieldNames.length
-        ),
+        extractRowValues: createArtifactFieldValueReader(extractor, fieldNames),
+        writeRow: rowWriter.writeRow,
+        flushRows: rowWriter.flushRows,
       });
     }
 
