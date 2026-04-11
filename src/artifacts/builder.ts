@@ -45,6 +45,11 @@ const DEFAULT_CACHE_SIZE = -131072;
 const DEFAULT_THREAD_COUNT = Math.min(4, Math.max(2, availableParallelism()));
 const schemaCache = new Map<string, DatabaseSchema>();
 
+type QueryStatement = ReturnType<DatabaseSync['prepare']> & {
+  setReturnArrays?: (enabled: boolean) => unknown;
+  all: () => unknown[];
+};
+
 function isCacheableQuerySql(sql: string): boolean {
   const trimmed = sql.trimStart();
   if (trimmed.length === 0) {
@@ -57,6 +62,10 @@ function isCacheableQuerySql(sql: string): boolean {
   }
 
   return upper.startsWith('PRAGMA') && !trimmed.includes('=');
+}
+
+function normalizeRow(row: Record<string, unknown>, columns: string[]): any[] {
+  return columns.map((column) => row[column]);
 }
 
 function readFileId(data: Uint8Array): string {
@@ -89,10 +98,6 @@ function encodeFileId(fileId: string): number {
     (fileId.charCodeAt(2) << 16) |
     (fileId.charCodeAt(3) << 24)
   ) >>> 0;
-}
-
-function normalizeRow(row: Record<string, unknown>, columns: string[]): any[] {
-  return columns.map((column) => row[column]);
 }
 
 function withTransaction<T>(db: DatabaseSync, beginSql: string, operation: () => T): T {
@@ -249,8 +254,9 @@ export class FlatSQLArtifactBuilder {
   private readonly fileIdToTable = new Map<number, string>();
   private readonly extractors = new Map<string, ArtifactFieldExtractor>();
   private readonly queryCache = new Map<string, {
-    statement: ReturnType<DatabaseSync['prepare']>;
+    statement: QueryStatement;
     columns: string[];
+    arrayMode: boolean;
   }>();
   private sequence = 1;
 
@@ -342,17 +348,22 @@ export class FlatSQLArtifactBuilder {
     let cached = cacheable ? this.queryCache.get(sql) : undefined;
 
     if (!cached) {
-      const statement = this.db.prepare(sql);
+      const statement = this.db.prepare(sql) as QueryStatement;
+      const arrayMode = typeof statement.setReturnArrays === 'function';
+      if (arrayMode) {
+        statement.setReturnArrays!(true);
+      }
       const columns = statement.columns().map((column: SQLiteColumnMetadata) => column.name);
-      cached = { statement, columns };
+      cached = { statement, columns, arrayMode };
       if (cacheable) {
         this.queryCache.set(sql, cached);
       }
     }
 
-    const rows = cached.statement
-      .all()
-      .map((row: Record<string, unknown>) => normalizeRow(row, cached!.columns));
+    const rawRows = cached.statement.all();
+    const rows = cached.arrayMode
+      ? (rawRows as unknown as any[][])
+      : (rawRows as Record<string, unknown>[]).map((row) => normalizeRow(row, cached!.columns));
 
     return {
       columns: [...cached.columns],

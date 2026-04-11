@@ -34,6 +34,9 @@ function isCacheableQuerySql(sql) {
     }
     return upper.startsWith('PRAGMA') && !trimmed.includes('=');
 }
+function normalizeRow(row, columns) {
+    return columns.map((column) => row[column]);
+}
 function readFileId(data) {
     if (data.length < 8) {
         throw new Error('FlatBuffer payload is too short to contain a file identifier');
@@ -57,9 +60,6 @@ function encodeFileId(fileId) {
         (fileId.charCodeAt(1) << 8) |
         (fileId.charCodeAt(2) << 16) |
         (fileId.charCodeAt(3) << 24)) >>> 0;
-}
-function normalizeRow(row, columns) {
-    return columns.map((column) => row[column]);
 }
 function withTransaction(db, beginSql, operation) {
     let started = false;
@@ -245,15 +245,20 @@ export class FlatSQLArtifactBuilder {
         let cached = cacheable ? this.queryCache.get(sql) : undefined;
         if (!cached) {
             const statement = this.db.prepare(sql);
+            const arrayMode = typeof statement.setReturnArrays === 'function';
+            if (arrayMode) {
+                statement.setReturnArrays(true);
+            }
             const columns = statement.columns().map((column) => column.name);
-            cached = { statement, columns };
+            cached = { statement, columns, arrayMode };
             if (cacheable) {
                 this.queryCache.set(sql, cached);
             }
         }
-        const rows = cached.statement
-            .all()
-            .map((row) => normalizeRow(row, cached.columns));
+        const rawRows = cached.statement.all();
+        const rows = cached.arrayMode
+            ? rawRows
+            : rawRows.map((row) => normalizeRow(row, cached.columns));
         return {
             columns: [...cached.columns],
             rows,

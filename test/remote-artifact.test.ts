@@ -403,6 +403,42 @@ describe('remote artifact builder', () => {
     builder.close();
   });
 
+  test('artifact builder prepares read queries in array-return mode', async () => {
+    const sqlitePath = join(tempDir, 'users-query-arrays.sqlite');
+    const builder = FlatSQLArtifactBuilder.fromSchema(schema, {
+      sqlitePath,
+    });
+
+    builder.registerFileId('USER', 'User');
+    builder.enableDemoExtractors();
+    builder.ingestBuffers(
+      [createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30)],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    const db = (builder as any).db;
+    const originalPrepare = db.prepare.bind(db);
+    let setReturnArraysCalls = 0;
+    db.prepare = ((sql: string) => {
+      const statement = originalPrepare(sql);
+      const originalSetReturnArrays = statement.setReturnArrays.bind(statement);
+      statement.setReturnArrays = ((enabled: boolean) => {
+        if (enabled) {
+          setReturnArraysCalls += 1;
+        }
+        return originalSetReturnArrays(enabled);
+      }) as typeof statement.setReturnArrays;
+      return statement;
+    }) as typeof db.prepare;
+
+    expect(builder.query('SELECT key FROM "_idx_User_email" ORDER BY key').rows).toEqual([
+      ['alice@example.com'],
+    ]);
+    expect(setReturnArraysCalls).toBe(1);
+
+    builder.close();
+  });
+
   test('artifact worker builds sqlite artifact via worker thread', async () => {
     const sqlitePath = join(tempDir, 'users-worker.sqlite');
     const client = new FlatSQLArtifactWorkerClient();

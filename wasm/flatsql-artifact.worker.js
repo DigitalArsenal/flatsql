@@ -740,14 +740,19 @@ const methods = {
 
     if (!cached) {
       const statement = builder.db.prepare(sql);
+      const arrayMode = typeof statement.setReturnArrays === 'function';
+      if (arrayMode) {
+        statement.setReturnArrays(true);
+      }
       const columns = statement.columns().map((column) => column.name);
-      cached = { statement, columns };
+      cached = { statement, columns, arrayMode };
       if (cacheable) {
         builder.queryCache.set(sql, cached);
       }
     }
 
-    const rows = normalizeRows(cached.statement.all(), cached.columns);
+    const rawRows = cached.statement.all();
+    const rows = cached.arrayMode ? rawRows : normalizeRows(rawRows, cached.columns);
     return { columns: [...cached.columns], rows, rowCount: rows.length };
   },
   closeBuilder({ builderId }) {
