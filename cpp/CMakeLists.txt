@@ -160,7 +160,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
                 \"_flatsql_ingest_with_source\", \"_flatsql_ingest_one_with_source\", \
                 \"_flatsql_get_sources_count\", \"_flatsql_get_source_name\", \
-                \"_flatsql_query\", \"_flatsql_get_error\", \
+                \"_flatsql_query\", \"_flatsql_query_params\", \"_flatsql_query_many\", \
+                \"_flatsql_batch_result_count\", \"_flatsql_select_batch_result\", \"_flatsql_get_error\", \
                 \"_flatsql_result_column_count\", \"_flatsql_result_row_count\", \
                 \"_flatsql_result_column_name\", \"_flatsql_result_cell_type\", \
                 \"_flatsql_result_cell_number\", \"_flatsql_result_cell_string\", \
@@ -237,7 +238,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
                 \"_flatsql_ingest_with_source\", \"_flatsql_ingest_one_with_source\", \
                 \"_flatsql_get_sources_count\", \"_flatsql_get_source_name\", \
-                \"_flatsql_query\", \"_flatsql_get_error\", \
+                \"_flatsql_query\", \"_flatsql_query_params\", \"_flatsql_query_many\", \
+                \"_flatsql_batch_result_count\", \"_flatsql_select_batch_result\", \"_flatsql_get_error\", \
                 \"_flatsql_result_column_count\", \"_flatsql_result_row_count\", \
                 \"_flatsql_result_column_name\", \"_flatsql_result_cell_type\", \
                 \"_flatsql_result_cell_number\", \"_flatsql_result_cell_string\", \

@@ -392,13 +392,152 @@ Value extractTelemetryFieldGeneric(const uint8_t* data, size_t length, const std
     return std::monostate{};
 }
 
+enum ParamTag : uint8_t {
+    PARAM_NULL = 0,
+    PARAM_BOOL = 1,
+    PARAM_INT64 = 2,
+    PARAM_FLOAT64 = 3,
+    PARAM_STRING = 4,
+    PARAM_BYTES = 5,
+};
+
+void requireBytes(size_t offset, size_t need, size_t length) {
+    if (offset > length || need > length - offset) {
+        throw std::runtime_error("Malformed query parameter payload");
+    }
+}
+
+std::vector<Value> decodeParams(const uint8_t* data, size_t length, int paramCount) {
+    if (paramCount < 0) {
+        throw std::runtime_error("Invalid parameter count");
+    }
+    if (paramCount == 0) {
+        return {};
+    }
+    if (!data) {
+        throw std::runtime_error("Missing query parameter payload");
+    }
+
+    std::vector<Value> params;
+    params.reserve(static_cast<size_t>(paramCount));
+    size_t offset = 0;
+
+    for (int index = 0; index < paramCount; index++) {
+        requireBytes(offset, 5, length);
+        const uint8_t tag = data[offset++];
+        const uint32_t size = flatbuffers::ReadScalar<uint32_t>(data + offset);
+        offset += 4;
+        requireBytes(offset, size, length);
+
+        switch (tag) {
+            case PARAM_NULL:
+                if (size != 0) {
+                    throw std::runtime_error("NULL parameter payload must be empty");
+                }
+                params.emplace_back(std::monostate{});
+                break;
+            case PARAM_BOOL:
+                if (size != 1) {
+                    throw std::runtime_error("Boolean parameter payload must be 1 byte");
+                }
+                params.emplace_back(data[offset] != 0);
+                break;
+            case PARAM_INT64:
+                if (size != sizeof(int64_t)) {
+                    throw std::runtime_error("Integer parameter payload must be 8 bytes");
+                }
+                params.emplace_back(flatbuffers::ReadScalar<int64_t>(data + offset));
+                break;
+            case PARAM_FLOAT64:
+                if (size != sizeof(double)) {
+                    throw std::runtime_error("Float parameter payload must be 8 bytes");
+                }
+                params.emplace_back(flatbuffers::ReadScalar<double>(data + offset));
+                break;
+            case PARAM_STRING:
+                params.emplace_back(std::string(reinterpret_cast<const char*>(data + offset), size));
+                break;
+            case PARAM_BYTES:
+                params.emplace_back(std::vector<uint8_t>(data + offset, data + offset + size));
+                break;
+            default:
+                throw std::runtime_error("Unsupported query parameter tag");
+        }
+
+        offset += size;
+    }
+
+    if (offset != length) {
+        throw std::runtime_error("Unexpected trailing bytes in query parameter payload");
+    }
+
+    return params;
+}
+
+struct QueryRequest {
+    std::string sql;
+    std::vector<Value> params;
+};
+
+std::vector<QueryRequest> decodeQueryRequests(const uint8_t* data, size_t length, int requestCount) {
+    if (requestCount < 0) {
+        throw std::runtime_error("Invalid batch query count");
+    }
+    if (requestCount == 0) {
+        return {};
+    }
+    if (!data) {
+        throw std::runtime_error("Missing batch query payload");
+    }
+
+    std::vector<QueryRequest> requests;
+    requests.reserve(static_cast<size_t>(requestCount));
+    size_t offset = 0;
+
+    for (int index = 0; index < requestCount; index++) {
+        requireBytes(offset, 12, length);
+        const uint32_t sqlLength = flatbuffers::ReadScalar<uint32_t>(data + offset);
+        offset += 4;
+        const uint32_t paramCount = flatbuffers::ReadScalar<uint32_t>(data + offset);
+        offset += 4;
+        const uint32_t paramLength = flatbuffers::ReadScalar<uint32_t>(data + offset);
+        offset += 4;
+
+        requireBytes(offset, sqlLength, length);
+        std::string sql(reinterpret_cast<const char*>(data + offset), sqlLength);
+        offset += sqlLength;
+
+        requireBytes(offset, paramLength, length);
+        const uint8_t* paramData = paramLength > 0 ? data + offset : nullptr;
+        auto params = decodeParams(paramData, paramLength, static_cast<int>(paramCount));
+        offset += paramLength;
+
+        requests.push_back({std::move(sql), std::move(params)});
+    }
+
+    if (offset != length) {
+        throw std::runtime_error("Unexpected trailing bytes in batch query payload");
+    }
+
+    return requests;
+}
+
 // Global state for result handling
 QueryResult g_lastResult;
+std::vector<QueryResult> g_batchResults;
+int g_selectedBatchResult = -1;
 std::string g_lastError;
 std::vector<uint8_t> g_exportBuffer;
 std::vector<uint8_t> g_testBuffer;
 std::vector<FlatSQLDatabase::TableStats> g_statsBuffer;
 std::vector<std::string> g_sourcesBuffer;
+
+QueryResult& currentResult() {
+    if (g_selectedBatchResult >= 0 && g_selectedBatchResult < static_cast<int>(g_batchResults.size())) {
+        return g_batchResults[static_cast<size_t>(g_selectedBatchResult)];
+    }
+    return g_lastResult;
+}
 
 }  // anonymous namespace
 
@@ -481,6 +620,8 @@ double flatsql_ingest_one_with_source(void* handle, const uint8_t* data, size_t 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_query(void* handle, const char* sql) {
     try {
+        g_batchResults.clear();
+        g_selectedBatchResult = -1;
         g_lastResult = static_cast<FlatSQLDatabase*>(handle)->query(sql);
         g_lastError.clear();
         return 1;
@@ -491,32 +632,87 @@ int flatsql_query(void* handle, const char* sql) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+int flatsql_query_params(void* handle, const char* sql, const uint8_t* paramData, size_t paramLength, int paramCount) {
+    try {
+        g_batchResults.clear();
+        g_selectedBatchResult = -1;
+        g_lastResult = static_cast<FlatSQLDatabase*>(handle)->query(
+            sql,
+            decodeParams(paramData, paramLength, paramCount)
+        );
+        g_lastError.clear();
+        return 1;
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_query_many(void* handle, const uint8_t* requestData, size_t requestLength, int requestCount) {
+    try {
+        g_batchResults.clear();
+        auto requests = decodeQueryRequests(requestData, requestLength, requestCount);
+        g_batchResults.reserve(requests.size());
+        for (const auto& request : requests) {
+            g_batchResults.push_back(
+                static_cast<FlatSQLDatabase*>(handle)->query(request.sql, request.params)
+            );
+        }
+        g_selectedBatchResult = g_batchResults.empty() ? -1 : 0;
+        g_lastError.clear();
+        return 1;
+    } catch (const std::exception& e) {
+        g_batchResults.clear();
+        g_selectedBatchResult = -1;
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_batch_result_count() {
+    return static_cast<int>(g_batchResults.size());
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_select_batch_result(int index) {
+    if (index < 0 || index >= static_cast<int>(g_batchResults.size())) {
+        return 0;
+    }
+    g_selectedBatchResult = index;
+    return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
 const char* flatsql_get_error() {
     return g_lastError.c_str();
 }
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_result_column_count() {
-    return static_cast<int>(g_lastResult.columns.size());
+    return static_cast<int>(currentResult().columns.size());
 }
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_result_row_count() {
-    return static_cast<int>(g_lastResult.rows.size());
+    return static_cast<int>(currentResult().rows.size());
 }
 
 EMSCRIPTEN_KEEPALIVE
 const char* flatsql_result_column_name(int index) {
-    if (index < 0 || index >= static_cast<int>(g_lastResult.columns.size())) return "";
-    return g_lastResult.columns[index].c_str();
+    QueryResult& result = currentResult();
+    if (index < 0 || index >= static_cast<int>(result.columns.size())) return "";
+    return result.columns[static_cast<size_t>(index)].c_str();
 }
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_result_cell_type(int row, int col) {
-    if (row < 0 || row >= static_cast<int>(g_lastResult.rows.size())) return 0;
-    if (col < 0 || col >= static_cast<int>(g_lastResult.rows[row].size())) return 0;
+    QueryResult& result = currentResult();
+    if (row < 0 || row >= static_cast<int>(result.rows.size())) return 0;
+    if (col < 0 || col >= static_cast<int>(result.rows[static_cast<size_t>(row)].size())) return 0;
 
-    const Value& v = g_lastResult.rows[row][col];
+    const Value& v = result.rows[static_cast<size_t>(row)][static_cast<size_t>(col)];
     if (std::holds_alternative<std::monostate>(v)) return 0;
     if (std::holds_alternative<bool>(v)) return 1;
     if (std::holds_alternative<int32_t>(v)) return 2;
@@ -529,10 +725,11 @@ int flatsql_result_cell_type(int row, int col) {
 
 EMSCRIPTEN_KEEPALIVE
 double flatsql_result_cell_number(int row, int col) {
-    if (row < 0 || row >= static_cast<int>(g_lastResult.rows.size())) return 0;
-    if (col < 0 || col >= static_cast<int>(g_lastResult.rows[row].size())) return 0;
+    QueryResult& result = currentResult();
+    if (row < 0 || row >= static_cast<int>(result.rows.size())) return 0;
+    if (col < 0 || col >= static_cast<int>(result.rows[static_cast<size_t>(row)].size())) return 0;
 
-    const Value& v = g_lastResult.rows[row][col];
+    const Value& v = result.rows[static_cast<size_t>(row)][static_cast<size_t>(col)];
     if (std::holds_alternative<bool>(v)) return std::get<bool>(v) ? 1 : 0;
     if (std::holds_alternative<int32_t>(v)) return static_cast<double>(std::get<int32_t>(v));
     if (std::holds_alternative<int64_t>(v)) return static_cast<double>(std::get<int64_t>(v));
@@ -542,10 +739,11 @@ double flatsql_result_cell_number(int row, int col) {
 
 EMSCRIPTEN_KEEPALIVE
 const char* flatsql_result_cell_string(int row, int col) {
-    if (row < 0 || row >= static_cast<int>(g_lastResult.rows.size())) return "";
-    if (col < 0 || col >= static_cast<int>(g_lastResult.rows[row].size())) return "";
+    QueryResult& result = currentResult();
+    if (row < 0 || row >= static_cast<int>(result.rows.size())) return "";
+    if (col < 0 || col >= static_cast<int>(result.rows[static_cast<size_t>(row)].size())) return "";
 
-    const Value& v = g_lastResult.rows[row][col];
+    const Value& v = result.rows[static_cast<size_t>(row)][static_cast<size_t>(col)];
     if (std::holds_alternative<std::string>(v)) {
         return std::get<std::string>(v).c_str();
     }
@@ -554,10 +752,11 @@ const char* flatsql_result_cell_string(int row, int col) {
 
 EMSCRIPTEN_KEEPALIVE
 const uint8_t* flatsql_result_cell_blob(int row, int col) {
-    if (row < 0 || row >= static_cast<int>(g_lastResult.rows.size())) return nullptr;
-    if (col < 0 || col >= static_cast<int>(g_lastResult.rows[row].size())) return nullptr;
+    QueryResult& result = currentResult();
+    if (row < 0 || row >= static_cast<int>(result.rows.size())) return nullptr;
+    if (col < 0 || col >= static_cast<int>(result.rows[static_cast<size_t>(row)].size())) return nullptr;
 
-    const Value& v = g_lastResult.rows[row][col];
+    const Value& v = result.rows[static_cast<size_t>(row)][static_cast<size_t>(col)];
     if (std::holds_alternative<std::vector<uint8_t>>(v)) {
         return std::get<std::vector<uint8_t>>(v).data();
     }
@@ -566,10 +765,11 @@ const uint8_t* flatsql_result_cell_blob(int row, int col) {
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_result_cell_blob_size(int row, int col) {
-    if (row < 0 || row >= static_cast<int>(g_lastResult.rows.size())) return 0;
-    if (col < 0 || col >= static_cast<int>(g_lastResult.rows[row].size())) return 0;
+    QueryResult& result = currentResult();
+    if (row < 0 || row >= static_cast<int>(result.rows.size())) return 0;
+    if (col < 0 || col >= static_cast<int>(result.rows[static_cast<size_t>(row)].size())) return 0;
 
-    const Value& v = g_lastResult.rows[row][col];
+    const Value& v = result.rows[static_cast<size_t>(row)][static_cast<size_t>(col)];
     if (std::holds_alternative<std::vector<uint8_t>>(v)) {
         return static_cast<int>(std::get<std::vector<uint8_t>>(v).size());
     }

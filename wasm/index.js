@@ -5,6 +5,14 @@ import FlatSQLModule from './flatsql.js';
 
 let Module = null;
 let api = null;
+const textEncoder = new TextEncoder();
+
+const PARAM_NULL = 0;
+const PARAM_BOOL = 1;
+const PARAM_INT64 = 2;
+const PARAM_FLOAT64 = 3;
+const PARAM_STRING = 4;
+const PARAM_BYTES = 5;
 
 // Security: Track if integrity was verified
 let integrityVerified = false;
@@ -223,6 +231,10 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
 
         // Query execution
         query: Module.cwrap('flatsql_query', 'number', ['number', 'string']),
+        queryParams: Module.cwrap('flatsql_query_params', 'number', ['number', 'string', 'number', 'number', 'number']),
+        queryMany: Module.cwrap('flatsql_query_many', 'number', ['number', 'number', 'number', 'number']),
+        batchResultCount: Module.cwrap('flatsql_batch_result_count', 'number', []),
+        selectBatchResult: Module.cwrap('flatsql_select_batch_result', 'number', ['number']),
         getError: Module.cwrap('flatsql_get_error', 'string', []),
 
         // Result access
@@ -296,6 +308,134 @@ function withHeapBytes(data, callback) {
     } finally {
         Module._free(ptr);
     }
+}
+
+function encodeQueryParams(params) {
+    const parts = [];
+    let total = 0;
+
+    for (const value of params) {
+        let tag;
+        let payload;
+
+        if (value === null) {
+            tag = PARAM_NULL;
+            payload = new Uint8Array(0);
+        } else if (typeof value === 'boolean') {
+            tag = PARAM_BOOL;
+            payload = Uint8Array.of(value ? 1 : 0);
+        } else if (typeof value === 'number' && Number.isInteger(value)) {
+            if (!Number.isSafeInteger(value)) {
+                throw new TypeError('Integer query parameters must be safe integers');
+            }
+            tag = PARAM_INT64;
+            payload = new Uint8Array(8);
+            new DataView(payload.buffer, payload.byteOffset, payload.byteLength).setBigInt64(0, BigInt(value), true);
+        } else if (typeof value === 'number') {
+            tag = PARAM_FLOAT64;
+            payload = new Uint8Array(8);
+            new DataView(payload.buffer, payload.byteOffset, payload.byteLength).setFloat64(0, value, true);
+        } else if (typeof value === 'string') {
+            tag = PARAM_STRING;
+            payload = textEncoder.encode(value);
+        } else if (value instanceof Uint8Array) {
+            tag = PARAM_BYTES;
+            payload = value;
+        } else {
+            throw new TypeError(`Unsupported query parameter type: ${typeof value}`);
+        }
+
+        const header = new Uint8Array(5);
+        const view = new DataView(header.buffer);
+        view.setUint8(0, tag);
+        view.setUint32(1, payload.length, true);
+
+        parts.push(header, payload);
+        total += header.length + payload.length;
+    }
+
+    const encoded = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+        encoded.set(part, offset);
+        offset += part.length;
+    }
+
+    return encoded;
+}
+
+function encodeQueryRequests(queries) {
+    const parts = [];
+    let total = 0;
+
+    for (const query of queries) {
+        const sqlBytes = textEncoder.encode(query.sql);
+        const paramList = query.params ?? [];
+        const paramBytes = encodeQueryParams(paramList);
+        const header = new Uint8Array(12);
+        const view = new DataView(header.buffer);
+        view.setUint32(0, sqlBytes.length, true);
+        view.setUint32(4, paramList.length, true);
+        view.setUint32(8, paramBytes.length, true);
+
+        parts.push(header, sqlBytes, paramBytes);
+        total += header.length + sqlBytes.length + paramBytes.length;
+    }
+
+    const encoded = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+        encoded.set(part, offset);
+        offset += part.length;
+    }
+
+    return encoded;
+}
+
+function readCellValue(row, col) {
+    const type = api.resultCellType(row, col);
+    switch (type) {
+        case 0:
+            return null;
+        case 1:
+            return api.resultCellNumber(row, col) !== 0;
+        case 2:
+        case 3:
+        case 4:
+            return api.resultCellNumber(row, col);
+        case 5:
+            return api.resultCellString(row, col);
+        case 6: {
+            const blobPtr = api.resultCellBlob(row, col);
+            const blobSize = api.resultCellBlobSize(row, col);
+            return blobPtr && blobSize > 0
+                ? Array.from(new Uint8Array(Module.HEAPU8.buffer, blobPtr, blobSize))
+                : [];
+        }
+        default:
+            return null;
+    }
+}
+
+function readQueryResult() {
+    const colCount = api.resultColumnCount();
+    const rowCount = api.resultRowCount();
+
+    const columns = [];
+    for (let i = 0; i < colCount; i++) {
+        columns.push(api.resultColumnName(i));
+    }
+
+    const rows = [];
+    for (let r = 0; r < rowCount; r++) {
+        const row = [];
+        for (let c = 0; c < colCount; c++) {
+            row.push(readCellValue(r, c));
+        }
+        rows.push(row);
+    }
+
+    return { columns, rows };
 }
 
 function buildSizePrefixedStream(buffers) {
@@ -435,58 +575,48 @@ export class FlatSQLDatabase {
         return sources;
     }
 
-    query(sql) {
-        const success = api.query(this._handle, sql);
+    query(sql, params = undefined) {
+        const success = params === undefined
+            ? api.query(this._handle, sql)
+            : (() => {
+                const encodedParams = encodeQueryParams(params);
+                if (encodedParams.length === 0) {
+                    return api.queryParams(this._handle, sql, 0, 0, 0);
+                }
+                return withHeapBytes(
+                    encodedParams,
+                    (ptr) => api.queryParams(this._handle, sql, ptr, encodedParams.length, params.length)
+                );
+            })();
+        if (!success) {
+            throw new Error(api.getError());
+        }
+        return readQueryResult();
+    }
+
+    queryMany(queries) {
+        if (queries.length === 0) {
+            return [];
+        }
+
+        const encodedRequests = encodeQueryRequests(queries);
+        const success = withHeapBytes(
+            encodedRequests,
+            (ptr) => api.queryMany(this._handle, ptr, encodedRequests.length, queries.length)
+        );
         if (!success) {
             throw new Error(api.getError());
         }
 
-        // Read results
-        const colCount = api.resultColumnCount();
-        const rowCount = api.resultRowCount();
-
-        const columns = [];
-        for (let i = 0; i < colCount; i++) {
-            columns.push(api.resultColumnName(i));
-        }
-
-        const rows = [];
-        for (let r = 0; r < rowCount; r++) {
-            const row = [];
-            for (let c = 0; c < colCount; c++) {
-                const type = api.resultCellType(r, c);
-                switch (type) {
-                    case 0: // null
-                        row.push(null);
-                        break;
-                    case 1: // bool
-                        row.push(api.resultCellNumber(r, c) !== 0);
-                        break;
-                    case 2: // int32
-                    case 3: // int64
-                    case 4: // double
-                        row.push(api.resultCellNumber(r, c));
-                        break;
-                    case 5: // string
-                        row.push(api.resultCellString(r, c));
-                        break;
-                    case 6: // blob
-                        const blobPtr = api.resultCellBlob(r, c);
-                        const blobSize = api.resultCellBlobSize(r, c);
-                        if (blobPtr && blobSize > 0) {
-                            row.push(Array.from(new Uint8Array(Module.HEAPU8.buffer, blobPtr, blobSize)));
-                        } else {
-                            row.push([]);
-                        }
-                        break;
-                    default:
-                        row.push(null);
-                }
+        const resultCount = api.batchResultCount();
+        const results = [];
+        for (let index = 0; index < resultCount; index++) {
+            if (!api.selectBatchResult(index)) {
+                throw new Error(`Failed to select batch result ${index}`);
             }
-            rows.push(row);
+            results.push(readQueryResult());
         }
-
-        return { columns, rows };
+        return results;
     }
 
     exportData() {

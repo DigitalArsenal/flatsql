@@ -72,6 +72,52 @@ void testSQLiteEngine() {
     std::cout << "SQLite engine tests passed!" << std::endl;
 }
 
+void testSQLiteParameterizedStatementReuse() {
+    std::cout << "Testing SQLite parameterized statement reuse..." << std::endl;
+
+    SQLiteEngine engine;
+    char* errMsg = nullptr;
+    int rc = sqlite3_exec(
+        engine.getDb(),
+        "CREATE TABLE cache_test (id INTEGER PRIMARY KEY, email TEXT, active INTEGER);"
+        "INSERT INTO cache_test VALUES (1, 'alice@example.com', 1);"
+        "INSERT INTO cache_test VALUES (2, 'bob@example.com', 0);",
+        nullptr,
+        nullptr,
+        &errMsg
+    );
+    assert(rc == SQLITE_OK);
+
+    QueryResult alice = engine.execute(
+        "SELECT email FROM cache_test WHERE id = ?",
+        {int64_t(1)}
+    );
+    assert(alice.rowCount() == 1);
+    assert(std::get<std::string>(alice.rows[0][0]) == "alice@example.com");
+
+    QueryResult bob = engine.execute(
+        "SELECT email FROM cache_test WHERE id = ?",
+        {int64_t(2)}
+    );
+    assert(bob.rowCount() == 1);
+    assert(std::get<std::string>(bob.rows[0][0]) == "bob@example.com");
+
+    QueryResult staleBinding = engine.execute(
+        "SELECT ?1 AS first_value, ?2 IS NULL AS second_is_null",
+        {int64_t(9), std::string("sticky")}
+    );
+    assert(std::get<int64_t>(staleBinding.rows[0][1]) == 0);
+
+    QueryResult clearedBinding = engine.execute(
+        "SELECT ?1 AS first_value, ?2 IS NULL AS second_is_null",
+        {int64_t(10)}
+    );
+    assert(std::get<int64_t>(clearedBinding.rows[0][0]) == 10);
+    assert(std::get<int64_t>(clearedBinding.rows[0][1]) == 1);
+
+    std::cout << "SQLite parameterized statement reuse tests passed!" << std::endl;
+}
+
 void testSqliteIndex() {
     std::cout << "Testing SQLite-backed index..." << std::endl;
 
@@ -723,6 +769,7 @@ int main() {
     try {
         testSchemaParser();
         testSQLiteEngine();
+        testSQLiteParameterizedStatementReuse();
         testSqliteIndex();
         testStorage();
         testDatabase();

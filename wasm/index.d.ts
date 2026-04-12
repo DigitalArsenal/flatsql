@@ -8,6 +8,13 @@ export interface QueryResult {
   rows: any[][];
 }
 
+export type QueryParam = null | boolean | number | string | Uint8Array;
+
+export interface QueryRequest {
+  sql: string;
+  params?: QueryParam[];
+}
+
 export interface TableStats {
   tableName: string;
   fileId: string;
@@ -59,7 +66,12 @@ export interface FlatSQLDatabase {
   /**
    * Execute a SQL query
    */
-  query(sql: string): QueryResult;
+  query(sql: string, params?: QueryParam[]): QueryResult;
+
+  /**
+   * Execute multiple SQL queries and return results in request order
+   */
+  queryMany(queries: QueryRequest[]): QueryResult[];
 
   /**
    * Export all data as a stream of size-prefixed FlatBuffers
