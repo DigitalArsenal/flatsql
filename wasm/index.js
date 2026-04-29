@@ -9,30 +9,60 @@ let api = null;
 // Security: Track if integrity was verified
 let integrityVerified = false;
 
+function toBase64(bytes) {
+    if (typeof Buffer !== 'undefined') {
+        return Buffer.from(bytes).toString('base64');
+    }
+    let binary = '';
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+    }
+    return btoa(binary);
+}
+
+function normalizeHashResult(value) {
+    if (typeof value === 'string') {
+        return value;
+    }
+    if (value instanceof Uint8Array) {
+        return toBase64(value);
+    }
+    if (ArrayBuffer.isView(value)) {
+        return toBase64(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    }
+    if (value instanceof ArrayBuffer) {
+        return toBase64(new Uint8Array(value));
+    }
+    throw new Error('SHA-384 provider must return a base64 string or binary digest');
+}
+
+function hasNodeProcess() {
+    return typeof process !== 'undefined' &&
+        process.versions !== undefined &&
+        typeof process.versions.node === 'string';
+}
+
 /**
- * Compute SHA-384 hash of data and return as base64
- * Works in both Node.js and browser environments
+ * Compute SHA-384 hash of data and return as base64.
+ * Browser WebCrypto is intentionally not used; browser callers that require
+ * integrity verification must pass computeSHA384 backed by WASM/native crypto.
  * @param {ArrayBuffer} data
+ * @param {(data: ArrayBuffer) => Promise<string|Uint8Array|ArrayBuffer>|string|Uint8Array|ArrayBuffer} [provider]
  * @returns {Promise<string>}
  */
-async function computeSHA384(data) {
-    if (typeof crypto !== 'undefined' && crypto.subtle) {
-        // Browser or Node.js 18+
-        const hashBuffer = await crypto.subtle.digest('SHA-384', data);
-        const hashArray = new Uint8Array(hashBuffer);
-        // Convert to base64
-        if (typeof btoa !== 'undefined') {
-            return btoa(String.fromCharCode(...hashArray));
-        } else {
-            return Buffer.from(hashArray).toString('base64');
-        }
-    } else {
-        // Node.js fallback using dynamic import
-        const cryptoModule = await import('crypto');
+async function computeSHA384(data, provider) {
+    if (typeof provider === 'function') {
+        return normalizeHashResult(await provider(data));
+    }
+    if (hasNodeProcess()) {
+        const cryptoModule = await import('node:crypto');
         const hash = cryptoModule.createHash('sha384');
         hash.update(Buffer.from(data));
         return hash.digest('base64');
     }
+    throw new Error(
+        'WASM integrity verification requires a computeSHA384 option backed by WASM/native crypto; browser WebCrypto is intentionally not used.'
+    );
 }
 
 /**
@@ -41,8 +71,8 @@ async function computeSHA384(data) {
  * @param {string} expectedHash - Expected SHA-384 hash (base64)
  * @returns {Promise<boolean>}
  */
-async function verifyWASMIntegrity(wasmBinary, expectedHash) {
-    const computedHash = await computeSHA384(wasmBinary);
+async function verifyWASMIntegrity(wasmBinary, expectedHash, options = {}) {
+    const computedHash = await computeSHA384(wasmBinary, options.computeSHA384);
     return computedHash === expectedHash;
 }
 
@@ -177,7 +207,7 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
                 }
 
                 // Verify integrity
-                const isValid = await verifyWASMIntegrity(wasmBinary, expectedIntegrity);
+                const isValid = await verifyWASMIntegrity(wasmBinary, expectedIntegrity, options);
                 if (!isValid) {
                     throw new Error(
                         'WASM integrity check failed: hash mismatch. ' +

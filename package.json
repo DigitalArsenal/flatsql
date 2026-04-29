@@ -1,6 +1,6 @@
 {
   "name": "flatsql",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
   "type": "module",
   "main": "dist/index.js",
@@ -84,7 +84,7 @@
   "author": "Digital Arsenal <tj@digitalarsenal.io>",
   "license": "Apache-2.0",
   "dependencies": {
-    "flatc-wasm": "^26.1.31",
+    "flatc-wasm": "^26.1.32",
     "sql.js": "^1.10.0"
   },
   "devDependencies": {
