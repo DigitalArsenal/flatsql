@@ -20,17 +20,73 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export async function initSpatialSDM() {
   const wasmPath = join(__dirname, "flatsql-spatial.wasm");
   const wasmBytes = await readFile(wasmPath);
+  let exports;
+  const invoke = () => (fnPtr, ...args) => {
+    const table = exports?.__indirect_function_table;
+    const fn = table?.get(fnPtr);
+    if (typeof fn !== "function") {
+      throw new Error(`Missing indirect WASM function: ${fnPtr}`);
+    }
+    return fn(...args);
+  };
   const { instance } = await WebAssembly.instantiate(wasmBytes, {
-    env: {},
+    env: {
+      invoke_v: invoke("v"),
+      invoke_i: invoke("i"),
+      invoke_ii: invoke("ii"),
+      invoke_iii: invoke("iii"),
+      invoke_iiii: invoke("iiii"),
+      invoke_iiiii: invoke("iiiii"),
+      invoke_iiiiii: invoke("iiiiii"),
+      invoke_iiiiiii: invoke("iiiiiii"),
+      invoke_iiiiiiii: invoke("iiiiiiii"),
+      invoke_iiiiiiiiiiii: invoke("iiiiiiiiiiii"),
+      invoke_iiiiid: invoke("iiiiid"),
+      invoke_di: invoke("di"),
+      invoke_dii: invoke("dii"),
+      invoke_diii: invoke("diii"),
+      invoke_fiii: invoke("fiii"),
+      invoke_iid: invoke("iid"),
+      invoke_jiiii: invoke("jiiii"),
+      invoke_vi: invoke("vi"),
+      invoke_vid: invoke("vid"),
+      invoke_vii: invoke("vii"),
+      invoke_viii: invoke("viii"),
+      invoke_viiii: invoke("viiii"),
+      invoke_viiiii: invoke("viiiii"),
+      invoke_viiiiiii: invoke("viiiiiii"),
+      invoke_viiiiiiiiii: invoke("viiiiiiiiii"),
+      invoke_viiiiiiiiiiiiiii: invoke("viiiiiiiiiiiiiii"),
+      __cxa_begin_catch: (ptr) => ptr,
+      __cxa_end_catch: () => {},
+      __cxa_find_matching_catch_2: () => 0,
+      __cxa_find_matching_catch_3: () => 0,
+      __cxa_rethrow: () => {},
+      __cxa_throw: () => {},
+      __cxa_uncaught_exceptions: () => 0,
+      __resumeException: (ptr) => {
+        throw new Error(`Unhandled WASM exception: ${ptr}`);
+      },
+      emscripten_notify_memory_growth: () => {},
+    },
     wasi_snapshot_preview1: {
+      environ_get: () => 0,
+      environ_sizes_get: (environCount, environBufSize) => {
+        const memory = exports?.memory;
+        if (memory) {
+          const view = new DataView(memory.buffer);
+          view.setUint32(environCount, 0, true);
+          view.setUint32(environBufSize, 0, true);
+        }
+        return 0;
+      },
       proc_exit: () => {},
       fd_write: () => 0,
       fd_seek: () => 0,
       fd_close: () => 0,
     },
   });
-
-  const exports = instance.exports;
+  exports = instance.exports;
   const memory = /** @type {WebAssembly.Memory} */ (exports.memory);
 
   /**

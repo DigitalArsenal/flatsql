@@ -58,15 +58,18 @@ jobs:
       - name: Copy WASM to dist
         run: |
           mkdir -p wasm
+          mkdir -p sdm
           cp cpp/build-wasm/flatsql.js wasm/ || true
           cp cpp/build-wasm/flatsql.wasm wasm/ || true
           cp cpp/build-wasm/flatsql-wasi.wasm wasm/ || true
+          cp cpp/build-wasm/flatsql-spatial.wasm sdm/ || true
 
       - name: Verify build output
         run: |
           echo "Checking build output..."
           ls -la dist/
           ls -la wasm/ || true
+          ls -la sdm/ || true
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -75,6 +78,7 @@ jobs:
           path: |
             dist/
             wasm/
+            sdm/
             package.json
             README.md
             LICENSE
