@@ -41,6 +41,22 @@ static std::string normalizeSQL(const std::string& sql) {
     return result;
 }
 
+static std::string sqliteModuleNameForSource(const std::string& sourceName) {
+    std::string sanitized;
+    sanitized.reserve(sourceName.size());
+    for (unsigned char c : sourceName) {
+        if (std::isalnum(c)) {
+            sanitized.push_back(static_cast<char>(std::tolower(c)));
+        } else {
+            sanitized.push_back('_');
+        }
+    }
+    if (sanitized.empty()) {
+        sanitized = "source";
+    }
+    return "__flatsql_module_" + sanitized;
+}
+
 static bool isBusyResult(int rc) {
     return rc == SQLITE_BUSY || rc == SQLITE_LOCKED;
 }
@@ -183,9 +199,7 @@ void SQLiteEngine::registerSource(
     BatchExtractor batchExtractor,
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos
 ) {
-    const std::string moduleName =
-        "__flatsql_module_" + std::to_string(reinterpret_cast<uintptr_t>(this)) + "_" +
-        std::to_string(reinterpret_cast<uintptr_t>(tableDef));
+    const std::string moduleName = sqliteModuleNameForSource(sourceName);
     if (sources_.count(sourceName)) {
         throw std::runtime_error("Source already registered: " + sourceName);
     }
@@ -233,7 +247,7 @@ void SQLiteEngine::registerSource(
     // TEMP schema DDL can hang in the WASM/SQLite build, so keep virtual tables
     // in the main schema and reserve TEMP only for caller-managed objects.
     std::ostringstream sql;
-    sql << "CREATE VIRTUAL TABLE \"" << sourceName << "\" USING \"" << moduleName << "\"()";
+    sql << "CREATE VIRTUAL TABLE IF NOT EXISTS \"" << sourceName << "\" USING \"" << moduleName << "\"()";
 
     char* errMsg = nullptr;
     rc = sqlite3_exec(db_, sql.str().c_str(), nullptr, nullptr, &errMsg);

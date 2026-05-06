@@ -42,6 +42,9 @@ cp build-wasm/flatsql.js build-wasm/flatsql.wasm "$PROJECT_ROOT/wasm/"
 if [ -f build-wasm/flatsql-wasi.wasm ]; then
     cp build-wasm/flatsql-wasi.wasm "$PROJECT_ROOT/wasm/"
 fi
+if [ -f build-wasm/flatsql-spatial.wasm ]; then
+    cp build-wasm/flatsql-spatial.wasm "$PROJECT_ROOT/sdm/"
+fi
 
 # Generate integrity hash for WASM file (SHA-384, base64 encoded)
 echo "Generating integrity hash..."
@@ -77,7 +80,7 @@ echo ""
 echo "WASM build complete!"
 echo "Output files:"
 if [ -f "$PROJECT_ROOT/wasm/flatsql-wasi.wasm" ]; then
-    ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm" "$PROJECT_ROOT/wasm/flatsql-wasi.wasm" "$PROJECT_ROOT/wasm/integrity.json" 2>/dev/null || ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm" "$PROJECT_ROOT/wasm/flatsql-wasi.wasm"
+    ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm" "$PROJECT_ROOT/wasm/flatsql-wasi.wasm" "$PROJECT_ROOT/sdm/flatsql-spatial.wasm" "$PROJECT_ROOT/wasm/integrity.json" 2>/dev/null || ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm" "$PROJECT_ROOT/wasm/flatsql-wasi.wasm" "$PROJECT_ROOT/sdm/flatsql-spatial.wasm"
 else
-    ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm" "$PROJECT_ROOT/wasm/integrity.json" 2>/dev/null || ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm"
+    ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm" "$PROJECT_ROOT/sdm/flatsql-spatial.wasm" "$PROJECT_ROOT/wasm/integrity.json" 2>/dev/null || ls -la "$PROJECT_ROOT/wasm/flatsql.js" "$PROJECT_ROOT/wasm/flatsql.wasm" "$PROJECT_ROOT/sdm/flatsql-spatial.wasm"
 fi

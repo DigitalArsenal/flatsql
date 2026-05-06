@@ -325,6 +325,16 @@ export interface InitOptions {
   requireIntegrity?: boolean;
 
   /**
+   * SHA-384 digest provider used for browser integrity verification.
+   * Browser WebCrypto is intentionally not used; browser callers that require
+   * integrity verification must pass a WASM/native-backed provider.
+   * The result may be a base64 digest string or raw digest bytes.
+   */
+  computeSHA384?: (
+    data: ArrayBuffer
+  ) => Promise<string | Uint8Array | ArrayBuffer> | string | Uint8Array | ArrayBuffer;
+
+  /**
    * Custom Emscripten module factory function
    * Default: built-in FlatSQLModule
    */

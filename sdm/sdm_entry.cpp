@@ -73,9 +73,10 @@ size_t sdm_get_output_length(void) {
 // ---------------------------------------------------------------------------
 
 static int parseDoubles(const char* buf, size_t len, double* out, int maxCount) {
+    std::string input(buf, len);
     int count = 0;
-    const char* p = buf;
-    const char* end = buf + len;
+    const char* p = input.c_str();
+    const char* end = p + input.size();
     while (p < end && count < maxCount) {
         char* next = nullptr;
         out[count] = strtod(p, &next);
