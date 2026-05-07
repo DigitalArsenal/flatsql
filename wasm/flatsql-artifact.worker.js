@@ -432,6 +432,12 @@ function withTransaction(db, beginSql, operation) {
   }
 }
 
+function readPragmaText(db, name) {
+  const row = db.prepare(`PRAGMA ${name}`).get();
+  const value = row ? Object.values(row)[0] : undefined;
+  return typeof value === 'string' ? value.toLowerCase() : String(value ?? '').toLowerCase();
+}
+
 function applyPerformanceProfile(db, profile) {
   db.exec(`PRAGMA page_size = ${DEFAULT_PAGE_SIZE}`);
   db.exec(`PRAGMA threads = ${DEFAULT_THREAD_COUNT}`);
@@ -444,6 +450,9 @@ function applyPerformanceProfile(db, profile) {
   }
 
   db.exec('PRAGMA journal_mode = OFF');
+  if (readPragmaText(db, 'journal_mode') !== 'off') {
+    db.exec('PRAGMA journal_mode = MEMORY');
+  }
   db.exec('PRAGMA synchronous = OFF');
   db.exec('PRAGMA locking_mode = EXCLUSIVE');
   db.exec('PRAGMA temp_store = MEMORY');

@@ -564,7 +564,7 @@ The index stores `(key, sequence) → (offset, length)` mappings, allowing O(log
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 24+
 - CMake 3.20+ (for WASM builds)
 - Emscripten (for WASM builds)
 

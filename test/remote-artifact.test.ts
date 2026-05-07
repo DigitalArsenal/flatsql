@@ -150,7 +150,7 @@ describe('remote artifact builder', () => {
       sqlitePath,
     });
 
-    expect(builder.query('PRAGMA journal_mode').rows).toEqual([['off']]);
+    expect(['off', 'memory']).toContain(builder.query('PRAGMA journal_mode').rows[0]?.[0]);
     expect(builder.query('PRAGMA synchronous').rows).toEqual([[0]]);
     expect(builder.query('PRAGMA page_size').rows).toEqual([[32768]]);
     expect(builder.query('PRAGMA threads').rows).toEqual([[expectedFastThreads]]);
@@ -592,9 +592,8 @@ describe('remote artifact builder', () => {
       preferSharedArrayBuffer: false,
     });
 
-    await expect(builder.query('PRAGMA journal_mode')).resolves.toMatchObject({
-      rows: [['off']],
-    });
+    const journalMode = await builder.query('PRAGMA journal_mode');
+    expect(['off', 'memory']).toContain(journalMode.rows[0]?.[0]);
     await expect(builder.query('PRAGMA synchronous')).resolves.toMatchObject({
       rows: [[0]],
     });
