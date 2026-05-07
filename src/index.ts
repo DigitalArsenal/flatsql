@@ -8,6 +8,7 @@ export * from './core/index.js';
 export * from './cluster/index.js';
 export * from './flatbuffer-accessor.js';
 export * from './artifacts/index.js';
+export * from './response/index.js';
 export * from './standalone/index.js';
 
 // Re-export main types for convenience

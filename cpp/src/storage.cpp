@@ -48,6 +48,12 @@ StreamingFlatBufferStore::StreamingFlatBufferStore(size_t initialCapacity)
     : data_(initialCapacity) {
 }
 
+void StreamingFlatBufferStore::reserveCapacity(size_t capacity) {
+    if (capacity > data_.size()) {
+        data_.resize(capacity);
+    }
+}
+
 void StreamingFlatBufferStore::ensureCapacity(size_t needed) {
     size_t totalNeeded = static_cast<size_t>(writeOffset_) + needed;
     if (totalNeeded <= data_.size()) return;

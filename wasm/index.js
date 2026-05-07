@@ -264,13 +264,17 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
         queryParams: Module.cwrap('flatsql_query_params', 'number', ['number', 'string', 'number', 'number', 'number']),
         queryMany: Module.cwrap('flatsql_query_many', 'number', ['number', 'number', 'number', 'number']),
         buildQueryCacheKey: Module.cwrap('flatsql_build_query_cache_key', 'string', ['string', 'string', 'string', 'number', 'number', 'number']),
+        buildResponseArtifactCacheKey: Module.cwrap('flatsql_build_response_artifact_cache_key', 'string', ['string', 'string', 'string', 'string', 'string', 'string', 'number', 'number', 'number']),
         registerQueryTemplate: Module.cwrap('flatsql_register_query_template', 'number', ['number', 'string', 'string', 'number']),
         queryTemplate: Module.cwrap('flatsql_query_template', 'number', ['number', 'string', 'number', 'number', 'number']),
         clearQueryCache: Module.cwrap('flatsql_clear_query_cache', null, ['number']),
+        configureQueryCache: Module.cwrap('flatsql_configure_query_cache', 'number', ['number', 'number', 'number']),
         queryCacheHits: Module.cwrap('flatsql_query_cache_hits', 'number', ['number']),
         queryCacheMisses: Module.cwrap('flatsql_query_cache_misses', 'number', ['number']),
         queryCacheSize: Module.cwrap('flatsql_query_cache_size', 'number', ['number']),
         queryCacheGeneration: Module.cwrap('flatsql_query_cache_generation', 'number', ['number']),
+        queryCacheMaxEntries: Module.cwrap('flatsql_query_cache_max_entries', 'number', ['number']),
+        queryCacheMaxRows: Module.cwrap('flatsql_query_cache_max_rows', 'number', ['number']),
         batchResultCount: Module.cwrap('flatsql_batch_result_count', 'number', []),
         selectBatchResult: Module.cwrap('flatsql_select_batch_result', 'number', ['number']),
         getError: Module.cwrap('flatsql_get_error', 'string', []),
@@ -284,17 +288,25 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
         resultCellString: Module.cwrap('flatsql_result_cell_string', 'string', ['number', 'number']),
         resultCellBlob: Module.cwrap('flatsql_result_cell_blob', 'number', ['number', 'number']),
         resultCellBlobSize: Module.cwrap('flatsql_result_cell_blob_size', 'number', ['number', 'number']),
+        queryRawFlatBufferStream: Module.cwrap('flatsql_query_raw_flatbuffer_stream', 'number', ['number', 'string', 'number', 'number', 'number']),
+        responseArtifactData: Module.cwrap('flatsql_response_artifact_data', 'number', []),
+        responseArtifactSize: Module.cwrap('flatsql_response_artifact_size', 'number', []),
+        responseArtifactRowCount: Module.cwrap('flatsql_response_artifact_row_count', 'number', []),
+        responseArtifactColumnCount: Module.cwrap('flatsql_response_artifact_column_count', 'number', []),
 
         // Export/Import
         exportData: Module.cwrap('flatsql_export_data', 'number', ['number']),
         exportSize: Module.cwrap('flatsql_export_size', 'number', []),
         loadAndRebuild: Module.cwrap('flatsql_load_and_rebuild', null, ['number', 'number', 'number']),
+        reserveStorage: Module.cwrap('flatsql_reserve_storage', null, ['number', 'number']),
+        loadFromDb: Module.cwrap('flatsql_load_from_db', null, ['number', 'number']),
 
         // Test helpers
         createTestUser: Module.cwrap('flatsql_create_test_user', 'number', ['number', 'string', 'string', 'number']),
         createTestPost: Module.cwrap('flatsql_create_test_post', 'number', ['number', 'number', 'string']),
         createTestMPE: Module.cwrap('flatsql_create_test_mpe', 'number', ['string', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'number']),
         createTestTelemetry: Module.cwrap('flatsql_create_test_telemetry', 'number', ['number', 'string', 'string', 'string', 'number', 'number', 'number']),
+        createTestPublishEvent: Module.cwrap('flatsql_create_test_publish_event', 'number', ['string', 'string', 'number', 'number']),
         testBufferSize: Module.cwrap('flatsql_test_buffer_size', 'number', []),
 
         // Stats
@@ -522,6 +534,12 @@ export class FlatSQL {
         return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
     }
 
+    createTestPublishEvent(fileId, recordId, eventIndex, payloadSize) {
+        const ptr = api.createTestPublishEvent(fileId, recordId, eventIndex, payloadSize);
+        const size = api.testBufferSize();
+        return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
+    }
+
     createTestMPE(entityId, epoch, meanMotion, eccentricity, inclination,
                   raOfAscNode, argOfPericenter, meanAnomaly, bstar, meanElementTheory = 0) {
         const ptr = api.createTestMPE(
@@ -561,6 +579,44 @@ export class FlatSQL {
             : withHeapBytes(
                 encodedParams,
                 (ptr) => api.buildQueryCacheKey(dataset, artifactVersion, queryId, ptr, encodedParams.length, params.length)
+            );
+        if (!key) {
+            throw new Error(api.getError());
+        }
+        return key;
+    }
+
+    buildResponseArtifactCacheKey(schemaName, schemaVersion, sql, options = {}) {
+        const format = options.format ?? 'json';
+        const publishEventKey = options.publishEventKey ?? '';
+        const projectionList = (options.projection ?? []).join('\n');
+        const params = options.params ?? [];
+        const encodedParams = encodeQueryParams(params);
+        const key = encodedParams.length === 0
+            ? api.buildResponseArtifactCacheKey(
+                schemaName,
+                schemaVersion,
+                sql,
+                format,
+                publishEventKey,
+                projectionList,
+                0,
+                0,
+                0
+            )
+            : withHeapBytes(
+                encodedParams,
+                (ptr) => api.buildResponseArtifactCacheKey(
+                    schemaName,
+                    schemaVersion,
+                    sql,
+                    format,
+                    publishEventKey,
+                    projectionList,
+                    ptr,
+                    encodedParams.length,
+                    params.length
+                )
             );
         if (!key) {
             throw new Error(api.getError());
@@ -680,12 +736,27 @@ export class FlatSQLDatabase {
         api.clearQueryCache(this._handle);
     }
 
+    configureQueryCache({ maxEntries, maxRows }) {
+        if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+            throw new TypeError(`maxEntries must be a positive safe integer, received: ${maxEntries}`);
+        }
+        if (!Number.isSafeInteger(maxRows) || maxRows <= 0) {
+            throw new TypeError(`maxRows must be a positive safe integer, received: ${maxRows}`);
+        }
+        const success = api.configureQueryCache(this._handle, maxEntries, maxRows);
+        if (!success) {
+            throw new Error(api.getError());
+        }
+    }
+
     getQueryCacheStats() {
         return {
             hits: api.queryCacheHits(this._handle),
             misses: api.queryCacheMisses(this._handle),
             size: api.queryCacheSize(this._handle),
-            generation: api.queryCacheGeneration(this._handle)
+            generation: api.queryCacheGeneration(this._handle),
+            maxEntries: api.queryCacheMaxEntries(this._handle),
+            maxRows: api.queryCacheMaxRows(this._handle)
         };
     }
 
@@ -714,6 +785,23 @@ export class FlatSQLDatabase {
         return results;
     }
 
+    queryRawFlatBufferStream(sql, params = []) {
+        const encodedParams = encodeQueryParams(params);
+        const success = encodedParams.length === 0
+            ? api.queryRawFlatBufferStream(this._handle, sql, 0, 0, 0)
+            : withHeapBytes(
+                encodedParams,
+                (ptr) => api.queryRawFlatBufferStream(this._handle, sql, ptr, encodedParams.length, params.length)
+            );
+        if (!success) {
+            throw new Error(api.getError());
+        }
+
+        const ptr = api.responseArtifactData();
+        const size = api.responseArtifactSize();
+        return ptr && size > 0 ? new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice() : new Uint8Array();
+    }
+
     exportData() {
         const ptr = api.exportData(this._handle);
         const size = api.exportSize();
@@ -725,6 +813,17 @@ export class FlatSQLDatabase {
         Module.HEAPU8.set(data, ptr);
         api.loadAndRebuild(this._handle, ptr, data.length);
         Module._free(ptr);
+    }
+
+    reserveStorageBytes(bytes) {
+        api.reserveStorage(this._handle, bytes);
+    }
+
+    loadAndRebuildFrom(sourceDb) {
+        if (!sourceDb?._handle) {
+            throw new TypeError('loadAndRebuildFrom requires a FlatSQL WASM database.');
+        }
+        api.loadFromDb(this._handle, sourceDb._handle);
     }
 
     getStats() {

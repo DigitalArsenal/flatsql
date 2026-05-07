@@ -28,4 +28,11 @@ describe('WASM package crypto boundary', () => {
     expect(types).toContain('computeSHA384?');
     expect(types).toContain('Browser WebCrypto is intentionally not used');
   });
+
+  test('response artifact helpers avoid Node-only crypto imports', () => {
+    const source = readRepoFile('src/response/cache-key.ts');
+
+    expect(source).not.toContain('node:crypto');
+    expect(source).not.toContain('createHash');
+  });
 });

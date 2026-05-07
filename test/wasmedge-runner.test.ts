@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createStandaloneArtifactBuilder } from '../src/artifacts/index.js';
+import { decodeSizePrefixedStream } from '../src/artifacts/transport.js';
 import {
   buildFlatSQLWasmEdgeRunner,
   hasWasmEdgeBuildInputs,
@@ -42,6 +43,7 @@ describe('WasmEdge process runner', () => {
         flatsql.createTestUser(1, 'Alice', 'alice@example.com', 30),
         flatsql.createTestUser(2, 'Bob', 'bob@example.com', 25),
       ]);
+      await builder.configureQueryCache({ maxEntries: 16, maxRows: 8 });
       await builder.registerQueryTemplate('userByEmail', 'SELECT id FROM User WHERE email = ?', true);
 
       await expect(builder.queryTemplate('userByEmail', ['alice@example.com'])).resolves.toEqual({
@@ -49,7 +51,13 @@ describe('WasmEdge process runner', () => {
         rows: [[1]],
         rowCount: 1,
       });
-      await expect(builder.getQueryCacheStats()).resolves.toMatchObject({ hits: 0, misses: 1, size: 1 });
+      await expect(builder.getQueryCacheStats()).resolves.toMatchObject({
+        hits: 0,
+        misses: 1,
+        size: 1,
+        maxEntries: 16,
+        maxRows: 8,
+      });
 
       await expect(builder.queryTemplate('userByEmail', ['alice@example.com'])).resolves.toEqual({
         columns: ['id'],
@@ -58,6 +66,23 @@ describe('WasmEdge process runner', () => {
       });
       await expect(builder.getQueryCacheStats()).resolves.toMatchObject({ hits: 1, misses: 1, size: 1 });
       await expect(builder.getFlatBufferByIndex('User', 'email', ['alice@example.com'])).resolves.toBeInstanceOf(Uint8Array);
+      const rawStream = await builder.queryRawFlatBufferStream(
+        'SELECT _data FROM User WHERE email = ?',
+        ['bob@example.com']
+      );
+      expect(decodeSizePrefixedStream(rawStream)).toEqual([
+        flatsql.createTestUser(2, 'Bob', 'bob@example.com', 25),
+      ]);
+      await expect(
+        builder.buildResponseArtifactCacheKey('PNM', '2', ' SELECT   *   FROM PNM WHERE FILE_ID = ? ', {
+          format: 'raw',
+          publishEventKey: 'PNM-event-1',
+          projection: ['FILE_ID'],
+          params: ['PNM|42'],
+        })
+      ).resolves.toBe(
+        'flatsql:response:v1|s=504e4d|v=32|f=726177|e=504e4d2d6576656e742d31|q=53454c454354202a2046524f4d20504e4d2057484552452046494c455f4944203d203f|c=1:46494c455f4944|p=1:s=504e4d7c3432'
+      );
     } finally {
       await builder.close();
     }

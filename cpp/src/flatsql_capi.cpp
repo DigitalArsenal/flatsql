@@ -6,7 +6,9 @@
 #include <flatbuffers/flatbuffers.h>
 #include <flatbuffers/encryption.h>
 #include "../schemas/mpe_schema_generated.h"
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <vector>
 #include <string>
 
@@ -251,6 +253,86 @@ std::vector<uint8_t> createTelemetryFlatBufferInternal(int32_t packetId,
     return fb;
 }
 
+std::vector<uint8_t> createPublishEventFlatBufferInternal(const std::string& fileId,
+                                                          const std::string& recordId,
+                                                          int32_t eventIndex,
+                                                          int32_t payloadSize) {
+    const int32_t normalizedPayloadSize = std::max(payloadSize, 0);
+    std::vector<uint8_t> fb;
+
+    fb.resize(4);
+    fb.push_back('P'); fb.push_back('U'); fb.push_back('B'); fb.push_back('L');
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t vtableStart = fb.size();
+    writeU16(fb, 14);
+    writeU16(fb, 24);
+    writeU16(fb, 4);
+    writeU16(fb, 8);
+    writeU16(fb, 12);
+    writeU16(fb, 16);
+    writeU16(fb, 20);
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t tableStart = fb.size();
+    int32_t vtableOffset = static_cast<int32_t>(tableStart - vtableStart);
+    writeI32(fb, vtableOffset);
+    writeU32(fb, 0);  // FILE_ID offset placeholder
+    writeU32(fb, 0);  // RECORD_ID offset placeholder
+    writeI32(fb, eventIndex);
+    writeI32(fb, normalizedPayloadSize);
+    writeU32(fb, 0);  // PAYLOAD offset placeholder
+
+    size_t fileIdFieldPos = tableStart + 4;
+    size_t recordIdFieldPos = tableStart + 8;
+    size_t payloadFieldPos = tableStart + 20;
+
+    size_t actualFileIdPos = fb.size();
+    writeU32(fb, static_cast<uint32_t>(fileId.size()));
+    for (char c : fileId) fb.push_back(static_cast<uint8_t>(c));
+    fb.push_back(0);
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t actualRecordIdPos = fb.size();
+    writeU32(fb, static_cast<uint32_t>(recordId.size()));
+    for (char c : recordId) fb.push_back(static_cast<uint8_t>(c));
+    fb.push_back(0);
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t actualPayloadPos = fb.size();
+    writeU32(fb, static_cast<uint32_t>(normalizedPayloadSize));
+    for (int32_t index = 0; index < normalizedPayloadSize; index++) {
+        fb.push_back(static_cast<uint8_t>((eventIndex * 31 + index * 17) % 256));
+    }
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    uint32_t fileIdRelOffset = static_cast<uint32_t>(actualFileIdPos - fileIdFieldPos);
+    fb[fileIdFieldPos] = fileIdRelOffset & 0xFF;
+    fb[fileIdFieldPos + 1] = (fileIdRelOffset >> 8) & 0xFF;
+    fb[fileIdFieldPos + 2] = (fileIdRelOffset >> 16) & 0xFF;
+    fb[fileIdFieldPos + 3] = (fileIdRelOffset >> 24) & 0xFF;
+
+    uint32_t recordIdRelOffset = static_cast<uint32_t>(actualRecordIdPos - recordIdFieldPos);
+    fb[recordIdFieldPos] = recordIdRelOffset & 0xFF;
+    fb[recordIdFieldPos + 1] = (recordIdRelOffset >> 8) & 0xFF;
+    fb[recordIdFieldPos + 2] = (recordIdRelOffset >> 16) & 0xFF;
+    fb[recordIdFieldPos + 3] = (recordIdRelOffset >> 24) & 0xFF;
+
+    uint32_t payloadRelOffset = static_cast<uint32_t>(actualPayloadPos - payloadFieldPos);
+    fb[payloadFieldPos] = payloadRelOffset & 0xFF;
+    fb[payloadFieldPos + 1] = (payloadRelOffset >> 8) & 0xFF;
+    fb[payloadFieldPos + 2] = (payloadRelOffset >> 16) & 0xFF;
+    fb[payloadFieldPos + 3] = (payloadRelOffset >> 24) & 0xFF;
+
+    uint32_t rootOffset = static_cast<uint32_t>(tableStart);
+    fb[0] = rootOffset & 0xFF;
+    fb[1] = (rootOffset >> 8) & 0xFF;
+    fb[2] = (rootOffset >> 16) & 0xFF;
+    fb[3] = (rootOffset >> 24) & 0xFF;
+
+    return fb;
+}
+
 uint16_t getFieldOffset(const uint8_t* vtable, uint16_t vtableSize, int fieldIndex) {
     size_t vtableEntry = 4 + fieldIndex * 2;
     if (vtableEntry + 2 > vtableSize) return 0;
@@ -393,6 +475,40 @@ Value extractTelemetryFieldGeneric(const uint8_t* data, size_t length, const std
     return std::monostate{};
 }
 
+Value extractPublishEventFieldGeneric(const uint8_t* data, size_t length, const std::string& fieldName) {
+    (void)length;
+    if (!data) return std::monostate{};
+
+    uint32_t rootOffset = flatbuffers::ReadScalar<uint32_t>(data);
+    const uint8_t* root = data + rootOffset;
+    int32_t vtableOffset = flatbuffers::ReadScalar<int32_t>(root);
+    const uint8_t* vtable = root - vtableOffset;
+    uint16_t vtableSize = flatbuffers::ReadScalar<uint16_t>(vtable);
+
+    auto readString = [&](int fieldIndex) -> Value {
+        uint16_t off = getFieldOffset(vtable, vtableSize, fieldIndex);
+        if (off == 0) return std::string();
+        uint32_t strOffset = flatbuffers::ReadScalar<uint32_t>(root + off);
+        const uint8_t* strPtr = root + off + strOffset;
+        uint32_t strLen = flatbuffers::ReadScalar<uint32_t>(strPtr);
+        const char* str = reinterpret_cast<const char*>(strPtr + 4);
+        return std::string(str, strLen);
+    };
+
+    auto readInt = [&](int fieldIndex) -> Value {
+        uint16_t off = getFieldOffset(vtable, vtableSize, fieldIndex);
+        if (off == 0) return static_cast<int32_t>(0);
+        return static_cast<int32_t>(flatbuffers::ReadScalar<int32_t>(root + off));
+    };
+
+    if (fieldName == "FILE_ID") return readString(0);
+    if (fieldName == "RECORD_ID") return readString(1);
+    if (fieldName == "EVENT_INDEX") return readInt(2);
+    if (fieldName == "PAYLOAD_SIZE") return readInt(3);
+
+    return std::monostate{};
+}
+
 enum ParamTag : uint8_t {
     PARAM_NULL = 0,
     PARAM_BOOL = 1,
@@ -478,6 +594,29 @@ std::vector<Value> decodeParams(const uint8_t* data, size_t length, int paramCou
     return params;
 }
 
+std::vector<std::string> decodeStringList(const char* data) {
+    std::vector<std::string> values;
+    if (!data || data[0] == '\0') {
+        return values;
+    }
+
+    std::string input(data);
+    size_t start = 0;
+    while (start <= input.size()) {
+        const size_t end = input.find('\n', start);
+        const size_t length = (end == std::string::npos) ? input.size() - start : end - start;
+        if (length > 0) {
+            values.emplace_back(input.substr(start, length));
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return values;
+}
+
 struct QueryRequest {
     std::string sql;
     std::vector<Value> params;
@@ -536,6 +675,9 @@ int g_selectedBatchResult = -1;
 std::string g_lastError;
 std::string g_cacheKeyBuffer;
 std::vector<uint8_t> g_exportBuffer;
+std::vector<uint8_t> g_responseArtifactBuffer;
+size_t g_responseArtifactRowCount = 0;
+size_t g_responseArtifactColumnCount = 0;
 std::vector<uint8_t> g_testBuffer;
 std::vector<FlatSQLDatabase::TableStats> g_statsBuffer;
 std::vector<std::string> g_sourcesBuffer;
@@ -583,6 +725,9 @@ void flatsql_enable_demo_extractors(void* handle) {
     }
     if (db->getTableDef("Telemetry")) {
         db->setFieldExtractor("Telemetry", extractTelemetryFieldGeneric);
+    }
+    if (db->getTableDef("PublishEventRecord")) {
+        db->setFieldExtractor("PublishEventRecord", extractPublishEventFieldGeneric);
     }
 }
 
@@ -719,6 +864,37 @@ const char* flatsql_build_query_cache_key(
 }
 
 EMSCRIPTEN_KEEPALIVE
+const char* flatsql_build_response_artifact_cache_key(
+    const char* schemaName,
+    const char* schemaVersion,
+    const char* sql,
+    const char* format,
+    const char* publishEventKey,
+    const char* projectionList,
+    const uint8_t* paramData,
+    size_t paramLength,
+    int paramCount
+) {
+    try {
+        g_cacheKeyBuffer = buildResponseArtifactCacheKey(
+            schemaName ? schemaName : "",
+            schemaVersion ? schemaVersion : "",
+            sql ? sql : "",
+            format ? format : "",
+            publishEventKey ? publishEventKey : "",
+            decodeStringList(projectionList),
+            decodeParams(paramData, paramLength, paramCount)
+        );
+        g_lastError.clear();
+        return g_cacheKeyBuffer.c_str();
+    } catch (const std::exception& e) {
+        g_cacheKeyBuffer.clear();
+        g_lastError = e.what();
+        return "";
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
 int flatsql_register_query_template(void* handle,
                                     const char* queryId,
                                     const char* sql,
@@ -764,6 +940,18 @@ void flatsql_clear_query_cache(void* handle) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+int flatsql_configure_query_cache(void* handle, size_t maxEntries, size_t maxRows) {
+    try {
+        static_cast<FlatSQLDatabase*>(handle)->configureQueryResultCache(maxEntries, maxRows);
+        g_lastError.clear();
+        return 1;
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
 double flatsql_query_cache_hits(void* handle) {
     return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getQueryCacheStats().hits);
 }
@@ -781,6 +969,16 @@ double flatsql_query_cache_size(void* handle) {
 EMSCRIPTEN_KEEPALIVE
 double flatsql_query_cache_generation(void* handle) {
     return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getQueryCacheStats().generation);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_query_cache_max_entries(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getQueryCacheStats().maxEntries);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_query_cache_max_rows(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getQueryCacheStats().maxRows);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -891,6 +1089,68 @@ const uint8_t* flatsql_export_data(void* handle) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+int flatsql_query_raw_flatbuffer_stream(
+    void* handle,
+    const char* sql,
+    const uint8_t* paramData,
+    size_t paramLength,
+    int paramCount
+) {
+    try {
+        auto result = static_cast<FlatSQLDatabase*>(handle)->query(
+            sql ? sql : "",
+            decodeParams(paramData, paramLength, paramCount)
+        );
+
+        g_responseArtifactBuffer.clear();
+        g_responseArtifactRowCount = result.rows.size();
+        g_responseArtifactColumnCount = result.columns.size();
+        for (const auto& row : result.rows) {
+            for (const auto& value : row) {
+                const auto* bytes = std::get_if<std::vector<uint8_t>>(&value);
+                if (!bytes) {
+                    throw std::runtime_error("raw response stream queries must return only BLOB cells");
+                }
+                if (bytes->size() > std::numeric_limits<uint32_t>::max()) {
+                    throw std::runtime_error("raw response stream record exceeds size-prefix capacity");
+                }
+                writeU32(g_responseArtifactBuffer, static_cast<uint32_t>(bytes->size()));
+                g_responseArtifactBuffer.insert(g_responseArtifactBuffer.end(), bytes->begin(), bytes->end());
+            }
+        }
+
+        g_lastError.clear();
+        return 1;
+    } catch (const std::exception& e) {
+        g_responseArtifactBuffer.clear();
+        g_responseArtifactRowCount = 0;
+        g_responseArtifactColumnCount = 0;
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+const uint8_t* flatsql_response_artifact_data() {
+    return g_responseArtifactBuffer.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_response_artifact_size() {
+    return static_cast<int>(g_responseArtifactBuffer.size());
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_response_artifact_row_count() {
+    return static_cast<double>(g_responseArtifactRowCount);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_response_artifact_column_count() {
+    return static_cast<double>(g_responseArtifactColumnCount);
+}
+
+EMSCRIPTEN_KEEPALIVE
 int flatsql_export_size() {
     return static_cast<int>(g_exportBuffer.size());
 }
@@ -898,6 +1158,21 @@ int flatsql_export_size() {
 EMSCRIPTEN_KEEPALIVE
 void flatsql_load_and_rebuild(void* handle, const uint8_t* data, size_t length) {
     static_cast<FlatSQLDatabase*>(handle)->loadAndRebuild(data, length);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void flatsql_reserve_storage(void* handle, size_t bytes) {
+    static_cast<FlatSQLDatabase*>(handle)->reserveStorage(bytes);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void flatsql_load_from_db(void* handle, void* sourceHandle) {
+    auto* source = static_cast<FlatSQLDatabase*>(sourceHandle);
+    const auto& sourceStorage = source->getStorage();
+    static_cast<FlatSQLDatabase*>(handle)->loadAndRebuild(
+        sourceStorage.getDataBuffer(),
+        static_cast<size_t>(sourceStorage.getDataSize())
+    );
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -956,6 +1231,20 @@ const uint8_t* flatsql_create_test_telemetry(int32_t packetId,
                                                      temperatureC,
                                                      signalDb,
                                                      timestampS);
+    return g_testBuffer.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+const uint8_t* flatsql_create_test_publish_event(const char* fileId,
+                                                 const char* recordId,
+                                                 int32_t eventIndex,
+                                                 int32_t payloadSize) {
+    g_testBuffer = createPublishEventFlatBufferInternal(
+        fileId ? fileId : "",
+        recordId ? recordId : "",
+        eventIndex,
+        payloadSize
+    );
     return g_testBuffer.data();
 }
 

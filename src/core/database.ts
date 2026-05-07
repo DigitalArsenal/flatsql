@@ -102,6 +102,20 @@ export class FlatSQLDatabase {
     return rowids;
   }
 
+  // Create a runtime index without requiring database-specific schema annotations.
+  createIndex(tableName: string, columnName: string): void {
+    const tableStore = this.tables.get(tableName);
+    if (!tableStore) {
+      throw new Error(`Table not found: ${tableName}`);
+    }
+
+    tableStore.createIndex(columnName);
+  }
+
+  getStorageBytes(): number {
+    return this.storage.getCurrentSize();
+  }
+
   // Execute a simple SQL query
   // Supports: SELECT columns FROM table WHERE column = value
   //           SELECT columns FROM table WHERE column BETWEEN min AND max
@@ -165,6 +179,10 @@ export class FlatSQLDatabase {
       records = tableStore.scanAll();
     }
 
+    if (parsed.limit !== undefined) {
+      records = records.slice(0, parsed.limit);
+    }
+
     // Determine columns
     const tableDef = tableStore.getTableDef();
     const columns = parsed.columns[0] === '*'
@@ -176,6 +194,7 @@ export class FlatSQLDatabase {
       return columns.map(col => {
         if (col === '_rowid') return record.rowid;
         if (col === '_offset') return record.offset;
+        if (col === '_data') return record.data;
         return record.fields.get(col) ?? null;
       });
     });
@@ -199,6 +218,7 @@ export class FlatSQLDatabase {
       const columns = selectMatch[1].split(',').map(c => c.trim());
       const table = selectMatch[2];
       const whereClause = selectMatch[3];
+      const limit = selectMatch[5] === undefined ? undefined : Number(selectMatch[5]);
 
       let where: ParsedQuery['where'];
 
@@ -230,6 +250,7 @@ export class FlatSQLDatabase {
         table,
         columns,
         where,
+        limit,
       };
     }
 
@@ -346,4 +367,5 @@ interface ParsedQuery {
     minValue?: any;
     maxValue?: any;
   };
+  limit?: number;
 }

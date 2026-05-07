@@ -19,6 +19,27 @@ export interface StandaloneArtifactBuilderOptions {
 type MaybePromise<T> = T | Promise<T>;
 type StandaloneQueryParam = null | boolean | number | string | Uint8Array;
 
+export interface StandaloneResponseArtifactCacheKeyOptions {
+  format?: string;
+  publishEventKey?: string | null;
+  projection?: readonly string[];
+  params?: ArtifactQueryParams;
+}
+
+export interface StandaloneQueryCacheConfig {
+  maxEntries: number;
+  maxRows: number;
+}
+
+export interface StandaloneQueryCacheStats {
+  hits: number;
+  misses: number;
+  size: number;
+  generation: number;
+  maxEntries: number;
+  maxRows: number;
+}
+
 interface StandaloneDatabase {
   destroy(): MaybePromise<void>;
   registerFileId(fileId: string, tableName: string): MaybePromise<void>;
@@ -27,16 +48,31 @@ interface StandaloneDatabase {
   ingestBuffers(buffers: Uint8Array[], source?: string | null): MaybePromise<number>;
   query(sql: string, params?: StandaloneQueryParam[]): MaybePromise<{ columns: string[]; rows: unknown[][] }>;
   queryMany(queries: Array<{ sql: string; params?: StandaloneQueryParam[] }>): MaybePromise<Array<{ columns: string[]; rows: unknown[][] }>>;
+  queryRawFlatBufferStream(sql: string, params?: StandaloneQueryParam[]): MaybePromise<Uint8Array>;
   registerQueryTemplate(queryId: string, sql: string, cacheable?: boolean): MaybePromise<void>;
   queryTemplate(queryId: string, params?: StandaloneQueryParam[]): MaybePromise<{ columns: string[]; rows: unknown[][] }>;
   clearQueryCache(): MaybePromise<void>;
-  getQueryCacheStats(): MaybePromise<{ hits: number; misses: number; size: number; generation: number }>;
+  configureQueryCache(config: StandaloneQueryCacheConfig): MaybePromise<void>;
+  getQueryCacheStats(): MaybePromise<StandaloneQueryCacheStats>;
   getFlatBufferByIndex(tableName: string, indexName: string, keyParams?: StandaloneQueryParam[]): MaybePromise<Uint8Array | null>;
   exportData(): MaybePromise<Uint8Array>;
   loadAndRebuild(data: Uint8Array): MaybePromise<void>;
+  reserveStorageBytes(bytes: number): MaybePromise<void>;
+  loadAndRebuildFrom(sourceDb: StandaloneDatabase): MaybePromise<void>;
 }
 
 interface StandaloneRuntime {
+  buildResponseArtifactCacheKey(
+    schemaName: string,
+    schemaVersion: string,
+    sql: string,
+    options?: {
+      format?: string;
+      publishEventKey?: string | null;
+      projection?: readonly string[];
+      params?: StandaloneQueryParam[];
+    }
+  ): MaybePromise<string>;
   createDatabase(schema: string, dbName?: string): MaybePromise<StandaloneDatabase>;
   close?(): MaybePromise<void>;
 }
@@ -160,6 +196,10 @@ export class FlatSQLStandaloneArtifactBuilder {
     return result instanceof Promise ? result.then((items) => items.map(normalizeResult)) : result.map(normalizeResult);
   }
 
+  queryRawFlatBufferStream(sql: string, params?: ArtifactQueryParams): MaybePromise<Uint8Array> {
+    return this.db.queryRawFlatBufferStream(sql, normalizeQueryParams(params) ?? []);
+  }
+
   registerQueryTemplate(queryId: string, sql: string, cacheable = true): MaybePromise<void> {
     return this.db.registerQueryTemplate(queryId, sql, cacheable);
   }
@@ -173,8 +213,26 @@ export class FlatSQLStandaloneArtifactBuilder {
     return this.db.clearQueryCache();
   }
 
-  getQueryCacheStats(): MaybePromise<{ hits: number; misses: number; size: number; generation: number }> {
+  configureQueryCache(config: StandaloneQueryCacheConfig): MaybePromise<void> {
+    return this.db.configureQueryCache(config);
+  }
+
+  getQueryCacheStats(): MaybePromise<StandaloneQueryCacheStats> {
     return this.db.getQueryCacheStats();
+  }
+
+  buildResponseArtifactCacheKey(
+    schemaName: string,
+    schemaVersion: string | number,
+    sql: string,
+    options: StandaloneResponseArtifactCacheKeyOptions = {}
+  ): MaybePromise<string> {
+    return this.standaloneRuntime.buildResponseArtifactCacheKey(schemaName, String(schemaVersion), sql, {
+      format: options.format,
+      publishEventKey: options.publishEventKey,
+      projection: options.projection,
+      params: normalizeQueryParams(options.params) ?? [],
+    });
   }
 
   getFlatBufferByIndex(tableName: string, indexName: string, keyParams?: ArtifactQueryParams): MaybePromise<Uint8Array | null> {
@@ -187,6 +245,14 @@ export class FlatSQLStandaloneArtifactBuilder {
 
   loadAndRebuild(data: Uint8Array): MaybePromise<void> {
     return this.db.loadAndRebuild(data);
+  }
+
+  reserveStorageBytes(bytes: number): MaybePromise<void> {
+    return this.db.reserveStorageBytes(bytes);
+  }
+
+  loadAndRebuildFrom(source: FlatSQLStandaloneArtifactBuilder): MaybePromise<void> {
+    return this.db.loadAndRebuildFrom(source.db);
   }
 }
 

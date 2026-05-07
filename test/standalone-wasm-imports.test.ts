@@ -12,6 +12,7 @@ const REQUIRED_EXPORTS = [
   'flatsql_destroy_db',
   'flatsql_register_file_id',
   'flatsql_ingest',
+  'flatsql_build_response_artifact_cache_key',
   'flatsql_register_query_template',
   'flatsql_query_template',
   'flatsql_query_cache_hits',

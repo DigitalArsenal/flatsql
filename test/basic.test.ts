@@ -64,6 +64,25 @@ describe('BTree', () => {
     expect(results[0].dataOffset).toBe(200n);
   });
 
+  test('returns every duplicate key after node splits', () => {
+    const tree = new BTree({
+      name: 'file_id_idx',
+      tableName: 'records',
+      columnName: 'FILE_ID',
+      keyType: KeyType.String,
+      order: 4,
+    });
+
+    for (let index = 0; index < 20; index++) {
+      tree.insert('publish-event-1', BigInt(index * 100), 50, BigInt(index));
+    }
+
+    const results = tree.search('publish-event-1');
+
+    expect(results).toHaveLength(20);
+    expect(new Set(results.map((entry) => entry.sequence))).toHaveProperty('size', 20);
+  });
+
   test('serialization', () => {
     const tree = new BTree({
       name: 'test_idx',
@@ -236,6 +255,28 @@ describe('FlatSQLDatabase', () => {
     const filtered = db.query("SELECT name, age FROM User WHERE age = 25");
     expect(filtered.rowCount).toBe(1);
     expect(filtered.rows[0]).toContain('Bob');
+  });
+
+  test('honors LIMIT for large result queries', () => {
+    const schema = parseSchema(`
+      table Event {
+        id: int;
+        type: string;
+      }
+      root_type Event;
+    `, 'events');
+
+    const accessor = new MockAccessor();
+    const db = new FlatSQLDatabase(schema, accessor);
+
+    for (let index = 0; index < 10; index++) {
+      db.insert('Event', { id: index, type: 'sample' });
+    }
+
+    const limited = db.query('SELECT id FROM Event LIMIT 3');
+
+    expect(limited.rowCount).toBe(3);
+    expect(limited.rows).toEqual([[0], [1], [2]]);
   });
 
   test('streaming insert', () => {

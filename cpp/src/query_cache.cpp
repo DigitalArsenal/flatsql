@@ -1,4 +1,5 @@
 #include "flatsql/query_cache.h"
+#include <cctype>
 #include <iomanip>
 #include <sstream>
 #include <type_traits>
@@ -67,6 +68,61 @@ std::string buildQueryCacheKey(const std::string& dataset,
         key.push_back(':');
         key += encodeValueForCacheKey(param);
     }
+    return key;
+}
+
+namespace {
+
+std::string normalizeSqlForCacheKey(const std::string& sql) {
+    std::string normalized;
+    normalized.reserve(sql.size());
+    bool pendingSpace = false;
+
+    for (unsigned char ch : sql) {
+        if (std::isspace(ch)) {
+            if (!normalized.empty()) {
+                pendingSpace = true;
+            }
+            continue;
+        }
+
+        if (pendingSpace) {
+            normalized.push_back(' ');
+            pendingSpace = false;
+        }
+        normalized.push_back(static_cast<char>(ch));
+    }
+
+    return normalized;
+}
+
+}  // namespace
+
+std::string buildResponseArtifactCacheKey(const std::string& schemaName,
+                                          const std::string& schemaVersion,
+                                          const std::string& sql,
+                                          const std::string& format,
+                                          const std::string& publishEventKey,
+                                          const std::vector<std::string>& projection,
+                                          const std::vector<Value>& params) {
+    std::string key = "flatsql:response:v1|s=" + stringToHex(schemaName) +
+                      "|v=" + stringToHex(schemaVersion) +
+                      "|f=" + stringToHex(format) +
+                      "|e=" + stringToHex(publishEventKey) +
+                      "|q=" + stringToHex(normalizeSqlForCacheKey(sql)) +
+                      "|c=" + std::to_string(projection.size());
+
+    for (const auto& column : projection) {
+        key.push_back(':');
+        key += stringToHex(column);
+    }
+
+    key += "|p=" + std::to_string(params.size());
+    for (const auto& param : params) {
+        key.push_back(':');
+        key += encodeValueForCacheKey(param);
+    }
+
     return key;
 }
 

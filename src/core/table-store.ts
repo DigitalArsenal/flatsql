@@ -62,6 +62,41 @@ export class TableStore {
     }
   }
 
+  // Create or rebuild a runtime index without requiring schema annotations.
+  createIndex(columnName: string): void {
+    if (this.indexes.has(columnName)) {
+      return;
+    }
+
+    const column = this.tableDef.columns.find((candidate) => candidate.name === columnName);
+    if (!column) {
+      throw new Error(`Column not found: ${this.tableDef.name}.${columnName}`);
+    }
+
+    const index = new BTree({
+      name: `${this.tableDef.name}_${column.name}_idx`,
+      tableName: this.tableDef.name,
+      columnName: column.name,
+      keyType: this.columnTypeToKeyType(column.sqlType),
+      order: 64,
+    });
+
+    for (const storedRecord of this.storage.iterateTableRecords(this.tableDef.name)) {
+      let key: any;
+      if (column.name === '_rowid') {
+        key = Number(storedRecord.header.sequence);
+      } else if (column.name === '_offset') {
+        key = Number(storedRecord.offset);
+      } else {
+        key = this.fieldAccessor(storedRecord.data, column.flatbufferPath);
+      }
+
+      index.insert(key, storedRecord.offset, storedRecord.data.length, storedRecord.header.sequence);
+    }
+
+    this.indexes.set(column.name, index);
+  }
+
   // Insert a new record
   insert(flatbufferData: Uint8Array): bigint {
     const rowid = this.rowIdCounter++;

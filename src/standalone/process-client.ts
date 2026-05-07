@@ -15,6 +15,11 @@ const OP_QUERY_CACHE_STATS = 11;
 const OP_GET_FLATBUFFER_BY_INDEX = 12;
 const OP_EXPORT_DATA = 13;
 const OP_LOAD_AND_REBUILD = 14;
+const OP_BUILD_RESPONSE_ARTIFACT_CACHE_KEY = 15;
+const OP_QUERY_RAW_FLATBUFFER_STREAM = 16;
+const OP_RESERVE_STORAGE = 17;
+const OP_LOAD_FROM_DB = 18;
+const OP_CONFIGURE_QUERY_CACHE = 19;
 
 const PARAM_NULL = 0;
 const PARAM_BOOL = 1;
@@ -86,8 +91,11 @@ class BinaryWriter {
 
 class BinaryReader {
   private offset = 0;
+  private readonly data: Uint8Array;
 
-  constructor(private readonly data: Uint8Array) {}
+  constructor(data: Uint8Array) {
+    this.data = new Uint8Array(data);
+  }
 
   u8(): number {
     this.require(1);
@@ -411,6 +419,37 @@ export class FlatSQLWasmEdgeProcessRuntime {
   close(): Promise<void> {
     return this.process.close();
   }
+
+  async buildResponseArtifactCacheKey(
+    schemaName: string,
+    schemaVersion: string,
+    sql: string,
+    options: {
+      format?: string;
+      publishEventKey?: string | null;
+      projection?: readonly string[];
+      params?: StandaloneQueryParam[];
+    } = {}
+  ): Promise<string> {
+    const params = options.params ?? [];
+    const paramBytes = encodeQueryParams(params);
+    const reader = await this.process.request(
+      writeRequest(OP_BUILD_RESPONSE_ARTIFACT_CACHE_KEY, (writer) => {
+        writer.string(schemaName);
+        writer.string(schemaVersion);
+        writer.string(sql);
+        writer.string(options.format ?? 'json');
+        writer.string(options.publishEventKey ?? '');
+        writer.u32(options.projection?.length ?? 0);
+        for (const column of options.projection ?? []) {
+          writer.string(column);
+        }
+        writer.u32(params.length);
+        writer.bytes(paramBytes);
+      })
+    );
+    return reader.string();
+  }
 }
 
 export class FlatSQLWasmEdgeProcessDatabase {
@@ -494,6 +533,19 @@ export class FlatSQLWasmEdgeProcessDatabase {
     return results;
   }
 
+  async queryRawFlatBufferStream(sql: string, params: StandaloneQueryParam[] = []): Promise<Uint8Array> {
+    const paramBytes = encodeQueryParams(params);
+    const reader = await this.process.request(
+      writeRequest(OP_QUERY_RAW_FLATBUFFER_STREAM, (writer) => {
+        writer.u32(this.handle);
+        writer.string(sql);
+        writer.u32(params.length);
+        writer.bytes(paramBytes);
+      })
+    );
+    return reader.bytes();
+  }
+
   async registerQueryTemplate(queryId: string, sql: string, cacheable = true): Promise<void> {
     await this.process.request(
       writeRequest(OP_REGISTER_QUERY_TEMPLATE, (writer) => {
@@ -522,13 +574,38 @@ export class FlatSQLWasmEdgeProcessDatabase {
     await this.process.request(writeRequest(OP_CLEAR_QUERY_CACHE, (writer) => writer.u32(this.handle)));
   }
 
-  async getQueryCacheStats(): Promise<{ hits: number; misses: number; size: number; generation: number }> {
+  async configureQueryCache({ maxEntries, maxRows }: { maxEntries: number; maxRows: number }): Promise<void> {
+    if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+      throw new TypeError(`maxEntries must be a positive safe integer, received: ${maxEntries}`);
+    }
+    if (!Number.isSafeInteger(maxRows) || maxRows <= 0) {
+      throw new TypeError(`maxRows must be a positive safe integer, received: ${maxRows}`);
+    }
+    await this.process.request(
+      writeRequest(OP_CONFIGURE_QUERY_CACHE, (writer) => {
+        writer.u32(this.handle);
+        writer.u32(maxEntries);
+        writer.u32(maxRows);
+      })
+    );
+  }
+
+  async getQueryCacheStats(): Promise<{
+    hits: number;
+    misses: number;
+    size: number;
+    generation: number;
+    maxEntries: number;
+    maxRows: number;
+  }> {
     const reader = await this.process.request(writeRequest(OP_QUERY_CACHE_STATS, (writer) => writer.u32(this.handle)));
     return {
       hits: reader.f64(),
       misses: reader.f64(),
       size: reader.f64(),
       generation: reader.f64(),
+      maxEntries: reader.f64(),
+      maxRows: reader.f64(),
     };
   }
 
@@ -560,6 +637,24 @@ export class FlatSQLWasmEdgeProcessDatabase {
       writeRequest(OP_LOAD_AND_REBUILD, (writer) => {
         writer.u32(this.handle);
         writer.bytes(data);
+      })
+    );
+  }
+
+  async reserveStorageBytes(bytes: number): Promise<void> {
+    await this.process.request(
+      writeRequest(OP_RESERVE_STORAGE, (writer) => {
+        writer.u32(this.handle);
+        writer.u32(bytes);
+      })
+    );
+  }
+
+  async loadAndRebuildFrom(sourceDb: FlatSQLWasmEdgeProcessDatabase): Promise<void> {
+    await this.process.request(
+      writeRequest(OP_LOAD_FROM_DB, (writer) => {
+        writer.u32(this.handle);
+        writer.u32(sourceDb.handle);
       })
     );
   }

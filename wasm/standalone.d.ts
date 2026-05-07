@@ -10,6 +10,20 @@ export interface StandaloneQueryCacheStats {
   misses: number;
   size: number;
   generation: number;
+  maxEntries: number;
+  maxRows: number;
+}
+
+export interface StandaloneQueryCacheConfig {
+  maxEntries: number;
+  maxRows: number;
+}
+
+export interface StandaloneResponseArtifactCacheKeyOptions {
+  format?: string;
+  publishEventKey?: string | null;
+  projection?: string[];
+  params?: StandaloneQueryParam[];
 }
 
 export interface LoadFlatSQLStandaloneOptions {
@@ -38,11 +52,18 @@ export class FlatSQLStandalone {
   createDatabase(schema: string, dbName?: string): FlatSQLStandaloneDatabase;
   createTestUser(id: number, name: string, email: string, age: number): Uint8Array;
   createTestPost(id: number, userId: number, title: string): Uint8Array;
+  createTestPublishEvent(fileId: string, recordId: string, eventIndex: number, payloadSize: number): Uint8Array;
   buildQueryCacheKey(
     dataset: string,
     artifactVersion: string,
     queryId: string,
     params?: StandaloneQueryParam[]
+  ): string;
+  buildResponseArtifactCacheKey(
+    schemaName: string,
+    schemaVersion: string,
+    sql: string,
+    options?: StandaloneResponseArtifactCacheKeyOptions
   ): string;
 }
 
@@ -55,11 +76,16 @@ export class FlatSQLStandaloneDatabase {
   ingestOne(data: Uint8Array, source?: string | null): number;
   query(sql: string, params?: StandaloneQueryParam[]): StandaloneQueryResult;
   queryMany(queries: Array<{ sql: string; params?: StandaloneQueryParam[] }>): StandaloneQueryResult[];
+  queryRawFlatBufferStream(sql: string, params?: StandaloneQueryParam[]): Uint8Array;
   registerQueryTemplate(queryId: string, sql: string, cacheable?: boolean): void;
   queryTemplate(queryId: string, params?: StandaloneQueryParam[]): StandaloneQueryResult;
   clearQueryCache(): void;
+  configureQueryCache(config: StandaloneQueryCacheConfig): void;
   getQueryCacheStats(): StandaloneQueryCacheStats;
   exportData(): Uint8Array;
   loadAndRebuild(data: Uint8Array): void;
+  reserveStorageBytes(bytes: number): void;
+  loadAndRebuildFrom(sourceDb: FlatSQLStandaloneDatabase): void;
   getFlatBufferByIndex(tableName: string, indexName: string, keyParams?: StandaloneQueryParam[]): Uint8Array | null;
+  getStorageInfo(): { ptr: number; size: number };
 }

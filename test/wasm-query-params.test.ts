@@ -1,4 +1,5 @@
 import initFlatSQL from '../wasm/index.js';
+import { decodeSizePrefixedStream } from '../src/artifacts/transport.js';
 
 describe('WASM parameterized queries', () => {
   test('binds positional parameters through the WASM query API', async () => {
@@ -247,6 +248,32 @@ describe('WASM parameterized queries', () => {
     db.destroy();
   });
 
+  test('builds raw FlatBuffer response streams in the WASM core', async () => {
+    const flatsql = await initFlatSQL({ skipIntegrityCheck: true });
+    const db = flatsql.createDatabase(
+      `
+        table User {
+          id: int (id);
+          name: string;
+          email: string (key);
+          age: int;
+        }
+      `,
+      'wasm-query-raw-response-stream'
+    );
+
+    db.registerFileId('USER', 'User');
+    db.enableDemoExtractors();
+    const alice = flatsql.createTestUser(1, 'Alice', 'alice@example.com', 30);
+    const bob = flatsql.createTestUser(2, 'Bob', 'bob@example.com', 25);
+    db.ingestBuffers([alice, bob]);
+
+    const stream = db.queryRawFlatBufferStream('SELECT _data FROM User WHERE id = ?', [2]);
+    expect(decodeSizePrefixedStream(stream)).toEqual([bob]);
+
+    db.destroy();
+  });
+
   test('builds canonical query cache keys through the WASM core', async () => {
     const flatsql = await initFlatSQL({ skipIntegrityCheck: true });
 
@@ -257,6 +284,42 @@ describe('WASM parameterized queries', () => {
     expect(flatsql.buildQueryCacheKey('PNM', 'sha-123', 'by-file-id', ['PNM|42'])).toBe(key);
     expect(flatsql.buildQueryCacheKey('PNM', 'sha-456', 'by-file-id', ['PNM|42'])).not.toBe(key);
     expect(flatsql.buildQueryCacheKey('PNM', 'sha-123', 'by-file-id', [42])).not.toBe(key);
+  });
+
+  test('builds canonical response artifact cache keys through the WASM core', async () => {
+    const flatsql = await initFlatSQL({ skipIntegrityCheck: true });
+
+    const key = flatsql.buildResponseArtifactCacheKey(
+      'PNM',
+      '2',
+      ' SELECT   *   FROM PNM WHERE FILE_ID = ? ',
+      {
+        format: 'raw',
+        publishEventKey: 'PNM-event-1',
+        projection: ['FILE_ID'],
+        params: ['PNM|42'],
+      }
+    );
+
+    expect(key).toBe(
+      'flatsql:response:v1|s=504e4d|v=32|f=726177|e=504e4d2d6576656e742d31|q=53454c454354202a2046524f4d20504e4d2057484552452046494c455f4944203d203f|c=1:46494c455f4944|p=1:s=504e4d7c3432'
+    );
+    expect(
+      flatsql.buildResponseArtifactCacheKey('PNM', '2', 'SELECT * FROM PNM WHERE FILE_ID = ?', {
+        format: 'raw',
+        publishEventKey: 'PNM-event-1',
+        projection: ['FILE_ID'],
+        params: ['PNM|42'],
+      })
+    ).toBe(key);
+    expect(
+      flatsql.buildResponseArtifactCacheKey('PNM', '2', 'SELECT * FROM PNM WHERE FILE_ID = ?', {
+        format: 'flatbuffer',
+        publishEventKey: 'PNM-event-1',
+        projection: ['FILE_ID'],
+        params: ['PNM|42'],
+      })
+    ).not.toBe(key);
   });
 
   test('exposes generic raw FlatBuffer lookup by indexed column', async () => {
@@ -341,6 +404,51 @@ describe('WASM parameterized queries', () => {
     expect(db.getQueryCacheStats()).toMatchObject({ hits: 1, misses: 2 });
 
     expect(() => db.queryTemplate('missing_template')).toThrow(/Query template not found/);
+
+    db.destroy();
+  });
+
+  test('configures native query cache entry and row limits', async () => {
+    const flatsql = await initFlatSQL({ skipIntegrityCheck: true });
+    const db = flatsql.createDatabase(
+      `
+        table User {
+          id: int (id);
+          name: string;
+          email: string (key);
+          age: int;
+        }
+      `,
+      'wasm-query-template-cache-limits'
+    );
+
+    db.registerFileId('USER', 'User');
+    db.enableDemoExtractors();
+    db.configureQueryCache({ maxEntries: 1, maxRows: 1 });
+    db.ingestBuffers([
+      flatsql.createTestUser(1, 'Alice', 'alice@example.com', 30),
+      flatsql.createTestUser(2, 'Bob', 'bob@example.com', 25),
+    ]);
+
+    db.registerQueryTemplate('user_by_id', 'SELECT email FROM User WHERE id = ?', true);
+    db.registerQueryTemplate('user_by_email', 'SELECT id FROM User WHERE email = ?', true);
+    db.registerQueryTemplate('all_users', 'SELECT id FROM User ORDER BY id', true);
+
+    expect(db.getQueryCacheStats()).toMatchObject({
+      maxEntries: 1,
+      maxRows: 1,
+    });
+
+    db.queryTemplate('user_by_id', [1]);
+    expect(db.getQueryCacheStats()).toMatchObject({ hits: 0, misses: 1, size: 1 });
+    db.queryTemplate('user_by_email', ['bob@example.com']);
+    expect(db.getQueryCacheStats()).toMatchObject({ hits: 0, misses: 2, size: 1 });
+    db.queryTemplate('user_by_id', [1]);
+    expect(db.getQueryCacheStats()).toMatchObject({ hits: 0, misses: 3, size: 1 });
+
+    db.queryTemplate('all_users');
+    db.queryTemplate('all_users');
+    expect(db.getQueryCacheStats()).toMatchObject({ hits: 0, misses: 5, size: 1 });
 
     db.destroy();
   });

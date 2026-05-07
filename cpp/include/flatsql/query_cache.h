@@ -16,6 +16,13 @@ std::string buildQueryCacheKey(const std::string& dataset,
                                const std::string& artifactVersion,
                                const std::string& queryId,
                                const std::vector<Value>& params);
+std::string buildResponseArtifactCacheKey(const std::string& schemaName,
+                                          const std::string& schemaVersion,
+                                          const std::string& sql,
+                                          const std::string& format,
+                                          const std::string& publishEventKey,
+                                          const std::vector<std::string>& projection,
+                                          const std::vector<Value>& params);
 
 }  // namespace flatsql
 

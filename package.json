@@ -1,6 +1,6 @@
 {
   "name": "flatsql",
-  "version": "0.4.3",
+  "version": "1.0.0",
   "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
   "type": "module",
   "main": "dist/index.js",
@@ -26,6 +26,10 @@
       "types": "./dist/artifacts/standalone-builder.d.ts",
       "import": "./dist/artifacts/standalone-builder.js"
     },
+    "./response": {
+      "types": "./dist/response/index.d.ts",
+      "import": "./dist/response/index.js"
+    },
     "./standalone/wasmedge": {
       "types": "./dist/standalone/index.d.ts",
       "import": "./dist/standalone/index.js"
@@ -48,6 +52,11 @@
     "sdm/*.wasm",
     "sdm/*.d.ts",
     "sdm/*.json",
+    "scripts/stress-docker.sh",
+    "stress/docker/*",
+    "stress/sds/*.mjs",
+    "docs/response-artifacts.md",
+    "docs/agents/*.md",
     "README.md",
     "LICENSE"
   ],
@@ -67,7 +76,12 @@
     "test:wasi": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasi.test.ts test/standalone-wasm-imports.test.ts",
     "test:wasmedge": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasmedge-standalone.test.ts test/wasmedge-runner.test.ts",
     "test:cluster": "bash scripts/cluster-validation.sh",
-    "test:cluster:smoke": "bash scripts/cluster-validation.sh --duration=5 --stretch-duration=5 --readers=4 --stretch-readers=6"
+    "test:cluster:smoke": "bash scripts/cluster-validation.sh --duration=5 --stretch-duration=5 --readers=4 --stretch-readers=6",
+    "stress:sds:smoke": "bash scripts/stress-docker.sh smoke",
+    "stress:sds:docker-smoke": "bash scripts/stress-docker.sh docker-smoke",
+    "stress:sds:docker-fleet": "bash scripts/stress-docker.sh docker-fleet",
+    "stress:sds:full-config": "bash scripts/stress-docker.sh full-config",
+    "stress:sds:full": "bash scripts/stress-docker.sh full"
   },
   "repository": {
     "type": "git",
@@ -99,6 +113,7 @@
   "author": "Digital Arsenal <tj@digitalarsenal.io>",
   "license": "Apache-2.0",
   "dependencies": {
+    "flatbuffers": "^25.9.23",
     "flatc-wasm": "^26.1.32",
     "sql.js": "^1.10.0"
   },

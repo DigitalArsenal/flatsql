@@ -27,6 +27,8 @@ export declare class FlatSQLDatabase {
     insert(tableName: string, data: Record<string, any>): bigint;
     insertRaw(tableName: string, flatbufferData: Uint8Array): bigint;
     stream(tableName: string, flatbuffers: Iterable<Uint8Array>): bigint[];
+    createIndex(tableName: string, columnName: string): void;
+    getStorageBytes(): number;
     query(sql: string): QueryResult;
     private parseSQL;
     private parseValue;

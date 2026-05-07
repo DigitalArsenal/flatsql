@@ -175,6 +175,8 @@ public:
         uint64_t misses = 0;
         size_t size = 0;
         uint64_t generation = 0;
+        size_t maxEntries = 0;
+        size_t maxRows = 0;
     };
 
     // Register a named SQL template for native cached execution.
@@ -188,6 +190,9 @@ public:
 
     // Clear cached query results without unregistering templates.
     void clearQueryResultCache();
+
+    // Configure bounded native query-result caching.
+    void configureQueryResultCache(size_t maxEntries, size_t maxRows);
 
     QueryCacheStats getQueryCacheStats() const;
 
@@ -239,6 +244,9 @@ public:
 
     // Get storage for direct access
     const StreamingFlatBufferStore& getStorage() const { return *storage_; }
+
+    // Preallocate storage for known large ingest targets.
+    void reserveStorage(size_t bytes);
 
     // Set field extractor for a table (required for indexing and queries)
     void setFieldExtractor(const std::string& tableName, TableStore::FieldExtractor extractor);
@@ -502,8 +510,8 @@ private:
     uint64_t queryCacheHits_ = 0;
     uint64_t queryCacheMisses_ = 0;
 
-    static constexpr size_t MAX_QUERY_RESULT_CACHE_ENTRIES = 1024;
-    static constexpr size_t MAX_QUERY_RESULT_CACHE_ROWS = 1000;
+    size_t queryResultCacheMaxEntries_ = 1024;
+    size_t queryResultCacheMaxRows_ = 1000;
 
     // Encryption
     std::unique_ptr<flatbuffers::EncryptionContext> encryptionCtx_;

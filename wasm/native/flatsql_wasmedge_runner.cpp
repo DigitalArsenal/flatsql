@@ -29,6 +29,11 @@ constexpr uint32_t OP_QUERY_CACHE_STATS = 11;
 constexpr uint32_t OP_GET_FLATBUFFER_BY_INDEX = 12;
 constexpr uint32_t OP_EXPORT_DATA = 13;
 constexpr uint32_t OP_LOAD_AND_REBUILD = 14;
+constexpr uint32_t OP_BUILD_RESPONSE_ARTIFACT_CACHE_KEY = 15;
+constexpr uint32_t OP_QUERY_RAW_FLATBUFFER_STREAM = 16;
+constexpr uint32_t OP_RESERVE_STORAGE = 17;
+constexpr uint32_t OP_LOAD_FROM_DB = 18;
+constexpr uint32_t OP_CONFIGURE_QUERY_CACHE = 19;
 
 int g_protocolFd = STDOUT_FILENO;
 
@@ -386,6 +391,17 @@ void checkFlatSQL(WasmEdgeRuntime& runtime, uint32_t success) {
     }
 }
 
+std::string joinStrings(const std::vector<std::string>& values, char delimiter) {
+    std::string out;
+    for (size_t index = 0; index < values.size(); index++) {
+        if (index > 0) {
+            out.push_back(delimiter);
+        }
+        out += values[index];
+    }
+    return out;
+}
+
 void encodeQueryResult(WasmEdgeRuntime& runtime, Writer& writer) {
     const uint32_t columnCount = runtime.callI32("flatsql_result_column_count");
     const uint32_t rowCount = runtime.callI32("flatsql_result_row_count");
@@ -573,6 +589,29 @@ std::vector<uint8_t> handleRequest(WasmEdgeRuntime& runtime, const std::vector<u
             }
             break;
         }
+        case OP_QUERY_RAW_FLATBUFFER_STREAM: {
+            const uint32_t handle = reader.u32();
+            const std::string sql = reader.string();
+            const uint32_t paramCount = reader.u32();
+            const std::vector<uint8_t> params = reader.byteVector();
+            reader.finish();
+            const uint32_t success = runtime.withString(sql, [&](uint32_t sqlPtr) {
+                return runtime.withBytes(params, [&](uint32_t paramsPtr) {
+                    return runtime.callI32("flatsql_query_raw_flatbuffer_stream", {
+                        WasmEdge_ValueGenI32(static_cast<int32_t>(handle)),
+                        WasmEdge_ValueGenI32(static_cast<int32_t>(sqlPtr)),
+                        WasmEdge_ValueGenI32(static_cast<int32_t>(paramsPtr)),
+                        WasmEdge_ValueGenI32(static_cast<int32_t>(params.size())),
+                        WasmEdge_ValueGenI32(static_cast<int32_t>(paramCount)),
+                    });
+                });
+            });
+            checkFlatSQL(runtime, success);
+            const uint32_t ptr = runtime.callI32("flatsql_response_artifact_data");
+            const uint32_t size = runtime.callI32("flatsql_response_artifact_size");
+            body.bytes(runtime.readBytes(ptr, size));
+            break;
+        }
         case OP_REGISTER_QUERY_TEMPLATE: {
             const uint32_t handle = reader.u32();
             const std::string queryId = reader.string();
@@ -619,6 +658,19 @@ std::vector<uint8_t> handleRequest(WasmEdgeRuntime& runtime, const std::vector<u
             runtime.callVoid("flatsql_clear_query_cache", {WasmEdge_ValueGenI32(static_cast<int32_t>(handle))});
             break;
         }
+        case OP_CONFIGURE_QUERY_CACHE: {
+            const uint32_t handle = reader.u32();
+            const uint32_t maxEntries = reader.u32();
+            const uint32_t maxRows = reader.u32();
+            reader.finish();
+            const uint32_t success = runtime.callI32("flatsql_configure_query_cache", {
+                WasmEdge_ValueGenI32(static_cast<int32_t>(handle)),
+                WasmEdge_ValueGenI32(static_cast<int32_t>(maxEntries)),
+                WasmEdge_ValueGenI32(static_cast<int32_t>(maxRows)),
+            });
+            checkFlatSQL(runtime, success);
+            break;
+        }
         case OP_QUERY_CACHE_STATS: {
             const uint32_t handle = reader.u32();
             reader.finish();
@@ -626,6 +678,8 @@ std::vector<uint8_t> handleRequest(WasmEdgeRuntime& runtime, const std::vector<u
             body.f64(runtime.callF64("flatsql_query_cache_misses", {WasmEdge_ValueGenI32(static_cast<int32_t>(handle))}));
             body.f64(runtime.callF64("flatsql_query_cache_size", {WasmEdge_ValueGenI32(static_cast<int32_t>(handle))}));
             body.f64(runtime.callF64("flatsql_query_cache_generation", {WasmEdge_ValueGenI32(static_cast<int32_t>(handle))}));
+            body.f64(runtime.callF64("flatsql_query_cache_max_entries", {WasmEdge_ValueGenI32(static_cast<int32_t>(handle))}));
+            body.f64(runtime.callF64("flatsql_query_cache_max_rows", {WasmEdge_ValueGenI32(static_cast<int32_t>(handle))}));
             break;
         }
         case OP_GET_FLATBUFFER_BY_INDEX: {
@@ -679,6 +733,78 @@ std::vector<uint8_t> handleRequest(WasmEdgeRuntime& runtime, const std::vector<u
                     WasmEdge_ValueGenI32(static_cast<int32_t>(data.size())),
                 });
             });
+            break;
+        }
+        case OP_RESERVE_STORAGE: {
+            const uint32_t handle = reader.u32();
+            const uint32_t bytes = reader.u32();
+            reader.finish();
+            runtime.callVoid("flatsql_reserve_storage", {
+                WasmEdge_ValueGenI32(static_cast<int32_t>(handle)),
+                WasmEdge_ValueGenI32(static_cast<int32_t>(bytes)),
+            });
+            break;
+        }
+        case OP_LOAD_FROM_DB: {
+            const uint32_t handle = reader.u32();
+            const uint32_t sourceHandle = reader.u32();
+            reader.finish();
+            runtime.callVoid("flatsql_load_from_db", {
+                WasmEdge_ValueGenI32(static_cast<int32_t>(handle)),
+                WasmEdge_ValueGenI32(static_cast<int32_t>(sourceHandle)),
+            });
+            break;
+        }
+        case OP_BUILD_RESPONSE_ARTIFACT_CACHE_KEY: {
+            const std::string schemaName = reader.string();
+            const std::string schemaVersion = reader.string();
+            const std::string sql = reader.string();
+            const std::string format = reader.string();
+            const std::string publishEventKey = reader.string();
+            const uint32_t projectionCount = reader.u32();
+            std::vector<std::string> projection;
+            projection.reserve(projectionCount);
+            for (uint32_t index = 0; index < projectionCount; index++) {
+                projection.push_back(reader.string());
+            }
+            const uint32_t paramCount = reader.u32();
+            const std::vector<uint8_t> params = reader.byteVector();
+            reader.finish();
+
+            const std::string projectionList = joinStrings(projection, '\n');
+            const uint32_t keyPtr = runtime.withString(schemaName, [&](uint32_t schemaNamePtr) {
+                return runtime.withString(schemaVersion, [&](uint32_t schemaVersionPtr) {
+                    return runtime.withString(sql, [&](uint32_t sqlPtr) {
+                        return runtime.withString(format, [&](uint32_t formatPtr) {
+                            return runtime.withString(publishEventKey, [&](uint32_t publishEventKeyPtr) {
+                                return runtime.withString(projectionList, [&](uint32_t projectionListPtr) {
+                                    return runtime.withBytes(params, [&](uint32_t paramsPtr) {
+                                        return runtime.callI32("flatsql_build_response_artifact_cache_key", {
+                                            WasmEdge_ValueGenI32(static_cast<int32_t>(schemaNamePtr)),
+                                            WasmEdge_ValueGenI32(static_cast<int32_t>(schemaVersionPtr)),
+                                            WasmEdge_ValueGenI32(static_cast<int32_t>(sqlPtr)),
+                                            WasmEdge_ValueGenI32(static_cast<int32_t>(formatPtr)),
+                                            WasmEdge_ValueGenI32(static_cast<int32_t>(publishEventKeyPtr)),
+                                            WasmEdge_ValueGenI32(static_cast<int32_t>(projectionListPtr)),
+                                            WasmEdge_ValueGenI32(static_cast<int32_t>(paramsPtr)),
+                                            WasmEdge_ValueGenI32(static_cast<int32_t>(params.size())),
+                                            WasmEdge_ValueGenI32(static_cast<int32_t>(paramCount)),
+                                        });
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+            if (keyPtr == 0) {
+                std::string error = runtime.lastError();
+                if (error.empty()) {
+                    error = "failed to build response artifact cache key";
+                }
+                throw std::runtime_error(error);
+            }
+            body.string(runtime.readCString(keyPtr));
             break;
         }
         default:

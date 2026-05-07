@@ -35,6 +35,8 @@ In scope:
 - Per-node data directories and storage budget checks.
 - Per-use-case metrics for records, bytes, latency, cache hits, cache misses, and failures.
 - Transport accounting for request bytes, response bytes, ingest bytes, and raw FlatBuffer bytes.
+- A production-readiness guardrail that fails if any node is below 75 bulk-ingest fps.
+- Full-mode generated payload sizing that targets the configured storage budget with millions of fleet records instead of hundreds of millions of tiny records.
 - Smoke-mode tests that run without requiring 100 GB of local free space.
 - Full-run configuration for 100 nodes at 1 GB/node.
 
@@ -62,7 +64,7 @@ Current gaps:
 - No Docker stress harness exists in FlatSQL.
 - The existing C++ cluster validation only uses the local `User` test schema.
 - Most SDS schemas do not mark fields with FlatSQL `indexed`, `key`, or `id` metadata, so v1 needs a generic workload plus explicit PNM/DPM `FILE_ID` workloads.
-- The native result cache has fixed limits of 1024 entries and 1000 rows per cached result. The stress harness should measure when those limits help and when they become a bottleneck.
+- The native result cache defaults to 1024 entries and 1000 rows per cached result. Production hosts can tune those limits, and the stress harness should measure when defaults help and when larger FILE_ID traffic needs different settings.
 
 ## Architecture
 
@@ -85,7 +87,7 @@ The controller discovers schemas, creates a workload manifest, partitions work a
 Responsibilities:
 
 - discover SDS schemas from `SDS_SCHEMA_ROOT`
-- parse root type and `file_identifier`
+- parse schema names, root types, and table names without treating database/index annotations as schema requirements
 - record schema parse/build failures
 - generate node assignments
 - produce a run manifest with mode, node count, storage budget, seed, and use-case mix
@@ -153,7 +155,7 @@ This lets us separate compute wins from transport wins. A node-local cache hit a
 
 ### 1. SDS Schema Sweep
 
-Load every SDS `main.fbs`, parse root type and `file_identifier`, and attempt a minimal generated-record ingest.
+Load every SDS `main.fbs`, parse schema name, root type, and table names, and attempt a minimal generated-record ingest.
 
 Purpose:
 
@@ -169,6 +171,7 @@ Metrics:
 
 - ingest bytes/sec
 - records/sec
+- per-node fps, with production readiness requiring at least 75 fps on every node
 - per-batch latency
 - WAL growth
 - final storage bytes
@@ -192,7 +195,7 @@ Purpose:
 
 - measure cache miss cost
 - expose cache-entry churn
-- find when the 1024-entry cache cap becomes too small
+- find when the default 1024-entry cache cap becomes too small
 
 ### 5. Mixed Hot/Cold Query Distribution
 
@@ -377,14 +380,14 @@ A run fails when:
 - schema discovery finds zero schemas
 - metrics cannot be reduced into a summary
 
-The final report should call out weaknesses rather than only pass/fail:
+The final report should call out operational findings rather than only pass/fail:
 
 - slowest schema
 - highest bandwidth use case
 - lowest cache hit rate
 - largest WAL growth
 - worst p99 latency
-- schemas skipped or unsupported
+- schemas skipped or unsupported by the harness implementation
 - bottlenecked node
 
 ## Testing
@@ -405,7 +408,7 @@ The harness is expected to reveal at least these pressure points:
 
 - cache capacity too small for broad cold `FILE_ID` traffic
 - full-cache invalidation after ingest reducing value during high-churn updates
-- schemas without indexed fields limiting realistic SQL lookup speed
+- missing external SDN per-schema index profiles limiting realistic SQL lookup speed
 - raw result transfer becoming bandwidth-heavy for large payloads
 - large SQL result sets needing paging or streaming
 - WAL contention or checkpoint behavior under concurrent ingest/query load
@@ -420,3 +423,4 @@ The design is ready to implement when it is acceptable that v1:
 - supports 100 actual Docker worker containers for full mode
 - keeps smoke mode cheap and deterministic
 - makes transport metrics part of every use case
+- keeps canonical SDS schemas database-neutral; `FILE_ID` publish-event indexing and per-schema query profiles belong to Space Data Network policy artifacts, not schema annotations

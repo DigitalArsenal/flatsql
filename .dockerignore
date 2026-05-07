@@ -1,0 +1,9 @@
+node_modules/
+dist/
+cpp/build/
+cpp/build-wasm/
+cpp/build-release/
+cpp/build-test/
+stress/results/
+.git/
+.DS_Store

@@ -54,6 +54,9 @@ public:
 
     explicit StreamingFlatBufferStore(size_t initialCapacity = 1024 * 1024);
 
+    // Preallocate storage for known large ingest targets. writeOffset_ remains unchanged.
+    void reserveCapacity(size_t capacity);
+
     // Stream raw size-prefixed FlatBuffers
     // Calls callback for each complete FlatBuffer ingested
     // Returns number of bytes consumed (for buffer management)

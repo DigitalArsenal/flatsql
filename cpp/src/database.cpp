@@ -319,6 +319,11 @@ void FlatSQLDatabase::loadAndRebuild(const uint8_t* data, size_t length) {
         }, profile);
 }
 
+void FlatSQLDatabase::reserveStorage(size_t bytes) {
+    std::unique_lock lock(*accessMutex_);
+    storage_->reserveCapacity(bytes);
+}
+
 void FlatSQLDatabase::initializeSQLiteEngine() {
     if (sqliteInitialized_) return;
 
@@ -481,13 +486,29 @@ void FlatSQLDatabase::clearQueryResultCache() {
     invalidateQueryResultCacheUnlocked();
 }
 
+void FlatSQLDatabase::configureQueryResultCache(size_t maxEntries, size_t maxRows) {
+    if (maxEntries == 0) {
+        throw std::runtime_error("query cache maxEntries must be greater than zero");
+    }
+    if (maxRows == 0) {
+        throw std::runtime_error("query cache maxRows must be greater than zero");
+    }
+
+    std::unique_lock lock(*accessMutex_);
+    queryResultCacheMaxEntries_ = maxEntries;
+    queryResultCacheMaxRows_ = maxRows;
+    invalidateQueryResultCacheUnlocked();
+}
+
 FlatSQLDatabase::QueryCacheStats FlatSQLDatabase::getQueryCacheStats() const {
     std::shared_lock lock(*accessMutex_);
     return QueryCacheStats{
         queryCacheHits_,
         queryCacheMisses_,
         queryResultCache_.size(),
-        queryCacheGeneration_
+        queryCacheGeneration_,
+        queryResultCacheMaxEntries_,
+        queryResultCacheMaxRows_
     };
 }
 
@@ -499,7 +520,7 @@ void FlatSQLDatabase::invalidateQueryResultCacheUnlocked() {
 
 void FlatSQLDatabase::storeCachedQueryResultUnlocked(const std::string& key,
                                                      const QueryResult& result) {
-    if (result.rows.size() > MAX_QUERY_RESULT_CACHE_ROWS) {
+    if (result.rows.size() > queryResultCacheMaxRows_) {
         return;
     }
 
@@ -518,7 +539,7 @@ void FlatSQLDatabase::storeCachedQueryResultUnlocked(const std::string& key,
     queryResultCacheLru_.push_front(key);
     queryResultCache_.emplace(key, CachedQueryResult{result, queryResultCacheLru_.begin()});
 
-    while (queryResultCache_.size() > MAX_QUERY_RESULT_CACHE_ENTRIES) {
+    while (queryResultCache_.size() > queryResultCacheMaxEntries_) {
         const std::string& evictedKey = queryResultCacheLru_.back();
         queryResultCache_.erase(evictedKey);
         queryResultCacheLru_.pop_back();

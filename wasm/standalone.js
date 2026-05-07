@@ -441,6 +441,21 @@ export class FlatSQLStandalone {
     return this._runtime.readBytes(ptr, size);
   }
 
+  createTestPublishEvent(fileId, recordId, eventIndex, payloadSize) {
+    const ptr = this._runtime.withCString(fileId, (fileIdPtr) =>
+      this._runtime.withCString(recordId, (recordIdPtr) =>
+        this._runtime.exports.flatsql_create_test_publish_event(
+          fileIdPtr,
+          recordIdPtr,
+          eventIndex,
+          payloadSize
+        )
+      )
+    );
+    const size = this._runtime.exports.flatsql_test_buffer_size();
+    return this._runtime.readBytes(ptr, size);
+  }
+
   buildQueryCacheKey(dataset, artifactVersion, queryId, params = []) {
     const paramBytes = encodeQueryParams(params);
     const keyPtr = this._runtime.withCString(dataset, (datasetPtr) =>
@@ -454,6 +469,44 @@ export class FlatSQLStandalone {
               paramPtr,
               paramBytes.length,
               params.length
+            )
+          )
+        )
+      )
+    );
+    const key = this._runtime.readCString(keyPtr);
+    if (!key) {
+      throw new Error(this._runtime.readCString(this._runtime.exports.flatsql_get_error()));
+    }
+    return key;
+  }
+
+  buildResponseArtifactCacheKey(schemaName, schemaVersion, sql, options = {}) {
+    const format = options.format ?? 'json';
+    const publishEventKey = options.publishEventKey ?? '';
+    const projectionList = (options.projection ?? []).join('\n');
+    const params = options.params ?? [];
+    const paramBytes = encodeQueryParams(params);
+    const keyPtr = this._runtime.withCString(schemaName, (schemaPtr) =>
+      this._runtime.withCString(schemaVersion, (versionPtr) =>
+        this._runtime.withCString(sql, (sqlPtr) =>
+          this._runtime.withCString(format, (formatPtr) =>
+            this._runtime.withCString(publishEventKey, (eventPtr) =>
+              this._runtime.withCString(projectionList, (projectionPtr) =>
+                this._runtime.withBytes(paramBytes, (paramPtr) =>
+                  this._runtime.exports.flatsql_build_response_artifact_cache_key(
+                    schemaPtr,
+                    versionPtr,
+                    sqlPtr,
+                    formatPtr,
+                    eventPtr,
+                    projectionPtr,
+                    paramPtr,
+                    paramBytes.length,
+                    params.length
+                  )
+                )
+              )
             )
           )
         )
@@ -557,6 +610,26 @@ export class FlatSQLStandaloneDatabase {
     return results;
   }
 
+  queryRawFlatBufferStream(sql, params = []) {
+    const paramBytes = encodeQueryParams(params);
+    const success = this._runtime.withCString(sql, (sqlPtr) =>
+      this._runtime.withBytes(paramBytes, (paramPtr) =>
+        this._runtime.exports.flatsql_query_raw_flatbuffer_stream(
+          this._handle,
+          sqlPtr,
+          paramPtr,
+          paramBytes.length,
+          params.length
+        )
+      )
+    );
+    this._runtime.check(success);
+
+    const ptr = this._runtime.exports.flatsql_response_artifact_data();
+    const size = this._runtime.exports.flatsql_response_artifact_size();
+    return ptr && size > 0 ? this._runtime.readBytes(ptr, size) : new Uint8Array();
+  }
+
   registerQueryTemplate(queryId, sql, cacheable = true) {
     const success = this._runtime.withCString(queryId, (queryIdPtr) =>
       this._runtime.withCString(sql, (sqlPtr) =>
@@ -592,12 +665,26 @@ export class FlatSQLStandaloneDatabase {
     this._runtime.exports.flatsql_clear_query_cache(this._handle);
   }
 
+  configureQueryCache({ maxEntries, maxRows }) {
+    if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+      throw new TypeError(`maxEntries must be a positive safe integer, received: ${maxEntries}`);
+    }
+    if (!Number.isSafeInteger(maxRows) || maxRows <= 0) {
+      throw new TypeError(`maxRows must be a positive safe integer, received: ${maxRows}`);
+    }
+    this._runtime.check(
+      this._runtime.exports.flatsql_configure_query_cache(this._handle, maxEntries, maxRows)
+    );
+  }
+
   getQueryCacheStats() {
     return {
       hits: this._runtime.exports.flatsql_query_cache_hits(this._handle),
       misses: this._runtime.exports.flatsql_query_cache_misses(this._handle),
       size: this._runtime.exports.flatsql_query_cache_size(this._handle),
       generation: this._runtime.exports.flatsql_query_cache_generation(this._handle),
+      maxEntries: this._runtime.exports.flatsql_query_cache_max_entries(this._handle),
+      maxRows: this._runtime.exports.flatsql_query_cache_max_rows(this._handle),
     };
   }
 
@@ -611,6 +698,17 @@ export class FlatSQLStandaloneDatabase {
     this._runtime.withBytes(data, (ptr) =>
       this._runtime.exports.flatsql_load_and_rebuild(this._handle, ptr, data.length)
     );
+  }
+
+  reserveStorageBytes(bytes) {
+    this._runtime.exports.flatsql_reserve_storage(this._handle, bytes);
+  }
+
+  loadAndRebuildFrom(sourceDb) {
+    if (!sourceDb?._handle) {
+      throw new TypeError('loadAndRebuildFrom requires a FlatSQL standalone database.');
+    }
+    this._runtime.exports.flatsql_load_from_db(this._handle, sourceDb._handle);
   }
 
   getFlatBufferByIndex(tableName, indexName, keyParams = []) {
@@ -631,5 +729,12 @@ export class FlatSQLStandaloneDatabase {
     );
     const size = this._runtime.exports.flatsql_get_raw_flatbuffer_size();
     return ptr && size > 0 ? this._runtime.readBytes(ptr, size) : null;
+  }
+
+  getStorageInfo() {
+    return {
+      ptr: this._runtime.exports.flatsql_get_storage_buffer(this._handle),
+      size: this._runtime.exports.flatsql_get_storage_size(this._handle),
+    };
   }
 }
