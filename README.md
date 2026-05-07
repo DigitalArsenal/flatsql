@@ -156,7 +156,7 @@ const builder = await createStandaloneArtifactBuilder(schema, {
 });
 ```
 
-WasmEdge must support WebAssembly exception handling for this artifact. The test runner uses `wasmedge --enable-exception-handling --reactor wasm/flatsql-wasi.wasm _initialize` for the smoke check and the native C API runner enables the same proposal programmatically.
+WasmEdge must support WebAssembly exception handling for this artifact. The test runner uses `wasmedge --enable-exception-handling --reactor wasm/flatsql-wasi.wasm _initialize` for the smoke check and the native C API runner enables the same proposal programmatically. Some Node 24 builds require `node --experimental-wasm-exnref` when directly instantiating the standalone WASI artifact.
 
 For high-volume repeated FILE_ID responses, build the cache key through the C++ runtime, wrap query results as response artifacts, and let edge/browser/WasmEdge host caches serve the immutable bytes by ETag or content hash. FlatSQL creates deterministic native cache keys and chunk metadata; deployment code owns CDN placement, routing, authorization, and global invalidation.
 
