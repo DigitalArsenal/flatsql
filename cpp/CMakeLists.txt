@@ -81,6 +81,7 @@ set(FLATSQL_LIB_SOURCES
     src/sqlite_index.cpp
     src/schema_parser.cpp
     src/database.cpp
+    src/query_cache.cpp
     src/junction.cpp
     src/sqlite_vtab.cpp
     src/sqlite_engine.cpp
@@ -101,6 +102,7 @@ set(FLATSQL_HEADERS
     include/flatsql/sqlite_index.h
     include/flatsql/schema_parser.h
     include/flatsql/database.h
+    include/flatsql/query_cache.h
     include/flatsql/junction.h
     include/flatsql/types.h
     include/flatsql/sqlite_vtab.h
@@ -116,8 +118,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
 
     set(FLATSQL_BUILD_WASM ON)
 
-    # WASM-specific compiler flags
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
+    # WASM-specific compiler flags are applied per target below. The browser
+    # bundle uses Emscripten JS exception helpers, while the standalone reactor
+    # must stay import-clean for WasmEdge/browser direct instantiation.
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 
     # Create the WASM library (includes SQLite amalgamation directly)
@@ -129,6 +132,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         ${SQLITE_DIR}
         ${SQLEAN_DIR}
     )
+    target_compile_options(flatsql PRIVATE -fexceptions)
 
     # SQLite compile definitions for minimal WASM build
     target_compile_definitions(flatsql PRIVATE
@@ -160,15 +164,28 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
                 \"_flatsql_ingest_with_source\", \"_flatsql_ingest_one_with_source\", \
                 \"_flatsql_get_sources_count\", \"_flatsql_get_source_name\", \
-                \"_flatsql_query\", \"_flatsql_get_error\", \
+                \"_flatsql_query\", \"_flatsql_query_params\", \"_flatsql_query_many\", \
+                \"_flatsql_build_query_cache_key\", \
+                \"_flatsql_build_response_artifact_cache_key\", \
+                \"_flatsql_register_query_template\", \"_flatsql_query_template\", \
+                \"_flatsql_clear_query_cache\", \"_flatsql_configure_query_cache\", \
+                \"_flatsql_query_cache_hits\", \
+                \"_flatsql_query_cache_misses\", \"_flatsql_query_cache_size\", \
+                \"_flatsql_query_cache_generation\", \"_flatsql_query_cache_max_entries\", \
+                \"_flatsql_query_cache_max_rows\", \
+                \"_flatsql_batch_result_count\", \"_flatsql_select_batch_result\", \"_flatsql_get_error\", \
                 \"_flatsql_result_column_count\", \"_flatsql_result_row_count\", \
                 \"_flatsql_result_column_name\", \"_flatsql_result_cell_type\", \
                 \"_flatsql_result_cell_number\", \"_flatsql_result_cell_string\", \
                 \"_flatsql_result_cell_blob\", \"_flatsql_result_cell_blob_size\", \
+                \"_flatsql_query_raw_flatbuffer_stream\", \"_flatsql_response_artifact_data\", \
+                \"_flatsql_response_artifact_size\", \"_flatsql_response_artifact_row_count\", \
+                \"_flatsql_response_artifact_column_count\", \
                 \"_flatsql_export_data\", \"_flatsql_export_size\", \
-                \"_flatsql_load_and_rebuild\", \
+                \"_flatsql_load_and_rebuild\", \"_flatsql_reserve_storage\", \"_flatsql_load_from_db\", \
                 \"_flatsql_create_test_user\", \"_flatsql_create_test_post\", \
                 \"_flatsql_create_test_mpe\", \"_flatsql_create_test_telemetry\", \
+                \"_flatsql_create_test_publish_event\", \
                 \"_flatsql_test_buffer_size\", \
                 \"_flatsql_get_stats_count\", \"_flatsql_get_stat_table_name\", \
                 \"_flatsql_get_stat_file_id\", \"_flatsql_get_stat_record_count\", \
@@ -178,6 +195,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_mark_deleted\", \"_flatsql_get_deleted_count\", \
                 \"_flatsql_clear_tombstones\", \
                 \"_flatsql_get_flatbuffer_by_id\", \"_flatsql_get_flatbuffer_by_email\", \
+                \"_flatsql_get_flatbuffer_by_index\", \
                 \"_flatsql_get_raw_flatbuffer_size\", \"_flatsql_get_raw_flatbuffer_sequence\", \
                 \"_flatsql_get_storage_buffer\", \"_flatsql_get_storage_size\", \
                 \"_flatsql_set_encryption_key\", \"_flatsql_is_encrypted\", \
@@ -188,6 +206,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             -s EXPORTED_RUNTIME_METHODS='[\"ccall\", \"cwrap\", \"UTF8ToString\", \"stringToUTF8\", \"lengthBytesUTF8\", \"HEAPU8\"]' \
             -s ALLOW_MEMORY_GROWTH=1 \
             -s INITIAL_MEMORY=16777216 \
+            -s MAXIMUM_MEMORY=4294967296 \
             -s STACK_SIZE=1048576 \
             -s NO_EXIT_RUNTIME=1 \
             -s FILESYSTEM=0 \
@@ -209,6 +228,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         ${SQLITE_DIR}
         ${SQLEAN_DIR}
     )
+    target_compile_options(flatsql_wasi PRIVATE -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0)
 
     target_compile_definitions(flatsql_wasi PRIVATE
         SQLITE_THREADSAFE=0
@@ -228,6 +248,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         LINK_FLAGS "\
             -s WASM=1 \
             -s STANDALONE_WASM=1 \
+            -s PURE_WASI=1 \
             --no-entry \
             -s EXPORTED_FUNCTIONS='[ \
                 \"_malloc\", \"_free\", \
@@ -237,15 +258,28 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
                 \"_flatsql_ingest_with_source\", \"_flatsql_ingest_one_with_source\", \
                 \"_flatsql_get_sources_count\", \"_flatsql_get_source_name\", \
-                \"_flatsql_query\", \"_flatsql_get_error\", \
+                \"_flatsql_query\", \"_flatsql_query_params\", \"_flatsql_query_many\", \
+                \"_flatsql_build_query_cache_key\", \
+                \"_flatsql_build_response_artifact_cache_key\", \
+                \"_flatsql_register_query_template\", \"_flatsql_query_template\", \
+                \"_flatsql_clear_query_cache\", \"_flatsql_configure_query_cache\", \
+                \"_flatsql_query_cache_hits\", \
+                \"_flatsql_query_cache_misses\", \"_flatsql_query_cache_size\", \
+                \"_flatsql_query_cache_generation\", \"_flatsql_query_cache_max_entries\", \
+                \"_flatsql_query_cache_max_rows\", \
+                \"_flatsql_batch_result_count\", \"_flatsql_select_batch_result\", \"_flatsql_get_error\", \
                 \"_flatsql_result_column_count\", \"_flatsql_result_row_count\", \
                 \"_flatsql_result_column_name\", \"_flatsql_result_cell_type\", \
                 \"_flatsql_result_cell_number\", \"_flatsql_result_cell_string\", \
                 \"_flatsql_result_cell_blob\", \"_flatsql_result_cell_blob_size\", \
+                \"_flatsql_query_raw_flatbuffer_stream\", \"_flatsql_response_artifact_data\", \
+                \"_flatsql_response_artifact_size\", \"_flatsql_response_artifact_row_count\", \
+                \"_flatsql_response_artifact_column_count\", \
                 \"_flatsql_export_data\", \"_flatsql_export_size\", \
-                \"_flatsql_load_and_rebuild\", \
+                \"_flatsql_load_and_rebuild\", \"_flatsql_reserve_storage\", \"_flatsql_load_from_db\", \
                 \"_flatsql_create_test_user\", \"_flatsql_create_test_post\", \
                 \"_flatsql_create_test_mpe\", \"_flatsql_create_test_telemetry\", \
+                \"_flatsql_create_test_publish_event\", \
                 \"_flatsql_test_buffer_size\", \
                 \"_flatsql_get_stats_count\", \"_flatsql_get_stat_table_name\", \
                 \"_flatsql_get_stat_file_id\", \"_flatsql_get_stat_record_count\", \
@@ -255,6 +289,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_mark_deleted\", \"_flatsql_get_deleted_count\", \
                 \"_flatsql_clear_tombstones\", \
                 \"_flatsql_get_flatbuffer_by_id\", \"_flatsql_get_flatbuffer_by_email\", \
+                \"_flatsql_get_flatbuffer_by_index\", \
                 \"_flatsql_get_raw_flatbuffer_size\", \"_flatsql_get_raw_flatbuffer_sequence\", \
                 \"_flatsql_get_storage_buffer\", \"_flatsql_get_storage_size\", \
                 \"_flatsql_set_encryption_key\", \"_flatsql_is_encrypted\", \
@@ -263,13 +298,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_compute_hmac\", \"_flatsql_verify_hmac\" \
             ]' \
             -s ALLOW_MEMORY_GROWTH=1 \
-            -s INITIAL_MEMORY=16777216 \
+            -s INITIAL_MEMORY=67108864 \
+            -s MAXIMUM_MEMORY=4294967296 \
             -s STACK_SIZE=1048576 \
-                        -s FILESYSTEM=0 \
+            -s WASMFS=1 \
             -s ALLOW_TABLE_GROWTH=1 \
             -s EMULATE_FUNCTION_POINTER_CASTS=1 \
-            -fexceptions \
-            -s DISABLE_EXCEPTION_CATCHING=0 \
+            -fwasm-exceptions \
+            -s WASM_LEGACY_EXCEPTIONS=0 \
         "
     )
 

@@ -14,6 +14,7 @@ export declare class TableStore {
     private fieldAccessor;
     constructor(tableDef: TableDef, storage: StackedFlatBufferStore, fieldAccessor: (data: Uint8Array, fieldPath: string[]) => any);
     private columnTypeToKeyType;
+    createIndex(columnName: string): void;
     insert(flatbufferData: Uint8Array): bigint;
     findByIndex(columnName: string, key: any): TableRecord[];
     findByRange(columnName: string, minKey: any, maxKey: any): TableRecord[];

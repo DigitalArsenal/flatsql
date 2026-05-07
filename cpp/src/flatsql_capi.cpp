@@ -2,10 +2,13 @@
 // This avoids the "table index out of bounds" issue with SQLite vtable callbacks in workers
 
 #include "flatsql/database.h"
+#include "flatsql/query_cache.h"
 #include <flatbuffers/flatbuffers.h>
 #include <flatbuffers/encryption.h>
 #include "../schemas/mpe_schema_generated.h"
+#include <algorithm>
 #include <cstring>
+#include <limits>
 #include <vector>
 #include <string>
 
@@ -250,6 +253,86 @@ std::vector<uint8_t> createTelemetryFlatBufferInternal(int32_t packetId,
     return fb;
 }
 
+std::vector<uint8_t> createPublishEventFlatBufferInternal(const std::string& fileId,
+                                                          const std::string& recordId,
+                                                          int32_t eventIndex,
+                                                          int32_t payloadSize) {
+    const int32_t normalizedPayloadSize = std::max(payloadSize, 0);
+    std::vector<uint8_t> fb;
+
+    fb.resize(4);
+    fb.push_back('P'); fb.push_back('U'); fb.push_back('B'); fb.push_back('L');
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t vtableStart = fb.size();
+    writeU16(fb, 14);
+    writeU16(fb, 24);
+    writeU16(fb, 4);
+    writeU16(fb, 8);
+    writeU16(fb, 12);
+    writeU16(fb, 16);
+    writeU16(fb, 20);
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t tableStart = fb.size();
+    int32_t vtableOffset = static_cast<int32_t>(tableStart - vtableStart);
+    writeI32(fb, vtableOffset);
+    writeU32(fb, 0);  // FILE_ID offset placeholder
+    writeU32(fb, 0);  // RECORD_ID offset placeholder
+    writeI32(fb, eventIndex);
+    writeI32(fb, normalizedPayloadSize);
+    writeU32(fb, 0);  // PAYLOAD offset placeholder
+
+    size_t fileIdFieldPos = tableStart + 4;
+    size_t recordIdFieldPos = tableStart + 8;
+    size_t payloadFieldPos = tableStart + 20;
+
+    size_t actualFileIdPos = fb.size();
+    writeU32(fb, static_cast<uint32_t>(fileId.size()));
+    for (char c : fileId) fb.push_back(static_cast<uint8_t>(c));
+    fb.push_back(0);
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t actualRecordIdPos = fb.size();
+    writeU32(fb, static_cast<uint32_t>(recordId.size()));
+    for (char c : recordId) fb.push_back(static_cast<uint8_t>(c));
+    fb.push_back(0);
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    size_t actualPayloadPos = fb.size();
+    writeU32(fb, static_cast<uint32_t>(normalizedPayloadSize));
+    for (int32_t index = 0; index < normalizedPayloadSize; index++) {
+        fb.push_back(static_cast<uint8_t>((eventIndex * 31 + index * 17) % 256));
+    }
+    while (fb.size() % 4 != 0) fb.push_back(0);
+
+    uint32_t fileIdRelOffset = static_cast<uint32_t>(actualFileIdPos - fileIdFieldPos);
+    fb[fileIdFieldPos] = fileIdRelOffset & 0xFF;
+    fb[fileIdFieldPos + 1] = (fileIdRelOffset >> 8) & 0xFF;
+    fb[fileIdFieldPos + 2] = (fileIdRelOffset >> 16) & 0xFF;
+    fb[fileIdFieldPos + 3] = (fileIdRelOffset >> 24) & 0xFF;
+
+    uint32_t recordIdRelOffset = static_cast<uint32_t>(actualRecordIdPos - recordIdFieldPos);
+    fb[recordIdFieldPos] = recordIdRelOffset & 0xFF;
+    fb[recordIdFieldPos + 1] = (recordIdRelOffset >> 8) & 0xFF;
+    fb[recordIdFieldPos + 2] = (recordIdRelOffset >> 16) & 0xFF;
+    fb[recordIdFieldPos + 3] = (recordIdRelOffset >> 24) & 0xFF;
+
+    uint32_t payloadRelOffset = static_cast<uint32_t>(actualPayloadPos - payloadFieldPos);
+    fb[payloadFieldPos] = payloadRelOffset & 0xFF;
+    fb[payloadFieldPos + 1] = (payloadRelOffset >> 8) & 0xFF;
+    fb[payloadFieldPos + 2] = (payloadRelOffset >> 16) & 0xFF;
+    fb[payloadFieldPos + 3] = (payloadRelOffset >> 24) & 0xFF;
+
+    uint32_t rootOffset = static_cast<uint32_t>(tableStart);
+    fb[0] = rootOffset & 0xFF;
+    fb[1] = (rootOffset >> 8) & 0xFF;
+    fb[2] = (rootOffset >> 16) & 0xFF;
+    fb[3] = (rootOffset >> 24) & 0xFF;
+
+    return fb;
+}
+
 uint16_t getFieldOffset(const uint8_t* vtable, uint16_t vtableSize, int fieldIndex) {
     size_t vtableEntry = 4 + fieldIndex * 2;
     if (vtableEntry + 2 > vtableSize) return 0;
@@ -392,13 +475,219 @@ Value extractTelemetryFieldGeneric(const uint8_t* data, size_t length, const std
     return std::monostate{};
 }
 
+Value extractPublishEventFieldGeneric(const uint8_t* data, size_t length, const std::string& fieldName) {
+    (void)length;
+    if (!data) return std::monostate{};
+
+    uint32_t rootOffset = flatbuffers::ReadScalar<uint32_t>(data);
+    const uint8_t* root = data + rootOffset;
+    int32_t vtableOffset = flatbuffers::ReadScalar<int32_t>(root);
+    const uint8_t* vtable = root - vtableOffset;
+    uint16_t vtableSize = flatbuffers::ReadScalar<uint16_t>(vtable);
+
+    auto readString = [&](int fieldIndex) -> Value {
+        uint16_t off = getFieldOffset(vtable, vtableSize, fieldIndex);
+        if (off == 0) return std::string();
+        uint32_t strOffset = flatbuffers::ReadScalar<uint32_t>(root + off);
+        const uint8_t* strPtr = root + off + strOffset;
+        uint32_t strLen = flatbuffers::ReadScalar<uint32_t>(strPtr);
+        const char* str = reinterpret_cast<const char*>(strPtr + 4);
+        return std::string(str, strLen);
+    };
+
+    auto readInt = [&](int fieldIndex) -> Value {
+        uint16_t off = getFieldOffset(vtable, vtableSize, fieldIndex);
+        if (off == 0) return static_cast<int32_t>(0);
+        return static_cast<int32_t>(flatbuffers::ReadScalar<int32_t>(root + off));
+    };
+
+    if (fieldName == "FILE_ID") return readString(0);
+    if (fieldName == "RECORD_ID") return readString(1);
+    if (fieldName == "EVENT_INDEX") return readInt(2);
+    if (fieldName == "PAYLOAD_SIZE") return readInt(3);
+
+    return std::monostate{};
+}
+
+enum ParamTag : uint8_t {
+    PARAM_NULL = 0,
+    PARAM_BOOL = 1,
+    PARAM_INT64 = 2,
+    PARAM_FLOAT64 = 3,
+    PARAM_STRING = 4,
+    PARAM_BYTES = 5,
+};
+
+void requireBytes(size_t offset, size_t need, size_t length) {
+    if (offset > length || need > length - offset) {
+        throw std::runtime_error("Malformed query parameter payload");
+    }
+}
+
+std::vector<Value> decodeParams(const uint8_t* data, size_t length, int paramCount) {
+    if (paramCount < 0) {
+        throw std::runtime_error("Invalid parameter count");
+    }
+    if (paramCount == 0) {
+        return {};
+    }
+    if (!data) {
+        throw std::runtime_error("Missing query parameter payload");
+    }
+    if (static_cast<size_t>(paramCount) > length / 5) {
+        throw std::runtime_error("Query parameter count exceeds payload capacity");
+    }
+
+    std::vector<Value> params;
+    params.reserve(static_cast<size_t>(paramCount));
+    size_t offset = 0;
+
+    for (int index = 0; index < paramCount; index++) {
+        requireBytes(offset, 5, length);
+        const uint8_t tag = data[offset++];
+        const uint32_t size = flatbuffers::ReadScalar<uint32_t>(data + offset);
+        offset += 4;
+        requireBytes(offset, size, length);
+
+        switch (tag) {
+            case PARAM_NULL:
+                if (size != 0) {
+                    throw std::runtime_error("NULL parameter payload must be empty");
+                }
+                params.emplace_back(std::monostate{});
+                break;
+            case PARAM_BOOL:
+                if (size != 1) {
+                    throw std::runtime_error("Boolean parameter payload must be 1 byte");
+                }
+                params.emplace_back(data[offset] != 0);
+                break;
+            case PARAM_INT64:
+                if (size != sizeof(int64_t)) {
+                    throw std::runtime_error("Integer parameter payload must be 8 bytes");
+                }
+                params.emplace_back(flatbuffers::ReadScalar<int64_t>(data + offset));
+                break;
+            case PARAM_FLOAT64:
+                if (size != sizeof(double)) {
+                    throw std::runtime_error("Float parameter payload must be 8 bytes");
+                }
+                params.emplace_back(flatbuffers::ReadScalar<double>(data + offset));
+                break;
+            case PARAM_STRING:
+                params.emplace_back(std::string(reinterpret_cast<const char*>(data + offset), size));
+                break;
+            case PARAM_BYTES:
+                params.emplace_back(std::vector<uint8_t>(data + offset, data + offset + size));
+                break;
+            default:
+                throw std::runtime_error("Unsupported query parameter tag");
+        }
+
+        offset += size;
+    }
+
+    if (offset != length) {
+        throw std::runtime_error("Unexpected trailing bytes in query parameter payload");
+    }
+
+    return params;
+}
+
+std::vector<std::string> decodeStringList(const char* data) {
+    std::vector<std::string> values;
+    if (!data || data[0] == '\0') {
+        return values;
+    }
+
+    std::string input(data);
+    size_t start = 0;
+    while (start <= input.size()) {
+        const size_t end = input.find('\n', start);
+        const size_t length = (end == std::string::npos) ? input.size() - start : end - start;
+        if (length > 0) {
+            values.emplace_back(input.substr(start, length));
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return values;
+}
+
+struct QueryRequest {
+    std::string sql;
+    std::vector<Value> params;
+};
+
+std::vector<QueryRequest> decodeQueryRequests(const uint8_t* data, size_t length, int requestCount) {
+    if (requestCount < 0) {
+        throw std::runtime_error("Invalid batch query count");
+    }
+    if (requestCount == 0) {
+        return {};
+    }
+    if (!data) {
+        throw std::runtime_error("Missing batch query payload");
+    }
+    if (static_cast<size_t>(requestCount) > length / 12) {
+        throw std::runtime_error("Batch query count exceeds payload capacity");
+    }
+
+    std::vector<QueryRequest> requests;
+    requests.reserve(static_cast<size_t>(requestCount));
+    size_t offset = 0;
+
+    for (int index = 0; index < requestCount; index++) {
+        requireBytes(offset, 12, length);
+        const uint32_t sqlLength = flatbuffers::ReadScalar<uint32_t>(data + offset);
+        offset += 4;
+        const uint32_t paramCount = flatbuffers::ReadScalar<uint32_t>(data + offset);
+        offset += 4;
+        const uint32_t paramLength = flatbuffers::ReadScalar<uint32_t>(data + offset);
+        offset += 4;
+
+        requireBytes(offset, sqlLength, length);
+        std::string sql(reinterpret_cast<const char*>(data + offset), sqlLength);
+        offset += sqlLength;
+
+        requireBytes(offset, paramLength, length);
+        const uint8_t* paramData = paramLength > 0 ? data + offset : nullptr;
+        auto params = decodeParams(paramData, paramLength, static_cast<int>(paramCount));
+        offset += paramLength;
+
+        requests.push_back({std::move(sql), std::move(params)});
+    }
+
+    if (offset != length) {
+        throw std::runtime_error("Unexpected trailing bytes in batch query payload");
+    }
+
+    return requests;
+}
+
 // Global state for result handling
 QueryResult g_lastResult;
+std::vector<QueryResult> g_batchResults;
+int g_selectedBatchResult = -1;
 std::string g_lastError;
+std::string g_cacheKeyBuffer;
 std::vector<uint8_t> g_exportBuffer;
+std::vector<uint8_t> g_responseArtifactBuffer;
+size_t g_responseArtifactRowCount = 0;
+size_t g_responseArtifactColumnCount = 0;
 std::vector<uint8_t> g_testBuffer;
 std::vector<FlatSQLDatabase::TableStats> g_statsBuffer;
 std::vector<std::string> g_sourcesBuffer;
+
+QueryResult& currentResult() {
+    if (g_selectedBatchResult >= 0 && g_selectedBatchResult < static_cast<int>(g_batchResults.size())) {
+        return g_batchResults[static_cast<size_t>(g_selectedBatchResult)];
+    }
+    return g_lastResult;
+}
 
 }  // anonymous namespace
 
@@ -425,21 +714,20 @@ void flatsql_register_file_id(void* handle, const char* fileId, const char* tabl
 EMSCRIPTEN_KEEPALIVE
 void flatsql_enable_demo_extractors(void* handle) {
     auto* db = static_cast<FlatSQLDatabase*>(handle);
-    try {
+    if (db->getTableDef("User")) {
         db->setFieldExtractor("User", extractUserFieldGeneric);
-    } catch (const std::exception&) {
     }
-    try {
+    if (db->getTableDef("Post")) {
         db->setFieldExtractor("Post", extractPostFieldGeneric);
-    } catch (const std::exception&) {
     }
-    try {
+    if (db->getTableDef("MPE")) {
         db->setFieldExtractor("MPE", extractMPEFieldGeneric);
-    } catch (const std::exception&) {
     }
-    try {
+    if (db->getTableDef("Telemetry")) {
         db->setFieldExtractor("Telemetry", extractTelemetryFieldGeneric);
-    } catch (const std::exception&) {
+    }
+    if (db->getTableDef("PublishEventRecord")) {
+        db->setFieldExtractor("PublishEventRecord", extractPublishEventFieldGeneric);
     }
 }
 
@@ -481,6 +769,8 @@ double flatsql_ingest_one_with_source(void* handle, const uint8_t* data, size_t 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_query(void* handle, const char* sql) {
     try {
+        g_batchResults.clear();
+        g_selectedBatchResult = -1;
         g_lastResult = static_cast<FlatSQLDatabase*>(handle)->query(sql);
         g_lastError.clear();
         return 1;
@@ -491,36 +781,241 @@ int flatsql_query(void* handle, const char* sql) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+int flatsql_query_params(void* handle, const char* sql, const uint8_t* paramData, size_t paramLength, int paramCount) {
+    try {
+        g_batchResults.clear();
+        g_selectedBatchResult = -1;
+        g_lastResult = static_cast<FlatSQLDatabase*>(handle)->query(
+            sql,
+            decodeParams(paramData, paramLength, paramCount)
+        );
+        g_lastError.clear();
+        return 1;
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_query_many(void* handle, const uint8_t* requestData, size_t requestLength, int requestCount) {
+    try {
+        g_batchResults.clear();
+        auto requests = decodeQueryRequests(requestData, requestLength, requestCount);
+        g_batchResults.reserve(requests.size());
+        for (const auto& request : requests) {
+            g_batchResults.push_back(
+                static_cast<FlatSQLDatabase*>(handle)->query(request.sql, request.params)
+            );
+        }
+        g_selectedBatchResult = g_batchResults.empty() ? -1 : 0;
+        g_lastError.clear();
+        return 1;
+    } catch (const std::exception& e) {
+        g_batchResults.clear();
+        g_selectedBatchResult = -1;
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_batch_result_count() {
+    return static_cast<int>(g_batchResults.size());
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_select_batch_result(int index) {
+    if (index < 0 || index >= static_cast<int>(g_batchResults.size())) {
+        return 0;
+    }
+    g_selectedBatchResult = index;
+    return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
 const char* flatsql_get_error() {
     return g_lastError.c_str();
 }
 
 EMSCRIPTEN_KEEPALIVE
+const char* flatsql_build_query_cache_key(
+    const char* dataset,
+    const char* artifactVersion,
+    const char* queryId,
+    const uint8_t* paramData,
+    size_t paramLength,
+    int paramCount
+) {
+    try {
+        g_cacheKeyBuffer = buildQueryCacheKey(
+            dataset ? dataset : "",
+            artifactVersion ? artifactVersion : "",
+            queryId ? queryId : "",
+            decodeParams(paramData, paramLength, paramCount)
+        );
+        g_lastError.clear();
+        return g_cacheKeyBuffer.c_str();
+    } catch (const std::exception& e) {
+        g_cacheKeyBuffer.clear();
+        g_lastError = e.what();
+        return "";
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* flatsql_build_response_artifact_cache_key(
+    const char* schemaName,
+    const char* schemaVersion,
+    const char* sql,
+    const char* format,
+    const char* publishEventKey,
+    const char* projectionList,
+    const uint8_t* paramData,
+    size_t paramLength,
+    int paramCount
+) {
+    try {
+        g_cacheKeyBuffer = buildResponseArtifactCacheKey(
+            schemaName ? schemaName : "",
+            schemaVersion ? schemaVersion : "",
+            sql ? sql : "",
+            format ? format : "",
+            publishEventKey ? publishEventKey : "",
+            decodeStringList(projectionList),
+            decodeParams(paramData, paramLength, paramCount)
+        );
+        g_lastError.clear();
+        return g_cacheKeyBuffer.c_str();
+    } catch (const std::exception& e) {
+        g_cacheKeyBuffer.clear();
+        g_lastError = e.what();
+        return "";
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_register_query_template(void* handle,
+                                    const char* queryId,
+                                    const char* sql,
+                                    int cacheable) {
+    try {
+        static_cast<FlatSQLDatabase*>(handle)->registerQueryTemplate(
+            queryId ? queryId : "",
+            sql ? sql : "",
+            cacheable != 0
+        );
+        g_lastError.clear();
+        return 1;
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_query_template(void* handle,
+                           const char* queryId,
+                           const uint8_t* paramData,
+                           size_t paramLength,
+                           int paramCount) {
+    try {
+        g_batchResults.clear();
+        g_selectedBatchResult = -1;
+        g_lastResult = static_cast<FlatSQLDatabase*>(handle)->queryTemplate(
+            queryId ? queryId : "",
+            decodeParams(paramData, paramLength, paramCount)
+        );
+        g_lastError.clear();
+        return 1;
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+void flatsql_clear_query_cache(void* handle) {
+    static_cast<FlatSQLDatabase*>(handle)->clearQueryResultCache();
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_configure_query_cache(void* handle, size_t maxEntries, size_t maxRows) {
+    try {
+        static_cast<FlatSQLDatabase*>(handle)->configureQueryResultCache(maxEntries, maxRows);
+        g_lastError.clear();
+        return 1;
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_query_cache_hits(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getQueryCacheStats().hits);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_query_cache_misses(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getQueryCacheStats().misses);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_query_cache_size(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getQueryCacheStats().size);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_query_cache_generation(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getQueryCacheStats().generation);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_query_cache_max_entries(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getQueryCacheStats().maxEntries);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_query_cache_max_rows(void* handle) {
+    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->getQueryCacheStats().maxRows);
+}
+
+EMSCRIPTEN_KEEPALIVE
 int flatsql_result_column_count() {
-    return static_cast<int>(g_lastResult.columns.size());
+    return static_cast<int>(currentResult().columns.size());
 }
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_result_row_count() {
-    return static_cast<int>(g_lastResult.rows.size());
+    return static_cast<int>(currentResult().rows.size());
 }
 
 EMSCRIPTEN_KEEPALIVE
 const char* flatsql_result_column_name(int index) {
-    if (index < 0 || index >= static_cast<int>(g_lastResult.columns.size())) return "";
-    return g_lastResult.columns[index].c_str();
+    QueryResult& result = currentResult();
+    if (index < 0 || index >= static_cast<int>(result.columns.size())) return "";
+    return result.columns[static_cast<size_t>(index)].c_str();
 }
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_result_cell_type(int row, int col) {
-    if (row < 0 || row >= static_cast<int>(g_lastResult.rows.size())) return 0;
-    if (col < 0 || col >= static_cast<int>(g_lastResult.rows[row].size())) return 0;
+    QueryResult& result = currentResult();
+    if (row < 0 || row >= static_cast<int>(result.rows.size())) return 0;
+    if (col < 0 || col >= static_cast<int>(result.rows[static_cast<size_t>(row)].size())) return 0;
 
-    const Value& v = g_lastResult.rows[row][col];
+    const Value& v = result.rows[static_cast<size_t>(row)][static_cast<size_t>(col)];
     if (std::holds_alternative<std::monostate>(v)) return 0;
     if (std::holds_alternative<bool>(v)) return 1;
+    if (std::holds_alternative<int8_t>(v)) return 2;
+    if (std::holds_alternative<int16_t>(v)) return 2;
     if (std::holds_alternative<int32_t>(v)) return 2;
+    if (std::holds_alternative<uint8_t>(v)) return 2;
+    if (std::holds_alternative<uint16_t>(v)) return 2;
+    if (std::holds_alternative<uint32_t>(v)) return 3;
     if (std::holds_alternative<int64_t>(v)) return 3;
+    if (std::holds_alternative<uint64_t>(v)) return 3;
+    if (std::holds_alternative<float>(v)) return 4;
     if (std::holds_alternative<double>(v)) return 4;
     if (std::holds_alternative<std::string>(v)) return 5;
     if (std::holds_alternative<std::vector<uint8_t>>(v)) return 6;
@@ -529,23 +1024,32 @@ int flatsql_result_cell_type(int row, int col) {
 
 EMSCRIPTEN_KEEPALIVE
 double flatsql_result_cell_number(int row, int col) {
-    if (row < 0 || row >= static_cast<int>(g_lastResult.rows.size())) return 0;
-    if (col < 0 || col >= static_cast<int>(g_lastResult.rows[row].size())) return 0;
+    QueryResult& result = currentResult();
+    if (row < 0 || row >= static_cast<int>(result.rows.size())) return 0;
+    if (col < 0 || col >= static_cast<int>(result.rows[static_cast<size_t>(row)].size())) return 0;
 
-    const Value& v = g_lastResult.rows[row][col];
+    const Value& v = result.rows[static_cast<size_t>(row)][static_cast<size_t>(col)];
     if (std::holds_alternative<bool>(v)) return std::get<bool>(v) ? 1 : 0;
+    if (std::holds_alternative<int8_t>(v)) return static_cast<double>(std::get<int8_t>(v));
+    if (std::holds_alternative<int16_t>(v)) return static_cast<double>(std::get<int16_t>(v));
     if (std::holds_alternative<int32_t>(v)) return static_cast<double>(std::get<int32_t>(v));
     if (std::holds_alternative<int64_t>(v)) return static_cast<double>(std::get<int64_t>(v));
+    if (std::holds_alternative<uint8_t>(v)) return static_cast<double>(std::get<uint8_t>(v));
+    if (std::holds_alternative<uint16_t>(v)) return static_cast<double>(std::get<uint16_t>(v));
+    if (std::holds_alternative<uint32_t>(v)) return static_cast<double>(std::get<uint32_t>(v));
+    if (std::holds_alternative<uint64_t>(v)) return static_cast<double>(std::get<uint64_t>(v));
+    if (std::holds_alternative<float>(v)) return static_cast<double>(std::get<float>(v));
     if (std::holds_alternative<double>(v)) return std::get<double>(v);
     return 0;
 }
 
 EMSCRIPTEN_KEEPALIVE
 const char* flatsql_result_cell_string(int row, int col) {
-    if (row < 0 || row >= static_cast<int>(g_lastResult.rows.size())) return "";
-    if (col < 0 || col >= static_cast<int>(g_lastResult.rows[row].size())) return "";
+    QueryResult& result = currentResult();
+    if (row < 0 || row >= static_cast<int>(result.rows.size())) return "";
+    if (col < 0 || col >= static_cast<int>(result.rows[static_cast<size_t>(row)].size())) return "";
 
-    const Value& v = g_lastResult.rows[row][col];
+    const Value& v = result.rows[static_cast<size_t>(row)][static_cast<size_t>(col)];
     if (std::holds_alternative<std::string>(v)) {
         return std::get<std::string>(v).c_str();
     }
@@ -554,10 +1058,11 @@ const char* flatsql_result_cell_string(int row, int col) {
 
 EMSCRIPTEN_KEEPALIVE
 const uint8_t* flatsql_result_cell_blob(int row, int col) {
-    if (row < 0 || row >= static_cast<int>(g_lastResult.rows.size())) return nullptr;
-    if (col < 0 || col >= static_cast<int>(g_lastResult.rows[row].size())) return nullptr;
+    QueryResult& result = currentResult();
+    if (row < 0 || row >= static_cast<int>(result.rows.size())) return nullptr;
+    if (col < 0 || col >= static_cast<int>(result.rows[static_cast<size_t>(row)].size())) return nullptr;
 
-    const Value& v = g_lastResult.rows[row][col];
+    const Value& v = result.rows[static_cast<size_t>(row)][static_cast<size_t>(col)];
     if (std::holds_alternative<std::vector<uint8_t>>(v)) {
         return std::get<std::vector<uint8_t>>(v).data();
     }
@@ -566,10 +1071,11 @@ const uint8_t* flatsql_result_cell_blob(int row, int col) {
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_result_cell_blob_size(int row, int col) {
-    if (row < 0 || row >= static_cast<int>(g_lastResult.rows.size())) return 0;
-    if (col < 0 || col >= static_cast<int>(g_lastResult.rows[row].size())) return 0;
+    QueryResult& result = currentResult();
+    if (row < 0 || row >= static_cast<int>(result.rows.size())) return 0;
+    if (col < 0 || col >= static_cast<int>(result.rows[static_cast<size_t>(row)].size())) return 0;
 
-    const Value& v = g_lastResult.rows[row][col];
+    const Value& v = result.rows[static_cast<size_t>(row)][static_cast<size_t>(col)];
     if (std::holds_alternative<std::vector<uint8_t>>(v)) {
         return static_cast<int>(std::get<std::vector<uint8_t>>(v).size());
     }
@@ -583,6 +1089,68 @@ const uint8_t* flatsql_export_data(void* handle) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+int flatsql_query_raw_flatbuffer_stream(
+    void* handle,
+    const char* sql,
+    const uint8_t* paramData,
+    size_t paramLength,
+    int paramCount
+) {
+    try {
+        auto result = static_cast<FlatSQLDatabase*>(handle)->query(
+            sql ? sql : "",
+            decodeParams(paramData, paramLength, paramCount)
+        );
+
+        g_responseArtifactBuffer.clear();
+        g_responseArtifactRowCount = result.rows.size();
+        g_responseArtifactColumnCount = result.columns.size();
+        for (const auto& row : result.rows) {
+            for (const auto& value : row) {
+                const auto* bytes = std::get_if<std::vector<uint8_t>>(&value);
+                if (!bytes) {
+                    throw std::runtime_error("raw response stream queries must return only BLOB cells");
+                }
+                if (bytes->size() > std::numeric_limits<uint32_t>::max()) {
+                    throw std::runtime_error("raw response stream record exceeds size-prefix capacity");
+                }
+                writeU32(g_responseArtifactBuffer, static_cast<uint32_t>(bytes->size()));
+                g_responseArtifactBuffer.insert(g_responseArtifactBuffer.end(), bytes->begin(), bytes->end());
+            }
+        }
+
+        g_lastError.clear();
+        return 1;
+    } catch (const std::exception& e) {
+        g_responseArtifactBuffer.clear();
+        g_responseArtifactRowCount = 0;
+        g_responseArtifactColumnCount = 0;
+        g_lastError = e.what();
+        return 0;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+const uint8_t* flatsql_response_artifact_data() {
+    return g_responseArtifactBuffer.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_response_artifact_size() {
+    return static_cast<int>(g_responseArtifactBuffer.size());
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_response_artifact_row_count() {
+    return static_cast<double>(g_responseArtifactRowCount);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_response_artifact_column_count() {
+    return static_cast<double>(g_responseArtifactColumnCount);
+}
+
+EMSCRIPTEN_KEEPALIVE
 int flatsql_export_size() {
     return static_cast<int>(g_exportBuffer.size());
 }
@@ -590,6 +1158,21 @@ int flatsql_export_size() {
 EMSCRIPTEN_KEEPALIVE
 void flatsql_load_and_rebuild(void* handle, const uint8_t* data, size_t length) {
     static_cast<FlatSQLDatabase*>(handle)->loadAndRebuild(data, length);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void flatsql_reserve_storage(void* handle, size_t bytes) {
+    static_cast<FlatSQLDatabase*>(handle)->reserveStorage(bytes);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void flatsql_load_from_db(void* handle, void* sourceHandle) {
+    auto* source = static_cast<FlatSQLDatabase*>(sourceHandle);
+    const auto& sourceStorage = source->getStorage();
+    static_cast<FlatSQLDatabase*>(handle)->loadAndRebuild(
+        sourceStorage.getDataBuffer(),
+        static_cast<size_t>(sourceStorage.getDataSize())
+    );
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -648,6 +1231,20 @@ const uint8_t* flatsql_create_test_telemetry(int32_t packetId,
                                                      temperatureC,
                                                      signalDb,
                                                      timestampS);
+    return g_testBuffer.data();
+}
+
+EMSCRIPTEN_KEEPALIVE
+const uint8_t* flatsql_create_test_publish_event(const char* fileId,
+                                                 const char* recordId,
+                                                 int32_t eventIndex,
+                                                 int32_t payloadSize) {
+    g_testBuffer = createPublishEventFlatBufferInternal(
+        fileId ? fileId : "",
+        recordId ? recordId : "",
+        eventIndex,
+        payloadSize
+    );
     return g_testBuffer.data();
 }
 
@@ -741,11 +1338,18 @@ static const uint8_t* g_rawFlatBuffer = nullptr;
 static uint32_t g_rawFlatBufferSize = 0;
 static uint64_t g_rawFlatBufferSequence = 0;
 
+static void resetRawFlatBufferState() {
+    g_rawFlatBuffer = nullptr;
+    g_rawFlatBufferSize = 0;
+    g_rawFlatBufferSequence = 0;
+}
+
 // Get raw FlatBuffer pointer by table name and indexed column value
 // Returns pointer to FlatBuffer in WASM memory, or 0 if not found
 // Call flatsql_get_raw_flatbuffer_size() after to get the size
 EMSCRIPTEN_KEEPALIVE
 const uint8_t* flatsql_get_flatbuffer_by_id(void* handle, const char* tableName, int32_t id) {
+    resetRawFlatBufferState();
     auto* db = static_cast<FlatSQLDatabase*>(handle);
     g_rawFlatBuffer = db->findRawByIndex(tableName, "id", static_cast<int64_t>(id),
                                           &g_rawFlatBufferSize, &g_rawFlatBufferSequence);
@@ -755,10 +1359,45 @@ const uint8_t* flatsql_get_flatbuffer_by_id(void* handle, const char* tableName,
 // Get raw FlatBuffer pointer by table name and email (string key)
 EMSCRIPTEN_KEEPALIVE
 const uint8_t* flatsql_get_flatbuffer_by_email(void* handle, const char* tableName, const char* email) {
+    resetRawFlatBufferState();
     auto* db = static_cast<FlatSQLDatabase*>(handle);
     g_rawFlatBuffer = db->findRawByIndex(tableName, "email", std::string(email),
                                           &g_rawFlatBufferSize, &g_rawFlatBufferSequence);
     return g_rawFlatBuffer;
+}
+
+// Get raw FlatBuffer pointer by table name, indexed column name, and one typed key.
+EMSCRIPTEN_KEEPALIVE
+const uint8_t* flatsql_get_flatbuffer_by_index(
+    void* handle,
+    const char* tableName,
+    const char* columnName,
+    const uint8_t* paramData,
+    size_t paramLength,
+    int paramCount
+) {
+    try {
+        resetRawFlatBufferState();
+        auto params = decodeParams(paramData, paramLength, paramCount);
+        if (params.size() != 1) {
+            throw std::runtime_error("Indexed FlatBuffer lookup expects exactly one key parameter");
+        }
+
+        auto* db = static_cast<FlatSQLDatabase*>(handle);
+        g_rawFlatBuffer = db->findRawByIndex(
+            tableName ? tableName : "",
+            columnName ? columnName : "",
+            params[0],
+            &g_rawFlatBufferSize,
+            &g_rawFlatBufferSequence
+        );
+        g_lastError.clear();
+        return g_rawFlatBuffer;
+    } catch (const std::exception& e) {
+        resetRawFlatBufferState();
+        g_lastError = e.what();
+        return nullptr;
+    }
 }
 
 // Get size of the last accessed raw FlatBuffer

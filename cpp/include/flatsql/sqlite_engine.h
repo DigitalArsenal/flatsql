@@ -7,6 +7,7 @@
 #include "flatsql/sqlite_vtab.h"
 #include <sqlite3.h>
 #include <memory>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace flatsql {
@@ -182,6 +183,13 @@ public:
                             uint64_t* outSequence = nullptr);
 
 private:
+    struct ParsedQuery {
+        std::string tableName;
+        std::string columnName;
+        bool isPointQuery = false;
+        bool isFullScan = false;
+    };
+
     // Try to intercept simple queries and use direct API instead of VTable
     // Returns true if query was intercepted and result is populated
     bool tryFastPath(const std::string& sql, const std::vector<Value>& params, QueryResult& result);
@@ -191,6 +199,9 @@ private:
 
     // Helper to find source with case-insensitive matching
     SourceInfo* findSourceCaseInsensitive(const std::string& lowerTableName);
+
+    // Helper to get cached column names for a source
+    const std::vector<std::string>& getCachedColumnNames(const SourceInfo* source);
 
     sqlite3* db_;
     SQLiteConnectionOptions options_;
@@ -208,6 +219,13 @@ private:
 
     // Clear statement cache
     void clearStmtCache();
+
+    // Clear parsed fast-path/source caches when source/schema state changes
+    void clearFastPathCaches();
+
+    mutable std::unordered_map<std::string, SourceInfo*> sourceNameCache_;
+    mutable std::unordered_map<std::string, ParsedQuery> parsedQueryCache_;
+    mutable std::unordered_map<std::string, std::vector<std::string>> columnNamesCache_;
 
     // Helper to build column list for CREATE VIEW
     std::string buildColumnList(const TableDef* tableDef) const;

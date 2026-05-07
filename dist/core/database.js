@@ -58,6 +58,17 @@ export class FlatSQLDatabase {
         }
         return rowids;
     }
+    // Create a runtime index without requiring database-specific schema annotations.
+    createIndex(tableName, columnName) {
+        const tableStore = this.tables.get(tableName);
+        if (!tableStore) {
+            throw new Error(`Table not found: ${tableName}`);
+        }
+        tableStore.createIndex(columnName);
+    }
+    getStorageBytes() {
+        return this.storage.getCurrentSize();
+    }
     // Execute a simple SQL query
     // Supports: SELECT columns FROM table WHERE column = value
     //           SELECT columns FROM table WHERE column BETWEEN min AND max
@@ -115,6 +126,9 @@ export class FlatSQLDatabase {
         else {
             records = tableStore.scanAll();
         }
+        if (parsed.limit !== undefined) {
+            records = records.slice(0, parsed.limit);
+        }
         // Determine columns
         const tableDef = tableStore.getTableDef();
         const columns = parsed.columns[0] === '*'
@@ -127,6 +141,8 @@ export class FlatSQLDatabase {
                     return record.rowid;
                 if (col === '_offset')
                     return record.offset;
+                if (col === '_data')
+                    return record.data;
                 return record.fields.get(col) ?? null;
             });
         });
@@ -144,6 +160,7 @@ export class FlatSQLDatabase {
             const columns = selectMatch[1].split(',').map(c => c.trim());
             const table = selectMatch[2];
             const whereClause = selectMatch[3];
+            const limit = selectMatch[5] === undefined ? undefined : Number(selectMatch[5]);
             let where;
             if (whereClause) {
                 // Parse BETWEEN
@@ -173,6 +190,7 @@ export class FlatSQLDatabase {
                 table,
                 columns,
                 where,
+                limit,
             };
         }
         // Security: Don't expose SQL in error message (could contain sensitive data)

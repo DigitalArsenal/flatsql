@@ -2103,8 +2103,8 @@
 
     <section class="code-section" id="code">
         <div class="section-title">
-            <h2>Simple API</h2>
-            <p>Stream format: [4-byte size LE][FlatBuffer with file_id]...</p>
+            <h2>Standalone Runtime API</h2>
+            <p>One C++ WASI artifact runs in browsers through a small shim and in WasmEdge through a resident runner with native query caching.</p>
         </div>
         <div class="code-tabs">
             <button class="code-tab active" data-tab="js">JavaScript</button>
@@ -2112,21 +2112,24 @@
             <button class="code-tab" data-tab="cli">CLI</button>
         </div>
         <div class="code-block">
-            <pre id="codeContent"><span class="comment">// Create database from schema</span>
-<span class="keyword">const</span> db = <span class="keyword">new</span> FlatSQLDatabase(schema, <span class="string">"mydb"</span>);
+            <pre id="codeContent"><span class="keyword">import</span> { createStandaloneArtifactBuilder } <span class="keyword">from</span> <span class="string">"flatsql/artifacts/standalone"</span>;
 
-<span class="comment">// Register file identifiers for routing</span>
-db.<span class="function">registerFileId</span>(<span class="string">"TELE"</span>, <span class="string">"Telemetry"</span>);
+<span class="keyword">const</span> builder = <span class="keyword">await</span> <span class="function">createStandaloneArtifactBuilder</span>(schema, {
+  runtime: <span class="string">"standalone"</span>
+});
 
-<span class="comment">// Register data sources</span>
-db.<span class="function">registerSource</span>(<span class="string">"satellite-1"</span>);
-db.<span class="function">registerSource</span>(<span class="string">"ground-station"</span>);
+<span class="keyword">await</span> builder.<span class="function">registerFileId</span>(<span class="string">"TELE"</span>, <span class="string">"Telemetry"</span>);
+<span class="keyword">await</span> builder.<span class="function">ingestBuffers</span>(telemetryBuffers);
 
-<span class="comment">// Stream size-prefixed FlatBuffers to a source</span>
-<span class="keyword">const</span> bytesConsumed = db.<span class="function">ingest</span>(streamData, <span class="string">"satellite-1"</span>);
+<span class="keyword">await</span> builder.<span class="function">registerQueryTemplate</span>(
+  <span class="string">"packetById"</span>,
+  <span class="string">"SELECT packet_id, subsystem FROM Telemetry WHERE packet_id = ?"</span>,
+  <span class="keyword">true</span>
+);
 
-<span class="comment">// Query with SQL (filter by _source)</span>
-<span class="keyword">const</span> result = db.<span class="function">query</span>(<span class="string">"SELECT packet_id, subsystem, signal_db FROM Telemetry WHERE _source = 'satellite-1'"</span>);</pre>
+<span class="keyword">await</span> builder.<span class="function">queryTemplate</span>(<span class="string">"packetById"</span>, [42]); <span class="comment">// cache miss</span>
+<span class="keyword">await</span> builder.<span class="function">queryTemplate</span>(<span class="string">"packetById"</span>, [42]); <span class="comment">// cache hit</span>
+<span class="keyword">const</span> stats = <span class="keyword">await</span> builder.<span class="function">getQueryCacheStats</span>();</pre>
         </div>
     </section>
 
@@ -2196,21 +2199,24 @@ db.<span class="function">registerSource</span>(<span class="string">"ground-sta
 
         // Code tabs
         const codeExamples = {
-            js: `<span class="comment">// Create database from schema</span>
-<span class="keyword">const</span> db = <span class="keyword">new</span> FlatSQLDatabase(schema, <span class="string">"mydb"</span>);
+            js: `<span class="keyword">import</span> { createStandaloneArtifactBuilder } <span class="keyword">from</span> <span class="string">"flatsql/artifacts/standalone"</span>;
 
-<span class="comment">// Register file identifiers for routing</span>
-db.<span class="function">registerFileId</span>(<span class="string">"TELE"</span>, <span class="string">"Telemetry"</span>);
+<span class="keyword">const</span> builder = <span class="keyword">await</span> <span class="function">createStandaloneArtifactBuilder</span>(schema, {
+  runtime: <span class="string">"standalone"</span>
+});
 
-<span class="comment">// Register data sources</span>
-db.<span class="function">registerSource</span>(<span class="string">"satellite-1"</span>);
-db.<span class="function">registerSource</span>(<span class="string">"ground-station"</span>);
+<span class="keyword">await</span> builder.<span class="function">registerFileId</span>(<span class="string">"TELE"</span>, <span class="string">"Telemetry"</span>);
+<span class="keyword">await</span> builder.<span class="function">ingestBuffers</span>(telemetryBuffers);
 
-<span class="comment">// Stream size-prefixed FlatBuffers to a source</span>
-<span class="keyword">const</span> bytesConsumed = db.<span class="function">ingest</span>(streamData, <span class="string">"satellite-1"</span>);
+<span class="keyword">await</span> builder.<span class="function">registerQueryTemplate</span>(
+  <span class="string">"packetById"</span>,
+  <span class="string">"SELECT packet_id, subsystem FROM Telemetry WHERE packet_id = ?"</span>,
+  <span class="keyword">true</span>
+);
 
-<span class="comment">// Query with SQL (filter by _source)</span>
-<span class="keyword">const</span> result = db.<span class="function">query</span>(<span class="string">"SELECT packet_id, subsystem, signal_db FROM Telemetry WHERE _source = 'satellite-1'"</span>);`,
+<span class="keyword">await</span> builder.<span class="function">queryTemplate</span>(<span class="string">"packetById"</span>, [42]); <span class="comment">// cache miss</span>
+<span class="keyword">await</span> builder.<span class="function">queryTemplate</span>(<span class="string">"packetById"</span>, [42]); <span class="comment">// cache hit</span>
+<span class="keyword">const</span> stats = <span class="keyword">await</span> builder.<span class="function">getQueryCacheStats</span>();`,
             cpp: `<span class="comment">// Create database from schema</span>
 FlatSQLDatabase db = FlatSQLDatabase::<span class="function">fromSchema</span>(schema, <span class="string">"mydb"</span>);
 

@@ -72,6 +72,56 @@ void testSQLiteEngine() {
     std::cout << "SQLite engine tests passed!" << std::endl;
 }
 
+void testSQLiteParameterizedStatementReuse() {
+    std::cout << "Testing SQLite parameterized statement reuse..." << std::endl;
+
+    SQLiteEngine engine;
+    char* errMsg = nullptr;
+    int rc = sqlite3_exec(
+        engine.getDb(),
+        "CREATE TABLE cache_test (id INTEGER PRIMARY KEY, email TEXT, active INTEGER);"
+        "INSERT INTO cache_test VALUES (1, 'alice@example.com', 1);"
+        "INSERT INTO cache_test VALUES (2, 'bob@example.com', 0);",
+        nullptr,
+        nullptr,
+        &errMsg
+    );
+    assert(rc == SQLITE_OK);
+
+    QueryResult alice = engine.execute(
+        "SELECT email FROM cache_test WHERE id = ?",
+        {int64_t(1)}
+    );
+    assert(alice.rowCount() == 1);
+    assert(std::get<std::string>(alice.rows[0][0]) == "alice@example.com");
+
+    QueryResult bob = engine.execute(
+        "SELECT email FROM cache_test WHERE id = ?",
+        {int64_t(2)}
+    );
+    assert(bob.rowCount() == 1);
+    assert(std::get<std::string>(bob.rows[0][0]) == "bob@example.com");
+
+    QueryResult staleBinding = engine.execute(
+        "SELECT ?1 AS first_value, ?2 IS NULL AS second_is_null",
+        {int64_t(9), std::string("sticky")}
+    );
+    assert(std::get<int64_t>(staleBinding.rows[0][1]) == 0);
+
+    bool rejectedMissingParam = false;
+    try {
+        engine.execute(
+            "SELECT ?1 AS first_value, ?2 IS NULL AS second_is_null",
+            {int64_t(10)}
+        );
+    } catch (const std::runtime_error& error) {
+        rejectedMissingParam = std::string(error.what()).find("expects 2 parameters but received 1") != std::string::npos;
+    }
+    assert(rejectedMissingParam);
+
+    std::cout << "SQLite parameterized statement reuse tests passed!" << std::endl;
+}
+
 void testSqliteIndex() {
     std::cout << "Testing SQLite-backed index..." << std::endl;
 
@@ -377,6 +427,70 @@ void testDatabase() {
     assert(result.rowCount() == 2);
 
     std::cout << "Database tests passed!" << std::endl;
+}
+
+void testQueryTemplateCache() {
+    std::cout << "Testing C++ query template cache..." << std::endl;
+
+    std::string schema = R"(
+        table items {
+            id: int (id);
+            name: string;
+            price: float;
+        }
+    )";
+
+    FlatSQLDatabase db = FlatSQLDatabase::fromSchema(schema, "template_cache_test");
+    db.registerFileId("ITEM", "items");
+    db.registerQueryTemplate("item_count", "SELECT COUNT(*) FROM items");
+
+    std::vector<uint8_t> fakeData = {0x08, 0x00, 0x00, 0x00, 'I', 'T', 'E', 'M'};
+    db.ingestOne(fakeData.data(), fakeData.size());
+
+    QueryResult first = db.queryTemplate("item_count");
+    assert(first.rowCount() == 1);
+    assert(std::get<int64_t>(first.rows[0][0]) == 1);
+
+    auto statsAfterFirst = db.getQueryCacheStats();
+    assert(statsAfterFirst.misses == 1);
+    assert(statsAfterFirst.hits == 0);
+    assert(statsAfterFirst.size == 1);
+
+    QueryResult second = db.queryTemplate("item_count");
+    assert(std::get<int64_t>(second.rows[0][0]) == 1);
+
+    auto statsAfterSecond = db.getQueryCacheStats();
+    assert(statsAfterSecond.hits == 1);
+    assert(statsAfterSecond.misses == 1);
+    assert(statsAfterSecond.size == 1);
+
+    db.ingestOne(fakeData.data(), fakeData.size());
+
+    QueryResult afterIngest = db.queryTemplate("item_count");
+    assert(std::get<int64_t>(afterIngest.rows[0][0]) == 2);
+
+    auto statsAfterInvalidation = db.getQueryCacheStats();
+    assert(statsAfterInvalidation.hits == 1);
+    assert(statsAfterInvalidation.misses == 2);
+    assert(statsAfterInvalidation.size == 1);
+
+    db.registerQueryTemplate("uncached_count", "SELECT COUNT(*) FROM items", false);
+    db.queryTemplate("uncached_count");
+    db.queryTemplate("uncached_count");
+
+    auto statsAfterUncached = db.getQueryCacheStats();
+    assert(statsAfterUncached.hits == 1);
+    assert(statsAfterUncached.misses == 2);
+
+    bool rejectedMissingTemplate = false;
+    try {
+        db.queryTemplate("missing_template");
+    } catch (const std::runtime_error& error) {
+        rejectedMissingTemplate = std::string(error.what()).find("Query template not found") != std::string::npos;
+    }
+    assert(rejectedMissingTemplate);
+
+    std::cout << "C++ query template cache tests passed!" << std::endl;
 }
 
 void testSchemaAnalyzer() {
@@ -723,9 +837,11 @@ int main() {
     try {
         testSchemaParser();
         testSQLiteEngine();
+        testSQLiteParameterizedStatementReuse();
         testSqliteIndex();
         testStorage();
         testDatabase();
+        testQueryTemplateCache();
         testSchemaAnalyzer();
         testCycleDetection();
         testJunctionManager();

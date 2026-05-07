@@ -1,4 +1,5 @@
 #include "flatsql/database.h"
+#include "flatsql/query_cache.h"
 #include <algorithm>
 #include <mutex>
 #include <stdexcept>
@@ -258,6 +259,7 @@ FlatSQLDatabase FlatSQLDatabase::fromSchema(const std::string& source,
 }
 
 void FlatSQLDatabase::registerFileId(const std::string& fileId, const std::string& tableName) {
+    std::unique_lock lock(*accessMutex_);
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         throw std::runtime_error("Table not found: " + tableName);
@@ -265,6 +267,7 @@ void FlatSQLDatabase::registerFileId(const std::string& fileId, const std::strin
 
     fileIdToTable_[fileId] = tableName;
     it->second->setFileId(fileId);
+    invalidateQueryResultCacheUnlocked();
 }
 
 void FlatSQLDatabase::onIngest(std::string_view fileId, const uint8_t* data, size_t length,
@@ -285,6 +288,7 @@ void FlatSQLDatabase::onIngest(std::string_view fileId, const uint8_t* data, siz
 
 size_t FlatSQLDatabase::ingest(const uint8_t* data, size_t length, size_t* recordsIngested) {
     std::unique_lock lock(*accessMutex_);
+    invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     return storage_->ingest(data, length,
         [this](std::string_view fileId, const uint8_t* data, size_t len,
@@ -295,6 +299,7 @@ size_t FlatSQLDatabase::ingest(const uint8_t* data, size_t length, size_t* recor
 
 uint64_t FlatSQLDatabase::ingestOne(const uint8_t* flatbuffer, size_t length) {
     std::unique_lock lock(*accessMutex_);
+    invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     return storage_->ingestFlatBuffer(flatbuffer, length,
         [this](std::string_view fileId, const uint8_t* data, size_t len,
@@ -305,12 +310,18 @@ uint64_t FlatSQLDatabase::ingestOne(const uint8_t* flatbuffer, size_t length) {
 
 void FlatSQLDatabase::loadAndRebuild(const uint8_t* data, size_t length) {
     std::unique_lock lock(*accessMutex_);
+    invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     storage_->loadAndRebuild(data, length,
         [this](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
             onIngest(fileId, data, len, seq, offset);
         }, profile);
+}
+
+void FlatSQLDatabase::reserveStorage(size_t bytes) {
+    std::unique_lock lock(*accessMutex_);
+    storage_->reserveCapacity(bytes);
 }
 
 void FlatSQLDatabase::initializeSQLiteEngine() {
@@ -386,7 +397,7 @@ QueryResult FlatSQLDatabase::query(const std::string& sql) {
         return sqliteEngine_->execute(sql);
     }
 
-    std::shared_lock lock(*accessMutex_);
+    std::unique_lock lock(*accessMutex_);
     return sqliteEngine_->execute(sql);
 }
 
@@ -397,7 +408,7 @@ QueryResult FlatSQLDatabase::query(const std::string& sql, const std::vector<Val
         return sqliteEngine_->execute(sql, params);
     }
 
-    std::shared_lock lock(*accessMutex_);
+    std::unique_lock lock(*accessMutex_);
     return sqliteEngine_->execute(sql, params);
 }
 
@@ -412,8 +423,134 @@ QueryResult FlatSQLDatabase::query(const std::string& sql, int64_t param) {
         return sqliteEngine_->execute(sql, singleParam);
     }
 
-    std::shared_lock lock(*accessMutex_);
+    std::unique_lock lock(*accessMutex_);
     return sqliteEngine_->execute(sql, singleParam);
+}
+
+void FlatSQLDatabase::registerQueryTemplate(const std::string& queryId,
+                                            const std::string& sql,
+                                            bool cacheable) {
+    std::unique_lock lock(*accessMutex_);
+    auto existing = queryTemplates_.find(queryId);
+    const bool changed = existing != queryTemplates_.end() &&
+        (existing->second.sql != sql || existing->second.cacheable != cacheable);
+
+    queryTemplates_[queryId] = QueryTemplateDef{sql, cacheable};
+
+    if (changed) {
+        invalidateQueryResultCacheUnlocked();
+    }
+}
+
+QueryResult FlatSQLDatabase::queryTemplate(const std::string& queryId,
+                                           const std::vector<Value>& params) {
+    std::unique_lock lock(*accessMutex_);
+
+    auto templateIt = queryTemplates_.find(queryId);
+    if (templateIt == queryTemplates_.end()) {
+        throw std::runtime_error("Query template not found: " + queryId);
+    }
+
+    const QueryTemplateDef& tmpl = templateIt->second;
+    if (tmpl.cacheable) {
+        const std::string cacheKey = buildTemplateCacheKeyUnlocked(queryId, tmpl.sql, params);
+        auto cached = queryResultCache_.find(cacheKey);
+        if (cached != queryResultCache_.end()) {
+            queryCacheHits_++;
+            queryResultCacheLru_.splice(
+                queryResultCacheLru_.begin(),
+                queryResultCacheLru_,
+                cached->second.lruIt
+            );
+            cached->second.lruIt = queryResultCacheLru_.begin();
+            return cached->second.result;
+        }
+
+        queryCacheMisses_++;
+        if (!sqliteInitialized_) {
+            initializeSQLiteEngine();
+        }
+        QueryResult result = sqliteEngine_->execute(tmpl.sql, params);
+        storeCachedQueryResultUnlocked(cacheKey, result);
+        return result;
+    }
+
+    if (!sqliteInitialized_) {
+        initializeSQLiteEngine();
+    }
+    return sqliteEngine_->execute(tmpl.sql, params);
+}
+
+void FlatSQLDatabase::clearQueryResultCache() {
+    std::unique_lock lock(*accessMutex_);
+    invalidateQueryResultCacheUnlocked();
+}
+
+void FlatSQLDatabase::configureQueryResultCache(size_t maxEntries, size_t maxRows) {
+    if (maxEntries == 0) {
+        throw std::runtime_error("query cache maxEntries must be greater than zero");
+    }
+    if (maxRows == 0) {
+        throw std::runtime_error("query cache maxRows must be greater than zero");
+    }
+
+    std::unique_lock lock(*accessMutex_);
+    queryResultCacheMaxEntries_ = maxEntries;
+    queryResultCacheMaxRows_ = maxRows;
+    invalidateQueryResultCacheUnlocked();
+}
+
+FlatSQLDatabase::QueryCacheStats FlatSQLDatabase::getQueryCacheStats() const {
+    std::shared_lock lock(*accessMutex_);
+    return QueryCacheStats{
+        queryCacheHits_,
+        queryCacheMisses_,
+        queryResultCache_.size(),
+        queryCacheGeneration_,
+        queryResultCacheMaxEntries_,
+        queryResultCacheMaxRows_
+    };
+}
+
+void FlatSQLDatabase::invalidateQueryResultCacheUnlocked() {
+    queryResultCache_.clear();
+    queryResultCacheLru_.clear();
+    queryCacheGeneration_++;
+}
+
+void FlatSQLDatabase::storeCachedQueryResultUnlocked(const std::string& key,
+                                                     const QueryResult& result) {
+    if (result.rows.size() > queryResultCacheMaxRows_) {
+        return;
+    }
+
+    auto existing = queryResultCache_.find(key);
+    if (existing != queryResultCache_.end()) {
+        existing->second.result = result;
+        queryResultCacheLru_.splice(
+            queryResultCacheLru_.begin(),
+            queryResultCacheLru_,
+            existing->second.lruIt
+        );
+        existing->second.lruIt = queryResultCacheLru_.begin();
+        return;
+    }
+
+    queryResultCacheLru_.push_front(key);
+    queryResultCache_.emplace(key, CachedQueryResult{result, queryResultCacheLru_.begin()});
+
+    while (queryResultCache_.size() > queryResultCacheMaxEntries_) {
+        const std::string& evictedKey = queryResultCacheLru_.back();
+        queryResultCache_.erase(evictedKey);
+        queryResultCacheLru_.pop_back();
+    }
+}
+
+std::string FlatSQLDatabase::buildTemplateCacheKeyUnlocked(const std::string& queryId,
+                                                           const std::string& sql,
+                                                           const std::vector<Value>& params) const {
+    (void)sql;
+    return buildQueryCacheKey(schema_.name, std::to_string(queryCacheGeneration_), queryId, params);
 }
 
 size_t FlatSQLDatabase::queryCount(const std::string& sql, const std::vector<Value>& params) {
@@ -423,14 +560,14 @@ size_t FlatSQLDatabase::queryCount(const std::string& sql, const std::vector<Val
         return sqliteEngine_->executeAndCount(sql, params);
     }
 
-    std::shared_lock lock(*accessMutex_);
+    std::unique_lock lock(*accessMutex_);
     return sqliteEngine_->executeAndCount(sql, params);
 }
 
 std::vector<StoredRecord> FlatSQLDatabase::findByIndex(const std::string& tableName,
                                                         const std::string& column,
                                                         const Value& value) {
-    std::shared_lock lock(*accessMutex_);
+    std::unique_lock lock(*accessMutex_);
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         return {};
@@ -442,7 +579,7 @@ bool FlatSQLDatabase::findOneByIndex(const std::string& tableName,
                                       const std::string& column,
                                       const Value& value,
                                       StoredRecord& result) {
-    std::shared_lock lock(*accessMutex_);
+    std::unique_lock lock(*accessMutex_);
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         return false;
@@ -472,7 +609,7 @@ const uint8_t* FlatSQLDatabase::findRawByIndex(const std::string& tableName,
                                                 const Value& value,
                                                 uint32_t* outLength,
                                                 uint64_t* outSequence) {
-    std::shared_lock lock(*accessMutex_);
+    std::unique_lock lock(*accessMutex_);
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         return nullptr;
@@ -522,12 +659,14 @@ const uint8_t* FlatSQLDatabase::findRawByIndex(const std::string& tableName,
 }
 
 void FlatSQLDatabase::setFieldExtractor(const std::string& tableName, TableStore::FieldExtractor extractor) {
+    std::unique_lock lock(*accessMutex_);
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         throw std::runtime_error("Table not found: " + tableName);
     }
 
     it->second->setFieldExtractor(extractor);
+    invalidateQueryResultCacheUnlocked();
 
     // If table has a file ID registered, update SQLite registration
     if (!it->second->getFileId().empty()) {
@@ -536,12 +675,14 @@ void FlatSQLDatabase::setFieldExtractor(const std::string& tableName, TableStore
 }
 
 void FlatSQLDatabase::setFastFieldExtractor(const std::string& tableName, TableStore::FastFieldExtractor extractor) {
+    std::unique_lock lock(*accessMutex_);
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         throw std::runtime_error("Table not found: " + tableName);
     }
 
     it->second->setFastFieldExtractor(extractor);
+    invalidateQueryResultCacheUnlocked();
 
     // If table has a file ID registered, update SQLite registration
     if (!it->second->getFileId().empty()) {
@@ -550,12 +691,14 @@ void FlatSQLDatabase::setFastFieldExtractor(const std::string& tableName, TableS
 }
 
 void FlatSQLDatabase::setBatchExtractor(const std::string& tableName, TableStore::BatchExtractor extractor) {
+    std::unique_lock lock(*accessMutex_);
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         throw std::runtime_error("Table not found: " + tableName);
     }
 
     it->second->setBatchExtractor(extractor);
+    invalidateQueryResultCacheUnlocked();
 
     // If table has a file ID registered, update SQLite registration
     if (!it->second->getFileId().empty()) {
@@ -604,6 +747,7 @@ void FlatSQLDatabase::registerSource(const std::string& sourceName) {
         }
     }
 
+    invalidateQueryResultCacheUnlocked();
     registeredSources_.push_back(sourceName);
 
     // Create source-specific tables for each base table
@@ -680,6 +824,7 @@ void FlatSQLDatabase::createUnifiedViews() {
             sqliteEngine_->createUnifiedView(tableDef.name, sourceTableNames);
         }
     }
+    invalidateQueryResultCacheUnlocked();
 }
 
 void FlatSQLDatabase::onIngestWithSource(std::string_view fileId, const uint8_t* data, size_t length,
@@ -702,6 +847,7 @@ size_t FlatSQLDatabase::ingestWithSource(const uint8_t* data, size_t length,
                                           const std::string& source,
                                           size_t* recordsIngested) {
     std::unique_lock lock(*accessMutex_);
+    invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     return storage_->ingest(data, length,
         [this, &source](std::string_view fileId, const uint8_t* data, size_t len,
@@ -713,6 +859,7 @@ size_t FlatSQLDatabase::ingestWithSource(const uint8_t* data, size_t length,
 uint64_t FlatSQLDatabase::ingestOneWithSource(const uint8_t* flatbuffer, size_t length,
                                                const std::string& source) {
     std::unique_lock lock(*accessMutex_);
+    invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     return storage_->ingestFlatBuffer(flatbuffer, length,
         [this, &source](std::string_view fileId, const uint8_t* data, size_t len,
@@ -729,6 +876,8 @@ void FlatSQLDatabase::registerExternalSource(
     const std::string& fileId,
     TableStore::FieldExtractor extractor
 ) {
+    std::unique_lock lock(*accessMutex_);
+    invalidateQueryResultCacheUnlocked();
     // Build index map (empty for external sources)
     std::unordered_map<std::string, SqliteIndex*> indexes;
 
@@ -746,7 +895,9 @@ void FlatSQLDatabase::createUnifiedView(
     const std::string& viewName,
     const std::vector<std::string>& sourceNames
 ) {
+    std::unique_lock lock(*accessMutex_);
     sqliteEngine_->createUnifiedView(viewName, sourceNames);
+    invalidateQueryResultCacheUnlocked();
 }
 
 // ==================== Delete Support ====================
@@ -754,6 +905,7 @@ void FlatSQLDatabase::createUnifiedView(
 void FlatSQLDatabase::markDeleted(const std::string& tableName, uint64_t sequence) {
     std::unique_lock lock(*accessMutex_);
     sqliteEngine_->markDeleted(tableName, sequence);
+    invalidateQueryResultCacheUnlocked();
 }
 
 size_t FlatSQLDatabase::getDeletedCount(const std::string& tableName) const {
@@ -764,12 +916,15 @@ size_t FlatSQLDatabase::getDeletedCount(const std::string& tableName) const {
 void FlatSQLDatabase::clearTombstones(const std::string& tableName) {
     std::unique_lock lock(*accessMutex_);
     sqliteEngine_->clearTombstones(tableName);
+    invalidateQueryResultCacheUnlocked();
 }
 
 // ==================== Encryption ====================
 
 void FlatSQLDatabase::setEncryptionKey(const uint8_t* key, size_t keySize) {
+    std::unique_lock lock(*accessMutex_);
     encryptionCtx_ = std::make_unique<flatbuffers::EncryptionContext>(key, keySize);
+    invalidateQueryResultCacheUnlocked();
 }
 
 bool FlatSQLDatabase::hasEncryptedFields() const {

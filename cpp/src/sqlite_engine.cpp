@@ -90,6 +90,43 @@ static void execOrThrow(sqlite3* db, const char* sql) {
     }
 }
 
+static std::string trimCopy(std::string value) {
+    auto isNotSpace = [](unsigned char c) { return !std::isspace(c); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), isNotSpace));
+    value.erase(std::find_if(value.rbegin(), value.rend(), isNotSpace).base(), value.end());
+    return value;
+}
+
+static void stripIdentifierQuotes(std::string& identifier) {
+    if (identifier.size() >= 2 && identifier.front() == '"' && identifier.back() == '"') {
+        identifier = identifier.substr(1, identifier.size() - 2);
+    }
+}
+
+static bool parsePointPredicate(const std::string& whereClause, std::string& columnName) {
+    size_t eqPos = whereClause.find(" = ?");
+    size_t tokenLength = 4;
+    if (eqPos == std::string::npos) {
+        eqPos = whereClause.find("= ?");
+        tokenLength = 3;
+    }
+    if (eqPos == std::string::npos) {
+        return false;
+    }
+
+    std::string trailing = trimCopy(whereClause.substr(eqPos + tokenLength));
+    if (trailing == ";") {
+        trailing.clear();
+    }
+    if (!trailing.empty()) {
+        return false;
+    }
+
+    columnName = trimCopy(whereClause.substr(0, eqPos));
+    stripIdentifierQuotes(columnName);
+    return !columnName.empty();
+}
+
 SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
     : db_(nullptr)
     , options_(std::move(options)) {
@@ -125,6 +162,7 @@ SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
 
 SQLiteEngine::~SQLiteEngine() {
     clearStmtCache();
+    clearFastPathCaches();
     if (db_) {
         sqlite3_close(db_);
         db_ = nullptr;
@@ -138,6 +176,12 @@ void SQLiteEngine::clearStmtCache() {
         }
     }
     stmtCache_.clear();
+}
+
+void SQLiteEngine::clearFastPathCaches() {
+    sourceNameCache_.clear();
+    parsedQueryCache_.clear();
+    columnNamesCache_.clear();
 }
 
 sqlite3_stmt* SQLiteEngine::getOrPrepareStmt(const std::string& sql) const {
@@ -171,18 +215,28 @@ sqlite3_stmt* SQLiteEngine::getOrPrepareStmt(const std::string& sql) const {
 SQLiteEngine::SQLiteEngine(SQLiteEngine&& other) noexcept
     : db_(other.db_)
     , options_(std::move(other.options_))
-    , sources_(std::move(other.sources_)) {
+    , sources_(std::move(other.sources_))
+    , stmtCache_(std::move(other.stmtCache_))
+    , sourceNameCache_(std::move(other.sourceNameCache_))
+    , parsedQueryCache_(std::move(other.parsedQueryCache_))
+    , columnNamesCache_(std::move(other.columnNamesCache_)) {
     other.db_ = nullptr;
 }
 
 SQLiteEngine& SQLiteEngine::operator=(SQLiteEngine&& other) noexcept {
     if (this != &other) {
+        clearStmtCache();
+        clearFastPathCaches();
         if (db_) {
             sqlite3_close(db_);
         }
         db_ = other.db_;
         options_ = std::move(other.options_);
         sources_ = std::move(other.sources_);
+        stmtCache_ = std::move(other.stmtCache_);
+        sourceNameCache_ = std::move(other.sourceNameCache_);
+        parsedQueryCache_ = std::move(other.parsedQueryCache_);
+        columnNamesCache_ = std::move(other.columnNamesCache_);
         other.db_ = nullptr;
     }
     return *this;
@@ -257,6 +311,9 @@ void SQLiteEngine::registerSource(
         sources_.erase(sourceName);
         throw std::runtime_error("Failed to create virtual table: " + error);
     }
+
+    clearFastPathCaches();
+    clearStmtCache();
 }
 
 std::string SQLiteEngine::buildColumnList(const TableDef* tableDef) const {
@@ -337,32 +394,36 @@ void SQLiteEngine::createUnifiedView(
 }
 
 void SQLiteEngine::bindValue(sqlite3_stmt* stmt, int idx, const Value& value) const {
+    int rc = SQLITE_OK;
     std::visit([&](const auto& v) {
         using T = std::decay_t<decltype(v)>;
         if constexpr (std::is_same_v<T, std::monostate>) {
-            sqlite3_bind_null(stmt, idx);
+            rc = sqlite3_bind_null(stmt, idx);
         } else if constexpr (std::is_same_v<T, bool>) {
-            sqlite3_bind_int(stmt, idx, v ? 1 : 0);
+            rc = sqlite3_bind_int(stmt, idx, v ? 1 : 0);
         } else if constexpr (std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t> || std::is_same_v<T, int32_t>) {
-            sqlite3_bind_int(stmt, idx, static_cast<int>(v));
+            rc = sqlite3_bind_int(stmt, idx, static_cast<int>(v));
         } else if constexpr (std::is_same_v<T, int64_t>) {
-            sqlite3_bind_int64(stmt, idx, v);
+            rc = sqlite3_bind_int64(stmt, idx, v);
         } else if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, uint16_t> || std::is_same_v<T, uint32_t>) {
-            sqlite3_bind_int(stmt, idx, static_cast<int>(v));
+            rc = sqlite3_bind_int(stmt, idx, static_cast<int>(v));
         } else if constexpr (std::is_same_v<T, uint64_t>) {
-            sqlite3_bind_int64(stmt, idx, static_cast<sqlite3_int64>(v));
+            rc = sqlite3_bind_int64(stmt, idx, static_cast<sqlite3_int64>(v));
         } else if constexpr (std::is_same_v<T, float>) {
-            sqlite3_bind_double(stmt, idx, static_cast<double>(v));
+            rc = sqlite3_bind_double(stmt, idx, static_cast<double>(v));
         } else if constexpr (std::is_same_v<T, double>) {
-            sqlite3_bind_double(stmt, idx, v);
+            rc = sqlite3_bind_double(stmt, idx, v);
         } else if constexpr (std::is_same_v<T, std::string>) {
-            sqlite3_bind_text(stmt, idx, v.c_str(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
+            rc = sqlite3_bind_text(stmt, idx, v.c_str(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
         } else if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
-            sqlite3_bind_blob(stmt, idx, v.data(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
+            rc = sqlite3_bind_blob(stmt, idx, v.empty() ? nullptr : v.data(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
         } else {
-            sqlite3_bind_null(stmt, idx);
+            rc = sqlite3_bind_null(stmt, idx);
         }
     }, value);
+    if (rc != SQLITE_OK) {
+        throw std::runtime_error("SQLite bind error: " + std::string(sqlite3_errmsg(db_)));
+    }
 }
 
 QueryResult SQLiteEngine::execute(const std::string& sql) {
@@ -379,6 +440,15 @@ QueryResult SQLiteEngine::execute(const std::string& sql, const std::vector<Valu
 
     // Use cached prepared statement
     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+    int expectedParams = sqlite3_bind_parameter_count(stmt);
+    if (expectedParams != static_cast<int>(params.size())) {
+        throw std::runtime_error(
+            "SQL statement expects " + std::to_string(expectedParams) +
+            " parameters but received " + std::to_string(params.size())
+        );
+    }
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
 
     // Bind parameters
     for (size_t i = 0; i < params.size(); i++) {
@@ -455,6 +525,15 @@ size_t SQLiteEngine::executeAndCount(const std::string& sql, const std::vector<V
     }
 
     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+    int expectedParams = sqlite3_bind_parameter_count(stmt);
+    if (expectedParams != static_cast<int>(params.size())) {
+        throw std::runtime_error(
+            "SQL statement expects " + std::to_string(expectedParams) +
+            " parameters but received " + std::to_string(params.size())
+        );
+    }
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
 
     // Bind parameters
     for (size_t i = 0; i < params.size(); i++) {
@@ -498,23 +577,8 @@ size_t SQLiteEngine::executeAndCount(const std::string& sql, const std::vector<V
 
 static int fastPathCountHits = 0;
 
-// Cache for case-insensitive lookups (table name -> actual source name)
-static thread_local std::unordered_map<std::string, SourceInfo*> sourceNameCache_;
-
-// Cache for parsed SQL queries
-struct ParsedQuery {
-    std::string tableName;
-    std::string columnName;
-    bool isPointQuery;
-    bool isFullScan;
-};
-static thread_local std::unordered_map<std::string, ParsedQuery> parsedQueryCache_;
-
-// Cache for column names (avoids rebuilding for each query)
-static thread_local std::unordered_map<std::string, std::vector<std::string>> columnNamesCache_;
-
 // Helper to get cached column names for a source
-static const std::vector<std::string>& getCachedColumnNames(const SourceInfo* source) {
+const std::vector<std::string>& SQLiteEngine::getCachedColumnNames(const SourceInfo* source) {
     auto it = columnNamesCache_.find(source->name);
     if (it != columnNamesCache_.end()) {
         return it->second;
@@ -588,30 +652,15 @@ bool SQLiteEngine::tryFastPathCount(const std::string& sql, const std::vector<Va
             while (!pq.tableName.empty() && (pq.tableName.back() == ' ' || pq.tableName.back() == ';')) {
                 pq.tableName.pop_back();
             }
-            if (pq.tableName.size() >= 2 && pq.tableName.front() == '"' && pq.tableName.back() == '"') {
-                pq.tableName = pq.tableName.substr(1, pq.tableName.size() - 2);
-            }
+            stripIdentifierQuotes(pq.tableName);
         } else {
             pq.tableName = normalized.substr(14, wherePos - 14);
-            if (pq.tableName.size() >= 2 && pq.tableName.front() == '"' && pq.tableName.back() == '"') {
-                pq.tableName = pq.tableName.substr(1, pq.tableName.size() - 2);
-            }
+            pq.tableName = trimCopy(pq.tableName);
+            stripIdentifierQuotes(pq.tableName);
 
             // Parse column name
             std::string whereClause = normalized.substr(wherePos + 7);
-            size_t eqPos = whereClause.find(" = ?");
-            if (eqPos == std::string::npos) {
-                eqPos = whereClause.find("= ?");
-            }
-            if (eqPos != std::string::npos) {
-                pq.columnName = whereClause.substr(0, eqPos);
-                while (!pq.columnName.empty() && pq.columnName.back() == ' ') {
-                    pq.columnName.pop_back();
-                }
-                if (pq.columnName.size() >= 2 && pq.columnName.front() == '"' && pq.columnName.back() == '"') {
-                    pq.columnName = pq.columnName.substr(1, pq.columnName.size() - 2);
-                }
-            } else {
+            if (!parsePointPredicate(whereClause, pq.columnName)) {
                 pq.isPointQuery = false;
             }
         }
@@ -763,29 +812,14 @@ bool SQLiteEngine::tryFastPath(const std::string& sql, const std::vector<Value>&
             while (!pq.tableName.empty() && (pq.tableName.back() == ' ' || pq.tableName.back() == ';')) {
                 pq.tableName.pop_back();
             }
-            if (pq.tableName.size() >= 2 && pq.tableName.front() == '"' && pq.tableName.back() == '"') {
-                pq.tableName = pq.tableName.substr(1, pq.tableName.size() - 2);
-            }
+            stripIdentifierQuotes(pq.tableName);
         } else {
             pq.tableName = normalized.substr(14, wherePos - 14);
-            if (pq.tableName.size() >= 2 && pq.tableName.front() == '"' && pq.tableName.back() == '"') {
-                pq.tableName = pq.tableName.substr(1, pq.tableName.size() - 2);
-            }
+            pq.tableName = trimCopy(pq.tableName);
+            stripIdentifierQuotes(pq.tableName);
 
             std::string whereClause = normalized.substr(wherePos + 7);
-            size_t eqPos = whereClause.find(" = ?");
-            if (eqPos == std::string::npos) {
-                eqPos = whereClause.find("= ?");
-            }
-            if (eqPos != std::string::npos) {
-                pq.columnName = whereClause.substr(0, eqPos);
-                while (!pq.columnName.empty() && pq.columnName.back() == ' ') {
-                    pq.columnName.pop_back();
-                }
-                if (pq.columnName.size() >= 2 && pq.columnName.front() == '"' && pq.columnName.back() == '"') {
-                    pq.columnName = pq.columnName.substr(1, pq.columnName.size() - 2);
-                }
-            } else {
+            if (!parsePointPredicate(whereClause, pq.columnName)) {
                 pq.isPointQuery = false;
             }
         }
@@ -970,9 +1004,8 @@ bool SQLiteEngine::tryFastPathMinimal(const std::string& sql, const std::vector<
     std::string tableName = normalized.substr(14, fromEnd - 14);
 
     // Remove quotes if present
-    if (tableName.size() >= 2 && tableName.front() == '"' && tableName.back() == '"') {
-        tableName = tableName.substr(1, tableName.size() - 2);
-    }
+    tableName = trimCopy(tableName);
+    stripIdentifierQuotes(tableName);
 
     // Find the source
     auto* source = getSource(tableName);
@@ -983,24 +1016,9 @@ bool SQLiteEngine::tryFastPathMinimal(const std::string& sql, const std::vector<
     // Parse "where column = ?"
     std::string whereClause = normalized.substr(fromEnd + 7);  // Skip " where "
 
-    // Look for "columnname = ?" pattern
-    size_t eqPos = whereClause.find(" = ?");
-    if (eqPos == std::string::npos) {
-        // Try without space: "columnname= ?"
-        eqPos = whereClause.find("= ?");
-        if (eqPos == std::string::npos) {
-            return false;
-        }
-    }
-
-    std::string columnName = whereClause.substr(0, eqPos);
-    // Trim trailing spaces from column name
-    while (!columnName.empty() && columnName.back() == ' ') {
-        columnName.pop_back();
-    }
-    // Remove quotes if present
-    if (columnName.size() >= 2 && columnName.front() == '"' && columnName.back() == '"') {
-        columnName = columnName.substr(1, columnName.size() - 2);
+    std::string columnName;
+    if (!parsePointPredicate(whereClause, columnName)) {
+        return false;
     }
 
     // Check if we have an index on this column

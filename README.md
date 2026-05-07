@@ -75,10 +75,117 @@ FlatBuffer → Query (via virtual table) → FlatBuffer
 ## Runtime Choices & Performance Gates
 
 - Production should prefer the SQLite-backed native/WASM path (`initFlatSQL` → `FlatSQL` → `createDatabase`). The pure TypeScript `FlatSQLDatabase` is preserved only as an explicit fallback/reference implementation for environments that cannot load the WASM module.
+- Standalone deployments use the C++ WASI reactor at `flatsql/wasi.wasm`. Browser hosts load it through `flatsql/standalone`, while Node/WasmEdge hosts use a resident runner from `flatsql/standalone/wasmedge`.
+- Artifact-builder cache behavior belongs to C++: query templates, result-cache keys, invalidation generation, hit/miss counters, SQL execution, and raw FlatBuffer lookup all live in the WASM database instance. JavaScript only marshals bytes and fills host capability gaps.
 - Use `db.ingestBuffers([...])` on the WASM path when your input is already a set of raw FlatBuffers. It feeds the native bulk-stream ingest path instead of looping through `ingestOne(...)`.
 - Run `npm run bench` (alias `npm run bench:perf`) as the single-command benchmark matrix for FlatSQL JS vs FlatSQL WASM. Use `npm run bench:perf:profile` to print the WASM ingest phase breakdown (`pack`, `decode`, `append`, `index`, `verify`) alongside the gate table.
   Profiling mode is diagnostic and includes instrumentation overhead; use the non-profile benchmark for merge-gate decisions.
 - Run `npm run test:cluster` for the native WAL-backed cluster validation workload, or `npm run test:cluster:smoke` for the short preflight run.
+
+## SDS Stress Harness
+
+The Space Data Standards stress harness exercises every discoverable `main.fbs` under `../spacedatastandards.org/schema`, records bandwidth and storage-fill metrics, and keeps canonical schemas database-neutral. Results are written under `stress/results/<run-id>/`.
+
+```bash
+# Local smoke path, no Docker required.
+npm run stress:sds:smoke -- --run-id sds-smoke
+
+# Existing single-controller Docker smoke path.
+npm run stress:sds:docker-smoke -- --run-id sds-docker-smoke
+
+# Container-per-node fleet path for small probes, e.g. 10 isolated nodes.
+npm run stress:sds:docker-fleet -- --run-id sds-10-node --nodes 10 --storage-gb 1 --records-per-node 100000
+
+# Generate and validate the 100-node / 1 GB-per-node production compose file without running it.
+npm run stress:sds:full-config -- --run-id sds-full
+docker compose -f stress/results/sds-full/docker-compose.full.yml config
+
+# Run the full production gate. Requires Docker and enough local storage.
+CONFIRM_FULL_STRESS=1 npm run stress:sds:full -- --run-id sds-full
+```
+
+The production gate only passes when the aggregate report shows container isolation, Docker transport, at least 100 nodes, no metric errors, measured native/standalone/WasmEdge events, complete SDS schema-sweep coverage, at least 95% storage fill against the 1 GB/node target on every node, and bulk-ingest throughput at or above 75 fps on every node.
+
+Full mode defaults to 20,000 records per node, or 2 million records across the 100-node fleet. In full mode the generated PublishEventRecord payload size scales from the configured storage budget so the run targets the requested per-node storage fill without requiring hundreds of millions of tiny records.
+
+## Agent Runtime Notes
+
+Use these entrypoints when wiring agents or deployments:
+
+| Import | Runtime | Use for |
+|--------|---------|---------|
+| `flatsql/wasm` | Emscripten JS wrapper + C++ WASM | Existing browser/Node API |
+| `flatsql/standalone` | Raw `flatsql-wasi.wasm` + small JS WASI shim | Browser or Node direct WebAssembly API |
+| `flatsql/artifacts/standalone` | C++ artifact builder facade | Cache-centric artifact workflows |
+| `flatsql/response` | Response artifact bytes | ETags, chunks, and raw byte artifacts keyed by native runtime cache keys |
+| `flatsql/standalone/wasmedge` | Native WasmEdge runner builder/client | Persistent standalone runtime in Node |
+| `flatsql` `FlatSQLDatabase` | Pure TypeScript fallback | Reference or no-WASM environments only |
+
+For repeated FILE_ID-style traffic, register a cacheable query template once and call `queryTemplate(...)` with positional params. Identical query IDs and params hit the C++ result cache; ingest, load, template changes, and explicit `clearQueryCache()` invalidate stale entries by generation.
+
+```javascript
+import { createStandaloneArtifactBuilder } from 'flatsql/artifacts/standalone';
+
+const builder = await createStandaloneArtifactBuilder(schema, { runtime: 'standalone' });
+await builder.registerFileId('USER', 'User');
+await builder.enableDemoExtractors();
+await builder.ingestBuffers(buffers);
+await builder.configureQueryCache({ maxEntries: 4096, maxRows: 5000 });
+await builder.registerQueryTemplate('userByEmail', 'SELECT id FROM User WHERE email = ?', true);
+
+await builder.queryTemplate('userByEmail', ['alice@example.com']); // miss
+await builder.queryTemplate('userByEmail', ['alice@example.com']); // hit
+console.log(await builder.getQueryCacheStats());
+```
+
+The native cache defaults to 1024 entries and 1000 rows per cached result. Tune `maxEntries` and `maxRows` for production FILE_ID traffic instead of recompiling the C++ core.
+
+For WasmEdge, build the small host runner and pass it to the same builder. The runner keeps one WASI module instance resident so cache state survives across requests.
+
+```javascript
+import { createStandaloneArtifactBuilder } from 'flatsql/artifacts/standalone';
+import { buildFlatSQLWasmEdgeRunner } from 'flatsql/standalone/wasmedge';
+
+const runner = await buildFlatSQLWasmEdgeRunner({
+  outputPath: './build/flatsql-wasmedge-runner',
+});
+
+const builder = await createStandaloneArtifactBuilder(schema, {
+  runtime: 'wasmedge',
+  wasmEdgeRunnerBinary: runner.outputPath,
+});
+```
+
+WasmEdge must support WebAssembly exception handling for this artifact. The test runner uses `wasmedge --enable-exception-handling --reactor wasm/flatsql-wasi.wasm _initialize` for the smoke check and the native C API runner enables the same proposal programmatically.
+
+For high-volume repeated FILE_ID responses, build the cache key through the C++ runtime, wrap query results as response artifacts, and let edge/browser/WasmEdge host caches serve the immutable bytes by ETag or content hash. FlatSQL creates deterministic native cache keys and chunk metadata; deployment code owns CDN placement, routing, authorization, and global invalidation.
+
+```javascript
+import { createQueryResponseArtifact } from 'flatsql/response';
+
+const sql = 'SELECT _data FROM PublishEventRecord WHERE FILE_ID = ?';
+const cacheKey = await builder.buildResponseArtifactCacheKey('PublishEventRecord', '1', sql, {
+  format: 'raw-flatbuffer-stream',
+  publishEventKey: 'publish-1',
+  projection: ['_data'],
+  params: ['publish-1'],
+});
+const result = await builder.query(sql, ['publish-1']);
+const artifact = createQueryResponseArtifact(result, {
+  schemaName: 'PublishEventRecord',
+  schemaVersion: 1,
+  sql,
+  params: ['publish-1'],
+  format: 'raw-flatbuffer-stream',
+  publishEventKey: 'publish-1',
+  projection: ['_data'],
+  cacheKey,
+});
+
+console.log(artifact.metadata.cacheKey, artifact.metadata.etag);
+```
+
+See `docs/response-artifacts.md` and `docs/agents/response-artifacts.md` for production and agent guidance.
 
 
 ## Source Code
@@ -475,13 +582,16 @@ npm test
 # Clone DA-FlatBuffers (required dependency)
 git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
 
-# Build WASM
-cd cpp
-emcmake cmake -B build-wasm -DCMAKE_BUILD_TYPE=Release
-cmake --build build-wasm
+# Build browser, standalone WASI, and SDM artifacts
+npm run build:wasm
+
+# Verify standalone and package surfaces
+npm run test:wasi
+npm run test:wasmedge
+npm test -- --runInBand --runTestsByPath test/package-exports.test.ts
 ```
 
-Output: `wasm/flatsql.js` and `wasm/flatsql.wasm`
+Output: `wasm/flatsql.js`, `wasm/flatsql.wasm`, `wasm/flatsql-wasi.wasm`, `sdm/flatsql-spatial.wasm`, and docs copies for GitHub Pages.
 
 ### Run Demo Locally
 

@@ -8,9 +8,11 @@
 #include "flatsql/sqlite_engine.h"
 #include "flatbuffers/encryption.h"
 #include <atomic>
+#include <list>
 #include <set>
 #include <memory>
 #include <shared_mutex>
+#include <unordered_map>
 
 namespace flatsql {
 
@@ -168,6 +170,32 @@ public:
     // Execute SQL query with a single integer parameter (most optimized for int key lookups)
     QueryResult query(const std::string& sql, int64_t param);
 
+    struct QueryCacheStats {
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        size_t size = 0;
+        uint64_t generation = 0;
+        size_t maxEntries = 0;
+        size_t maxRows = 0;
+    };
+
+    // Register a named SQL template for native cached execution.
+    void registerQueryTemplate(const std::string& queryId,
+                               const std::string& sql,
+                               bool cacheable = true);
+
+    // Execute a registered SQL template through the native result cache.
+    QueryResult queryTemplate(const std::string& queryId,
+                              const std::vector<Value>& params = {});
+
+    // Clear cached query results without unregistering templates.
+    void clearQueryResultCache();
+
+    // Configure bounded native query-result caching.
+    void configureQueryResultCache(size_t maxEntries, size_t maxRows);
+
+    QueryCacheStats getQueryCacheStats() const;
+
     // Execute and count without building QueryResult (for benchmarking)
     size_t queryCount(const std::string& sql, const std::vector<Value>& params = {});
 
@@ -216,6 +244,9 @@ public:
 
     // Get storage for direct access
     const StreamingFlatBufferStore& getStorage() const { return *storage_; }
+
+    // Preallocate storage for known large ingest targets.
+    void reserveStorage(size_t bytes);
 
     // Set field extractor for a table (required for indexing and queries)
     void setFieldExtractor(const std::string& tableName, TableStore::FieldExtractor extractor);
@@ -439,6 +470,22 @@ private:
         return pos != std::string::npos ? tableName.substr(pos + 1) : "";
     }
 
+    struct QueryTemplateDef {
+        std::string sql;
+        bool cacheable = true;
+    };
+
+    struct CachedQueryResult {
+        QueryResult result;
+        std::list<std::string>::iterator lruIt;
+    };
+
+    void invalidateQueryResultCacheUnlocked();
+    void storeCachedQueryResultUnlocked(const std::string& key, const QueryResult& result);
+    std::string buildTemplateCacheKeyUnlocked(const std::string& queryId,
+                                              const std::string& sql,
+                                              const std::vector<Value>& params) const;
+
     DatabaseSchema schema_;
     std::shared_ptr<StreamingFlatBufferStore> storage_;
     std::shared_ptr<std::shared_mutex> accessMutex_;
@@ -455,6 +502,16 @@ private:
 
     // Track which tables have been registered with SQLite
     std::set<std::string> sqliteRegisteredTables_;
+
+    std::unordered_map<std::string, QueryTemplateDef> queryTemplates_;
+    std::list<std::string> queryResultCacheLru_;
+    std::unordered_map<std::string, CachedQueryResult> queryResultCache_;
+    uint64_t queryCacheGeneration_ = 0;
+    uint64_t queryCacheHits_ = 0;
+    uint64_t queryCacheMisses_ = 0;
+
+    size_t queryResultCacheMaxEntries_ = 1024;
+    size_t queryResultCacheMaxRows_ = 1000;
 
     // Encryption
     std::unique_ptr<flatbuffers::EncryptionContext> encryptionCtx_;

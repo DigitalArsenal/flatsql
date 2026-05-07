@@ -149,24 +149,25 @@ export class BTree {
     const node = this.getNode(nodeId);
     const results: IndexEntry[] = [];
 
-    let i = 0;
-    while (i < node.entries.length && compareKeys(key, node.entries[i].key, this.config.keyType) > 0) {
-      i++;
-    }
+    for (let i = 0; i < node.entries.length; i++) {
+      const entry = node.entries[i];
+      const cmp = compareKeys(key, entry.key, this.config.keyType);
 
-    // Collect all matching entries (handles duplicates)
-    while (i < node.entries.length && compareKeys(key, node.entries[i].key, this.config.keyType) === 0) {
-      results.push(node.entries[i]);
-      i++;
+      if (!node.isLeaf && cmp <= 0) {
+        results.push(...this.searchNode(node.children[i], key));
+      }
+
+      if (cmp === 0) {
+        results.push(entry);
+      }
+
+      if (cmp < 0) {
+        return results;
+      }
     }
 
     if (!node.isLeaf) {
-      // Search appropriate child
-      let childIdx = 0;
-      while (childIdx < node.entries.length && compareKeys(key, node.entries[childIdx].key, this.config.keyType) > 0) {
-        childIdx++;
-      }
-      results.push(...this.searchNode(node.children[childIdx], key));
+      results.push(...this.searchNode(node.children[node.entries.length], key));
     }
 
     return results;

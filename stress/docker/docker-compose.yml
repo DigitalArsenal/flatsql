@@ -1,0 +1,51 @@
+services:
+  controller:
+    build:
+      context: ../..
+      dockerfile: stress/docker/Dockerfile
+    environment:
+      STRESS_MODE: ${STRESS_MODE:-smoke}
+      RUN_ID: ${RUN_ID:-docker-smoke}
+      NODE_COUNT: ${NODE_COUNT:-2}
+      NODE_STORAGE_GB: ${NODE_STORAGE_GB:-0.01}
+      RECORDS_PER_NODE: ${RECORDS_PER_NODE:-25}
+      BATCH_BYTES: ${BATCH_BYTES:-1048576}
+      QUERY_CONCURRENCY: ${QUERY_CONCURRENCY:-4}
+      HOT_QUERY_RATIO: ${HOT_QUERY_RATIO:-0.9}
+      SDS_SCHEMA_ROOT: /sds/schema
+      OUTPUT_DIR: /stress-results
+      RUNTIME: ${RUNTIME:-standalone}
+      NODE_ISOLATION: ${NODE_ISOLATION:-logical}
+      STRESS_TRANSPORT: docker-compose
+    volumes:
+      - ${SDS_SCHEMA_ROOT_HOST:-../../spacedatastandards.org/schema}:/sds/schema:ro
+      - ${OUTPUT_DIR_HOST:-../results/docker-smoke}:/stress-results
+    command:
+      - node
+      - stress/sds/run.mjs
+      - --mode
+      - ${STRESS_MODE:-smoke}
+      - --schema-root
+      - /sds/schema
+      - --output-dir
+      - /stress-results
+      - --nodes
+      - ${NODE_COUNT:-2}
+      - --storage-gb
+      - ${NODE_STORAGE_GB:-0.01}
+      - --records-per-node
+      - ${RECORDS_PER_NODE:-25}
+      - --batch-bytes
+      - ${BATCH_BYTES:-1048576}
+      - --query-concurrency
+      - ${QUERY_CONCURRENCY:-4}
+      - --hot-query-ratio
+      - ${HOT_QUERY_RATIO:-0.9}
+      - --run-id
+      - ${RUN_ID:-docker-smoke}
+      - --runtime
+      - ${RUNTIME:-standalone}
+      - --node-isolation
+      - ${NODE_ISOLATION:-logical}
+      - --transport
+      - docker-compose
