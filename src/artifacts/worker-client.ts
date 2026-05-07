@@ -17,6 +17,9 @@ import type {
 } from './types.js';
 
 const schemaCache = new Map<string, DatabaseSchema>();
+const MAX_PENDING_CALLS = 1024;
+const MAX_QUERY_RESULT_CACHE_ENTRIES = 1024;
+const MAX_QUERY_RESULT_CACHE_ROWS = 1000;
 const VOLATILE_QUERY_PATTERNS = [
   /\bRANDOM\s*\(/i,
   /\bCHANGES\s*\(/i,
@@ -42,6 +45,22 @@ interface WorkerMessage {
   success?: boolean;
   result?: any;
   error?: string;
+}
+
+interface Deferred<T> {
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
+  promise: Promise<T>;
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { resolve, reject, promise };
 }
 
 function supportsSharedArrayBuffer(): boolean {
@@ -74,22 +93,22 @@ function cloneQueryResult(result: ArtifactQueryResult): ArtifactQueryResult {
   };
 }
 
-function encodeCacheValue(value: unknown): string | null {
+function encodeCacheValue(value: unknown): Record<string, unknown> | null {
   if (value === null) {
-    return 'l';
+    return { type: 'null' };
   }
 
   switch (typeof value) {
     case 'string':
-      return `s:${value.length}:${value}`;
+      return { type: 'string', value };
     case 'number':
-      return `n:${Object.is(value, -0) ? '-0' : String(value)}`;
+      return { type: 'number', value: Object.is(value, -0) ? '-0' : String(value) };
     case 'bigint':
-      return `i:${value.toString()}`;
+      return { type: 'bigint', value: value.toString() };
     case 'boolean':
-      return value ? 'b:1' : 'b:0';
+      return { type: 'boolean', value };
     case 'undefined':
-      return 'u';
+      return { type: 'undefined' };
     default:
       return null;
   }
@@ -109,7 +128,7 @@ function buildResultCacheKey(sql: string, params: ArtifactQueryParams | undefine
     if (encoded.some((value) => value === null)) {
       return null;
     }
-    return `${sql}\u0000a:${encoded.join('\u0001')}`;
+    return JSON.stringify({ sql, params: { type: 'array', values: encoded } });
   }
 
   const prototype = Object.getPrototypeOf(params);
@@ -118,16 +137,42 @@ function buildResultCacheKey(sql: string, params: ArtifactQueryParams | undefine
   }
 
   const namedParams = params as Record<string, unknown>;
-  const encodedEntries: string[] = [];
+  const encodedEntries: Array<{ key: string; value: Record<string, unknown> }> = [];
   const keys = Object.keys(namedParams).sort();
   for (const key of keys) {
     const encodedValue = encodeCacheValue(namedParams[key]);
     if (encodedValue === null) {
       return null;
     }
-    encodedEntries.push(`${key}\u0002${encodedValue}`);
+    encodedEntries.push({ key, value: encodedValue });
   }
-  return `${sql}\u0000o:${encodedEntries.join('\u0001')}`;
+  return JSON.stringify({ sql, params: { type: 'object', entries: encodedEntries } });
+}
+
+function getCachedResult(cache: Map<string, ArtifactQueryResult>, key: string): ArtifactQueryResult | undefined {
+  const cached = cache.get(key);
+  if (!cached) {
+    return undefined;
+  }
+  cache.delete(key);
+  cache.set(key, cached);
+  return cached;
+}
+
+function setCachedResult(cache: Map<string, ArtifactQueryResult>, key: string, result: ArtifactQueryResult): void {
+  if (result.rowCount > MAX_QUERY_RESULT_CACHE_ROWS) {
+    cache.delete(key);
+    return;
+  }
+
+  cache.set(key, cloneQueryResult(result));
+  while (cache.size > MAX_QUERY_RESULT_CACHE_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    cache.delete(oldest);
+  }
 }
 
 export class FlatSQLArtifactWorkerClient {
@@ -135,6 +180,7 @@ export class FlatSQLArtifactWorkerClient {
   private worker: Worker | null = null;
   private nextId = 1;
   private readonly pending = new Map<number, PendingCall>();
+  private closed = false;
 
   constructor(workerPath: URL = new URL('../../wasm/flatsql-artifact.worker.js', import.meta.url)) {
     this.workerPath = workerPath;
@@ -145,11 +191,23 @@ export class FlatSQLArtifactWorkerClient {
       return;
     }
 
-    this.worker = new Worker(this.workerPath);
+    this.closed = false;
+    const worker = new Worker(this.workerPath);
+    this.worker = worker;
 
     await new Promise<void>((resolve, reject) => {
+      let ready = false;
+      let settled = false;
+      const rejectInit = (error: Error) => {
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      };
       const handleMessage = (message: WorkerMessage) => {
         if (message.type === 'ready') {
+          ready = true;
+          settled = true;
           resolve();
           return;
         }
@@ -171,11 +229,29 @@ export class FlatSQLArtifactWorkerClient {
         }
       };
 
-      this.worker!.on('message', handleMessage);
-      this.worker!.on('error', reject);
-      this.worker!.on('exit', (code) => {
+      const handleFailure = (error: Error) => {
+        if (this.worker === worker) {
+          this.worker = null;
+          this.closed = true;
+        }
+        this.rejectAllPending(error);
+        if (!ready) {
+          rejectInit(error);
+        }
+      };
+
+      worker.on('message', handleMessage);
+      worker.on('error', handleFailure);
+      worker.on('exit', (code) => {
+        if (this.worker !== worker) {
+          return;
+        }
+        this.worker = null;
+        this.closed = true;
         if (code !== 0) {
-          reject(new Error(`Artifact worker exited with code ${code}`));
+          handleFailure(new Error(`Artifact worker exited with code ${code}`));
+        } else {
+          this.rejectAllPending(new Error('Artifact worker exited'));
         }
       });
     });
@@ -204,19 +280,37 @@ export class FlatSQLArtifactWorkerClient {
       return;
     }
 
-    await this.worker.terminate();
+    const worker = this.worker;
     this.worker = null;
+    this.closed = true;
+    this.rejectAllPending(new Error('Artifact worker client closed'));
+    await worker.terminate();
+  }
+
+  private rejectAllPending(error: Error): void {
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
   }
 
   async call(method: string, params: Record<string, unknown>): Promise<any> {
-    if (!this.worker) {
+    if (!this.worker || this.closed) {
       throw new Error('Artifact worker client is not initialized');
+    }
+    if (this.pending.size >= MAX_PENDING_CALLS) {
+      throw new Error(`Artifact worker has too many pending calls (${MAX_PENDING_CALLS})`);
     }
 
     const id = this.nextId++;
     return await new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.worker!.postMessage({ id, method, params });
+      try {
+        this.worker!.postMessage({ id, method, params });
+      } catch (error) {
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 }
@@ -227,6 +321,8 @@ export class FlatSQLArtifactWorkerBuilder {
   private readonly schema: DatabaseSchema;
   private readonly preferSharedArrayBuffer: boolean;
   private readonly queryResultCache = new Map<string, ArtifactQueryResult>();
+  private readonly inFlightQueries = new Map<string, Promise<ArtifactQueryResult>>();
+  private queryGeneration = 0;
 
   constructor(
     client: FlatSQLArtifactWorkerClient,
@@ -249,7 +345,9 @@ export class FlatSQLArtifactWorkerBuilder {
   }
 
   async ingestBuffers(buffers: Uint8Array[], options: ArtifactIngestOptions = {}): Promise<ArtifactIngestResult> {
+    this.queryGeneration += 1;
     this.queryResultCache.clear();
+    this.inFlightQueries.clear();
     const canUseShared = this.preferSharedArrayBuffer && supportsSharedArrayBuffer();
     if (canUseShared) {
       const byteLength = sizePrefixedByteLength(buffers);
@@ -265,24 +363,44 @@ export class FlatSQLArtifactWorkerBuilder {
 
     return await this.client.call('ingestClone', {
       builderId: this.builderId,
-      buffers: buffers.map((buffer) => Array.from(buffer)),
+      buffers,
       options,
     });
   }
 
   async query(sql: string, params?: ArtifactQueryParams): Promise<ArtifactQueryResult> {
     const resultCacheKey = buildResultCacheKey(sql, params);
-    const cached = resultCacheKey ? this.queryResultCache.get(resultCacheKey) : undefined;
+    const cached = resultCacheKey ? getCachedResult(this.queryResultCache, resultCacheKey) : undefined;
     if (cached) {
       return cloneQueryResult(cached);
     }
 
-    const result = await this.client.call('query', { builderId: this.builderId, sql, params }) as ArtifactQueryResult;
-    if (resultCacheKey) {
-      this.queryResultCache.set(resultCacheKey, result);
-      return cloneQueryResult(result);
+    if (!resultCacheKey) {
+      return await this.client.call('query', { builderId: this.builderId, sql, params }) as ArtifactQueryResult;
     }
-    return result;
+
+    const existing = this.inFlightQueries.get(resultCacheKey);
+    if (existing) {
+      return cloneQueryResult(await existing);
+    }
+
+    const generation = this.queryGeneration;
+    const promise = (async () => {
+      const result = await this.client.call('query', { builderId: this.builderId, sql, params }) as ArtifactQueryResult;
+      if (generation === this.queryGeneration) {
+        setCachedResult(this.queryResultCache, resultCacheKey, result);
+      }
+      return result;
+    })();
+    this.inFlightQueries.set(resultCacheKey, promise);
+
+    try {
+      return cloneQueryResult(await promise);
+    } finally {
+      if (this.inFlightQueries.get(resultCacheKey) === promise) {
+        this.inFlightQueries.delete(resultCacheKey);
+      }
+    }
   }
 
   async queryMany(queries: readonly ArtifactQuerySpec[]): Promise<ArtifactQueryResult[]> {
@@ -291,42 +409,94 @@ export class FlatSQLArtifactWorkerBuilder {
     }
 
     const results: ArtifactQueryResult[] = new Array(queries.length);
-    const uncachedQueries: ArtifactQuerySpec[] = [];
-    const uncachedIndices: number[] = [];
-    const uncachedCacheKeys: Array<string | null> = [];
+    const uncachedEntries: Array<{
+      query: ArtifactQuerySpec;
+      indices: number[];
+      cacheKey: string | null;
+      deferred?: Deferred<ArtifactQueryResult>;
+    }> = [];
+    const uncachedByKey = new Map<string, typeof uncachedEntries[number]>();
+    const pendingExisting: Array<{ index: number; promise: Promise<ArtifactQueryResult> }> = [];
 
     for (let index = 0; index < queries.length; index += 1) {
       const query = queries[index];
       const resultCacheKey = buildResultCacheKey(query.sql, query.params);
-      const cached = resultCacheKey ? this.queryResultCache.get(resultCacheKey) : undefined;
+      const cached = resultCacheKey ? getCachedResult(this.queryResultCache, resultCacheKey) : undefined;
       if (cached) {
         results[index] = cloneQueryResult(cached);
         continue;
       }
 
-      uncachedQueries.push(query);
-      uncachedIndices.push(index);
-      uncachedCacheKeys.push(resultCacheKey);
+      if (resultCacheKey) {
+        const existing = this.inFlightQueries.get(resultCacheKey);
+        if (existing) {
+          pendingExisting.push({ index, promise: existing });
+          continue;
+        }
+
+        const duplicate = uncachedByKey.get(resultCacheKey);
+        if (duplicate) {
+          duplicate.indices.push(index);
+          continue;
+        }
+      }
+
+      const entry = { query, indices: [index], cacheKey: resultCacheKey };
+      uncachedEntries.push(entry);
+      if (resultCacheKey) {
+        uncachedByKey.set(resultCacheKey, entry);
+      }
     }
 
-    if (uncachedQueries.length === 0) {
+    if (uncachedEntries.length === 0 && pendingExisting.length === 0) {
       return results;
     }
 
-    const freshResults = await this.client.call('queryMany', {
-      builderId: this.builderId,
-      queries: uncachedQueries,
-    }) as ArtifactQueryResult[];
+    const generation = this.queryGeneration;
+    for (const entry of uncachedEntries) {
+      if (!entry.cacheKey) {
+        continue;
+      }
+      const deferred = createDeferred<ArtifactQueryResult>();
+      entry.deferred = deferred;
+      this.inFlightQueries.set(entry.cacheKey, deferred.promise);
+    }
 
-    for (let index = 0; index < freshResults.length; index += 1) {
-      const result = freshResults[index];
-      const resultIndex = uncachedIndices[index];
-      const resultCacheKey = uncachedCacheKeys[index];
-      if (resultCacheKey) {
-        this.queryResultCache.set(resultCacheKey, result);
-        results[resultIndex] = cloneQueryResult(result);
-      } else {
-        results[resultIndex] = result;
+    try {
+      if (uncachedEntries.length > 0) {
+        const freshResults = await this.client.call('queryMany', {
+          builderId: this.builderId,
+          queries: uncachedEntries.map((entry) => entry.query),
+        }) as ArtifactQueryResult[];
+
+        for (let index = 0; index < freshResults.length; index += 1) {
+          const result = freshResults[index];
+          const entry = uncachedEntries[index];
+          if (entry.cacheKey && generation === this.queryGeneration) {
+            setCachedResult(this.queryResultCache, entry.cacheKey, result);
+          }
+          entry.deferred?.resolve(result);
+          for (const resultIndex of entry.indices) {
+            results[resultIndex] = entry.cacheKey ? cloneQueryResult(result) : result;
+          }
+        }
+      }
+
+      await Promise.all(
+        pendingExisting.map(async ({ index, promise }) => {
+          results[index] = cloneQueryResult(await promise);
+        })
+      );
+    } catch (error) {
+      for (const entry of uncachedEntries) {
+        entry.deferred?.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+      throw error;
+    } finally {
+      for (const entry of uncachedEntries) {
+        if (entry.cacheKey && this.inFlightQueries.get(entry.cacheKey) === entry.deferred?.promise) {
+          this.inFlightQueries.delete(entry.cacheKey);
+        }
       }
     }
 
@@ -335,6 +505,7 @@ export class FlatSQLArtifactWorkerBuilder {
 
   async close(): Promise<void> {
     this.queryResultCache.clear();
+    this.inFlightQueries.clear();
     await this.client.call('closeBuilder', { builderId: this.builderId });
   }
 }

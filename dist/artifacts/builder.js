@@ -22,6 +22,9 @@ const DEFAULT_PAGE_SIZE = 32768;
 const DEFAULT_MMAP_SIZE = 268435456;
 const DEFAULT_CACHE_SIZE = -131072;
 const DEFAULT_THREAD_COUNT = Math.min(4, Math.max(2, availableParallelism()));
+const MAX_QUERY_STATEMENT_CACHE_ENTRIES = 256;
+const MAX_QUERY_RESULT_CACHE_ENTRIES = 1024;
+const MAX_QUERY_RESULT_CACHE_ROWS = 1000;
 const schemaCache = new Map();
 const VOLATILE_QUERY_PATTERNS = [
     /\bRANDOM\s*\(/i,
@@ -62,19 +65,19 @@ function cloneQueryResult(result) {
 }
 function encodeCacheValue(value) {
     if (value === null) {
-        return 'l';
+        return { type: 'null' };
     }
     switch (typeof value) {
         case 'string':
-            return `s:${value.length}:${value}`;
+            return { type: 'string', value };
         case 'number':
-            return `n:${Object.is(value, -0) ? '-0' : String(value)}`;
+            return { type: 'number', value: Object.is(value, -0) ? '-0' : String(value) };
         case 'bigint':
-            return `i:${value.toString()}`;
+            return { type: 'bigint', value: value.toString() };
         case 'boolean':
-            return value ? 'b:1' : 'b:0';
+            return { type: 'boolean', value };
         case 'undefined':
-            return 'u';
+            return { type: 'undefined' };
         default:
             return null;
     }
@@ -91,7 +94,7 @@ function buildResultCacheKey(sql, params) {
         if (encoded.some((value) => value === null)) {
             return null;
         }
-        return `${sql}\u0000a:${encoded.join('\u0001')}`;
+        return JSON.stringify({ sql, params: { type: 'array', values: encoded } });
     }
     const prototype = Object.getPrototypeOf(params);
     if (prototype !== Object.prototype && prototype !== null) {
@@ -105,9 +108,51 @@ function buildResultCacheKey(sql, params) {
         if (encodedValue === null) {
             return null;
         }
-        encodedEntries.push(`${key}\u0002${encodedValue}`);
+        encodedEntries.push({ key, value: encodedValue });
     }
-    return `${sql}\u0000o:${encodedEntries.join('\u0001')}`;
+    return JSON.stringify({ sql, params: { type: 'object', entries: encodedEntries } });
+}
+function getCachedResult(cache, key) {
+    const cached = cache.get(key);
+    if (!cached) {
+        return undefined;
+    }
+    cache.delete(key);
+    cache.set(key, cached);
+    return cached;
+}
+function setCachedResult(cache, key, result) {
+    if (result.rowCount > MAX_QUERY_RESULT_CACHE_ROWS) {
+        cache.delete(key);
+        return;
+    }
+    cache.set(key, cloneQueryResult(result));
+    while (cache.size > MAX_QUERY_RESULT_CACHE_ENTRIES) {
+        const oldest = cache.keys().next().value;
+        if (oldest === undefined) {
+            break;
+        }
+        cache.delete(oldest);
+    }
+}
+function getCachedStatement(cache, key) {
+    const cached = cache.get(key);
+    if (!cached) {
+        return undefined;
+    }
+    cache.delete(key);
+    cache.set(key, cached);
+    return cached;
+}
+function setCachedStatement(cache, key, value) {
+    cache.set(key, value);
+    while (cache.size > MAX_QUERY_STATEMENT_CACHE_ENTRIES) {
+        const oldest = cache.keys().next().value;
+        if (oldest === undefined) {
+            break;
+        }
+        cache.delete(oldest);
+    }
 }
 function executeStatementAll(statement, params) {
     if (params === undefined) {
@@ -338,12 +383,12 @@ export class FlatSQLArtifactBuilder {
     }
     query(sql, params) {
         const resultCacheKey = buildResultCacheKey(sql, params);
-        const cachedResult = resultCacheKey ? this.queryResultCache.get(resultCacheKey) : undefined;
+        const cachedResult = resultCacheKey ? getCachedResult(this.queryResultCache, resultCacheKey) : undefined;
         if (cachedResult) {
             return cloneQueryResult(cachedResult);
         }
         const cacheable = isCacheableQuerySql(sql);
-        let cached = cacheable ? this.queryCache.get(sql) : undefined;
+        let cached = cacheable ? getCachedStatement(this.queryCache, sql) : undefined;
         if (!cached) {
             const statement = this.db.prepare(sql);
             const arrayMode = typeof statement.setReturnArrays === 'function';
@@ -353,7 +398,7 @@ export class FlatSQLArtifactBuilder {
             const columns = statement.columns().map((column) => column.name);
             cached = { statement, columns, arrayMode };
             if (cacheable) {
-                this.queryCache.set(sql, cached);
+                setCachedStatement(this.queryCache, sql, cached);
             }
         }
         const rawRows = executeStatementAll(cached.statement, params);
@@ -366,7 +411,7 @@ export class FlatSQLArtifactBuilder {
             rowCount: rows.length,
         };
         if (resultCacheKey) {
-            this.queryResultCache.set(resultCacheKey, result);
+            setCachedResult(this.queryResultCache, resultCacheKey, result);
         }
         return resultCacheKey ? cloneQueryResult(result) : result;
     }

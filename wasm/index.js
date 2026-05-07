@@ -263,6 +263,14 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
         query: Module.cwrap('flatsql_query', 'number', ['number', 'string']),
         queryParams: Module.cwrap('flatsql_query_params', 'number', ['number', 'string', 'number', 'number', 'number']),
         queryMany: Module.cwrap('flatsql_query_many', 'number', ['number', 'number', 'number', 'number']),
+        buildQueryCacheKey: Module.cwrap('flatsql_build_query_cache_key', 'string', ['string', 'string', 'string', 'number', 'number', 'number']),
+        registerQueryTemplate: Module.cwrap('flatsql_register_query_template', 'number', ['number', 'string', 'string', 'number']),
+        queryTemplate: Module.cwrap('flatsql_query_template', 'number', ['number', 'string', 'number', 'number', 'number']),
+        clearQueryCache: Module.cwrap('flatsql_clear_query_cache', null, ['number']),
+        queryCacheHits: Module.cwrap('flatsql_query_cache_hits', 'number', ['number']),
+        queryCacheMisses: Module.cwrap('flatsql_query_cache_misses', 'number', ['number']),
+        queryCacheSize: Module.cwrap('flatsql_query_cache_size', 'number', ['number']),
+        queryCacheGeneration: Module.cwrap('flatsql_query_cache_generation', 'number', ['number']),
         batchResultCount: Module.cwrap('flatsql_batch_result_count', 'number', []),
         selectBatchResult: Module.cwrap('flatsql_select_batch_result', 'number', ['number']),
         getError: Module.cwrap('flatsql_get_error', 'string', []),
@@ -305,6 +313,15 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
         markDeleted: Module.cwrap('flatsql_mark_deleted', null, ['number', 'string', 'number']),
         getDeletedCount: Module.cwrap('flatsql_get_deleted_count', 'number', ['number', 'string']),
         clearTombstones: Module.cwrap('flatsql_clear_tombstones', null, ['number', 'string']),
+
+        // Raw FlatBuffer access
+        getFlatBufferById: Module.cwrap('flatsql_get_flatbuffer_by_id', 'number', ['number', 'string', 'number']),
+        getFlatBufferByEmail: Module.cwrap('flatsql_get_flatbuffer_by_email', 'number', ['number', 'string', 'string']),
+        getFlatBufferByIndex: Module.cwrap('flatsql_get_flatbuffer_by_index', 'number', ['number', 'string', 'string', 'number', 'number', 'number']),
+        getRawFlatBufferSize: Module.cwrap('flatsql_get_raw_flatbuffer_size', 'number', []),
+        getRawFlatBufferSequence: Module.cwrap('flatsql_get_raw_flatbuffer_sequence', 'number', []),
+        getStorageBuffer: Module.cwrap('flatsql_get_storage_buffer', 'number', ['number']),
+        getStorageSize: Module.cwrap('flatsql_get_storage_size', 'number', ['number']),
 
         // Encryption
         setEncryptionKey: Module.cwrap('flatsql_set_encryption_key', 'number', ['number', 'number', 'number']),
@@ -536,6 +553,20 @@ export class FlatSQL {
     wasIntegrityVerified() {
         return integrityVerified;
     }
+
+    buildQueryCacheKey(dataset, artifactVersion, queryId, params = []) {
+        const encodedParams = encodeQueryParams(params);
+        const key = encodedParams.length === 0
+            ? api.buildQueryCacheKey(dataset, artifactVersion, queryId, 0, 0, 0)
+            : withHeapBytes(
+                encodedParams,
+                (ptr) => api.buildQueryCacheKey(dataset, artifactVersion, queryId, ptr, encodedParams.length, params.length)
+            );
+        if (!key) {
+            throw new Error(api.getError());
+        }
+        return key;
+    }
 }
 
 // Database wrapper class
@@ -624,6 +655,40 @@ export class FlatSQLDatabase {
         return readQueryResult();
     }
 
+    registerQueryTemplate(queryId, sql, cacheable = true) {
+        const success = api.registerQueryTemplate(this._handle, queryId, sql, cacheable ? 1 : 0);
+        if (!success) {
+            throw new Error(api.getError());
+        }
+    }
+
+    queryTemplate(queryId, params = []) {
+        const encodedParams = encodeQueryParams(params);
+        const success = encodedParams.length === 0
+            ? api.queryTemplate(this._handle, queryId, 0, 0, 0)
+            : withHeapBytes(
+                encodedParams,
+                (ptr) => api.queryTemplate(this._handle, queryId, ptr, encodedParams.length, params.length)
+            );
+        if (!success) {
+            throw new Error(api.getError());
+        }
+        return readQueryResult();
+    }
+
+    clearQueryCache() {
+        api.clearQueryCache(this._handle);
+    }
+
+    getQueryCacheStats() {
+        return {
+            hits: api.queryCacheHits(this._handle),
+            misses: api.queryCacheMisses(this._handle),
+            size: api.queryCacheSize(this._handle),
+            generation: api.queryCacheGeneration(this._handle)
+        };
+    }
+
     queryMany(queries) {
         if (queries.length === 0) {
             return [];
@@ -699,6 +764,80 @@ export class FlatSQLDatabase {
 
     clearTombstones(tableName) {
         api.clearTombstones(this._handle, tableName);
+    }
+
+    getFlatBufferById(tableName, id) {
+        const ptr = api.getFlatBufferById(this._handle, tableName, id);
+        if (!ptr) {
+            return null;
+        }
+        return {
+            ptr,
+            size: api.getRawFlatBufferSize(),
+            sequence: api.getRawFlatBufferSequence()
+        };
+    }
+
+    getFlatBufferByEmail(tableName, email) {
+        const ptr = api.getFlatBufferByEmail(this._handle, tableName, email);
+        if (!ptr) {
+            return null;
+        }
+        return {
+            ptr,
+            size: api.getRawFlatBufferSize(),
+            sequence: api.getRawFlatBufferSequence()
+        };
+    }
+
+    getFlatBufferByIndex(tableName, columnName, value) {
+        const encodedParams = encodeQueryParams([value]);
+        const ptr = withHeapBytes(
+            encodedParams,
+            (paramPtr) => api.getFlatBufferByIndex(
+                this._handle,
+                tableName,
+                columnName,
+                paramPtr,
+                encodedParams.length,
+                1
+            )
+        );
+        if (!ptr) {
+            const error = api.getError();
+            if (error) {
+                throw new Error(error);
+            }
+            return null;
+        }
+        return {
+            ptr,
+            size: api.getRawFlatBufferSize(),
+            sequence: api.getRawFlatBufferSequence()
+        };
+    }
+
+    getFlatBufferDataById(tableName, id) {
+        const record = this.getFlatBufferById(tableName, id);
+        if (!record) {
+            return null;
+        }
+        return new Uint8Array(Module.HEAPU8.buffer, record.ptr, record.size).slice();
+    }
+
+    getFlatBufferDataByIndex(tableName, columnName, value) {
+        const record = this.getFlatBufferByIndex(tableName, columnName, value);
+        if (!record) {
+            return null;
+        }
+        return new Uint8Array(Module.HEAPU8.buffer, record.ptr, record.size).slice();
+    }
+
+    getStorageInfo() {
+        return {
+            ptr: api.getStorageBuffer(this._handle),
+            size: api.getStorageSize(this._handle)
+        };
     }
 
     // ==================== Encryption API ====================

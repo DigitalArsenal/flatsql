@@ -9,6 +9,7 @@ const DEFAULT_PAGE_SIZE = 32768;
 const DEFAULT_MMAP_SIZE = 268435456;
 const DEFAULT_CACHE_SIZE = -131072;
 const DEFAULT_THREAD_COUNT = Math.min(4, Math.max(2, availableParallelism()));
+const MAX_QUERY_STATEMENT_CACHE_ENTRIES = 256;
 
 function isCacheableQuerySql(sql) {
   const trimmed = sql.trimStart();
@@ -49,9 +50,30 @@ function executeStatementAll(statement, params) {
   return statement.all(params);
 }
 
+function getCachedStatement(cache, key) {
+  const cached = cache.get(key);
+  if (!cached) {
+    return undefined;
+  }
+  cache.delete(key);
+  cache.set(key, cached);
+  return cached;
+}
+
+function setCachedStatement(cache, key, value) {
+  cache.set(key, value);
+  while (cache.size > MAX_QUERY_STATEMENT_CACHE_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    cache.delete(oldest);
+  }
+}
+
 function runQuery(builder, sql, params) {
   const cacheable = isCacheableQuerySql(sql);
-  let cached = cacheable ? builder.queryCache.get(sql) : undefined;
+  let cached = cacheable ? getCachedStatement(builder.queryCache, sql) : undefined;
 
   if (!cached) {
     const statement = builder.db.prepare(sql);
@@ -62,7 +84,7 @@ function runQuery(builder, sql, params) {
     const columns = statement.columns().map((column) => column.name);
     cached = { statement, columns, arrayMode };
     if (cacheable) {
-      builder.queryCache.set(sql, cached);
+      setCachedStatement(builder.queryCache, sql, cached);
     }
   }
 
@@ -656,8 +678,14 @@ function forEachSizePrefixedBuffer(stream, visitor) {
   let index = 0;
 
   while (offset < stream.byteLength) {
+    if (offset + 4 > stream.byteLength) {
+      throw new Error(`Invalid size-prefixed stream: truncated frame header at offset ${offset}`);
+    }
     const size = view.getUint32(offset, true);
     offset += 4;
+    if (offset + size > stream.byteLength) {
+      throw new Error(`Invalid size-prefixed stream: truncated frame at index ${index}`);
+    }
     visitor(stream.subarray(offset, offset + size), index);
     offset += size;
     index += 1;

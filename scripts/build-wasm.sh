@@ -8,15 +8,17 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 EMSDK_DIR="$PROJECT_ROOT/packages/emsdk"
 CPP_DIR="$PROJECT_ROOT/cpp"
 
-# Check if emsdk is installed
-if [ ! -f "$EMSDK_DIR/emsdk_env.sh" ]; then
-    echo "Error: emsdk not found. Run 'npm run emsdk:install' first."
+# Prefer the repo-local emsdk when present, but allow production builders and
+# Homebrew-based developer machines to provide emcmake/emcc on PATH.
+if [ -f "$EMSDK_DIR/emsdk_env.sh" ]; then
+    echo "Sourcing emsdk environment..."
+    source "$EMSDK_DIR/emsdk_env.sh"
+elif command -v emcmake >/dev/null 2>&1 && command -v emcc >/dev/null 2>&1; then
+    echo "Using emsdk tools from PATH..."
+else
+    echo "Error: emsdk not found. Run 'npm run emsdk:install' or provide emcmake/emcc on PATH."
     exit 1
 fi
-
-# Source emsdk environment
-echo "Sourcing emsdk environment..."
-source "$EMSDK_DIR/emsdk_env.sh"
 
 # Configure and build
 cd "$CPP_DIR"

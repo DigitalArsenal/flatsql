@@ -681,6 +681,100 @@ describe('remote artifact builder', () => {
     await client.close();
   });
 
+  test('artifact worker coalesces concurrent identical read queries', async () => {
+    const sqlitePath = join(tempDir, 'users-worker-query-singleflight.sqlite');
+    const client = new FlatSQLArtifactWorkerClient();
+    await client.init();
+
+    const builder = await client.createBuilder(schema, {
+      sqlitePath,
+      preferSharedArrayBuffer: false,
+    });
+
+    await builder.registerFileId('USER', 'User');
+    await builder.enableDemoExtractors();
+    await builder.ingestBuffers(
+      [createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30)],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    const originalCall = (client as any).call.bind(client);
+    let queryCalls = 0;
+    (client as any).call = async (method: string, params: Record<string, unknown>) => {
+      if (method === 'query') {
+        queryCalls += 1;
+      }
+      return await originalCall(method, params);
+    };
+
+    const sql = 'SELECT COUNT(*) FROM "_idx_User_email"';
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => builder.query(sql))
+    );
+
+    expect(results.every((result) => result.rows[0][0] === 1)).toBe(true);
+    expect(queryCalls).toBe(1);
+
+    await builder.close();
+    await client.close();
+  });
+
+  test('artifact worker ignores stale in-flight query results after ingest invalidates cache', async () => {
+    const sqlitePath = join(tempDir, 'users-worker-query-generation.sqlite');
+    const client = new FlatSQLArtifactWorkerClient();
+    await client.init();
+
+    const builder = await client.createBuilder(schema, {
+      sqlitePath,
+      preferSharedArrayBuffer: false,
+    });
+
+    await builder.registerFileId('USER', 'User');
+    await builder.enableDemoExtractors();
+    await builder.ingestBuffers(
+      [createUserFlatBuffer(1, 'Alice', 'alice@example.com', 30)],
+      { sourceName: 'users.bin', startOffset: 0 }
+    );
+
+    const originalCall = (client as any).call.bind(client);
+    let releaseQuery: (() => void) | undefined;
+    let queryResultReady: (() => void) | undefined;
+    let delayedQuery = false;
+    const queryResultReadyPromise = new Promise<void>((resolve) => {
+      queryResultReady = resolve;
+    });
+
+    (client as any).call = async (method: string, params: Record<string, unknown>) => {
+      if (method !== 'query' || delayedQuery) {
+        return await originalCall(method, params);
+      }
+      delayedQuery = true;
+
+      const result = await originalCall(method, params);
+      queryResultReady!();
+      await new Promise<void>((resolve) => {
+        releaseQuery = resolve;
+      });
+      return result;
+    };
+
+    const sql = 'SELECT COUNT(*) FROM "_idx_User_email"';
+    const staleQuery = builder.query(sql);
+    await queryResultReadyPromise;
+
+    await builder.ingestBuffers(
+      [createUserFlatBuffer(2, 'Bob', 'bob@example.com', 25)],
+      { sourceName: 'users.bin', startOffset: 64 }
+    );
+
+    releaseQuery!();
+    await expect(staleQuery).resolves.toMatchObject({ rows: [[1]] });
+    await expect(builder.query(sql)).resolves.toMatchObject({ rows: [[2]] });
+
+    await builder.close();
+    await client.close();
+  });
+
   test('artifact worker caches parameterized read results by sql and params', async () => {
     const sqlitePath = join(tempDir, 'users-worker-query-params.sqlite');
     const client = new FlatSQLArtifactWorkerClient();
@@ -808,6 +902,16 @@ describe('remote artifact builder', () => {
 
     stream[11] = 42;
     expect(visited[1][0]).toBe(42);
+  });
+
+  test('size-prefixed iteration rejects truncated frames', async () => {
+    const stream = new Uint8Array(7);
+    new DataView(stream.buffer).setUint32(0, 8, true);
+    stream.set([1, 2, 3], 4);
+
+    expect(() => forEachSizePrefixedBuffer(stream, () => undefined)).toThrow(
+      /truncated frame/
+    );
   });
 
   test('artifact builder rolls back the whole ingest batch on error', async () => {

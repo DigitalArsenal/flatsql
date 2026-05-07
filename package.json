@@ -18,6 +18,18 @@
       "types": "./wasm/wasi.d.ts",
       "import": "./wasm/wasi.js"
     },
+    "./standalone": {
+      "types": "./wasm/standalone.d.ts",
+      "import": "./wasm/standalone.js"
+    },
+    "./artifacts/standalone": {
+      "types": "./dist/artifacts/standalone-builder.d.ts",
+      "import": "./dist/artifacts/standalone-builder.js"
+    },
+    "./standalone/wasmedge": {
+      "types": "./dist/standalone/index.d.ts",
+      "import": "./dist/standalone/index.js"
+    },
     "./wasi.wasm": "./wasm/flatsql-wasi.wasm",
     "./sdm": {
       "types": "./sdm/index.d.ts",
@@ -29,7 +41,9 @@
     "dist",
     "wasm/*.js",
     "wasm/*.wasm",
+    "wasm/*.json",
     "wasm/*.d.ts",
+    "wasm/native/*.cpp",
     "sdm/*.js",
     "sdm/*.wasm",
     "sdm/*.d.ts",
@@ -47,10 +61,11 @@
     "bench": "node bench/flatsql-perf.mjs",
     "bench:perf": "node bench/flatsql-perf.mjs",
     "bench:perf:profile": "node bench/flatsql-perf.mjs --profile",
-    "prepublishOnly": "npm run build",
+    "prepublishOnly": "npm run build && npm run test:wasi && npm run test:wasmedge && npm test -- --runInBand --runTestsByPath test/package-exports.test.ts",
     "emsdk:install": "bash scripts/install-emsdk.sh",
     "emsdk:env": "echo 'Run: source packages/emsdk/emsdk_env.sh'",
-    "test:wasi": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasi.test.ts",
+    "test:wasi": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasi.test.ts test/standalone-wasm-imports.test.ts",
+    "test:wasmedge": "node --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasmedge-standalone.test.ts test/wasmedge-runner.test.ts",
     "test:cluster": "bash scripts/cluster-validation.sh",
     "test:cluster:smoke": "bash scripts/cluster-validation.sh --duration=5 --stretch-duration=5 --readers=4 --stretch-readers=6"
   },

@@ -21,8 +21,14 @@ export function forEachSizePrefixedBuffer(stream, visitor) {
     let offset = 0;
     let index = 0;
     while (offset < stream.byteLength) {
+        if (stream.byteLength - offset < 4) {
+            throw new Error(`Invalid size-prefixed stream: truncated frame header at offset ${offset}`);
+        }
         const size = view.getUint32(offset, true);
         offset += 4;
+        if (size > stream.byteLength - offset) {
+            throw new Error(`Invalid size-prefixed stream: truncated frame at index ${index}`);
+        }
         visitor(stream.subarray(offset, offset + size), index);
         offset += size;
         index += 1;

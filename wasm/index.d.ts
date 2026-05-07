@@ -15,6 +15,13 @@ export interface QueryRequest {
   params?: QueryParam[];
 }
 
+export interface QueryCacheStats {
+  hits: number;
+  misses: number;
+  size: number;
+  generation: number;
+}
+
 export interface TableStats {
   tableName: string;
   fileId: string;
@@ -67,6 +74,26 @@ export interface FlatSQLDatabase {
    * Execute a SQL query
    */
   query(sql: string, params?: QueryParam[]): QueryResult;
+
+  /**
+   * Register a named SQL template for native cached execution.
+   */
+  registerQueryTemplate(queryId: string, sql: string, cacheable?: boolean): void;
+
+  /**
+   * Execute a registered SQL template through the native result cache.
+   */
+  queryTemplate(queryId: string, params?: QueryParam[]): QueryResult;
+
+  /**
+   * Clear cached query results without unregistering templates.
+   */
+  clearQueryCache(): void;
+
+  /**
+   * Read native query result cache counters for this database handle.
+   */
+  getQueryCacheStats(): QueryCacheStats;
 
   /**
    * Execute multiple SQL queries and return results in request order
@@ -166,9 +193,24 @@ export interface FlatSQLDatabase {
   getFlatBufferByEmail(tableName: string, email: string): { ptr: number; size: number; sequence: number } | null;
 
   /**
+   * Get raw FlatBuffer pointer and size by table name, indexed column, and typed key.
+   * Returns { ptr, size, sequence } or null if not found.
+   */
+  getFlatBufferByIndex(
+    tableName: string,
+    columnName: string,
+    value: QueryParam
+  ): { ptr: number; size: number; sequence: number } | null;
+
+  /**
    * Get a copy of the raw FlatBuffer data as Uint8Array
    */
   getFlatBufferDataById(tableName: string, id: number): Uint8Array | null;
+
+  /**
+   * Get a copy of raw FlatBuffer data by table name, indexed column, and typed key.
+   */
+  getFlatBufferDataByIndex(tableName: string, columnName: string, value: QueryParam): Uint8Array | null;
 
   /**
    * Get the underlying storage buffer info
@@ -294,6 +336,16 @@ export interface FlatSQL {
    * Check if WASM was loaded with integrity verification
    */
   wasIntegrityVerified(): boolean;
+
+  /**
+   * Build the canonical query result cache key in the WASM core.
+   */
+  buildQueryCacheKey(
+    dataset: string,
+    artifactVersion: string,
+    queryId: string,
+    params?: QueryParam[]
+  ): string;
 }
 
 /**

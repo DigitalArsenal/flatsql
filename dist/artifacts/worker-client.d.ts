@@ -5,10 +5,12 @@ export declare class FlatSQLArtifactWorkerClient {
     private worker;
     private nextId;
     private readonly pending;
+    private closed;
     constructor(workerPath?: URL);
     init(): Promise<void>;
     createBuilder(schemaSource: string, options: ArtifactWorkerBuilderOptions): Promise<FlatSQLArtifactWorkerBuilder>;
     close(): Promise<void>;
+    private rejectAllPending;
     call(method: string, params: Record<string, unknown>): Promise<any>;
 }
 export declare class FlatSQLArtifactWorkerBuilder {
@@ -17,6 +19,8 @@ export declare class FlatSQLArtifactWorkerBuilder {
     private readonly schema;
     private readonly preferSharedArrayBuffer;
     private readonly queryResultCache;
+    private readonly inFlightQueries;
+    private queryGeneration;
     constructor(client: FlatSQLArtifactWorkerClient, builderId: string, schema: DatabaseSchema, options: ArtifactWorkerBuilderOptions);
     registerFileId(fileId: string, tableName: string): Promise<void>;
     enableDemoExtractors(): Promise<void>;
