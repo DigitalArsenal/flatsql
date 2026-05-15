@@ -1,6 +1,6 @@
 {
   "name": "flatsql",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
   "type": "module",
   "main": "dist/index.js",
@@ -70,7 +70,7 @@
     "bench": "node bench/flatsql-perf.mjs",
     "bench:perf": "node bench/flatsql-perf.mjs",
     "bench:perf:profile": "node bench/flatsql-perf.mjs --profile",
-    "prepublishOnly": "npm run build && npm run test:wasi && npm run test:wasmedge && npm test -- --runInBand --runTestsByPath test/package-exports.test.ts",
+    "prepublishOnly": "npm run build && npm run test:wasi && npm run test:wasmedge && npm test -- --runInBand --runTestsByPath test/package-exports.test.ts test/wasm-generic-extractor.test.ts test/wasm-pointer.test.ts",
     "emsdk:install": "bash scripts/install-emsdk.sh",
     "emsdk:env": "echo 'Run: source packages/emsdk/emsdk_env.sh'",
     "test:wasi": "node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasi.test.ts test/standalone-wasm-imports.test.ts",

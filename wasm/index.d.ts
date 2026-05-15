@@ -474,4 +474,6 @@ export function initFlatSQL(options?: InitOptions | (() => Promise<any>)): Promi
  */
 export function wasIntegrityVerified(): boolean;
 
+export function __testWasmPointerToByteOffset(ptr: number): number;
+
 export default initFlatSQL;

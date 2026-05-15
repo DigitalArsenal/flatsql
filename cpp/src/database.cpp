@@ -1,5 +1,6 @@
 #include "flatsql/database.h"
 #include "flatsql/query_cache.h"
+#include <flatbuffers/flatbuffers.h>
 #include <algorithm>
 #include <mutex>
 #include <stdexcept>
@@ -9,6 +10,188 @@
 #endif
 
 namespace flatsql {
+
+namespace {
+
+bool readFlatBufferLayout(const uint8_t* data,
+                          size_t length,
+                          size_t& rootOffset,
+                          size_t& vtableOffset,
+                          uint16_t& vtableSize) {
+    if (!data || length < sizeof(uint32_t)) {
+        return false;
+    }
+
+    const uint32_t root = flatbuffers::ReadScalar<uint32_t>(data);
+    if (root > length || length - root < sizeof(int32_t)) {
+        return false;
+    }
+
+    const int32_t vtableDistance = flatbuffers::ReadScalar<int32_t>(data + root);
+    if (vtableDistance <= 0 || static_cast<size_t>(vtableDistance) > root) {
+        return false;
+    }
+
+    const size_t vtable = root - static_cast<size_t>(vtableDistance);
+    if (vtable > length || length - vtable < sizeof(uint16_t)) {
+        return false;
+    }
+
+    const uint16_t size = flatbuffers::ReadScalar<uint16_t>(data + vtable);
+    if (size < 4 || size > length - vtable) {
+        return false;
+    }
+
+    rootOffset = root;
+    vtableOffset = vtable;
+    vtableSize = size;
+    return true;
+}
+
+uint16_t readFieldOffset(const uint8_t* data,
+                         size_t length,
+                         size_t vtableOffset,
+                         uint16_t vtableSize,
+                         size_t fieldIndex) {
+    const size_t entryOffset = vtableOffset + 4 + fieldIndex * sizeof(uint16_t);
+    if (entryOffset > length || sizeof(uint16_t) > length - entryOffset) {
+        return 0;
+    }
+    if (entryOffset + sizeof(uint16_t) > vtableOffset + vtableSize) {
+        return 0;
+    }
+    return flatbuffers::ReadScalar<uint16_t>(data + entryOffset);
+}
+
+template <typename T>
+Value readScalarField(const uint8_t* data, size_t length, size_t fieldOffset) {
+    if (fieldOffset > length || sizeof(T) > length - fieldOffset) {
+        return std::monostate{};
+    }
+    return flatbuffers::ReadScalar<T>(data + fieldOffset);
+}
+
+Value readStringField(const uint8_t* data, size_t length, size_t fieldOffset) {
+    if (fieldOffset > length || sizeof(uint32_t) > length - fieldOffset) {
+        return std::monostate{};
+    }
+
+    const uint32_t relativeOffset = flatbuffers::ReadScalar<uint32_t>(data + fieldOffset);
+    if (relativeOffset > length || fieldOffset > length - relativeOffset) {
+        return std::monostate{};
+    }
+
+    const size_t stringOffset = fieldOffset + relativeOffset;
+    if (stringOffset > length || sizeof(uint32_t) > length - stringOffset) {
+        return std::monostate{};
+    }
+
+    const uint32_t stringLength = flatbuffers::ReadScalar<uint32_t>(data + stringOffset);
+    if (stringOffset + sizeof(uint32_t) > length || stringLength > length - stringOffset - sizeof(uint32_t)) {
+        return std::monostate{};
+    }
+
+    const char* text = reinterpret_cast<const char*>(data + stringOffset + sizeof(uint32_t));
+    return std::string(text, stringLength);
+}
+
+Value readBytesField(const uint8_t* data, size_t length, size_t fieldOffset) {
+    if (fieldOffset > length || sizeof(uint32_t) > length - fieldOffset) {
+        return std::monostate{};
+    }
+
+    const uint32_t relativeOffset = flatbuffers::ReadScalar<uint32_t>(data + fieldOffset);
+    if (relativeOffset > length || fieldOffset > length - relativeOffset) {
+        return std::monostate{};
+    }
+
+    const size_t vectorOffset = fieldOffset + relativeOffset;
+    if (vectorOffset > length || sizeof(uint32_t) > length - vectorOffset) {
+        return std::monostate{};
+    }
+
+    const uint32_t vectorLength = flatbuffers::ReadScalar<uint32_t>(data + vectorOffset);
+    if (vectorOffset + sizeof(uint32_t) > length || vectorLength > length - vectorOffset - sizeof(uint32_t)) {
+        return std::monostate{};
+    }
+
+    const uint8_t* begin = data + vectorOffset + sizeof(uint32_t);
+    return std::vector<uint8_t>(begin, begin + vectorLength);
+}
+
+Value readGenericColumnValue(const uint8_t* data,
+                             size_t length,
+                             const ColumnDef& column,
+                             size_t fieldIndex) {
+    size_t rootOffset = 0;
+    size_t vtableOffset = 0;
+    uint16_t vtableSize = 0;
+    if (!readFlatBufferLayout(data, length, rootOffset, vtableOffset, vtableSize)) {
+        return std::monostate{};
+    }
+
+    const uint16_t fieldObjectOffset = readFieldOffset(data, length, vtableOffset, vtableSize, fieldIndex);
+    if (fieldObjectOffset == 0) {
+        return std::monostate{};
+    }
+
+    const size_t fieldOffset = rootOffset + fieldObjectOffset;
+    if (fieldOffset >= length) {
+        return std::monostate{};
+    }
+
+    switch (column.type) {
+        case ValueType::Bool: {
+            Value raw = readScalarField<uint8_t>(data, length, fieldOffset);
+            if (auto* value = std::get_if<uint8_t>(&raw)) {
+                return *value != 0;
+            }
+            return std::monostate{};
+        }
+        case ValueType::Int8:
+            return readScalarField<int8_t>(data, length, fieldOffset);
+        case ValueType::Int16:
+            return readScalarField<int16_t>(data, length, fieldOffset);
+        case ValueType::Int32:
+            return readScalarField<int32_t>(data, length, fieldOffset);
+        case ValueType::Int64:
+            return readScalarField<int64_t>(data, length, fieldOffset);
+        case ValueType::UInt8:
+            return readScalarField<uint8_t>(data, length, fieldOffset);
+        case ValueType::UInt16:
+            return readScalarField<uint16_t>(data, length, fieldOffset);
+        case ValueType::UInt32:
+            return readScalarField<uint32_t>(data, length, fieldOffset);
+        case ValueType::UInt64:
+            return readScalarField<uint64_t>(data, length, fieldOffset);
+        case ValueType::Float32:
+            return readScalarField<float>(data, length, fieldOffset);
+        case ValueType::Float64:
+            return readScalarField<double>(data, length, fieldOffset);
+        case ValueType::String:
+            return readStringField(data, length, fieldOffset);
+        case ValueType::Bytes:
+            return readBytesField(data, length, fieldOffset);
+        case ValueType::Null:
+        default:
+            return std::monostate{};
+    }
+}
+
+TableStore::FieldExtractor makeGenericFieldExtractor(TableDef tableDef) {
+    return [tableDef = std::move(tableDef)](const uint8_t* data,
+                                            size_t length,
+                                            const std::string& fieldName) -> Value {
+        for (size_t index = 0; index < tableDef.columns.size(); index++) {
+            if (tableDef.columns[index].name == fieldName) {
+                return readGenericColumnValue(data, length, tableDef.columns[index], index);
+            }
+        }
+        return std::monostate{};
+    };
+}
+
+}  // namespace
 
 // ==================== TableStore ====================
 
@@ -248,6 +431,7 @@ FlatSQLDatabase::FlatSQLDatabase(const DatabaseSchema& schema, RuntimeOptions op
     for (const auto& tableDef : schema_.tables) {
         tables_[tableDef.name] = std::make_unique<TableStore>(
             tableDef, *storage_, sqliteEngine_->getDb());
+        tables_[tableDef.name]->setFieldExtractor(makeGenericFieldExtractor(tableDef));
     }
 }
 

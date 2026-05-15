@@ -359,10 +359,32 @@ export function wasIntegrityVerified() {
     return integrityVerified;
 }
 
+function wasmPointerToByteOffset(ptr) {
+    const numeric = Number(ptr);
+    if (!Number.isFinite(numeric)) {
+        throw new TypeError(`Invalid WASM pointer: ${ptr}`);
+    }
+    return numeric >>> 0;
+}
+
+export const __testWasmPointerToByteOffset = wasmPointerToByteOffset;
+
+function heapBytes(ptr, size) {
+    return new Uint8Array(Module.HEAPU8.buffer, wasmPointerToByteOffset(ptr), size);
+}
+
+function copyHeapBytes(ptr, size) {
+    return heapBytes(ptr, size).slice();
+}
+
+function setHeapBytes(data, ptr) {
+    Module.HEAPU8.set(data, wasmPointerToByteOffset(ptr));
+}
+
 function withHeapBytes(data, callback) {
     const ptr = Module._malloc(data.length);
     try {
-        Module.HEAPU8.set(data, ptr);
+        setHeapBytes(data, ptr);
         return callback(ptr);
     } finally {
         Module._free(ptr);
@@ -468,7 +490,7 @@ function readCellValue(row, col) {
             const blobPtr = api.resultCellBlob(row, col);
             const blobSize = api.resultCellBlobSize(row, col);
             return blobPtr && blobSize > 0
-                ? Array.from(new Uint8Array(Module.HEAPU8.buffer, blobPtr, blobSize))
+                ? Array.from(copyHeapBytes(blobPtr, blobSize))
                 : [];
         }
         default:
@@ -525,19 +547,19 @@ export class FlatSQL {
     createTestUser(id, name, email, age) {
         const ptr = api.createTestUser(id, name, email, age);
         const size = api.testBufferSize();
-        return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
+        return copyHeapBytes(ptr, size);
     }
 
     createTestPost(id, userId, title) {
         const ptr = api.createTestPost(id, userId, title);
         const size = api.testBufferSize();
-        return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
+        return copyHeapBytes(ptr, size);
     }
 
     createTestPublishEvent(fileId, recordId, eventIndex, payloadSize) {
         const ptr = api.createTestPublishEvent(fileId, recordId, eventIndex, payloadSize);
         const size = api.testBufferSize();
-        return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
+        return copyHeapBytes(ptr, size);
     }
 
     createTestMPE(entityId, epoch, meanMotion, eccentricity, inclination,
@@ -555,13 +577,13 @@ export class FlatSQL {
             meanElementTheory
         );
         const size = api.testBufferSize();
-        return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
+        return copyHeapBytes(ptr, size);
     }
 
     createTestTelemetry(packetId, spacecraft, subsystem, mode, temperatureC, signalDb, timestampS) {
         const ptr = api.createTestTelemetry(packetId, spacecraft, subsystem, mode, temperatureC, signalDb, timestampS);
         const size = api.testBufferSize();
-        return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
+        return copyHeapBytes(ptr, size);
     }
 
     /**
@@ -799,18 +821,18 @@ export class FlatSQLDatabase {
 
         const ptr = api.responseArtifactData();
         const size = api.responseArtifactSize();
-        return ptr && size > 0 ? new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice() : new Uint8Array();
+        return ptr && size > 0 ? copyHeapBytes(ptr, size) : new Uint8Array();
     }
 
     exportData() {
         const ptr = api.exportData(this._handle);
         const size = api.exportSize();
-        return new Uint8Array(Module.HEAPU8.buffer, ptr, size).slice();
+        return copyHeapBytes(ptr, size);
     }
 
     loadAndRebuild(data) {
         const ptr = Module._malloc(data.length);
-        Module.HEAPU8.set(data, ptr);
+        setHeapBytes(data, ptr);
         api.loadAndRebuild(this._handle, ptr, data.length);
         Module._free(ptr);
     }
@@ -921,7 +943,7 @@ export class FlatSQLDatabase {
         if (!record) {
             return null;
         }
-        return new Uint8Array(Module.HEAPU8.buffer, record.ptr, record.size).slice();
+        return copyHeapBytes(record.ptr, record.size);
     }
 
     getFlatBufferDataByIndex(tableName, columnName, value) {
@@ -929,7 +951,7 @@ export class FlatSQLDatabase {
         if (!record) {
             return null;
         }
-        return new Uint8Array(Module.HEAPU8.buffer, record.ptr, record.size).slice();
+        return copyHeapBytes(record.ptr, record.size);
     }
 
     getStorageInfo() {
@@ -947,7 +969,7 @@ export class FlatSQLDatabase {
      */
     setEncryptionKey(key) {
         const ptr = Module._malloc(key.length);
-        Module.HEAPU8.set(key, ptr);
+        setHeapBytes(key, ptr);
         const result = api.setEncryptionKey(this._handle, ptr, key.length);
         Module._free(ptr);
         if (!result) throw new Error(api.getError());
@@ -969,11 +991,11 @@ export class FlatSQLDatabase {
      */
     encryptBuffer(buffer, schema) {
         const bufPtr = Module._malloc(buffer.length);
-        Module.HEAPU8.set(buffer, bufPtr);
+        setHeapBytes(buffer, bufPtr);
         const schemaPtr = Module._malloc(schema.length);
-        Module.HEAPU8.set(schema, schemaPtr);
+        setHeapBytes(schema, schemaPtr);
         const result = api.encryptBuffer(this._handle, bufPtr, buffer.length, schemaPtr, schema.length);
-        const encrypted = new Uint8Array(Module.HEAPU8.buffer, bufPtr, buffer.length).slice();
+        const encrypted = copyHeapBytes(bufPtr, buffer.length);
         Module._free(bufPtr);
         Module._free(schemaPtr);
         if (!result) throw new Error(api.getError());
@@ -988,11 +1010,11 @@ export class FlatSQLDatabase {
      */
     decryptBuffer(buffer, schema) {
         const bufPtr = Module._malloc(buffer.length);
-        Module.HEAPU8.set(buffer, bufPtr);
+        setHeapBytes(buffer, bufPtr);
         const schemaPtr = Module._malloc(schema.length);
-        Module.HEAPU8.set(schema, schemaPtr);
+        setHeapBytes(schema, schemaPtr);
         const result = api.decryptBuffer(this._handle, bufPtr, buffer.length, schemaPtr, schema.length);
-        const decrypted = new Uint8Array(Module.HEAPU8.buffer, bufPtr, buffer.length).slice();
+        const decrypted = copyHeapBytes(bufPtr, buffer.length);
         Module._free(bufPtr);
         Module._free(schemaPtr);
         if (!result) throw new Error(api.getError());
@@ -1026,10 +1048,10 @@ export class FlatSQLDatabase {
      */
     computeHMAC(buffer) {
         const bufPtr = Module._malloc(buffer.length);
-        Module.HEAPU8.set(buffer, bufPtr);
+        setHeapBytes(buffer, bufPtr);
         const macPtr = Module._malloc(32);
         const result = api.computeHMAC(this._handle, bufPtr, buffer.length, macPtr);
-        const mac = new Uint8Array(Module.HEAPU8.buffer, macPtr, 32).slice();
+        const mac = copyHeapBytes(macPtr, 32);
         Module._free(bufPtr);
         Module._free(macPtr);
         if (!result) throw new Error('HMAC computation failed - is encryption key set?');
@@ -1044,9 +1066,9 @@ export class FlatSQLDatabase {
      */
     verifyHMAC(buffer, mac) {
         const bufPtr = Module._malloc(buffer.length);
-        Module.HEAPU8.set(buffer, bufPtr);
+        setHeapBytes(buffer, bufPtr);
         const macPtr = Module._malloc(32);
-        Module.HEAPU8.set(mac, macPtr);
+        setHeapBytes(mac, macPtr);
         const result = api.verifyHMAC(this._handle, bufPtr, buffer.length, macPtr);
         Module._free(bufPtr);
         Module._free(macPtr);
