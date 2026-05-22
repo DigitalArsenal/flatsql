@@ -375,6 +375,10 @@ IndexEntry SqliteIndex::extractEntry(sqlite3_stmt* stmt) const {
 }
 
 void SqliteIndex::insert(const Value& key, uint64_t dataOffset, uint32_t dataLength, uint64_t sequence) {
+    if (std::holds_alternative<std::monostate>(key)) {
+        return;
+    }
+
     sqlite3_reset(insertStmt_);
     sqlite3_clear_bindings(insertStmt_);
 

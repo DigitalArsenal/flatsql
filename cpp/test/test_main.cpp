@@ -179,6 +179,15 @@ void testSqliteIndex() {
         assert(index.getEntryCount() == 0);
     }
 
+    // ==================== Null Index Key Tests ====================
+    std::cout << "  Testing null index keys..." << std::endl;
+    {
+        SqliteIndex nullIndex(db, "test_table", "null_column", ValueType::Int32);
+
+        nullIndex.insert(std::monostate{}, 123, 10, 1);
+        assert(nullIndex.getEntryCount() == 0);
+    }
+
     // ==================== String Index Tests ====================
     std::cout << "  Testing string index..." << std::endl;
     {
