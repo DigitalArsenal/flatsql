@@ -25,6 +25,11 @@
             --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
             --sdn-stack-footer-height: 40px;
+            --sdn-stack-header-height: 52px;
+            --sdn-stack-header-brand-size: 15px;
+            --sdn-stack-header-link-size: 14px;
+            --sdn-stack-header-action-size: 13px;
+            --sdn-stack-header-mobile-link-size: 16px;
         }
 
         html { scroll-behavior: smooth; }
@@ -67,7 +72,7 @@
             top: 0;
             left: 0;
             right: 0;
-            height: 44px;
+            height: var(--sdn-stack-header-height, 52px);
             z-index: 9999;
             background: var(--nav-bg);
             backdrop-filter: blur(20px);
@@ -89,7 +94,7 @@
             align-items: center;
             gap: 8px;
             font-weight: 600;
-            font-size: 14px;
+            font-size: var(--sdn-stack-header-brand-size, 15px);
             color: var(--text-primary);
             text-decoration: none;
         }
@@ -107,7 +112,7 @@
         .nav-links a {
             color: var(--text-secondary);
             text-decoration: none;
-            font-size: 12px;
+            font-size: var(--sdn-stack-header-link-size, 14px);
             font-weight: 600;
             transition: opacity 0.2s;
         }
@@ -120,7 +125,7 @@
             gap: 8px;
             padding: 8px 20px;
             border-radius: 28px;
-            font-size: 12px;
+            font-size: var(--sdn-stack-header-action-size, 13px);
             font-weight: 600;
             text-decoration: none;
             transition: all 0.3s;
