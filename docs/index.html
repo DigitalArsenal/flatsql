@@ -9,6 +9,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script defer src="https://spacedatastandards.org/sdn-stack-nav.js"></script>
     <style>
         /* Reset */
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -23,6 +24,7 @@
             --nav-bg: rgba(22, 22, 23, 1.0);
             --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
+            --sdn-stack-nav-height: 32px;
         }
 
         html { scroll-behavior: smooth; }
@@ -61,7 +63,7 @@
         /* Navigation */
         nav {
             position: fixed;
-            top: 0;
+            top: var(--sdn-stack-nav-height, 32px);
             left: 0;
             right: 0;
             height: 44px;
@@ -1595,6 +1597,7 @@
     </style>
 </head>
 <body>
+    <sdn-stack-nav active="flatsql"></sdn-stack-nav>
     <!-- Fixed full-page video background -->
     <video class="page-video-bg" id="pageVideoBg" autoplay loop muted playsinline></video>
     <div class="page-video-overlay"></div>

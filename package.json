@@ -67,6 +67,7 @@
     "test:wasm": "node wasm/test-bulk-ingest.mjs",
     "dev": "tsc --watch",
     "serve": "vite docs --port 8081",
+    "check:nav": "node scripts/check-sdn-stack-nav.mjs flatsql docs/index.html",
     "bench": "node bench/flatsql-perf.mjs",
     "bench:perf": "node bench/flatsql-perf.mjs",
     "bench:perf:profile": "node bench/flatsql-perf.mjs --profile",
