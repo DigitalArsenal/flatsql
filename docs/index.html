@@ -24,7 +24,7 @@
             --nav-bg: rgba(22, 22, 23, 1.0);
             --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
-            --sdn-stack-nav-height: 32px;
+            --sdn-stack-footer-height: 40px;
         }
 
         html { scroll-behavior: smooth; }
@@ -36,6 +36,7 @@
             line-height: 1.6;
             overflow-x: hidden;
             -webkit-font-smoothing: antialiased;
+            padding-bottom: var(--sdn-stack-footer-height, 40px);
         }
 
         /* Fixed full-page video background */
@@ -63,7 +64,7 @@
         /* Navigation */
         nav {
             position: fixed;
-            top: var(--sdn-stack-nav-height, 32px);
+            top: 0;
             left: 0;
             right: 0;
             height: 44px;
@@ -1483,6 +1484,49 @@
         .code-block .comment { color: var(--text-muted); }
         .code-block .function { color: var(--text-primary); }
 
+        /* SDN Stack Section */
+        .stack-section {
+            padding: 120px 24px;
+            max-width: 1024px;
+            margin: 0 auto;
+            position: relative;
+        }
+
+        .stack-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+        }
+
+        .stack-card {
+            min-height: 168px;
+            padding: 24px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 16px;
+            background: rgba(22, 22, 23, 0.72);
+            text-decoration: none;
+            transition: transform 0.2s, background-color 0.2s, border-color 0.2s;
+        }
+
+        .stack-card:hover,
+        .stack-card.active {
+            transform: translateY(-2px);
+            border-color: rgba(255, 255, 255, 0.28);
+            background: rgba(42, 42, 45, 0.84);
+        }
+
+        .stack-card h3 {
+            margin-bottom: 10px;
+            color: var(--text-primary);
+            font-size: 18px;
+        }
+
+        .stack-card p {
+            color: var(--text-secondary);
+            font-size: 14px;
+            line-height: 1.55;
+        }
+
         /* Footer */
         footer {
             padding: 80px 24px 40px;
@@ -1592,6 +1636,7 @@
             .overview { padding: 60px 24px; }
             .demo { padding: 60px 24px; }
             .code-section { padding: 60px 24px; }
+            .stack-section { padding: 60px 24px; }
             .nav-links { display: none; }
         }
     </style>
@@ -1618,6 +1663,7 @@
                 <a href="#overview">Overview</a>
                 <a href="#demo">Demo</a>
                 <a href="#code">Code</a>
+                <a href="#stack">Stack</a>
                 <a href="https://github.com/DigitalArsenal/flatbuffers" target="_blank">Docs</a>
             </div>
             <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" class="btn" target="_blank">
@@ -2133,6 +2179,36 @@
 <span class="keyword">await</span> builder.<span class="function">queryTemplate</span>(<span class="string">"packetById"</span>, [42]); <span class="comment">// cache miss</span>
 <span class="keyword">await</span> builder.<span class="function">queryTemplate</span>(<span class="string">"packetById"</span>, [42]); <span class="comment">// cache hit</span>
 <span class="keyword">const</span> stats = <span class="keyword">await</span> builder.<span class="function">getQueryCacheStats</span>();</pre>
+        </div>
+    </section>
+
+    <section id="stack" class="stack-section">
+        <div class="section-title">
+            <p class="eyebrow">SDN Stack</p>
+            <h2>Move across the stack</h2>
+            <p>FlatSQL is the query surface for FlatBuffer data inside the broader SDN toolchain.</p>
+        </div>
+        <div class="stack-grid">
+            <a href="https://spacedatastandards.org/" class="stack-card">
+                <h3>Standards</h3>
+                <p>Canonical space data schemas and generated bindings.</p>
+            </a>
+            <a href="https://digitalarsenal.github.io/flatbuffers/" class="stack-card">
+                <h3>FlatBuffers</h3>
+                <p>Binary encoding, schema tooling, and runtimes.</p>
+            </a>
+            <a href="https://digitalarsenal.github.io/flatsql/" class="stack-card active">
+                <h3>FlatSQL</h3>
+                <p>SQL-style queries over FlatBuffer-backed datasets.</p>
+            </a>
+            <a href="https://spacedatanetwork.org/" class="stack-card">
+                <h3>SDN</h3>
+                <p>Publication, discovery, delivery, and marketplace infrastructure.</p>
+            </a>
+            <a href="https://digitalarsenal.github.io/space-data-module-sdk/" class="stack-card">
+                <h3>Module SDK</h3>
+                <p>WASM module packaging and compatibility tooling.</p>
+            </a>
         </div>
     </section>
 
