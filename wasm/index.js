@@ -293,6 +293,12 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
         responseArtifactSize: Module.cwrap('flatsql_response_artifact_size', 'number', []),
         responseArtifactRowCount: Module.cwrap('flatsql_response_artifact_row_count', 'number', []),
         responseArtifactColumnCount: Module.cwrap('flatsql_response_artifact_column_count', 'number', []),
+        responseArtifactCacheHit: Module.cwrap('flatsql_response_artifact_cache_hit', 'number', []),
+        configureRawStreamCache: Module.cwrap('flatsql_configure_raw_stream_cache', 'number', ['number', 'number', 'number']),
+        rawStreamCacheHits: Module.cwrap('flatsql_raw_stream_cache_hits', 'number', ['number']),
+        rawStreamCacheMisses: Module.cwrap('flatsql_raw_stream_cache_misses', 'number', ['number']),
+        rawStreamCacheSize: Module.cwrap('flatsql_raw_stream_cache_size', 'number', ['number']),
+        rawStreamCacheTotalBytes: Module.cwrap('flatsql_raw_stream_cache_total_bytes', 'number', ['number']),
 
         // Export/Import
         exportData: Module.cwrap('flatsql_export_data', 'number', ['number']),
@@ -822,6 +828,27 @@ export class FlatSQLDatabase {
         const ptr = api.responseArtifactData();
         const size = api.responseArtifactSize();
         return ptr && size > 0 ? copyHeapBytes(ptr, size) : new Uint8Array();
+    }
+
+    // True when the last queryRawFlatBufferStream call was served from the
+    // engine's response-artifact cache (no SQL re-execution).
+    lastRawStreamCacheHit() {
+        return api.responseArtifactCacheHit() !== 0;
+    }
+
+    configureRawStreamCache(maxEntries, maxTotalBytes) {
+        if (!api.configureRawStreamCache(this._handle, maxEntries, maxTotalBytes)) {
+            throw new Error(api.getError());
+        }
+    }
+
+    getRawStreamCacheStats() {
+        return {
+            hits: api.rawStreamCacheHits(this._handle),
+            misses: api.rawStreamCacheMisses(this._handle),
+            entries: api.rawStreamCacheSize(this._handle),
+            totalBytes: api.rawStreamCacheTotalBytes(this._handle)
+        };
     }
 
     exportData() {

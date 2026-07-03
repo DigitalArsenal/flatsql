@@ -176,6 +176,13 @@ public:
     size_t executeAndCount(const std::string& sql, const std::vector<Value>& params = {});
 
     /**
+     * True when the prepared statement for sql cannot modify the database
+     * (sqlite3_stmt_readonly). Prepares (and caches) the statement on first
+     * use; throws std::runtime_error for unparseable SQL like execute().
+     */
+    bool statementIsReadOnly(const std::string& sql) const;
+
+    /**
      * Get last error message.
      */
     std::string getLastError() const;

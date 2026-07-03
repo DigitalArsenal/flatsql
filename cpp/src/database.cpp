@@ -2,6 +2,7 @@
 #include "flatsql/query_cache.h"
 #include <flatbuffers/flatbuffers.h>
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 
@@ -636,22 +637,40 @@ QueryResult FlatSQLDatabase::query(const std::string& sql) {
     if (!sqliteInitialized_) {
         std::unique_lock initLock(*accessMutex_);
         initializeSQLiteEngine();
-        return sqliteEngine_->execute(sql);
+        QueryResult result = sqliteEngine_->execute(sql);
+        invalidateCachesIfStatementWritesUnlocked(sql);
+        return result;
     }
 
     std::unique_lock lock(*accessMutex_);
-    return sqliteEngine_->execute(sql);
+    QueryResult result = sqliteEngine_->execute(sql);
+    invalidateCachesIfStatementWritesUnlocked(sql);
+    return result;
 }
 
 QueryResult FlatSQLDatabase::query(const std::string& sql, const std::vector<Value>& params) {
     if (!sqliteInitialized_) {
         std::unique_lock initLock(*accessMutex_);
         initializeSQLiteEngine();
-        return sqliteEngine_->execute(sql, params);
+        QueryResult result = sqliteEngine_->execute(sql, params);
+        invalidateCachesIfStatementWritesUnlocked(sql);
+        return result;
     }
 
     std::unique_lock lock(*accessMutex_);
-    return sqliteEngine_->execute(sql, params);
+    QueryResult result = sqliteEngine_->execute(sql, params);
+    invalidateCachesIfStatementWritesUnlocked(sql);
+    return result;
+}
+
+// DML/DDL executed through plain query() invalidates the native result
+// caches: cached template results and raw-stream artifacts may read control
+// tables that plain SQL just mutated. The statement is already prepared and
+// cached by execute(), so the readonly check is a map lookup.
+void FlatSQLDatabase::invalidateCachesIfStatementWritesUnlocked(const std::string& sql) {
+    if (!sqliteEngine_->statementIsReadOnly(sql)) {
+        invalidateQueryResultCacheUnlocked();
+    }
 }
 
 QueryResult FlatSQLDatabase::query(const std::string& sql, int64_t param) {
@@ -662,11 +681,15 @@ QueryResult FlatSQLDatabase::query(const std::string& sql, int64_t param) {
     if (!sqliteInitialized_) {
         std::unique_lock initLock(*accessMutex_);
         initializeSQLiteEngine();
-        return sqliteEngine_->execute(sql, singleParam);
+        QueryResult result = sqliteEngine_->execute(sql, singleParam);
+        invalidateCachesIfStatementWritesUnlocked(sql);
+        return result;
     }
 
     std::unique_lock lock(*accessMutex_);
-    return sqliteEngine_->execute(sql, singleParam);
+    QueryResult result = sqliteEngine_->execute(sql, singleParam);
+    invalidateCachesIfStatementWritesUnlocked(sql);
+    return result;
 }
 
 void FlatSQLDatabase::registerQueryTemplate(const std::string& queryId,
@@ -757,6 +780,9 @@ FlatSQLDatabase::QueryCacheStats FlatSQLDatabase::getQueryCacheStats() const {
 void FlatSQLDatabase::invalidateQueryResultCacheUnlocked() {
     queryResultCache_.clear();
     queryResultCacheLru_.clear();
+    rawStreamCache_.clear();
+    rawStreamCacheLru_.clear();
+    rawStreamCacheTotalBytes_ = 0;
     queryCacheGeneration_++;
 }
 
@@ -793,6 +819,155 @@ std::string FlatSQLDatabase::buildTemplateCacheKeyUnlocked(const std::string& qu
                                                            const std::vector<Value>& params) const {
     (void)sql;
     return buildQueryCacheKey(schema_.name, std::to_string(queryCacheGeneration_), queryId, params);
+}
+
+bool FlatSQLDatabase::queryRawFlatBufferStream(const std::string& sql,
+                                               const std::vector<Value>& params,
+                                               RawStreamResult* result,
+                                               std::string* errorMessage) {
+    std::unique_lock lock(*accessMutex_);
+    if (!sqliteInitialized_) {
+        initializeSQLiteEngine();
+    }
+
+    // Only read-only statements are cacheable; the raw-stream contract is
+    // SELECT-shaped anyway (all cells BLOB). SQL is pre-validated by the C
+    // API, so the prepare inside statementIsReadOnly cannot throw for
+    // user-supplied errors.
+    const bool cacheable = sqliteEngine_->statementIsReadOnly(sql);
+    std::string cacheKey;
+    if (cacheable) {
+        cacheKey = buildQueryCacheKey(schema_.name,
+                                      std::to_string(queryCacheGeneration_),
+                                      "raw-stream:" + sql,
+                                      params);
+        auto cached = rawStreamCache_.find(cacheKey);
+        if (cached != rawStreamCache_.end()) {
+            rawStreamCacheHits_++;
+            rawStreamCacheLru_.splice(
+                rawStreamCacheLru_.begin(),
+                rawStreamCacheLru_,
+                cached->second.lruIt
+            );
+            cached->second.lruIt = rawStreamCacheLru_.begin();
+            *result = cached->second.result;
+            result->cacheHit = true;
+            return true;
+        }
+        rawStreamCacheMisses_++;
+    }
+
+    QueryResult queryResult = sqliteEngine_->execute(sql, params);
+    if (!cacheable) {
+        // A raw-stream request that writes (e.g. RETURNING) must invalidate
+        // like any other DML through the engine.
+        invalidateQueryResultCacheUnlocked();
+    }
+
+    size_t totalBytes = 0;
+    for (const auto& row : queryResult.rows) {
+        for (const auto& value : row) {
+            const auto* bytes = std::get_if<std::vector<uint8_t>>(&value);
+            if (!bytes) {
+                if (errorMessage) {
+                    *errorMessage = "raw response stream queries must return only BLOB cells";
+                }
+                return false;
+            }
+            if (bytes->size() > std::numeric_limits<uint32_t>::max()) {
+                if (errorMessage) {
+                    *errorMessage = "raw response stream record exceeds size-prefix capacity";
+                }
+                return false;
+            }
+            totalBytes += 4 + bytes->size();
+        }
+    }
+
+    auto stream = std::make_shared<std::vector<uint8_t>>();
+    stream->reserve(totalBytes);
+    for (const auto& row : queryResult.rows) {
+        for (const auto& value : row) {
+            const auto& bytes = std::get<std::vector<uint8_t>>(value);
+            const uint32_t size = static_cast<uint32_t>(bytes.size());
+            stream->push_back(static_cast<uint8_t>(size & 0xFF));
+            stream->push_back(static_cast<uint8_t>((size >> 8) & 0xFF));
+            stream->push_back(static_cast<uint8_t>((size >> 16) & 0xFF));
+            stream->push_back(static_cast<uint8_t>((size >> 24) & 0xFF));
+            stream->insert(stream->end(), bytes.begin(), bytes.end());
+        }
+    }
+
+    result->stream = std::move(stream);
+    result->rowCount = queryResult.rows.size();
+    result->columnCount = queryResult.columns.size();
+    result->cacheHit = false;
+
+    if (cacheable) {
+        storeRawStreamResultUnlocked(cacheKey, *result);
+    }
+    return true;
+}
+
+void FlatSQLDatabase::storeRawStreamResultUnlocked(const std::string& key,
+                                                   const RawStreamResult& result) {
+    const size_t streamBytes = result.stream ? result.stream->size() : 0;
+    if (streamBytes > rawStreamCacheMaxTotalBytes_) {
+        return;  // single stream over the byte budget — serve uncached
+    }
+
+    auto existing = rawStreamCache_.find(key);
+    if (existing != rawStreamCache_.end()) {
+        const size_t oldBytes =
+            existing->second.result.stream ? existing->second.result.stream->size() : 0;
+        rawStreamCacheTotalBytes_ = rawStreamCacheTotalBytes_ - oldBytes + streamBytes;
+        existing->second.result = result;
+        rawStreamCacheLru_.splice(
+            rawStreamCacheLru_.begin(),
+            rawStreamCacheLru_,
+            existing->second.lruIt
+        );
+        existing->second.lruIt = rawStreamCacheLru_.begin();
+    } else {
+        rawStreamCacheLru_.push_front(key);
+        rawStreamCache_.emplace(key, CachedRawStream{result, rawStreamCacheLru_.begin()});
+        rawStreamCacheTotalBytes_ += streamBytes;
+    }
+
+    while (!rawStreamCacheLru_.empty() &&
+           (rawStreamCache_.size() > rawStreamCacheMaxEntries_ ||
+            rawStreamCacheTotalBytes_ > rawStreamCacheMaxTotalBytes_)) {
+        const std::string& evictedKey = rawStreamCacheLru_.back();
+        auto evicted = rawStreamCache_.find(evictedKey);
+        if (evicted != rawStreamCache_.end()) {
+            const size_t evictedBytes =
+                evicted->second.result.stream ? evicted->second.result.stream->size() : 0;
+            rawStreamCacheTotalBytes_ -= evictedBytes;
+            rawStreamCache_.erase(evicted);
+        }
+        rawStreamCacheLru_.pop_back();
+    }
+}
+
+void FlatSQLDatabase::configureRawStreamCache(size_t maxEntries, size_t maxTotalBytes) {
+    std::unique_lock lock(*accessMutex_);
+    rawStreamCacheMaxEntries_ = maxEntries;
+    rawStreamCacheMaxTotalBytes_ = maxTotalBytes;
+    rawStreamCache_.clear();
+    rawStreamCacheLru_.clear();
+    rawStreamCacheTotalBytes_ = 0;
+}
+
+FlatSQLDatabase::RawStreamCacheStats FlatSQLDatabase::getRawStreamCacheStats() const {
+    std::shared_lock lock(*accessMutex_);
+    return RawStreamCacheStats{
+        rawStreamCacheHits_,
+        rawStreamCacheMisses_,
+        rawStreamCache_.size(),
+        rawStreamCacheTotalBytes_,
+        rawStreamCacheMaxEntries_,
+        rawStreamCacheMaxTotalBytes_
+    };
 }
 
 size_t FlatSQLDatabase::queryCount(const std::string& sql, const std::vector<Value>& params) {

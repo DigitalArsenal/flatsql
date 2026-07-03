@@ -77,6 +77,14 @@ export class FlatSQLStandaloneDatabase {
   query(sql: string, params?: StandaloneQueryParam[]): StandaloneQueryResult;
   queryMany(queries: Array<{ sql: string; params?: StandaloneQueryParam[] }>): StandaloneQueryResult[];
   queryRawFlatBufferStream(sql: string, params?: StandaloneQueryParam[]): Uint8Array;
+  lastRawStreamCacheHit(): boolean;
+  configureRawStreamCache(maxEntries: number, maxTotalBytes: number): void;
+  getRawStreamCacheStats(): {
+    hits: number;
+    misses: number;
+    entries: number;
+    totalBytes: number;
+  };
   registerQueryTemplate(queryId: string, sql: string, cacheable?: boolean): void;
   queryTemplate(queryId: string, params?: StandaloneQueryParam[]): StandaloneQueryResult;
   clearQueryCache(): void;

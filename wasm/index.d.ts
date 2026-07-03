@@ -125,6 +125,14 @@ export interface FlatSQLDatabase {
    * as a native size-prefixed response stream.
    */
   queryRawFlatBufferStream(sql: string, params?: QueryParam[]): Uint8Array;
+  lastRawStreamCacheHit(): boolean;
+  configureRawStreamCache(maxEntries: number, maxTotalBytes: number): void;
+  getRawStreamCacheStats(): {
+    hits: number;
+    misses: number;
+    entries: number;
+    totalBytes: number;
+  };
 
   /**
    * Export all data as a stream of size-prefixed FlatBuffers

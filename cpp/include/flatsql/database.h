@@ -211,6 +211,52 @@ public:
 
     QueryCacheStats getQueryCacheStats() const;
 
+    // ==================== Raw-stream response artifact cache ====================
+    // Materialized aligned response streams ([u32le size][bytes] frames, all
+    // cells BLOB) cached by (sql, params) so repeated raw-stream requests
+    // skip SQL re-execution entirely. Keys embed queryCacheGeneration_, so
+    // EVERY existing invalidation point (ingest, ingestOne, loadAndRebuild,
+    // registerFileId, registerSource, createUnifiedViews, markDeleted,
+    // clearTombstones, setEncryptionKey, DML through query(), ...) also
+    // invalidates cached raw streams; the entries themselves are dropped on
+    // invalidation to release memory. Only read-only statements
+    // (sqlite3_stmt_readonly) are cached.
+
+    struct RawStreamResult {
+        // Aligned size-prefixed stream; shared so cache hits are zero-copy
+        // and callers keep a valid buffer even across eviction.
+        std::shared_ptr<const std::vector<uint8_t>> stream;
+        size_t rowCount = 0;
+        size_t columnCount = 0;
+        bool cacheHit = false;
+    };
+
+    struct RawStreamCacheStats {
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        size_t entries = 0;
+        size_t totalBytes = 0;
+        size_t maxEntries = 0;
+        size_t maxTotalBytes = 0;
+    };
+
+    // Execute a raw FlatBuffer-stream query through the response-artifact
+    // cache. Returns false with *errorMessage set for user-level failures
+    // (non-BLOB cell, oversize record) WITHOUT throwing — no-throw contract
+    // for the no-exceptions build (SQL itself must be pre-validated by the
+    // caller, matching the C API).
+    bool queryRawFlatBufferStream(const std::string& sql,
+                                  const std::vector<Value>& params,
+                                  RawStreamResult* result,
+                                  std::string* errorMessage);
+
+    // Configure bounded raw-stream artifact caching (entry count + total
+    // payload byte budget; a single stream larger than the byte budget is
+    // returned uncached).
+    void configureRawStreamCache(size_t maxEntries, size_t maxTotalBytes);
+
+    RawStreamCacheStats getRawStreamCacheStats() const;
+
     // Execute and count without building QueryResult (for benchmarking)
     size_t queryCount(const std::string& sql, const std::vector<Value>& params = {});
 
@@ -495,8 +541,15 @@ private:
         std::list<std::string>::iterator lruIt;
     };
 
+    struct CachedRawStream {
+        RawStreamResult result;
+        std::list<std::string>::iterator lruIt;
+    };
+
     void invalidateQueryResultCacheUnlocked();
+    void invalidateCachesIfStatementWritesUnlocked(const std::string& sql);
     void storeCachedQueryResultUnlocked(const std::string& key, const QueryResult& result);
+    void storeRawStreamResultUnlocked(const std::string& key, const RawStreamResult& result);
     std::string buildTemplateCacheKeyUnlocked(const std::string& queryId,
                                               const std::string& sql,
                                               const std::vector<Value>& params) const;
@@ -527,6 +580,15 @@ private:
 
     size_t queryResultCacheMaxEntries_ = 1024;
     size_t queryResultCacheMaxRows_ = 1000;
+
+    // Raw-stream response artifact cache (see public section above).
+    std::list<std::string> rawStreamCacheLru_;
+    std::unordered_map<std::string, CachedRawStream> rawStreamCache_;
+    size_t rawStreamCacheTotalBytes_ = 0;
+    uint64_t rawStreamCacheHits_ = 0;
+    uint64_t rawStreamCacheMisses_ = 0;
+    size_t rawStreamCacheMaxEntries_ = 64;
+    size_t rawStreamCacheMaxTotalBytes_ = 256 * 1024 * 1024;
 
     // Encryption
     std::unique_ptr<flatbuffers::EncryptionContext> encryptionCtx_;

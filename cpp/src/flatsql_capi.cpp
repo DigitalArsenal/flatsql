@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <vector>
 #include <string>
 
@@ -733,9 +734,10 @@ int g_selectedBatchResult = -1;
 std::string g_lastError;
 std::string g_cacheKeyBuffer;
 std::vector<uint8_t> g_exportBuffer;
-std::vector<uint8_t> g_responseArtifactBuffer;
+std::shared_ptr<const std::vector<uint8_t>> g_responseArtifactStream;
 size_t g_responseArtifactRowCount = 0;
 size_t g_responseArtifactColumnCount = 0;
+int g_responseArtifactCacheHit = 0;
 std::vector<uint8_t> g_testBuffer;
 std::vector<FlatSQLDatabase::TableStats> g_statsBuffer;
 std::vector<std::string> g_sourcesBuffer;
@@ -1289,6 +1291,13 @@ const uint8_t* flatsql_export_data(void* handle) {
     return g_exportBuffer.data();
 }
 
+static void clearResponseArtifact() {
+    g_responseArtifactStream.reset();
+    g_responseArtifactRowCount = 0;
+    g_responseArtifactColumnCount = 0;
+    g_responseArtifactCacheHit = 0;
+}
+
 EMSCRIPTEN_KEEPALIVE
 int flatsql_query_raw_flatbuffer_stream(
     void* handle,
@@ -1303,55 +1312,44 @@ int flatsql_query_raw_flatbuffer_stream(
     std::vector<Value> params;
     std::string errorMessage;
     if (!decodeParamsNoThrow(paramData, paramLength, paramCount, &params, &errorMessage)) {
-        g_responseArtifactBuffer.clear();
-        g_responseArtifactRowCount = 0;
-        g_responseArtifactColumnCount = 0;
+        clearResponseArtifact();
         g_lastError = errorMessage;
         return 0;
     }
 
     int expectedParams = 0;
     if (!db->validateSQL(sqlStr, &expectedParams, &errorMessage)) {
-        g_responseArtifactBuffer.clear();
-        g_responseArtifactRowCount = 0;
-        g_responseArtifactColumnCount = 0;
+        clearResponseArtifact();
         g_lastError = errorMessage;
         return 0;
     }
     if (expectedParams != static_cast<int>(params.size())) {
-        g_responseArtifactBuffer.clear();
-        g_responseArtifactRowCount = 0;
-        g_responseArtifactColumnCount = 0;
+        clearResponseArtifact();
         g_lastError = paramCountMismatchMessage(expectedParams, params.size());
         return 0;
     }
 
     try {
-        auto result = db->query(sqlStr, params);
-
-        g_responseArtifactBuffer.clear();
-        g_responseArtifactRowCount = result.rows.size();
-        g_responseArtifactColumnCount = result.columns.size();
-        for (const auto& row : result.rows) {
-            for (const auto& value : row) {
-                const auto* bytes = std::get_if<std::vector<uint8_t>>(&value);
-                if (!bytes) {
-                    throw std::runtime_error("raw response stream queries must return only BLOB cells");
-                }
-                if (bytes->size() > std::numeric_limits<uint32_t>::max()) {
-                    throw std::runtime_error("raw response stream record exceeds size-prefix capacity");
-                }
-                writeU32(g_responseArtifactBuffer, static_cast<uint32_t>(bytes->size()));
-                g_responseArtifactBuffer.insert(g_responseArtifactBuffer.end(), bytes->begin(), bytes->end());
-            }
+        // Cached response-artifact path: repeated (sql, params) requests
+        // return the previously materialized aligned stream without
+        // re-executing SQL; any ingest/DML/mark-deleted invalidates
+        // (generation-keyed, see FlatSQLDatabase::queryRawFlatBufferStream).
+        FlatSQLDatabase::RawStreamResult result;
+        if (!db->queryRawFlatBufferStream(sqlStr, params, &result, &errorMessage)) {
+            clearResponseArtifact();
+            g_lastError = errorMessage;
+            return 0;
         }
+
+        g_responseArtifactStream = result.stream;
+        g_responseArtifactRowCount = result.rowCount;
+        g_responseArtifactColumnCount = result.columnCount;
+        g_responseArtifactCacheHit = result.cacheHit ? 1 : 0;
 
         g_lastError.clear();
         return 1;
     } catch (const std::exception& e) {
-        g_responseArtifactBuffer.clear();
-        g_responseArtifactRowCount = 0;
-        g_responseArtifactColumnCount = 0;
+        clearResponseArtifact();
         g_lastError = e.what();
         return 0;
     }
@@ -1359,12 +1357,55 @@ int flatsql_query_raw_flatbuffer_stream(
 
 EMSCRIPTEN_KEEPALIVE
 const uint8_t* flatsql_response_artifact_data() {
-    return g_responseArtifactBuffer.data();
+    return g_responseArtifactStream ? g_responseArtifactStream->data() : nullptr;
 }
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_response_artifact_size() {
-    return static_cast<int>(g_responseArtifactBuffer.size());
+    return g_responseArtifactStream ? static_cast<int>(g_responseArtifactStream->size()) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_response_artifact_cache_hit() {
+    return g_responseArtifactCacheHit;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_configure_raw_stream_cache(void* handle, int maxEntries, double maxTotalBytes) {
+    if (maxEntries < 0 || maxTotalBytes < 0) {
+        g_lastError = "raw stream cache limits must be non-negative";
+        return 0;
+    }
+    static_cast<FlatSQLDatabase*>(handle)->configureRawStreamCache(
+        static_cast<size_t>(maxEntries),
+        static_cast<size_t>(maxTotalBytes)
+    );
+    g_lastError.clear();
+    return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_raw_stream_cache_hits(void* handle) {
+    return static_cast<double>(
+        static_cast<FlatSQLDatabase*>(handle)->getRawStreamCacheStats().hits);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_raw_stream_cache_misses(void* handle) {
+    return static_cast<double>(
+        static_cast<FlatSQLDatabase*>(handle)->getRawStreamCacheStats().misses);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int flatsql_raw_stream_cache_size(void* handle) {
+    return static_cast<int>(
+        static_cast<FlatSQLDatabase*>(handle)->getRawStreamCacheStats().entries);
+}
+
+EMSCRIPTEN_KEEPALIVE
+double flatsql_raw_stream_cache_total_bytes(void* handle) {
+    return static_cast<double>(
+        static_cast<FlatSQLDatabase*>(handle)->getRawStreamCacheStats().totalBytes);
 }
 
 EMSCRIPTEN_KEEPALIVE

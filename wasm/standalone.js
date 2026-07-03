@@ -630,6 +630,30 @@ export class FlatSQLStandaloneDatabase {
     return ptr && size > 0 ? this._runtime.readBytes(ptr, size) : new Uint8Array();
   }
 
+  // True when the last queryRawFlatBufferStream call was served from the
+  // engine's response-artifact cache (no SQL re-execution).
+  lastRawStreamCacheHit() {
+    return this._runtime.exports.flatsql_response_artifact_cache_hit() !== 0;
+  }
+
+  configureRawStreamCache(maxEntries, maxTotalBytes) {
+    const ok = this._runtime.exports.flatsql_configure_raw_stream_cache(
+      this._handle,
+      maxEntries,
+      maxTotalBytes
+    );
+    this._runtime.check(ok);
+  }
+
+  getRawStreamCacheStats() {
+    return {
+      hits: this._runtime.exports.flatsql_raw_stream_cache_hits(this._handle),
+      misses: this._runtime.exports.flatsql_raw_stream_cache_misses(this._handle),
+      entries: this._runtime.exports.flatsql_raw_stream_cache_size(this._handle),
+      totalBytes: this._runtime.exports.flatsql_raw_stream_cache_total_bytes(this._handle),
+    };
+  }
+
   registerQueryTemplate(queryId, sql, cacheable = true) {
     const success = this._runtime.withCString(queryId, (queryIdPtr) =>
       this._runtime.withCString(sql, (sqlPtr) =>

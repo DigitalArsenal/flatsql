@@ -180,7 +180,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_result_cell_blob\", \"_flatsql_result_cell_blob_size\", \
                 \"_flatsql_query_raw_flatbuffer_stream\", \"_flatsql_response_artifact_data\", \
                 \"_flatsql_response_artifact_size\", \"_flatsql_response_artifact_row_count\", \
-                \"_flatsql_response_artifact_column_count\", \
+                \"_flatsql_response_artifact_column_count\", \"_flatsql_response_artifact_cache_hit\", \
+                \"_flatsql_configure_raw_stream_cache\", \"_flatsql_raw_stream_cache_hits\", \
+                \"_flatsql_raw_stream_cache_misses\", \"_flatsql_raw_stream_cache_size\", \
+                \"_flatsql_raw_stream_cache_total_bytes\", \
                 \"_flatsql_export_data\", \"_flatsql_export_size\", \
                 \"_flatsql_load_and_rebuild\", \"_flatsql_reserve_storage\", \"_flatsql_load_from_db\", \
                 \"_flatsql_create_test_user\", \"_flatsql_create_test_post\", \
@@ -273,7 +276,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_result_cell_blob\", \"_flatsql_result_cell_blob_size\", \
                 \"_flatsql_query_raw_flatbuffer_stream\", \"_flatsql_response_artifact_data\", \
                 \"_flatsql_response_artifact_size\", \"_flatsql_response_artifact_row_count\", \
-                \"_flatsql_response_artifact_column_count\", \
+                \"_flatsql_response_artifact_column_count\", \"_flatsql_response_artifact_cache_hit\", \
+                \"_flatsql_configure_raw_stream_cache\", \"_flatsql_raw_stream_cache_hits\", \
+                \"_flatsql_raw_stream_cache_misses\", \"_flatsql_raw_stream_cache_size\", \
+                \"_flatsql_raw_stream_cache_total_bytes\", \
                 \"_flatsql_export_data\", \"_flatsql_export_size\", \
                 \"_flatsql_load_and_rebuild\", \"_flatsql_reserve_storage\", \"_flatsql_load_from_db\", \
                 \"_flatsql_create_test_user\", \"_flatsql_create_test_post\", \

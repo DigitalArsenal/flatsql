@@ -573,6 +573,11 @@ QueryResult SQLiteEngine::execute(const std::string& sql, const std::vector<Valu
     return result;
 }
 
+bool SQLiteEngine::statementIsReadOnly(const std::string& sql) const {
+    sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+    return sqlite3_stmt_readonly(stmt) != 0;
+}
+
 size_t SQLiteEngine::executeAndCount(const std::string& sql, const std::vector<Value>& params) {
     // Try fast path for simple queries - bypass VTable entirely
     size_t fastCount = 0;
