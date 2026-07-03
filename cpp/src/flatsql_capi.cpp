@@ -867,8 +867,15 @@ int flatsql_query(void* handle, const char* sql) {
     // Pre-validate without exceptions so invalid SQL never throws (and never
     // traps on the no-eh build); errors land in the g_lastError latch.
     std::string validationError;
-    if (!db->validateSQL(sqlStr, nullptr, &validationError)) {
+    int expectedParams = 0;
+    if (!db->validateSQL(sqlStr, &expectedParams, &validationError)) {
         g_lastError = validationError;
+        return 0;
+    }
+    if (expectedParams != 0) {
+        // The no-param entry point must not run SQL with placeholders:
+        // unbound params execute as NULL, silently matching nothing.
+        g_lastError = paramCountMismatchMessage(expectedParams, 0);
         return 0;
     }
 

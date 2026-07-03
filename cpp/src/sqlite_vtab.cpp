@@ -455,6 +455,14 @@ int FlatBufferVTabModule::xFilter(sqlite3_vtab_cursor* pCursor, int idxNum, cons
                 return SQLITE_OK;
             }
 
+            // SQL semantics: `col = NULL` never matches. This also keeps NULL
+            // (std::monostate) keys out of the b-tree search, which cannot
+            // order them and loops forever (unbound ? params arrive as NULL).
+            if (sqlite3_value_type(argv[argIdx]) == SQLITE_NULL) {
+                cursor->atEof = true;
+                return SQLITE_OK;
+            }
+
             // Get column name and look up index directly using column index
             const std::string& colName = vtab->tableDef->columns[colIdx].name;
             auto indexIt = vtab->indexes.find(colName);
