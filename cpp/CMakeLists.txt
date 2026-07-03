@@ -242,10 +242,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_ENABLE_RTREE=1
     )
 
-    set_target_properties(flatsql_wasi PROPERTIES
-        OUTPUT_NAME "flatsql-wasi"
-        SUFFIX ".wasm"
-        LINK_FLAGS "\
+    # Shared WASI link flags (everything except the exception strategy) so the
+    # exceptions and no-exceptions artifacts stay export-identical.
+    set(FLATSQL_WASI_BASE_LINK_FLAGS "\
             -s WASM=1 \
             -s STANDALONE_WASM=1 \
             -s PURE_WASI=1 \
@@ -304,9 +303,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             -s WASMFS=1 \
             -s ALLOW_TABLE_GROWTH=1 \
             -s EMULATE_FUNCTION_POINTER_CASTS=1 \
-            -fwasm-exceptions \
-            -s WASM_LEGACY_EXCEPTIONS=0 \
-        "
+        ")
+
+    set_target_properties(flatsql_wasi PROPERTIES
+        OUTPUT_NAME "flatsql-wasi"
+        SUFFIX ".wasm"
+        LINK_FLAGS "${FLATSQL_WASI_BASE_LINK_FLAGS} -fwasm-exceptions -s WASM_LEGACY_EXCEPTIONS=0"
     )
 
     add_custom_command(TARGET flatsql_wasi POST_BUILD
@@ -315,6 +317,47 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             ${CMAKE_CURRENT_SOURCE_DIR}/../docs/
         COMMENT "Copying flatsql-wasi.wasm to docs/"
     )
+
+    # No-exceptions WASI variant: identical sources/exports, but throws abort
+    # instead of unwinding. Server hosts need this because WasmEdge's AOT
+    # compiler (0.14–0.17) cannot parse wasm-exceptions (exnref) modules and
+    # its interpreter is ~100x too slow for query workloads. Interim artifact
+    # until the engine's error paths are exception-free by construction.
+    add_executable(flatsql_wasi_noeh ${FLATSQL_WASM_SOURCES} ${SQLITE_DIR}/sqlite3.c)
+
+    target_include_directories(flatsql_wasi_noeh PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+        ${SQLEAN_DIR}
+    )
+    target_compile_options(flatsql_wasi_noeh PRIVATE -fignore-exceptions)
+
+    target_compile_definitions(flatsql_wasi_noeh PRIVATE
+        SQLITE_THREADSAFE=0
+        SQLITE_OMIT_LOAD_EXTENSION=1
+        SQLITE_OMIT_WAL=1
+        SQLITE_OMIT_DEPRECATED=1
+        SQLITE_OMIT_SHARED_CACHE=1
+        SQLITE_OMIT_PROGRESS_CALLBACK=1
+        SQLITE_DEFAULT_MEMSTATUS=0
+        SQLITE_DQS=0
+        SQLITE_ENABLE_RTREE=1
+    )
+
+    set_target_properties(flatsql_wasi_noeh PROPERTIES
+        OUTPUT_NAME "flatsql-wasi-noeh"
+        SUFFIX ".wasm"
+        LINK_FLAGS "${FLATSQL_WASI_BASE_LINK_FLAGS}"
+    )
+
+    add_custom_command(TARGET flatsql_wasi_noeh POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE_DIR:flatsql_wasi_noeh>/flatsql-wasi-noeh.wasm
+            ${CMAKE_CURRENT_SOURCE_DIR}/../wasm/
+        COMMENT "Copying flatsql-wasi-noeh.wasm to wasm/"
+    )
+
     # Space Data Module (SDM) — standalone spatial engine WASM
     # Compliant with https://github.com/DigitalArsenal/space-data-module-sdk
     set(SDM_SOURCES
