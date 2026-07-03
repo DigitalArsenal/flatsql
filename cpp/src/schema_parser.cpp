@@ -196,21 +196,49 @@ DatabaseSchema SchemaParser::parseJSONSchema(const std::string& json, const std:
     return schema;
 }
 
+bool SchemaParser::tryParse(const std::string& source, DatabaseSchema* out, std::string* errOut,
+                            const std::string& dbName) noexcept {
+    // No-throw parse path: the former throw site ("Empty schema source") is an
+    // error return here. The try/catch only shields the exceptions build from
+    // unexpected internal failures (allocation, regex) to honor noexcept.
+    try {
+        if (errOut) errOut->clear();
+
+        std::string trimmed = trim(source);
+
+        // Detect format
+        if (trimmed.empty()) {
+            if (errOut) *errOut = "Empty schema source";
+            return false;
+        }
+
+        // JSON starts with {
+        DatabaseSchema schema = (trimmed[0] == '{')
+            ? parseJSONSchema(source, dbName)
+            : parseIDL(source, dbName);
+
+        if (out) *out = std::move(schema);
+        return true;
+    } catch (const std::exception& e) {
+        if (errOut) {
+            try { *errOut = e.what(); } catch (...) {}
+        }
+        return false;
+    } catch (...) {
+        if (errOut) {
+            try { *errOut = "Failed to parse schema"; } catch (...) {}
+        }
+        return false;
+    }
+}
+
 DatabaseSchema SchemaParser::parse(const std::string& source, const std::string& dbName) {
-    std::string trimmed = trim(source);
-
-    // Detect format
-    if (trimmed.empty()) {
-        throw std::runtime_error("Empty schema source");
+    DatabaseSchema schema;
+    std::string error;
+    if (!tryParse(source, &schema, &error, dbName)) {
+        throw std::runtime_error(error.empty() ? "Failed to parse schema" : error);
     }
-
-    // JSON starts with {
-    if (trimmed[0] == '{') {
-        return parseJSONSchema(source, dbName);
-    }
-
-    // Otherwise assume IDL
-    return parseIDL(source, dbName);
+    return schema;
 }
 
 }  // namespace flatsql

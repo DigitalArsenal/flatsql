@@ -518,80 +518,106 @@ enum ParamTag : uint8_t {
     PARAM_BYTES = 5,
 };
 
-void requireBytes(size_t offset, size_t need, size_t length) {
-    if (offset > length || need > length - offset) {
-        throw std::runtime_error("Malformed query parameter payload");
-    }
+bool hasBytes(size_t offset, size_t need, size_t length) {
+    return offset <= length && need <= length - offset;
 }
 
-std::vector<Value> decodeParams(const uint8_t* data, size_t length, int paramCount) {
-    if (paramCount < 0) {
-        throw std::runtime_error("Invalid parameter count");
-    }
-    if (paramCount == 0) {
-        return {};
-    }
-    if (!data) {
-        throw std::runtime_error("Missing query parameter payload");
-    }
-    if (static_cast<size_t>(paramCount) > length / 5) {
-        throw std::runtime_error("Query parameter count exceeds payload capacity");
-    }
+// Exception-free TLV parameter decoder. Returns false and sets *err on
+// malformed payloads instead of throwing, so the no-exceptions WASI build
+// never traps on user-supplied parameter data.
+bool decodeParamsNoThrow(const uint8_t* data, size_t length, int paramCount,
+                         std::vector<Value>* out, std::string* err) noexcept {
+    try {
+        if (out) out->clear();
+        if (err) err->clear();
 
-    std::vector<Value> params;
-    params.reserve(static_cast<size_t>(paramCount));
-    size_t offset = 0;
+        auto fail = [&](const char* message) {
+            if (err) *err = message;
+            if (out) out->clear();
+            return false;
+        };
 
-    for (int index = 0; index < paramCount; index++) {
-        requireBytes(offset, 5, length);
-        const uint8_t tag = data[offset++];
-        const uint32_t size = flatbuffers::ReadScalar<uint32_t>(data + offset);
-        offset += 4;
-        requireBytes(offset, size, length);
-
-        switch (tag) {
-            case PARAM_NULL:
-                if (size != 0) {
-                    throw std::runtime_error("NULL parameter payload must be empty");
-                }
-                params.emplace_back(std::monostate{});
-                break;
-            case PARAM_BOOL:
-                if (size != 1) {
-                    throw std::runtime_error("Boolean parameter payload must be 1 byte");
-                }
-                params.emplace_back(data[offset] != 0);
-                break;
-            case PARAM_INT64:
-                if (size != sizeof(int64_t)) {
-                    throw std::runtime_error("Integer parameter payload must be 8 bytes");
-                }
-                params.emplace_back(flatbuffers::ReadScalar<int64_t>(data + offset));
-                break;
-            case PARAM_FLOAT64:
-                if (size != sizeof(double)) {
-                    throw std::runtime_error("Float parameter payload must be 8 bytes");
-                }
-                params.emplace_back(flatbuffers::ReadScalar<double>(data + offset));
-                break;
-            case PARAM_STRING:
-                params.emplace_back(std::string(reinterpret_cast<const char*>(data + offset), size));
-                break;
-            case PARAM_BYTES:
-                params.emplace_back(std::vector<uint8_t>(data + offset, data + offset + size));
-                break;
-            default:
-                throw std::runtime_error("Unsupported query parameter tag");
+        if (!out) {
+            return fail("Missing parameter output vector");
+        }
+        if (paramCount < 0) {
+            return fail("Invalid parameter count");
+        }
+        if (paramCount == 0) {
+            return true;
+        }
+        if (!data) {
+            return fail("Missing query parameter payload");
+        }
+        if (static_cast<size_t>(paramCount) > length / 5) {
+            return fail("Query parameter count exceeds payload capacity");
         }
 
-        offset += size;
-    }
+        std::vector<Value>& params = *out;
+        params.reserve(static_cast<size_t>(paramCount));
+        size_t offset = 0;
 
-    if (offset != length) {
-        throw std::runtime_error("Unexpected trailing bytes in query parameter payload");
-    }
+        for (int index = 0; index < paramCount; index++) {
+            if (!hasBytes(offset, 5, length)) {
+                return fail("Malformed query parameter payload");
+            }
+            const uint8_t tag = data[offset++];
+            const uint32_t size = flatbuffers::ReadScalar<uint32_t>(data + offset);
+            offset += 4;
+            if (!hasBytes(offset, size, length)) {
+                return fail("Malformed query parameter payload");
+            }
 
-    return params;
+            switch (tag) {
+                case PARAM_NULL:
+                    if (size != 0) {
+                        return fail("NULL parameter payload must be empty");
+                    }
+                    params.emplace_back(std::monostate{});
+                    break;
+                case PARAM_BOOL:
+                    if (size != 1) {
+                        return fail("Boolean parameter payload must be 1 byte");
+                    }
+                    params.emplace_back(data[offset] != 0);
+                    break;
+                case PARAM_INT64:
+                    if (size != sizeof(int64_t)) {
+                        return fail("Integer parameter payload must be 8 bytes");
+                    }
+                    params.emplace_back(flatbuffers::ReadScalar<int64_t>(data + offset));
+                    break;
+                case PARAM_FLOAT64:
+                    if (size != sizeof(double)) {
+                        return fail("Float parameter payload must be 8 bytes");
+                    }
+                    params.emplace_back(flatbuffers::ReadScalar<double>(data + offset));
+                    break;
+                case PARAM_STRING:
+                    params.emplace_back(std::string(reinterpret_cast<const char*>(data + offset), size));
+                    break;
+                case PARAM_BYTES:
+                    params.emplace_back(std::vector<uint8_t>(data + offset, data + offset + size));
+                    break;
+                default:
+                    return fail("Unsupported query parameter tag");
+            }
+
+            offset += size;
+        }
+
+        if (offset != length) {
+            return fail("Unexpected trailing bytes in query parameter payload");
+        }
+
+        return true;
+    } catch (...) {
+        if (err) {
+            try { *err = "Malformed query parameter payload"; } catch (...) {}
+        }
+        if (out) out->clear();
+        return false;
+    }
 }
 
 std::vector<std::string> decodeStringList(const char* data) {
@@ -622,50 +648,82 @@ struct QueryRequest {
     std::vector<Value> params;
 };
 
-std::vector<QueryRequest> decodeQueryRequests(const uint8_t* data, size_t length, int requestCount) {
-    if (requestCount < 0) {
-        throw std::runtime_error("Invalid batch query count");
+// Exception-free batch request decoder (see decodeParamsNoThrow).
+bool decodeQueryRequestsNoThrow(const uint8_t* data, size_t length, int requestCount,
+                                std::vector<QueryRequest>* out, std::string* err) noexcept {
+    try {
+        if (out) out->clear();
+        if (err) err->clear();
+
+        auto fail = [&](const char* message) {
+            if (err) *err = message;
+            if (out) out->clear();
+            return false;
+        };
+
+        if (!out) {
+            return fail("Missing batch query output vector");
+        }
+        if (requestCount < 0) {
+            return fail("Invalid batch query count");
+        }
+        if (requestCount == 0) {
+            return true;
+        }
+        if (!data) {
+            return fail("Missing batch query payload");
+        }
+        if (static_cast<size_t>(requestCount) > length / 12) {
+            return fail("Batch query count exceeds payload capacity");
+        }
+
+        std::vector<QueryRequest>& requests = *out;
+        requests.reserve(static_cast<size_t>(requestCount));
+        size_t offset = 0;
+
+        for (int index = 0; index < requestCount; index++) {
+            if (!hasBytes(offset, 12, length)) {
+                return fail("Malformed query parameter payload");
+            }
+            const uint32_t sqlLength = flatbuffers::ReadScalar<uint32_t>(data + offset);
+            offset += 4;
+            const uint32_t paramCount = flatbuffers::ReadScalar<uint32_t>(data + offset);
+            offset += 4;
+            const uint32_t paramLength = flatbuffers::ReadScalar<uint32_t>(data + offset);
+            offset += 4;
+
+            if (!hasBytes(offset, sqlLength, length)) {
+                return fail("Malformed query parameter payload");
+            }
+            std::string sql(reinterpret_cast<const char*>(data + offset), sqlLength);
+            offset += sqlLength;
+
+            if (!hasBytes(offset, paramLength, length)) {
+                return fail("Malformed query parameter payload");
+            }
+            const uint8_t* paramData = paramLength > 0 ? data + offset : nullptr;
+            std::vector<Value> params;
+            if (!decodeParamsNoThrow(paramData, paramLength, static_cast<int>(paramCount), &params, err)) {
+                if (out) out->clear();
+                return false;
+            }
+            offset += paramLength;
+
+            requests.push_back({std::move(sql), std::move(params)});
+        }
+
+        if (offset != length) {
+            return fail("Unexpected trailing bytes in batch query payload");
+        }
+
+        return true;
+    } catch (...) {
+        if (err) {
+            try { *err = "Malformed batch query payload"; } catch (...) {}
+        }
+        if (out) out->clear();
+        return false;
     }
-    if (requestCount == 0) {
-        return {};
-    }
-    if (!data) {
-        throw std::runtime_error("Missing batch query payload");
-    }
-    if (static_cast<size_t>(requestCount) > length / 12) {
-        throw std::runtime_error("Batch query count exceeds payload capacity");
-    }
-
-    std::vector<QueryRequest> requests;
-    requests.reserve(static_cast<size_t>(requestCount));
-    size_t offset = 0;
-
-    for (int index = 0; index < requestCount; index++) {
-        requireBytes(offset, 12, length);
-        const uint32_t sqlLength = flatbuffers::ReadScalar<uint32_t>(data + offset);
-        offset += 4;
-        const uint32_t paramCount = flatbuffers::ReadScalar<uint32_t>(data + offset);
-        offset += 4;
-        const uint32_t paramLength = flatbuffers::ReadScalar<uint32_t>(data + offset);
-        offset += 4;
-
-        requireBytes(offset, sqlLength, length);
-        std::string sql(reinterpret_cast<const char*>(data + offset), sqlLength);
-        offset += sqlLength;
-
-        requireBytes(offset, paramLength, length);
-        const uint8_t* paramData = paramLength > 0 ? data + offset : nullptr;
-        auto params = decodeParams(paramData, paramLength, static_cast<int>(paramCount));
-        offset += paramLength;
-
-        requests.push_back({std::move(sql), std::move(params)});
-    }
-
-    if (offset != length) {
-        throw std::runtime_error("Unexpected trailing bytes in batch query payload");
-    }
-
-    return requests;
 }
 
 // Global state for result handling
@@ -689,6 +747,12 @@ QueryResult& currentResult() {
     return g_lastResult;
 }
 
+std::string paramCountMismatchMessage(int expected, size_t provided) {
+    // Must match SQLiteEngine::execute()'s throw message exactly.
+    return "SQL statement expects " + std::to_string(expected) +
+           " parameters but received " + std::to_string(provided);
+}
+
 }  // anonymous namespace
 
 // ==================== Exported C API Functions ====================
@@ -697,8 +761,24 @@ extern "C" {
 
 EMSCRIPTEN_KEEPALIVE
 void* flatsql_create_db(const char* schema, const char* dbName) {
-    auto* db = new FlatSQLDatabase(FlatSQLDatabase::fromSchema(schema, dbName));
-    return static_cast<void*>(db);
+    try {
+        DatabaseSchema parsedSchema;
+        std::string parseError;
+        if (!SchemaParser::tryParse(schema ? schema : "",
+                                    &parsedSchema,
+                                    &parseError,
+                                    dbName ? dbName : "default")) {
+            g_lastError = parseError.empty() ? "Failed to parse schema" : parseError;
+            return nullptr;
+        }
+
+        auto* db = new FlatSQLDatabase(parsedSchema);
+        g_lastError.clear();
+        return static_cast<void*>(db);
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+        return nullptr;
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -744,8 +824,18 @@ double flatsql_ingest_one(void* handle, const uint8_t* data, size_t length) {
 // Source-aware ingestion
 EMSCRIPTEN_KEEPALIVE
 void flatsql_register_source(void* handle, const char* sourceName) {
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    const std::string name = sourceName ? sourceName : "";
+
+    // Pre-check duplicates without exceptions so the no-eh build never traps.
+    // Message must match FlatSQLDatabase::registerSource's throw text.
+    if (db->hasSource(name)) {
+        g_lastError = "Source already registered: " + name;
+        return;
+    }
+
     try {
-        static_cast<FlatSQLDatabase*>(handle)->registerSource(sourceName);
+        db->registerSource(name);
     } catch (const std::exception& e) {
         g_lastError = e.what();
     }
@@ -768,10 +858,22 @@ double flatsql_ingest_one_with_source(void* handle, const uint8_t* data, size_t 
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_query(void* handle, const char* sql) {
+    g_batchResults.clear();
+    g_selectedBatchResult = -1;
+
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    const std::string sqlStr = sql ? sql : "";
+
+    // Pre-validate without exceptions so invalid SQL never throws (and never
+    // traps on the no-eh build); errors land in the g_lastError latch.
+    std::string validationError;
+    if (!db->validateSQL(sqlStr, nullptr, &validationError)) {
+        g_lastError = validationError;
+        return 0;
+    }
+
     try {
-        g_batchResults.clear();
-        g_selectedBatchResult = -1;
-        g_lastResult = static_cast<FlatSQLDatabase*>(handle)->query(sql);
+        g_lastResult = db->query(sqlStr);
         g_lastError.clear();
         return 1;
     } catch (const std::exception& e) {
@@ -782,13 +884,31 @@ int flatsql_query(void* handle, const char* sql) {
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_query_params(void* handle, const char* sql, const uint8_t* paramData, size_t paramLength, int paramCount) {
+    g_batchResults.clear();
+    g_selectedBatchResult = -1;
+
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    const std::string sqlStr = sql ? sql : "";
+
+    std::vector<Value> params;
+    std::string errorMessage;
+    if (!decodeParamsNoThrow(paramData, paramLength, paramCount, &params, &errorMessage)) {
+        g_lastError = errorMessage;
+        return 0;
+    }
+
+    int expectedParams = 0;
+    if (!db->validateSQL(sqlStr, &expectedParams, &errorMessage)) {
+        g_lastError = errorMessage;
+        return 0;
+    }
+    if (expectedParams != static_cast<int>(params.size())) {
+        g_lastError = paramCountMismatchMessage(expectedParams, params.size());
+        return 0;
+    }
+
     try {
-        g_batchResults.clear();
-        g_selectedBatchResult = -1;
-        g_lastResult = static_cast<FlatSQLDatabase*>(handle)->query(
-            sql,
-            decodeParams(paramData, paramLength, paramCount)
-        );
+        g_lastResult = db->query(sqlStr, params);
         g_lastError.clear();
         return 1;
     } catch (const std::exception& e) {
@@ -799,14 +919,35 @@ int flatsql_query_params(void* handle, const char* sql, const uint8_t* paramData
 
 EMSCRIPTEN_KEEPALIVE
 int flatsql_query_many(void* handle, const uint8_t* requestData, size_t requestLength, int requestCount) {
+    g_batchResults.clear();
+    g_selectedBatchResult = -1;
+
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+
+    std::vector<QueryRequest> requests;
+    std::string errorMessage;
+    if (!decodeQueryRequestsNoThrow(requestData, requestLength, requestCount, &requests, &errorMessage)) {
+        g_lastError = errorMessage;
+        return 0;
+    }
+
+    // Pre-validate every request before executing any of them.
+    for (const auto& request : requests) {
+        int expectedParams = 0;
+        if (!db->validateSQL(request.sql, &expectedParams, &errorMessage)) {
+            g_lastError = errorMessage;
+            return 0;
+        }
+        if (expectedParams != static_cast<int>(request.params.size())) {
+            g_lastError = paramCountMismatchMessage(expectedParams, request.params.size());
+            return 0;
+        }
+    }
+
     try {
-        g_batchResults.clear();
-        auto requests = decodeQueryRequests(requestData, requestLength, requestCount);
         g_batchResults.reserve(requests.size());
         for (const auto& request : requests) {
-            g_batchResults.push_back(
-                static_cast<FlatSQLDatabase*>(handle)->query(request.sql, request.params)
-            );
+            g_batchResults.push_back(db->query(request.sql, request.params));
         }
         g_selectedBatchResult = g_batchResults.empty() ? -1 : 0;
         g_lastError.clear();
@@ -847,12 +988,20 @@ const char* flatsql_build_query_cache_key(
     size_t paramLength,
     int paramCount
 ) {
+    std::vector<Value> params;
+    std::string errorMessage;
+    if (!decodeParamsNoThrow(paramData, paramLength, paramCount, &params, &errorMessage)) {
+        g_cacheKeyBuffer.clear();
+        g_lastError = errorMessage;
+        return "";
+    }
+
     try {
         g_cacheKeyBuffer = buildQueryCacheKey(
             dataset ? dataset : "",
             artifactVersion ? artifactVersion : "",
             queryId ? queryId : "",
-            decodeParams(paramData, paramLength, paramCount)
+            params
         );
         g_lastError.clear();
         return g_cacheKeyBuffer.c_str();
@@ -875,6 +1024,14 @@ const char* flatsql_build_response_artifact_cache_key(
     size_t paramLength,
     int paramCount
 ) {
+    std::vector<Value> params;
+    std::string errorMessage;
+    if (!decodeParamsNoThrow(paramData, paramLength, paramCount, &params, &errorMessage)) {
+        g_cacheKeyBuffer.clear();
+        g_lastError = errorMessage;
+        return "";
+    }
+
     try {
         g_cacheKeyBuffer = buildResponseArtifactCacheKey(
             schemaName ? schemaName : "",
@@ -883,7 +1040,7 @@ const char* flatsql_build_response_artifact_cache_key(
             format ? format : "",
             publishEventKey ? publishEventKey : "",
             decodeStringList(projectionList),
-            decodeParams(paramData, paramLength, paramCount)
+            params
         );
         g_lastError.clear();
         return g_cacheKeyBuffer.c_str();
@@ -899,10 +1056,19 @@ int flatsql_register_query_template(void* handle,
                                     const char* queryId,
                                     const char* sql,
                                     int cacheable) {
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    const std::string sqlStr = sql ? sql : "";
+
+    std::string validationError;
+    if (!db->validateSQL(sqlStr, nullptr, &validationError)) {
+        g_lastError = validationError;
+        return 0;
+    }
+
     try {
-        static_cast<FlatSQLDatabase*>(handle)->registerQueryTemplate(
+        db->registerQueryTemplate(
             queryId ? queryId : "",
-            sql ? sql : "",
+            sqlStr,
             cacheable != 0
         );
         g_lastError.clear();
@@ -919,13 +1085,41 @@ int flatsql_query_template(void* handle,
                            const uint8_t* paramData,
                            size_t paramLength,
                            int paramCount) {
+    g_batchResults.clear();
+    g_selectedBatchResult = -1;
+
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    const std::string queryIdStr = queryId ? queryId : "";
+
+    // Pre-check template existence without exceptions.
+    // Message must match FlatSQLDatabase::queryTemplate's throw text.
+    if (!db->hasQueryTemplate(queryIdStr)) {
+        g_lastError = "Query template not found: " + queryIdStr;
+        return 0;
+    }
+
+    std::vector<Value> params;
+    std::string errorMessage;
+    if (!decodeParamsNoThrow(paramData, paramLength, paramCount, &params, &errorMessage)) {
+        g_lastError = errorMessage;
+        return 0;
+    }
+
+    const std::string* templateSql = db->queryTemplateSQL(queryIdStr);
+    if (templateSql) {
+        int expectedParams = 0;
+        if (!db->validateSQL(*templateSql, &expectedParams, &errorMessage)) {
+            g_lastError = errorMessage;
+            return 0;
+        }
+        if (expectedParams != static_cast<int>(params.size())) {
+            g_lastError = paramCountMismatchMessage(expectedParams, params.size());
+            return 0;
+        }
+    }
+
     try {
-        g_batchResults.clear();
-        g_selectedBatchResult = -1;
-        g_lastResult = static_cast<FlatSQLDatabase*>(handle)->queryTemplate(
-            queryId ? queryId : "",
-            decodeParams(paramData, paramLength, paramCount)
-        );
+        g_lastResult = db->queryTemplate(queryIdStr, params);
         g_lastError.clear();
         return 1;
     } catch (const std::exception& e) {
@@ -1096,11 +1290,37 @@ int flatsql_query_raw_flatbuffer_stream(
     size_t paramLength,
     int paramCount
 ) {
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    const std::string sqlStr = sql ? sql : "";
+
+    std::vector<Value> params;
+    std::string errorMessage;
+    if (!decodeParamsNoThrow(paramData, paramLength, paramCount, &params, &errorMessage)) {
+        g_responseArtifactBuffer.clear();
+        g_responseArtifactRowCount = 0;
+        g_responseArtifactColumnCount = 0;
+        g_lastError = errorMessage;
+        return 0;
+    }
+
+    int expectedParams = 0;
+    if (!db->validateSQL(sqlStr, &expectedParams, &errorMessage)) {
+        g_responseArtifactBuffer.clear();
+        g_responseArtifactRowCount = 0;
+        g_responseArtifactColumnCount = 0;
+        g_lastError = errorMessage;
+        return 0;
+    }
+    if (expectedParams != static_cast<int>(params.size())) {
+        g_responseArtifactBuffer.clear();
+        g_responseArtifactRowCount = 0;
+        g_responseArtifactColumnCount = 0;
+        g_lastError = paramCountMismatchMessage(expectedParams, params.size());
+        return 0;
+    }
+
     try {
-        auto result = static_cast<FlatSQLDatabase*>(handle)->query(
-            sql ? sql : "",
-            decodeParams(paramData, paramLength, paramCount)
-        );
+        auto result = db->query(sqlStr, params);
 
         g_responseArtifactBuffer.clear();
         g_responseArtifactRowCount = result.rows.size();
@@ -1376,13 +1596,20 @@ const uint8_t* flatsql_get_flatbuffer_by_index(
     size_t paramLength,
     int paramCount
 ) {
-    try {
-        resetRawFlatBufferState();
-        auto params = decodeParams(paramData, paramLength, paramCount);
-        if (params.size() != 1) {
-            throw std::runtime_error("Indexed FlatBuffer lookup expects exactly one key parameter");
-        }
+    resetRawFlatBufferState();
 
+    std::vector<Value> params;
+    std::string errorMessage;
+    if (!decodeParamsNoThrow(paramData, paramLength, paramCount, &params, &errorMessage)) {
+        g_lastError = errorMessage;
+        return nullptr;
+    }
+    if (params.size() != 1) {
+        g_lastError = "Indexed FlatBuffer lookup expects exactly one key parameter";
+        return nullptr;
+    }
+
+    try {
         auto* db = static_cast<FlatSQLDatabase*>(handle);
         g_rawFlatBuffer = db->findRawByIndex(
             tableName ? tableName : "",

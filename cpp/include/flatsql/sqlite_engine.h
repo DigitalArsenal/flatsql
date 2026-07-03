@@ -101,6 +101,19 @@ public:
     );
 
     /**
+     * Validate SQL without executing it. Never throws.
+     *
+     * Prepares every statement in the (possibly multi-statement) SQL with
+     * sqlite3_prepare_v2 and finalizes it immediately. No statement is executed.
+     *
+     * @param sql            SQL text (may contain multiple statements)
+     * @param paramCountOut  Optional out: total bind-parameter count across all statements
+     * @param errOut         Optional out: error message ("SQL error: <sqlite message>")
+     * @return true if all statements compiled successfully
+     */
+    bool validateSQL(const std::string& sql, int* paramCountOut, std::string* errOut) noexcept;
+
+    /**
      * Execute a SQL query and return results.
      *
      * @param sql  SQL query string

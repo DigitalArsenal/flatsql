@@ -22,6 +22,11 @@ public:
     // Auto-detect format and parse
     static DatabaseSchema parse(const std::string& source, const std::string& dbName = "default");
 
+    // Auto-detect format and parse without throwing.
+    // Returns false and sets errOut (e.g. "Empty schema source") on failure.
+    static bool tryParse(const std::string& source, DatabaseSchema* out, std::string* errOut,
+                         const std::string& dbName = "default") noexcept;
+
 private:
     static ValueType idlTypeToValueType(const std::string& idlType);
     static ValueType jsonTypeToValueType(const std::string& jsonType, const std::string& format = "");

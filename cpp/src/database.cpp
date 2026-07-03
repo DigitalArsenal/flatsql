@@ -574,6 +574,64 @@ void FlatSQLDatabase::updateSQLiteTable(const std::string& tableName) {
     sqliteRegisteredTables_.insert(tableName);
 }
 
+bool FlatSQLDatabase::validateSQL(const std::string& sql, int* paramCountOut, std::string* errOut) noexcept {
+    // Never throws for user-triggerable failures; the try/catch guards the
+    // exceptions build against unexpected internal errors (mutex/alloc/engine
+    // initialization) so noexcept never terminates there.
+    try {
+        std::unique_lock lock(*accessMutex_);
+        if (!sqliteInitialized_) {
+            initializeSQLiteEngine();
+        }
+        return sqliteEngine_->validateSQL(sql, paramCountOut, errOut);
+    } catch (const std::exception& e) {
+        if (paramCountOut) *paramCountOut = 0;
+        if (errOut) {
+            try { *errOut = e.what(); } catch (...) {}
+        }
+        return false;
+    } catch (...) {
+        if (paramCountOut) *paramCountOut = 0;
+        if (errOut) {
+            try { *errOut = "SQL error: validation failed"; } catch (...) {}
+        }
+        return false;
+    }
+}
+
+bool FlatSQLDatabase::hasQueryTemplate(const std::string& id) const noexcept {
+    try {
+        std::shared_lock lock(*accessMutex_);
+        return queryTemplates_.find(id) != queryTemplates_.end();
+    } catch (...) {
+        return false;
+    }
+}
+
+const std::string* FlatSQLDatabase::queryTemplateSQL(const std::string& id) const noexcept {
+    try {
+        std::shared_lock lock(*accessMutex_);
+        auto it = queryTemplates_.find(id);
+        return it == queryTemplates_.end() ? nullptr : &it->second.sql;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+bool FlatSQLDatabase::hasSource(const std::string& name) const noexcept {
+    try {
+        std::shared_lock lock(*accessMutex_);
+        for (const auto& s : registeredSources_) {
+            if (s == name) {
+                return true;
+            }
+        }
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
 QueryResult FlatSQLDatabase::query(const std::string& sql) {
     if (!sqliteInitialized_) {
         std::unique_lock initLock(*accessMutex_);

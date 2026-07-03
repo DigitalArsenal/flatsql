@@ -426,6 +426,62 @@ void SQLiteEngine::bindValue(sqlite3_stmt* stmt, int idx, const Value& value) co
     }
 }
 
+bool SQLiteEngine::validateSQL(const std::string& sql, int* paramCountOut, std::string* errOut) noexcept {
+    // Exception-free validation path: plain sqlite3 C API only. The try/catch
+    // exists solely to keep the noexcept contract on the exceptions build if a
+    // string allocation fails; it compiles to dead code under -fignore-exceptions.
+    try {
+        if (paramCountOut) *paramCountOut = 0;
+        if (errOut) errOut->clear();
+
+        if (!db_) {
+            if (errOut) *errOut = "SQL error: database handle is not open";
+            return false;
+        }
+
+        int totalParams = 0;
+        size_t statementCount = 0;
+        const char* cursor = sql.c_str();
+        const char* end = cursor + sql.size();
+
+        while (cursor < end) {
+            sqlite3_stmt* stmt = nullptr;
+            const char* tail = nullptr;
+            int rc = sqlite3_prepare_v2(db_, cursor, static_cast<int>(end - cursor), &stmt, &tail);
+            if (rc != SQLITE_OK) {
+                if (stmt) sqlite3_finalize(stmt);
+                if (errOut) *errOut = "SQL error: " + std::string(sqlite3_errmsg(db_));
+                return false;
+            }
+
+            if (stmt) {
+                totalParams += sqlite3_bind_parameter_count(stmt);
+                statementCount++;
+                sqlite3_finalize(stmt);
+            }
+
+            if (!tail || tail == cursor) {
+                break;
+            }
+            cursor = tail;
+        }
+
+        if (statementCount == 0) {
+            if (errOut) *errOut = "SQL error: no SQL statement provided";
+            return false;
+        }
+
+        if (paramCountOut) *paramCountOut = totalParams;
+        return true;
+    } catch (...) {
+        if (errOut) {
+            // Avoid allocating in this path; assign from a literal only if possible.
+            try { *errOut = "SQL error: validation failed"; } catch (...) {}
+        }
+        return false;
+    }
+}
+
 QueryResult SQLiteEngine::execute(const std::string& sql) {
     return execute(sql, {});
 }

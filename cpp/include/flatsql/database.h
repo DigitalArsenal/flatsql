@@ -161,6 +161,21 @@ public:
     // Load existing stream data and rebuild indexes
     void loadAndRebuild(const uint8_t* data, size_t length);
 
+    // Validate SQL without executing it. Never throws.
+    // Initializes the SQLite engine (registering pending tables) if needed so
+    // validation sees the same schema the subsequent query would.
+    // paramCountOut receives the total bind-parameter count across statements.
+    bool validateSQL(const std::string& sql, int* paramCountOut, std::string* errOut) noexcept;
+
+    // Check whether a query template is registered. Never throws.
+    bool hasQueryTemplate(const std::string& id) const noexcept;
+
+    // Get the SQL text of a registered query template (nullptr if unknown). Never throws.
+    const std::string* queryTemplateSQL(const std::string& id) const noexcept;
+
+    // Check whether a named ingest source is registered. Never throws.
+    bool hasSource(const std::string& name) const noexcept;
+
     // Execute SQL query (uses SQLite virtual tables)
     QueryResult query(const std::string& sql);
 
