@@ -227,16 +227,15 @@ int FlatBufferVTabModule::xBestIndex(sqlite3_vtab* pVTab, sqlite3_index_info* pI
             continue;
         }
 
-        // Skip virtual columns for index optimization
+        // Skip virtual columns for index optimization.
+        //
+        // In particular, NEVER claim the `_source` equality constraint:
+        // xBestIndex used to assign it an argvIndex with omit=1 while
+        // xFilter ignored the argv entirely, so `WHERE _source = 'T@src'`
+        // returned rows from EVERY source partition (wrong results). By
+        // leaving the constraint unclaimed, SQLite evaluates it itself
+        // against the xColumn value, which is always correct.
         if (colIdx >= static_cast<int>(vtab->tableDef->columns.size())) {
-            // Check if filtering by _source
-            if (colIdx == vtab->sourceColumnIndex && constraint.op == SQLITE_INDEX_CONSTRAINT_EQ) {
-                // _source filter - we can use this to skip the table entirely
-                // if it doesn't match our source name (handled at xFilter time)
-                pIdxInfo->aConstraintUsage[i].argvIndex = argvIndex++;
-                pIdxInfo->aConstraintUsage[i].omit = 1;
-                usableConstraints++;
-            }
             continue;
         }
 
