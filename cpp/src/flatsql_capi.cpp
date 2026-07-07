@@ -1355,6 +1355,71 @@ int flatsql_query_raw_flatbuffer_stream(
     }
 }
 
+// Sandboxed public query (gateway loop G.5): one read-only SELECT under an
+// authorizer (record tables / shadow tables / unified views only; no PRAGMA,
+// no ATTACH, no DDL/DML/temp writes), single-statement enforced, statement
+// timeout via the progress handler, row/byte caps enforced in the step loop.
+// mode 0 = record stream (all cells BLOB -> aligned [u32le size][bytes]
+// frames), mode 1 = bare JSON array of {"<column>": value} objects with
+// column names verbatim from SQLite (schema-exact capitalization). The
+// result is read through the response-artifact exports (data/size/row_count/
+// column_count; cache_hit always 0 — sandboxed executions bypass every
+// cache). Limits <= 0 mean "unlimited"; timeoutMs <= 0 means no deadline.
+// Returns 1 on success, 0 with flatsql_get_error() latched ("sandbox:
+// <code>: ..." for sandbox rejections).
+EMSCRIPTEN_KEEPALIVE
+int flatsql_query_sandboxed(
+    void* handle,
+    const char* sql,
+    const uint8_t* paramData,
+    size_t paramLength,
+    int paramCount,
+    int mode,
+    double maxRows,
+    double maxBytes,
+    double timeoutMs
+) {
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    const std::string sqlStr = sql ? sql : "";
+
+    std::vector<Value> params;
+    std::string errorMessage;
+    if (!decodeParamsNoThrow(paramData, paramLength, paramCount, &params, &errorMessage)) {
+        clearResponseArtifact();
+        g_lastError = errorMessage;
+        return 0;
+    }
+    if (mode != 0 && mode != 1) {
+        clearResponseArtifact();
+        g_lastError = "sandbox: mode: unknown result mode (0 = record stream, 1 = json rows)";
+        return 0;
+    }
+
+    SQLiteEngine::SandboxLimits limits;
+    if (maxRows > 0) limits.maxRows = static_cast<uint64_t>(maxRows);
+    if (maxBytes > 0) limits.maxBytes = static_cast<uint64_t>(maxBytes);
+    if (timeoutMs > 0) limits.timeoutMs = static_cast<uint32_t>(timeoutMs);
+
+    SQLiteEngine::SandboxOutput output;
+    if (!db->querySandboxed(sqlStr, params,
+                            mode == 0 ? SQLiteEngine::SandboxMode::RecordStream
+                                      : SQLiteEngine::SandboxMode::JsonRows,
+                            limits, &output, &errorMessage)) {
+        clearResponseArtifact();
+        g_lastError = errorMessage;
+        return 0;
+    }
+
+    g_responseArtifactStream =
+        std::make_shared<const std::vector<uint8_t>>(std::move(output.payload));
+    g_responseArtifactRowCount = output.rowCount;
+    g_responseArtifactColumnCount = output.columnCount;
+    g_responseArtifactCacheHit = 0;
+
+    g_lastError.clear();
+    return 1;
+}
+
 EMSCRIPTEN_KEEPALIVE
 const uint8_t* flatsql_response_artifact_data() {
     return g_responseArtifactStream ? g_responseArtifactStream->data() : nullptr;

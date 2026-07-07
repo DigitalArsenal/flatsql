@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <thread>
 #include <cctype>
+#include <cstdio>
+#include <cstring>
 
 // sqlean extension init functions (C linkage)
 extern "C" {
@@ -477,6 +479,469 @@ bool SQLiteEngine::validateSQL(const std::string& sql, int* paramCountOut, std::
         if (errOut) {
             // Avoid allocating in this path; assign from a literal only if possible.
             try { *errOut = "SQL error: validation failed"; } catch (...) {}
+        }
+        return false;
+    }
+}
+
+// ==================== Sandboxed public query (gateway loop G.5) ====================
+
+namespace {
+
+struct SandboxAuthCtx {
+    const std::unordered_set<std::string>* allowedTables = nullptr;
+    // Every real table/view name in the database (sqlite_master + temp
+    // schema). SQLITE_READ on a name that is NOT a real schema object is a
+    // CTE / subquery alias (e.g. the whole-table read SQLite issues for
+    // `SELECT count(*) FROM cte`) and is safe to allow: if the name resolved
+    // to nothing at all, prepare fails later anyway, and a CTE that SHADOWS
+    // a real table name is still checked against the real name (false
+    // rejection — the safe direction).
+    const std::unordered_set<std::string>* existingObjects = nullptr;
+    std::string violation;  // first denial, human-readable
+};
+
+// Human-readable names for denied authorizer actions.
+const char* sandboxActionName(int action) {
+    switch (action) {
+        case SQLITE_PRAGMA: return "PRAGMA";
+        case SQLITE_ATTACH: return "ATTACH";
+        case SQLITE_DETACH: return "DETACH";
+        case SQLITE_INSERT: return "INSERT";
+        case SQLITE_UPDATE: return "UPDATE";
+        case SQLITE_DELETE: return "DELETE";
+        case SQLITE_TRANSACTION: return "TRANSACTION";
+        case SQLITE_SAVEPOINT: return "SAVEPOINT";
+        case SQLITE_ALTER_TABLE: return "ALTER TABLE";
+        case SQLITE_REINDEX: return "REINDEX";
+        case SQLITE_ANALYZE: return "ANALYZE";
+        case SQLITE_CREATE_INDEX:
+        case SQLITE_CREATE_TABLE:
+        case SQLITE_CREATE_TRIGGER:
+        case SQLITE_CREATE_VIEW:
+        case SQLITE_CREATE_VTABLE: return "CREATE";
+        case SQLITE_CREATE_TEMP_INDEX:
+        case SQLITE_CREATE_TEMP_TABLE:
+        case SQLITE_CREATE_TEMP_TRIGGER:
+        case SQLITE_CREATE_TEMP_VIEW: return "CREATE TEMP";
+        case SQLITE_DROP_INDEX:
+        case SQLITE_DROP_TABLE:
+        case SQLITE_DROP_TEMP_INDEX:
+        case SQLITE_DROP_TEMP_TABLE:
+        case SQLITE_DROP_TEMP_TRIGGER:
+        case SQLITE_DROP_TEMP_VIEW:
+        case SQLITE_DROP_TRIGGER:
+        case SQLITE_DROP_VIEW:
+        case SQLITE_DROP_VTABLE: return "DROP";
+        default: return "this operation";
+    }
+}
+
+int sandboxAuthorizer(void* userData, int action,
+                      const char* arg1, const char* /*arg2*/,
+                      const char* /*dbName*/, const char* /*trigger*/) {
+    auto* ctx = static_cast<SandboxAuthCtx*>(userData);
+    switch (action) {
+        case SQLITE_SELECT:
+        case SQLITE_FUNCTION:
+        case SQLITE_RECURSIVE:
+            return SQLITE_OK;
+        case SQLITE_READ: {
+            const char* table = arg1;
+            if (table && ctx->allowedTables && ctx->allowedTables->count(table)) {
+                return SQLITE_OK;
+            }
+            // sqlite_master / sqlite_temp_master / sqlite_sequence / ... are
+            // reserved names that never appear in the schema enumeration —
+            // deny them BEFORE the CTE allowance below.
+            const bool reservedName = table && std::strncmp(table, "sqlite_", 7) == 0;
+            if (!reservedName && table && ctx->existingObjects &&
+                !ctx->existingObjects->count(table)) {
+                return SQLITE_OK;  // CTE / subquery alias, not a real object
+            }
+            if (ctx->violation.empty()) {
+                ctx->violation = std::string("table \"") + (table ? table : "?") +
+                                 "\" is outside the public query surface";
+            }
+            return SQLITE_DENY;
+        }
+        default:
+            if (ctx->violation.empty()) {
+                ctx->violation = std::string(sandboxActionName(action)) +
+                                 " is not permitted (read-only SELECT sandbox)";
+            }
+            return SQLITE_DENY;
+    }
+}
+
+struct SandboxProgressCtx {
+    std::chrono::steady_clock::time_point deadline;
+    bool expired = false;
+};
+
+int sandboxProgress(void* userData) {
+    auto* ctx = static_cast<SandboxProgressCtx*>(userData);
+    if (std::chrono::steady_clock::now() >= ctx->deadline) {
+        ctx->expired = true;
+        return 1;  // abort with SQLITE_INTERRUPT
+    }
+    return 0;
+}
+
+// VDBE ops between progress-handler callbacks; small enough that a deadline
+// overshoot is bounded, large enough to stay invisible on the hot path (the
+// handler is only installed for sandboxed statements).
+constexpr int kSandboxProgressOps = 4096;
+
+void sandboxJsonEscapeInto(std::vector<uint8_t>* out, const char* s, size_t len) {
+    static const char* hex = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == '"' || c == '\\') {
+            out->push_back('\\');
+            out->push_back(c);
+        } else if (c == '\n') {
+            out->push_back('\\'); out->push_back('n');
+        } else if (c == '\r') {
+            out->push_back('\\'); out->push_back('r');
+        } else if (c == '\t') {
+            out->push_back('\\'); out->push_back('t');
+        } else if (c < 0x20) {
+            const char buf[6] = {'\\', 'u', '0', '0', hex[(c >> 4) & 0xF], hex[c & 0xF]};
+            out->insert(out->end(), buf, buf + 6);
+        } else {
+            out->push_back(c);
+        }
+    }
+}
+
+void sandboxBase64Into(std::vector<uint8_t>* out, const uint8_t* data, size_t len) {
+    static const char* alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0;
+    for (; i + 2 < len; i += 3) {
+        const uint32_t n = (static_cast<uint32_t>(data[i]) << 16) |
+                           (static_cast<uint32_t>(data[i + 1]) << 8) |
+                           static_cast<uint32_t>(data[i + 2]);
+        out->push_back(alphabet[(n >> 18) & 63]);
+        out->push_back(alphabet[(n >> 12) & 63]);
+        out->push_back(alphabet[(n >> 6) & 63]);
+        out->push_back(alphabet[n & 63]);
+    }
+    if (i + 1 == len) {
+        const uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+        out->push_back(alphabet[(n >> 18) & 63]);
+        out->push_back(alphabet[(n >> 12) & 63]);
+        out->push_back('=');
+        out->push_back('=');
+    } else if (i + 2 == len) {
+        const uint32_t n = (static_cast<uint32_t>(data[i]) << 16) |
+                           (static_cast<uint32_t>(data[i + 1]) << 8);
+        out->push_back(alphabet[(n >> 18) & 63]);
+        out->push_back(alphabet[(n >> 12) & 63]);
+        out->push_back(alphabet[(n >> 6) & 63]);
+        out->push_back('=');
+    }
+}
+
+void sandboxAppendLiteral(std::vector<uint8_t>* out, const char* s) {
+    out->insert(out->end(), s, s + std::strlen(s));
+}
+
+}  // namespace
+
+bool SQLiteEngine::executeSandboxed(const std::string& sql,
+                                    const std::vector<Value>& params,
+                                    const std::unordered_set<std::string>& allowedTables,
+                                    SandboxMode mode,
+                                    const SandboxLimits& limits,
+                                    SandboxOutput* out,
+                                    std::string* errOut) noexcept {
+    // The try/catch keeps the noexcept contract on the exceptions build if a
+    // string/vector allocation fails; under -fignore-exceptions it is dead
+    // code (allocation failure aborts, like everywhere else in the engine).
+    try {
+        const auto fail = [&](const std::string& message) {
+            if (errOut) *errOut = message;
+            return false;
+        };
+        if (!db_) {
+            return fail("SQL error: database handle is not open");
+        }
+        if (out) {
+            out->payload.clear();
+            out->rowCount = 0;
+            out->columnCount = 0;
+        }
+
+        // Real schema objects (tables, views, indexes, vtabs), collected so
+        // the authorizer can tell CTE/subquery aliases from real tables.
+        // FAIL CLOSED: if enumeration fails the CTE allowance is disabled
+        // entirely (unknown names are then denied) — never fail open.
+        std::unordered_set<std::string> existingObjects;
+        bool schemaEnumerated = false;
+        const auto enumerateSchema = [&](const char* schemaSql) {
+            sqlite3_stmt* schemaStmt = nullptr;
+            bool clean = false;
+            if (sqlite3_prepare_v2(db_, schemaSql, -1, &schemaStmt, nullptr) == SQLITE_OK) {
+                int stepRc;
+                while ((stepRc = sqlite3_step(schemaStmt)) == SQLITE_ROW) {
+                    const char* name =
+                        reinterpret_cast<const char*>(sqlite3_column_text(schemaStmt, 0));
+                    if (name) existingObjects.insert(name);
+                }
+                clean = (stepRc == SQLITE_DONE);
+            }
+            if (schemaStmt) sqlite3_finalize(schemaStmt);
+            return clean;
+        };
+        // The main schema must enumerate cleanly; the temp schema is
+        // best-effort (it may not exist before first temp use, and temp
+        // writes are denied by the authorizer anyway).
+        schemaEnumerated = enumerateSchema("SELECT name FROM sqlite_master");
+        enumerateSchema("SELECT name FROM sqlite_temp_master");
+
+        // Layer 1: authorizer during prepare — deny everything but
+        // SELECT/READ-on-allowlist/functions. Cleared before returning.
+        SandboxAuthCtx auth;
+        auth.allowedTables = &allowedTables;
+        auth.existingObjects = schemaEnumerated ? &existingObjects : nullptr;
+        sqlite3_set_authorizer(db_, sandboxAuthorizer, &auth);
+
+        sqlite3_stmt* stmt = nullptr;
+        const char* tail = nullptr;
+        const int prepareRc =
+            sqlite3_prepare_v2(db_, sql.c_str(), static_cast<int>(sql.size()), &stmt, &tail);
+        sqlite3_set_authorizer(db_, nullptr, nullptr);
+
+        if (prepareRc != SQLITE_OK) {
+            if (stmt) sqlite3_finalize(stmt);
+            if (!auth.violation.empty()) {
+                return fail("sandbox: not-authorized: " + auth.violation);
+            }
+            return fail("SQL error: " + std::string(sqlite3_errmsg(db_)));
+        }
+        if (!stmt) {
+            return fail("sandbox: empty-statement: no SQL statement provided");
+        }
+
+        // Layer 2: single statement — reject any non-whitespace tail
+        // (including trailing comments; the public contract is one bare
+        // SELECT).
+        for (const char* p = tail; p && *p; p++) {
+            if (!std::isspace(static_cast<unsigned char>(*p))) {
+                sqlite3_finalize(stmt);
+                return fail("sandbox: multi-statement: exactly one SELECT statement is allowed");
+            }
+        }
+
+        // Layer 3: SELECT-shaped and structurally read-only.
+        if (!sqlite3_stmt_readonly(stmt)) {
+            sqlite3_finalize(stmt);
+            return fail("sandbox: read-only: statement could modify the database");
+        }
+        const int numCols = sqlite3_column_count(stmt);
+        if (numCols <= 0) {
+            sqlite3_finalize(stmt);
+            return fail("sandbox: not-select: statement returns no result columns");
+        }
+
+        const int expectedParams = sqlite3_bind_parameter_count(stmt);
+        if (expectedParams != static_cast<int>(params.size())) {
+            sqlite3_finalize(stmt);
+            return fail("sandbox: params: SQL statement expects " +
+                        std::to_string(expectedParams) + " parameters but received " +
+                        std::to_string(params.size()));
+        }
+        for (size_t i = 0; i < params.size(); i++) {
+            int rc = SQLITE_OK;
+            const Value& value = params[i];
+            const int idx = static_cast<int>(i + 1);
+            std::visit([&](const auto& v) {
+                using T = std::decay_t<decltype(v)>;
+                if constexpr (std::is_same_v<T, std::monostate>) {
+                    rc = sqlite3_bind_null(stmt, idx);
+                } else if constexpr (std::is_same_v<T, bool>) {
+                    rc = sqlite3_bind_int(stmt, idx, v ? 1 : 0);
+                } else if constexpr (std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t> ||
+                                     std::is_same_v<T, int32_t> || std::is_same_v<T, uint8_t> ||
+                                     std::is_same_v<T, uint16_t> || std::is_same_v<T, uint32_t>) {
+                    rc = sqlite3_bind_int(stmt, idx, static_cast<int>(v));
+                } else if constexpr (std::is_same_v<T, int64_t>) {
+                    rc = sqlite3_bind_int64(stmt, idx, v);
+                } else if constexpr (std::is_same_v<T, uint64_t>) {
+                    rc = sqlite3_bind_int64(stmt, idx, static_cast<sqlite3_int64>(v));
+                } else if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>) {
+                    rc = sqlite3_bind_double(stmt, idx, static_cast<double>(v));
+                } else if constexpr (std::is_same_v<T, std::string>) {
+                    rc = sqlite3_bind_text(stmt, idx, v.c_str(), static_cast<int>(v.size()),
+                                           SQLITE_TRANSIENT);
+                } else if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
+                    rc = sqlite3_bind_blob(stmt, idx, v.empty() ? nullptr : v.data(),
+                                           static_cast<int>(v.size()), SQLITE_TRANSIENT);
+                } else {
+                    rc = sqlite3_bind_null(stmt, idx);
+                }
+            }, value);
+            if (rc != SQLITE_OK) {
+                sqlite3_finalize(stmt);
+                return fail("SQL error: " + std::string(sqlite3_errmsg(db_)));
+            }
+        }
+
+        // Layer 4: statement deadline via the progress handler.
+        SandboxProgressCtx progress;
+        if (limits.timeoutMs > 0) {
+            progress.deadline = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(limits.timeoutMs);
+            sqlite3_progress_handler(db_, kSandboxProgressOps, sandboxProgress, &progress);
+        }
+
+        std::vector<uint8_t> payload;
+        size_t rowCount = 0;
+        std::string failure;
+
+        // JSON column-name prefixes (escaped once), verbatim from
+        // sqlite3_column_name — schema-exact capitalization by construction.
+        std::vector<std::vector<uint8_t>> jsonKeys;
+        if (mode == SandboxMode::JsonRows) {
+            jsonKeys.resize(static_cast<size_t>(numCols));
+            for (int i = 0; i < numCols; i++) {
+                std::vector<uint8_t>& key = jsonKeys[static_cast<size_t>(i)];
+                key.push_back(i == 0 ? '{' : ',');
+                key.push_back('"');
+                const char* name = sqlite3_column_name(stmt, i);
+                sandboxJsonEscapeInto(&key, name ? name : "", name ? std::strlen(name) : 0);
+                key.push_back('"');
+                key.push_back(':');
+            }
+            payload.push_back('[');
+        }
+
+        int rc;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            rowCount++;
+            // Layer 5a: row cap (reject, never truncate).
+            if (limits.maxRows > 0 && rowCount > limits.maxRows) {
+                failure = "sandbox: row-cap: result exceeds " +
+                          std::to_string(limits.maxRows) + " rows";
+                break;
+            }
+            if (mode == SandboxMode::RecordStream) {
+                for (int i = 0; i < numCols; i++) {
+                    if (sqlite3_column_type(stmt, i) != SQLITE_BLOB) {
+                        failure = "sandbox: not-a-record-stream: raw response stream queries "
+                                  "must return only BLOB cells (projection results are "
+                                  "JSON-only — request format=json)";
+                        break;
+                    }
+                    const uint8_t* blob = static_cast<const uint8_t*>(sqlite3_column_blob(stmt, i));
+                    const int len = sqlite3_column_bytes(stmt, i);
+                    const uint32_t size = static_cast<uint32_t>(len);
+                    payload.push_back(static_cast<uint8_t>(size & 0xFF));
+                    payload.push_back(static_cast<uint8_t>((size >> 8) & 0xFF));
+                    payload.push_back(static_cast<uint8_t>((size >> 16) & 0xFF));
+                    payload.push_back(static_cast<uint8_t>((size >> 24) & 0xFF));
+                    if (len > 0) payload.insert(payload.end(), blob, blob + len);
+                }
+            } else {
+                if (rowCount > 1) payload.push_back(',');
+                for (int i = 0; i < numCols; i++) {
+                    const std::vector<uint8_t>& key = jsonKeys[static_cast<size_t>(i)];
+                    payload.insert(payload.end(), key.begin(), key.end());
+                    switch (sqlite3_column_type(stmt, i)) {
+                        case SQLITE_NULL:
+                            sandboxAppendLiteral(&payload, "null");
+                            break;
+                        case SQLITE_INTEGER: {
+                            char buf[32];
+                            std::snprintf(buf, sizeof(buf), "%lld",
+                                          static_cast<long long>(sqlite3_column_int64(stmt, i)));
+                            sandboxAppendLiteral(&payload, buf);
+                            break;
+                        }
+                        case SQLITE_FLOAT: {
+                            const double v = sqlite3_column_double(stmt, i);
+                            if (v != v || v > 1.7976931348623157e308 ||
+                                v < -1.7976931348623157e308) {
+                                sandboxAppendLiteral(&payload, "null");  // NaN/Inf have no JSON
+                            } else {
+                                char buf[40];
+                                std::snprintf(buf, sizeof(buf), "%.17g", v);
+                                sandboxAppendLiteral(&payload, buf);
+                            }
+                            break;
+                        }
+                        case SQLITE_TEXT: {
+                            const char* text =
+                                reinterpret_cast<const char*>(sqlite3_column_text(stmt, i));
+                            const int len = sqlite3_column_bytes(stmt, i);
+                            payload.push_back('"');
+                            sandboxJsonEscapeInto(&payload, text ? text : "",
+                                                  static_cast<size_t>(len));
+                            payload.push_back('"');
+                            break;
+                        }
+                        case SQLITE_BLOB: {
+                            const uint8_t* blob =
+                                static_cast<const uint8_t*>(sqlite3_column_blob(stmt, i));
+                            const int len = sqlite3_column_bytes(stmt, i);
+                            payload.push_back('"');
+                            sandboxBase64Into(&payload, blob, static_cast<size_t>(len));
+                            payload.push_back('"');
+                            break;
+                        }
+                        default:
+                            sandboxAppendLiteral(&payload, "null");
+                            break;
+                    }
+                }
+                payload.push_back('}');
+            }
+            if (!failure.empty()) break;
+            // Layer 5b: byte cap on the assembled payload.
+            if (limits.maxBytes > 0 && payload.size() > limits.maxBytes) {
+                failure = "sandbox: byte-cap: result exceeds " +
+                          std::to_string(limits.maxBytes) + " bytes";
+                break;
+            }
+        }
+
+        if (limits.timeoutMs > 0) {
+            sqlite3_progress_handler(db_, 0, nullptr, nullptr);
+        }
+
+        if (failure.empty() && rc != SQLITE_DONE && rc != SQLITE_ROW) {
+            if (progress.expired || rc == SQLITE_INTERRUPT) {
+                failure = "sandbox: timeout: statement exceeded " +
+                          std::to_string(limits.timeoutMs) + " ms";
+            } else {
+                failure = "SQL error: " + std::string(sqlite3_errmsg(db_));
+            }
+        }
+        sqlite3_finalize(stmt);
+        if (!failure.empty()) {
+            return fail(failure);
+        }
+
+        if (mode == SandboxMode::JsonRows) {
+            payload.push_back(']');
+            if (limits.maxBytes > 0 && payload.size() > limits.maxBytes) {
+                return fail("sandbox: byte-cap: result exceeds " +
+                            std::to_string(limits.maxBytes) + " bytes");
+            }
+        }
+
+        if (out) {
+            out->payload = std::move(payload);
+            out->rowCount = rowCount;
+            out->columnCount = static_cast<size_t>(numCols);
+        }
+        if (errOut) errOut->clear();
+        return true;
+    } catch (...) {
+        if (errOut) {
+            try { *errOut = "sandbox: internal: sandboxed execution failed"; } catch (...) {}
         }
         return false;
     }

@@ -5,6 +5,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <unordered_set>
 
 #ifdef FLATSQL_HAVE_OPENSSL
 #include <openssl/hmac.h>
@@ -907,6 +908,41 @@ bool FlatSQLDatabase::queryRawFlatBufferStream(const std::string& sql,
         storeRawStreamResultUnlocked(cacheKey, *result);
     }
     return true;
+}
+
+bool FlatSQLDatabase::querySandboxed(const std::string& sql,
+                                     const std::vector<Value>& params,
+                                     SQLiteEngine::SandboxMode mode,
+                                     const SQLiteEngine::SandboxLimits& limits,
+                                     SQLiteEngine::SandboxOutput* out,
+                                     std::string* errorMessage) noexcept {
+    try {
+        std::unique_lock lock(*accessMutex_);
+        if (!sqliteInitialized_) {
+            initializeSQLiteEngine();
+        }
+
+        // The public query surface: record base tables (schema names),
+        // per-source shadow tables ("OMM@celestrak-gp"), and the unified
+        // views (which reuse the base table name). Control tables created
+        // through plain SQL DDL are deliberately absent — the authorizer
+        // denies reading them.
+        std::unordered_set<std::string> allowed;
+        for (const auto& tableDef : schema_.tables) {
+            allowed.insert(tableDef.name);
+        }
+        for (const auto& entry : tables_) {
+            allowed.insert(entry.first);
+        }
+
+        return sqliteEngine_->executeSandboxed(sql, params, allowed, mode, limits, out,
+                                               errorMessage);
+    } catch (...) {
+        if (errorMessage) {
+            try { *errorMessage = "sandbox: internal: sandboxed execution failed"; } catch (...) {}
+        }
+        return false;
+    }
 }
 
 void FlatSQLDatabase::storeRawStreamResultUnlocked(const std::string& key,

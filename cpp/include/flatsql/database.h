@@ -257,6 +257,22 @@ public:
 
     RawStreamCacheStats getRawStreamCacheStats() const;
 
+    // ==================== Sandboxed public query (gateway loop G.5) ====================
+    // Execute UNTRUSTED SQL through SQLiteEngine::executeSandboxed: one
+    // read-only SELECT, authorizer-restricted to this database's record
+    // tables / source shadow tables / unified views (control tables created
+    // through plain SQL DDL are NOT readable), with a statement timeout and
+    // row/byte caps. Bypasses every cache (no pollution, no invalidation) —
+    // sandboxed executions are structurally read-only. Never throws; on
+    // failure *errorMessage carries "sandbox: <code>: ..." for sandbox
+    // rejections or "SQL error: ..." for plain SQL errors.
+    bool querySandboxed(const std::string& sql,
+                        const std::vector<Value>& params,
+                        SQLiteEngine::SandboxMode mode,
+                        const SQLiteEngine::SandboxLimits& limits,
+                        SQLiteEngine::SandboxOutput* out,
+                        std::string* errorMessage) noexcept;
+
     // Execute and count without building QueryResult (for benchmarking)
     size_t queryCount(const std::string& sql, const std::vector<Value>& params = {});
 

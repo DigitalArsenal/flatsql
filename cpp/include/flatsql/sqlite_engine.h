@@ -113,6 +113,58 @@ public:
      */
     bool validateSQL(const std::string& sql, int* paramCountOut, std::string* errOut) noexcept;
 
+    // ==================== Sandboxed public query (gateway loop G.5) ====================
+    // A single-statement, read-only, resource-capped execution path for
+    // UNTRUSTED SQL (the public /api/v1/query surface). Never throws — every
+    // rejection lands in *errOut with a stable "sandbox: <code>: ..." prefix
+    // so hosts can map violations to typed errors. Defense layers:
+    //   1. sqlite3_set_authorizer during prepare: only SQLITE_SELECT /
+    //      SQLITE_FUNCTION / SQLITE_RECURSIVE / SQLITE_READ-on-allowlisted
+    //      tables are permitted; PRAGMA, ATTACH/DETACH, every DDL/DML verb
+    //      (incl. temp objects), TRANSACTION/SAVEPOINT and reads outside
+    //      `allowedTables` are denied (prepare fails).
+    //   2. single-statement: any non-whitespace prepare tail is rejected.
+    //   3. sqlite3_stmt_readonly must be true and the statement must return
+    //      result columns (SELECT-shaped).
+    //   4. sqlite3_progress_handler timeout (steady-clock deadline) —
+    //      runaway statements abort with SQLITE_INTERRUPT.
+    //   5. row / byte caps enforced inside the step loop (reject, not
+    //      truncate).
+    // The sandbox never touches the statement cache or the query/raw-stream
+    // caches, and never invalidates anything (it is structurally read-only).
+
+    enum class SandboxMode {
+        RecordStream,  // all cells BLOB -> aligned [u32le size][bytes] frames
+        JsonRows       // bare JSON array of {"<column>": value} objects
+    };
+
+    struct SandboxLimits {
+        uint64_t maxRows = 0;    // 0 = unlimited
+        uint64_t maxBytes = 0;   // 0 = unlimited (output payload bytes)
+        uint32_t timeoutMs = 0;  // 0 = no deadline
+    };
+
+    struct SandboxOutput {
+        std::vector<uint8_t> payload;  // stream frames or UTF-8 JSON array
+        size_t rowCount = 0;
+        size_t columnCount = 0;
+    };
+
+    /**
+     * Execute untrusted SQL under the sandbox contract above. Never throws.
+     *
+     * @param allowedTables table/view names SQLITE_READ may touch
+     * @return true on success; false with *errOut set ("sandbox: <code>: ..."
+     *         for sandbox rejections, "SQL error: ..." for plain SQL errors)
+     */
+    bool executeSandboxed(const std::string& sql,
+                          const std::vector<Value>& params,
+                          const std::unordered_set<std::string>& allowedTables,
+                          SandboxMode mode,
+                          const SandboxLimits& limits,
+                          SandboxOutput* out,
+                          std::string* errOut) noexcept;
+
     /**
      * Execute a SQL query and return results.
      *

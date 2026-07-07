@@ -141,7 +141,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_OMIT_WAL=1
         SQLITE_OMIT_DEPRECATED=1
         SQLITE_OMIT_SHARED_CACHE=1
-        SQLITE_OMIT_PROGRESS_CALLBACK=1
         SQLITE_DEFAULT_MEMSTATUS=0
         SQLITE_DQS=0
         SQLITE_ENABLE_RTREE=1
@@ -178,6 +177,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_result_column_name\", \"_flatsql_result_cell_type\", \
                 \"_flatsql_result_cell_number\", \"_flatsql_result_cell_string\", \
                 \"_flatsql_result_cell_blob\", \"_flatsql_result_cell_blob_size\", \
+                \"_flatsql_query_sandboxed\", \
                 \"_flatsql_query_raw_flatbuffer_stream\", \"_flatsql_response_artifact_data\", \
                 \"_flatsql_response_artifact_size\", \"_flatsql_response_artifact_row_count\", \
                 \"_flatsql_response_artifact_column_count\", \"_flatsql_response_artifact_cache_hit\", \
@@ -239,7 +239,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_OMIT_WAL=1
         SQLITE_OMIT_DEPRECATED=1
         SQLITE_OMIT_SHARED_CACHE=1
-        SQLITE_OMIT_PROGRESS_CALLBACK=1
         SQLITE_DEFAULT_MEMSTATUS=0
         SQLITE_DQS=0
         SQLITE_ENABLE_RTREE=1
@@ -274,6 +273,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_result_column_name\", \"_flatsql_result_cell_type\", \
                 \"_flatsql_result_cell_number\", \"_flatsql_result_cell_string\", \
                 \"_flatsql_result_cell_blob\", \"_flatsql_result_cell_blob_size\", \
+                \"_flatsql_query_sandboxed\", \
                 \"_flatsql_query_raw_flatbuffer_stream\", \"_flatsql_response_artifact_data\", \
                 \"_flatsql_response_artifact_size\", \"_flatsql_response_artifact_row_count\", \
                 \"_flatsql_response_artifact_column_count\", \"_flatsql_response_artifact_cache_hit\", \
@@ -345,7 +345,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_OMIT_WAL=1
         SQLITE_OMIT_DEPRECATED=1
         SQLITE_OMIT_SHARED_CACHE=1
-        SQLITE_OMIT_PROGRESS_CALLBACK=1
         SQLITE_DEFAULT_MEMSTATUS=0
         SQLITE_DQS=0
         SQLITE_ENABLE_RTREE=1

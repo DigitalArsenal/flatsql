@@ -630,6 +630,42 @@ export class FlatSQLStandaloneDatabase {
     return ptr && size > 0 ? this._runtime.readBytes(ptr, size) : new Uint8Array();
   }
 
+  // Sandboxed public query (gateway loop G.5): one read-only SELECT under
+  // the engine authorizer (record tables / shadow tables / unified views
+  // only), single-statement, statement timeout, row/byte caps. options:
+  // { mode: "stream" | "json", maxRows, maxBytes, timeoutMs }. Returns
+  // { payload: Uint8Array, rows, columns } — payload is the aligned frame
+  // stream (mode "stream") or UTF-8 bare-array JSON bytes (mode "json").
+  // Sandbox rejections throw with the engine's "sandbox: <code>: ..." text.
+  querySandboxed(sql, params = [], options = {}) {
+    const paramBytes = encodeQueryParams(params);
+    const mode = options.mode === "json" ? 1 : 0;
+    const success = this._runtime.withCString(sql, (sqlPtr) =>
+      this._runtime.withBytes(paramBytes, (paramPtr) =>
+        this._runtime.exports.flatsql_query_sandboxed(
+          this._handle,
+          sqlPtr,
+          paramPtr,
+          paramBytes.length,
+          params.length,
+          mode,
+          options.maxRows > 0 ? options.maxRows : 0,
+          options.maxBytes > 0 ? options.maxBytes : 0,
+          options.timeoutMs > 0 ? options.timeoutMs : 0
+        )
+      )
+    );
+    this._runtime.check(success);
+
+    const ptr = this._runtime.exports.flatsql_response_artifact_data();
+    const size = this._runtime.exports.flatsql_response_artifact_size();
+    return {
+      payload: ptr && size > 0 ? this._runtime.readBytes(ptr, size) : new Uint8Array(),
+      rows: this._runtime.exports.flatsql_response_artifact_row_count(),
+      columns: this._runtime.exports.flatsql_response_artifact_column_count(),
+    };
+  }
+
   // True when the last queryRawFlatBufferStream call was served from the
   // engine's response-artifact cache (no SQL re-execution).
   lastRawStreamCacheHit() {

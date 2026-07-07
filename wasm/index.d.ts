@@ -125,6 +125,20 @@ export interface FlatSQLDatabase {
    * as a native size-prefixed response stream.
    */
   queryRawFlatBufferStream(sql: string, params?: QueryParam[]): Uint8Array;
+
+  /**
+   * Sandboxed public query (gateway loop G.5): one read-only SELECT under
+   * the engine authorizer (record tables / shadow tables / unified views
+   * only), single statement, statement timeout, row/byte caps (reject, not
+   * truncate). mode "stream" returns aligned size-prefixed frames (all
+   * cells must be BLOB); mode "json" returns UTF-8 bare-array JSON bytes
+   * with column names verbatim. Rejections throw "sandbox: <code>: ...".
+   */
+  querySandboxed(
+    sql: string,
+    params?: QueryParam[],
+    options?: { mode?: 'stream' | 'json'; maxRows?: number; maxBytes?: number; timeoutMs?: number }
+  ): { payload: Uint8Array; rows: number; columns: number };
   lastRawStreamCacheHit(): boolean;
   configureRawStreamCache(maxEntries: number, maxTotalBytes: number): void;
   getRawStreamCacheStats(): {

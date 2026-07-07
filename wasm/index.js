@@ -289,6 +289,7 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
         resultCellBlob: Module.cwrap('flatsql_result_cell_blob', 'number', ['number', 'number']),
         resultCellBlobSize: Module.cwrap('flatsql_result_cell_blob_size', 'number', ['number', 'number']),
         queryRawFlatBufferStream: Module.cwrap('flatsql_query_raw_flatbuffer_stream', 'number', ['number', 'string', 'number', 'number', 'number']),
+        querySandboxed: Module.cwrap('flatsql_query_sandboxed', 'number', ['number', 'string', 'number', 'number', 'number', 'number', 'number', 'number', 'number']),
         responseArtifactData: Module.cwrap('flatsql_response_artifact_data', 'number', []),
         responseArtifactSize: Module.cwrap('flatsql_response_artifact_size', 'number', []),
         responseArtifactRowCount: Module.cwrap('flatsql_response_artifact_row_count', 'number', []),
@@ -828,6 +829,38 @@ export class FlatSQLDatabase {
         const ptr = api.responseArtifactData();
         const size = api.responseArtifactSize();
         return ptr && size > 0 ? copyHeapBytes(ptr, size) : new Uint8Array();
+    }
+
+    // Sandboxed public query (gateway loop G.5): one read-only SELECT under
+    // the engine authorizer (record tables / shadow tables / unified views
+    // only), single-statement, statement timeout, row/byte caps. options:
+    // { mode: "stream" | "json", maxRows, maxBytes, timeoutMs }. Returns
+    // { payload: Uint8Array, rows, columns } — payload is the aligned frame
+    // stream (mode "stream") or UTF-8 bare-array JSON bytes (mode "json").
+    // Sandbox rejections throw with the engine's "sandbox: <code>: ..." text.
+    querySandboxed(sql, params = [], options = {}) {
+        const encodedParams = encodeQueryParams(params);
+        const mode = options.mode === 'json' ? 1 : 0;
+        const maxRows = options.maxRows > 0 ? options.maxRows : 0;
+        const maxBytes = options.maxBytes > 0 ? options.maxBytes : 0;
+        const timeoutMs = options.timeoutMs > 0 ? options.timeoutMs : 0;
+        const success = encodedParams.length === 0
+            ? api.querySandboxed(this._handle, sql, 0, 0, 0, mode, maxRows, maxBytes, timeoutMs)
+            : withHeapBytes(
+                encodedParams,
+                (ptr) => api.querySandboxed(this._handle, sql, ptr, encodedParams.length, params.length, mode, maxRows, maxBytes, timeoutMs)
+            );
+        if (!success) {
+            throw new Error(api.getError());
+        }
+
+        const ptr = api.responseArtifactData();
+        const size = api.responseArtifactSize();
+        return {
+            payload: ptr && size > 0 ? copyHeapBytes(ptr, size) : new Uint8Array(),
+            rows: api.responseArtifactRowCount(),
+            columns: api.responseArtifactColumnCount(),
+        };
     }
 
     // True when the last queryRawFlatBufferStream call was served from the
