@@ -1,0 +1,7 @@
+{
+  "algorithm": "ed25519",
+  "keyId": "spaceaware-sdn-isomorphic-2026-07-21",
+  "publicKeyHex": "088ac3d85932dc6946e3ff62882afb48885c2df0cd8b34f2993c5885e3424d89",
+  "developmentOnly": false,
+  "buildMode": "production"
+}

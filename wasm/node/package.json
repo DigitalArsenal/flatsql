@@ -1,0 +1,29 @@
+{
+  "name": "@digitalarsenal/flatsql-wasm-node",
+  "version": "2.0.0",
+  "description": "Independently signed isomorphic FlatSQL SDN WASM node",
+  "type": "module",
+  "license": "Apache-2.0",
+  "files": [
+    "README.md",
+    "build.mjs",
+    "release.mjs",
+    "plugin-manifest.json",
+    "publisher.json",
+    "dist/isomorphic/**",
+    "test/**"
+  ],
+  "scripts": {
+    "build": "FLATSQL_NODE_BUILD_MODE=development node build.mjs",
+    "test": "FLATSQL_NODE_EXPECT_BUILD_MODE=development node --test test/*.test.mjs",
+    "test:production": "FLATSQL_NODE_EXPECT_BUILD_MODE=production node --test test/package-contract.test.mjs test/runtime-contract.test.mjs test/sds-boundary-contract.test.mjs",
+    "release": "FLATSQL_NODE_BUILD_MODE=production node build.mjs && npm run test:production && node release.mjs --check && npm pack",
+    "release:dry-run": "node release.mjs --check && npm pack --dry-run --json --ignore-scripts"
+  },
+  "dependencies": {
+    "flatbuffers": "^25.9.23"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

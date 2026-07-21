@@ -363,6 +363,110 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         COMMENT "Copying flatsql-wasi-noeh.wasm to wasm/"
     )
 
+    # Independently packaged SDN FlatSQL node. The generated directory is
+    # produced by wasm/node/build.mjs from the canonical PLG and SDS PIV/FSO/FSB
+    # schemas before CMake configuration.
+    set(
+        FLATSQL_SDN_NODE_GENERATED_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/../wasm/node/.build/generated"
+        CACHE PATH
+        "Generated SDN FlatSQL node ABI sources"
+    )
+    if(EXISTS "${FLATSQL_SDN_NODE_GENERATED_DIR}/invoke_support.cpp")
+        add_library(
+            flatsql_sdn_node_capi
+            OBJECT
+            src/flatsql_capi.cpp
+        )
+        target_include_directories(flatsql_sdn_node_capi PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${FLATBUFFERS_INCLUDE_DIR}
+            ${SQLITE_DIR}
+            ${SQLEAN_DIR}
+        )
+        target_compile_options(
+            flatsql_sdn_node_capi
+            PRIVATE
+                -fignore-exceptions
+                -include
+                ${FLATSQL_SDN_NODE_GENERATED_DIR}/private_capi_exports.h
+        )
+        target_compile_definitions(flatsql_sdn_node_capi PRIVATE
+            SQLITE_THREADSAFE=0
+            SQLITE_OMIT_LOAD_EXTENSION=1
+            SQLITE_OMIT_WAL=1
+            SQLITE_OMIT_DEPRECATED=1
+            SQLITE_OMIT_SHARED_CACHE=1
+            SQLITE_DEFAULT_MEMSTATUS=0
+            SQLITE_DQS=0
+            SQLITE_ENABLE_RTREE=1
+        )
+        add_executable(
+            flatsql_sdn_node
+            ${FLATSQL_LIB_SOURCES}
+            $<TARGET_OBJECTS:flatsql_sdn_node_capi>
+            ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
+            ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp
+            ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
+            ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
+            ${FLATBUFFERS_SRC_DIR}/reflection.cpp
+            ${FLATBUFFERS_SRC_DIR}/util.cpp
+            ${FLATBUFFERS_SRC_DIR}/options.cpp
+            src/sdn_node.cpp
+            ${FLATSQL_SDN_NODE_GENERATED_DIR}/invoke_support.cpp
+            ${FLATSQL_SDN_NODE_GENERATED_DIR}/plugin_manifest_exports.c
+            ${SQLITE_DIR}/sqlite3.c
+        )
+
+        target_include_directories(flatsql_sdn_node PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${FLATBUFFERS_INCLUDE_DIR}
+            ${SQLITE_DIR}
+            ${SQLEAN_DIR}
+            ${FLATSQL_SDN_NODE_GENERATED_DIR}
+        )
+        target_compile_options(
+            flatsql_sdn_node
+            PRIVATE
+                -fignore-exceptions
+                -fvisibility=hidden
+        )
+        target_compile_definitions(flatsql_sdn_node PRIVATE
+            SQLITE_THREADSAFE=0
+            SQLITE_OMIT_LOAD_EXTENSION=1
+            SQLITE_OMIT_WAL=1
+            SQLITE_OMIT_DEPRECATED=1
+            SQLITE_OMIT_SHARED_CACHE=1
+            SQLITE_DEFAULT_MEMSTATUS=0
+            SQLITE_DQS=0
+            SQLITE_ENABLE_RTREE=1
+        )
+        set_target_properties(flatsql_sdn_node PROPERTIES
+            OUTPUT_NAME "flatsql-sdn-node"
+            SUFFIX ".wasm"
+            LINK_FLAGS "\
+                -s WASM=1 \
+                -s STANDALONE_WASM=1 \
+                -s PURE_WASI=1 \
+                --no-entry \
+                -s EXPORTED_FUNCTIONS='[\
+                    \"_plugin_alloc\", \"_plugin_free\", \
+                    \"_plugin_invoke_stream\", \
+                    \"_plugin_get_manifest_flatbuffer\", \
+                    \"_plugin_get_manifest_flatbuffer_size\" \
+                ]' \
+                -s EXPORT_KEEPALIVE=0 \
+                -s ALLOW_MEMORY_GROWTH=1 \
+                -s INITIAL_MEMORY=67108864 \
+                -s MAXIMUM_MEMORY=4294967296 \
+                -s STACK_SIZE=1048576 \
+                -s WASMFS=1 \
+                -s ALLOW_TABLE_GROWTH=1 \
+                -s EMULATE_FUNCTION_POINTER_CASTS=1 \
+            "
+        )
+    endif()
+
     # Space Data Module (SDM) — standalone spatial engine WASM
     # Compliant with https://github.com/DigitalArsenal/space-data-module-sdk
     set(SDM_SOURCES

@@ -74,6 +74,29 @@ FlatBuffer → Query (via virtual table) → FlatBuffer
 
 ## Runtime Choices & Performance Gates
 
+### SDN flow runtime contract
+
+Within an SDN module flow, FlatSQL always runs as a signed, pluggable WASM node.
+The exact same artifact bytes and hash run under the browser/JavaScript harness
+and WasmEdge. The pure TypeScript implementation is a library fallback and
+must not substitute for the FlatSQL node in an isomorphic flow.
+
+FlatSQL remains independently instantiated and addressable by its signed
+manifest and artifact hash. A flow bundle may carry those bytes, but a compiler
+must not statically fold FlatSQL into the consuming application module.
+
+The FlatSQL node owns SQL, tables, rows, indexes, compaction, snapshots, and
+reload semantics. Hosts provide only generic opaque byte persistence,
+shared-arena bounds checking, clocks/wakeups, network byte streams, and module
+lifecycle. They must not expose a FlatSQL service, `storage_engine_link`, or
+schema-aware row/query API.
+
+Every FlatSQL module input and output port supports both canonical SDS
+FlatBuffer and aligned-binary representations for the same schema identity.
+`PIV`/`TAB.WIRE_FORMAT` selects per frame. Aligned frames are transient
+shared-memory views; durable, network, and fallback records remain canonical
+size-prefixed FlatBuffers.
+
 - Production should prefer the SQLite-backed native/WASM path (`initFlatSQL` → `FlatSQL` → `createDatabase`). The pure TypeScript `FlatSQLDatabase` is preserved only as an explicit fallback/reference implementation for environments that cannot load the WASM module.
 - Standalone deployments use the C++ WASI reactor at `flatsql/wasi.wasm`. Browser hosts load it through `flatsql/standalone`, while Node/WasmEdge hosts use a resident runner from `flatsql/standalone/wasmedge`.
 - Artifact-builder cache behavior belongs to C++: query templates, result-cache keys, invalidation generation, hit/miss counters, SQL execution, and raw FlatBuffer lookup all live in the WASM database instance. JavaScript only marshals bytes and fills host capability gaps.
