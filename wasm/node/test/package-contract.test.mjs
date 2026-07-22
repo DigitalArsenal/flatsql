@@ -8,10 +8,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const nodeDirectory = path.resolve(testDirectory, "..");
 const repositoriesDirectory = path.resolve(testDirectory, "../../../../..");
-const sdkDirectory = path.join(
-  repositoriesDirectory,
-  "ancillary-packages/space-data-module-sdk",
-);
+const sdkDirectory = process.env.SPACE_DATA_MODULE_SDK_ROOT
+  ? path.resolve(process.env.SPACE_DATA_MODULE_SDK_ROOT)
+  : path.join(repositoriesDirectory, "ancillary-packages/space-data-module-sdk");
 const standardsDirectory = path.join(
   repositoriesDirectory,
   "main-packages/spacedatastandards.org",
@@ -159,13 +158,14 @@ test("FlatSQL is an independently signed isomorphic SDN WASM node", async () => 
   const manifest = JSON.parse(manifestBytes.toString("utf8"));
 
   assert.equal(manifest.pluginId, "com.digitalarsenal.flatsql.store");
+  assert.equal(manifest.version, "2.0.1");
   assert.deepEqual(
     [...(manifest.runtimeTargets ?? [])].sort(),
     ["browser", "wasmedge"],
     "the same node artifact must target browser and WasmEdge",
   );
   assert.deepEqual(manifest.invokeSurfaces, ["direct"]);
-  assert.deepEqual(manifest.capabilities ?? [], []);
+  assert.deepEqual(manifest.capabilities ?? [], ["storage_adapter"]);
   assert.deepEqual(manifest.externalInterfaces ?? [], []);
 
   const methods = new Map(
@@ -230,6 +230,20 @@ test("FlatSQL is an independently signed isomorphic SDN WASM node", async () => 
 
   const { inspectModule } = await importSdk("src/host/isomorphicLoader.js");
   const inspection = await inspectModule(artifactBytes);
+  assert.deepEqual(
+    inspection.imports
+      .filter((imported) => imported.module === "space_data_module_host")
+      .map((imported) => imported.name)
+      .sort(),
+    [
+      "call",
+      "clear_response",
+      "last_status_code",
+      "read_response",
+      "response_len",
+    ],
+    "browser and WasmEdge must expose only the same generic hostcall ABI",
+  );
   for (const imported of inspection.imports) {
     const qualifiedName = `${imported.module}.${imported.name}`;
     assert.equal(

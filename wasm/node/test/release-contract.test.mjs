@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -19,7 +20,7 @@ async function readJson(relativePath) {
 test("FlatSQL node package declares build, test, and guarded release assets", async () => {
   const packageJson = await readJson("package.json");
   assert.equal(packageJson.name, "@digitalarsenal/flatsql-wasm-node");
-  assert.equal(packageJson.version, "2.0.0");
+  assert.equal(packageJson.version, "2.0.1");
   assert.match(packageJson.scripts?.build ?? "", /FLATSQL_NODE_BUILD_MODE=development/);
   assert.match(packageJson.scripts?.test ?? "", /node --test/);
   assert.match(packageJson.scripts?.release ?? "", /FLATSQL_NODE_BUILD_MODE=production/);
@@ -78,16 +79,46 @@ test("production build refuses the embedded development signer", async () => {
 });
 
 test("release guard rejects a developmentOnly publisher", async () => {
-  await assert.rejects(
-    execFileAsync(process.execPath, [path.join(nodeDirectory, "release.mjs"), "--check"], {
-      cwd: nodeDirectory,
-    }),
-    (error) => {
-      assert.match(
-        `${error?.stdout ?? ""}${error?.stderr ?? ""}`,
-        /development-only FlatSQL publisher cannot be released/,
-      );
-      return true;
-    },
+  const fixtureDirectory = await mkdtemp(
+    path.join(tmpdir(), "flatsql-release-guard-"),
   );
+  try {
+    await mkdir(path.join(fixtureDirectory, "dist/isomorphic"), {
+      recursive: true,
+    });
+    await Promise.all([
+      writeFile(
+        path.join(fixtureDirectory, "release.mjs"),
+        await readFile(path.join(nodeDirectory, "release.mjs")),
+      ),
+      writeFile(
+        path.join(fixtureDirectory, "publisher.json"),
+        JSON.stringify({ developmentOnly: true }),
+      ),
+      writeFile(
+        path.join(fixtureDirectory, "dist/isomorphic/artifact.json"),
+        "{}",
+      ),
+      writeFile(
+        path.join(fixtureDirectory, "dist/isomorphic/module.wasm"),
+        new Uint8Array(),
+      ),
+    ]);
+    await assert.rejects(
+      execFileAsync(
+        process.execPath,
+        [path.join(fixtureDirectory, "release.mjs"), "--check"],
+        { cwd: fixtureDirectory },
+      ),
+      (error) => {
+        assert.match(
+          `${error?.stdout ?? ""}${error?.stderr ?? ""}`,
+          /development-only FlatSQL publisher cannot be released/,
+        );
+        return true;
+      },
+    );
+  } finally {
+    await rm(fixtureDirectory, { recursive: true, force: true });
+  }
 });

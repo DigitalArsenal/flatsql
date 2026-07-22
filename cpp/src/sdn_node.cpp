@@ -34,6 +34,12 @@ constexpr const char* kFsbFileIdentifier = "$FSB";
 constexpr const char* kFsbRootType = "FSB";
 constexpr const char* kSnapshotSchemaName = "FlatSQLNodeSnapshot";
 constexpr const char* kSnapshotFileIdentifier = "FSN1";
+constexpr const char* kOpaqueNamespace = "primary";
+constexpr const char* kOpaqueManifestKey = "snapshot.manifest";
+constexpr const char* kOpaqueManifestIdentifier = "FDM2";
+constexpr size_t kOpaqueChunkBytes = 1024 * 1024;
+constexpr uint64_t kMaxOpaqueSnapshotBytes = 512ull * 1024 * 1024;
+constexpr int32_t kMaxHostcallResponseBytes = 4 * 1024 * 1024;
 constexpr uint32_t kFlatbufferWireFormat =
     PLUGIN_PAYLOAD_WIRE_FORMAT_FLATBUFFER;
 constexpr uint32_t kAlignedWireFormat =
@@ -55,6 +61,32 @@ std::map<std::string, ViewDefinition> g_views;
 uint64_t g_retention_max_records = 0;
 uint64_t g_retention_max_age_millis = 0;
 uint64_t g_compaction_target_bytes = 0;
+bool g_durable_state_checked = false;
+bool g_durable_state_poisoned = false;
+std::string g_durable_poison_error;
+bool g_durable_manifest_found = false;
+uint64_t g_durable_generation = 0;
+std::vector<uint8_t> g_durable_manifest;
+std::vector<std::string> g_durable_chunk_keys;
+
+extern "C" {
+
+__attribute__((import_module("space_data_module_host"), import_name("call")))
+int32_t sdm_host_call(
+    const char* operation_ptr,
+    int32_t operation_len,
+    const char* payload_ptr,
+    int32_t payload_len);
+__attribute__((import_module("space_data_module_host"), import_name("response_len")))
+int32_t sdm_host_response_len(void);
+__attribute__((import_module("space_data_module_host"), import_name("read_response")))
+int32_t sdm_host_read_response(char* destination_ptr, int32_t destination_len);
+__attribute__((import_module("space_data_module_host"), import_name("clear_response")))
+int32_t sdm_host_clear_response(void);
+__attribute__((import_module("space_data_module_host"), import_name("last_status_code")))
+int32_t sdm_host_last_status_code(void);
+
+}  // extern "C"
 
 extern "C" void* flatsql_create_db(const char* schema, const char* db_name);
 extern "C" void flatsql_destroy_db(void* handle);
@@ -1184,6 +1216,14 @@ uint32_t readU32(const uint8_t* data) {
         (static_cast<uint32_t>(data[3]) << 24u);
 }
 
+uint64_t readU64(const uint8_t* data) {
+    uint64_t value = 0;
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        value |= static_cast<uint64_t>(data[shift / 8]) << shift;
+    }
+    return value;
+}
+
 void appendU32(std::vector<uint8_t>* output, uint32_t value) {
     for (unsigned shift = 0; shift < 32; shift += 8) {
         output->push_back(static_cast<uint8_t>((value >> shift) & 0xffu));
@@ -1204,6 +1244,505 @@ void appendString(std::vector<uint8_t>* output, const std::string& value) {
 void appendBytes(std::vector<uint8_t>* output, const std::vector<uint8_t>& value) {
     appendU64(output, value.size());
     output->insert(output->end(), value.begin(), value.end());
+}
+
+struct HostcallResponse {
+    std::string meta;
+    std::vector<std::vector<uint8_t>> segments;
+};
+
+size_t skipJsonWhitespace(const std::string& json, size_t cursor) {
+    while (cursor < json.size()) {
+        const char value = json[cursor];
+        if (value != ' ' && value != '\t' && value != '\r' && value != '\n') {
+            break;
+        }
+        ++cursor;
+    }
+    return cursor;
+}
+
+size_t findJsonValue(const std::string& json, const char* key) {
+    const std::string marker = std::string("\"") + key + "\"";
+    const size_t key_position = json.find(marker);
+    if (key_position == std::string::npos) return key_position;
+    const size_t colon = json.find(':', key_position + marker.size());
+    if (colon == std::string::npos) return colon;
+    return skipJsonWhitespace(json, colon + 1);
+}
+
+bool findJsonBool(const std::string& json, const char* key, bool* output) {
+    if (!output) return false;
+    const size_t cursor = findJsonValue(json, key);
+    if (cursor == std::string::npos) return false;
+    if (json.compare(cursor, 4, "true") == 0) {
+        *output = true;
+        return true;
+    }
+    if (json.compare(cursor, 5, "false") == 0) {
+        *output = false;
+        return true;
+    }
+    return false;
+}
+
+bool findJsonString(
+    const std::string& json,
+    const char* key,
+    std::string* output) {
+    if (!output) return false;
+    size_t cursor = findJsonValue(json, key);
+    if (cursor == std::string::npos || cursor >= json.size() ||
+        json[cursor] != '"') {
+        return false;
+    }
+    ++cursor;
+    const size_t end = json.find('"', cursor);
+    if (end == std::string::npos) return false;
+    output->assign(json.data() + cursor, end - cursor);
+    return true;
+}
+
+bool findJsonStringArray(
+    const std::string& json,
+    const char* key,
+    std::vector<std::string>* output) {
+    if (!output) return false;
+    size_t cursor = findJsonValue(json, key);
+    if (cursor == std::string::npos || cursor >= json.size() ||
+        json[cursor] != '[') {
+        return false;
+    }
+    output->clear();
+    cursor = skipJsonWhitespace(json, cursor + 1);
+    while (cursor < json.size() && json[cursor] != ']') {
+        if (json[cursor] != '"') return false;
+        ++cursor;
+        std::string value;
+        while (cursor < json.size() && json[cursor] != '"') {
+            if (json[cursor] == '\\') return false;
+            value.push_back(json[cursor]);
+            ++cursor;
+        }
+        if (cursor >= json.size()) return false;
+        output->push_back(std::move(value));
+        cursor = skipJsonWhitespace(json, cursor + 1);
+        if (cursor < json.size() && json[cursor] == ',') {
+            cursor = skipJsonWhitespace(json, cursor + 1);
+        } else if (cursor >= json.size() || json[cursor] != ']') {
+            return false;
+        }
+    }
+    return cursor < json.size() && json[cursor] == ']';
+}
+
+bool findJsonBinaryReference(
+    const std::string& json,
+    const char* key,
+    size_t* output) {
+    if (!output) return false;
+    size_t cursor = findJsonValue(json, key);
+    if (cursor == std::string::npos || cursor >= json.size() ||
+        json[cursor] != '{') {
+        return false;
+    }
+    cursor = skipJsonWhitespace(json, cursor + 1);
+    constexpr const char* kBinaryKey = "\"$bin\"";
+    constexpr size_t kBinaryKeyLength = 6;
+    if (json.compare(cursor, kBinaryKeyLength, kBinaryKey) != 0) return false;
+    cursor = skipJsonWhitespace(json, cursor + kBinaryKeyLength);
+    if (cursor >= json.size() || json[cursor] != ':') return false;
+    cursor = skipJsonWhitespace(json, cursor + 1);
+    if (cursor >= json.size() || json[cursor] < '0' || json[cursor] > '9') {
+        return false;
+    }
+    size_t index = 0;
+    while (cursor < json.size() && json[cursor] >= '0' && json[cursor] <= '9') {
+        index = index * 10 + static_cast<size_t>(json[cursor] - '0');
+        ++cursor;
+    }
+    cursor = skipJsonWhitespace(json, cursor);
+    if (cursor >= json.size() || json[cursor] != '}') return false;
+    *output = index;
+    return true;
+}
+
+bool decodeBase64(const std::string& encoded, std::vector<uint8_t>* output) {
+    if (!output || encoded.size() % 4 != 0) return false;
+    std::array<int8_t, 256> table{};
+    table.fill(-1);
+    constexpr const char* kAlphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (int index = 0; index < 64; ++index) {
+        table[static_cast<uint8_t>(kAlphabet[index])] =
+            static_cast<int8_t>(index);
+    }
+    output->clear();
+    output->reserve(encoded.size() / 4 * 3);
+    for (size_t offset = 0; offset < encoded.size(); offset += 4) {
+        const bool final_group = offset + 4 == encoded.size();
+        const bool pad_third = encoded[offset + 2] == '=';
+        const bool pad_fourth = encoded[offset + 3] == '=';
+        if ((!final_group && (pad_third || pad_fourth)) ||
+            (pad_third && !pad_fourth)) {
+            return false;
+        }
+        const int first = table[static_cast<uint8_t>(encoded[offset])];
+        const int second = table[static_cast<uint8_t>(encoded[offset + 1])];
+        const int third = pad_third
+            ? 0
+            : table[static_cast<uint8_t>(encoded[offset + 2])];
+        const int fourth = pad_fourth
+            ? 0
+            : table[static_cast<uint8_t>(encoded[offset + 3])];
+        if (first < 0 || second < 0 || third < 0 || fourth < 0) return false;
+        const uint32_t value =
+            (static_cast<uint32_t>(first) << 18u) |
+            (static_cast<uint32_t>(second) << 12u) |
+            (static_cast<uint32_t>(third) << 6u) |
+            static_cast<uint32_t>(fourth);
+        output->push_back(static_cast<uint8_t>(value >> 16u));
+        if (!pad_third) output->push_back(static_cast<uint8_t>(value >> 8u));
+        if (!pad_fourth) output->push_back(static_cast<uint8_t>(value));
+    }
+    return true;
+}
+
+bool parseHostcallEnvelope(
+    const std::vector<uint8_t>& envelope,
+    HostcallResponse* output) {
+    if (!output || envelope.size() < 8) return false;
+    size_t offset = 0;
+    const uint32_t meta_length = readU32(envelope.data());
+    offset += 4;
+    if (meta_length > envelope.size() - offset - 4) return false;
+    output->meta.assign(
+        reinterpret_cast<const char*>(envelope.data() + offset),
+        meta_length);
+    offset += meta_length;
+    const uint32_t segment_count = readU32(envelope.data() + offset);
+    offset += 4;
+    if (segment_count > (envelope.size() - offset) / 4) return false;
+    output->segments.clear();
+    output->segments.reserve(segment_count);
+    for (uint32_t index = 0; index < segment_count; ++index) {
+        if (offset + 4 > envelope.size()) return false;
+        const uint32_t segment_length = readU32(envelope.data() + offset);
+        offset += 4;
+        if (segment_length > envelope.size() - offset) return false;
+        output->segments.emplace_back(
+            envelope.begin() + static_cast<std::ptrdiff_t>(offset),
+            envelope.begin() +
+                static_cast<std::ptrdiff_t>(offset + segment_length));
+        offset += segment_length;
+    }
+    return offset == envelope.size();
+}
+
+bool callHost(
+    const char* operation,
+    const std::string& meta,
+    const std::vector<uint8_t>* segment,
+    HostcallResponse* response,
+    std::string* error) {
+    std::vector<uint8_t> request;
+    request.reserve(
+        8 + meta.size() + (segment ? 4 + segment->size() : 0));
+    appendU32(&request, static_cast<uint32_t>(meta.size()));
+    request.insert(request.end(), meta.begin(), meta.end());
+    appendU32(&request, segment ? 1 : 0);
+    if (segment) {
+        appendU32(&request, static_cast<uint32_t>(segment->size()));
+        request.insert(request.end(), segment->begin(), segment->end());
+    }
+
+    sdm_host_clear_response();
+    const int32_t call_result = sdm_host_call(
+        operation,
+        static_cast<int32_t>(std::strlen(operation)),
+        reinterpret_cast<const char*>(request.data()),
+        static_cast<int32_t>(request.size()));
+    const int32_t host_status = sdm_host_last_status_code();
+    const int32_t response_length = sdm_host_response_len();
+    if (response_length < 8 || response_length > kMaxHostcallResponseBytes) {
+        sdm_host_clear_response();
+        if (error) {
+            *error = "opaque storage adapter response violates size bounds";
+        }
+        return false;
+    }
+    std::vector<uint8_t> response_bytes(
+        static_cast<size_t>(response_length),
+        0);
+    const int32_t copied = sdm_host_read_response(
+        reinterpret_cast<char*>(response_bytes.data()),
+        response_length);
+    sdm_host_clear_response();
+    bool ok = false;
+    if (call_result != 0 || host_status != 0 || copied != response_length ||
+        !parseHostcallEnvelope(response_bytes, response) ||
+        !findJsonBool(response->meta, "ok", &ok) || !ok) {
+        if (error) *error = "opaque storage adapter rejected the operation";
+        return false;
+    }
+    return true;
+}
+
+struct DurableManifest {
+    uint64_t generation = 0;
+    uint64_t total_size = 0;
+    uint32_t chunk_size = 0;
+    uint32_t chunk_count = 0;
+    std::vector<uint8_t> digest;
+};
+
+std::string durableChunkKey(uint64_t generation, uint32_t chunk_index) {
+    return "snapshot.g" + std::to_string(generation) + ".c" +
+        std::to_string(chunk_index) + ".bin";
+}
+
+std::vector<uint8_t> encodeDurableManifest(
+    const DurableManifest& manifest) {
+    std::vector<uint8_t> bytes;
+    bytes.reserve(60);
+    bytes.insert(
+        bytes.end(),
+        kOpaqueManifestIdentifier,
+        kOpaqueManifestIdentifier + 4);
+    appendU64(&bytes, manifest.generation);
+    appendU64(&bytes, manifest.total_size);
+    appendU32(&bytes, manifest.chunk_size);
+    appendU32(&bytes, manifest.chunk_count);
+    bytes.insert(bytes.end(), manifest.digest.begin(), manifest.digest.end());
+    return bytes;
+}
+
+bool parseDurableManifest(
+    const std::vector<uint8_t>& bytes,
+    DurableManifest* manifest,
+    std::string* error) {
+    if (!manifest || bytes.size() != 60 ||
+        std::memcmp(bytes.data(), kOpaqueManifestIdentifier, 4) != 0) {
+        if (error) *error = "opaque snapshot manifest is invalid";
+        return false;
+    }
+    manifest->generation = readU64(bytes.data() + 4);
+    manifest->total_size = readU64(bytes.data() + 12);
+    manifest->chunk_size = readU32(bytes.data() + 20);
+    manifest->chunk_count = readU32(bytes.data() + 24);
+    manifest->digest.assign(bytes.begin() + 28, bytes.end());
+    if (manifest->generation == 0 ||
+        manifest->chunk_size != kOpaqueChunkBytes ||
+        manifest->total_size > kMaxOpaqueSnapshotBytes ||
+        manifest->total_size > std::numeric_limits<size_t>::max()) {
+        if (error) *error = "opaque snapshot manifest fields are invalid";
+        return false;
+    }
+    const uint64_t expected_chunks = manifest->total_size == 0
+        ? 0
+        : ((manifest->total_size - 1) / manifest->chunk_size) + 1;
+    if (expected_chunks > std::numeric_limits<uint32_t>::max() ||
+        manifest->chunk_count != expected_chunks ||
+        manifest->digest.size() != 32) {
+        if (error) *error = "opaque snapshot manifest chunk layout is invalid";
+        return false;
+    }
+    return true;
+}
+
+bool readOpaqueValue(
+    const std::string& key,
+    std::vector<uint8_t>* value,
+    bool* found,
+    std::string* error) {
+    if (!value || !found) return false;
+    HostcallResponse response;
+    const std::string meta =
+        std::string("{\"namespace\":\"") + kOpaqueNamespace +
+        "\",\"key\":\"" + key + "\"}";
+    if (!callHost(
+            "storage.adapter.opaque.read",
+            meta,
+            nullptr,
+            &response,
+            error) ||
+        !findJsonBool(response.meta, "found", found)) {
+        if (error && error->empty()) {
+            *error = "opaque snapshot response is missing found state";
+        }
+        return false;
+    }
+    value->clear();
+    if (!*found) return true;
+
+    size_t segment_index = 0;
+    if (findJsonBinaryReference(
+            response.meta,
+            "bytes_b64",
+            &segment_index)) {
+        if (segment_index >= response.segments.size()) {
+            if (error) *error = "opaque snapshot references missing bytes";
+            return false;
+        }
+        *value = std::move(response.segments[segment_index]);
+        return true;
+    }
+    std::string encoded;
+    if (!findJsonString(response.meta, "bytes_b64", &encoded) ||
+        !decodeBase64(encoded, value)) {
+        if (error) *error = "opaque snapshot bytes are not valid base64";
+        return false;
+    }
+    return true;
+}
+
+bool replaceOpaqueValue(
+    const std::string& key,
+    const std::vector<uint8_t>& value,
+    std::string* error) {
+    HostcallResponse response;
+    const std::string replace_meta =
+        std::string("{\"namespace\":\"") + kOpaqueNamespace +
+        "\",\"key\":\"" + key +
+        "\",\"data\":{\"$bin\":0}}";
+    return callHost(
+        "storage.adapter.opaque.replace",
+        replace_meta,
+        &value,
+        &response,
+        error);
+}
+
+bool deleteOpaqueValue(const std::string& key, std::string* error) {
+    HostcallResponse response;
+    const std::string meta =
+        std::string("{\"namespace\":\"") + kOpaqueNamespace +
+        "\",\"key\":\"" + key + "\"}";
+    return callHost(
+        "storage.adapter.opaque.delete",
+        meta,
+        nullptr,
+        &response,
+        error);
+}
+
+bool syncOpaqueState(std::string* error) {
+    HostcallResponse response;
+    const std::string sync_meta =
+        std::string("{\"namespace\":\"") + kOpaqueNamespace + "\"}";
+    return callHost(
+        "storage.adapter.opaque.sync",
+        sync_meta,
+        nullptr,
+        &response,
+        error);
+}
+
+bool listOpaqueValues(
+    std::vector<std::string>* keys,
+    std::string* error) {
+    if (!keys) return false;
+    HostcallResponse response;
+    const std::string meta =
+        std::string("{\"namespace\":\"") + kOpaqueNamespace + "\"}";
+    if (!callHost(
+            "storage.adapter.opaque.list",
+            meta,
+            nullptr,
+            &response,
+            error) ||
+        !findJsonStringArray(response.meta, "keys", keys)) {
+        if (error && error->empty()) {
+            *error = "opaque storage adapter list response is invalid";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool isDurableChunkKey(const std::string& key) {
+    static const std::regex pattern(
+        R"(^snapshot\.g[0-9]+\.c[0-9]+\.bin$)");
+    return std::regex_match(key, pattern);
+}
+
+bool deleteOpaqueValues(
+    const std::vector<std::string>& keys,
+    std::string* error) {
+    if (keys.empty()) return true;
+    for (const auto& key : keys) {
+        if (!deleteOpaqueValue(key, error)) return false;
+    }
+    return syncOpaqueState(error);
+}
+
+bool sweepOrphanDurableChunks(
+    const std::vector<std::string>& committed_keys,
+    std::string* error) {
+    std::vector<std::string> stored_keys;
+    if (!listOpaqueValues(&stored_keys, error)) return false;
+    const std::set<std::string> committed(
+        committed_keys.begin(),
+        committed_keys.end());
+    std::vector<std::string> orphaned;
+    for (const auto& key : stored_keys) {
+        if (isDurableChunkKey(key) && committed.count(key) == 0) {
+            orphaned.push_back(key);
+        }
+    }
+    return deleteOpaqueValues(orphaned, error);
+}
+
+bool readDurableSnapshot(
+    std::vector<uint8_t>* snapshot,
+    bool* found,
+    uint64_t* generation,
+    std::vector<uint8_t>* manifest_bytes,
+    std::vector<std::string>* chunk_keys,
+    std::string* error) {
+    if (!snapshot || !found || !generation || !manifest_bytes || !chunk_keys) {
+        return false;
+    }
+    if (!readOpaqueValue(
+            kOpaqueManifestKey,
+            manifest_bytes,
+            found,
+            error)) {
+        return false;
+    }
+    snapshot->clear();
+    chunk_keys->clear();
+    *generation = 0;
+    if (!*found) return true;
+
+    DurableManifest manifest;
+    if (!parseDurableManifest(*manifest_bytes, &manifest, error)) return false;
+    snapshot->reserve(static_cast<size_t>(manifest.total_size));
+    chunk_keys->reserve(manifest.chunk_count);
+    uint64_t remaining = manifest.total_size;
+    for (uint32_t index = 0; index < manifest.chunk_count; ++index) {
+        const std::string key = durableChunkKey(manifest.generation, index);
+        std::vector<uint8_t> chunk;
+        bool chunk_found = false;
+        if (!readOpaqueValue(key, &chunk, &chunk_found, error)) return false;
+        const size_t expected_size = static_cast<size_t>(std::min<uint64_t>(
+            remaining,
+            manifest.chunk_size));
+        if (!chunk_found || chunk.size() != expected_size) {
+            if (error) *error = "opaque snapshot chunk is missing or truncated";
+            return false;
+        }
+        snapshot->insert(snapshot->end(), chunk.begin(), chunk.end());
+        chunk_keys->push_back(key);
+        remaining -= chunk.size();
+    }
+    if (remaining != 0 || snapshot->size() != manifest.total_size ||
+        sha256(*snapshot) != manifest.digest) {
+        if (error) *error = "opaque snapshot digest does not match its chunks";
+        return false;
+    }
+    *generation = manifest.generation;
+    return true;
 }
 
 class SnapshotReader {
@@ -1365,6 +1904,301 @@ bool parseSnapshotBytes(
     return true;
 }
 
+bool installSnapshotBytes(
+    const std::vector<uint8_t>& snapshot_bytes,
+    std::string* error_code,
+    std::string* error) {
+    SnapshotState state;
+    if (!parseSnapshotBytes(snapshot_bytes, &state, error)) {
+        if (error_code) *error_code = "snapshot-invalid";
+        return false;
+    }
+    std::vector<uint8_t> replacement_reflection_schema;
+    void* replacement = createConfiguredDatabase(
+        state.schema_idl,
+        state.database_name,
+        state.table_bindings,
+        &replacement_reflection_schema,
+        error);
+    if (!replacement) {
+        if (error_code) *error_code = "snapshot-schema-invalid";
+        return false;
+    }
+    uint64_t stored_records = 0;
+    if (!verifyRecordStream(
+            state.storage,
+            nullptr,
+            nullptr,
+            state.table_bindings,
+            replacement_reflection_schema,
+            &stored_records,
+            error)) {
+        flatsql_destroy_db(replacement);
+        if (error_code) *error_code = "snapshot-record-stream-invalid";
+        return false;
+    }
+    flatsql_load_and_rebuild(
+        replacement,
+        state.storage.empty() ? nullptr : state.storage.data(),
+        state.storage.size());
+    if (g_database) flatsql_destroy_db(g_database);
+    g_database = replacement;
+    g_schema_idl = std::move(state.schema_idl);
+    g_database_name = std::move(state.database_name);
+    g_table_bindings = std::move(state.table_bindings);
+    g_reflection_schema = std::move(replacement_reflection_schema);
+    g_views = std::move(state.views);
+    g_retention_max_records = state.retention_max_records;
+    g_retention_max_age_millis = state.retention_max_age_millis;
+    g_compaction_target_bytes = state.compaction_target_bytes;
+    return true;
+}
+
+bool ensureDurableStateLoaded(std::string* error) {
+    if (g_durable_state_poisoned) {
+        if (error) *error = g_durable_poison_error;
+        return false;
+    }
+    if (g_durable_state_checked) return true;
+    std::vector<uint8_t> snapshot_bytes;
+    std::vector<uint8_t> manifest_bytes;
+    std::vector<std::string> chunk_keys;
+    bool found = false;
+    uint64_t generation = 0;
+    if (!readDurableSnapshot(
+            &snapshot_bytes,
+            &found,
+            &generation,
+            &manifest_bytes,
+            &chunk_keys,
+            error)) {
+        return false;
+    }
+    if (found) {
+        std::string error_code;
+        if (!installSnapshotBytes(snapshot_bytes, &error_code, error)) {
+            if (error && !error_code.empty()) {
+                *error = error_code + ": " + *error;
+            }
+            return false;
+        }
+    }
+    g_durable_manifest_found = found;
+    g_durable_generation = generation;
+    g_durable_manifest = std::move(manifest_bytes);
+    g_durable_chunk_keys = std::move(chunk_keys);
+    g_durable_state_checked = true;
+    std::string sweep_error;
+    sweepOrphanDurableChunks(g_durable_chunk_keys, &sweep_error);
+    return true;
+}
+
+bool prepareDurableStateForExplicitReload(std::string* error) {
+    if (g_durable_state_checked && !g_durable_state_poisoned) return true;
+    std::vector<uint8_t> manifest_bytes;
+    bool found = false;
+    if (!readOpaqueValue(
+            kOpaqueManifestKey,
+            &manifest_bytes,
+            &found,
+            error)) {
+        return false;
+    }
+    uint64_t generation = 0;
+    std::vector<std::string> chunk_keys;
+    if (found) {
+        DurableManifest manifest;
+        std::string manifest_error;
+        if (parseDurableManifest(
+                manifest_bytes,
+                &manifest,
+                &manifest_error)) {
+            generation = manifest.generation;
+            chunk_keys.reserve(manifest.chunk_count);
+            for (uint32_t index = 0; index < manifest.chunk_count; ++index) {
+                chunk_keys.push_back(durableChunkKey(generation, index));
+            }
+        }
+    }
+    g_durable_manifest_found = found;
+    g_durable_generation = generation;
+    g_durable_manifest = std::move(manifest_bytes);
+    g_durable_chunk_keys = std::move(chunk_keys);
+    return true;
+}
+
+void bestEffortDeleteOpaqueValues(const std::vector<std::string>& keys) {
+    std::string ignored;
+    deleteOpaqueValues(keys, &ignored);
+}
+
+bool persistDurableState(std::string* error) {
+    if (!g_database) {
+        if (error) *error = "FlatSQL database is not configured";
+        return false;
+    }
+    if (g_durable_generation == std::numeric_limits<uint64_t>::max()) {
+        if (error) *error = "opaque snapshot generation is exhausted";
+        return false;
+    }
+    const std::vector<uint8_t> snapshot_bytes = createSnapshotBytes();
+    DurableManifest next;
+    next.generation = g_durable_generation + 1;
+    next.total_size = snapshot_bytes.size();
+    next.chunk_size = static_cast<uint32_t>(kOpaqueChunkBytes);
+    next.chunk_count = snapshot_bytes.empty()
+        ? 0
+        : static_cast<uint32_t>(
+            (snapshot_bytes.size() - 1) / kOpaqueChunkBytes + 1);
+    next.digest = sha256(snapshot_bytes);
+
+    std::vector<std::string> next_chunk_keys;
+    next_chunk_keys.reserve(next.chunk_count);
+    for (uint32_t index = 0; index < next.chunk_count; ++index) {
+        const size_t offset = static_cast<size_t>(index) * kOpaqueChunkBytes;
+        const size_t length = std::min(
+            kOpaqueChunkBytes,
+            snapshot_bytes.size() - offset);
+        const std::string key = durableChunkKey(next.generation, index);
+        next_chunk_keys.push_back(key);
+        const std::vector<uint8_t> chunk(
+            snapshot_bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+            snapshot_bytes.begin() +
+                static_cast<std::ptrdiff_t>(offset + length));
+        if (!replaceOpaqueValue(key, chunk, error)) {
+            const std::string primary_error = error ? *error : std::string();
+            bestEffortDeleteOpaqueValues(next_chunk_keys);
+            if (error) *error = primary_error;
+            return false;
+        }
+    }
+    if (!syncOpaqueState(error)) {
+        const std::string primary_error = error ? *error : std::string();
+        bestEffortDeleteOpaqueValues(next_chunk_keys);
+        if (error) *error = primary_error;
+        return false;
+    }
+
+    const std::vector<uint8_t> next_manifest = encodeDurableManifest(next);
+    if (!replaceOpaqueValue(kOpaqueManifestKey, next_manifest, error)) {
+        const std::string primary_error = error ? *error : std::string();
+        bestEffortDeleteOpaqueValues(next_chunk_keys);
+        if (error) *error = primary_error;
+        return false;
+    }
+    if (!syncOpaqueState(error)) {
+        const std::string primary_error = error ? *error : std::string();
+        std::string rollback_error;
+        const bool manifest_restored = g_durable_manifest_found
+            ? replaceOpaqueValue(
+                kOpaqueManifestKey,
+                g_durable_manifest,
+                &rollback_error)
+            : deleteOpaqueValue(kOpaqueManifestKey, &rollback_error);
+        const bool rollback_synced = manifest_restored &&
+            syncOpaqueState(&rollback_error);
+        if (rollback_synced) {
+            bestEffortDeleteOpaqueValues(next_chunk_keys);
+        } else {
+            g_durable_state_checked = false;
+            g_durable_state_poisoned = true;
+            g_durable_poison_error =
+                "opaque snapshot commit is indeterminate after manifest rollback failure";
+        }
+        if (error) {
+            *error = primary_error;
+            if (!rollback_synced) {
+                *error += "; manifest rollback failed: " + rollback_error;
+            }
+        }
+        return false;
+    }
+
+    const std::vector<std::string> previous_chunk_keys =
+        g_durable_chunk_keys;
+    g_durable_manifest_found = true;
+    g_durable_generation = next.generation;
+    g_durable_manifest = next_manifest;
+    g_durable_chunk_keys = next_chunk_keys;
+    g_durable_state_checked = true;
+    g_durable_state_poisoned = false;
+    g_durable_poison_error.clear();
+    bestEffortDeleteOpaqueValues(previous_chunk_keys);
+    return true;
+}
+
+struct InMemoryRollbackState {
+    bool configured = false;
+    std::vector<uint8_t> snapshot;
+};
+
+InMemoryRollbackState captureInMemoryState() {
+    InMemoryRollbackState state;
+    state.configured = g_database != nullptr;
+    if (state.configured) state.snapshot = createSnapshotBytes();
+    return state;
+}
+
+void clearInMemoryState() {
+    if (g_database) flatsql_destroy_db(g_database);
+    g_database = nullptr;
+    g_schema_idl.clear();
+    g_database_name.clear();
+    g_table_bindings.clear();
+    g_reflection_schema.clear();
+    g_views.clear();
+    g_retention_max_records = 0;
+    g_retention_max_age_millis = 0;
+    g_compaction_target_bytes = 0;
+}
+
+bool restoreInMemoryState(
+    const InMemoryRollbackState& state,
+    std::string* error) {
+    if (!state.configured) {
+        clearInMemoryState();
+        return true;
+    }
+    std::string error_code;
+    return installSnapshotBytes(state.snapshot, &error_code, error);
+}
+
+int durableStateFailure(
+    flatSqlNodeOperation operation,
+    uint64_t request_id,
+    uint32_t wire_format,
+    const char* error_code,
+    const std::string& error) {
+    return pushStatus(
+        operation,
+        request_id,
+        flatSqlNodeStatus_INTERNAL_ERROR,
+        0,
+        0,
+        error_code,
+        error,
+        wire_format);
+}
+
+int durableMutationFailure(
+    flatSqlNodeOperation operation,
+    uint64_t request_id,
+    uint32_t wire_format,
+    const InMemoryRollbackState& rollback,
+    const std::string& persistence_error) {
+    std::string message = persistence_error;
+    std::string rollback_error;
+    if (!restoreInMemoryState(rollback, &rollback_error)) {
+        message += "; in-memory rollback failed: " + rollback_error;
+    }
+    return durableStateFailure(
+        operation,
+        request_id,
+        wire_format,
+        "durable-state-persist-failed",
+        message);
+}
+
 bool trimRecordStream(
     const std::vector<uint8_t>& source,
     uint64_t max_records,
@@ -1520,10 +2354,21 @@ extern "C" int configure_index(void) {
             control.wire_format,
             error);
     }
+    if (!ensureDurableStateLoaded(&error)) {
+        return durableStateFailure(
+            flatSqlNodeOperation_CONFIGURE_INDEX,
+            control.request_id,
+            control.wire_format,
+            "durable-state-load-failed",
+            error);
+    }
     std::string error_code;
+    const bool configuration_unchanged = configurationMatches(control);
+    InMemoryRollbackState rollback;
+    if (!configuration_unchanged) rollback = captureInMemoryState();
     if (!applyConfiguration(
             control,
-            false,
+            configuration_unchanged,
             &error_code,
             &error)) {
         return pushStatus(
@@ -1535,6 +2380,14 @@ extern "C" int configure_index(void) {
             error_code.c_str(),
             error,
             control.wire_format);
+    }
+    if (!configuration_unchanged && !persistDurableState(&error)) {
+        return durableMutationFailure(
+            flatSqlNodeOperation_CONFIGURE_INDEX,
+            control.request_id,
+            control.wire_format,
+            rollback,
+            error);
     }
     return pushStatus(
         flatSqlNodeOperation_CONFIGURE_INDEX,
@@ -1568,6 +2421,14 @@ extern "C" int append_records(void) {
                 control.request_id,
                 control.wire_format,
                 "append_records accepts at most one configuration frame");
+        }
+        if (!ensureDurableStateLoaded(&error)) {
+            return durableStateFailure(
+                flatSqlNodeOperation_APPEND_RECORDS,
+                control.request_id,
+                control.wire_format,
+                "durable-state-load-failed",
+                error);
         }
         std::string error_code;
         if (!validateConfiguration(control, &error_code, &error) ||
@@ -1609,6 +2470,9 @@ extern "C" int append_records(void) {
                 "append_records requires control or records input");
         }
         std::string error_code;
+        const bool configuration_unchanged = configurationMatches(control);
+        InMemoryRollbackState rollback;
+        if (!configuration_unchanged) rollback = captureInMemoryState();
         if (!applyConfiguration(
                 control,
                 true,
@@ -1623,6 +2487,14 @@ extern "C" int append_records(void) {
                 error_code.c_str(),
                 error,
                 control.wire_format);
+        }
+        if (!configuration_unchanged && !persistDurableState(&error)) {
+            return durableMutationFailure(
+                flatSqlNodeOperation_CONFIGURE_INDEX,
+                control.request_id,
+                control.wire_format,
+                rollback,
+                error);
         }
         return pushStatus(
             flatSqlNodeOperation_CONFIGURE_INDEX,
@@ -1642,6 +2514,14 @@ extern "C" int append_records(void) {
         wire_format = control.wire_format;
     } else {
         request_id = streams.front().request_id;
+    }
+    if (!has_control && !ensureDurableStateLoaded(&error)) {
+        return durableStateFailure(
+            flatSqlNodeOperation_APPEND_RECORDS,
+            request_id,
+            wire_format,
+            "durable-state-load-failed",
+            error);
     }
     if (!g_database && !has_control) {
         return pushStatus(
@@ -1745,6 +2625,7 @@ extern "C" int append_records(void) {
             stream.data.begin(),
             stream.data.end());
     }
+    const InMemoryRollbackState rollback = captureInMemoryState();
     const uint64_t consumed_bytes = static_cast<uint64_t>(flatsql_ingest(
         append_database,
         combined_stream.empty() ? nullptr : combined_stream.data(),
@@ -1764,6 +2645,14 @@ extern "C" int append_records(void) {
             append_database,
             std::move(staged_reflection_schema));
         staged_database = false;
+    }
+    if (!persistDurableState(&error)) {
+        return durableMutationFailure(
+            flatSqlNodeOperation_APPEND_RECORDS,
+            request_id,
+            wire_format,
+            rollback,
+            error);
     }
     return pushStatus(
         flatSqlNodeOperation_APPEND_RECORDS,
@@ -1796,6 +2685,14 @@ extern "C" int query_records(void) {
             control.request_id,
             control.wire_format,
             "query_records requires QUERY_RECORDS operation");
+    }
+    if (!ensureDurableStateLoaded(&error)) {
+        return durableStateFailure(
+            flatSqlNodeOperation_QUERY_RECORDS,
+            control.request_id,
+            control.wire_format,
+            "durable-state-load-failed",
+            error);
     }
     if (!g_database) {
         return pushStatus(
@@ -1899,6 +2796,14 @@ extern "C" int upsert_view(void) {
             control.wire_format,
             "upsert_view requires a view name and SQL query");
     }
+    if (!ensureDurableStateLoaded(&error)) {
+        return durableStateFailure(
+            flatSqlNodeOperation_UPSERT_VIEW,
+            control.request_id,
+            control.wire_format,
+            "durable-state-load-failed",
+            error);
+    }
     if (!g_database) {
         return pushStatus(
             flatSqlNodeOperation_UPSERT_VIEW,
@@ -1921,10 +2826,19 @@ extern "C" int upsert_view(void) {
             "UPSERT_KEY_EXPRESSION is not supported by named query views",
             control.wire_format);
     }
+    const InMemoryRollbackState rollback = captureInMemoryState();
     g_views[control.view_name] = {
         control.query,
         control.upsert_key_expression,
     };
+    if (!persistDurableState(&error)) {
+        return durableMutationFailure(
+            flatSqlNodeOperation_UPSERT_VIEW,
+            control.request_id,
+            control.wire_format,
+            rollback,
+            error);
+    }
     return pushStatus(
         flatSqlNodeOperation_UPSERT_VIEW,
         control.request_id,
@@ -1956,6 +2870,14 @@ extern "C" int compact(void) {
             control.request_id,
             control.wire_format,
             "compact requires COMPACT operation");
+    }
+    if (!ensureDurableStateLoaded(&error)) {
+        return durableStateFailure(
+            flatSqlNodeOperation_COMPACT,
+            control.request_id,
+            control.wire_format,
+            "durable-state-load-failed",
+            error);
     }
     if (!g_database) {
         return pushStatus(
@@ -2056,9 +2978,18 @@ extern "C" int compact(void) {
             }
         }
     }
+    const InMemoryRollbackState rollback = captureInMemoryState();
     flatsql_destroy_db(g_database);
     g_database = replacement;
     g_reflection_schema = std::move(replacement_reflection_schema);
+    if (!persistDurableState(&error)) {
+        return durableMutationFailure(
+            flatSqlNodeOperation_COMPACT,
+            control.request_id,
+            control.wire_format,
+            rollback,
+            error);
+    }
     return pushStatus(
         flatSqlNodeOperation_COMPACT,
         control.request_id,
@@ -2091,6 +3022,14 @@ extern "C" int configure_retention(void) {
             control.wire_format,
             "configure_retention requires CONFIGURE_RETENTION operation");
     }
+    if (!ensureDurableStateLoaded(&error)) {
+        return durableStateFailure(
+            flatSqlNodeOperation_CONFIGURE_RETENTION,
+            control.request_id,
+            control.wire_format,
+            "durable-state-load-failed",
+            error);
+    }
     if (!g_database) {
         return pushStatus(
             flatSqlNodeOperation_CONFIGURE_RETENTION,
@@ -2114,9 +3053,18 @@ extern "C" int configure_retention(void) {
             "this node supports RETENTION_MAX_RECORDS only; max-age and target-bytes require a typed timestamp/size policy",
             control.wire_format);
     }
+    const InMemoryRollbackState rollback = captureInMemoryState();
     g_retention_max_records = control.retention_max_records;
     g_retention_max_age_millis = 0;
     g_compaction_target_bytes = 0;
+    if (!persistDurableState(&error)) {
+        return durableMutationFailure(
+            flatSqlNodeOperation_CONFIGURE_RETENTION,
+            control.request_id,
+            control.wire_format,
+            rollback,
+            error);
+    }
     return pushStatus(
         flatSqlNodeOperation_CONFIGURE_RETENTION,
         control.request_id,
@@ -2148,6 +3096,14 @@ extern "C" int snapshot(void) {
             control.request_id,
             control.wire_format,
             "snapshot requires SNAPSHOT operation");
+    }
+    if (!ensureDurableStateLoaded(&error)) {
+        return durableStateFailure(
+            flatSqlNodeOperation_SNAPSHOT,
+            control.request_id,
+            control.wire_format,
+            "durable-state-load-failed",
+            error);
     }
     if (!g_database) {
         return pushStatus(
@@ -2235,70 +3191,35 @@ extern "C" int reload(void) {
             "FSB snapshot SHA256 does not match DATA",
             wire_format);
     }
-    SnapshotState state;
-    if (!parseSnapshotBytes(snapshot_bytes, &state, &error)) {
+    if (!prepareDurableStateForExplicitReload(&error)) {
+        return durableStateFailure(
+            flatSqlNodeOperation_RELOAD,
+            request_id,
+            wire_format,
+            "durable-state-load-failed",
+            error);
+    }
+    const InMemoryRollbackState rollback = captureInMemoryState();
+    std::string error_code;
+    if (!installSnapshotBytes(snapshot_bytes, &error_code, &error)) {
         return pushStatus(
             flatSqlNodeOperation_RELOAD,
             request_id,
             flatSqlNodeStatus_INVALID_ARGUMENT,
             0,
             0,
-            "snapshot-invalid",
+            error_code.c_str(),
             error,
             wire_format);
     }
-    std::vector<uint8_t> replacement_reflection_schema;
-    void* replacement = createConfiguredDatabase(
-        state.schema_idl,
-        state.database_name,
-        state.table_bindings,
-        &replacement_reflection_schema,
-        &error);
-    if (!replacement) {
-        return pushStatus(
+    if (!persistDurableState(&error)) {
+        return durableMutationFailure(
             flatSqlNodeOperation_RELOAD,
             request_id,
-            flatSqlNodeStatus_INVALID_ARGUMENT,
-            0,
-            0,
-            "snapshot-schema-invalid",
-            error,
-            wire_format);
+            wire_format,
+            rollback,
+            error);
     }
-    uint64_t stored_records = 0;
-    if (!verifyRecordStream(
-            state.storage,
-            nullptr,
-            nullptr,
-            state.table_bindings,
-            replacement_reflection_schema,
-            &stored_records,
-            &error)) {
-        flatsql_destroy_db(replacement);
-        return pushStatus(
-            flatSqlNodeOperation_RELOAD,
-            request_id,
-            flatSqlNodeStatus_INVALID_ARGUMENT,
-            0,
-            0,
-            "snapshot-record-stream-invalid",
-            error,
-            wire_format);
-    }
-    flatsql_load_and_rebuild(
-        replacement,
-        state.storage.empty() ? nullptr : state.storage.data(),
-        state.storage.size());
-    if (g_database) flatsql_destroy_db(g_database);
-    g_database = replacement;
-    g_schema_idl = std::move(state.schema_idl);
-    g_database_name = std::move(state.database_name);
-    g_table_bindings = std::move(state.table_bindings);
-    g_reflection_schema = std::move(replacement_reflection_schema);
-    g_views = std::move(state.views);
-    g_retention_max_records = state.retention_max_records;
-    g_retention_max_age_millis = state.retention_max_age_millis;
-    g_compaction_target_bytes = state.compaction_target_bytes;
     return pushStatus(
         flatSqlNodeOperation_RELOAD,
         request_id,

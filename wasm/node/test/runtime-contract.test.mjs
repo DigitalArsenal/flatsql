@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -11,10 +12,9 @@ import { loadFlatSQLStandalone } from "../../standalone.js";
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const nodeDirectory = path.resolve(testDirectory, "..");
 const repositoriesDirectory = path.resolve(testDirectory, "../../../../..");
-const sdkDirectory = path.join(
-  repositoriesDirectory,
-  "ancillary-packages/space-data-module-sdk",
-);
+const sdkDirectory = process.env.SPACE_DATA_MODULE_SDK_ROOT
+  ? path.resolve(process.env.SPACE_DATA_MODULE_SDK_ROOT)
+  : path.join(repositoriesDirectory, "ancillary-packages/space-data-module-sdk");
 const manifest = JSON.parse(
   await readFile(path.join(nodeDirectory, "plugin-manifest.json"), "utf8"),
 );
@@ -40,6 +40,7 @@ const FSO_OPERATION = Object.freeze({
 });
 const FSO_STATUS_COMPLETE = 4;
 const FSO_STATUS_INVALID_ARGUMENT = 5;
+const FSO_STATUS_INTERNAL_ERROR = 10;
 const FSB_KIND = Object.freeze({
   RECORD_STREAM: 1,
   QUERY_RESULT: 2,
@@ -80,7 +81,7 @@ function sdkUrl(relativePath) {
   return pathToFileURL(path.join(sdkDirectory, relativePath)).href;
 }
 
-async function createHarness() {
+async function createHarness(options = {}) {
   const wasmEdgeRunner = process.env.FLATSQL_NODE_WASMEDGE_RUNNER;
   if (wasmEdgeRunner) {
     const wasmPath = process.env.FLATSQL_NODE_WASMEDGE_WASM;
@@ -102,15 +103,94 @@ async function createHarness() {
   const { createBrowserModuleHarness } = await import(
     sdkUrl("src/testing/browserModuleHarness.js")
   );
+  const hostcallDispatch =
+    options.hostcallDispatch ?? createOpaqueStateAdapter().dispatch;
   return createBrowserModuleHarness({
     wasmSource: artifactBytes,
     manifest,
     surface: "direct",
+    hostcallDispatch,
     verifySignature: {
       trustedPublicKeys: [publisher.publicKeyHex],
       requireSignature: true,
     },
   });
+}
+
+function createOpaqueStateAdapter(options = {}) {
+  const values = new Map();
+  const calls = [];
+  const scheduledFailures = [];
+  const storageKey = (params) => `${params.namespace}\0${params.key}`;
+  const visibleKeys = () =>
+    [...values.keys()].map((key) => key.split("\0").at(-1)).sort();
+  return {
+    calls,
+    failNext(operation, occurrence = 1) {
+      assert.ok(Number.isInteger(occurrence) && occurrence > 0);
+      scheduledFailures.push({ operation, remaining: occurrence });
+    },
+    keys() {
+      return visibleKeys();
+    },
+    mutate(key, mutate) {
+      const storage = storageKey({ namespace: "primary", key });
+      const current = values.get(storage);
+      assert.ok(current, `opaque key ${key} exists`);
+      const replacement = current.slice();
+      mutate(replacement);
+      values.set(storage, replacement);
+    },
+    copy(sourceKey, targetKey) {
+      const source = values.get(storageKey({
+        namespace: "primary",
+        key: sourceKey,
+      }));
+      assert.ok(source, `opaque key ${sourceKey} exists`);
+      values.set(
+        storageKey({ namespace: "primary", key: targetKey }),
+        source.slice(),
+      );
+    },
+    dispatch(operation, params) {
+      calls.push({ operation, params });
+      const failure = scheduledFailures.find(
+        (candidate) => candidate.operation === operation,
+      );
+      if (failure) {
+        failure.remaining -= 1;
+        if (failure.remaining === 0) {
+          scheduledFailures.splice(scheduledFailures.indexOf(failure), 1);
+          throw new Error(`injected ${operation} failure`);
+        }
+      }
+      if (operation === "storage.adapter.opaque.read") {
+        const value = values.get(storageKey(params));
+        return {
+          found: value !== undefined,
+          bytes_b64: options.base64Reads
+            ? Buffer.from(value ?? new Uint8Array()).toString("base64")
+            : value?.slice() ?? new Uint8Array(),
+        };
+      }
+      if (operation === "storage.adapter.opaque.replace") {
+        assert.ok(params.data instanceof Uint8Array);
+        values.set(storageKey(params), params.data.slice());
+        return { stored_bytes: params.data.byteLength };
+      }
+      if (operation === "storage.adapter.opaque.sync") {
+        return { synced: true };
+      }
+      if (operation === "storage.adapter.opaque.list") {
+        return { keys: visibleKeys() };
+      }
+      if (operation === "storage.adapter.opaque.delete") {
+        values.delete(storageKey(params));
+        return { deleted: true };
+      }
+      throw new Error(`unexpected opaque-state operation: ${operation}`);
+    },
+  };
 }
 
 function methodType(methodId, direction, portId, wireFormat) {
@@ -462,6 +542,18 @@ function assertRejected(response, expectedOperation, requestId) {
   return status;
 }
 
+function assertInternalError(response, expectedOperation, requestId, errorCode) {
+  assert.equal(response.statusCode, 0, response.errorMessage ?? response.errorCode);
+  const statusFrame = response.outputs.find((frame) => frame.portId === "status");
+  assert.ok(statusFrame, "failed operation emits status");
+  const status = decodeOutputFrame(statusFrame);
+  assert.equal(status.operation, expectedOperation);
+  assert.equal(status.requestId, BigInt(requestId));
+  assert.equal(status.status, FSO_STATUS_INTERNAL_ERROR);
+  assert.equal(status.errorCode, errorCode);
+  return status;
+}
+
 function wrapSizePrefixed(records) {
   const total = records.reduce((sum, record) => sum + 4 + record.byteLength, 0);
   const stream = new Uint8Array(total);
@@ -525,7 +617,7 @@ async function configure(harness, wireFormat, requestId = 1) {
   assertComplete(response, FSO_OPERATION.CONFIGURE_INDEX, requestId);
 }
 
-async function append(harness, wireFormat, data, requestId = 2) {
+async function invokeAppend(harness, wireFormat, data, requestId = 2) {
   const typeRef = methodType("append_records", "input", "records", wireFormat);
   const payloadOptions = {
     requestId,
@@ -541,14 +633,24 @@ async function append(harness, wireFormat, data, requestId = 2) {
   const payload = wireFormat === "aligned-binary"
     ? buildAlignedFsb(payloadOptions)
     : buildCanonicalFsb(payloadOptions);
-  const response = await harness.invoke({
+  return harness.invoke({
     methodId: "append_records",
     inputs: [{ portId: "records", typeRef, payload }],
   });
+}
+
+async function append(harness, wireFormat, data, requestId = 2) {
+  const response = await invokeAppend(harness, wireFormat, data, requestId);
   return assertComplete(response, FSO_OPERATION.APPEND_RECORDS, requestId);
 }
 
-async function query(harness, wireFormat, queryText, requestId = 3, viewName = "") {
+async function invokeQuery(
+  harness,
+  wireFormat,
+  queryText,
+  requestId = 3,
+  viewName = "",
+) {
   const typeRef = methodType("query_records", "input", "query", wireFormat);
   const payloadOptions = {
     operation: FSO_OPERATION.QUERY_RECORDS,
@@ -559,10 +661,20 @@ async function query(harness, wireFormat, queryText, requestId = 3, viewName = "
   const payload = wireFormat === "aligned-binary"
     ? buildAlignedFso(payloadOptions)
     : buildCanonicalFso(payloadOptions);
-  const response = await harness.invoke({
+  return harness.invoke({
     methodId: "query_records",
     inputs: [{ portId: "query", typeRef, payload }],
   });
+}
+
+async function query(harness, wireFormat, queryText, requestId = 3, viewName = "") {
+  const response = await invokeQuery(
+    harness,
+    wireFormat,
+    queryText,
+    requestId,
+    viewName,
+  );
   assertComplete(response, FSO_OPERATION.QUERY_RECORDS, requestId);
   return { response, ...outputStream(response, "records") };
 }
@@ -1146,6 +1258,446 @@ test("snapshot reloads into a fresh signed node with byte-identical query output
   } finally {
     target.destroy();
   }
+});
+
+test("append persists a node-owned snapshot that a fresh signed instance reloads automatically", async () => {
+  const fixtureRuntime = await loadFlatSQLStandalone();
+  const expected = wrapSizePrefixed([
+    fixtureRuntime.createTestUser(77, "Durable", "durable@example.com", 42),
+  ]);
+  const opaqueState = createOpaqueStateAdapter({ base64Reads: true });
+  const source = await createHarness({
+    hostcallDispatch: opaqueState.dispatch,
+  });
+  try {
+    await configure(source, "flatbuffer", 201);
+    await append(source, "flatbuffer", expected, 202);
+  } finally {
+    source.destroy();
+  }
+
+  assert.deepEqual(
+    opaqueState.calls.map(({ operation }) => operation),
+    [
+      "storage.adapter.opaque.read",
+      "storage.adapter.opaque.list",
+      "storage.adapter.opaque.replace",
+      "storage.adapter.opaque.sync",
+      "storage.adapter.opaque.replace",
+      "storage.adapter.opaque.sync",
+      "storage.adapter.opaque.replace",
+      "storage.adapter.opaque.sync",
+      "storage.adapter.opaque.replace",
+      "storage.adapter.opaque.sync",
+      "storage.adapter.opaque.delete",
+      "storage.adapter.opaque.sync",
+    ],
+    "the signed node stages chunks, commits the manifest, then cleans the prior generation",
+  );
+  for (const { params } of opaqueState.calls) {
+    assert.equal(params.namespace, "primary");
+  }
+  assert.deepEqual(
+    opaqueState.calls
+      .filter(({ operation }) => operation === "storage.adapter.opaque.replace")
+      .map(({ params }) => params.key),
+    [
+      "snapshot.g1.c0.bin",
+      "snapshot.manifest",
+      "snapshot.g2.c0.bin",
+      "snapshot.manifest",
+    ],
+  );
+  assert.equal(
+    opaqueState.calls.find(({ operation }) => operation === "storage.adapter.opaque.delete")
+      .params.key,
+    "snapshot.g1.c0.bin",
+  );
+
+  const targetCallOffset = opaqueState.calls.length;
+  const target = await createHarness({
+    hostcallDispatch: opaqueState.dispatch,
+  });
+  try {
+    await configure(target, "flatbuffer", 203);
+    assert.deepEqual(
+      (await query(
+        target,
+        "flatbuffer",
+        "SELECT _data FROM User ORDER BY id",
+        204,
+      )).data,
+      expected,
+    );
+  } finally {
+    target.destroy();
+  }
+  assert.deepEqual(
+    opaqueState.calls.slice(targetCallOffset).map(({ operation }) => operation),
+    [
+      "storage.adapter.opaque.read",
+      "storage.adapter.opaque.read",
+      "storage.adapter.opaque.list",
+    ],
+    "a fresh signed instance restores the committed manifest and chunk without explicit reload",
+  );
+});
+
+test("opaque replace and commit-sync failures roll back live and restart-visible rows", async () => {
+  const fixtureRuntime = await loadFlatSQLStandalone();
+  const baseline = wrapSizePrefixed([
+    fixtureRuntime.createTestUser(80, "Baseline", "baseline@example.com", 40),
+  ]);
+  const candidates = [
+    {
+      operation: "storage.adapter.opaque.replace",
+      occurrence: 1,
+      record: fixtureRuntime.createTestUser(81, "Replace", "replace@example.com", 41),
+    },
+    {
+      operation: "storage.adapter.opaque.sync",
+      occurrence: 2,
+      record: fixtureRuntime.createTestUser(82, "Sync", "sync@example.com", 42),
+    },
+  ];
+  const opaqueState = createOpaqueStateAdapter();
+  const source = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  try {
+    await configure(source, "flatbuffer", 210);
+    await append(source, "flatbuffer", baseline, 211);
+
+    for (let index = 0; index < candidates.length; index += 1) {
+      const candidate = candidates[index];
+      opaqueState.failNext(candidate.operation, candidate.occurrence);
+      const requestId = 212 + index * 3;
+      assertInternalError(
+        await invokeAppend(
+          source,
+          "flatbuffer",
+          wrapSizePrefixed([candidate.record]),
+          requestId,
+        ),
+        FSO_OPERATION.APPEND_RECORDS,
+        requestId,
+        "durable-state-persist-failed",
+      );
+      assert.deepEqual(
+        (await query(
+          source,
+          "flatbuffer",
+          "SELECT _data FROM User ORDER BY id",
+          requestId + 1,
+        )).data,
+        baseline,
+        "failed persistence rolls back the live database",
+      );
+
+      const fresh = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+      try {
+        assert.deepEqual(
+          (await query(
+            fresh,
+            "flatbuffer",
+            "SELECT _data FROM User ORDER BY id",
+            requestId + 2,
+          )).data,
+          baseline,
+          "failed persistence leaves the prior committed generation restart-visible",
+        );
+      } finally {
+        fresh.destroy();
+      }
+      assert.deepEqual(
+        opaqueState.keys(),
+        ["snapshot.g2.c0.bin", "snapshot.manifest"],
+        "failed generations are cleaned without deleting the prior commit",
+      );
+    }
+  } finally {
+    source.destroy();
+  }
+});
+
+test("indeterminate manifest rollback poisons normal APIs until explicit repair", async () => {
+  const fixtureRuntime = await loadFlatSQLStandalone();
+  const baseline = wrapSizePrefixed([
+    fixtureRuntime.createTestUser(90, "Poison Base", "poison-base@example.com", 50),
+  ]);
+  const candidate = wrapSizePrefixed([
+    fixtureRuntime.createTestUser(91, "Poison Next", "poison-next@example.com", 51),
+  ]);
+  const opaqueState = createOpaqueStateAdapter();
+  const source = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  try {
+    await configure(source, "flatbuffer", 220);
+    await append(source, "flatbuffer", baseline, 221);
+    const snapshotType = methodType("snapshot", "input", "control", "flatbuffer");
+    const snapshotResponse = await source.invoke({
+      methodId: "snapshot",
+      inputs: [{
+        portId: "control",
+        typeRef: snapshotType,
+        payload: buildCanonicalFso({
+          operation: FSO_OPERATION.SNAPSHOT,
+          requestId: 225,
+        }),
+      }],
+    });
+    assertComplete(snapshotResponse, FSO_OPERATION.SNAPSHOT, 225);
+    const snapshotFrames = snapshotResponse.outputs.filter(
+      (frame) => frame.portId === "snapshot",
+    );
+    opaqueState.failNext("storage.adapter.opaque.sync", 2);
+    opaqueState.failNext("storage.adapter.opaque.replace", 3);
+    assertInternalError(
+      await invokeAppend(source, "flatbuffer", candidate, 222),
+      FSO_OPERATION.APPEND_RECORDS,
+      222,
+      "durable-state-persist-failed",
+    );
+    for (const requestId of [223, 224]) {
+      assertInternalError(
+        await invokeQuery(
+          source,
+          "flatbuffer",
+          "SELECT _data FROM User ORDER BY id",
+          requestId,
+        ),
+        FSO_OPERATION.QUERY_RECORDS,
+        requestId,
+        "durable-state-load-failed",
+      );
+    }
+    const reloadType = methodType("reload", "input", "snapshot", "flatbuffer");
+    assertComplete(
+      await source.invoke({
+        methodId: "reload",
+        inputs: snapshotFrames.map((frame) => ({
+          portId: "snapshot",
+          typeRef: reloadType,
+          payload: frame.payload,
+        })),
+      }),
+      FSO_OPERATION.RELOAD,
+      225,
+    );
+    assert.deepEqual(
+      (await query(
+        source,
+        "flatbuffer",
+        "SELECT _data FROM User ORDER BY id",
+        226,
+      )).data,
+      baseline,
+      "explicit reload is the only operation that clears the poison state",
+    );
+  } finally {
+    source.destroy();
+  }
+});
+
+test("opaque snapshots are digest-checked chunks below the browser hostcall ceiling", async () => {
+  const fixtureRuntime = await loadFlatSQLStandalone();
+  const records = [];
+  let recordStreamBytes = 0;
+  for (let index = 0; recordStreamBytes < 1_200_000; index += 1) {
+    const record = fixtureRuntime.createTestUser(
+      20_000 + index,
+      `Durable Chunk ${index}`,
+      `durable-chunk-${index}@example.com`,
+      20 + (index % 70),
+    );
+    records.push(record);
+    recordStreamBytes += 4 + record.byteLength;
+  }
+  const expected = wrapSizePrefixed(records);
+  const opaqueState = createOpaqueStateAdapter();
+  const source = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  let snapshotFrames;
+  try {
+    await configure(source, "flatbuffer", 230);
+    await append(source, "flatbuffer", expected, 231);
+    const snapshotType = methodType("snapshot", "input", "control", "flatbuffer");
+    const snapshotResponse = await source.invoke({
+      methodId: "snapshot",
+      inputs: [{
+        portId: "control",
+        typeRef: snapshotType,
+        payload: buildCanonicalFso({
+          operation: FSO_OPERATION.SNAPSHOT,
+          requestId: 234,
+        }),
+      }],
+    });
+    assertComplete(snapshotResponse, FSO_OPERATION.SNAPSHOT, 234);
+    snapshotFrames = snapshotResponse.outputs.filter(
+      (frame) => frame.portId === "snapshot",
+    );
+  } finally {
+    source.destroy();
+  }
+
+  const committedChunks = opaqueState.keys().filter((key) =>
+    key.startsWith("snapshot.g2.c")
+  );
+  assert.ok(committedChunks.length >= 2, "the catalog spans multiple opaque chunks");
+  const chunkWrites = opaqueState.calls.filter(({ operation, params }) =>
+    operation === "storage.adapter.opaque.replace" &&
+      params.key.startsWith("snapshot.g2.c")
+  );
+  assert.equal(chunkWrites.length, committedChunks.length);
+  assert.equal(
+    Math.max(...chunkWrites.map(({ params }) => params.data.byteLength)),
+    1024 * 1024,
+    "node-owned chunks stay well below the canonical 16 MiB bridge request limit",
+  );
+
+  const target = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  try {
+    assert.deepEqual(
+      (await query(
+        target,
+        "flatbuffer",
+        "SELECT _data FROM User ORDER BY id",
+        232,
+      )).data,
+      expected,
+    );
+  } finally {
+    target.destroy();
+  }
+
+  opaqueState.mutate(committedChunks[0], (bytes) => {
+    bytes[Math.floor(bytes.byteLength / 2)] ^= 0x01;
+  });
+  const corrupted = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  try {
+    const queryType = methodType("query_records", "input", "query", "flatbuffer");
+    const response = await corrupted.invoke({
+      methodId: "query_records",
+      inputs: [{
+        portId: "query",
+        typeRef: queryType,
+        payload: buildCanonicalFso({
+          operation: FSO_OPERATION.QUERY_RECORDS,
+          requestId: 233,
+          query: "SELECT _data FROM User ORDER BY id",
+        }),
+      }],
+    });
+    assertInternalError(
+      response,
+      FSO_OPERATION.QUERY_RECORDS,
+      233,
+      "durable-state-load-failed",
+    );
+  } finally {
+    corrupted.destroy();
+  }
+
+  const repair = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  try {
+    const reloadType = methodType("reload", "input", "snapshot", "flatbuffer");
+    const reloadResponse = await repair.invoke({
+      methodId: "reload",
+      inputs: snapshotFrames.map((frame) => ({
+        portId: "snapshot",
+        typeRef: reloadType,
+        payload: frame.payload,
+      })),
+    });
+    assertComplete(reloadResponse, FSO_OPERATION.RELOAD, 234);
+  } finally {
+    repair.destroy();
+  }
+  const recovered = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  try {
+    assert.deepEqual(
+      (await query(
+        recovered,
+        "flatbuffer",
+        "SELECT _data FROM User ORDER BY id",
+        235,
+      )).data,
+      expected,
+      "an explicit checksum-valid snapshot repairs corrupt durable chunks",
+    );
+  } finally {
+    recovered.destroy();
+  }
+});
+
+test("fresh durable load sweeps orphan chunk generations", async () => {
+  const fixtureRuntime = await loadFlatSQLStandalone();
+  const expected = wrapSizePrefixed([
+    fixtureRuntime.createTestUser(92, "Orphan", "orphan@example.com", 52),
+  ]);
+  const opaqueState = createOpaqueStateAdapter();
+  const source = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  try {
+    await configure(source, "flatbuffer", 240);
+    await append(source, "flatbuffer", expected, 241);
+  } finally {
+    source.destroy();
+  }
+  opaqueState.copy("snapshot.g2.c0.bin", "snapshot.g999.c0.bin");
+
+  const target = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  try {
+    assert.deepEqual(
+      (await query(
+        target,
+        "flatbuffer",
+        "SELECT _data FROM User ORDER BY id",
+        242,
+      )).data,
+      expected,
+    );
+  } finally {
+    target.destroy();
+  }
+  assert.deepEqual(
+    opaqueState.keys(),
+    ["snapshot.g2.c0.bin", "snapshot.manifest"],
+    "load deletes only unreferenced FlatSQL generation chunks",
+  );
+});
+
+test("oversized durable metadata fails before chunk reads or allocation growth", async () => {
+  const opaqueState = createOpaqueStateAdapter();
+  const source = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  try {
+    await configure(source, "flatbuffer", 250);
+  } finally {
+    source.destroy();
+  }
+  opaqueState.mutate("snapshot.manifest", (bytes) => {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    view.setBigUint64(12, 513n * 1024n * 1024n, true);
+    view.setUint32(24, 513, true);
+  });
+  const callOffset = opaqueState.calls.length;
+  const target = await createHarness({ hostcallDispatch: opaqueState.dispatch });
+  try {
+    assertInternalError(
+      await invokeQuery(
+        target,
+        "flatbuffer",
+        "SELECT _data FROM User ORDER BY id",
+        251,
+      ),
+      FSO_OPERATION.QUERY_RECORDS,
+      251,
+      "durable-state-load-failed",
+    );
+  } finally {
+    target.destroy();
+  }
+  assert.deepEqual(
+    opaqueState.calls.slice(callOffset).map(({ operation }) => operation),
+    ["storage.adapter.opaque.read"],
+    "oversized metadata is rejected before reserving or fetching any chunk",
+  );
 });
 
 test("multi-chunk snapshots reload completely and reject middle-chunk corruption without mutation", async () => {
