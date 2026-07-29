@@ -22,6 +22,10 @@
       "types": "./wasm/standalone.d.ts",
       "import": "./wasm/standalone.js"
     },
+    "./artifacts": {
+      "types": "./dist/artifacts/index.d.ts",
+      "import": "./dist/artifacts/index.js"
+    },
     "./artifacts/standalone": {
       "types": "./dist/artifacts/standalone-builder.d.ts",
       "import": "./dist/artifacts/standalone-builder.js"

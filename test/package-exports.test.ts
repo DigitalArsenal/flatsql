@@ -2,12 +2,18 @@ describe('published package exports', () => {
   test('root and standalone subpaths expose production runtime entrypoints', async () => {
     const loadPackageExport = (specifier: string) => import(specifier);
     const root = await loadPackageExport('flatsql');
+    const artifacts = await loadPackageExport('flatsql/artifacts');
     const standaloneArtifacts = await loadPackageExport('flatsql/artifacts/standalone');
     const response = await loadPackageExport('flatsql/response');
     const wasmedge = await loadPackageExport('flatsql/standalone/wasmedge');
     const standalone = await loadPackageExport('flatsql/standalone');
 
-    expect(typeof root.createStandaloneArtifactBuilder).toBe('function');
+    // The root entry is browser-safe: node-only builders moved behind the
+    // 'flatsql/artifacts' and 'flatsql/standalone/wasmedge' subpath exports
+    // (they pull node:sqlite / node:os / node:child_process).
+    expect(root.FlatSQLDatabase).toBeDefined();
+    expect(root.createStandaloneArtifactBuilder).toBeUndefined();
+    expect(typeof artifacts.FlatSQLArtifactBuilder).toBe('function');
     expect(typeof root.createQueryResponseArtifact).toBe('function');
     expect(typeof response.createQueryResponseArtifact).toBe('function');
     expect(typeof response.MemoryResponseArtifactCache).toBe('function');
