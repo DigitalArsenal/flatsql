@@ -31,9 +31,7 @@ export declare class FlatSQLDatabase {
     getStorageBytes(): number;
     query(sql: string): QueryResult;
     private parseSQL;
-    private parseValue;
     private enforceRateLimit;
-    private evaluateCondition;
     getTableDef(tableName: string): TableDef | undefined;
     listTables(): string[];
     exportData(): Uint8Array;
@@ -44,4 +42,45 @@ export declare class FlatSQLDatabase {
         indexes: string[];
     }[];
 }
+export interface OrderByTerm {
+    column: string;
+    descending: boolean;
+}
+type ComparisonOperator = '=' | '!=' | '<>' | '<' | '>' | '<=' | '>=';
+export type WhereNode = {
+    kind: 'and';
+    children: WhereNode[];
+} | {
+    kind: 'or';
+    children: WhereNode[];
+} | {
+    kind: 'not';
+    child: WhereNode;
+} | {
+    kind: 'cmp';
+    column: string;
+    operator: ComparisonOperator;
+    value: any;
+} | {
+    kind: 'between';
+    column: string;
+    minValue: any;
+    maxValue: any;
+    negated: boolean;
+} | {
+    kind: 'in';
+    column: string;
+    values: any[];
+    negated: boolean;
+} | {
+    kind: 'like';
+    column: string;
+    matcher: RegExp;
+    negated: boolean;
+} | {
+    kind: 'isNull';
+    column: string;
+    negated: boolean;
+};
+export {};
 //# sourceMappingURL=database.d.ts.map
