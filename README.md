@@ -482,14 +482,29 @@ const back = sdm.fromECEF(ecef.x, ecef.y, ecef.z);
 
 ## SQL Support
 
+FlatSQL ships two query engines. The WASM engine (`initFlatSQL()`) embeds
+SQLite and speaks full SQL. The pure-JS engine (`FlatSQLDatabase`, used where a
+WASM instance is not available) implements the focused subset below.
+
+### Fail-closed guarantee
+
+Both engines reject what they cannot execute. In particular the JS engine
+**throws** on a `WHERE`, `ORDER BY`, or `LIMIT` clause its grammar does not
+understand. It never falls back to an unfiltered scan: a caller that asks for a
+subset must get that subset or an error, never the whole table with no
+indication that the filter was dropped.
+
 ### Supported
 
 - `SELECT` with column selection
-- `WHERE` with `=`, `<`, `>`, `<=`, `>=`, `BETWEEN`, `LIKE`, `AND`, `OR`
-- `ORDER BY` (ASC/DESC)
+- `WHERE` with `=`, `!=`/`<>`, `<`, `>`, `<=`, `>=`, `BETWEEN`, `IN`, `LIKE`,
+  `IS NULL`, and `AND` / `OR` / `NOT` / parentheses
+- `LIKE` with `%` and `_` wildcards, ASCII case-insensitive (the SQLite default)
+- `ORDER BY` (ASC/DESC, multiple terms)
 - `LIMIT` and `OFFSET`
-- `COUNT(*)` aggregate
-- Index-accelerated queries on `(id)` and `(key)` columns
+- `COUNT(*)` aggregate (WASM engine)
+- Index-accelerated queries on `(id)` and `(key)` columns, including as one
+  conjunct of a larger `AND` predicate
 
 ### Not Supported
 
