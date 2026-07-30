@@ -674,6 +674,32 @@ void FlatSQLDatabase::invalidateCachesIfStatementWritesUnlocked(const std::strin
     }
 }
 
+bool FlatSQLDatabase::queryNoThrow(const std::string& sql, const std::vector<Value>& params,
+                                   QueryResult& out, std::string* errOut) noexcept try {
+    std::unique_lock lock(*accessMutex_);
+    if (!sqliteInitialized_) {
+        initializeSQLiteEngine();
+    }
+    if (!sqliteEngine_->executeNoThrow(sql, params, out, errOut)) {
+        return false;
+    }
+    // Same cache invalidation as query(), through the no-throw readonly probe.
+    if (!sqliteEngine_->statementIsReadOnlyNoThrow(sql)) {
+        invalidateQueryResultCacheUnlocked();
+    }
+    return true;
+} catch (const std::exception& e) {
+    if (errOut) {
+        try { *errOut = e.what(); } catch (...) {}
+    }
+    return false;
+} catch (...) {
+    if (errOut) {
+        try { *errOut = "SQL execution error: internal failure"; } catch (...) {}
+    }
+    return false;
+}
+
 QueryResult FlatSQLDatabase::query(const std::string& sql, int64_t param) {
     // Use thread-local reusable vector for single-param queries
     static thread_local std::vector<Value> singleParam(1);
@@ -745,6 +771,63 @@ QueryResult FlatSQLDatabase::queryTemplate(const std::string& queryId,
         initializeSQLiteEngine();
     }
     return sqliteEngine_->execute(tmpl.sql, params);
+}
+
+bool FlatSQLDatabase::queryTemplateNoThrow(const std::string& queryId, const std::vector<Value>& params,
+                                           QueryResult& out, std::string* errOut) noexcept try {
+    std::unique_lock lock(*accessMutex_);
+
+    auto templateIt = queryTemplates_.find(queryId);
+    if (templateIt == queryTemplates_.end()) {
+        if (errOut) {
+            try { *errOut = "Query template not found: " + queryId; } catch (...) {}
+        }
+        return false;
+    }
+
+    const QueryTemplateDef& tmpl = templateIt->second;
+    if (tmpl.cacheable) {
+        const std::string cacheKey = buildTemplateCacheKeyUnlocked(queryId, tmpl.sql, params);
+        auto cached = queryResultCache_.find(cacheKey);
+        if (cached != queryResultCache_.end()) {
+            queryCacheHits_++;
+            queryResultCacheLru_.splice(
+                queryResultCacheLru_.begin(),
+                queryResultCacheLru_,
+                cached->second.lruIt
+            );
+            cached->second.lruIt = queryResultCacheLru_.begin();
+            out = cached->second.result;
+            return true;
+        }
+
+        queryCacheMisses_++;
+        if (!sqliteInitialized_) {
+            initializeSQLiteEngine();
+        }
+        QueryResult result;
+        if (!sqliteEngine_->executeNoThrow(tmpl.sql, params, result, errOut)) {
+            return false;
+        }
+        storeCachedQueryResultUnlocked(cacheKey, result);
+        out = std::move(result);
+        return true;
+    }
+
+    if (!sqliteInitialized_) {
+        initializeSQLiteEngine();
+    }
+    return sqliteEngine_->executeNoThrow(tmpl.sql, params, out, errOut);
+} catch (const std::exception& e) {
+    if (errOut) {
+        try { *errOut = e.what(); } catch (...) {}
+    }
+    return false;
+} catch (...) {
+    if (errOut) {
+        try { *errOut = "SQL execution error: internal failure"; } catch (...) {}
+    }
+    return false;
 }
 
 void FlatSQLDatabase::clearQueryResultCache() {

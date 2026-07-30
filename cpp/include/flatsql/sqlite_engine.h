@@ -186,6 +186,23 @@ public:
     QueryResult execute(const std::string& sql, const std::vector<Value>& params);
 
     /**
+     * Exception-free execution. Identical semantics to execute(sql, params),
+     * except every SQL failure (prepare, parameter count, bind, step) is
+     * reported as `false` + errOut instead of a throw.
+     *
+     * This is the path the C ABI must use. The WASI artifact the servers run
+     * is compiled `-fignore-exceptions` (CMakeLists FLATSQL_WASI target
+     * flatsql_wasi_noeh), which lowers every `throw` to `unreachable` — so on
+     * that artifact a throwing error path is not an error, it is a guest abort
+     * that poisons the whole engine instance. A SQL error is host-reachable
+     * input; it must never leave the guest through a trap.
+     *
+     * @return true on success; on false, out is untouched and errOut is set.
+     */
+    bool executeNoThrow(const std::string& sql, const std::vector<Value>& params,
+                        QueryResult& out, std::string* errOut) noexcept;
+
+    /**
      * Mark a record as deleted in a source.
      * The record will be skipped in future queries.
      *
@@ -233,6 +250,12 @@ public:
      * use; throws std::runtime_error for unparseable SQL like execute().
      */
     bool statementIsReadOnly(const std::string& sql) const;
+
+    /**
+     * Exception-free form of statementIsReadOnly. An unpreparable statement
+     * reports "not read-only" (conservative) instead of throwing.
+     */
+    bool statementIsReadOnlyNoThrow(const std::string& sql) const noexcept;
 
     /**
      * Get last error message.
@@ -286,8 +309,14 @@ private:
     // Get or create a prepared statement (cached)
     sqlite3_stmt* getOrPrepareStmt(const std::string& sql) const;
 
+    // Exception-free form: returns nullptr + errOut instead of throwing.
+    sqlite3_stmt* getOrPrepareStmtNoThrow(const std::string& sql, std::string* errOut) const noexcept;
+
     // Bind a Value to a prepared statement parameter
     void bindValue(sqlite3_stmt* stmt, int idx, const Value& value) const;
+
+    // Exception-free form: returns false + errOut instead of throwing.
+    bool bindValueNoThrow(sqlite3_stmt* stmt, int idx, const Value& value, std::string* errOut) const noexcept;
 
     // Clear statement cache
     void clearStmtCache();

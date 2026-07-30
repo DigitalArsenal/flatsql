@@ -59,11 +59,29 @@ static std::string sqliteModuleNameForSource(const std::string& sourceName) {
     return "__flatsql_module_" + sanitized;
 }
 
+// setErr assigns an error message without ever letting the assignment itself
+// escape. Used by the exception-free (`*NoThrow`) paths, which the C ABI calls
+// on the `-fignore-exceptions` WASI artifact where a throw is an `unreachable`.
+static void setErr(std::string* errOut, const std::string& message) noexcept {
+    if (!errOut) {
+        return;
+    }
+    try {
+        *errOut = message;
+    } catch (...) {
+        // An error message that cannot be allocated is still an error; the
+        // caller sees the false return, which is what it acts on.
+    }
+}
+
 static bool isBusyResult(int rc) {
     return rc == SQLITE_BUSY || rc == SQLITE_LOCKED;
 }
 
-static int stepWithRetry(sqlite3* db, sqlite3_stmt* stmt, const SQLiteConnectionOptions& options) {
+// Exception-free step. Returns the sqlite result code; a busy/locked result
+// that survives the retry budget is returned AS a result code (never thrown),
+// so no-eh callers can report it instead of trapping.
+static int stepWithRetryNoThrow(sqlite3_stmt* stmt, const SQLiteConnectionOptions& options) noexcept {
     int rc = SQLITE_OK;
     int delayMs = std::max(1, options.busyBackoffMs);
 
@@ -79,7 +97,15 @@ static int stepWithRetry(sqlite3* db, sqlite3_stmt* stmt, const SQLiteConnection
         delayMs = std::min(delayMs * 2, 32);
     }
 
-    throw std::runtime_error("SQLite busy/locked after retries: " + std::string(sqlite3_errmsg(db)));
+    return rc;
+}
+
+static int stepWithRetry(sqlite3* db, sqlite3_stmt* stmt, const SQLiteConnectionOptions& options) {
+    const int rc = stepWithRetryNoThrow(stmt, options);
+    if (isBusyResult(rc)) {
+        throw std::runtime_error("SQLite busy/locked after retries: " + std::string(sqlite3_errmsg(db)));
+    }
+    return rc;
 }
 
 static void execOrThrow(sqlite3* db, const char* sql) {
@@ -187,6 +213,15 @@ void SQLiteEngine::clearFastPathCaches() {
 }
 
 sqlite3_stmt* SQLiteEngine::getOrPrepareStmt(const std::string& sql) const {
+    std::string err;
+    sqlite3_stmt* stmt = getOrPrepareStmtNoThrow(sql, &err);
+    if (!stmt) {
+        throw std::runtime_error(err);
+    }
+    return stmt;
+}
+
+sqlite3_stmt* SQLiteEngine::getOrPrepareStmtNoThrow(const std::string& sql, std::string* errOut) const noexcept {
     auto it = stmtCache_.find(sql);
     if (it != stmtCache_.end()) {
         sqlite3_reset(it->second);
@@ -207,7 +242,8 @@ sqlite3_stmt* SQLiteEngine::getOrPrepareStmt(const std::string& sql) const {
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        throw std::runtime_error("SQL error: " + std::string(sqlite3_errmsg(db_)));
+        setErr(errOut, "SQL error: " + std::string(sqlite3_errmsg(db_)));
+        return nullptr;
     }
 
     stmtCache_[sql] = stmt;
@@ -426,6 +462,42 @@ void SQLiteEngine::bindValue(sqlite3_stmt* stmt, int idx, const Value& value) co
     if (rc != SQLITE_OK) {
         throw std::runtime_error("SQLite bind error: " + std::string(sqlite3_errmsg(db_)));
     }
+}
+
+bool SQLiteEngine::bindValueNoThrow(sqlite3_stmt* stmt, int idx, const Value& value,
+                                    std::string* errOut) const noexcept {
+    int rc = SQLITE_OK;
+    std::visit([&](const auto& v) {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+            rc = sqlite3_bind_null(stmt, idx);
+        } else if constexpr (std::is_same_v<T, bool>) {
+            rc = sqlite3_bind_int(stmt, idx, v ? 1 : 0);
+        } else if constexpr (std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t> || std::is_same_v<T, int32_t>) {
+            rc = sqlite3_bind_int(stmt, idx, static_cast<int>(v));
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            rc = sqlite3_bind_int64(stmt, idx, v);
+        } else if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, uint16_t> || std::is_same_v<T, uint32_t>) {
+            rc = sqlite3_bind_int(stmt, idx, static_cast<int>(v));
+        } else if constexpr (std::is_same_v<T, uint64_t>) {
+            rc = sqlite3_bind_int64(stmt, idx, static_cast<sqlite3_int64>(v));
+        } else if constexpr (std::is_same_v<T, float>) {
+            rc = sqlite3_bind_double(stmt, idx, static_cast<double>(v));
+        } else if constexpr (std::is_same_v<T, double>) {
+            rc = sqlite3_bind_double(stmt, idx, v);
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            rc = sqlite3_bind_text(stmt, idx, v.c_str(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
+        } else if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
+            rc = sqlite3_bind_blob(stmt, idx, v.empty() ? nullptr : v.data(), static_cast<int>(v.size()), SQLITE_TRANSIENT);
+        } else {
+            rc = sqlite3_bind_null(stmt, idx);
+        }
+    }, value);
+    if (rc != SQLITE_OK) {
+        setErr(errOut, "SQLite bind error: " + std::string(sqlite3_errmsg(db_)));
+        return false;
+    }
+    return true;
 }
 
 bool SQLiteEngine::validateSQL(const std::string& sql, int* paramCountOut, std::string* errOut) noexcept {
@@ -953,27 +1025,44 @@ QueryResult SQLiteEngine::execute(const std::string& sql) {
 
 QueryResult SQLiteEngine::execute(const std::string& sql, const std::vector<Value>& params) {
     QueryResult result;
+    std::string error;
+    if (!executeNoThrow(sql, params, result, &error)) {
+        throw std::runtime_error(error);
+    }
+    return result;
+}
+
+bool SQLiteEngine::executeNoThrow(const std::string& sql, const std::vector<Value>& params,
+                                  QueryResult& out, std::string* errOut) noexcept try {
+    QueryResult result;
 
     // Try fast path for simple queries
     if (tryFastPath(sql, params, result)) {
-        return result;
+        out = std::move(result);
+        return true;
     }
 
     // Use cached prepared statement
-    sqlite3_stmt* stmt = getOrPrepareStmt(sql);
+    sqlite3_stmt* stmt = getOrPrepareStmtNoThrow(sql, errOut);
+    if (!stmt) {
+        return false;
+    }
     int expectedParams = sqlite3_bind_parameter_count(stmt);
     if (expectedParams != static_cast<int>(params.size())) {
-        throw std::runtime_error(
+        setErr(errOut,
             "SQL statement expects " + std::to_string(expectedParams) +
             " parameters but received " + std::to_string(params.size())
         );
+        return false;
     }
     sqlite3_reset(stmt);
     sqlite3_clear_bindings(stmt);
 
     // Bind parameters
     for (size_t i = 0; i < params.size(); i++) {
-        bindValue(stmt, static_cast<int>(i + 1), params[i]);
+        if (!bindValueNoThrow(stmt, static_cast<int>(i + 1), params[i], errOut)) {
+            return false;
+        }
     }
 
     // Get column names
@@ -986,7 +1075,7 @@ QueryResult SQLiteEngine::execute(const std::string& sql, const std::vector<Valu
 
     // Fetch rows - optimized to reduce allocations
     int rc;
-    while ((rc = stepWithRetry(db_, stmt, options_)) == SQLITE_ROW) {
+    while ((rc = stepWithRetryNoThrow(stmt, options_)) == SQLITE_ROW) {
         result.rows.emplace_back();
         std::vector<Value>& row = result.rows.back();
         row.resize(numCols);
@@ -1032,15 +1121,40 @@ QueryResult SQLiteEngine::execute(const std::string& sql, const std::vector<Valu
     // sqlite3_reset is called by getOrPrepareStmt on next use
 
     if (rc != SQLITE_DONE) {
-        throw std::runtime_error("SQL execution error: " + std::string(sqlite3_errmsg(db_)));
+        // Constraint violations, busy/locked-after-retries, IO and corruption
+        // errors all land here. This is the exact frame that used to trap the
+        // guest under -fignore-exceptions (host-01 record-catalog hydration,
+        // graph task mod-flatsql-query-params-unreachable-trap): a SQL error
+        // is a RESULT, not an abort.
+        setErr(errOut, "SQL execution error: " + std::string(sqlite3_errmsg(db_)));
+        // Leave no bound state behind for the next user of the cached stmt.
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        return false;
     }
 
-    return result;
+    out = std::move(result);
+    return true;
+} catch (const std::exception& e) {
+    // Exceptions build only: a non-SQL internal failure still leaves through
+    // the value channel so both artifacts behave identically.
+    setErr(errOut, e.what());
+    return false;
+} catch (...) {
+    setErr(errOut, "SQL execution error: internal failure");
+    return false;
 }
 
 bool SQLiteEngine::statementIsReadOnly(const std::string& sql) const {
     sqlite3_stmt* stmt = getOrPrepareStmt(sql);
     return sqlite3_stmt_readonly(stmt) != 0;
+}
+
+bool SQLiteEngine::statementIsReadOnlyNoThrow(const std::string& sql) const noexcept {
+    sqlite3_stmt* stmt = getOrPrepareStmtNoThrow(sql, nullptr);
+    // Unpreparable statement: assume it wrote, so caches are invalidated rather
+    // than left stale. Never a trap.
+    return stmt != nullptr && sqlite3_stmt_readonly(stmt) != 0;
 }
 
 size_t SQLiteEngine::executeAndCount(const std::string& sql, const std::vector<Value>& params) {

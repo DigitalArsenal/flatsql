@@ -881,14 +881,21 @@ int flatsql_query(void* handle, const char* sql) {
         return 0;
     }
 
-    try {
-        g_lastResult = db->query(sqlStr);
-        g_lastError.clear();
-        return 1;
-    } catch (const std::exception& e) {
-        g_lastError = e.what();
+    // NOTE (mod-flatsql-query-params-unreachable-trap): the catch below is DEAD
+    // CODE on the artifact production runs. flatsql-wasi-noeh.wasm is compiled
+    // -fignore-exceptions, which lowers every `throw` to `unreachable` — so an
+    // error path that throws is a guest abort, not an error. Errors must travel
+    // through the VALUE channel (queryNoThrow -> g_lastError) on every entry
+    // the host can reach.
+    std::string queryError;
+    QueryResult result;
+    if (!db->queryNoThrow(sqlStr, {}, result, &queryError)) {
+        g_lastError = queryError;
         return 0;
     }
+    g_lastResult = std::move(result);
+    g_lastError.clear();
+    return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -916,14 +923,18 @@ int flatsql_query_params(void* handle, const char* sql, const uint8_t* paramData
         return 0;
     }
 
-    try {
-        g_lastResult = db->query(sqlStr, params);
-        g_lastError.clear();
-        return 1;
-    } catch (const std::exception& e) {
-        g_lastError = e.what();
+    // Same contract as flatsql_query: no throw may reach the guest boundary.
+    // This is the entry that aborted host-01's record-catalog hydration for
+    // weeks — a plain SQLite constraint error inside a replay INSERT trapped
+    // the guest and poisoned the engine on every boot.
+    QueryResult result;
+    if (!db->queryNoThrow(sqlStr, params, result, &errorMessage)) {
+        g_lastError = errorMessage;
         return 0;
     }
+    g_lastResult = std::move(result);
+    g_lastError.clear();
+    return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -953,20 +964,20 @@ int flatsql_query_many(void* handle, const uint8_t* requestData, size_t requestL
         }
     }
 
-    try {
-        g_batchResults.reserve(requests.size());
-        for (const auto& request : requests) {
-            g_batchResults.push_back(db->query(request.sql, request.params));
+    g_batchResults.reserve(requests.size());
+    for (const auto& request : requests) {
+        QueryResult result;
+        if (!db->queryNoThrow(request.sql, request.params, result, &errorMessage)) {
+            g_batchResults.clear();
+            g_selectedBatchResult = -1;
+            g_lastError = errorMessage;
+            return 0;
         }
-        g_selectedBatchResult = g_batchResults.empty() ? -1 : 0;
-        g_lastError.clear();
-        return 1;
-    } catch (const std::exception& e) {
-        g_batchResults.clear();
-        g_selectedBatchResult = -1;
-        g_lastError = e.what();
-        return 0;
+        g_batchResults.push_back(std::move(result));
     }
+    g_selectedBatchResult = g_batchResults.empty() ? -1 : 0;
+    g_lastError.clear();
+    return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -1127,14 +1138,14 @@ int flatsql_query_template(void* handle,
         }
     }
 
-    try {
-        g_lastResult = db->queryTemplate(queryIdStr, params);
-        g_lastError.clear();
-        return 1;
-    } catch (const std::exception& e) {
-        g_lastError = e.what();
+    QueryResult result;
+    if (!db->queryTemplateNoThrow(queryIdStr, params, result, &errorMessage)) {
+        g_lastError = errorMessage;
         return 0;
     }
+    g_lastResult = std::move(result);
+    g_lastError.clear();
+    return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE

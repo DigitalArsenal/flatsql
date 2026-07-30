@@ -182,6 +182,16 @@ public:
     // Execute SQL query with parameters (faster for repeated queries)
     QueryResult query(const std::string& sql, const std::vector<Value>& params);
 
+    // Exception-free form of query(sql, params). Every SQL failure is reported
+    // as false + *errOut; nothing throws.
+    //
+    // The C ABI MUST use this. The WASI artifact the servers execute
+    // (flatsql-wasi-noeh.wasm) is compiled -fignore-exceptions, so a throw on
+    // that artifact is not an error object — it is an `unreachable` trap that
+    // aborts the guest and poisons the whole engine instance for the host.
+    bool queryNoThrow(const std::string& sql, const std::vector<Value>& params,
+                      QueryResult& out, std::string* errOut) noexcept;
+
     // Execute SQL query with a single integer parameter (most optimized for int key lookups)
     QueryResult query(const std::string& sql, int64_t param);
 
@@ -202,6 +212,12 @@ public:
     // Execute a registered SQL template through the native result cache.
     QueryResult queryTemplate(const std::string& queryId,
                               const std::vector<Value>& params = {});
+
+    // Exception-free form of queryTemplate. Same C-ABI contract as
+    // queryNoThrow: on the -fignore-exceptions WASI artifact a throw is an
+    // `unreachable` trap, so template execution errors must be values.
+    bool queryTemplateNoThrow(const std::string& queryId, const std::vector<Value>& params,
+                              QueryResult& out, std::string* errOut) noexcept;
 
     // Clear cached query results without unregistering templates.
     void clearQueryResultCache();
