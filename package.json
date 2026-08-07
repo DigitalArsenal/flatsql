@@ -1,6 +1,6 @@
 {
   "name": "flatsql",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
   "type": "module",
   "main": "dist/index.js",
@@ -23,6 +23,7 @@
       "import": "./wasm/standalone.js"
     },
     "./io": {
+      "types": "./wasm/flatsql-io.d.ts",
       "import": "./wasm/flatsql-io.js"
     },
     "./artifacts": {
