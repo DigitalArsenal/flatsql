@@ -1,0 +1,290 @@
+[
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DSQLITE_DQS=0 -DSQLITE_ENABLE_RTREE=1 -DSQLITE_OMIT_DEPRECATED=1 -DSQLITE_OMIT_LOAD_EXTENSION=1 -DSQLITE_THREADSAFE=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -O3 -DNDEBUG -arch arm64 -w -o CMakeFiles/sqlite3.dir/vendor/sqlite/sqlite3.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite/sqlite3.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite/sqlite3.c",
+  "output": "CMakeFiles/sqlite3.dir/vendor/sqlite/sqlite3.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/src/storage.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/storage.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/storage.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/src/storage.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/src/sqlite_index.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/sqlite_index.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/sqlite_index.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/src/sqlite_index.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/src/schema_parser.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/schema_parser.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/schema_parser.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/src/schema_parser.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/src/database.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/database.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/database.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/src/database.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/src/query_cache.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/query_cache.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/query_cache.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/src/query_cache.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/src/junction.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/junction.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/junction.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/src/junction.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/src/sqlite_vtab.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/sqlite_vtab.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/sqlite_vtab.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/src/sqlite_vtab.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/src/sqlite_engine.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/sqlite_engine.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/sqlite_engine.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/src/sqlite_engine.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/src/geo_functions.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/geo_functions.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/geo_functions.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/src/geo_functions.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/src/geo_geometry.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/geo_geometry.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/geo_geometry.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/src/geo_geometry.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++ -DFLATSQL_HAVE_OPENSSL=1 -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_lib.dir/Users/tj/software/worktrees/flatbuffers/src/encryption.cpp.o -c /Users/tj/software/worktrees/flatbuffers/src/encryption.cpp",
+  "file": "/Users/tj/software/worktrees/flatbuffers/src/encryption.cpp",
+  "output": "CMakeFiles/flatsql_lib.dir/Users/tj/software/worktrees/flatbuffers/src/encryption.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/math/extension.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/math/extension.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/math/extension.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/math/extension.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/stats/extension.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/stats/extension.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/stats/extension.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/stats/extension.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/stats/scalar.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/stats/scalar.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/stats/scalar.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/stats/scalar.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/stats/series.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/stats/series.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/stats/series.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/stats/series.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/extension.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/extension.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/extension.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/extension.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/bstring.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/bstring.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/bstring.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/bstring.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/rstring.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/rstring.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/rstring.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/rstring.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/runes.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/runes.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/runes.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/runes.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/utf8/utf8.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/utf8/utf8.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/utf8/utf8.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/utf8/utf8.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/utf8/rune.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/utf8/rune.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/utf8/rune.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/utf8/rune.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/utf8/case.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/utf8/case.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/text/utf8/case.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/text/utf8/case.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/uuid/extension.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/uuid/extension.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/uuid/extension.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/uuid/extension.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/extension.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/extension.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/extension.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/extension.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/common.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/common.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/common.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/common.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/caver.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/caver.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/caver.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/caver.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/damlev.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/damlev.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/damlev.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/damlev.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/editdist.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/editdist.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/editdist.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/editdist.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/hamming.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/hamming.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/hamming.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/hamming.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/jarowin.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/jarowin.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/jarowin.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/jarowin.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/leven.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/leven.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/leven.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/leven.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/osadist.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/osadist.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/osadist.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/osadist.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/phonetic.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/phonetic.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/phonetic.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/phonetic.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/rsoundex.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/rsoundex.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/rsoundex.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/rsoundex.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/soundex.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/soundex.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/soundex.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/soundex.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/cc -DFLATSQL_HAVE_OPENSSL=1 -DSQLITE_CORE -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -arch arm64 -o CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/translit.c.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/translit.c",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean/fuzzy/translit.c",
+  "output": "CMakeFiles/flatsql_lib.dir/vendor/sqlean/fuzzy/translit.c.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql.dir/src/flatsql.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/flatsql.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/src/flatsql.cpp",
+  "output": "CMakeFiles/flatsql.dir/src/flatsql.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_test.dir/test/test_main.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/test_main.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/test_main.cpp",
+  "output": "CMakeFiles/flatsql_test.dir/test/test_main.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/schemas -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_integration_test.dir/test/integration_test.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/integration_test.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/integration_test.cpp",
+  "output": "CMakeFiles/flatsql_integration_test.dir/test/integration_test.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/schemas -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_socket_test.dir/test/socket_stream_test.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/socket_stream_test.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/socket_stream_test.cpp",
+  "output": "CMakeFiles/flatsql_socket_test.dir/test/socket_stream_test.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/schemas -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -O3 -o CMakeFiles/flatsql_benchmark.dir/test/benchmark.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/benchmark.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/benchmark.cpp",
+  "output": "CMakeFiles/flatsql_benchmark.dir/test/benchmark.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/schemas -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_roundtrip_test.dir/test/roundtrip_test.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/roundtrip_test.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/roundtrip_test.cpp",
+  "output": "CMakeFiles/flatsql_roundtrip_test.dir/test/roundtrip_test.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/schemas -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_cluster_validation.dir/test/cluster_validation_test.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/cluster_validation_test.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/cluster_validation_test.cpp",
+  "output": "CMakeFiles/flatsql_cluster_validation.dir/test/cluster_validation_test.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/schemas -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -O3 -o CMakeFiles/flatsql_mpe_benchmark.dir/test/mpe_benchmark.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/mpe_benchmark.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/mpe_benchmark.cpp",
+  "output": "CMakeFiles/flatsql_mpe_benchmark.dir/test/mpe_benchmark.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -O3 -o CMakeFiles/flatsql_geo_benchmark.dir/test/geo_benchmark.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/geo_benchmark.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/geo_benchmark.cpp",
+  "output": "CMakeFiles/flatsql_geo_benchmark.dir/test/geo_benchmark.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_geo_test.dir/test/test_geo.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/test_geo.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/test_geo.cpp",
+  "output": "CMakeFiles/flatsql_geo_test.dir/test/test_geo.cpp.o"
+},
+{
+  "directory": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native",
+  "command": "/usr/bin/c++  -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/../../flatbuffers/include -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlite -I/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/vendor/sqlean -isystem /opt/homebrew/Cellar/openssl@3/3.6.1/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -o CMakeFiles/flatsql_disk_persistence_test.dir/test/disk_persistence_test.cpp.o -c /Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/disk_persistence_test.cpp",
+  "file": "/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/test/disk_persistence_test.cpp",
+  "output": "CMakeFiles/flatsql_disk_persistence_test.dir/test/disk_persistence_test.cpp.o"
+}
+]

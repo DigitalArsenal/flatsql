@@ -783,6 +783,53 @@ void* flatsql_create_db(const char* schema, const char* dbName) {
     }
 }
 
+// Disk-backed open. `path` names a real database file reachable through the
+// wasm FS layer: a WASI preopened directory under WasmEdge/wasmtime, the
+// shim-bridged VFS in the browser. SQLite's pager provides durability; there is
+// no second format and no new host capability — the module only ever touches
+// paths the host already preopened for it.
+//
+// path == nullptr / "" / ":memory:" is EXACTLY flatsql_create_db (ephemeral),
+// so existing consumers are byte-for-byte unaffected.
+// journalMode: 0 default(DELETE), 1 WAL, 2 TRUNCATE, 3 MEMORY.
+// Returns nullptr with flatsql_get_error() set — never traps, keeping the
+// -fignore-exceptions WASI artifact host-safe (b26ed45 contract).
+EMSCRIPTEN_KEEPALIVE
+void* flatsql_open_db(const char* schema, const char* dbName,
+                      const char* path, int journalMode) {
+    try {
+        DatabaseSchema parsedSchema;
+        std::string parseError;
+        if (!SchemaParser::tryParse(schema ? schema : "",
+                                    &parsedSchema,
+                                    &parseError,
+                                    dbName ? dbName : "default")) {
+            g_lastError = parseError.empty() ? "Failed to parse schema" : parseError;
+            return nullptr;
+        }
+
+        FlatSQLDatabase::RuntimeOptions options;
+        const std::string dbFile = path ? path : "";
+        options.sqlite.path = dbFile.empty() ? std::string(":memory:") : dbFile;
+        options.sqlite.journalMode = journalMode;
+        options.sqlite.enableWal = (journalMode == 1);
+
+        auto* db = new FlatSQLDatabase(parsedSchema, std::move(options));
+        g_lastError.clear();
+        return static_cast<void*>(db);
+    } catch (const std::exception& e) {
+        g_lastError = e.what();
+        return nullptr;
+    }
+}
+
+// 1 when this handle is backed by a real file rather than ":memory:".
+EMSCRIPTEN_KEEPALIVE
+int flatsql_is_disk_backed(void* handle) {
+    if (!handle) return 0;
+    return static_cast<FlatSQLDatabase*>(handle)->isDiskBacked() ? 1 : 0;
+}
+
 EMSCRIPTEN_KEEPALIVE
 void flatsql_destroy_db(void* handle) {
     delete static_cast<FlatSQLDatabase*>(handle);

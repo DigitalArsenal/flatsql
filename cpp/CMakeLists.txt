@@ -158,6 +158,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             -s EXPORTED_FUNCTIONS='[ \
                 \"_malloc\", \"_free\", \
                 \"_flatsql_create_db\", \"_flatsql_destroy_db\", \
+                \"_flatsql_open_db\", \"_flatsql_is_disk_backed\", \
                 \"_flatsql_register_file_id\", \"_flatsql_enable_demo_extractors\", \
                 \"_flatsql_ingest\", \"_flatsql_ingest_one\", \
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
@@ -254,6 +255,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             -s EXPORTED_FUNCTIONS='[ \
                 \"_malloc\", \"_free\", \
                 \"_flatsql_create_db\", \"_flatsql_destroy_db\", \
+                \"_flatsql_open_db\", \"_flatsql_is_disk_backed\", \
                 \"_flatsql_register_file_id\", \"_flatsql_enable_demo_extractors\", \
                 \"_flatsql_ingest\", \"_flatsql_ingest_one\", \
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
@@ -669,7 +671,17 @@ else()
         ${SQLITE_DIR}
     )
 
+    # Disk-backed engine persistence (docs/STORAGE-DURABILITY.md)
+    add_executable(flatsql_disk_persistence_test test/disk_persistence_test.cpp)
+    target_link_libraries(flatsql_disk_persistence_test PRIVATE flatsql_lib)
+    target_include_directories(flatsql_disk_persistence_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+    )
+
     enable_testing()
+    add_test(NAME FlatSQLDiskPersistenceTest COMMAND flatsql_disk_persistence_test)
     add_test(NAME FlatSQLTest COMMAND flatsql_test)
     add_test(NAME FlatSQLIntegrationTest COMMAND flatsql_integration_test)
     add_test(NAME FlatSQLSocketTest COMMAND flatsql_socket_test)

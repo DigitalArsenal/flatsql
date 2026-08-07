@@ -356,6 +356,10 @@ public:
         return storage_->exportData();
     }
 
+    // True when the engine is backed by a real database file rather than the
+    // ephemeral ":memory:" engine.
+    bool isDiskBacked() const { return diskBacked_; }
+
     // Get schema
     const DatabaseSchema& getSchema() const { return schema_; }
 
@@ -630,6 +634,7 @@ private:
 
     IngestProfile ingestProfile_;
     bool ingestProfileEnabled_ = false;
+    bool diskBacked_ = false;
 };
 
 }  // namespace flatsql

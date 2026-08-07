@@ -13,8 +13,19 @@
 namespace flatsql {
 
 struct SQLiteConnectionOptions {
+    // ":memory:" keeps the historical ephemeral engine. Any other value names a
+    // real database file reached through whatever filesystem the wasm host
+    // exposes (WASI preopen natively, the shim-bridged VFS in the browser).
     std::string path = ":memory:";
     bool enableWal = false;
+    // Rollback-journal mode for disk-backed opens. Ignored for ":memory:".
+    //   0 = engine default (DELETE)   1 = WAL
+    //   2 = TRUNCATE                  3 = MEMORY
+    // WAL needs SQLite shared memory (xShmMap), which plain WASI preopens do
+    // NOT provide, so WAL is not selectable on the wasi target today; see
+    // docs/STORAGE-DURABILITY.md §3.5. DELETE/TRUNCATE are crash-safe with a
+    // single writer, which the one-daemon-per-box law already guarantees.
+    int journalMode = 0;
     int busyTimeoutMs = 250;
     int maxBusyRetries = 8;
     int busyBackoffMs = 1;

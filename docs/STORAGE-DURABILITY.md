@@ -1,8 +1,11 @@
 # FlatSQL durable storage — root cause and target design
 
-Status: **specification + root-cause record**. No engine code has landed for this
-yet; this document is the contract the implementation and the host integration
-(Hermes, Phase 2) build against.
+Status: **partial implementation + specification**. The disk-backed engine path
+and its ABI have landed and are tested natively (§3.3, `cpp/test/
+disk_persistence_test.cpp`). The wasm VFS bridge (§3.5), the `.fsix` index layer
+(§3.2) and the sdn-js backend matrix are specified and not yet built. This
+document is the contract the remaining implementation and the host integration
+(Hermes) build against.
 
 Owner-directed, 2026-08-06. Filed by Janus (module-SDK / ABI oracle) under graph
 task `flatsql-ltx-state-persistence`.
@@ -188,14 +191,26 @@ message. **No new host capability class.** Errors are values, never traps — th
 `unreachable` (commit `b26ed45`), so every entry point below is `noexcept` by
 construction.
 
-```c
-/* Open disk-backed. streamDir/indexDir must be inside a host-preopened dir.
-   Returns NULL + flatsql_get_error() on failure. NULL/"" dirs == today's
-   ephemeral engine, byte-for-byte. */
-void* flatsql_open_db(const char* schema, const char* dbName,
-                      const char* streamDir, const char* indexDir);
+**LANDED** — exported by the browser and both wasi targets, tested by
+`cpp/test/disk_persistence_test.cpp`:
 
+```c
+/* Open disk-backed. `path` must resolve inside a host-preopened directory.
+   path == NULL / "" / ":memory:" is EXACTLY flatsql_create_db, so every
+   existing consumer is byte-for-byte unaffected.
+   journalMode: 0 default(DELETE), 1 WAL, 2 TRUNCATE, 3 MEMORY.
+   Returns NULL + flatsql_get_error() on failure; never traps. */
+void* flatsql_open_db(const char* schema, const char* dbName,
+                      const char* path, int journalMode);
+
+/* 1 when this handle is backed by a real file. The host uses this to decide
+   whether a boot may trust persisted state. */
 int  flatsql_is_disk_backed(void* h);
+```
+
+**SPECIFIED, not yet built** — the `.fsix` layer over the streams:
+
+```c
 
 /* Boot. Opens + verifies index files, re-indexes the tail, returns the record
    count now visible. Negative = error code below; the host then calls
@@ -243,15 +258,76 @@ code:
 Acceptance is parity evidence, not "works in X": identical inputs must produce
 identical query results and an identical flushed high-water mark in both lanes.
 
-### 3.5 Build changes required
+### 3.5 Wasm file I/O — MEASURED, and why emscripten's FS is the wrong road
 
-- Drop `SQLITE_OMIT_WAL=1` from the wasm targets *if and only if* the vendored
-  engine remains in the read path (see §4); it is irrelevant to `.fsix`.
-- Browser target cannot keep `-s FILESYSTEM=0`.
-- The WASI target must actually link a WASI-backed FS. Today it does not — §2.2.
-  **Verify by asserting `path_open` is in the module's import list**; that check
-  belongs in the toolchain guardrail tests, because its absence is exactly the
-  silent failure that produced this whole class.
+Two builds were run to settle this empirically rather than by reasoning.
+
+**Measurement 1 — the ABI alone does not pull in file I/O.** After adding
+`flatsql_open_db` and rebuilding the wasi target unchanged, the module exports
+the new functions but still imports exactly six WASI functions. The original
+hypothesis — that `":memory:"` made `open()` unreachable and the linker
+dead-stripped the FS — is **refuted**. `-s WASMFS=1` routes file I/O to WasmFS's
+**in-memory** backend, so a path-backed open succeeds against RAM and never
+reaches WASI at all. That is worse than failing: it looks durable and is not.
+
+**Measurement 2 — `-s FORCE_FILESYSTEM=1` does not fix it either.** That build
+produces 19 imports:
+
+```
+fd_close, fd_fdstat_get, fd_read, fd_seek, fd_sync, fd_write,      <- real WASI
+__syscall_chmod, __syscall_faccessat, __syscall_fchmod,
+__syscall_fchown32, __syscall_ftruncate64, __syscall_getcwd,
+__syscall_readlinkat, __syscall_rmdir, __syscall_unlinkat,
+__syscall_utimensat,                                               <- NOT WASI
+clock_time_get, environ_get, environ_sizes_get
+```
+
+Real `fd_*` operations appear, but **`path_open` never does**, and ten
+emscripten JS-library `__syscall_*` imports do. Those are not WASI; nothing in
+either host satisfies them, so the module would fail to instantiate under
+WasmEdge. Emscripten's standalone FS is half-mapped, and chasing it trades a
+clean six-import surface for a broken one. **Both build-flag changes were
+reverted.** The wasi target's import surface is unchanged at six.
+
+**Ruling (Janus, ABI owner): FlatSQL brings its own VFS.** Register a
+`sqlite3_vfs` whose methods call out through a small, explicit, FlatSQL-owned
+import set that *both* hosts satisfy identically:
+
+```
+flatsql_io_open(pathPtr, pathLen, flags) -> handle   (negative = error)
+flatsql_io_read(handle, dstPtr, len, offset)  -> bytes read
+flatsql_io_write(handle, srcPtr, len, offset) -> bytes written
+flatsql_io_truncate(handle, size)             -> status
+flatsql_io_sync(handle)                       -> status
+flatsql_io_size(handle)                       -> size
+flatsql_io_close(handle)                      -> status
+```
+
+Why this is the right layer:
+
+- **Isomorphic by construction.** One import set, identical in both lanes. No
+  runtime detection in module code; the difference lives entirely in the host
+  shim, which is where it belongs.
+- **The browser lane fits without inventing anything.** The JS shim satisfies
+  these against its existing persistence stores. Because the interface is
+  offset-addressed, a flat key->bytes store emulates pread/pwrite by chunking a
+  file into fixed-size **page-group keys** (`<file>/<pageGroup>`), which is what
+  keeps a flush O(dirty) instead of rewriting the whole blob.
+- **The native lane is trivial.** The Go host backs the same seven calls with
+  real files under a preopened directory — connector work, which is exactly what
+  the host is permitted to do.
+- **`-s FILESYSTEM=0` stays** on the browser target, and the wasi target keeps
+  its six-import surface. No emscripten FS anywhere.
+- `SQLITE_OMIT_WAL=1` stays on all wasm targets: WAL needs `xShmMap` shared
+  memory, which neither lane provides. Disk-backed wasm uses TRUNCATE
+  (`journalMode = 2`), crash-safe under the single writer the one-daemon-per-box
+  law already guarantees. This is a deliberate, documented choice, not a
+  limitation discovered later.
+
+**Guardrail test:** once the VFS lands, assert the exact import set of each wasm
+target. An unexpected import means the FS silently re-routed; a *missing* one
+means I/O silently went to RAM. Both are the failure class that produced this
+entire defect, and both must fail the build.
 
 ---
 

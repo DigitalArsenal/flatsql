@@ -172,9 +172,23 @@ SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
         sqlite3_busy_timeout(db_, options_.busyTimeoutMs);
     }
 
-    if (options_.enableWal && options_.path != ":memory:") {
-        execOrThrow(db_, "PRAGMA journal_mode=WAL");
-        execOrThrow(db_, "PRAGMA synchronous=NORMAL");
+    if (options_.path != ":memory:") {
+        const int mode = options_.enableWal ? 1 : options_.journalMode;
+        switch (mode) {
+            case 1:
+                execOrThrow(db_, "PRAGMA journal_mode=WAL");
+                execOrThrow(db_, "PRAGMA synchronous=NORMAL");
+                break;
+            case 2:
+                execOrThrow(db_, "PRAGMA journal_mode=TRUNCATE");
+                execOrThrow(db_, "PRAGMA synchronous=FULL");
+                break;
+            case 3:
+                execOrThrow(db_, "PRAGMA journal_mode=MEMORY");
+                break;
+            default:
+                break;
+        }
     }
 
     // Register custom geo/spatial functions

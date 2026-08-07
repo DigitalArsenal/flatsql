@@ -426,6 +426,8 @@ FlatSQLDatabase::FlatSQLDatabase(const DatabaseSchema& schema, RuntimeOptions op
     , accessMutex_(options.accessMutex ? std::move(options.accessMutex)
                                        : std::make_shared<std::shared_mutex>()) {
 
+    diskBacked_ = !options.sqlite.path.empty() && options.sqlite.path != ":memory:";
+
     // Initialize SQLite engine first (we need its db handle for indexes)
     sqliteEngine_ = std::make_unique<SQLiteEngine>(options.sqlite);
 

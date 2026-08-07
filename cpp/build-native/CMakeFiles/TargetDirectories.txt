@@ -1,0 +1,16 @@
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/sqlite3.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_lib.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_test.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_integration_test.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_socket_test.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_benchmark.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_roundtrip_test.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_cluster_validation.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_mpe_benchmark.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_geo_benchmark.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_geo_test.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/flatsql_disk_persistence_test.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/test.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/edit_cache.dir
+/Users/tj/software/worktrees/flatsql--ltx-state-persistence/cpp/build-native/CMakeFiles/rebuild_cache.dir
