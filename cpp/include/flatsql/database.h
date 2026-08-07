@@ -29,6 +29,14 @@ public:
     // This is the streaming index builder - called for each FlatBuffer as it arrives
     void onIngest(const uint8_t* data, size_t length, uint64_t sequence, uint64_t offset);
 
+    // Replay path: the record's index rows are already durable on disk, so only
+    // the in-memory record info is restored. Never touches the index tables.
+    void onIngestReplay(uint64_t sequence, uint64_t offset);
+
+    // Drop every derived row this table owns (index tables + R-Tree + record
+    // infos), so a full re-derivation cannot double-insert.
+    void clearDerived();
+
     // Find by indexed column
     std::vector<StoredRecord> findByIndex(const std::string& column, const Value& value);
 
@@ -360,6 +368,42 @@ public:
     // ephemeral ":memory:" engine.
     bool isDiskBacked() const { return diskBacked_; }
 
+    // ---- Durable state (docs/STORAGE-DURABILITY.md §3.3) -------------------
+    // The SDS FlatBuffer stream is the data; the index is derived state. All
+    // four calls go through the same seven host-I/O imports the VFS uses, so
+    // they behave identically in every lane.
+    //
+    // Return codes are the stable host contract. EVERY negative value is
+    // recoverable by reindexAll(); none of them means data was lost.
+    //   0   OK          -1 no persisted state   -2 format/schema mismatch
+    //  -3   verification failure                -4 torn pair (stream short)
+    //  -5   filesystem unreachable / not disk-backed
+    static constexpr int kStateOk            = 0;
+    static constexpr int kStateAbsent        = -1;
+    static constexpr int kStateVersionMismatch = -2;
+    static constexpr int kStateCorrupt       = -3;
+    static constexpr int kStateTorn          = -4;
+    static constexpr int kStateNoFilesystem  = -5;
+
+    // Boot: open + verify the stream and the persisted index, replay only the
+    // tail past the recorded high-water mark. Returns the record count now
+    // visible, or a negative code above.
+    int openState();
+
+    // Full re-derivation from the stream. Always available, always correct.
+    // Returns the record count, or a negative code.
+    int reindexAll();
+
+    // Append everything since the last flush to the stream, fsync it, then
+    // commit the index + high-water mark. Returns 0 or a negative code.
+    int flushState();
+
+    // High-water mark a host may resume its own journal from.
+    uint64_t flushedOffset() const { return flushedOffset_; }
+
+    // Path of the SDS FlatBuffer stream that backs this database.
+    const std::string& streamPath() const { return streamPath_; }
+
     // Get schema
     const DatabaseSchema& getSchema() const { return schema_; }
 
@@ -539,9 +583,12 @@ public:
     bool verifyHMAC(const uint8_t* buffer, size_t length, const uint8_t* mac) const;
 
 private:
-    // Callback for streaming ingest - routes to correct table and builds indexes
+    // Callback for streaming ingest - routes to correct table and builds indexes.
+    // buildIndexes=false replays a record whose index rows are already durable:
+    // record infos are restored, index writes are skipped. That is the whole
+    // point of persisting the index — a boot pays for the scan, not the build.
     void onIngest(std::string_view fileId, const uint8_t* data, size_t length,
-                  uint64_t sequence, uint64_t offset);
+                  uint64_t sequence, uint64_t offset, bool buildIndexes = true);
 
     // Callback for source-aware ingest - routes to source-specific table
     void onIngestWithSource(std::string_view fileId, const uint8_t* data, size_t length,
@@ -635,6 +682,20 @@ private:
     IngestProfile ingestProfile_;
     bool ingestProfileEnabled_ = false;
     bool diskBacked_ = false;
+
+    // Durable-state members (flatsql_state.cpp). streamPath_ is derived from
+    // the database path so a host that names one names both — there is no way
+    // to end up with an index and a stream that were never meant to pair.
+    std::string sqlitePath_;
+    std::string streamPath_;
+    uint64_t flushedOffset_ = 0;
+
+    // Shared by openState/reindexAll: drive the store's rebuild, indexing only
+    // the records at or past `indexFromOffset` (everything below it already has
+    // its index rows on disk).
+    int loadStreamFromDisk(uint64_t indexFromOffset);
+    int readWholeStream(std::vector<uint8_t>* out);
+    void clearDerivedState();
 };
 
 }  // namespace flatsql

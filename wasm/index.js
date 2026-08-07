@@ -144,6 +144,13 @@ async function loadIntegrityFile(basePath = '') {
  * // Skip integrity check (development only)
  * const flatsql = await initFlatSQL({ skipIntegrityCheck: true });
  */
+let ioBackend = null;
+
+/** The I/O backend this runtime was initialised with (null when ephemeral). */
+export function getFlatSqlIoBackend() {
+    return ioBackend;
+}
+
 export async function initFlatSQL(moduleFactoryOrOptions) {
     let moduleFactory = FlatSQLModule;
     let options = {};
@@ -183,6 +190,16 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
 
     // Create module configuration
     const moduleConfig = {};
+
+    // The seven-import host I/O contract (cpp/include/flatsql/flatsql_io.h).
+    // cpp/js/flatsql_io_library.js reads this off the Module and translates
+    // pointers into typed arrays; everything else about storage lives in the
+    // backend. With no backend, disk-backed opens fail closed with an error
+    // value — they never quietly succeed against RAM.
+    ioBackend = options.io ?? null;
+    if (ioBackend) {
+        moduleConfig.flatsqlIO = ioBackend;
+    }
 
     // If we have an expected hash, use custom WASM instantiation with verification
     if (expectedIntegrity && !options.skipIntegrityCheck) {
@@ -243,6 +260,13 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
     api = {
         // Database lifecycle
         createDb: Module.cwrap('flatsql_create_db', 'number', ['string', 'string']),
+        openDb: Module.cwrap('flatsql_open_db', 'number', ['string', 'string', 'string', 'number']),
+        isDiskBacked: Module.cwrap('flatsql_is_disk_backed', 'number', ['number']),
+        openState: Module.cwrap('flatsql_open_state', 'number', ['number']),
+        reindexAll: Module.cwrap('flatsql_reindex_all', 'number', ['number']),
+        flushIndex: Module.cwrap('flatsql_flush_index', 'number', ['number']),
+        flushedOffset: Module.cwrap('flatsql_flushed_offset', 'number', ['number']),
+        streamPath: Module.cwrap('flatsql_stream_path', 'string', ['number']),
         destroyDb: Module.cwrap('flatsql_destroy_db', null, ['number']),
         registerFileId: Module.cwrap('flatsql_register_file_id', null, ['number', 'string', 'string']),
         enableDemoExtractors: Module.cwrap('flatsql_enable_demo_extractors', null, ['number']),
@@ -550,6 +574,30 @@ export class FlatSQL {
         return new FlatSQLDatabase(handle);
     }
 
+    /**
+     * Disk-backed open through the I/O backend passed to initFlatSQL.
+     *
+     * `path` is a name in the BACKEND's namespace — a real path under a WASI
+     * preopen on the server, a key prefix in a browser store. The module never
+     * learns which, which is what makes one artifact work in both.
+     *
+     * journalMode: 0 DELETE, 1 WAL (not available on wasm — no xShmMap in
+     * either lane), 2 TRUNCATE (the wasm default, crash-safe under the single
+     * writer the one-daemon-per-box law guarantees), 3 MEMORY.
+     *
+     * Async backends must be hydrated BEFORE this call and flushed after
+     * flushIndex(); see wasm/flatsql-io.js.
+     */
+    openDatabase(schema, dbName = 'default', path = '', journalMode = 2) {
+        const handle = api.openDb(schema, dbName, path ?? '', journalMode);
+        if (!handle) {
+            throw new Error(
+                `Failed to open FlatSQL database at "${path}": ${api.getError() || 'unknown error'}`
+            );
+        }
+        return new FlatSQLDatabase(handle);
+    }
+
     // Create test FlatBuffers
     createTestUser(id, name, email, age) {
         const ptr = api.createTestUser(id, name, email, age);
@@ -658,6 +706,42 @@ export class FlatSQL {
 export class FlatSQLDatabase {
     constructor(handle) {
         this._handle = handle;
+    }
+
+    // ---- Durable state (docs/STORAGE-DURABILITY.md §3.3) ------------------
+    // Codes are VALUES, never throws:
+    //   >=0 record count / OK   -1 absent   -2 format or schema mismatch
+    //   -3 corrupt              -4 torn pair (stream shorter than the mark)
+    //   -5 no filesystem
+    // Every negative is recoverable with reindexAll(); none means data loss.
+
+    isDiskBacked() {
+        return api.isDiskBacked(this._handle) === 1;
+    }
+
+    /** Boot: verify persisted state, replay only the stream tail. */
+    openState() {
+        return api.openState(this._handle);
+    }
+
+    /** Full re-derivation from the stream. Always available. */
+    reindexAll() {
+        return api.reindexAll(this._handle);
+    }
+
+    /** Append new stream bytes, sync, then commit the index + high-water mark. */
+    flushIndex() {
+        return api.flushIndex(this._handle);
+    }
+
+    /** High-water mark a host may resume its own journal from. */
+    flushedOffset() {
+        return api.flushedOffset(this._handle);
+    }
+
+    /** Path of the SDS FlatBuffer stream backing this handle. */
+    streamPath() {
+        return api.streamPath(this._handle);
     }
 
     destroy() {

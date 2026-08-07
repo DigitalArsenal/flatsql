@@ -85,11 +85,28 @@ set(FLATSQL_LIB_SOURCES
     src/junction.cpp
     src/sqlite_vtab.cpp
     src/sqlite_engine.cpp
+    src/flatsql_state.cpp
     src/geo_functions.cpp
     src/geo_geometry.cpp
     ${FLATBUFFERS_ENCRYPTION_SOURCES}
     ${SQLEAN_SOURCES}
 )
+
+# FlatSQL's own sqlite3_vfs over the seven-import host I/O contract
+# (include/flatsql/flatsql_io.h). Linked ONLY into targets that are allowed to
+# grow those seven imports: the engine artifacts (browser + both wasi) and every
+# native build. Deliberately NOT linked into flatsql_sdn_node / flatsql_sdm —
+# those are space-data-module-sdk MODULES and must keep the generic hook set;
+# a module that grows private imports is a new host capability, which is an
+# owner decision, not a build detail. Targets without it refuse a disk-backed
+# open outright rather than silently succeeding against RAM.
+set(FLATSQL_VFS_SOURCES src/flatsql_vfs.cpp)
+if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN))
+    # Natively there is no host to import from, so the same seven functions are
+    # supplied over POSIX pread/pwrite. This is what lets CTest exercise the
+    # exact VFS the wasm lanes use.
+    list(APPEND FLATSQL_VFS_SOURCES src/flatsql_io_native.cpp)
+endif()
 
 # Sources for WASM build - C API (no embind, worker-compatible)
 set(FLATSQL_WASM_SOURCES
@@ -124,7 +141,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 
     # Create the WASM library (includes SQLite amalgamation directly)
-    add_executable(flatsql ${FLATSQL_WASM_SOURCES} ${SQLITE_DIR}/sqlite3.c)
+    add_executable(flatsql ${FLATSQL_WASM_SOURCES} ${FLATSQL_VFS_SOURCES} ${SQLITE_DIR}/sqlite3.c)
 
     target_include_directories(flatsql PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -136,6 +153,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
 
     # SQLite compile definitions for minimal WASM build
     target_compile_definitions(flatsql PRIVATE
+        FLATSQL_ENABLE_IO_VFS=1
+        SQLITE_TEMP_STORE=3
         SQLITE_THREADSAFE=0
         SQLITE_OMIT_LOAD_EXTENSION=1
         SQLITE_OMIT_WAL=1
@@ -159,6 +178,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_malloc\", \"_free\", \
                 \"_flatsql_create_db\", \"_flatsql_destroy_db\", \
                 \"_flatsql_open_db\", \"_flatsql_is_disk_backed\", \
+                \"_flatsql_open_state\", \"_flatsql_reindex_all\", \
+                \"_flatsql_flush_index\", \"_flatsql_flushed_offset\", \
+                \"_flatsql_stream_path\", \
                 \"_flatsql_register_file_id\", \"_flatsql_enable_demo_extractors\", \
                 \"_flatsql_ingest\", \"_flatsql_ingest_one\", \
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
@@ -214,6 +236,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             -s STACK_SIZE=1048576 \
             -s NO_EXIT_RUNTIME=1 \
             -s FILESYSTEM=0 \
+            --js-library ${CMAKE_CURRENT_SOURCE_DIR}/js/flatsql_io_library.js \
             -s ENVIRONMENT='web,worker,node' \
             -s SINGLE_FILE=0 \
             -s ALLOW_TABLE_GROWTH=1 \
@@ -224,7 +247,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
     )
 
     # Build a standalone WASI-compatible module for Go runtimes (wazero/wasmtime)
-    add_executable(flatsql_wasi ${FLATSQL_WASM_SOURCES} ${SQLITE_DIR}/sqlite3.c)
+    add_executable(flatsql_wasi ${FLATSQL_WASM_SOURCES} ${FLATSQL_VFS_SOURCES} ${SQLITE_DIR}/sqlite3.c)
 
     target_include_directories(flatsql_wasi PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -235,6 +258,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
     target_compile_options(flatsql_wasi PRIVATE -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0)
 
     target_compile_definitions(flatsql_wasi PRIVATE
+        FLATSQL_ENABLE_IO_VFS=1
+        SQLITE_TEMP_STORE=3
         SQLITE_THREADSAFE=0
         SQLITE_OMIT_LOAD_EXTENSION=1
         SQLITE_OMIT_WAL=1
@@ -256,6 +281,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_malloc\", \"_free\", \
                 \"_flatsql_create_db\", \"_flatsql_destroy_db\", \
                 \"_flatsql_open_db\", \"_flatsql_is_disk_backed\", \
+                \"_flatsql_open_state\", \"_flatsql_reindex_all\", \
+                \"_flatsql_flush_index\", \"_flatsql_flushed_offset\", \
+                \"_flatsql_stream_path\", \
                 \"_flatsql_register_file_id\", \"_flatsql_enable_demo_extractors\", \
                 \"_flatsql_ingest\", \"_flatsql_ingest_one\", \
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
@@ -331,7 +359,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
     # compiler (0.14–0.17) cannot parse wasm-exceptions (exnref) modules and
     # its interpreter is ~100x too slow for query workloads. Interim artifact
     # until the engine's error paths are exception-free by construction.
-    add_executable(flatsql_wasi_noeh ${FLATSQL_WASM_SOURCES} ${SQLITE_DIR}/sqlite3.c)
+    add_executable(flatsql_wasi_noeh ${FLATSQL_WASM_SOURCES} ${FLATSQL_VFS_SOURCES} ${SQLITE_DIR}/sqlite3.c)
 
     target_include_directories(flatsql_wasi_noeh PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -342,6 +370,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
     target_compile_options(flatsql_wasi_noeh PRIVATE -fignore-exceptions)
 
     target_compile_definitions(flatsql_wasi_noeh PRIVATE
+        FLATSQL_ENABLE_IO_VFS=1
+        SQLITE_TEMP_STORE=3
         SQLITE_THREADSAFE=0
         SQLITE_OMIT_LOAD_EXTENSION=1
         SQLITE_OMIT_WAL=1
@@ -550,8 +580,11 @@ else()
         target_compile_options(sqlite3 PRIVATE -w)
     endif()
 
-    # Native library
-    add_library(flatsql_lib STATIC ${FLATSQL_LIB_SOURCES})
+    # Native library. The VFS sources ride along so the native lane exercises
+    # the SAME sqlite3_vfs the wasm lanes use (flatsql_io_native.cpp supplies
+    # the seven functions that are imports on wasm).
+    add_library(flatsql_lib STATIC ${FLATSQL_LIB_SOURCES} ${FLATSQL_VFS_SOURCES})
+    target_compile_definitions(flatsql_lib PUBLIC FLATSQL_ENABLE_IO_VFS=1)
 
     target_include_directories(flatsql_lib PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -680,7 +713,28 @@ else()
         ${SQLITE_DIR}
     )
 
+    # FlatSQL's own VFS, end to end through the seven-import contract
+    add_executable(flatsql_vfs_test test/vfs_test.cpp)
+    target_link_libraries(flatsql_vfs_test PRIVATE flatsql_lib)
+    target_include_directories(flatsql_vfs_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+    )
+
+    # Durable state over the stream + persisted index (the native half of the
+    # sdn-js backend matrix)
+    add_executable(flatsql_state_persistence_test test/state_persistence_test.cpp)
+    target_link_libraries(flatsql_state_persistence_test PRIVATE flatsql_lib)
+    target_include_directories(flatsql_state_persistence_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+    )
+
     enable_testing()
+    add_test(NAME FlatSQLVfsTest COMMAND flatsql_vfs_test)
+    add_test(NAME FlatSQLStatePersistenceTest COMMAND flatsql_state_persistence_test)
     add_test(NAME FlatSQLDiskPersistenceTest COMMAND flatsql_disk_persistence_test)
     add_test(NAME FlatSQLTest COMMAND flatsql_test)
     add_test(NAME FlatSQLIntegrationTest COMMAND flatsql_integration_test)

@@ -1,3 +1,5 @@
+import { createFlatSqlIoImports, createMemoryBackend } from './flatsql-io.js';
+
 const DEFAULT_STANDALONE_URL = new URL('./flatsql-wasi.wasm', import.meta.url);
 
 const PARAM_NULL = 0;
@@ -382,10 +384,25 @@ export async function loadFlatSQLStandalone(options = {}) {
   const wasmBytes = await loadWasmBytes(options);
   const state = { memory: null };
   const imports = makeWasiImports(state, options.wasi ?? options);
+
+  // The seven-import host I/O contract (cpp/include/flatsql/flatsql_io.h).
+  // The module imports these unconditionally, so they are always supplied: with
+  // no backend the default is in-memory, which keeps the historical ephemeral
+  // behaviour byte-for-byte and never pretends a path is durable.
+  const io = options.io ?? createMemoryBackend();
+  imports.env = {
+    ...createFlatSqlIoImports(io, () => state.memory),
+    ...(imports.env ?? {}),
+  };
+
   const mergedImports = options.imports
     ? {
         ...imports,
         ...options.imports,
+        env: {
+          ...imports.env,
+          ...(options.imports.env ?? {}),
+        },
         wasi_snapshot_preview1: {
           ...imports.wasi_snapshot_preview1,
           ...(options.imports.wasi_snapshot_preview1 ?? {}),
@@ -399,16 +416,45 @@ export async function loadFlatSQLStandalone(options = {}) {
     instance.exports._initialize();
   }
 
-  return new FlatSQLStandalone(createRuntime(instance.exports), module);
+  return new FlatSQLStandalone(createRuntime(instance.exports), module, io);
 }
 
 export const createStandaloneFlatSQL = loadFlatSQLStandalone;
 
 export class FlatSQLStandalone {
-  constructor(runtime, module) {
+  constructor(runtime, module, io) {
     this._runtime = runtime;
     this.module = module;
     this.memory = runtime.memory;
+    // The I/O backend this instance was wired to. Callers await io.hydrate()
+    // before opening a disk-backed database and io.flush() after
+    // flushIndex(); on synchronous backends both are no-ops.
+    this.io = io ?? null;
+  }
+
+  /**
+   * Disk-backed open. `path` is a name in the backend's namespace — a real
+   * path under a WASI preopen, a key prefix in a browser store. The module
+   * never learns which, and that is the point.
+   *
+   * journalMode: 0 DELETE, 1 WAL (unavailable on wasm), 2 TRUNCATE, 3 MEMORY.
+   * TRUNCATE is the wasm default because WAL needs xShmMap shared memory that
+   * neither lane provides (docs/STORAGE-DURABILITY.md §3.5).
+   */
+  openDatabase(schema, dbName = 'default', path = '', journalMode = 2) {
+    const handle = this._runtime.withCString(schema, (schemaPtr) =>
+      this._runtime.withCString(dbName, (namePtr) =>
+        this._runtime.withCString(path ?? '', (pathPtr) =>
+          this._runtime.exports.flatsql_open_db(schemaPtr, namePtr, pathPtr, journalMode)
+        )
+      )
+    );
+    if (!handle) {
+      const errPtr = this._runtime.exports.flatsql_get_error();
+      const message = errPtr ? this._runtime.readCString(errPtr) : 'unknown error';
+      throw new Error(`Failed to open FlatSQL database at "${path}": ${message}`);
+    }
+    return new FlatSQLStandaloneDatabase(this._runtime, handle);
   }
 
   createDatabase(schema, dbName = 'default') {
@@ -531,6 +577,37 @@ export class FlatSQLStandaloneDatabase {
       this._runtime.exports.flatsql_destroy_db(this._handle);
       this._handle = 0;
     }
+  }
+
+  // ---- Durable state (docs/STORAGE-DURABILITY.md §3.3) --------------------
+  // Codes are values, never throws:
+  //   >=0 record count / OK   -1 absent   -2 format or schema   -3 corrupt
+  //   -4 torn pair            -5 no filesystem
+  // EVERY negative is recoverable with reindexAll(); none means data loss.
+
+  isDiskBacked() {
+    return this._runtime.exports.flatsql_is_disk_backed(this._handle) === 1;
+  }
+
+  openState() {
+    return this._runtime.exports.flatsql_open_state(this._handle);
+  }
+
+  reindexAll() {
+    return this._runtime.exports.flatsql_reindex_all(this._handle);
+  }
+
+  flushIndex() {
+    return this._runtime.exports.flatsql_flush_index(this._handle);
+  }
+
+  flushedOffset() {
+    return this._runtime.exports.flatsql_flushed_offset(this._handle);
+  }
+
+  streamPath() {
+    const ptr = this._runtime.exports.flatsql_stream_path(this._handle);
+    return ptr ? this._runtime.readCString(ptr) : '';
   }
 
   registerFileId(fileId, tableName) {

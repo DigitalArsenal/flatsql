@@ -1,0 +1,216 @@
+/**
+ * The wasm half of the durability matrix: the REAL artifact, instantiated
+ * through the standalone shim, driven over the seven-import host I/O contract.
+ *
+ * cpp/test/state_persistence_test.cpp runs these exact scenarios natively. This
+ * file runs them in wasm against three different backends. If any lane
+ * disagrees with any other, that is a defect in the shim — the engine is one
+ * binary and cannot be "different in the browser".
+ *
+ *   node wasm/test-io-persistence.mjs
+ */
+
+import { readFileSync } from 'node:fs';
+import * as nodeFs from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { loadFlatSQLStandalone } from './standalone.js';
+import {
+  createMemoryBackend,
+  createNodeFsBackend,
+  createChunkedStoreBackend,
+} from './flatsql-io.js';
+
+const WASM_PATH = fileURLToPath(new URL('./flatsql-wasi-noeh.wasm', import.meta.url));
+
+let failures = 0;
+const check = (cond, what) => {
+  if (cond) {
+    console.log(`    ok   ${what}`);
+  } else {
+    console.error(`    FAIL ${what}`);
+    failures++;
+  }
+};
+
+const SCHEMA = `
+  table omm {
+    NORAD_CAT_ID: int (key);
+    OBJECT_NAME: string;
+  }
+`;
+
+/** Size-prefixed SDS-shaped FlatBuffer frames: [u32 size][buffer], id at 4..7. */
+function makeStream(firstId, count) {
+  const frames = [];
+  for (let i = 0; i < count; i++) {
+    const name = new TextEncoder().encode(`SAT-${firstId + i}`);
+    const body = new Uint8Array(12 + name.length + ((4 - ((12 + name.length) % 4)) % 4));
+    body[0] = 4;
+    body.set(new TextEncoder().encode('OMM '), 4);
+    new DataView(body.buffer).setUint32(8, firstId + i, true);
+    body.set(name, 12);
+    const frame = new Uint8Array(4 + body.length);
+    new DataView(frame.buffer).setUint32(0, body.length, true);
+    frame.set(body, 4);
+    frames.push(frame);
+  }
+  const total = frames.reduce((n, f) => n + f.length, 0);
+  const stream = new Uint8Array(total);
+  let at = 0;
+  for (const f of frames) {
+    stream.set(f, at);
+    at += f.length;
+  }
+  return stream;
+}
+
+/** Minimal in-memory key->bytes store: the exact shape sdn-js stores expose. */
+function makeKeyValueStore() {
+  const map = new Map();
+  return {
+    map,
+    available: true,
+    async readBytes(key) {
+      return map.has(key) ? new Uint8Array(map.get(key)) : null;
+    },
+    async writeBytes(key, bytes) {
+      map.set(key, new Uint8Array(bytes));
+    },
+    async deleteKey(key) {
+      map.delete(key);
+    },
+  };
+}
+
+async function openEngine(backend) {
+  return loadFlatSQLStandalone({
+    bytes: readFileSync(WASM_PATH),
+    io: backend,
+  });
+}
+
+/**
+ * One backend, the full matrix. Everything here is backend-agnostic on purpose:
+ * a lane that needs special-casing has already diverged.
+ */
+async function runMatrix(label, backend, dbPath) {
+  console.log(`\n--- backend: ${label} ---`);
+  const stream = makeStream(25544, 25);
+  const late = makeStream(40000, 5);
+
+  // 1. ingest -> flush -> TEAR DOWN
+  let markAfterFlush = 0;
+  let countBefore = 0;
+  {
+    await backend.hydrate(dbPath);
+    await backend.hydrate(`${dbPath}.fsdata`);
+    const engine = await openEngine(backend);
+    const db = engine.openDatabase(SCHEMA, 'sds', dbPath, 2);
+    check(db.isDiskBacked(), 'reports disk-backed');
+
+    db.registerFileId('OMM ', 'omm');
+    db.ingest(stream);
+    countBefore = db.query('SELECT COUNT(*) AS n FROM omm').rows[0][0];
+    check(Number(countBefore) === 25, `25 records visible pre-teardown (got ${countBefore})`);
+
+    check(db.flushIndex() === 0, 'flushIndex returns 0');
+    markAfterFlush = db.flushedOffset();
+    check(markAfterFlush === stream.length,
+      `high-water mark equals stream length (${markAfterFlush} vs ${stream.length})`);
+
+    db.destroy();
+    await backend.flush(); // durability barrier resolves here for async stores
+  }
+
+  // 2. reopen from the backend -> byte-identical
+  {
+    await backend.hydrate(dbPath);
+    await backend.hydrate(`${dbPath}.fsdata`);
+    const engine = await openEngine(backend);
+    const db = engine.openDatabase(SCHEMA, 'sds', dbPath, 2);
+    db.registerFileId('OMM ', 'omm');
+
+    const restored = db.openState();
+    check(restored === 25, `openState replays 25 records (got ${restored})`);
+    check(db.flushedOffset() === markAfterFlush, 'high-water mark survived teardown');
+
+    const after = db.query('SELECT COUNT(*) AS n FROM omm').rows[0][0];
+    check(String(after) === String(countBefore),
+      `query result identical after reopen (${after} vs ${countBefore})`);
+
+    // 3. late append past the mark -> tail re-index
+    db.ingest(late);
+    check(db.flushIndex() === 0, 'second flush');
+    check(db.flushedOffset() === stream.length + late.length,
+      'mark advanced by exactly the appended bytes');
+    db.destroy();
+    await backend.flush();
+  }
+
+  {
+    await backend.hydrate(dbPath);
+    await backend.hydrate(`${dbPath}.fsdata`);
+    const engine = await openEngine(backend);
+    const db = engine.openDatabase(SCHEMA, 'sds', dbPath, 2);
+    db.registerFileId('OMM ', 'omm');
+    const restored = db.openState();
+    check(restored === 30, `tail re-index picks up late appends (got ${restored})`);
+    db.destroy();
+  }
+
+  // 4. corrupt derived state -> full re-derivation, never data loss
+  {
+    await backend.hydrate(dbPath);
+    const engine = await openEngine(backend);
+    const db = engine.openDatabase(SCHEMA, 'sds', dbPath, 2);
+    db.registerFileId('OMM ', 'omm');
+    const rebuilt = db.reindexAll();
+    check(rebuilt === 30, `reindexAll re-derives everything from the stream (got ${rebuilt})`);
+    db.destroy();
+    await backend.flush();
+  }
+}
+
+/**
+ * The ephemeral engine is NOT skipped. Its documented behaviour — no
+ * filesystem, so state calls report -5 and the caller derives fresh — is
+ * asserted, because that fallback is a real production path.
+ */
+async function runEphemeral() {
+  console.log('\n--- backend: none (ephemeral :memory:) ---');
+  const engine = await openEngine(createMemoryBackend());
+  const db = engine.createDatabase(SCHEMA, 'sds');
+  db.registerFileId('OMM ', 'omm');
+  db.ingest(makeStream(25544, 3));
+
+  check(!db.isDiskBacked(), 'ephemeral engine reports NOT disk-backed');
+  check(db.openState() === -5, 'openState reports -5 (no filesystem)');
+  check(db.flushState === undefined || db.flushIndex() === -5, 'flushIndex reports -5');
+  const n = db.query('SELECT COUNT(*) AS n FROM omm').rows[0][0];
+  check(Number(n) === 3, 'ephemeral ingest and query still work');
+  db.destroy();
+}
+
+const tmp = mkdtempSync(join(tmpdir(), 'flatsql-io-'));
+try {
+  await runMatrix('memory', createMemoryBackend(), 'sds.db');
+  await runMatrix('node-fs', createNodeFsBackend(nodeFs, { root: tmp }), 'sds.db');
+  await runMatrix(
+    'chunked key->bytes store (the sdn-js shape)',
+    createChunkedStoreBackend(makeKeyValueStore(), { chunkBytes: 4096 }),
+    'sds.db',
+  );
+  await runEphemeral();
+} finally {
+  rmSync(tmp, { recursive: true, force: true });
+}
+
+if (failures) {
+  console.error(`\n${failures} check(s) FAILED`);
+  process.exit(1);
+}
+console.log('\nAll wasm I/O persistence checks passed.');

@@ -208,7 +208,10 @@ void* flatsql_open_db(const char* schema, const char* dbName,
 int  flatsql_is_disk_backed(void* h);
 ```
 
-**SPECIFIED, not yet built** — the `.fsix` layer over the streams:
+**LANDED (slice 2)** — the durable-state layer over the stream. Exported by
+the browser bundle and both wasi targets; tested natively
+(`cpp/test/state_persistence_test.cpp`) and in wasm across three backends
+(`wasm/test-io-persistence.mjs`):
 
 ```c
 
@@ -392,3 +395,167 @@ the code no longer matches:
 - Chain contract: a file's `(MinTXID-1, PreApplyChecksum)` must equal the
   previous file's `(MaxTXID, PostApplyChecksum)`.
 - A snapshot is exactly `MinTXID == 1`.
+
+
+---
+
+## 6. Slice 2 — LANDED. The VFS, the state layer, and what `.fsix` became.
+
+### 6.1 The seven-import contract, as built
+
+`cpp/include/flatsql/flatsql_io.h`. Module `env`, identical names and identical
+signatures on every target — verified by `scripts/check-wasm-imports.mjs`:
+
+```c
+i32 flatsql_io_open(ptr path, i32 pathLen, i32 flags)   /* handle | negative */
+i32 flatsql_io_read(i32 h, ptr dst, i32 len, f64 offset)
+i32 flatsql_io_write(i32 h, ptr src, i32 len, f64 offset)
+i32 flatsql_io_truncate(i32 h, f64 size)
+i32 flatsql_io_sync(i32 h)
+f64 flatsql_io_size(i32 h)
+i32 flatsql_io_close(i32 h)
+```
+
+Two decisions worth keeping:
+
+- **Offsets and sizes are `f64`, not `i64`.** Emscripten legalizes i64 across
+  the JS boundary for the browser target and does not for `STANDALONE_WASM`, so
+  an i64 here would give the same function name genuinely different signatures
+  in the two lanes. `f64` is exact to 2^53 (9 PB) and identical everywhere.
+- **`xAccess` and `xDelete` ride on `open` flags** (`FLATSQL_IO_PROBE`,
+  `FLATSQL_IO_UNLINK`) rather than becoming imports eight and nine. Both are
+  pure path->status questions that allocate no handle; a VFS cannot work
+  without them, and spending two more imports on them buys nothing.
+
+Locking is a documented no-op: one writer per database (the one-daemon-per-box
+law on the server, tab ownership in the browser). `xDeviceCharacteristics`
+returns 0 — claiming a capability the weakest lane lacks would let the pager
+skip journal work in one lane and not the other, which is a divergence in crash
+recovery.
+
+### 6.2 Measured import surfaces (the guardrail's baseline)
+
+| Artifact | WASI | flatsql_io | Notes |
+|---|---|---|---|
+| `flatsql-wasi-noeh.wasm` | 6 | 7 | engine; server lane |
+| `flatsql-wasi.wasm` | 6 | 7 | engine; exceptions variant |
+| `flatsql.js` + `flatsql.wasm` | n/a | 7 (via `--js-library`) | `FILESYSTEM=0` intact |
+| `flatsql-sdn-node.wasm` | 6 | **0** | MODULE: generic hook set only |
+
+The module artifacts deliberately do NOT link the VFS. A space-data-module-sdk
+module that grows private imports is a new host capability, which is an owner
+decision, not a build detail — so those targets instead **refuse** a disk-backed
+open (`sqlite_engine.cpp`) rather than silently succeeding against RAM.
+
+`scripts/check-wasm-imports.mjs` fails the build on any drift in either
+direction: a missing import means I/O went to RAM, an extra one means the
+filesystem got re-routed. Both are this defect's failure class.
+
+### 6.3 `.fsix` — SUPERSEDED for now, deliberately, and recorded
+
+The spec called for `.fsix`: FlatSQL-native paged index files finishing the dead
+`btree.h`/`btree.cpp` lineage. **It was not built, and that is a decision, not
+an omission.**
+
+Once the VFS existed, the durable index the owner asked for already existed too:
+the index b-trees are written page by page **through FlatSQL's own VFS**, into a
+file FlatSQL owns, by code in the FlatSQL binary. Every word of ruling (2) — "the
+btree / SQLite table data to disk ... through the WasmEdge or shim FS access" —
+is satisfied, and ruling (1) is satisfied because there is no second engine and
+no second process: the vendored SQLite is FlatSQL's own b-tree implementation,
+which the owner already ruled on (option A).
+
+Writing a second, parallel, crash-safe pager beside a mature one *in the same
+binary* to hold the same tuples would add a novel corruption surface to a task
+whose entire purpose is durability. `.fsix` is therefore **slice 3**, and it
+needs a measurement to justify it, not a preference: the case for it is page
+density (a `.fsix` page holds key+offset+length+sequence tuples, where a SQLite
+page carries row overhead) and it should be opened when index size or flush cost
+is shown to matter. `btree.h`/`btree.cpp` stay in the repo as the starting
+point; they are still in no CMake target.
+
+### 6.4 What durability looks like now
+
+```
+<db>            SQLite b-trees: index tuples + _flatsql_state, through the VFS
+<db>.fsdata     append-only stream of size-prefixed SDS FlatBuffer records
+```
+
+- `flatsql_flush_index` appends `[flushedOffset, writeOffset)` to the stream and
+  **fsyncs it BEFORE** committing the mark. The order is the invariant: the
+  index may only ever claim a mark the stream can already back. Reversed, it
+  manufactures torn pairs.
+- `flatsql_open_state` verifies format + schema fingerprint + stream length,
+  then replays the stream **indexing only the tail past the mark**. Records
+  below it keep the index rows already on disk — that is the entire win: a boot
+  pays for a scan, not for an index build.
+- Any failure is a negative code and one `flatsql_reindex_all` away from
+  correct. There is no code that means data was lost, because the stream is
+  never rewritten by any recovery path.
+
+### 6.5 Browser satisfaction (`wasm/flatsql-io.js`)
+
+Three backends, one interface, shared by the emscripten bundle and the
+standalone shim: `createMemoryBackend`, `createNodeFsBackend`,
+`createChunkedStoreBackend`. The last is the sdn-js lane: any flat key->bytes
+store gets pread/pwrite semantics from fixed-size page-group keys
+(`<prefix><path>#<group>` plus a `#meta` length record), so a flush costs
+O(dirty chunks) instead of O(file).
+
+**The one honest asymmetry, and it is in the shim where it belongs.** IndexedDB
+and the HTTP desktop store cannot answer synchronously; a wasm import cannot
+await. So the chunked backend keeps a synchronous page cache and makes
+durability an explicit awaited JS step:
+
+```js
+await backend.hydrate(path);   // BEFORE opening
+...engine runs fully synchronously...
+await backend.flush();         // AFTER flatsql_flush_index()
+```
+
+`flatsql_io_sync` is therefore a durability *barrier* in that lane, not a
+durability *guarantee*. Results are byte-identical to the native lane in every
+case — only the moment bytes land differs, and it is awaited rather than
+assumed. A shim that claimed fsync semantics it cannot deliver would be exactly
+the class of lie this task exists to remove.
+
+### 6.6 Parity evidence
+
+| Lane | Harness | Result |
+|---|---|---|
+| native (POSIX pread/pwrite) | `ctest` — `FlatSQLVfsTest`, `FlatSQLStatePersistenceTest` | 8/8 suites pass |
+| wasm + memory backend | `wasm/test-io-persistence.mjs` | pass |
+| wasm + node-fs backend | same file, same assertions | pass |
+| wasm + chunked key->bytes backend | same file, same assertions | pass |
+| wasm, ephemeral `:memory:` | same file | documented -5, asserted not skipped |
+
+Every lane runs the identical scenario: ingest 25 size-prefixed records, flush,
+**tear the engine down**, reopen from the backend, assert identical query
+results and an identical high-water mark; append 5 more past the mark and assert
+the tail re-index finds 30; corrupt the state and assert full re-derivation
+recovers 30. Cross-lane divergence in any assertion is a shim defect, not a
+platform quirk.
+
+### 6.7 Phase 2 (Hermes) — refined by what actually landed
+
+1. `flatsqlrt` must register a host module **`env`** exporting the seven
+   functions in §6.1 over real files under the store directory. This is a hard
+   gate: the module imports them unconditionally, so a host that does not
+   provide them **cannot instantiate the artifact**. Pin bump and host wiring
+   land together or not at all.
+2. WASI preopens are NOT how this works and `WithWASIArgs` preopens are not
+   required for FlatSQL I/O — the seven imports are the entire filesystem. The
+   preopen plumbing at `kubo/sdn/wasmrt/runtime.go:206` stays useful for other
+   modules; it is not part of this contract.
+3. Open with `flatsql_open_db(schema, dbName, path, 2)` — journalMode 2
+   (TRUNCATE). Then `flatsql_open_state`; map -1..-5 to typed errors; ANY
+   negative => `flatsql_reindex_all`, which is today's behaviour and never
+   worse.
+4. Call `flatsql_flush_index` at the cadence the host already checkpoints at.
+   `flatsql_flushed_offset` is the resume point that makes
+   `record_catalog_replay.go:36-47`'s UNSOUND-cursor ruling obsolete.
+5. Keep fail-closed export (`ErrRecordCatalogHydrating`, 2a2ffea5) until
+   open+verify completes.
+6. `sdn-server/internal/flatsqldrv/standalone.go:33`'s `sql.Open("sqlite", ...)`
+   for auth.db is still a genuine second engine and still contrary to "use
+   FlatSQL only". It can move now that FlatSQL is disk-backed.

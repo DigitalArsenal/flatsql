@@ -26,6 +26,12 @@ struct SQLiteConnectionOptions {
     // docs/STORAGE-DURABILITY.md §3.5. DELETE/TRUNCATE are crash-safe with a
     // single writer, which the one-daemon-per-box law already guarantees.
     int journalMode = 0;
+    // sqlite3_vfs to open through. Empty selects the platform default: the
+    // system VFS natively, FlatSQL's own seven-import VFS ("flatsql_io") on
+    // every wasm target, where there is no system filesystem to fall back to.
+    // Set explicitly to force one lane — the native VFS test does exactly that
+    // so the wasm I/O path is exercised in CTest. See flatsql_io.h.
+    std::string vfs;
     int busyTimeoutMs = 250;
     int maxBusyRetries = 8;
     int busyBackoffMs = 1;

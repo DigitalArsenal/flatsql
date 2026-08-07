@@ -1,4 +1,5 @@
 #include "flatsql/sqlite_engine.h"
+#include "flatsql/flatsql_io.h"
 #include "flatsql/geo_functions.h"
 #include <algorithm>
 #include <chrono>
@@ -159,7 +160,48 @@ SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
     : db_(nullptr)
     , options_(std::move(options)) {
     int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
-    int rc = sqlite3_open_v2(options_.path.c_str(), &db_, flags, nullptr);
+
+    // Pick the VFS. Never rely on registration order deciding the default:
+    // name the VFS explicitly so the same path opens through the same code in
+    // every lane. On wasm there is no system filesystem at all — FILESYSTEM=0
+    // stays and a disk-backed open MUST route through the seven-import VFS or
+    // it silently lands in RAM, which is the exact defect this task exists to
+    // close (docs/STORAGE-DURABILITY.md §4).
+    std::string vfsName = options_.vfs;
+    const bool wantsFile = !options_.path.empty() && options_.path != ":memory:";
+#if defined(__wasm__)
+#  if defined(FLATSQL_ENABLE_IO_VFS)
+    if (vfsName.empty() && wantsFile) {
+        vfsName = flatsql::kFlatSqlVfsName;
+    }
+#  else
+    // A wasm target built WITHOUT the I/O VFS has no filesystem of any kind.
+    // Refuse the open instead of succeeding against RAM: "it looked durable
+    // and was not" is the whole defect (docs/STORAGE-DURABILITY.md §2.2).
+    // Targets that are space-data-module-sdk MODULES deliberately stay in this
+    // branch — a module keeps the generic hook set and never grows private
+    // imports; disk backing belongs to the engine artifact.
+    if (wantsFile) {
+        throw std::runtime_error(
+            "FlatSQL: disk-backed open requested but this build has no I/O VFS "
+            "(FLATSQL_ENABLE_IO_VFS off); refusing to fall back to memory");
+    }
+#  endif
+#endif
+#if defined(FLATSQL_ENABLE_IO_VFS)
+    if (!vfsName.empty()) {
+        registerFlatSqlIoVfs(false);
+    }
+#else
+    if (!vfsName.empty() && vfsName == std::string("flatsql_io")) {
+        throw std::runtime_error(
+            "FlatSQL: vfs 'flatsql_io' requested but not compiled into this "
+            "target (FLATSQL_ENABLE_IO_VFS off)");
+    }
+#endif
+
+    int rc = sqlite3_open_v2(options_.path.c_str(), &db_, flags,
+                             vfsName.empty() ? nullptr : vfsName.c_str());
     if (rc != SQLITE_OK) {
         std::string error = sqlite3_errmsg(db_);
         sqlite3_close(db_);

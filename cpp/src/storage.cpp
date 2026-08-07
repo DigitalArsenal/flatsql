@@ -58,7 +58,9 @@ void StreamingFlatBufferStore::ensureCapacity(size_t needed) {
     size_t totalNeeded = static_cast<size_t>(writeOffset_) + needed;
     if (totalNeeded <= data_.size()) return;
 
-    size_t newSize = data_.size() * 2;
+    // Never double from zero — that spins forever. An empty arena starts at a
+    // page rather than at nothing.
+    size_t newSize = data_.empty() ? 4096 : data_.size() * 2;
     while (newSize < totalNeeded) {
         newSize *= 2;
     }

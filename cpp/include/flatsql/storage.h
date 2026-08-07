@@ -138,6 +138,20 @@ public:
     uint64_t getRecordCount() const { return recordCount_; }
     uint64_t getDataSize() const { return writeOffset_; }
 
+    // Drop every in-memory record. The stream on disk is NOT touched — this
+    // only empties the arena so a full re-derivation can replay it from byte 0.
+    void reset() {
+        // Deliberately does NOT free data_: ensureCapacity() grows by doubling,
+        // so a zero-length buffer would spin forever. Bytes past writeOffset_
+        // are never read.
+        writeOffset_ = 0;
+        recordCount_ = 0;
+        nextSequence_ = 1;
+        sequenceToOffset_.clear();
+        offsetToSequence_.clear();
+        fileIdToRecords_.clear();
+    }
+
     // Extract file identifier from a FlatBuffer (bytes 4-7)
     static std::string extractFileId(const uint8_t* flatbuffer, size_t length);
 

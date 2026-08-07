@@ -312,6 +312,31 @@ void TableStore::insertIntoRTree(const SpatialIndexDef& si, const uint8_t* data,
     sqlite3_finalize(stmt);
 }
 
+void TableStore::clearDerived() {
+    // Direct DELETE rather than SqliteIndex::clear(): that path throws, and a
+    // throw on the -fignore-exceptions WASI artifact is a guest abort. A full
+    // re-derivation is a RECOVERY path — it may never be the thing that kills
+    // the instance (b26ed45).
+    for (auto& [name, index] : indexes_) {
+        const std::string sql =
+            "DELETE FROM \"" + index->getIndexTableName() + "\"";
+        sqlite3_exec(indexDb_, sql.c_str(), nullptr, nullptr, nullptr);
+    }
+    for (const auto& si : spatialIndexes_) {
+        const std::string sql = "DELETE FROM \"" + si.rtreeName + "\"";
+        sqlite3_exec(indexDb_, sql.c_str(), nullptr, nullptr, nullptr);
+    }
+    recordInfos_.clear();
+    recordCount_ = 0;
+}
+
+// Replay of a record whose index rows are already on disk. Restores the record
+// info the vtab scans need and nothing else — no extraction, no index insert.
+void TableStore::onIngestReplay(uint64_t sequence, uint64_t offset) {
+    recordCount_++;
+    recordInfos_.push_back({offset, sequence});
+}
+
 void TableStore::onIngest(const uint8_t* data, size_t length, uint64_t sequence, uint64_t offset) {
     // This is the streaming index builder
     // Called for each FlatBuffer as it arrives
@@ -427,6 +452,13 @@ FlatSQLDatabase::FlatSQLDatabase(const DatabaseSchema& schema, RuntimeOptions op
                                        : std::make_shared<std::shared_mutex>()) {
 
     diskBacked_ = !options.sqlite.path.empty() && options.sqlite.path != ":memory:";
+    if (diskBacked_) {
+        // One name, one pair: the stream that backs this database is derived
+        // from the database path, so a host cannot pair an index with a stream
+        // that was never meant to go with it.
+        sqlitePath_ = options.sqlite.path;
+        streamPath_ = options.sqlite.path + ".fsdata";
+    }
 
     // Initialize SQLite engine first (we need its db handle for indexes)
     sqliteEngine_ = std::make_unique<SQLiteEngine>(options.sqlite);
@@ -459,7 +491,7 @@ void FlatSQLDatabase::registerFileId(const std::string& fileId, const std::strin
 }
 
 void FlatSQLDatabase::onIngest(std::string_view fileId, const uint8_t* data, size_t length,
-                                uint64_t sequence, uint64_t offset) {
+                                uint64_t sequence, uint64_t offset, bool buildIndexes) {
     // Route to the correct table based on file identifier
     std::string fileIdStr(fileId);
     auto mapIt = fileIdToTable_.find(fileIdStr);
@@ -470,7 +502,11 @@ void FlatSQLDatabase::onIngest(std::string_view fileId, const uint8_t* data, siz
 
     auto tableIt = tables_.find(mapIt->second);
     if (tableIt != tables_.end()) {
-        tableIt->second->onIngest(data, length, sequence, offset);
+        if (buildIndexes) {
+            tableIt->second->onIngest(data, length, sequence, offset);
+        } else {
+            tableIt->second->onIngestReplay(sequence, offset);
+        }
     }
 }
 

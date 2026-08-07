@@ -830,6 +830,52 @@ int flatsql_is_disk_backed(void* handle) {
     return static_cast<FlatSQLDatabase*>(handle)->isDiskBacked() ? 1 : 0;
 }
 
+// ---- Durable state (docs/STORAGE-DURABILITY.md §3.3) ----------------------
+// Every one of these returns a VALUE. There is no code that means "data lost":
+// each negative is recoverable by flatsql_reindex_all, whose worst case is
+// exactly the full re-derivation hosts do today.
+//   0/positive OK   -1 absent   -2 format/schema   -3 corrupt   -4 torn   -5 no FS
+
+// Boot: verify the persisted index, replay only the stream tail past the
+// recorded high-water mark. Returns the record count now visible.
+EMSCRIPTEN_KEEPALIVE
+int flatsql_open_state(void* handle) {
+    if (!handle) return FlatSQLDatabase::kStateNoFilesystem;
+    return static_cast<FlatSQLDatabase*>(handle)->openState();
+}
+
+// Full re-derivation from the stream. Always available, always correct.
+EMSCRIPTEN_KEEPALIVE
+int flatsql_reindex_all(void* handle) {
+    if (!handle) return FlatSQLDatabase::kStateNoFilesystem;
+    return static_cast<FlatSQLDatabase*>(handle)->reindexAll();
+}
+
+// Append new stream bytes, fsync, then commit the index + high-water mark.
+EMSCRIPTEN_KEEPALIVE
+int flatsql_flush_index(void* handle) {
+    if (!handle) return FlatSQLDatabase::kStateNoFilesystem;
+    return static_cast<FlatSQLDatabase*>(handle)->flushState();
+}
+
+// High-water mark a host may resume its own journal from. Returned as a double
+// so the value crosses to JS identically in both lanes — an i64 here would be
+// legalized on the browser target and not on the wasi target, which is the same
+// signature-divergence trap the I/O contract avoids (flatsql_io.h).
+EMSCRIPTEN_KEEPALIVE
+double flatsql_flushed_offset(void* handle) {
+    if (!handle) return 0;
+    return static_cast<double>(
+        static_cast<FlatSQLDatabase*>(handle)->flushedOffset());
+}
+
+// Path of the SDS FlatBuffer stream backing this handle ("" when ephemeral).
+EMSCRIPTEN_KEEPALIVE
+const char* flatsql_stream_path(void* handle) {
+    if (!handle) return "";
+    return static_cast<FlatSQLDatabase*>(handle)->streamPath().c_str();
+}
+
 EMSCRIPTEN_KEEPALIVE
 void flatsql_destroy_db(void* handle) {
     delete static_cast<FlatSQLDatabase*>(handle);
