@@ -86,11 +86,32 @@ function makeKeyValueStore() {
   };
 }
 
+// Two loaders, one contract. `engineFactory` is swapped so the ENTIRE matrix
+// below runs against the standalone/WASI artifact and against the emscripten
+// browser bundle without a single assertion changing. That is the only way a
+// lane-specific defect gets caught: the browser bundle once spun forever here,
+// because with FILESYSTEM=0 emscripten's open() stub returns fd 0 and sqlite's
+// vendored unix VFS loops on any fd below 3. Nothing had ever reached that code
+// while the builds had no file I/O at all.
+let engineFactory = null;
+
 async function openEngine(backend) {
+  return engineFactory(backend);
+}
+
+async function standaloneEngine(backend) {
   return loadFlatSQLStandalone({
     bytes: readFileSync(WASM_PATH),
     io: backend,
   });
+}
+
+async function browserEngine(backend) {
+  const { initFlatSQL } = await import('./index.js');
+  const flatsql = await initFlatSQL({ skipIntegrityCheck: true, io: backend });
+  // The browser bundle's FlatSQL class already exposes createDatabase /
+  // openDatabase with the same names and the same semantics.
+  return flatsql;
 }
 
 /**
@@ -197,6 +218,9 @@ async function runEphemeral() {
 
 const tmp = mkdtempSync(join(tmpdir(), 'flatsql-io-'));
 try {
+  // ---- lane 1: the standalone / WASI artifact (the server's binary) --------
+  engineFactory = standaloneEngine;
+  console.log('\n================ artifact: flatsql-wasi-noeh.wasm ================');
   await runMatrix('memory', createMemoryBackend(), 'sds.db');
   await runMatrix('node-fs', createNodeFsBackend(nodeFs, { root: tmp }), 'sds.db');
   await runMatrix(
@@ -205,6 +229,17 @@ try {
     'sds.db',
   );
   await runEphemeral();
+
+  // ---- lane 2: the emscripten browser bundle, SAME assertions -------------
+  // initFlatSQL rebinds its module-level wasm instance on every call, so the
+  // browser lane runs last and once.
+  engineFactory = browserEngine;
+  console.log('\n================ artifact: flatsql.js + flatsql.wasm ================');
+  await runMatrix(
+    'chunked key->bytes store (browser bundle)',
+    createChunkedStoreBackend(makeKeyValueStore(), { chunkBytes: 4096 }),
+    'browser.db',
+  );
 } finally {
   rmSync(tmp, { recursive: true, force: true });
 }

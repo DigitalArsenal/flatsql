@@ -519,6 +519,32 @@ case — only the moment bytes land differs, and it is awaited rather than
 assumed. A shim that claimed fsync semantics it cannot deliver would be exactly
 the class of lie this task exists to remove.
 
+### 6.5.1 The divergence the harness caught — FlatSQL's VFS is DEFAULT on wasm
+
+The first cross-lane run found a real one, and it is worth recording because it
+would have been extremely hard to diagnose in production: **the browser bundle
+hung forever on the first journal write.**
+
+The vendored SQLite still compiles its unix VFS, and it stays SQLite's default.
+With `FILESYSTEM=0`, emscripten's `open()` is an empty stub that returns 0 —
+a valid-looking fd below `SQLITE_MINIMUM_FILE_DESCRIPTOR` (3). `robust_open()`
+(`cpp/vendor/sqlite/sqlite3.c:38686`) then closes it, retries `/dev/null`, gets
+0 again, and **loops forever**. Nothing had ever reached that code, because the
+builds had no file I/O at all — the first thing to reach it is
+`sqlite3_randomness()`, which goes through the DEFAULT vfs when SQLite writes a
+journal header.
+
+Fix: on wasm, `registerFlatSqlIoVfs(makeDefault=true)`. The unix VFS is then
+unreachable — not for `xOpen`, not for `xRandomness`, not for anything. Natively
+the system VFS stays default and existing behaviour is untouched; the native VFS
+test names `flatsql_io` explicitly instead.
+
+The lesson generalises: on wasm a "default" system VFS is a loaded gun, because
+its failure mode is a spin rather than an error. The harness now runs the full
+matrix against BOTH artifacts (`flatsql-wasi-noeh.wasm` and the emscripten
+bundle) with identical assertions, which is what turned an invisible hang into a
+one-line diff.
+
 ### 6.6 Parity evidence
 
 | Lane | Harness | Result |
@@ -528,6 +554,7 @@ the class of lie this task exists to remove.
 | wasm + node-fs backend | same file, same assertions | pass |
 | wasm + chunked key->bytes backend | same file, same assertions | pass |
 | wasm, ephemeral `:memory:` | same file | documented -5, asserted not skipped |
+| **browser bundle** (`flatsql.js`) | same file, same assertions | pass (caught the §6.5.1 hang) |
 
 Every lane runs the identical scenario: ingest 25 size-prefixed records, flush,
 **tear the engine down**, reopen from the backend, assert identical query

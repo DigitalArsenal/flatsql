@@ -189,9 +189,25 @@ SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
 #  endif
 #endif
 #if defined(FLATSQL_ENABLE_IO_VFS)
+    // MEASURED, and the reason this is not merely "tidy": on wasm the vendored
+    // unix VFS is a landmine. With FILESYSTEM=0 emscripten's open() stub
+    // returns fd 0, and sqlite3.c's robust_open() (vendor/sqlite/sqlite3.c:38686)
+    // loops forever on any fd below SQLITE_MINIMUM_FILE_DESCRIPTOR — it closes
+    // it, retries "/dev/null", gets 0 again, and spins. Nothing ever reached
+    // that code while the builds had no file I/O at all; the first journal
+    // write does, because sqlite3_randomness() goes through the DEFAULT vfs.
+    //
+    // So on wasm FlatSQL's VFS is registered as the default and the unix VFS is
+    // never reachable — not for xOpen, not for xRandomness, not for anything.
+    // Natively the system VFS stays default and existing behaviour is untouched;
+    // the native VFS test names "flatsql_io" explicitly instead.
+#  if defined(__wasm__)
+    registerFlatSqlIoVfs(/*makeDefault=*/true);
+#  else
     if (!vfsName.empty()) {
-        registerFlatSqlIoVfs(false);
+        registerFlatSqlIoVfs(/*makeDefault=*/false);
     }
+#  endif
 #else
     if (!vfsName.empty() && vfsName == std::string("flatsql_io")) {
         throw std::runtime_error(
