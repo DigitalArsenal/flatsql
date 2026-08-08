@@ -106,6 +106,29 @@ public:
     );
 
     /**
+     * registerSource without the throw. Same work, same effects; reports the
+     * failure instead of raising it.
+     *
+     * The durable-state restore path (flatsql_state.cpp) must never throw: on
+     * the -fignore-exceptions WASI artifact a throw lowers to `unreachable`,
+     * which turns a recoverable "state could not be restored" into a dead
+     * instance. Boot is exactly where that must not happen, so it takes this
+     * door and the throwing overload above is a thin wrapper over it.
+     */
+    bool registerSourceNoThrow(
+        const std::string& sourceName,
+        StreamingFlatBufferStore* store,
+        const TableDef* tableDef,
+        const std::string& fileId,
+        FieldExtractor extractor,
+        const std::unordered_map<std::string, SqliteIndex*>& indexes = {},
+        FastFieldExtractor fastExtractor = nullptr,
+        BatchExtractor batchExtractor = nullptr,
+        const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos = nullptr,
+        std::string* errOut = nullptr
+    );
+
+    /**
      * Create a unified view that combines multiple sources with the same schema.
      * Generates a UNION ALL view with _source column.
      *
@@ -115,6 +138,13 @@ public:
     void createUnifiedView(
         const std::string& viewName,
         const std::vector<std::string>& sourceNames
+    );
+
+    /** createUnifiedView without the throw (see registerSourceNoThrow). */
+    bool createUnifiedViewNoThrow(
+        const std::string& viewName,
+        const std::vector<std::string>& sourceNames,
+        std::string* errOut = nullptr
     );
 
     /**

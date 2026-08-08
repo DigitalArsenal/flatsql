@@ -493,6 +493,52 @@ point; they are still in no CMake target.
   correct. There is no code that means data was lost, because the stream is
   never rewritten by any recovery path.
 
+### 6.4.1 Source partitions (1.4.5, upstream-flatsql-3)
+
+Measured on 1.4.4 through the chunked shim: `registerSource('alpha')` +
+`registerSource('beta')`, 60 and 20 records, flush, teardown — and the reopen
+came back **0/0**, with the persisted unified view answering `no such module:
+__flatsql_module_omm_alpha`. `openState` re-indexed by `file_identifier` into
+base tables only, so every partition was empty and re-registering produced an
+empty partition too. sdn-js partitions every standard by source, so this was
+what kept the browser lane on snapshot exports.
+
+Two designs were on the table. **The source is NOT recorded per frame in the
+arena.** The stream is `[u32 size][FlatBuffer]` and nothing else — the wire
+bytes, byte for byte, which is what makes `wire = disk = query` and the
+zero-copy reads true at all. A per-frame tag would make `.fsdata` a private
+format, break every byte-identity assertion, and invalidate the disk-backed
+state already live on the fleet. So the partition lives where every other
+derived fact already lives — in the index file:
+
+```
+_flatsql_sources        name, ord           registration order == UNION ALL order
+_flatsql_source_ranges  start, stop, source half-open arena spans, coalesced
+```
+
+An `ingestWithSource` call appends a **contiguous** run of frames, and
+consecutive runs from one source coalesce, so a per-provider partition costs a
+handful of rows, not one per record. `flush_index` writes the delta **inside
+the mark's own transaction**: a range can never claim stream the mark cannot
+back. `open_state` reads them back before the replay, routes each frame to its
+partition, and re-binds the vtab modules + unified views the schema already
+names — so a reopened database answers the same query with **no
+re-registration**. `reindex_all` reads them too: the wire bytes cannot
+re-derive a source, so ranges are durable metadata, never derived state.
+
+Compatibility is both directions and required, because host-01 is live on
+disk-backed state:
+
+- `kFormatVersion` stays **1**. The two tables are additive, so pre-1.4.5 state
+  opens with every record and no re-derivation — absent tables read as "no
+  partitions", never as `-2`.
+- A 1.4.5 database opens under 1.4.4, which never reads those tables.
+- `.fsdata` is unchanged in both directions, bit for bit.
+
+Proof: `cpp/test/state_persistence_test.cpp` cases 6 and 7 (native) and
+`wasm/test-io-persistence.mjs` `runSourceMatrix` (standalone WASI-noeh + the
+emscripten bundle, over node-fs and the chunked sdn-js store).
+
 ### 6.5 Browser satisfaction (`wasm/flatsql-io.js`)
 
 Three backends, one interface, shared by the emscripten bundle and the

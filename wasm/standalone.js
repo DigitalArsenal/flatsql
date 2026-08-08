@@ -622,6 +622,30 @@ export class FlatSQLStandaloneDatabase {
     this._runtime.exports.flatsql_enable_demo_extractors(this._handle);
   }
 
+  // Source partitions. The artifact has always exported these; the shim did
+  // not wrap them, so the wasm lane could ingest WITH a source but never
+  // declare one, and could not see what a reopen restored. Same three calls,
+  // same names, same order as wasm/index.js — one engine, one surface.
+  registerSource(sourceName) {
+    this._runtime.withCString(sourceName, (ptr) =>
+      this._runtime.exports.flatsql_register_source(this._handle, ptr)
+    );
+  }
+
+  createUnifiedViews() {
+    this._runtime.exports.flatsql_create_unified_views(this._handle);
+  }
+
+  listSources() {
+    const count = this._runtime.exports.flatsql_get_sources_count(this._handle);
+    const sources = [];
+    for (let i = 0; i < count; i++) {
+      const ptr = this._runtime.exports.flatsql_get_source_name(i);
+      sources.push(ptr ? this._runtime.readCString(ptr) : '');
+    }
+    return sources;
+  }
+
   ingest(data, source = null) {
     return this._runtime.withBytes(data, (ptr) => {
       if (source) {

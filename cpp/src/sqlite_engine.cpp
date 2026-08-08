@@ -363,9 +363,30 @@ void SQLiteEngine::registerSource(
     BatchExtractor batchExtractor,
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos
 ) {
+    std::string err;
+    if (!registerSourceNoThrow(sourceName, store, tableDef, fileId, extractor,
+                               indexes, fastExtractor, batchExtractor,
+                               sourceRecordInfos, &err)) {
+        throw std::runtime_error(err);
+    }
+}
+
+bool SQLiteEngine::registerSourceNoThrow(
+    const std::string& sourceName,
+    StreamingFlatBufferStore* store,
+    const TableDef* tableDef,
+    const std::string& fileId,
+    FieldExtractor extractor,
+    const std::unordered_map<std::string, SqliteIndex*>& indexes,
+    FastFieldExtractor fastExtractor,
+    BatchExtractor batchExtractor,
+    const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos,
+    std::string* errOut
+) {
     const std::string moduleName = sqliteModuleNameForSource(sourceName);
     if (sources_.count(sourceName)) {
-        throw std::runtime_error("Source already registered: " + sourceName);
+        if (errOut) *errOut = "Source already registered: " + sourceName;
+        return false;
     }
 
     // Create source info
@@ -405,7 +426,10 @@ void SQLiteEngine::registerSource(
 
     if (rc != SQLITE_OK) {
         sources_.erase(sourceName);
-        throw std::runtime_error("Failed to create SQLite module: " + std::string(sqlite3_errmsg(db_)));
+        if (errOut) {
+            *errOut = "Failed to create SQLite module: " + std::string(sqlite3_errmsg(db_));
+        }
+        return false;
     }
 
     // TEMP schema DDL can hang in the WASM/SQLite build, so keep virtual tables
@@ -419,11 +443,13 @@ void SQLiteEngine::registerSource(
         std::string error = errMsg ? errMsg : "Unknown error";
         sqlite3_free(errMsg);
         sources_.erase(sourceName);
-        throw std::runtime_error("Failed to create virtual table: " + error);
+        if (errOut) *errOut = "Failed to create virtual table: " + error;
+        return false;
     }
 
     clearFastPathCaches();
     clearStmtCache();
+    return true;
 }
 
 std::string SQLiteEngine::buildColumnList(const TableDef* tableDef) const {
@@ -446,8 +472,20 @@ void SQLiteEngine::createUnifiedView(
     const std::string& viewName,
     const std::vector<std::string>& sourceNames
 ) {
+    std::string err;
+    if (!createUnifiedViewNoThrow(viewName, sourceNames, &err)) {
+        throw std::runtime_error(err);
+    }
+}
+
+bool SQLiteEngine::createUnifiedViewNoThrow(
+    const std::string& viewName,
+    const std::vector<std::string>& sourceNames,
+    std::string* errOut
+) {
     if (sourceNames.empty()) {
-        throw std::runtime_error("Cannot create unified view with no sources");
+        if (errOut) *errOut = "Cannot create unified view with no sources";
+        return false;
     }
 
     // Verify all sources exist and have same schema
@@ -455,14 +493,16 @@ void SQLiteEngine::createUnifiedView(
     for (const auto& name : sourceNames) {
         auto it = sources_.find(name);
         if (it == sources_.end()) {
-            throw std::runtime_error("Source not found: " + name);
+            if (errOut) *errOut = "Source not found: " + name;
+            return false;
         }
         if (!baseSchema) {
             baseSchema = it->second->tableDef;
         } else {
             // Verify compatible schema (same columns)
             if (it->second->tableDef->columns.size() != baseSchema->columns.size()) {
-                throw std::runtime_error("Incompatible schemas for unified view");
+                if (errOut) *errOut = "Incompatible schemas for unified view";
+                return false;
             }
         }
     }
@@ -499,8 +539,10 @@ void SQLiteEngine::createUnifiedView(
     if (rc != SQLITE_OK) {
         std::string error = errMsg ? errMsg : "Unknown error";
         sqlite3_free(errMsg);
-        throw std::runtime_error("Failed to create unified view: " + error);
+        if (errOut) *errOut = "Failed to create unified view: " + error;
+        return false;
     }
+    return true;
 }
 
 void SQLiteEngine::bindValue(sqlite3_stmt* stmt, int idx, const Value& value) const {

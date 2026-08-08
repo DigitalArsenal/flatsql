@@ -3,6 +3,10 @@
  * SQL queries over raw FlatBuffer storage
  */
 
+import type { FlatSqlIoBackend } from './flatsql-io.js';
+
+export type { FlatSqlIoBackend };
+
 export interface QueryResult {
   columns: string[];
   rows: any[][];
@@ -458,6 +462,17 @@ export interface InitOptions {
   computeSHA384?: (
     data: ArrayBuffer
   ) => Promise<string | Uint8Array | ArrayBuffer> | string | Uint8Array | ArrayBuffer;
+
+  /**
+   * Host I/O backend for disk-backed databases — the seven-import contract in
+   * cpp/include/flatsql/flatsql_io.h, which the runtime has always read off
+   * this option (wasm/index.js: `ioBackend = options.io ?? null`).
+   *
+   * Declared here because a runtime option missing from the published types is
+   * a contract that every TypeScript caller has to defeat with a cast, and a
+   * cast is where drift starts. Use `flatsql/io` for the backends.
+   */
+  io?: FlatSqlIoBackend;
 
   /**
    * Custom Emscripten module factory function

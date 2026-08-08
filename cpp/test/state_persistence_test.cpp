@@ -297,6 +297,151 @@ void testMemoryReportsNoFilesystem() {
     CHECK(db.getStorage().getRecordCount() == 3, "ephemeral ingest unaffected");
 }
 
+// ---------------------------------------------------------------------------
+// 6. SOURCE PARTITIONS survive the teardown (upstream-flatsql-3).
+//
+//    Hermes measured this against 1.4.4 through the chunked shim: alpha=60,
+//    beta=20 before teardown, 0/0 after, and the persisted unified view then
+//    answered "no such module: __flatsql_module_omm_alpha". sdn-js partitions
+//    EVERY standard by source, so that made the browser lane unable to retire
+//    its snapshot exports. The reopen below re-registers nothing.
+// ---------------------------------------------------------------------------
+uint64_t tableRows(FlatSQLDatabase& db, const std::string& tableName) {
+    for (const auto& stat : db.getStats()) {
+        if (stat.tableName == tableName) return stat.recordCount;
+    }
+    return 0;
+}
+
+int64_t queryCount(FlatSQLDatabase& db, const std::string& sql) {
+    QueryResult result;
+    std::string err;
+    if (!db.queryNoThrow(sql, {}, result, &err)) return -1;
+    if (result.rows.empty() || result.rows[0].empty()) return -1;
+    if (const auto* n = std::get_if<int64_t>(&result.rows[0][0])) return *n;
+    return -1;
+}
+
+void testSourcePartitionsSurviveTeardown() {
+    std::cout << "Testing source partitions -> teardown -> reopen..." << std::endl;
+    const std::string path = tempBase("sources.db");
+    const std::vector<uint8_t> alpha = makeStream(25544, 60);
+    const std::vector<uint8_t> beta = makeStream(40000, 20);
+
+    std::string beforePayload;
+    int64_t beforeUnified = 0;
+    {
+        DatabaseSchema schema;
+        FlatSQLDatabase db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        db.registerSource("alpha");
+        db.registerSource("beta");
+        db.ingestWithSource(alpha.data(), alpha.size(), "alpha", nullptr);
+        db.ingestWithSource(beta.data(), beta.size(), "beta", nullptr);
+        db.createUnifiedViews();
+
+        CHECK(tableRows(db, "omm@alpha") == 60, "alpha holds 60 records pre-teardown");
+        CHECK(tableRows(db, "omm@beta") == 20, "beta holds 20 records pre-teardown");
+        beforeUnified = queryCount(db, "SELECT COUNT(*) FROM omm");
+        CHECK(beforeUnified == 80, "unified view sees 80 records pre-teardown");
+        CHECK(queryCount(db, "SELECT COUNT(*) FROM omm WHERE _source='omm@alpha'") == 60,
+              "_source filter selects alpha's 60 pre-teardown");
+
+        beforePayload = readPayloadBySequence(db, 0);
+        CHECK(db.flushState() == FlatSQLDatabase::kStateOk, "flush succeeds");
+    }  // TEAR DOWN
+
+    {
+        DatabaseSchema schema;
+        FlatSQLDatabase db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        // NOTHING is re-registered: no registerSource, no createUnifiedViews.
+        const int restored = db.openState();
+        CHECK(restored == 80, "openState replays all 80 records");
+
+        CHECK(db.listSources().size() == 2, "both sources come back");
+        CHECK(db.listSources()[0] == "alpha" && db.listSources()[1] == "beta",
+              "sources come back in REGISTRATION order (view row order)");
+        CHECK(tableRows(db, "omm@alpha") == 60, "alpha still holds 60 records");
+        CHECK(tableRows(db, "omm@beta") == 20, "beta still holds 20 records");
+
+        CHECK(queryCount(db, "SELECT COUNT(*) FROM omm") == beforeUnified,
+              "the persisted unified view answers WITHOUT re-registration");
+        CHECK(queryCount(db, "SELECT COUNT(*) FROM omm WHERE _source='omm@alpha'") == 60,
+              "_source filter still selects alpha's 60");
+        CHECK(readPayloadBySequence(db, 0) == beforePayload,
+              "payload bytes are IDENTICAL after reopen");
+    }
+
+    // A late append to ONE source lands in that source, not in the base table.
+    {
+        DatabaseSchema schema;
+        FlatSQLDatabase db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        CHECK(db.openState() == 80, "second reopen replays 80");
+        const std::vector<uint8_t> more = makeStream(50000, 5);
+        db.ingestWithSource(more.data(), more.size(), "beta", nullptr);
+        CHECK(db.flushState() == FlatSQLDatabase::kStateOk, "flush after late append");
+    }
+    {
+        DatabaseSchema schema;
+        FlatSQLDatabase db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        CHECK(db.openState() == 85, "third reopen replays 85");
+        CHECK(tableRows(db, "omm@alpha") == 60, "alpha unchanged by beta's append");
+        CHECK(tableRows(db, "omm@beta") == 25, "beta grew by exactly the appended 5");
+        CHECK(queryCount(db, "SELECT COUNT(*) FROM omm") == 85, "view sees 85");
+
+        // Full re-derivation keeps the partition: the ranges are durable
+        // metadata, not something the stream could ever re-derive.
+        CHECK(db.reindexAll() == 85, "reindexAll replays 85");
+        CHECK(tableRows(db, "omm@alpha") == 60, "alpha survives a full re-derivation");
+        CHECK(tableRows(db, "omm@beta") == 25, "beta survives a full re-derivation");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. COMPAT: state written by a build with no partition tables (1.4.4 and
+//    older, which is what is live on the fleet) must open unchanged — same
+//    record count, same bytes, no -2, no re-derivation. Simulated by dropping
+//    the two additive tables, which is byte-for-byte the older layout.
+// ---------------------------------------------------------------------------
+void testPrePartitionStateStillOpens() {
+    std::cout << "Testing pre-1.4.5 state (no partition tables) -> opens..." << std::endl;
+    const std::string path = tempBase("legacy.db");
+    const std::vector<uint8_t> stream = makeStream(25544, 9);
+
+    std::string before;
+    {
+        DatabaseSchema schema;
+        FlatSQLDatabase db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        db.ingest(stream.data(), stream.size(), nullptr);
+        before = readPayloadBySequence(db, 0);
+        CHECK(db.flushState() == FlatSQLDatabase::kStateOk, "flush");
+
+        QueryResult ignored;
+        std::string err;
+        CHECK(db.queryNoThrow("DROP TABLE IF EXISTS _flatsql_sources", {}, ignored, &err),
+              "drop _flatsql_sources (older layout)");
+        CHECK(db.queryNoThrow("DROP TABLE IF EXISTS _flatsql_source_ranges", {}, ignored, &err),
+              "drop _flatsql_source_ranges (older layout)");
+        CHECK(db.queryNoThrow("DELETE FROM _flatsql_state WHERE k='source_index'",
+                              {}, ignored, &err),
+              "drop the source_index marker (older layout)");
+    }
+
+    {
+        DatabaseSchema schema;
+        FlatSQLDatabase db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        const int restored = db.openState();
+        CHECK(restored == 9, "older state opens with every record, no -2");
+        CHECK(readPayloadBySequence(db, 0) == before, "older state's bytes are identical");
+        CHECK(db.listSources().empty(), "no partitions is 'no partitions', not an error");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -306,6 +451,8 @@ int main() {
     testCorruptFallsBackToReindex();
     testSchemaChangeInvalidates();
     testMemoryReportsNoFilesystem();
+    testSourcePartitionsSurviveTeardown();
+    testPrePartitionStateStillOpens();
 
     if (g_failures) {
         std::cerr << g_failures << " check(s) FAILED" << std::endl;

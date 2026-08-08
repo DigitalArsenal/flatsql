@@ -590,9 +590,12 @@ private:
     void onIngest(std::string_view fileId, const uint8_t* data, size_t length,
                   uint64_t sequence, uint64_t offset, bool buildIndexes = true);
 
-    // Callback for source-aware ingest - routes to source-specific table
+    // Callback for source-aware ingest - routes to source-specific table.
+    // buildIndexes=false replays a record whose index rows are already durable,
+    // exactly as in onIngest above.
     void onIngestWithSource(std::string_view fileId, const uint8_t* data, size_t length,
-                            uint64_t sequence, uint64_t offset, const std::string& source);
+                            uint64_t sequence, uint64_t offset, const std::string& source,
+                            bool buildIndexes = true);
 
     // Initialize SQLite engine with registered tables
     void initializeSQLiteEngine();
@@ -600,8 +603,17 @@ private:
     // Re-register a table with SQLite after extractor is set
     void updateSQLiteTable(const std::string& tableName);
 
+    // updateSQLiteTable without the throw — the durable-state restore path may
+    // not raise (see SQLiteEngine::registerSourceNoThrow).
+    bool updateSQLiteTableNoThrow(const std::string& tableName,
+                                  std::string* errOut = nullptr);
+
     // Create a source-specific table (e.g., User@siteA)
     void createSourceTable(const std::string& baseTableName, const std::string& source);
+
+    // Register a source if it is not registered yet. Returns true when this
+    // call created it. Never throws — registerSource() adds the throw.
+    bool ensureSourceRegisteredUnlocked(const std::string& sourceName);
 
     // Get source table name (e.g., "User" + "siteA" -> "User@siteA")
     static std::string getSourceTableName(const std::string& baseTable, const std::string& source) {
@@ -646,6 +658,33 @@ private:
     // Source tracking
     std::vector<std::string> registeredSources_;        // List of registered source names
     std::map<std::string, std::string> sourceFileIdToTable_;  // "source:fileId" -> "table@source"
+
+    // Which stretch of the append-only stream each source wrote.
+    //
+    // The stream is the SDS wire bytes and NOTHING else — no frame header, no
+    // per-record tag (storage.h). So "which source produced this record" cannot
+    // live in the arena without breaking the one contract everything else
+    // rests on (wire == disk == query, byte for byte). It lives here instead,
+    // and durably in the index file next to every other derived fact.
+    //
+    // An ingestWithSource() call appends a CONTIGUOUS run of frames, so the
+    // membership of a whole batch is two numbers. Consecutive runs from the
+    // same source coalesce, which is why a per-provider partition costs a
+    // handful of rows rather than one per record.
+    struct SourceRange {
+        uint64_t start = 0;   // first frame offset (inclusive)
+        uint64_t end = 0;     // one past the last frame (exclusive)
+        std::string source;
+    };
+    std::vector<SourceRange> sourceRanges_;  // sorted by start, non-overlapping
+
+    // Append/extend the range covering [start,end) for `source`.
+    void recordSourceRangeUnlocked(const std::string& source, uint64_t start, uint64_t end);
+
+    // Source that owns the frame at `offset`, or "" when the frame was ingested
+    // without one. `cursor` is carried across a forward scan so a whole replay
+    // costs one pass over the ranges.
+    const std::string* sourceForOffset(uint64_t offset, size_t* cursor) const;
 
     // SQLite engine for query execution
     std::unique_ptr<SQLiteEngine> sqliteEngine_;
@@ -692,10 +731,23 @@ private:
 
     // Shared by openState/reindexAll: drive the store's rebuild, indexing only
     // the records at or past `indexFromOffset` (everything below it already has
-    // its index rows on disk).
+    // its index rows on disk). Frames inside a persisted source range are
+    // routed to that source's partition, not just to the base table.
     int loadStreamFromDisk(uint64_t indexFromOffset);
     int readWholeStream(std::vector<uint8_t>* out);
     void clearDerivedState();
+
+    // Source partitions across a teardown (flatsql_state.cpp):
+    //   restore — read the registered sources + their stream ranges back, and
+    //             recreate the partition tables so a replay can route to them.
+    //   persist — write the delta since the last flush, in the flush's own
+    //             transaction, so ranges can never claim more than the mark.
+    //   rebind  — re-register the partition vtab modules and the unified views
+    //             a previous run left in the schema, so the reopened database
+    //             answers the SAME queries without re-registration.
+    int restoreSourceIndex();
+    int persistSourceIndex(uint64_t upToOffset);
+    void rebindSourceViews();
 };
 
 }  // namespace flatsql

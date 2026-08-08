@@ -487,6 +487,29 @@ void FlatSQLDatabase::registerFileId(const std::string& fileId, const std::strin
 
     fileIdToTable_[fileId] = tableName;
     it->second->setFileId(fileId);
+
+    // Sources registered BEFORE the file id would otherwise hold partition
+    // tables that route nothing — a silent empty partition that looks exactly
+    // like the restore defect this file exists to prevent. Order must not
+    // matter, so late file ids reach the partitions too.
+    for (const auto& source : registeredSources_) {
+        const std::string sourceTableName = getSourceTableName(tableName, source);
+        auto sourceIt = tables_.find(sourceTableName);
+        if (sourceIt == tables_.end()) continue;
+        if (!sourceIt->second->getFileId().empty()) continue;
+        sourceIt->second->setFileId(fileId);
+        sourceFileIdToTable_[source + ":" + fileId] = sourceTableName;
+        if (auto extractor = it->second->getFieldExtractor()) {
+            sourceIt->second->setFieldExtractor(extractor);
+        }
+        if (auto fastExtractor = it->second->getFastFieldExtractor()) {
+            sourceIt->second->setFastFieldExtractor(fastExtractor);
+        }
+        if (auto batchExtractor = it->second->getBatchExtractor()) {
+            sourceIt->second->setBatchExtractor(batchExtractor);
+        }
+    }
+
     invalidateQueryResultCacheUnlocked();
 }
 
@@ -563,16 +586,24 @@ void FlatSQLDatabase::initializeSQLiteEngine() {
 }
 
 void FlatSQLDatabase::updateSQLiteTable(const std::string& tableName) {
+    std::string err;
+    if (!updateSQLiteTableNoThrow(tableName, &err)) {
+        throw std::runtime_error(err);
+    }
+}
+
+bool FlatSQLDatabase::updateSQLiteTableNoThrow(const std::string& tableName,
+                                               std::string* errOut) {
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
-        return;
+        return true;
     }
 
     TableStore* tableStore = it->second.get();
 
     // Skip if already registered
     if (sqliteRegisteredTables_.count(tableName)) {
-        return;
+        return true;
     }
 
     // Build index map (SqliteIndex* pointers)
@@ -590,17 +621,19 @@ void FlatSQLDatabase::updateSQLiteTable(const std::string& tableName) {
     // Base tables should read record infos from the shared store so that
     // independent reader connections observe writer progress.
     const bool isSourceTable = tableName.find('@') != std::string::npos;
-    sqliteEngine_->registerSource(
-        tableName,
-        storage_.get(),
-        &tableStore->getTableDef(),
-        tableStore->getFileId(),
-        tableStore->getFieldExtractor(),
-        indexes,
-        tableStore->getFastFieldExtractor(),
-        tableStore->getBatchExtractor(),
-        isSourceTable ? &tableStore->getRecordInfos() : nullptr
-    );
+    if (!sqliteEngine_->registerSourceNoThrow(
+            tableName,
+            storage_.get(),
+            &tableStore->getTableDef(),
+            tableStore->getFileId(),
+            tableStore->getFieldExtractor(),
+            indexes,
+            tableStore->getFastFieldExtractor(),
+            tableStore->getBatchExtractor(),
+            isSourceTable ? &tableStore->getRecordInfos() : nullptr,
+            errOut)) {
+        return false;
+    }
 
     // Propagate encryption context to the registered source
     if (encryptionCtx_) {
@@ -612,6 +645,7 @@ void FlatSQLDatabase::updateSQLiteTable(const std::string& tableName) {
     }
 
     sqliteRegisteredTables_.insert(tableName);
+    return true;
 }
 
 bool FlatSQLDatabase::validateSQL(const std::string& sql, int* paramCountOut, std::string* errOut) noexcept {
@@ -1314,11 +1348,17 @@ std::vector<FlatSQLDatabase::TableStats> FlatSQLDatabase::getStats() const {
 
 void FlatSQLDatabase::registerSource(const std::string& sourceName) {
     std::unique_lock lock(*accessMutex_);
-    // Check if source already registered
+    if (!ensureSourceRegisteredUnlocked(sourceName)) {
+        throw std::runtime_error("Source already registered: " + sourceName);
+    }
+}
+
+// The registration itself, without the throw: durable-state restore reuses it
+// (a boot may not raise), and registerSource() supplies the throw for callers
+// that ask for a source twice.
+bool FlatSQLDatabase::ensureSourceRegisteredUnlocked(const std::string& sourceName) {
     for (const auto& s : registeredSources_) {
-        if (s == sourceName) {
-            throw std::runtime_error("Source already registered: " + sourceName);
-        }
+        if (s == sourceName) return false;
     }
 
     invalidateQueryResultCacheUnlocked();
@@ -1328,6 +1368,7 @@ void FlatSQLDatabase::registerSource(const std::string& sourceName) {
     for (const auto& tableDef : schema_.tables) {
         createSourceTable(tableDef.name, sourceName);
     }
+    return true;
 }
 
 void FlatSQLDatabase::createSourceTable(const std::string& baseTableName, const std::string& source) {
@@ -1396,13 +1437,20 @@ void FlatSQLDatabase::createUnifiedViews() {
         if (!sourceTableNames.empty()) {
             // Create unified view with base table name
             sqliteEngine_->createUnifiedView(tableDef.name, sourceTableNames);
+            // The view now OWNS that name in the schema. Without this, a later
+            // lazy initializeSQLiteEngine() would try to CREATE VIRTUAL TABLE
+            // over a view and raise — a throw that aborts the no-exceptions
+            // artifact outright. Registration order must not decide whether
+            // the engine survives its first query.
+            sqliteRegisteredTables_.insert(tableDef.name);
         }
     }
     invalidateQueryResultCacheUnlocked();
 }
 
 void FlatSQLDatabase::onIngestWithSource(std::string_view fileId, const uint8_t* data, size_t length,
-                                          uint64_t sequence, uint64_t offset, const std::string& source) {
+                                          uint64_t sequence, uint64_t offset, const std::string& source,
+                                          bool buildIndexes) {
     // Route to source-specific table
     std::string sourceKey = source + ":" + std::string(fileId);
     auto mapIt = sourceFileIdToTable_.find(sourceKey);
@@ -1413,8 +1461,38 @@ void FlatSQLDatabase::onIngestWithSource(std::string_view fileId, const uint8_t*
 
     auto tableIt = tables_.find(mapIt->second);
     if (tableIt != tables_.end()) {
-        tableIt->second->onIngest(data, length, sequence, offset);
+        if (buildIndexes) {
+            tableIt->second->onIngest(data, length, sequence, offset);
+        } else {
+            tableIt->second->onIngestReplay(sequence, offset);
+        }
     }
+}
+
+// A source's records are the frames it appended. Both entry points below note
+// the arena span they produced, which is what makes the partition survivable
+// without touching a single byte of the stream.
+void FlatSQLDatabase::recordSourceRangeUnlocked(const std::string& source,
+                                                 uint64_t start, uint64_t end) {
+    if (end <= start) return;
+    if (!sourceRanges_.empty()) {
+        SourceRange& back = sourceRanges_.back();
+        if (back.source == source && back.end == start) {
+            back.end = end;  // consecutive batches from one source are ONE range
+            return;
+        }
+    }
+    sourceRanges_.push_back(SourceRange{start, end, source});
+}
+
+const std::string* FlatSQLDatabase::sourceForOffset(uint64_t offset, size_t* cursor) const {
+    size_t i = cursor ? *cursor : 0;
+    while (i < sourceRanges_.size() && sourceRanges_[i].end <= offset) i++;
+    if (cursor) *cursor = i;
+    if (i < sourceRanges_.size() && offset >= sourceRanges_[i].start) {
+        return &sourceRanges_[i].source;
+    }
+    return nullptr;
 }
 
 size_t FlatSQLDatabase::ingestWithSource(const uint8_t* data, size_t length,
@@ -1423,11 +1501,14 @@ size_t FlatSQLDatabase::ingestWithSource(const uint8_t* data, size_t length,
     std::unique_lock lock(*accessMutex_);
     invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
-    return storage_->ingest(data, length,
+    const uint64_t begin = storage_->getWriteOffset();
+    const size_t consumed = storage_->ingest(data, length,
         [this, &source](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
             onIngestWithSource(fileId, data, len, seq, offset, source);
         }, recordsIngested, profile);
+    recordSourceRangeUnlocked(source, begin, storage_->getWriteOffset());
+    return consumed;
 }
 
 uint64_t FlatSQLDatabase::ingestOneWithSource(const uint8_t* flatbuffer, size_t length,
@@ -1435,11 +1516,14 @@ uint64_t FlatSQLDatabase::ingestOneWithSource(const uint8_t* flatbuffer, size_t 
     std::unique_lock lock(*accessMutex_);
     invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
-    return storage_->ingestFlatBuffer(flatbuffer, length,
+    const uint64_t begin = storage_->getWriteOffset();
+    const uint64_t seq = storage_->ingestFlatBuffer(flatbuffer, length,
         [this, &source](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
             onIngestWithSource(fileId, data, len, seq, offset, source);
         }, profile);
+    recordSourceRangeUnlocked(source, begin, storage_->getWriteOffset());
+    return seq;
 }
 
 // Legacy multi-source API (external storage)

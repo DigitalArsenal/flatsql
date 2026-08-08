@@ -197,6 +197,69 @@ async function runMatrix(label, backend, dbPath) {
 }
 
 /**
+ * SOURCE PARTITIONS across a teardown (upstream-flatsql-3).
+ *
+ * This is Hermes's measurement, verbatim: two sources, 60 and 20 records,
+ * flush, tear down, reopen — and NOTHING is re-registered on the way back.
+ * On 1.4.4 the partitions came back 0/0 and the persisted unified view
+ * answered "no such module: __flatsql_module_omm_alpha", which is what kept
+ * the browser lane on snapshot exports instead of disk-backed state.
+ */
+async function runSourceMatrix(label, backend, dbPath) {
+  console.log(`\n--- source partitions, backend: ${label} ---`);
+  const alpha = makeStream(25544, 60);
+  const beta = makeStream(40000, 20);
+  const count = (db, sql) => Number(db.query(sql).rows[0][0]);
+
+  {
+    await backend.hydrate(dbPath);
+    await backend.hydrate(`${dbPath}.fsdata`);
+    const engine = await openEngine(backend);
+    const db = engine.openDatabase(SCHEMA, 'sds', dbPath, 2);
+    db.registerFileId('OMM ', 'omm');
+    db.registerSource('alpha');
+    db.registerSource('beta');
+    db.ingest(alpha, 'alpha');
+    db.ingest(beta, 'beta');
+    db.createUnifiedViews();
+
+    check(count(db, 'SELECT COUNT(*) AS n FROM "omm@alpha"') === 60,
+      'alpha holds 60 records pre-teardown');
+    check(count(db, 'SELECT COUNT(*) AS n FROM "omm@beta"') === 20,
+      'beta holds 20 records pre-teardown');
+    check(count(db, 'SELECT COUNT(*) AS n FROM omm') === 80,
+      'unified view sees 80 pre-teardown');
+
+    check(db.flushIndex() === 0, 'flush with sources returns 0');
+    db.destroy();
+    await backend.flush();
+  }
+
+  {
+    await backend.hydrate(dbPath);
+    await backend.hydrate(`${dbPath}.fsdata`);
+    const engine = await openEngine(backend);
+    const db = engine.openDatabase(SCHEMA, 'sds', dbPath, 2);
+    db.registerFileId('OMM ', 'omm');
+    // No registerSource. No createUnifiedViews. That is the point.
+    const restored = db.openState();
+    check(restored === 80, `openState replays all 80 records (got ${restored})`);
+    check(db.listSources().join(',') === 'alpha,beta',
+      `sources come back in registration order (got ${db.listSources().join(',')})`);
+    check(count(db, 'SELECT COUNT(*) AS n FROM "omm@alpha"') === 60,
+      'alpha still holds 60 records after reopen');
+    check(count(db, 'SELECT COUNT(*) AS n FROM "omm@beta"') === 20,
+      'beta still holds 20 records after reopen');
+    check(count(db, 'SELECT COUNT(*) AS n FROM omm') === 80,
+      'the persisted unified view answers WITHOUT re-registration');
+    check(count(db, "SELECT COUNT(*) AS n FROM omm WHERE _source='omm@alpha'") === 60,
+      '_source filter still selects alpha alone');
+    db.destroy();
+    await backend.flush();
+  }
+}
+
+/**
  * The ephemeral engine is NOT skipped. Its documented behaviour — no
  * filesystem, so state calls report -5 and the caller derives fresh — is
  * asserted, because that fallback is a real production path.
@@ -228,6 +291,12 @@ try {
     createChunkedStoreBackend(makeKeyValueStore(), { chunkBytes: 4096 }),
     'sds.db',
   );
+  await runSourceMatrix('node-fs', createNodeFsBackend(nodeFs, { root: tmp }), 'sources.db');
+  await runSourceMatrix(
+    'chunked key->bytes store (the sdn-js shape)',
+    createChunkedStoreBackend(makeKeyValueStore(), { chunkBytes: 4096 }),
+    'sources.db',
+  );
   await runEphemeral();
 
   // ---- lane 2: the emscripten browser bundle, SAME assertions -------------
@@ -239,6 +308,11 @@ try {
     'chunked key->bytes store (browser bundle)',
     createChunkedStoreBackend(makeKeyValueStore(), { chunkBytes: 4096 }),
     'browser.db',
+  );
+  await runSourceMatrix(
+    'chunked key->bytes store (browser bundle)',
+    createChunkedStoreBackend(makeKeyValueStore(), { chunkBytes: 4096 }),
+    'browser-sources.db',
   );
 } finally {
   rmSync(tmp, { recursive: true, force: true });
