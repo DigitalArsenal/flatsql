@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/DigitalArsenal/flatsql/actions/workflows/ci.yml/badge.svg)](https://github.com/DigitalArsenal/flatsql/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/flatsql.svg)](https://www.npmjs.com/package/flatsql)
-[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
 
 **SQL queries over raw FlatBuffer storage** — A streaming query engine that keeps data in native FlatBuffer format while providing SQL access via SQLite virtual tables.
 
@@ -755,7 +755,7 @@ SELECT * FROM User WHERE _source = 'satellite-1';
 
 ## License
 
-Apache 2.0
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) — source-available, free for any noncommercial purpose. Commercial use requires a separate license from DigitalArsenal.io, Inc. See [LICENSE](LICENSE).
 
 ## Contributing
 

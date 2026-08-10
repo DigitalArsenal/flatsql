@@ -3,7 +3,7 @@
   "version": "2.0.1",
   "description": "Independently signed isomorphic FlatSQL SDN WASM node",
   "type": "module",
-  "license": "Apache-2.0",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "files": [
     "README.md",
     "build.mjs",
