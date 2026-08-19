@@ -30,3 +30,7 @@ wasm/integrity.json
 
 # Stress test outputs
 stress/results/
+
+# Local native CMake build directory (contains absolute-path CMakeCache.txt;
+# must never ship in the git tarball — see flatsql-build-native-tracked)
+cpp/build-native/
