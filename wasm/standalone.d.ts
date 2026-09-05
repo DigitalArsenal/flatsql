@@ -50,6 +50,7 @@ export class FlatSQLStandalone {
   readonly memory: WebAssembly.Memory;
 
   createDatabase(schema: string, dbName?: string): FlatSQLStandaloneDatabase;
+  openDatabase(schema: string, dbName?: string, path?: string, journalMode?: number): FlatSQLStandaloneDatabase;
   createTestUser(id: number, name: string, email: string, age: number): Uint8Array;
   createTestPost(id: number, userId: number, title: string): Uint8Array;
   createTestPublishEvent(fileId: string, recordId: string, eventIndex: number, payloadSize: number): Uint8Array;
@@ -68,6 +69,14 @@ export class FlatSQLStandalone {
 }
 
 export class FlatSQLStandaloneDatabase {
+  isDiskBacked(): boolean;
+  openState(): number;
+  reindexAll(): number;
+  /** Process at most maxRecords (default 4096). 1 = pending, 0 = complete, negative = error. */
+  reindexStep(maxRecords?: number): number;
+  flushIndex(): number;
+  flushedOffset(): number;
+  streamPath(): string;
   destroy(): void;
   registerFileId(fileId: string, tableName: string): void;
   enableDemoExtractors(): void;

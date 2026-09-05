@@ -21,6 +21,26 @@ extern "C" {
 
 namespace flatsql {
 
+SQLiteWriteBatch::SQLiteWriteBatch(SQLiteEngine& engine) noexcept : engine_(engine) {
+    QueryResult ignored;
+    active_ = engine_.executeNoThrow("SAVEPOINT __flatsql_write_batch", {}, ignored, &error_);
+}
+
+SQLiteWriteBatch::~SQLiteWriteBatch() {
+    if (!active_) return;
+    QueryResult ignored;
+    engine_.executeNoThrow("ROLLBACK TO __flatsql_write_batch", {}, ignored, nullptr);
+    engine_.executeNoThrow("RELEASE __flatsql_write_batch", {}, ignored, nullptr);
+}
+
+bool SQLiteWriteBatch::commit() noexcept {
+    if (!active_) return false;
+    QueryResult ignored;
+    if (!engine_.executeNoThrow("RELEASE __flatsql_write_batch", {}, ignored, &error_)) return false;
+    active_ = false;
+    return true;
+}
+
 // Helper to trim whitespace and convert to lowercase for comparison
 static std::string normalizeSQL(const std::string& sql) {
     std::string result;

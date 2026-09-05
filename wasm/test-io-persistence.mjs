@@ -48,11 +48,21 @@ function makeStream(firstId, count) {
   const frames = [];
   for (let i = 0; i < count; i++) {
     const name = new TextEncoder().encode(`SAT-${firstId + i}`);
-    const body = new Uint8Array(12 + name.length + ((4 - ((12 + name.length) % 4)) % 4));
-    body[0] = 4;
+    // Root at 16, vtable at 8, two fields, then a terminated string. Exercise
+    // real field extraction and B-tree writes, not just opaque frame counts.
+    const body = new Uint8Array((33 + name.length + 3) & ~3);
+    const view = new DataView(body.buffer);
+    view.setUint32(0, 16, true);
     body.set(new TextEncoder().encode('OMM '), 4);
-    new DataView(body.buffer).setUint32(8, firstId + i, true);
-    body.set(name, 12);
+    view.setUint16(8, 8, true);
+    view.setUint16(10, 12, true);
+    view.setUint16(12, 4, true);
+    view.setUint16(14, 8, true);
+    view.setInt32(16, 8, true);
+    view.setInt32(20, firstId + i, true);
+    view.setUint32(24, 4, true);
+    view.setUint32(28, name.length, true);
+    body.set(name, 32);
     const frame = new Uint8Array(4 + body.length);
     new DataView(frame.buffer).setUint32(0, body.length, true);
     frame.set(body, 4);
@@ -191,6 +201,19 @@ async function runMatrix(label, backend, dbPath) {
     db.registerFileId('OMM ', 'omm');
     const rebuilt = db.reindexAll();
     check(rebuilt === 30, `reindexAll re-derives everything from the stream (got ${rebuilt})`);
+    check(db.reindexStep(7) === 1, 'bounded rebuild yields after seven records');
+    let readError;
+    try { db.query('SELECT COUNT(*) FROM omm'); } catch (error) { readError = error; }
+    check(readError?.message.includes('state: reindex incomplete'), 'partial index is unavailable without trapping WASM');
+    let writeError;
+    try { db.ingest(makeStream(90000, 1)); } catch (error) { writeError = error; }
+    check(writeError?.message.includes('state: reindex incomplete'), 'ingest is rejected without trapping WASM');
+    check(db.flushIndex() < 0, 'partial rebuild cannot publish a checkpoint');
+    let steps = 1;
+    let rc;
+    do { rc = db.reindexStep(7); ++steps; } while (rc === 1 && steps < 10);
+    check(rc === 0 && steps === 5, 'same WASM instance resumes and completes five bounded steps');
+    check(Number(db.query('SELECT COUNT(*) FROM omm').rows[0][0]) === 30, 'complete index contains all records and no rejected write');
     db.destroy();
     await backend.flush();
   }

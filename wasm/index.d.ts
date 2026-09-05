@@ -55,6 +55,16 @@ export interface IngestProfile {
 }
 
 export interface FlatSQLDatabase {
+  isDiskBacked(): boolean;
+  /** Restore the durable checkpoint and replay its tail; negative means recovery is needed. */
+  openState(): number;
+  /** Rebuild the entire index and return its record count, or a negative state code. */
+  reindexAll(): number;
+  /** Process at most maxRecords (default 4096). 1 = pending, 0 = complete, negative = error. */
+  reindexStep(maxRecords?: number): number;
+  flushIndex(): number;
+  flushedOffset(): number;
+  streamPath(): string;
   /**
    * Register a file identifier to route FlatBuffers to a table
    */
@@ -354,6 +364,7 @@ export interface FlatSQL {
    * Create a new database with the given schema
    */
   createDatabase(schema: string, name: string): FlatSQLDatabase;
+  openDatabase(schema: string, name?: string, path?: string, journalMode?: number): FlatSQLDatabase;
 
   /**
    * Create a test User FlatBuffer (for demos)

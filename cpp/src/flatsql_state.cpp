@@ -27,6 +27,9 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -76,6 +79,38 @@ std::string schemaFingerprint(const DatabaseSchema& schema) {
     return std::string(buf);
 }
 
+std::string tableFingerprint(const DatabaseSchema& schema, const TableDef& table) {
+    // Keep the legacy aggregate fingerprint readable, but record the complete
+    // extraction/index contract for new checkpoints, including field IDs and
+    // defaults. Length-prefix strings to avoid delimiter ambiguities.
+    std::ostringstream out;
+    out << std::setprecision(17);
+    auto text = [&out](const std::string& value) { out << value.size() << ':' << value; };
+    text(schema.name);
+    text(table.name);
+    for (const auto& col : table.columns) {
+        text(col.name);
+        out << ':' << int(col.type) << ':' << col.nullable << col.indexed
+            << col.primaryKey << col.encrypted << col.spatial << ':' << col.fieldId << ':';
+        text(col.spatialPair);
+        out << ':' << col.defaultValue.has_value() << ':';
+        if (col.defaultValue) {
+            out << col.defaultValue->index() << ':';
+            std::visit([&](const auto& value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::is_same_v<T, std::string>) text(value);
+                else if constexpr (std::is_same_v<T, std::vector<uint8_t>>) {
+                    out << value.size() << ':';
+                    for (auto byte : value) out << unsigned(byte) << ',';
+                } else if constexpr (!std::is_same_v<T, std::monostate>) out << +value;
+            }, *col.defaultValue);
+        }
+        out << ';';
+    }
+    for (const auto& key : table.primaryKeyColumns) text(key);
+    return out.str();
+}
+
 }  // namespace
 
 #if !defined(FLATSQL_ENABLE_IO_VFS)
@@ -85,8 +120,10 @@ std::string schemaFingerprint(const DatabaseSchema& schema) {
 // the host contract identical: a negative code, recoverable, never a trap.
 int FlatSQLDatabase::openState() { return kStateNoFilesystem; }
 int FlatSQLDatabase::reindexAll() { return kStateNoFilesystem; }
+int FlatSQLDatabase::reindexStep(size_t) { return kStateNoFilesystem; }
 int FlatSQLDatabase::flushState() { return kStateNoFilesystem; }
-int FlatSQLDatabase::loadStreamFromDisk(uint64_t) { return kStateNoFilesystem; }
+int FlatSQLDatabase::flushStateUnlocked() { return kStateNoFilesystem; }
+int FlatSQLDatabase::loadStreamFromDisk(uint64_t, const std::unordered_set<std::string>&) { return kStateNoFilesystem; }
 int FlatSQLDatabase::readWholeStream(std::vector<uint8_t>*) { return kStateNoFilesystem; }
 void FlatSQLDatabase::clearDerivedState() {}
 int FlatSQLDatabase::restoreSourceIndex() { return kStateNoFilesystem; }
@@ -189,7 +226,8 @@ int FlatSQLDatabase::readWholeStream(std::vector<uint8_t>* out) {
 // range belongs to that source's partition, exactly as it did at ingest. A
 // replay that only ever reached the base tables is what made every
 // registerSource() partition come back empty (alpha=60/beta=20 -> 0/0).
-int FlatSQLDatabase::loadStreamFromDisk(uint64_t indexFromOffset) {
+int FlatSQLDatabase::loadStreamFromDisk(uint64_t indexFromOffset,
+                                      const std::unordered_set<std::string>& reindexTables) {
     std::vector<uint8_t> stream;
     const int rc = readWholeStream(&stream);
     if (rc < 0) return rc;
@@ -199,10 +237,12 @@ int FlatSQLDatabase::loadStreamFromDisk(uint64_t indexFromOffset) {
     size_t rangeCursor = 0;  // frames arrive in ascending offset order
     storage_->loadAndRebuild(
         stream.data(), stream.size(),
-        [this, indexFromOffset, &replayed, &rangeCursor](std::string_view fileId,
+        [this, indexFromOffset, &replayed, &rangeCursor, &reindexTables](std::string_view fileId,
                                                          const uint8_t* data, size_t len,
                                                          uint64_t seq, uint64_t offset) {
-            const bool buildIndexes = offset >= indexFromOffset;
+            const auto table = fileIdToTable_.find(std::string(fileId));
+            const bool buildIndexes = offset >= indexFromOffset ||
+                (table != fileIdToTable_.end() && reindexTables.count(table->second));
             const std::string* source = sourceForOffset(offset, &rangeCursor);
             if (source) {
                 onIngestWithSource(fileId, data, len, seq, offset, *source, buildIndexes);
@@ -362,7 +402,9 @@ void FlatSQLDatabase::clearDerivedState() {
 }
 
 int FlatSQLDatabase::openState() {
+    std::unique_lock lock(*accessMutex_);
     if (!diskBacked_ || !sqliteEngine_) return kStateNoFilesystem;
+    if (reindexUnavailable_) return kStateCorrupt;
 
     // 1. Is there persisted state at all? Every statement below goes through
     //    executeNoThrow: on the -fignore-exceptions WASI artifact a throw is
@@ -389,7 +431,8 @@ int FlatSQLDatabase::openState() {
     const int sourceRc = restoreSourceIndex();
     if (sourceRc < 0) return sourceRc;
 
-    std::string version, fingerprint, flushed;
+    std::string version, fingerprint, flushed, tableCount;
+    std::map<std::string, std::string> persistedTables;
     for (const auto& row : state.rows) {
         if (row.size() < 2) continue;
         const auto* key = std::get_if<std::string>(&row[0]);
@@ -398,11 +441,28 @@ int FlatSQLDatabase::openState() {
         if (*key == "format_version")     version = *val;
         else if (*key == "schema")        fingerprint = *val;
         else if (*key == "flushed_offset") flushed = *val;
+        else if (*key == "schema_table_count") tableCount = *val;
+        else if (key->compare(0, 13, "schema_table:") == 0)
+            persistedTables.emplace(key->substr(13), *val);
     }
 
     // 2. Format and schema must match, or the index rows mean something else.
     if (version != std::to_string(kFormatVersion)) return kStateVersionMismatch;
-    if (fingerprint != schemaFingerprint(schema_)) return kStateVersionMismatch;
+    std::unordered_set<std::string> addedTables;
+    if (!tableCount.empty() || fingerprint != schemaFingerprint(schema_)) {
+        // Older state has only an aggregate fingerprint and cannot prove an
+        // additive change. New state records every table in the same commit
+        // as the aggregate; a missing/changed/removed table still fails closed.
+        if (tableCount.empty() || tableCount != std::to_string(persistedTables.size()))
+            return kStateVersionMismatch;
+        for (const auto& [name, hash] : persistedTables) {
+            const auto* table = schema_.getTable(name);
+            if (!table || tableFingerprint(schema_, *table) != hash) return kStateVersionMismatch;
+        }
+        for (const auto& table : schema_.tables) {
+            if (!persistedTables.count(table.name)) addedTables.insert(table.name);
+        }
+    }
     if (flushed.empty()) return kStateAbsent;
 
     const uint64_t mark = std::strtoull(flushed.c_str(), nullptr, 10);
@@ -421,7 +481,17 @@ int FlatSQLDatabase::openState() {
     // 4. Restore. Everything below the mark keeps its on-disk index rows; the
     //    tail is re-indexed. This is the entire win: a boot pays for a scan of
     //    the stream, not for rebuilding every index.
-    const int replayed = loadStreamFromDisk(mark);
+    SQLiteWriteBatch batch(*sqliteEngine_);
+    if (!batch.ok()) return kStateCorrupt;
+    // A newly recognised table may have records already present in the wire
+    // stream. Rebuild just its indexes; unchanged tables keep their rows.
+    for (const auto& name : addedTables) {
+        for (auto& [tableName, table] : tables_) {
+            if (tableName == name || tableName.compare(0, name.size() + 1, name + "@") == 0)
+                table->clearDerived();
+        }
+    }
+    const int replayed = loadStreamFromDisk(mark, addedTables);
     if (replayed < 0) return replayed;
 
     flushedOffset_ = mark;
@@ -429,33 +499,102 @@ int FlatSQLDatabase::openState() {
     // 5. The partition tables now hold their records again; give them back the
     //    vtab modules and the unified views the schema already names.
     rebindSourceViews();
+    if (!addedTables.empty() && flushStateUnlocked() < 0) return kStateCorrupt;
+    if (!batch.commit()) return kStateCorrupt;
+    reindexUnavailable_ = false;
     return replayed;
 }
 
 int FlatSQLDatabase::reindexAll() {
+    int rc;
+    do { rc = reindexStep(4096); } while (rc == 1);
+    return rc < 0 ? rc : static_cast<int>(storage_->getRecordCount());
+}
+
+int FlatSQLDatabase::reindexStep(size_t maxRecords) {
+    std::unique_lock lock(*accessMutex_);
     if (!diskBacked_ || !sqliteEngine_) return kStateNoFilesystem;
+    if (maxRecords == 0) return kStateCorrupt;
+    auto fail = [this](int code) {
+        reindexBatch_.reset(); // rolls back only the rebuild's own savepoint
+        return code;
+    };
+    IoHandle file(flatsql_io_open(streamPath_.c_str(),
+        static_cast<int32_t>(streamPath_.size()), FLATSQL_IO_READ));
+    if (!file.ok()) return fail(kStateAbsent);
 
-    // Derived state only. The stream is never touched by a re-derivation —
-    // that is what makes every negative code above survivable. The source
-    // ranges are not derived from the stream (the wire bytes carry no source),
-    // so they are read back, never cleared.
-    clearDerivedState();
-    storage_->reset();
+    if (!reindexBatch_) {
+        const double size = flatsql_io_size(file.h);
+        if (size < 0) return kStateCorrupt;
+        reindexBatch_ = std::make_unique<SQLiteWriteBatch>(*sqliteEngine_);
+        if (!reindexBatch_->ok()) return fail(kStateCorrupt);
+        reindexUnavailable_ = true;
+        invalidateQueryResultCacheUnlocked();
+        reindexReadOffset_ = 0;
+        reindexStreamSize_ = static_cast<uint64_t>(size);
+        reindexSourceCursor_ = 0;
+        clearDerivedState();
+        storage_->reset();
+        const int sourceRc = restoreSourceIndex();
+        if (sourceRc < 0) return fail(sourceRc);
+    }
 
-    const int sourceRc = restoreSourceIndex();
-    if (sourceRc < 0) return sourceRc;
+    auto readExact = [&file](uint8_t* dst, size_t size, uint64_t offset) {
+        size_t done = 0;
+        while (done < size) {
+            const int32_t want = static_cast<int32_t>(std::min<size_t>(size - done, kIoChunk));
+            const int32_t got = flatsql_io_read(file.h, dst + done, want, static_cast<double>(offset + done));
+            if (got <= 0) return false;
+            done += static_cast<size_t>(got);
+        }
+        return true;
+    };
+    // Frames are read individually. Peak temporary memory is one record,
+    // instead of a second copy of the entire durable stream.
+    for (size_t count = 0; count < maxRecords && reindexReadOffset_ + 4 <= reindexStreamSize_; ++count) {
+        uint8_t prefix[4];
+        if (!readExact(prefix, 4, reindexReadOffset_)) return fail(kStateCorrupt);
+        const uint32_t length = uint32_t(prefix[0]) | (uint32_t(prefix[1]) << 8) |
+            (uint32_t(prefix[2]) << 16) | (uint32_t(prefix[3]) << 24);
+        const uint64_t framedLength = uint64_t(length) + 4;
+        if (framedLength > reindexStreamSize_ - reindexReadOffset_) {
+            // Preserve the legacy recovery contract: keep the complete
+            // prefix of a stream with a torn final record, never rewrite it.
+            reindexReadOffset_ = reindexStreamSize_;
+            break;
+        }
+        std::vector<uint8_t> frame(static_cast<size_t>(framedLength));
+        std::memcpy(frame.data(), prefix, 4);
+        if (!readExact(frame.data() + 4, length, reindexReadOffset_ + 4)) return fail(kStateCorrupt);
+        storage_->ingest(frame.data(), frame.size(),
+            [this](std::string_view fileId, const uint8_t* data, size_t len, uint64_t seq, uint64_t offset) {
+                const auto* source = sourceForOffset(offset, &reindexSourceCursor_);
+                if (source) onIngestWithSource(fileId, data, len, seq, offset, *source);
+                else onIngest(fileId, data, len, seq, offset);
+            });
+        reindexReadOffset_ += framedLength;
+    }
+    if (reindexReadOffset_ + 4 <= reindexStreamSize_) return 1;
 
-    const int replayed = loadStreamFromDisk(0);
-    if (replayed < 0) return replayed;
-
-    flushedOffset_ = 0;
-    const int rc = flushState();
-    if (rc < 0) return rc;
+    // These bytes came from the durable stream. Rebuild only the index and
+    // its checkpoint; do not rewrite the source stream during recovery.
+    flushedOffset_ = storage_->getWriteOffset();
+    const int rc = flushStateUnlocked();
+    if (rc < 0) return fail(rc);
     rebindSourceViews();
-    return replayed;
+    if (!reindexBatch_->commit()) return fail(kStateCorrupt);
+    reindexBatch_.reset();
+    reindexUnavailable_ = false;
+    return 0;
 }
 
 int FlatSQLDatabase::flushState() {
+    std::unique_lock lock(*accessMutex_);
+    if (reindexUnavailable_) return kStateCorrupt;
+    return flushStateUnlocked();
+}
+
+int FlatSQLDatabase::flushStateUnlocked() {
     if (!diskBacked_ || !sqliteEngine_) return kStateNoFilesystem;
 
     const uint64_t writeOffset = storage_->getWriteOffset();
@@ -488,13 +627,24 @@ int FlatSQLDatabase::flushState() {
     //    pager is about to commit through the VFS.
     QueryResult ignored;
     std::string err;
-    const bool ok =
-        sqliteEngine_->executeNoThrow(
+    SQLiteWriteBatch batch(*sqliteEngine_);
+    if (!batch.ok()) return kStateCorrupt;
+    if (!sqliteEngine_->executeNoThrow(
             "CREATE TABLE IF NOT EXISTS _flatsql_state("
             "k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID",
-            {}, ignored, &err) &&
-        sqliteEngine_->executeNoThrow("BEGIN IMMEDIATE", {}, ignored, &err) &&
-        sqliteEngine_->executeNoThrow(
+            {}, ignored, &err)) return kStateCorrupt;
+    std::string tableManifest;
+    for (const auto& table : schema_.tables) {
+        const auto value = tableFingerprint(schema_, table);
+        tableManifest += std::to_string(value.size()) + ':' + value;
+    }
+    QueryResult previous;
+    if (!sqliteEngine_->executeNoThrow(
+            "SELECT v FROM _flatsql_state WHERE k='schema_tables'", {}, previous, &err))
+        return kStateCorrupt;
+    const bool tablesChanged = previous.rows.empty() ||
+        previous.rows[0][0] != Value(tableManifest);
+    bool ok = sqliteEngine_->executeNoThrow(
             "INSERT OR REPLACE INTO _flatsql_state(k,v) VALUES"
             "('format_version',?),('schema',?),('stream',?),('flushed_offset',?),"
             "('source_index',?)",
@@ -506,10 +656,26 @@ int FlatSQLDatabase::flushState() {
             ignored, &err) &&
         // Same transaction, same mark: the partition can never describe more
         // stream than the mark admits, in either direction.
-        persistSourceIndex(writeOffset) == kStateOk &&
-        sqliteEngine_->executeNoThrow("COMMIT", {}, ignored, &err);
+        persistSourceIndex(writeOffset) == kStateOk;
+    if (ok && tablesChanged) {
+        ok = sqliteEngine_->executeNoThrow(
+            "DELETE FROM _flatsql_state WHERE substr(k,1,13)='schema_table:'", {}, ignored, &err);
+        for (const auto& table : schema_.tables) {
+            if (!ok) break;
+            ok = sqliteEngine_->executeNoThrow(
+                "INSERT OR REPLACE INTO _flatsql_state(k,v) VALUES(?,?)",
+                {Value("schema_table:" + table.name), Value(tableFingerprint(schema_, table))},
+                ignored, &err);
+        }
+        ok = ok && sqliteEngine_->executeNoThrow(
+            "INSERT OR REPLACE INTO _flatsql_state(k,v) VALUES('schema_table_count',?)",
+            {Value(std::to_string(schema_.tables.size()))}, ignored, &err) &&
+            sqliteEngine_->executeNoThrow(
+                "INSERT OR REPLACE INTO _flatsql_state(k,v) VALUES('schema_tables',?)",
+                {Value(tableManifest)}, ignored, &err);
+    }
+    ok = ok && batch.commit();
     if (!ok) {
-        sqliteEngine_->executeNoThrow("ROLLBACK", {}, ignored, &err);
         return kStateCorrupt;
     }
 

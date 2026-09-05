@@ -361,6 +361,7 @@ public:
     // Get raw storage data (for export)
     std::vector<uint8_t> exportData() const {
         std::shared_lock lock(*accessMutex_);
+        requireReadyUnlocked();
         return storage_->exportData();
     }
 
@@ -393,6 +394,18 @@ public:
     // Full re-derivation from the stream. Always available, always correct.
     // Returns the record count, or a negative code.
     int reindexAll();
+
+    // Rebuild at most maxRecords per call. Returns 1 while pending, 0 when
+    // complete, or a negative state code. Each invocation releases the engine
+    // lock; the index transaction commits only after the final chunk. Reads
+    // remain unavailable until completion. Restart retains the last complete
+    // on-disk checkpoint rather than publishing a partial rebuild.
+    int reindexStep(size_t maxRecords);
+
+    bool reindexPending() const {
+        std::shared_lock lock(*accessMutex_);
+        return reindexUnavailable_;
+    }
 
     // Append everything since the last flush to the stream, fsync it, then
     // commit the index + high-water mark. Returns 0 or a negative code.
@@ -728,12 +741,20 @@ private:
     std::string sqlitePath_;
     std::string streamPath_;
     uint64_t flushedOffset_ = 0;
+    std::unique_ptr<SQLiteWriteBatch> reindexBatch_;
+    uint64_t reindexReadOffset_ = 0;
+    uint64_t reindexStreamSize_ = 0;
+    size_t reindexSourceCursor_ = 0;
+    bool reindexUnavailable_ = false;
+    void requireReadyUnlocked() const;
+    int flushStateUnlocked();
 
     // Shared by openState/reindexAll: drive the store's rebuild, indexing only
     // the records at or past `indexFromOffset` (everything below it already has
     // its index rows on disk). Frames inside a persisted source range are
     // routed to that source's partition, not just to the base table.
-    int loadStreamFromDisk(uint64_t indexFromOffset);
+    int loadStreamFromDisk(uint64_t indexFromOffset,
+                           const std::unordered_set<std::string>& reindexTables = {});
     int readWholeStream(std::vector<uint8_t>* out);
     void clearDerivedState();
 

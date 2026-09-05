@@ -379,6 +379,23 @@ private:
     std::string buildColumnList(const TableDef* tableDef) const;
 };
 
+// An internal write group composes with a caller's transaction. SAVEPOINT,
+// unlike BEGIN/COMMIT, never commits or rolls back work owned by the caller.
+class SQLiteWriteBatch {
+public:
+    explicit SQLiteWriteBatch(SQLiteEngine& engine) noexcept;
+    ~SQLiteWriteBatch();
+    SQLiteWriteBatch(const SQLiteWriteBatch&) = delete;
+    SQLiteWriteBatch& operator=(const SQLiteWriteBatch&) = delete;
+    bool ok() const { return active_; }
+    bool commit() noexcept;
+    const std::string& error() const { return error_; }
+private:
+    SQLiteEngine& engine_;
+    bool active_ = false;
+    std::string error_;
+};
+
 }  // namespace flatsql
 
 #endif  // FLATSQL_SQLITE_ENGINE_H

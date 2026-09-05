@@ -14,6 +14,7 @@
 #include "flatsql/database.h"
 #include "flatsql/flatsql_io.h"
 #include "flatsql/schema_parser.h"
+#include "flatbuffers/flatbuffers.h"
 
 #include <cstdio>
 #include <cstring>
@@ -47,28 +48,18 @@ const char* kSchema = R"(
 
 // A minimal but REAL size-prefixed FlatBuffer frame: [u32 size][buffer], with
 // the file identifier at bytes 4..7 of the buffer, which is how FlatSQL routes
-// records to tables. Payload layout past that is irrelevant to the durability
-// contract — what has to survive is the byte range and its offset.
+// records to tables. The real table layout also exercises extraction and
+// persisted index writes, not only record offsets.
 std::vector<uint8_t> makeFrame(const char* fileId, uint32_t noradId,
                                const std::string& name) {
-    std::vector<uint8_t> body;
-    body.resize(8);
-    std::memset(body.data(), 0, 8);
-    body[0] = 4;  // root table offset (unused by these assertions)
-    std::memcpy(body.data() + 4, fileId, 4);
-    for (int i = 0; i < 4; i++) {
-        body.push_back(static_cast<uint8_t>((noradId >> (8 * i)) & 0xFF));
-    }
-    body.insert(body.end(), name.begin(), name.end());
-    while (body.size() % 4) body.push_back(0);
-
-    std::vector<uint8_t> frame;
-    const uint32_t size = static_cast<uint32_t>(body.size());
-    for (int i = 0; i < 4; i++) {
-        frame.push_back(static_cast<uint8_t>((size >> (8 * i)) & 0xFF));
-    }
-    frame.insert(frame.end(), body.begin(), body.end());
-    return frame;
+    flatbuffers::FlatBufferBuilder builder;
+    const auto objectName = builder.CreateString(name);
+    const auto start = builder.StartTable();
+    builder.AddElement<int32_t>(4, static_cast<int32_t>(noradId), 0);
+    builder.AddOffset(6, objectName);
+    const auto root = flatbuffers::Offset<flatbuffers::Table>(builder.EndTable(start));
+    builder.FinishSizePrefixed(root, fileId);
+    return {builder.GetBufferPointer(), builder.GetBufferPointer() + builder.GetSize()};
 }
 
 std::vector<uint8_t> makeStream(uint32_t firstId, int count) {
@@ -442,6 +433,179 @@ void testPrePartitionStateStillOpens() {
     }
 }
 
+int g_commits = 0;
+int observeCommit(void*) { ++g_commits; return 0; }
+int observeConnection(sqlite3* db, char**, const sqlite3_api_routines*) {
+    sqlite3_commit_hook(db, observeCommit, nullptr);
+    return SQLITE_OK;
+}
+
+void testBulkCommitBound() {
+    std::cout << "Testing bounded commits during bulk ingest and reindex..." << std::endl;
+    const auto extension = reinterpret_cast<void (*)()>(observeConnection);
+    CHECK(sqlite3_auto_extension(extension) == SQLITE_OK, "install commit observer");
+    {
+        DatabaseSchema schema;
+        auto db = openDb(tempBase("bulk.db"), &schema);
+        db.registerFileId("OMM ", "omm");
+        db.registerSource("alpha");
+        const auto stream = makeStream(1000, 128);
+        g_commits = 0;
+        CHECK(db.ingest(stream.data(), stream.size()) == stream.size(), "bulk base ingest");
+        CHECK(g_commits <= 1, "base batch commits at most once, not per record");
+        g_commits = 0;
+        CHECK(db.ingestWithSource(stream.data(), stream.size(), "alpha") == stream.size(), "bulk source ingest");
+        CHECK(g_commits <= 1, "source batch commits at most once");
+        CHECK(db.flushState() == 0, "flush populated stream");
+        g_commits = 0;
+        CHECK(db.reindexAll() == 256, "reindex all records");
+        CHECK(g_commits <= 1, "reindex commits index and mark together once");
+        CHECK(tableRows(db, "omm@alpha") == 128, "partition preserved by batched reindex");
+
+        QueryResult ignored;
+        std::string err;
+        CHECK(db.queryNoThrow("BEGIN IMMEDIATE", {}, ignored, &err), "caller transaction begins");
+        CHECK(db.reindexAll() == 256, "reindex nests inside caller transaction");
+        CHECK(db.queryNoThrow("COMMIT", {}, ignored, &err), "reindex leaves caller transaction open");
+    }
+    sqlite3_cancel_auto_extension(extension);
+}
+
+void testAdditiveSchemaPreservesIndexes() {
+    std::cout << "Testing additive schema preserves existing indexes..." << std::endl;
+    const auto path = tempBase("additive.db");
+    const auto stream = makeStream(5000, 8);
+    {
+        DatabaseSchema schema;
+        auto db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        db.ingest(stream.data(), stream.size());
+        CHECK(db.flushState() == 0, "persist original schema");
+    }
+    DatabaseSchema schema;
+    std::string err;
+    CHECK(SchemaParser::tryParse(std::string(kSchema) + " table added { value: int; }",
+                                &schema, &err, "sds"), "parse additive schema");
+    FlatSQLDatabase::RuntimeOptions options;
+    options.sqlite.path = path;
+    options.sqlite.vfs = kFlatSqlVfsName;
+    options.sqlite.journalMode = 2;
+    FlatSQLDatabase db(schema, options);
+    db.registerFileId("OMM ", "omm");
+    int extractions = 0;
+    db.setFieldExtractor("omm", [&](const uint8_t*, size_t, const std::string&) -> Value {
+        ++extractions;
+        return int32_t(0);
+    });
+    CHECK(db.openState() == 8, "adding an unrelated table keeps persisted state valid");
+    CHECK(extractions == 0, "unchanged rows reuse persisted indexes without extraction");
+    CHECK(db.getStorage().getRecordCount() == 8, "all existing records restored");
+}
+
+void testResumableReindex() {
+    std::cout << "Testing resumable rebuild and interrupted transaction..." << std::endl;
+    const auto path = tempBase("stepped.db");
+    const auto stream = makeStream(100, 9);
+    {
+        DatabaseSchema schema;
+        auto db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        db.ingest(stream.data(), stream.size());
+        CHECK(db.flushState() == 0, "persist before stepped rebuild");
+        CHECK(db.reindexStep(2) == 1, "first bounded step is pending");
+        CHECK(db.getStorage().getRecordCount() == 2, "first step processes two records");
+        QueryResult result;
+        std::string error;
+        CHECK(!db.queryNoThrow("SELECT COUNT(*) FROM omm", {}, result, &error), "partial index cannot answer a query");
+        CHECK(error == "state: reindex incomplete", "pending state is explicit");
+        CHECK(db.flushState() < 0, "partial rebuild cannot publish a checkpoint");
+        CHECK(db.reindexStep(2) == 1, "second bounded step is pending");
+        CHECK(db.getStorage().getRecordCount() == 4, "second step resumes from the cursor");
+        // Teardown rolls back the pending index transaction. The stream and
+        // previous complete checkpoint must still be usable.
+    }
+    {
+        DatabaseSchema schema;
+        auto db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        CHECK(db.openState() == 9, "interrupted rebuild preserves the complete checkpoint");
+        int steps = 0;
+        int rc;
+        do { rc = db.reindexStep(2); ++steps; } while (rc == 1 && steps < 10);
+        CHECK(rc == 0 && steps == 5, "bounded steps complete all nine records");
+        CHECK(queryCount(db, "SELECT COUNT(*) FROM omm") == 9, "completed index answers all records");
+        CHECK(db.exportData() == stream, "rebuild preserves canonical bytes exactly");
+    }
+}
+
+void testNewlyRecognizedTable() {
+    std::cout << "Testing existing wire records for an added table..." << std::endl;
+    const auto path = tempBase("recognized.db");
+    const auto frame = makeFrame("NEW ", 42, "newly recognized");
+    {
+        DatabaseSchema schema;
+        auto db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        db.registerSource("alpha");
+        db.ingestWithSource(frame.data(), frame.size(), "alpha");
+        CHECK(db.flushState() == 0, "unrecognized record is durable");
+    }
+    DatabaseSchema schema;
+    std::string error;
+    CHECK(SchemaParser::tryParse(std::string(kSchema) +
+        " table added { NORAD_CAT_ID: int (key); OBJECT_NAME: string; }", &schema, &error, "sds"), "parse added table");
+    FlatSQLDatabase::RuntimeOptions options;
+    options.sqlite.path = path;
+    options.sqlite.vfs = kFlatSqlVfsName;
+    options.sqlite.journalMode = 2;
+    {
+        FlatSQLDatabase db(schema, options);
+        db.registerFileId("OMM ", "omm");
+        db.registerFileId("NEW ", "added");
+        CHECK(db.openState() == 1, "added table reuses the existing wire stream");
+        CHECK(queryCount(db, "SELECT COUNT(*) FROM added WHERE NORAD_CAT_ID=42") == 1, "new table gets indexed and keeps its source partition");
+    }
+    {
+        FlatSQLDatabase db(schema, options);
+        db.registerFileId("NEW ", "added");
+        CHECK(db.openState() == 1, "additive checkpoint survives a second reopen");
+        CHECK(queryCount(db, "SELECT COUNT(*) FROM added WHERE NORAD_CAT_ID=42") == 1, "new index survives reopen");
+    }
+    // fieldId is deliberately absent from the legacy aggregate fingerprint.
+    schema.tables[1].columns[0].fieldId = 7;
+    FlatSQLDatabase changed(schema, options);
+    CHECK(changed.openState() == FlatSQLDatabase::kStateVersionMismatch, "complete per-table contract detects a changed field ID");
+}
+
+void testFailedBatchRequiresRecovery() {
+    std::cout << "Testing failed bulk extraction cannot expose divergent indexes..." << std::endl;
+    const auto path = tempBase("failed-batch.db");
+    const auto stream = makeStream(100, 4);
+    {
+        DatabaseSchema schema;
+        auto db = openDb(path, &schema);
+        db.registerFileId("OMM ", "omm");
+        db.ingest(stream.data(), stream.size());
+        CHECK(db.flushState() == 0, "checkpoint before failed batch");
+        db.setFieldExtractor("omm", [](const uint8_t*, size_t, const std::string&) -> Value {
+            throw std::runtime_error("injected extraction failure");
+        });
+        bool failed = false;
+        try { db.ingest(stream.data(), stream.size()); }
+        catch (const std::runtime_error&) { failed = true; }
+        CHECK(failed, "failed extraction is reported");
+        QueryResult result;
+        std::string error;
+        CHECK(!db.queryNoThrow("SELECT COUNT(*) FROM omm", {}, result, &error), "failed batch cannot expose rolled-back indexes with appended bytes");
+        CHECK(db.flushState() < 0, "failed batch cannot advance the durable checkpoint");
+    }
+    DatabaseSchema schema;
+    auto recovered = openDb(path, &schema);
+    recovered.registerFileId("OMM ", "omm");
+    CHECK(recovered.openState() == 4, "reopening recovers the last successful checkpoint");
+    CHECK(queryCount(recovered, "SELECT COUNT(*) FROM omm") == 4, "failed batch did not alter durable indexes");
+}
+
 }  // namespace
 
 int main() {
@@ -453,6 +617,11 @@ int main() {
     testMemoryReportsNoFilesystem();
     testSourcePartitionsSurviveTeardown();
     testPrePartitionStateStillOpens();
+    testBulkCommitBound();
+    testAdditiveSchemaPreservesIndexes();
+    testResumableReindex();
+    testNewlyRecognizedTable();
+    testFailedBatchRequiresRecovery();
 
     if (g_failures) {
         std::cerr << g_failures << " check(s) FAILED" << std::endl;

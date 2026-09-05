@@ -732,6 +732,15 @@ QueryResult g_lastResult;
 std::vector<QueryResult> g_batchResults;
 int g_selectedBatchResult = -1;
 std::string g_lastError;
+
+bool requireReadyHandle(void* handle) {
+    if (!handle || static_cast<FlatSQLDatabase*>(handle)->reindexPending()) {
+        g_lastError = handle ? "state: reindex incomplete" : "Invalid database handle";
+        return false;
+    }
+    g_lastError.clear();
+    return true;
+}
 std::string g_cacheKeyBuffer;
 std::vector<uint8_t> g_exportBuffer;
 std::shared_ptr<const std::vector<uint8_t>> g_responseArtifactStream;
@@ -851,6 +860,14 @@ int flatsql_reindex_all(void* handle) {
     return static_cast<FlatSQLDatabase*>(handle)->reindexAll();
 }
 
+// Cooperative rebuild: 1 pending, 0 complete, negative state code on error.
+EMSCRIPTEN_KEEPALIVE
+int flatsql_reindex_step(void* handle, int maxRecords) {
+    if (!handle) return FlatSQLDatabase::kStateNoFilesystem;
+    if (maxRecords <= 0) return FlatSQLDatabase::kStateCorrupt;
+    return static_cast<FlatSQLDatabase*>(handle)->reindexStep(static_cast<size_t>(maxRecords));
+}
+
 // Append new stream bytes, fsync, then commit the index + high-water mark.
 EMSCRIPTEN_KEEPALIVE
 int flatsql_flush_index(void* handle) {
@@ -908,17 +925,20 @@ void flatsql_enable_demo_extractors(void* handle) {
 
 EMSCRIPTEN_KEEPALIVE
 double flatsql_ingest(void* handle, const uint8_t* data, size_t length) {
+    if (!requireReadyHandle(handle)) return -1;
     return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->ingest(data, length));
 }
 
 EMSCRIPTEN_KEEPALIVE
 double flatsql_ingest_one(void* handle, const uint8_t* data, size_t length) {
+    if (!requireReadyHandle(handle)) return -1;
     return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->ingestOne(data, length));
 }
 
 // Source-aware ingestion
 EMSCRIPTEN_KEEPALIVE
 void flatsql_register_source(void* handle, const char* sourceName) {
+    if (!requireReadyHandle(handle)) return;
     auto* db = static_cast<FlatSQLDatabase*>(handle);
     const std::string name = sourceName ? sourceName : "";
 
@@ -938,16 +958,19 @@ void flatsql_register_source(void* handle, const char* sourceName) {
 
 EMSCRIPTEN_KEEPALIVE
 void flatsql_create_unified_views(void* handle) {
+    if (!requireReadyHandle(handle)) return;
     static_cast<FlatSQLDatabase*>(handle)->createUnifiedViews();
 }
 
 EMSCRIPTEN_KEEPALIVE
 double flatsql_ingest_with_source(void* handle, const uint8_t* data, size_t length, const char* source) {
+    if (!requireReadyHandle(handle)) return -1;
     return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->ingestWithSource(data, length, source));
 }
 
 EMSCRIPTEN_KEEPALIVE
 double flatsql_ingest_one_with_source(void* handle, const uint8_t* data, size_t length, const char* source) {
+    if (!requireReadyHandle(handle)) return -1;
     return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->ingestOneWithSource(data, length, source));
 }
 
@@ -1391,6 +1414,10 @@ int flatsql_result_cell_blob_size(int row, int col) {
 
 EMSCRIPTEN_KEEPALIVE
 const uint8_t* flatsql_export_data(void* handle) {
+    if (!requireReadyHandle(handle)) {
+        g_exportBuffer.clear();
+        return nullptr;
+    }
     g_exportBuffer = static_cast<FlatSQLDatabase*>(handle)->exportData();
     return g_exportBuffer.data();
 }
@@ -1594,6 +1621,7 @@ int flatsql_export_size() {
 
 EMSCRIPTEN_KEEPALIVE
 void flatsql_load_and_rebuild(void* handle, const uint8_t* data, size_t length) {
+    if (!requireReadyHandle(handle)) return;
     static_cast<FlatSQLDatabase*>(handle)->loadAndRebuild(data, length);
 }
 
@@ -1604,6 +1632,7 @@ void flatsql_reserve_storage(void* handle, size_t bytes) {
 
 EMSCRIPTEN_KEEPALIVE
 void flatsql_load_from_db(void* handle, void* sourceHandle) {
+    if (!requireReadyHandle(handle) || !requireReadyHandle(sourceHandle)) return;
     auto* source = static_cast<FlatSQLDatabase*>(sourceHandle);
     const auto& sourceStorage = source->getStorage();
     static_cast<FlatSQLDatabase*>(handle)->loadAndRebuild(

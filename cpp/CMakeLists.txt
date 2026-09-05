@@ -178,7 +178,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_malloc\", \"_free\", \
                 \"_flatsql_create_db\", \"_flatsql_destroy_db\", \
                 \"_flatsql_open_db\", \"_flatsql_is_disk_backed\", \
-                \"_flatsql_open_state\", \"_flatsql_reindex_all\", \
+                \"_flatsql_open_state\", \"_flatsql_reindex_all\", \"_flatsql_reindex_step\", \
                 \"_flatsql_flush_index\", \"_flatsql_flushed_offset\", \
                 \"_flatsql_stream_path\", \
                 \"_flatsql_register_file_id\", \"_flatsql_enable_demo_extractors\", \
@@ -281,7 +281,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_malloc\", \"_free\", \
                 \"_flatsql_create_db\", \"_flatsql_destroy_db\", \
                 \"_flatsql_open_db\", \"_flatsql_is_disk_backed\", \
-                \"_flatsql_open_state\", \"_flatsql_reindex_all\", \
+                \"_flatsql_open_state\", \"_flatsql_reindex_all\", \"_flatsql_reindex_step\", \
                 \"_flatsql_flush_index\", \"_flatsql_flushed_offset\", \
                 \"_flatsql_stream_path\", \
                 \"_flatsql_register_file_id\", \"_flatsql_enable_demo_extractors\", \

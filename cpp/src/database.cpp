@@ -535,17 +535,28 @@ void FlatSQLDatabase::onIngest(std::string_view fileId, const uint8_t* data, siz
 
 size_t FlatSQLDatabase::ingest(const uint8_t* data, size_t length, size_t* recordsIngested) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
+    SQLiteWriteBatch batch(*sqliteEngine_);
+    if (!batch.ok()) throw std::runtime_error(batch.error());
     invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
-    return storage_->ingest(data, length,
+    // If extraction or commit fails, SQL rolls back but the arena has already
+    // appended bytes. Refuse reads until recovery rather than serving indexes
+    // that disagree with that arena. The successful path clears the latch.
+    reindexUnavailable_ = true;
+    const auto consumed = storage_->ingest(data, length,
         [this](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
             onIngest(fileId, data, len, seq, offset);
         }, recordsIngested, profile);
+    if (!batch.commit()) throw std::runtime_error(batch.error());
+    reindexUnavailable_ = false;
+    return consumed;
 }
 
 uint64_t FlatSQLDatabase::ingestOne(const uint8_t* flatbuffer, size_t length) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
     invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     return storage_->ingestFlatBuffer(flatbuffer, length,
@@ -557,6 +568,7 @@ uint64_t FlatSQLDatabase::ingestOne(const uint8_t* flatbuffer, size_t length) {
 
 void FlatSQLDatabase::loadAndRebuild(const uint8_t* data, size_t length) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
     invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     storage_->loadAndRebuild(data, length,
@@ -706,31 +718,23 @@ bool FlatSQLDatabase::hasSource(const std::string& name) const noexcept {
     }
 }
 
-QueryResult FlatSQLDatabase::query(const std::string& sql) {
-    if (!sqliteInitialized_) {
-        std::unique_lock initLock(*accessMutex_);
-        initializeSQLiteEngine();
-        QueryResult result = sqliteEngine_->execute(sql);
-        invalidateCachesIfStatementWritesUnlocked(sql);
-        return result;
-    }
+void FlatSQLDatabase::requireReadyUnlocked() const {
+    if (reindexUnavailable_) throw std::runtime_error("state: reindex incomplete");
+}
 
+QueryResult FlatSQLDatabase::query(const std::string& sql) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
+    if (!sqliteInitialized_) initializeSQLiteEngine();
     QueryResult result = sqliteEngine_->execute(sql);
     invalidateCachesIfStatementWritesUnlocked(sql);
     return result;
 }
 
 QueryResult FlatSQLDatabase::query(const std::string& sql, const std::vector<Value>& params) {
-    if (!sqliteInitialized_) {
-        std::unique_lock initLock(*accessMutex_);
-        initializeSQLiteEngine();
-        QueryResult result = sqliteEngine_->execute(sql, params);
-        invalidateCachesIfStatementWritesUnlocked(sql);
-        return result;
-    }
-
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
+    if (!sqliteInitialized_) initializeSQLiteEngine();
     QueryResult result = sqliteEngine_->execute(sql, params);
     invalidateCachesIfStatementWritesUnlocked(sql);
     return result;
@@ -749,6 +753,11 @@ void FlatSQLDatabase::invalidateCachesIfStatementWritesUnlocked(const std::strin
 bool FlatSQLDatabase::queryNoThrow(const std::string& sql, const std::vector<Value>& params,
                                    QueryResult& out, std::string* errOut) noexcept try {
     std::unique_lock lock(*accessMutex_);
+    if (reindexUnavailable_) {
+        out = {};
+        if (errOut) *errOut = "state: reindex incomplete";
+        return false;
+    }
     if (!sqliteInitialized_) {
         initializeSQLiteEngine();
     }
@@ -777,18 +786,7 @@ QueryResult FlatSQLDatabase::query(const std::string& sql, int64_t param) {
     static thread_local std::vector<Value> singleParam(1);
     singleParam[0] = param;
 
-    if (!sqliteInitialized_) {
-        std::unique_lock initLock(*accessMutex_);
-        initializeSQLiteEngine();
-        QueryResult result = sqliteEngine_->execute(sql, singleParam);
-        invalidateCachesIfStatementWritesUnlocked(sql);
-        return result;
-    }
-
-    std::unique_lock lock(*accessMutex_);
-    QueryResult result = sqliteEngine_->execute(sql, singleParam);
-    invalidateCachesIfStatementWritesUnlocked(sql);
-    return result;
+    return query(sql, singleParam);
 }
 
 void FlatSQLDatabase::registerQueryTemplate(const std::string& queryId,
@@ -809,6 +807,7 @@ void FlatSQLDatabase::registerQueryTemplate(const std::string& queryId,
 QueryResult FlatSQLDatabase::queryTemplate(const std::string& queryId,
                                            const std::vector<Value>& params) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
 
     auto templateIt = queryTemplates_.find(queryId);
     if (templateIt == queryTemplates_.end()) {
@@ -848,6 +847,11 @@ QueryResult FlatSQLDatabase::queryTemplate(const std::string& queryId,
 bool FlatSQLDatabase::queryTemplateNoThrow(const std::string& queryId, const std::vector<Value>& params,
                                            QueryResult& out, std::string* errOut) noexcept try {
     std::unique_lock lock(*accessMutex_);
+    if (reindexUnavailable_) {
+        out = {};
+        if (errOut) *errOut = "state: reindex incomplete";
+        return false;
+    }
 
     auto templateIt = queryTemplates_.find(queryId);
     if (templateIt == queryTemplates_.end()) {
@@ -982,6 +986,11 @@ bool FlatSQLDatabase::queryRawFlatBufferStream(const std::string& sql,
                                                RawStreamResult* result,
                                                std::string* errorMessage) {
     std::unique_lock lock(*accessMutex_);
+    if (reindexUnavailable_) {
+        if (result) *result = {};
+        if (errorMessage) *errorMessage = "state: reindex incomplete";
+        return false;
+    }
     if (!sqliteInitialized_) {
         initializeSQLiteEngine();
     }
@@ -1073,6 +1082,11 @@ bool FlatSQLDatabase::querySandboxed(const std::string& sql,
                                      std::string* errorMessage) noexcept {
     try {
         std::unique_lock lock(*accessMutex_);
+        if (reindexUnavailable_) {
+            if (out) *out = {};
+            if (errorMessage) *errorMessage = "state: reindex incomplete";
+            return false;
+        }
         if (!sqliteInitialized_) {
             initializeSQLiteEngine();
         }
@@ -1162,13 +1176,9 @@ FlatSQLDatabase::RawStreamCacheStats FlatSQLDatabase::getRawStreamCacheStats() c
 }
 
 size_t FlatSQLDatabase::queryCount(const std::string& sql, const std::vector<Value>& params) {
-    if (!sqliteInitialized_) {
-        std::unique_lock initLock(*accessMutex_);
-        initializeSQLiteEngine();
-        return sqliteEngine_->executeAndCount(sql, params);
-    }
-
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
+    if (!sqliteInitialized_) initializeSQLiteEngine();
     return sqliteEngine_->executeAndCount(sql, params);
 }
 
@@ -1176,6 +1186,7 @@ std::vector<StoredRecord> FlatSQLDatabase::findByIndex(const std::string& tableN
                                                         const std::string& column,
                                                         const Value& value) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         return {};
@@ -1188,6 +1199,7 @@ bool FlatSQLDatabase::findOneByIndex(const std::string& tableName,
                                       const Value& value,
                                       StoredRecord& result) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         return false;
@@ -1218,6 +1230,7 @@ const uint8_t* FlatSQLDatabase::findRawByIndex(const std::string& tableName,
                                                 uint32_t* outLength,
                                                 uint64_t* outSequence) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
     auto it = tables_.find(tableName);
     if (it == tables_.end()) {
         return nullptr;
@@ -1348,6 +1361,7 @@ std::vector<FlatSQLDatabase::TableStats> FlatSQLDatabase::getStats() const {
 
 void FlatSQLDatabase::registerSource(const std::string& sourceName) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
     if (!ensureSourceRegisteredUnlocked(sourceName)) {
         throw std::runtime_error("Source already registered: " + sourceName);
     }
@@ -1499,21 +1513,28 @@ size_t FlatSQLDatabase::ingestWithSource(const uint8_t* data, size_t length,
                                           const std::string& source,
                                           size_t* recordsIngested) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
+    SQLiteWriteBatch batch(*sqliteEngine_);
+    if (!batch.ok()) throw std::runtime_error(batch.error());
     invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     const uint64_t begin = storage_->getWriteOffset();
+    reindexUnavailable_ = true;
     const size_t consumed = storage_->ingest(data, length,
         [this, &source](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
             onIngestWithSource(fileId, data, len, seq, offset, source);
         }, recordsIngested, profile);
     recordSourceRangeUnlocked(source, begin, storage_->getWriteOffset());
+    if (!batch.commit()) throw std::runtime_error(batch.error());
+    reindexUnavailable_ = false;
     return consumed;
 }
 
 uint64_t FlatSQLDatabase::ingestOneWithSource(const uint8_t* flatbuffer, size_t length,
                                                const std::string& source) {
     std::unique_lock lock(*accessMutex_);
+    requireReadyUnlocked();
     invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     const uint64_t begin = storage_->getWriteOffset();

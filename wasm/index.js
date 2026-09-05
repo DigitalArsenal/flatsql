@@ -264,6 +264,7 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
         isDiskBacked: Module.cwrap('flatsql_is_disk_backed', 'number', ['number']),
         openState: Module.cwrap('flatsql_open_state', 'number', ['number']),
         reindexAll: Module.cwrap('flatsql_reindex_all', 'number', ['number']),
+        reindexStep: Module.cwrap('flatsql_reindex_step', 'number', ['number', 'number']),
         flushIndex: Module.cwrap('flatsql_flush_index', 'number', ['number']),
         flushedOffset: Module.cwrap('flatsql_flushed_offset', 'number', ['number']),
         streamPath: Module.cwrap('flatsql_stream_path', 'string', ['number']),
@@ -729,6 +730,13 @@ export class FlatSQLDatabase {
         return api.reindexAll(this._handle);
     }
 
+    reindexStep(maxRecords = 4096) {
+        if (!Number.isSafeInteger(maxRecords) || maxRecords <= 0 || maxRecords > 0x7fffffff) {
+            throw new RangeError('maxRecords must be a positive 32-bit integer');
+        }
+        return api.reindexStep(this._handle, maxRecords);
+    }
+
     /** Append new stream bytes, sync, then commit the index + high-water mark. */
     flushIndex() {
         return api.flushIndex(this._handle);
@@ -761,12 +769,14 @@ export class FlatSQLDatabase {
 
     // Ingest data from Uint8Array (routes to base tables or source tables)
     ingest(data, source = null) {
-        return withHeapBytes(data, (ptr) => {
+        const result = withHeapBytes(data, (ptr) => {
             if (source) {
                 return api.ingestWithSource(this._handle, ptr, data.length, source);
             }
             return api.ingest(this._handle, ptr, data.length);
         });
+        if (result < 0) throw new Error(api.getError());
+        return result;
     }
 
     // Ingest many FlatBuffers via the native bulk stream path.
@@ -775,12 +785,14 @@ export class FlatSQLDatabase {
     }
 
     ingestOne(data, source = null) {
-        return withHeapBytes(data, (ptr) => {
+        const result = withHeapBytes(data, (ptr) => {
             if (source) {
                 return api.ingestOneWithSource(this._handle, ptr, data.length, source);
             }
             return api.ingestOne(this._handle, ptr, data.length);
         });
+        if (result < 0) throw new Error(api.getError());
+        return result;
     }
 
     // Register a named data source for source-aware ingestion
@@ -970,6 +982,8 @@ export class FlatSQLDatabase {
 
     exportData() {
         const ptr = api.exportData(this._handle);
+        const error = api.getError();
+        if (error) throw new Error(error);
         const size = api.exportSize();
         return copyHeapBytes(ptr, size);
     }

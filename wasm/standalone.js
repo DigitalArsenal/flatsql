@@ -597,6 +597,13 @@ export class FlatSQLStandaloneDatabase {
     return this._runtime.exports.flatsql_reindex_all(this._handle);
   }
 
+  reindexStep(maxRecords = 4096) {
+    if (!Number.isSafeInteger(maxRecords) || maxRecords <= 0 || maxRecords > 0x7fffffff) {
+      throw new RangeError('maxRecords must be a positive 32-bit integer');
+    }
+    return this._runtime.exports.flatsql_reindex_step(this._handle, maxRecords);
+  }
+
   flushIndex() {
     return this._runtime.exports.flatsql_flush_index(this._handle);
   }
@@ -647,7 +654,7 @@ export class FlatSQLStandaloneDatabase {
   }
 
   ingest(data, source = null) {
-    return this._runtime.withBytes(data, (ptr) => {
+    const result = this._runtime.withBytes(data, (ptr) => {
       if (source) {
         return this._runtime.withCString(source, (sourcePtr) =>
           this._runtime.exports.flatsql_ingest_with_source(this._handle, ptr, data.length, sourcePtr)
@@ -655,6 +662,8 @@ export class FlatSQLStandaloneDatabase {
       }
       return this._runtime.exports.flatsql_ingest(this._handle, ptr, data.length);
     });
+    if (result < 0) throw new Error(this._runtime.readCString(this._runtime.exports.flatsql_get_error()));
+    return result;
   }
 
   ingestBuffers(buffers, source = null) {
@@ -662,7 +671,7 @@ export class FlatSQLStandaloneDatabase {
   }
 
   ingestOne(data, source = null) {
-    return this._runtime.withBytes(data, (ptr) => {
+    const result = this._runtime.withBytes(data, (ptr) => {
       if (source) {
         return this._runtime.withCString(source, (sourcePtr) =>
           this._runtime.exports.flatsql_ingest_one_with_source(this._handle, ptr, data.length, sourcePtr)
@@ -670,6 +679,8 @@ export class FlatSQLStandaloneDatabase {
       }
       return this._runtime.exports.flatsql_ingest_one(this._handle, ptr, data.length);
     });
+    if (result < 0) throw new Error(this._runtime.readCString(this._runtime.exports.flatsql_get_error()));
+    return result;
   }
 
   query(sql, params = undefined) {
@@ -851,6 +862,8 @@ export class FlatSQLStandaloneDatabase {
 
   exportData() {
     const ptr = this._runtime.exports.flatsql_export_data(this._handle);
+    const error = this._runtime.readCString(this._runtime.exports.flatsql_get_error());
+    if (error) throw new Error(error);
     const size = this._runtime.exports.flatsql_export_size();
     return this._runtime.readBytes(ptr, size);
   }

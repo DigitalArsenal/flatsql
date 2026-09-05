@@ -223,12 +223,16 @@ int  flatsql_open_state(void* h);
 /* Explicit full re-derivation from the streams. Always available. */
 int  flatsql_reindex_all(void* h);
 
+/* Cooperative full re-derivation: at most max_records per call.
+   1 = pending, 0 = complete, negative = state error. */
+int  flatsql_reindex_step(void* h, int max_records);
+
 /* Flush dirty index pages and advance the recorded high-water mark. The host
    decides when; the engine just does it. */
 int  flatsql_flush_index(void* h);
 
 /* High-water mark the host may resume its own journal from. */
-uint64_t flatsql_flushed_offset(void* h, const char* streamId);
+double flatsql_flushed_offset(void* h);
 ```
 
 Error codes (stable, host maps to typed errors):
@@ -244,6 +248,37 @@ Error codes (stable, host maps to typed errors):
 
 Every negative code is recoverable by full re-index. There is no code that means
 "data lost".
+
+Bulk `ingest` and `ingestWithSource` use a SQLite savepoint around the entire
+call, including derived indexes. Full reindexing commits its index and checkpoint
+once. These savepoints nest inside a caller's transaction; neither reindexing
+nor flushing commits or rolls back that outer transaction. The wire stream is
+still appended and synced by `flushIndex()`, before its durable checkpoint.
+
+New checkpoints also store each table's complete schema contract. Adding tables
+preserves the indexes for unchanged tables and indexes any previously unknown
+records belonging to the new tables. Removing or changing a persisted table
+returns `-2`. Older checkpoints remain readable with the same schema; on a schema
+change, they require a full rebuild because they lack per-table evidence.
+
+Both JavaScript wrappers expose `reindexStep(maxRecords = 4096)`. Callers should
+yield to their scheduler between calls returning `1` and tune the record limit
+to the runtime's call budget. This bounds records per invocation, not wall time:
+one unusually large record can still be expensive. Temporary input memory is
+bounded by one frame, in addition to FlatSQL's stream arena and derived state.
+
+During a stepped rebuild, queries and ingestion report `state: reindex incomplete`
+and flushing is refused. Use only recovery calls and progress inspection until
+completion. The rebuild holds one index transaction across steps; destroying
+the handle rolls it back and preserves the previous durable checkpoint. A
+process restart restarts rebuilding from the durable stream; it does not resume
+an in-memory cursor. After a failed step, retry recovery or reopen the handle.
+The source stream is never rewritten by a rebuild.
+
+An extraction or commit failure during bulk ingestion also requires recovery:
+the index transaction rolls back and the handle refuses reads or flushes that
+could expose its partially appended arena. Reopen a disk-backed handle from its
+last durable checkpoint, or recreate and reload an ephemeral handle.
 
 ### 3.4 Isomorphism
 
