@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # FlatBuffers location
-set(FLATBUFFERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../flatbuffers")
+set(FLATBUFFERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../flatbuffers" CACHE PATH "FlatBuffers source checkout")
 set(FLATBUFFERS_INCLUDE_DIR "${FLATBUFFERS_DIR}/include")
 set(FLATBUFFERS_SRC_DIR "${FLATBUFFERS_DIR}/src")
 
@@ -163,6 +163,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_DEFAULT_MEMSTATUS=0
         SQLITE_DQS=0
         SQLITE_ENABLE_RTREE=1
+        SQLITE_ENABLE_FTS5=1
     )
 
     # Emscripten link flags for WASM output
@@ -268,6 +269,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_DEFAULT_MEMSTATUS=0
         SQLITE_DQS=0
         SQLITE_ENABLE_RTREE=1
+        SQLITE_ENABLE_FTS5=1
     )
 
     # Shared WASI link flags (everything except the exception strategy) so the
@@ -380,6 +382,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_DEFAULT_MEMSTATUS=0
         SQLITE_DQS=0
         SQLITE_ENABLE_RTREE=1
+        SQLITE_ENABLE_FTS5=1
     )
 
     set_target_properties(flatsql_wasi_noeh PROPERTIES
@@ -432,6 +435,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             SQLITE_DEFAULT_MEMSTATUS=0
             SQLITE_DQS=0
             SQLITE_ENABLE_RTREE=1
+        SQLITE_ENABLE_FTS5=1
         )
         add_executable(
             flatsql_sdn_node
@@ -472,6 +476,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             SQLITE_DEFAULT_MEMSTATUS=0
             SQLITE_DQS=0
             SQLITE_ENABLE_RTREE=1
+        SQLITE_ENABLE_FTS5=1
         )
         set_target_properties(flatsql_sdn_node PROPERTIES
             OUTPUT_NAME "flatsql-sdn-node"
@@ -574,6 +579,7 @@ else()
         SQLITE_OMIT_DEPRECATED=1
         SQLITE_DQS=0
         SQLITE_ENABLE_RTREE=1
+        SQLITE_ENABLE_FTS5=1
     )
     # Suppress warnings in SQLite code
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -732,7 +738,11 @@ else()
         ${SQLITE_DIR}
     )
 
+    add_executable(flatsql_full_text_search_test tests/full_text_search_test.cpp)
+    target_link_libraries(flatsql_full_text_search_test PRIVATE flatsql_lib)
+
     enable_testing()
+    add_test(NAME FlatSQLFullTextSearchTest COMMAND flatsql_full_text_search_test)
     add_test(NAME FlatSQLVfsTest COMMAND flatsql_vfs_test)
     add_test(NAME FlatSQLStatePersistenceTest COMMAND flatsql_state_persistence_test)
     add_test(NAME FlatSQLDiskPersistenceTest COMMAND flatsql_disk_persistence_test)
