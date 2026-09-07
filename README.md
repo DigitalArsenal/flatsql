@@ -776,6 +776,9 @@ The bundled SQLite engine includes FTS5 on native, browser and WASI targets.
 from a bound FlatBuffer blob using the registered table schema. Both raw and
 size-prefixed records are accepted; the file identifier must match the table.
 Encrypted columns, opaque byte vectors and internal columns are excluded.
+Scalar defaults retain their declared type. Enums use their declared integer
+width when their definition is present; unresolved named types and non-byte
+vectors stay opaque instead of being treated as strings.
 Unknown schemas and malformed supported fields return SQL errors.
 
 A host can persist that text in an FTS5 table keyed by its durable record ID,

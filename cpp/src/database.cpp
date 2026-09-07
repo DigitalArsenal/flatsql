@@ -220,7 +220,10 @@ bool recordSearchText(const TableDef& table, const uint8_t* data, size_t length,
             (!column.name.empty() && column.name[0] == '_')) continue;
         if (!readFieldOffset(data, length, vtable, vtableSize, index)) continue;
         const Value value = readGenericColumnValue(data, length, column, index);
-        if (std::holds_alternative<std::monostate>(value)) return fail("Invalid FlatBuffer search field");
+        if (std::holds_alternative<std::monostate>(value)) {
+            if (error) *error = "Invalid FlatBuffer search field: " + column.name;
+            return false;
+        }
         std::visit([&](const auto& item) {
             using T = std::decay_t<decltype(item)>;
             if constexpr (std::is_same_v<T, std::string>) text << item << '\n';

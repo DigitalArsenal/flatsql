@@ -3,6 +3,7 @@
 #include <sstream>
 #include <algorithm>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace flatsql {
 
@@ -42,8 +43,9 @@ ValueType SchemaParser::idlTypeToValueType(const std::string& idlType) {
         return ValueType::Bytes;
     }
 
-    // Default to string for unknown types
-    return ValueType::String;
+    // A named table, unresolved enum or non-byte vector does not have a
+    // string layout. Keep it opaque instead of reading its bytes as an offset.
+    return ValueType::Null;
 }
 
 ValueType SchemaParser::jsonTypeToValueType(const std::string& jsonType, const std::string& format) {
@@ -69,6 +71,12 @@ ValueType SchemaParser::jsonTypeToValueType(const std::string& jsonType, const s
 DatabaseSchema SchemaParser::parseIDL(const std::string& idl, const std::string& dbName) {
     DatabaseSchema schema;
     schema.name = dbName;
+
+    std::unordered_map<std::string, std::string> enumTypes;
+    const std::regex enumRegex(R"delim(enum\s+(\w+)\s*:\s*(\w+)\s*\{)delim");
+    for (std::sregex_iterator it(idl.begin(), idl.end(), enumRegex), end; it != end; ++it) {
+        enumTypes[(*it)[1].str()] = (*it)[2].str();
+    }
 
     // Match table definitions: table TableName { ... }
     std::regex tableRegex(R"delim(table\s+(\w+)\s*\{([^}]*)\})delim", std::regex::icase);
@@ -119,6 +127,11 @@ DatabaseSchema SchemaParser::parseIDL(const std::string& idl, const std::string&
                 typeStr = trim(typeStr);
             }
 
+            // Defaults are values, not part of the field's wire type.
+            typeStr = trim(typeStr.substr(0, typeStr.find('=')));
+            if (const auto type = enumTypes.find(typeStr); type != enumTypes.end()) {
+                typeStr = type->second;
+            }
             col.type = idlTypeToValueType(typeStr);
             tableDef.columns.push_back(col);
 
