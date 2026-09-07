@@ -525,6 +525,7 @@ void FlatSQLDatabase::registerFileId(const std::string& fileId, const std::strin
 
     fileIdToTable_[fileId] = tableName;
     it->second->setFileId(fileId);
+    sqliteEngine_->registerRecordSchema(tableName, &it->second->getTableDef(), fileId);
     const auto refreshIdentity = [&](const std::string& name) {
         // Initialization skips tables without an identifier. A later identity
         // must register the table as well as refresh an existing source.

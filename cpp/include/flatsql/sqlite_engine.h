@@ -315,6 +315,12 @@ public:
     SourceInfo* getSource(const std::string& sourceName);
     const SourceInfo* getSource(const std::string& sourceName) const;
 
+    // A schema can be queried through a unified view without a base vtable.
+    void registerRecordSchema(const std::string& name, const TableDef* definition,
+                              const std::string& fileId) {
+        recordSchemas_[name] = {definition, fileId};
+    }
+
     /**
      * Optimized query that returns raw FlatBuffer data for point lookups.
      * Bypasses Value construction entirely.
@@ -350,6 +356,7 @@ private:
     // Stable callback owner survives moves of the engine itself.
     std::unique_ptr<SQLiteEngine*> functionOwner_;
     std::map<std::string, std::unique_ptr<SourceInfo>> sources_;
+    std::map<std::string, std::pair<const TableDef*, std::string>> recordSchemas_;
 
     // Statement cache for frequently executed queries
     mutable std::unordered_map<std::string, sqlite3_stmt*> stmtCache_;

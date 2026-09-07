@@ -47,6 +47,11 @@ int main() {
     lateDatabase.query("SELECT 1");
     lateDatabase.registerFileId("$TST", "Sample");
     require(lateDatabase.query("SELECT flatsql_record_text('Sample',?)", {record}).rows == extracted.rows, "late file identifier registration reaches search extraction");
+    FlatSQLDatabase viewDatabase(lateSchema);
+    viewDatabase.registerFileId("$TST", "Sample");
+    viewDatabase.registerSource("provider");
+    viewDatabase.createUnifiedViews();
+    require(viewDatabase.query("SELECT flatsql_record_text('Sample',?)", {record}).rows == extracted.rows, "unified view retains its record schema");
     auto malformed = record; flatbuffers::WriteScalar<uint32_t>(malformed.data(),0xffffffff);
     QueryResult ignored; std::string error;
     require(!engine.executeNoThrow("SELECT flatsql_record_text('Sample',?)", {malformed}, ignored, &error), "reject malformed FlatBuffer");

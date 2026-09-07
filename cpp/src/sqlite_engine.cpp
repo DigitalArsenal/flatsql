@@ -280,19 +280,21 @@ SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
                 sqlite3_result_error(context, "Expected a registered table name and FlatBuffer blob", -1); return;
             }
             const std::string name(reinterpret_cast<const char*>(sqlite3_value_text(values[0])), sqlite3_value_bytes(values[0]));
-            const auto* source = engine->getSource(name);
-            if (!source || !source->tableDef || source->fileId.size() != 4) {
+            const auto schema = engine->recordSchemas_.find(name);
+            if (schema == engine->recordSchemas_.end() || !schema->second.first || schema->second.second.size() != 4) {
                 sqlite3_result_error(context, "Search schema is not registered", -1); return;
             }
+            const auto* definition = schema->second.first;
+            const auto& fileId = schema->second.second;
             auto* data = static_cast<const uint8_t*>(sqlite3_value_blob(values[1]));
             size_t length = static_cast<size_t>(sqlite3_value_bytes(values[1]));
             if (length >= 12 && flatbuffers::ReadScalar<uint32_t>(data) == length - 4 &&
-                std::memcmp(data + 8, source->fileId.data(), 4) == 0) { data += 4; length -= 4; }
-            if (length < 8 || std::memcmp(data + 4, source->fileId.data(), 4) != 0) {
+                std::memcmp(data + 8, fileId.data(), 4) == 0) { data += 4; length -= 4; }
+            if (length < 8 || std::memcmp(data + 4, fileId.data(), 4) != 0) {
                 sqlite3_result_error(context, "Record identifier differs from search schema", -1); return;
             }
             std::string text, error;
-            if (!recordSearchText(*source->tableDef, data, length, text, &error)) {
+            if (!recordSearchText(*definition, data, length, text, &error)) {
                 sqlite3_result_error(context, error.c_str(), -1); return;
             }
             sqlite3_result_text64(context, text.data(), text.size(), SQLITE_TRANSIENT, SQLITE_UTF8);
@@ -377,6 +379,7 @@ SQLiteEngine::SQLiteEngine(SQLiteEngine&& other) noexcept
     , options_(std::move(other.options_))
     , functionOwner_(std::move(other.functionOwner_))
     , sources_(std::move(other.sources_))
+    , recordSchemas_(std::move(other.recordSchemas_))
     , stmtCache_(std::move(other.stmtCache_))
     , sourceNameCache_(std::move(other.sourceNameCache_))
     , parsedQueryCache_(std::move(other.parsedQueryCache_))
@@ -397,6 +400,7 @@ SQLiteEngine& SQLiteEngine::operator=(SQLiteEngine&& other) noexcept {
         functionOwner_ = std::move(other.functionOwner_);
         if (functionOwner_) *functionOwner_ = this;
         sources_ = std::move(other.sources_);
+        recordSchemas_ = std::move(other.recordSchemas_);
         stmtCache_ = std::move(other.stmtCache_);
         sourceNameCache_ = std::move(other.sourceNameCache_);
         parsedQueryCache_ = std::move(other.parsedQueryCache_);
@@ -449,6 +453,7 @@ bool SQLiteEngine::registerSourceNoThrow(
     sourceInfo->store = store;
     sourceInfo->tableDef = tableDef;
     sourceInfo->fileId = fileId;
+    registerRecordSchema(sourceName, tableDef, fileId);
     sourceInfo->extractor = extractor;
     sourceInfo->batchExtractor = batchExtractor;
     sourceInfo->indexes = indexes;
