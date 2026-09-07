@@ -347,6 +347,8 @@ private:
 
     sqlite3* db_;
     SQLiteConnectionOptions options_;
+    // Stable callback owner survives moves of the engine itself.
+    std::unique_ptr<SQLiteEngine*> functionOwner_;
     std::map<std::string, std::unique_ptr<SourceInfo>> sources_;
 
     // Statement cache for frequently executed queries
