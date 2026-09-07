@@ -2,6 +2,7 @@
 // Exercise the actual FlatSQL connection, not the system SQLite library.
 #include "flatsql/sqlite_engine.h"
 #include "flatsql/database.h"
+#include "flatsql/schema_parser.h"
 #include <flatbuffers/flatbuffers.h>
 #include <iostream>
 #include <stdexcept>
@@ -60,6 +61,43 @@ int main() {
     require(moved.execute("SELECT flatsql_record_text('Sample',?)", {record}).rows == extracted.rows, "function survives engine move");
     engine = std::move(moved);
     require(engine.execute("SELECT flatsql_record_text('Sample',?)", {record}).rows == extracted.rows, "function survives move assignment");
+
+    // Live OMM archives contain non-default enums. An unresolved enum must
+    // never be interpreted as a string offset; explicit enum types retain
+    // their scalar width, and scalar defaults do not change that width.
+    const auto typedSchema = SchemaParser::parseIDL(R"(
+        enum Mode : ubyte { NONE, PASSIVE, ACTIVE }
+        table Typed {
+            name:string;
+            known:Mode = NONE;
+            external:UnresolvedMode = DEFAULT;
+            count:uint = 0;
+            samples:[double];
+            child:Nested;
+        }
+    )");
+    require(typedSchema.tables[0].columns[1].type == ValueType::UInt8, "declared enum retains its integer width");
+    require(typedSchema.tables[0].columns[2].type == ValueType::Null, "unresolved enum has no assumed wire layout");
+    require(typedSchema.tables[0].columns[3].type == ValueType::UInt32, "scalar default is not part of its type");
+    flatbuffers::FlatBufferBuilder typedBuilder;
+    const auto typedName = typedBuilder.CreateString("Active payload");
+    const auto samples = typedBuilder.CreateVector(std::vector<double>{1.0, 2.0});
+    const auto childStart = typedBuilder.StartTable();
+    typedBuilder.AddElement<uint32_t>(4, 77, 0);
+    const auto child = flatbuffers::Offset<flatbuffers::Table>(typedBuilder.EndTable(childStart));
+    const auto typedStart = typedBuilder.StartTable();
+    typedBuilder.AddOffset(4, typedName);
+    typedBuilder.AddElement<uint8_t>(6, 2, 0);
+    typedBuilder.AddElement<uint8_t>(8, 3, 0);
+    typedBuilder.AddElement<uint32_t>(10, 42, 0);
+    typedBuilder.AddOffset(12, samples);
+    typedBuilder.AddOffset(14, child);
+    typedBuilder.Finish(flatbuffers::Offset<flatbuffers::Table>(typedBuilder.EndTable(typedStart)), "$TYP");
+    const std::vector<uint8_t> typedRecord(typedBuilder.GetBufferPointer(), typedBuilder.GetBufferPointer()+typedBuilder.GetSize());
+    FlatSQLDatabase typedDatabase(typedSchema);
+    typedDatabase.registerFileId("$TYP", "Typed");
+    require(std::get<std::string>(typedDatabase.query("SELECT flatsql_record_text('Typed',?)", {typedRecord}).rows[0][0]) == "Active payload\n2\n42\n",
+        "search reads typed scalars and skips unresolved layouts and non-text vectors");
 
     engine.execute("CREATE VIRTUAL TABLE offering_fts USING fts5(node UNINDEXED, object_id, name, description, tokenize='unicode61')");
     for (int i = 1; i <= 205; ++i) {
