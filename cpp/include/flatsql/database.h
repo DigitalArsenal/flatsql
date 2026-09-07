@@ -16,6 +16,12 @@
 
 namespace flatsql {
 
+// Render the declared scalar/text fields of one unprefixed record for FTS.
+// Opaque bytes and encrypted columns never enter a plaintext search index.
+// Uses the bounds-checked generic reader, not a custom extractor callback.
+bool recordSearchText(const TableDef& table, const uint8_t* data, size_t length,
+                      std::string& output, std::string* error = nullptr);
+
 /**
  * Table store: manages records and indexes for a single table.
  * Works with streaming ingest - indexes are built as records arrive.

@@ -3,6 +3,9 @@
 #include <flatbuffers/flatbuffers.h>
 #include <algorithm>
 #include <limits>
+#include <sstream>
+#include <locale>
+#include <type_traits>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_set>
@@ -30,11 +33,12 @@ bool readFlatBufferLayout(const uint8_t* data,
     }
 
     const int32_t vtableDistance = flatbuffers::ReadScalar<int32_t>(data + root);
-    if (vtableDistance <= 0 || static_cast<size_t>(vtableDistance) > root) {
+    const int64_t vtablePosition = static_cast<int64_t>(root) - vtableDistance;
+    if (vtablePosition < 0 || static_cast<uint64_t>(vtablePosition) > length) {
         return false;
     }
 
-    const size_t vtable = root - static_cast<size_t>(vtableDistance);
+    const size_t vtable = static_cast<size_t>(vtablePosition);
     if (vtable > length || length - vtable < sizeof(uint16_t)) {
         return false;
     }
@@ -194,6 +198,40 @@ TableStore::FieldExtractor makeGenericFieldExtractor(TableDef tableDef) {
 }
 
 }  // namespace
+
+bool recordSearchText(const TableDef& table, const uint8_t* data, size_t length,
+                      std::string& output, std::string* error) {
+    output.clear();
+    const auto fail = [&](const char* reason) {
+        if (error) *error = reason;
+        return false;
+    };
+    if (length > 16 * 1024 * 1024) return fail("Record exceeds search extraction limit");
+    size_t root = 0, vtable = 0;
+    uint16_t vtableSize = 0;
+    if (!readFlatBufferLayout(data, length, root, vtable, vtableSize))
+        return fail("Invalid FlatBuffer search record");
+    std::ostringstream text;
+    text.imbue(std::locale::classic());
+    text.precision(std::numeric_limits<double>::max_digits10);
+    for (size_t index = 0; index < table.columns.size(); ++index) {
+        const auto& column = table.columns[index];
+        if (column.encrypted || column.type == ValueType::Bytes || column.type == ValueType::Null ||
+            (!column.name.empty() && column.name[0] == '_')) continue;
+        if (!readFieldOffset(data, length, vtable, vtableSize, index)) continue;
+        const Value value = readGenericColumnValue(data, length, column, index);
+        if (std::holds_alternative<std::monostate>(value)) return fail("Invalid FlatBuffer search field");
+        std::visit([&](const auto& item) {
+            using T = std::decay_t<decltype(item)>;
+            if constexpr (std::is_same_v<T, std::string>) text << item << '\n';
+            else if constexpr (std::is_same_v<T, bool>) text << (item ? "true" : "false") << '\n';
+            else if constexpr (std::is_arithmetic_v<T>) text << +item << '\n';
+        }, value);
+        if (text.tellp() > 16 * 1024 * 1024) return fail("Search text exceeds extraction limit");
+    }
+    output = text.str();
+    return true;
+}
 
 // ==================== TableStore ====================
 
@@ -487,6 +525,19 @@ void FlatSQLDatabase::registerFileId(const std::string& fileId, const std::strin
 
     fileIdToTable_[fileId] = tableName;
     it->second->setFileId(fileId);
+    sqliteEngine_->registerRecordSchema(tableName, &it->second->getTableDef(), fileId);
+    const auto refreshIdentity = [&](const std::string& name) {
+        // Initialization skips tables without an identifier. A later identity
+        // must register the table as well as refresh an existing source.
+        if (sqliteInitialized_) updateSQLiteTable(name);
+        if (sqliteEngine_) {
+            if (auto* source = sqliteEngine_->getSource(name)) {
+                source->fileId = fileId;
+                source->vtabInfo.fileId = fileId;
+            }
+        }
+    };
+    refreshIdentity(tableName);
 
     // Sources registered BEFORE the file id would otherwise hold partition
     // tables that route nothing — a silent empty partition that looks exactly
@@ -498,6 +549,7 @@ void FlatSQLDatabase::registerFileId(const std::string& fileId, const std::strin
         if (sourceIt == tables_.end()) continue;
         if (!sourceIt->second->getFileId().empty()) continue;
         sourceIt->second->setFileId(fileId);
+        refreshIdentity(sourceTableName);
         sourceFileIdToTable_[source + ":" + fileId] = sourceTableName;
         if (auto extractor = it->second->getFieldExtractor()) {
             sourceIt->second->setFieldExtractor(extractor);
