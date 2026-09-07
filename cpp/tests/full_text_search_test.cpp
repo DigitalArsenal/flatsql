@@ -42,6 +42,11 @@ int main() {
     forward.insert(forward.end(), record.begin()+vtableOffset, record.begin()+vtableOffset+vtableBytes);
     flatbuffers::WriteScalar<int32_t>(forward.data()+rootOffset, static_cast<int32_t>(rootOffset)-static_cast<int32_t>(record.size()));
     require(engine.execute("SELECT flatsql_record_text('Sample',?)", {forward}).rows == extracted.rows, "valid forward vtable is readable");
+    DatabaseSchema lateSchema; lateSchema.name = "late-identity"; lateSchema.tables.push_back(definition);
+    FlatSQLDatabase lateDatabase(lateSchema);
+    lateDatabase.query("SELECT 1");
+    lateDatabase.registerFileId("$TST", "Sample");
+    require(lateDatabase.query("SELECT flatsql_record_text('Sample',?)", {record}).rows == extracted.rows, "late file identifier registration reaches search extraction");
     auto malformed = record; flatbuffers::WriteScalar<uint32_t>(malformed.data(),0xffffffff);
     QueryResult ignored; std::string error;
     require(!engine.executeNoThrow("SELECT flatsql_record_text('Sample',?)", {malformed}, ignored, &error), "reject malformed FlatBuffer");

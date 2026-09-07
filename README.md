@@ -768,3 +768,18 @@ For questions, licensing inquiries, or commercial support: [tj@digitalarsenal.io
 ---
 
 Built on [DA-FlatBuffers](https://digitalarsenal.github.io/flatbuffers/) and [SQLite](https://sqlite.org/).
+
+### Full-text indexing of record archives
+
+The bundled SQLite engine includes FTS5 on native, browser and WASI targets.
+`SELECT flatsql_record_text('CAT', ?)` extracts searchable scalar/text fields
+from a bound FlatBuffer blob using the registered table schema. Both raw and
+size-prefixed records are accepted; the file identifier must match the table.
+Encrypted columns, opaque byte vectors and internal columns are excluded.
+Unknown schemas and malformed supported fields return SQL errors.
+
+A host can persist that text in an FTS5 table keyed by its durable record ID,
+including records outside the engine's active record window. Index lifecycle,
+source permissions, coverage and cursor identity remain the host's responsibility.
+The function covers the fields declared in the registered schema; it does not
+recursively decode nested tables or invent a text representation for binary data.

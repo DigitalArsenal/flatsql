@@ -525,6 +525,18 @@ void FlatSQLDatabase::registerFileId(const std::string& fileId, const std::strin
 
     fileIdToTable_[fileId] = tableName;
     it->second->setFileId(fileId);
+    const auto refreshIdentity = [&](const std::string& name) {
+        // Initialization skips tables without an identifier. A later identity
+        // must register the table as well as refresh an existing source.
+        if (sqliteInitialized_) updateSQLiteTable(name);
+        if (sqliteEngine_) {
+            if (auto* source = sqliteEngine_->getSource(name)) {
+                source->fileId = fileId;
+                source->vtabInfo.fileId = fileId;
+            }
+        }
+    };
+    refreshIdentity(tableName);
 
     // Sources registered BEFORE the file id would otherwise hold partition
     // tables that route nothing — a silent empty partition that looks exactly
@@ -536,6 +548,7 @@ void FlatSQLDatabase::registerFileId(const std::string& fileId, const std::strin
         if (sourceIt == tables_.end()) continue;
         if (!sourceIt->second->getFileId().empty()) continue;
         sourceIt->second->setFileId(fileId);
+        refreshIdentity(sourceTableName);
         sourceFileIdToTable_[source + ":" + fileId] = sourceTableName;
         if (auto extractor = it->second->getFieldExtractor()) {
             sourceIt->second->setFieldExtractor(extractor);
