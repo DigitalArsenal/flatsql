@@ -1,5 +1,6 @@
 #include "flatsql/sqlite_engine.h"
 #include "flatsql/database.h"
+#include "flatsql/record_search.h"
 #include <flatbuffers/flatbuffers.h>
 #include "flatsql/flatsql_io.h"
 #include "flatsql/geo_functions.h"
@@ -272,9 +273,7 @@ SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
     }
 
     functionOwner_ = std::make_unique<SQLiteEngine*>(this);
-    const int searchRc = sqlite3_create_function_v2(db_, "flatsql_record_text", 2,
-        SQLITE_UTF8 | SQLITE_DIRECTONLY, functionOwner_.get(),
-        [](sqlite3_context* context, int, sqlite3_value** values) {
+    const auto searchFunction = [](sqlite3_context* context, int count, sqlite3_value** values) {
             auto* engine = *static_cast<SQLiteEngine**>(sqlite3_user_data(context));
             if (sqlite3_value_type(values[0]) != SQLITE_TEXT || sqlite3_value_type(values[1]) != SQLITE_BLOB) {
                 sqlite3_result_error(context, "Expected a registered table name and FlatBuffer blob", -1); return;
@@ -288,6 +287,18 @@ SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
             const auto& fileId = schema->second.second;
             auto* data = static_cast<const uint8_t*>(sqlite3_value_blob(values[1]));
             size_t length = static_cast<size_t>(sqlite3_value_bytes(values[1]));
+            if (count == 3) {
+                if (sqlite3_value_type(values[2]) != SQLITE_BLOB) {
+                    sqlite3_result_error(context, "Expected a binary FlatBuffer schema", -1); return;
+                }
+                std::string text, error;
+                if (!reflectedRecordSearchText(static_cast<const uint8_t*>(sqlite3_value_blob(values[2])),
+                    sqlite3_value_bytes(values[2]), fileId, data, length, text, &error)) {
+                    sqlite3_result_error(context, error.c_str(), -1); return;
+                }
+                sqlite3_result_text64(context, text.data(), text.size(), SQLITE_TRANSIENT, SQLITE_UTF8);
+                return;
+            }
             if (length >= 12 && flatbuffers::ReadScalar<uint32_t>(data) == length - 4 &&
                 std::memcmp(data + 8, fileId.data(), 4) == 0) { data += 4; length -= 4; }
             if (length < 8 || std::memcmp(data + 4, fileId.data(), 4) != 0) {
@@ -298,8 +309,12 @@ SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
                 sqlite3_result_error(context, error.c_str(), -1); return;
             }
             sqlite3_result_text64(context, text.data(), text.size(), SQLITE_TRANSIENT, SQLITE_UTF8);
-        }, nullptr, nullptr, nullptr);
-    if (searchRc != SQLITE_OK) throw std::runtime_error("Unable to register FlatSQL record text extraction");
+        };
+    for (int count : {2, 3}) {
+        const int searchRc = sqlite3_create_function_v2(db_, "flatsql_record_text", count,
+            SQLITE_UTF8 | SQLITE_DIRECTONLY, functionOwner_.get(), searchFunction, nullptr, nullptr, nullptr);
+        if (searchRc != SQLITE_OK) throw std::runtime_error("Unable to register FlatSQL record text extraction");
+    }
 
     // Register custom geo/spatial functions
     registerGeoFunctions(db_);

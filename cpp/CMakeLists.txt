@@ -81,6 +81,8 @@ set(FLATSQL_LIB_SOURCES
     src/sqlite_index.cpp
     src/schema_parser.cpp
     src/database.cpp
+    src/record_search.cpp
+    ${FLATBUFFERS_SRC_DIR}/reflection.cpp
     src/query_cache.cpp
     src/junction.cpp
     src/sqlite_vtab.cpp
@@ -743,6 +745,9 @@ else()
 
     enable_testing()
     add_test(NAME FlatSQLFullTextSearchTest COMMAND flatsql_full_text_search_test)
+    add_executable(flatsql_full_text_reflection_test tests/full_text_reflection_test.cpp)
+    target_link_libraries(flatsql_full_text_reflection_test PRIVATE flatsql_lib)
+    add_test(NAME FlatSQLFullTextReflectionTest COMMAND flatsql_full_text_reflection_test)
     add_test(NAME FlatSQLVfsTest COMMAND flatsql_vfs_test)
     add_test(NAME FlatSQLStatePersistenceTest COMMAND flatsql_state_persistence_test)
     add_test(NAME FlatSQLDiskPersistenceTest COMMAND flatsql_disk_persistence_test)

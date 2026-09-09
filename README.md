@@ -74,6 +74,28 @@ FlatBuffer → Query (via virtual table) → FlatBuffer
 
 ## Runtime Choices & Performance Gates
 
+### Complete-record full-text search
+
+`flatsql_record_text(table, record, binary_schema)` extracts search text using a
+canonical FlatBuffers binary schema (`.bfbs`). This includes fields after vectors,
+nested tables and unions, even when the SQL table exposes only an initial set of
+columns. Records remain in their original binary format. The two-argument form
+continues to extract the registered SQL columns.
+
+Generate binary schemas from the same published IDL version used to produce the
+records, using `flatc -b --schema --bfbs-builtins`. The schema and record must match
+the registered table's file identifier. FlatSQL validates both inputs and indexes
+public scalar values, strings and nested content. It excludes encrypted fields,
+internal fields beginning with `_`, and opaque byte vectors.
+
+Extraction rejects unsupported layouts and reports bounds failures instead of
+returning partial text. Limits are 1 MiB per binary schema, 16 MiB per record and
+output, 100,000 visited values/objects and 64 nesting levels. Schema metadata with
+64-bit offsets or unknown advanced features is rejected. Consumers must include
+the binary schema and engine versions in their derived-index fingerprint so
+upgrades rebuild previously incomplete indexes. See the
+[FlatBuffers reflection documentation](https://flatbuffers.dev/languages/cpp/).
+
 ### SDN flow runtime contract
 
 Within an SDN module flow, FlatSQL always runs as a signed, pluggable WASM node.
