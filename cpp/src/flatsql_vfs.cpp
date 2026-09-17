@@ -31,12 +31,32 @@ namespace {
 
 constexpr int kMaxPathLen = 1024;
 
+// HEAP-BACKED WAL-INDEX. SQLite's own unix VFS does exactly this when the
+// database is held under an exclusive lock: "we do not really need shared
+// memory. No shared memory file is created. The shared memory will be
+// simulated with heap memory." (sqlite3.c, unixOpenSharedMemory).
+//
+// That is precisely this lane's situation — FlatSQL is opened by exactly one
+// writer, which the one-daemon-per-box law guarantees on the server and tab
+// ownership guarantees in the browser. The wal-index only has to be SHARED
+// when several processes attach; for a single connection it is just memory.
+//
+// 64 regions is the cap. Regions are szRegion bytes (32 KiB in practice), so
+// this covers a wal-index far larger than any WAL this engine will checkpoint,
+// and the map fails loudly rather than silently wrapping past the end.
+constexpr int kMaxShmRegions = 64;
+
 struct FlatSqlFile {
     sqlite3_file base;   // must be first
     int32_t handle;
     int deleteOnClose;
     char path[kMaxPathLen];
+    void* shmRegions[kMaxShmRegions];
+    int shmRegionSize;
 };
+
+// Defined below with the rest of the shm methods; fsClose needs it first.
+void freeShmRegions(FlatSqlFile* f);
 
 int mapIoError(int32_t status, int fallback) {
     switch (status) {
@@ -51,6 +71,7 @@ int mapIoError(int32_t status, int fallback) {
 
 int fsClose(sqlite3_file* file) {
     auto* f = reinterpret_cast<FlatSqlFile*>(file);
+    freeShmRegions(f);
     if (f->handle < 0) return SQLITE_OK;
     const int32_t rc = flatsql_io_close(f->handle);
     f->handle = -1;
@@ -141,8 +162,56 @@ int fsDeviceCharacteristics(sqlite3_file*) {
     return 0;
 }
 
+void freeShmRegions(FlatSqlFile* f) {
+    for (int i = 0; i < kMaxShmRegions; ++i) {
+        if (f->shmRegions[i] != nullptr) {
+            sqlite3_free(f->shmRegions[i]);
+            f->shmRegions[i] = nullptr;
+        }
+    }
+    f->shmRegionSize = 0;
+}
+
+int fsShmMap(sqlite3_file* file, int iRegion, int szRegion, int bExtend,
+             void volatile** pp) {
+    auto* f = reinterpret_cast<FlatSqlFile*>(file);
+    *pp = nullptr;
+    if (iRegion < 0 || iRegion >= kMaxShmRegions || szRegion <= 0) {
+        return SQLITE_IOERR_SHMMAP;
+    }
+    if (f->shmRegionSize == 0) {
+        f->shmRegionSize = szRegion;
+    } else if (f->shmRegionSize != szRegion) {
+        return SQLITE_IOERR_SHMMAP;
+    }
+    if (f->shmRegions[iRegion] == nullptr) {
+        // bExtend == 0 asks "does it exist yet?" and must not allocate: the
+        // pager uses the null answer to decide a recovery is needed.
+        if (!bExtend) return SQLITE_OK;
+        void* mem = sqlite3_malloc64(static_cast<sqlite3_uint64>(szRegion));
+        if (mem == nullptr) return SQLITE_NOMEM;
+        // Zeroed: SQLite requires a freshly created wal-index region to read
+        // as zero, or a dirty region is read as a valid header.
+        std::memset(mem, 0, static_cast<size_t>(szRegion));
+        f->shmRegions[iRegion] = mem;
+    }
+    *pp = f->shmRegions[iRegion];
+    return SQLITE_OK;
+}
+
+// One connection owns this wal-index, so every lock is trivially available.
+int fsShmLock(sqlite3_file*, int, int, int) { return SQLITE_OK; }
+
+// Single-threaded wasm: no other core's view needs ordering.
+void fsShmBarrier(sqlite3_file*) {}
+
+int fsShmUnmap(sqlite3_file* file, int /*deleteFlag*/) {
+    freeShmRegions(reinterpret_cast<FlatSqlFile*>(file));
+    return SQLITE_OK;
+}
+
 const sqlite3_io_methods kIoMethods = {
-    1,                          // iVersion
+    2,                          // iVersion: 2 exposes xShm* (WAL)
     fsClose,
     fsRead,
     fsWrite,
@@ -155,10 +224,8 @@ const sqlite3_io_methods kIoMethods = {
     fsFileControl,
     fsSectorSize,
     fsDeviceCharacteristics,
-    // v2 shared memory: xShmMap/xShmLock/xShmBarrier/xShmUnmap. Left null on
-    // purpose — this is exactly why WAL is unavailable and SQLITE_OMIT_WAL
-    // stays on every wasm target.
-    nullptr, nullptr, nullptr, nullptr,
+    // v2 shared memory, backed by heap rather than a -shm file.
+    fsShmMap, fsShmLock, fsShmBarrier, fsShmUnmap,
     nullptr, nullptr,  // v3 xFetch/xUnfetch (no mmap in any lane)
 };
 

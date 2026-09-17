@@ -265,7 +265,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_TEMP_STORE=3
         SQLITE_THREADSAFE=0
         SQLITE_OMIT_LOAD_EXTENSION=1
-        SQLITE_OMIT_WAL=1
+        # SQLITE_OMIT_WAL intentionally NOT set: the VFS implements xShm* on
+        # the heap, so journal_mode=WAL works on this lane.
         SQLITE_OMIT_DEPRECATED=1
         SQLITE_OMIT_SHARED_CACHE=1
         SQLITE_DEFAULT_MEMSTATUS=0
@@ -378,7 +379,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_TEMP_STORE=3
         SQLITE_THREADSAFE=0
         SQLITE_OMIT_LOAD_EXTENSION=1
-        SQLITE_OMIT_WAL=1
+        # SQLITE_OMIT_WAL intentionally NOT set: the VFS implements xShm* on
+        # the heap, so journal_mode=WAL works on this lane.
         SQLITE_OMIT_DEPRECATED=1
         SQLITE_OMIT_SHARED_CACHE=1
         SQLITE_DEFAULT_MEMSTATUS=0
