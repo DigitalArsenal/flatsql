@@ -777,7 +777,7 @@ SELECT * FROM User WHERE _source = 'satellite-1';
 
 ## License
 
-[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) — source-available, free for any noncommercial purpose. Commercial use requires a separate license from DigitalArsenal.io, Inc. See [LICENSE](LICENSE).
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) — source-available, free for any noncommercial purpose. Commercial use requires a separate license from Edgesource Corporation See [LICENSE](LICENSE).
 
 ## Contributing
 
