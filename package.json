@@ -122,7 +122,7 @@
     "rtree",
     "space-data-module"
   ],
-  "author": "Digital Arsenal <tj@digitalarsenal.io>",
+  "author": "Edgesource Corporation <tj@edgesource.com>",
   "license": "PolyForm-Noncommercial-1.0.0",
   "dependencies": {
     "flatbuffers": "^25.9.23",

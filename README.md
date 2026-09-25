@@ -785,7 +785,7 @@ Contributions welcome. Please open an issue first to discuss significant changes
 
 ## Contact
 
-For questions, licensing inquiries, or commercial support: [tj@digitalarsenal.io](mailto:tj@digitalarsenal.io)
+For questions, licensing inquiries, or commercial support: [tj@edgesource.com](mailto:tj@edgesource.com)
 
 ---
 
