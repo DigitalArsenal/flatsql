@@ -19,7 +19,6 @@ namespace {
 enum Label : uint8_t { kLabelFirst = 1, kLabelRepeat = 2, kLabelDead = 3, kLabelPromoted = 4 };
 constexpr int32_t kOpenRW = FLATSQL_IO_READ | FLATSQL_IO_WRITE;
 constexpr uint16_t kTypeFlagFullLabels = 1;
-constexpr uint16_t kTypeFlagMergeIntent = 2;
 constexpr uint16_t kTypeFlagMergeDone = 4;
 
 bool isLive(uint8_t label) { return label == kLabelFirst || label == kLabelRepeat || label == kLabelPromoted; }
@@ -355,14 +354,15 @@ void encodeTypeHead(const TypeOwner* t, uint8_t* slot, uint32_t* used, bool dura
     size_t off = sizeof(h);
     std::memcpy(slot + off, t->l0, sizeof(TypeL0DirEntry) * t->nL0);
     off += sizeof(TypeL0DirEntry) * t->nL0;
-    if (t->labeled.size() <= kMaxInlineLabels) {
-        std::vector<std::pair<uint32_t, uint64_t>> labels(t->labeled.begin(), t->labeled.end());
-        std::sort(labels.begin(), labels.end());
-        h.nLabels = uint16_t(labels.size());
-        for (const auto& l : labels) {
+    // labeled_through lives in each partition (written only by this owner).
+    const uint32_t nParts = t->nParts.load(std::memory_order_acquire);
+    if (nParts <= kMaxInlineLabels) {
+        h.nLabels = uint16_t(nParts);
+        for (uint32_t i = 0; i < nParts; i++) {
+            const Partition* p = t->partAt(i);
             LabelEntry le{};
-            le.pid = l.first;
-            le.labeledThrough = l.second;
+            le.pid = p->pid;
+            le.labeledThrough = p->labeledThrough.load(std::memory_order_relaxed);
             std::memcpy(slot + off, &le, sizeof(le));
             off += sizeof(le);
         }
@@ -491,11 +491,10 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
     Engine* e = w->engine();
     // Anything to label? (A25: compare with each partition's durable HWM.)
     const uint32_t nParts = t->nParts.load(std::memory_order_acquire);
-    bool work = !t->deletes.empty();
+    bool work = !t->deletes.empty() || t->mergePhase == 1;
     for (uint32_t i = 0; i < nParts && !work; i++) {
         Partition* p = t->partAt(i);
-        auto it = t->labeled.find(p->pid);
-        const uint64_t lt = it == t->labeled.end() ? 0 : it->second;
+        const uint64_t lt = p->labeledThrough.load(std::memory_order_relaxed);
         if (p->durablePseqHi.load(std::memory_order_acquire) > lt) work = true;
     }
     t->dirty.store(0, std::memory_order_relaxed);
@@ -519,8 +518,7 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
     if (!st->labels) return false;
     for (uint32_t i = 0; i < nParts && done < budget && !c.err; i++) {
         Partition* p = t->partAt(i);
-        auto it = t->labeled.find(p->pid);
-        const uint64_t lt = it == t->labeled.end() ? 0 : it->second;
+        const uint64_t lt = p->labeledThrough.load(std::memory_order_relaxed);
         const uint64_t hi = p->durablePseqHi.load(std::memory_order_acquire);
         if (hi <= lt) continue;
         // Published batch directory of the partition (seqlock).
@@ -628,7 +626,8 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
         t->deletes.swap(keep);
         tHotPathDepth = saved;
     }
-    if (c.err || (st->nLabels == 0 && sc->nArrivals == 0 && sc->nEntries == 0)) return false;
+    if (!c.err && t->mergePhase == 1) st->mergeDone = true;
+    if (c.err || (st->nLabels == 0 && sc->nArrivals == 0 && sc->nEntries == 0 && !st->mergeDone)) return false;
     // Arrivals bytes (frames arena).
     const uint32_t gBytes = sc->nArrivals * kArrivalBytes;
     if (gBytes) {
@@ -643,14 +642,9 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
     for (uint32_t i = 0; i < sc->nEntries; i++) sc->order[i] = &sc->entries[i];
     sortStaged(sc->order, sc->nEntries);
     const size_t l0Len = sc->nEntries ? l0BlockSize(sc->order, sc->nEntries) : 0;
-    const bool full = t->labeled.size() + st->nLabels > kMaxInlineLabels &&
+    const bool full = nParts > kMaxInlineLabels &&
                       (t->labelCkptOff == 0 || t->metaSinceCkpt >= e->config().ckptMetaBytes);
-    uint32_t nLabelEntries = st->nLabels;
-    if (full) {
-        nLabelEntries = uint32_t(t->labeled.size());
-        for (uint32_t i = 0; i < st->nLabels; i++)
-            if (!t->labeled.count(st->labels[i].p->pid)) nLabelEntries++;
-    }
+    const uint32_t nLabelEntries = full ? nParts : st->nLabels;
     const size_t labelsLen = size_t(nLabelEntries) * sizeof(LabelEntry);
     const size_t batchLen = sizeof(TypeBatchHeader) + labelsLen + l0Len + 8;
     uint8_t* b = static_cast<uint8_t*>(batches->alloc(batchLen, 8));
@@ -658,7 +652,11 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
     TypeBatchHeader h{};
     h.magic = kMagicTypeBatch;
     h.ver = 1;
-    h.flags = full ? kTypeFlagFullLabels : 0;
+    h.flags = uint16_t((full ? kTypeFlagFullLabels : 0) | (st->mergeDone ? kTypeFlagMergeDone : 0));
+    if (st->mergeDone) {
+        h.mergeGen = t->mergeGen;
+        h.mergedThroughCommit = t->mergeThroughCommit;
+    }
     h.commitSeq = st->commitSeq;
     h.firstGseq = st->firstGseq;
     h.nArrivals = st->nArrivals;
@@ -683,18 +681,14 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
         off += sizeof(le);
     };
     if (full) {
-        std::vector<std::pair<uint32_t, uint64_t>> all(t->labeled.begin(), t->labeled.end());
-        for (uint32_t i = 0; i < st->nLabels; i++) {
-            bool found = false;
-            for (auto& x : all)
-                if (x.first == st->labels[i].p->pid) {
-                    x.second = st->labels[i].through;
-                    found = true;
-                }
-            if (!found) all.push_back({st->labels[i].p->pid, st->labels[i].through});
+        // Every partition of the type, with this batch's labels applied.
+        for (uint32_t i = 0; i < nParts; i++) {
+            const Partition* p = t->partAt(i);
+            uint64_t through = p->labeledThrough.load(std::memory_order_relaxed);
+            for (uint32_t k = 0; k < st->nLabels; k++)
+                if (st->labels[k].p == p) through = st->labels[k].through;
+            putLabel(p->pid, through);
         }
-        std::sort(all.begin(), all.end());
-        for (const auto& x : all) putLabel(x.first, x.second);
     } else {
         for (uint32_t i = 0; i < st->nLabels; i++) putLabel(st->labels[i].p->pid, st->labels[i].through);
     }
@@ -729,9 +723,30 @@ void typePublish(Writer* w, TypeOwner* t, StagedType* st) {
         t->labelCkptSeg = st->mSeg;
         t->metaSinceCkpt = 0;
     }
-    for (uint32_t i = 0; i < st->nLabels; i++) {
-        t->labeled[st->labels[i].p->pid] = st->labels[i].through;
+    for (uint32_t i = 0; i < st->nLabels; i++)
         st->labels[i].p->labeledThrough.store(st->labels[i].through, std::memory_order_release);
+    if (st->mergeDone) {
+        // MERGE_DONE durable: the run replaces the merged L0 blocks.
+        t->runs.push_back(std::move(t->mergeRun));
+        t->mergeRun = SegRun();
+        w->io().close(&t->mergeMf);
+        t->manifestGenLoaded = t->mergeGen;
+        const uint32_t k = t->mergeK;
+        const uint32_t remaining = t->nL0 - k;
+        for (uint32_t i = 0; i < remaining; i++) {
+            t->l0[i] = t->l0[i + k];
+            t->acc[i] = t->acc[i + k];
+        }
+        t->nL0 = remaining;
+        if (remaining) {
+            uint64_t minPos = UINT64_MAX;
+            for (uint32_t i = 0; i < remaining; i++)
+                if (t->acc[i].chainPos && t->acc[i].chainPos < minPos) minPos = t->acc[i].chainPos;
+            if (minPos != UINT64_MAX) t->chain.freeBefore(e->pool(), minPos);
+        } else {
+            t->chain.freeAll(e->pool());
+        }
+        t->mergePhase = 0;
     }
     if (st->l0Len) {
         const uint32_t idx = t->nL0;
@@ -793,12 +808,13 @@ void typeRollback(Writer* w, TypeOwner* t, StagedType* st) {
     t->st = nullptr;
 }
 
-// Merges the unmerged type L0 blocks into one catalog run (A11 intent rule:
-// the run and manifest are named by the generation counter; an abandoned
-// generation is never reused).
-int32_t typeMerge(Writer* w, TypeOwner* t) {
+// Type merge pipeline: builds one catalog run over the unmerged type L0
+// blocks between rounds; the run and manifest are synced in the next round's
+// first phase and MERGE_DONE rides that round's type batch. Outputs are named
+// by the generation counter (never reused once a head records it).
+int32_t typeMergeStep(Writer* w, TypeOwner* t) {
     Engine* e = w->engine();
-    if (t->nL0 < e->config().mergeL0Blocks) return 0;
+    if (t->mergePhase != 0 || t->nL0 < e->config().mergeL0Blocks) return 0;
     int32_t rc = typeWarm(w, t);
     if (rc < 0) return rc;
     const uint32_t k = t->nL0;
@@ -823,10 +839,11 @@ int32_t typeMerge(Writer* w, TypeOwner* t) {
     if (rc < 0) return rc;
     PathBuf xp;
     pathTypeRun(&xp, w->eng_root(), t->fid, gen);
-    FileRef xf;
+    SegRun run;
+    run.gen = gen;
     rc = w->io().open(xp.c_str(), xp.len,
                       kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
-                      FileClass::Index, &xf);
+                      FileClass::Index, &run.file);
     if (rc < 0) return rc;
     struct Ent {
         const uint8_t* key;
@@ -835,21 +852,22 @@ int32_t typeMerge(Writer* w, TypeOwner* t) {
     };
     std::vector<std::vector<L0KindInfo>> infos(k);
     std::vector<uint16_t> kinds;
-    for (uint32_t i = 0; i < k; i++) {
+    for (uint32_t i = 0; i < k && rc >= 0; i++) {
         L0KindInfo ki[L0Accel::kMaxKinds];
         size_t nk = 0;
         if (!parseL0Block(blocks[i].data(), blocks[i].size(), ki, L0Accel::kMaxKinds, &nk)) {
-            w->io().close(&xf);
-            return FLATSQL_IO_ERR_IO;
+            rc = FLATSQL_IO_ERR_IO;
+            break;
         }
         infos[i].assign(ki, ki + nk);
         for (size_t j = 0; j < nk; j++) kinds.push_back(ki[j].kind);
     }
     std::sort(kinds.begin(), kinds.end());
     kinds.erase(std::unique(kinds.begin(), kinds.end()), kinds.end());
-    L1Writer lw(&w->io(), xf, 0, gen, 0, t->l0[0].commitSeq, t->l0[k - 1].commitSeq);
+    L1Writer lw(&w->io(), run.file, 0, gen, 0, t->l0[0].commitSeq, t->l0[k - 1].commitSeq);
     std::vector<Ent> ents;
     for (uint16_t kind : kinds) {
+        if (rc < 0) break;
         ents.clear();
         uint8_t vlen = valueLenOf(kind);
         for (uint32_t i = 0; i < k; i++)
@@ -875,14 +893,14 @@ int32_t typeMerge(Writer* w, TypeOwner* t) {
             rc = lw.add(en.key, en.klen, en.val);
         }
         if (rc >= 0) rc = lw.endKind();
-        if (rc < 0) break;
     }
-    int64_t xLen = rc >= 0 ? lw.finish() : rc;
-    if (xLen < 0 || w->io().sync(xf) < 0) {
-        w->io().close(&xf);
-        return xLen < 0 ? int32_t(xLen) : FLATSQL_IO_ERR_IO;
+    const int64_t xLen = rc >= 0 ? lw.finish() : rc;
+    if (xLen < 0) {
+        w->io().close(&run.file);
+        return int32_t(xLen);
     }
-    // Type manifest: the list of live catalog runs.
+    run.fileLen = uint64_t(xLen);
+    // Manifest: live catalog runs after this merge.
     std::vector<uint8_t> man(16);
     putU32(man.data(), kMagicManifest);
     putU32(man.data() + 4, uint32_t(t->runs.size() + 1));
@@ -896,7 +914,7 @@ int32_t typeMerge(Writer* w, TypeOwner* t) {
         putU64(man.data() + at + 8, len);
     };
     for (const auto& r : t->runs) addRun(r.gen, r.fileLen);
-    addRun(gen, uint64_t(xLen));
+    addRun(gen, run.fileLen);
     const size_t at = man.size();
     man.resize(at + 8, 0);
     putU32(man.data() + at, crc32c(man.data(), at));
@@ -904,59 +922,27 @@ int32_t typeMerge(Writer* w, TypeOwner* t) {
     char name[32];
     snprintf(name, sizeof(name), "mf-%06x.fsm", gen);
     pathType(&mp, w->eng_root(), t->fid, name);
-    FileRef mff;
     rc = w->io().open(mp.c_str(), mp.len,
                       kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
-                      FileClass::Manifest, &mff);
-    if (rc >= 0) rc = w->io().write(mff, man.data(), man.size(), 0);
-    if (rc >= 0) rc = w->io().sync(mff);
-    w->io().close(&mff);
+                      FileClass::Manifest, &t->mergeMf);
+    if (rc >= 0) rc = w->io().write(t->mergeMf, man.data(), man.size(), 0);
+    if (rc >= 0) {
+        run.run.reset(new L1Run());
+        rc = run.run->load(&w->io(), run.file, run.fileLen);
+    }
     if (rc < 0) {
-        w->io().close(&xf);
+        w->io().close(&run.file);
+        w->io().close(&t->mergeMf);
         return rc;
     }
-    // MERGE_DONE: a type batch with no entries, flagged, naming the manifest.
-    const size_t batchLen = sizeof(TypeBatchHeader) + 8;
-    std::vector<uint8_t> b(batchLen, 0);
-    TypeBatchHeader h{};
-    h.magic = kMagicTypeBatch;
-    h.ver = 1;
-    h.flags = kTypeFlagMergeDone;
-    h.commitSeq = t->commitSeq + 1;
-    h.gSeg = t->gSeg;
-    h.gOff = t->gLen;
-    h.gseqHi = t->gseqHi;
-    h.batchLen = uint32_t(batchLen);
-    h.l0Off = uint32_t(sizeof(TypeBatchHeader));
-    h.incarnation = e->incarnation();
-    h.firstLiveCount = t->firstLiveCount;
-    h.firstLiveBytes = t->firstLiveBytes;
-    h.arrivalsCount = t->arrivalsCount;
-    h.firstGseq = gen;  // manifest generation (MERGE_DONE batches carry no arrivals)
-    std::memcpy(b.data(), &h, sizeof(h));
-    putU32(b.data() + sizeof(h), crc32c(b.data(), sizeof(h)));
-    rc = ensureExtent(&w->io(), t->m, &t->mExtent, t->mEnd + batchLen, e->config().zeroFillStep);
-    if (rc >= 0) rc = w->io().write(t->m, b.data(), batchLen, t->mEnd);
-    if (rc >= 0) rc = w->io().sync(t->m);
-    if (rc < 0) {
-        w->io().close(&xf);
-        return rc;
-    }
-    t->commitSeq++;
-    t->mEnd += batchLen;
-    t->incarnation = e->incarnation();
-    SegRun run;
-    run.gen = gen;
-    run.file = xf;
-    run.fileLen = uint64_t(xLen);
-    run.run.reset(new L1Run());
-    rc = run.run->load(&w->io(), run.file, run.fileLen);
-    t->runs.push_back(std::move(run));
-    t->manifestGenLoaded = gen;
-    t->nL0 = 0;
-    t->chain.freeAll(e->pool());
-    if (rc < 0) return rc;
-    return typeWriteHead(w, t, false);
+    t->runs.reserve(t->runs.size() + 1);
+    t->mergeRun = std::move(run);
+    t->mergeGen = gen;
+    t->mergeK = k;
+    t->mergeThroughCommit = t->l0[k - 1].commitSeq;
+    t->mergePhase = 1;
+    t->dirty.store(1, std::memory_order_release);
+    return 1;
 }
 
 }  // namespace ps

@@ -179,6 +179,9 @@ bool ringMapAhead(RingDesc* r, SlabPool& pool, uint32_t reserveSlabs, uint32_t a
         r->mappedPages.fetch_add(1, std::memory_order_relaxed);
         mapped = true;
     }
+    // A satisfied request is withdrawn (a newer one fails the CAS and stays).
+    uint32_t w = want;
+    if (ok && want && uint64_t(want - 1) <= last) r->wantPage.compare_exchange_strong(w, 0);
     if (mapped) {
         r->mapGen.fetch_add(1, std::memory_order_release);
         if (r->prodWaiting.load(std::memory_order_acquire)) wakeU32(&r->mapGen, -1);

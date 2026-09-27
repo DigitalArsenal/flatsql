@@ -3,8 +3,21 @@
 
 #include <cstring>
 
+#include "flatsql/ps/platform.h"
+
 namespace flatsql {
 namespace ps {
+
+namespace {
+// Host calls leave the guest: allocations inside a host are not the engine's
+// (natively the host shares the process allocator; on wasm it cannot touch
+// the guest heap at all).
+struct HostCall {
+    int saved;
+    HostCall() : saved(tHotPathDepth) { tHotPathDepth = 0; }
+    ~HostCall() { tHotPathDepth = saved; }
+};
+}  // namespace
 
 namespace {
 
@@ -40,6 +53,7 @@ Io* importIo() {
 }
 
 int32_t IoCtx::open(const char* path, size_t len, int32_t flags, FileClass cls, FileRef* out) {
+    HostCall host;
     const int32_t h = io_->open(path, int32_t(len), flags);
     ctr(stats_, cls).opens.fetch_add(1, std::memory_order_relaxed);
     if (h < 0) return h;
@@ -49,15 +63,18 @@ int32_t IoCtx::open(const char* path, size_t len, int32_t flags, FileClass cls, 
 }
 
 int32_t IoCtx::probe(const char* path, size_t len) {
+    HostCall host;
     return io_->open(path, int32_t(len), FLATSQL_IO_PROBE);
 }
 
 int32_t IoCtx::unlink(const char* path, size_t len, bool durableIfUnused) {
+    HostCall host;
     return io_->open(path, int32_t(len),
                      FLATSQL_IO_UNLINK | (durableIfUnused ? FLATSQL_IO_UNLINK_IF_UNUSED : 0));
 }
 
 int64_t IoCtx::read(const FileRef& f, void* dst, size_t len, uint64_t off) {
+    HostCall host;
     size_t done = 0;
     while (done < len) {
         const size_t chunk = (len - done) > kMaxCall ? kMaxCall : (len - done);
@@ -74,6 +91,7 @@ int64_t IoCtx::read(const FileRef& f, void* dst, size_t len, uint64_t off) {
 }
 
 int32_t IoCtx::write(const FileRef& f, const void* src, size_t len, uint64_t off) {
+    HostCall host;
     size_t done = 0;
     while (done < len) {
         const size_t chunk = (len - done) > kMaxCall ? kMaxCall : (len - done);
@@ -101,21 +119,25 @@ int32_t IoCtx::writeZeros(const FileRef& f, uint64_t off, uint64_t len) {
 }
 
 int32_t IoCtx::truncate(const FileRef& f, uint64_t size) {
+    HostCall host;
     ctr(stats_, f.cls).truncates.fetch_add(1, std::memory_order_relaxed);
     return io_->truncate(f.handle, double(size));
 }
 
 int32_t IoCtx::sync(const FileRef& f) {
+    HostCall host;
     ctr(stats_, f.cls).syncs.fetch_add(1, std::memory_order_relaxed);
     return io_->sync(f.handle);
 }
 
 int64_t IoCtx::size(const FileRef& f) {
+    HostCall host;
     const double s = io_->size(f.handle);
     return int64_t(s);
 }
 
 int32_t IoCtx::close(FileRef* f) {
+    HostCall host;
     if (!f->valid()) return 0;
     const int32_t rc = io_->close(f->handle);
     f->handle = -1;

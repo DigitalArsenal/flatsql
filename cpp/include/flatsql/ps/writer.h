@@ -249,6 +249,32 @@ struct ReconcileState {
     bool phase2 = false;
 };
 
+// A merge in flight (design §4.5 + A11), pipelined through commit rounds:
+// INTENT rides one batch; outputs are written between rounds; their syncs
+// join the next round's first sync phase and MERGE_DONE its second.
+enum MergePhase : uint8_t {
+    kMergeIdle = 0,
+    kMergeIntentQueued,    // INTENT_MERGE queued for the next batch
+    kMergeIntentDurable,   // outputs may be written
+    kMergeOutputsWritten,  // outputs written (unsynced); DONE rides the next batch
+};
+
+struct MergePlan {
+    uint32_t seg = 0;
+    uint32_t gen = 0;
+    uint32_t k = 0;             // L0 batches merged
+    uint64_t firstPseq = 0;
+    uint64_t through = 0;
+    uint64_t rOff = 0;
+    uint64_t aOff = 0;
+    uint64_t rLen = 0;
+    uint64_t aLen = 0;
+    int64_t minEpoch = INT64_MAX;
+    int64_t maxEpoch = INT64_MIN;
+    FileRef r, a, mf;
+    SegRun run;                 // the new L1 run, accelerators preloaded
+};
+
 struct PendingKill {
     uint8_t cid[kCidLen];
     std::atomic<int32_t>* remaining;  // type-level delete ticket (may be null)
@@ -293,7 +319,7 @@ struct Partition {
     uint64_t intentROff = 0, intentAOff = 0, intentThrough = 0;
     uint32_t nL0 = 0;
     L0DirEntry l0[kMaxL0Dir];
-    L0Accel acc[kMaxL0Dir];
+    std::unique_ptr<L0Accel[]> acc;  // kMaxL0Dir accelerators, only while warm
     SlabChain chain;
     std::vector<SegmentInfo> segs;   // every segment with merged rows (+ active)
     std::vector<Lane> lanes;         // index = position; lane ids in Lane::id
@@ -307,6 +333,12 @@ struct Partition {
     uint64_t lastActivityNs = 0;
     ReconcileState rec;
     std::vector<PendingKill> kills;  // type-level kills from the mailbox
+    uint8_t mergePhase = kMergeIdle;
+    MergePlan mplan;
+    uint8_t pendingCtl[256];         // ctl records for the next batch
+    uint32_t pendingCtlBytes = 0;
+    uint32_t nPendingCtl = 0;
+    uint32_t mapAheadPages = 2;      // adaptive ring page supply
     uint32_t ownerEpoch = 1;
     FileRef h, m, d, l;              // owner handles
     FileRef rA, aA;                  // active segment r/a (merge)
@@ -363,6 +395,12 @@ struct TypeOwner {
     L0Accel acc[kMaxTypeL0Dir];
     SlabChain chain;
     std::vector<SegRun> runs;        // L1 runs of the catalog (x-<gen>.fsx)
+    uint8_t mergePhase = 0;          // 0 idle, 1 outputs written (DONE rides the next batch)
+    uint32_t mergeGen = 0;
+    uint32_t mergeK = 0;
+    uint64_t mergeThroughCommit = 0;
+    SegRun mergeRun;
+    FileRef mergeMf;
     std::unordered_map<uint32_t, uint64_t> labeled;  // pid -> labeled_through
     bool warm = false;
     FileRef h, m, g;
@@ -497,6 +535,7 @@ private:
     void releaseOwnership(Partition* p, uint8_t target);
     void runJobs();
     void queueSync(const FileRef& f, void* owner, uint8_t ownerKind);
+    void flushHeadSyncs();
 
     Engine* eng_;
     uint8_t id_;
@@ -515,6 +554,8 @@ private:
         uint8_t kind;  // 1 partition, 2 type
     };
     std::vector<JobOwner> jobOwners_;
+    std::vector<std::pair<void*, uint8_t>> headSyncs_;  // checkpoint heads to sync next round
+    uint64_t lastCommitNs_ = 0;
     StageScratch* sc_ = nullptr;
     Arena framesArena_;
     std::vector<uint8_t> lookupScratch_;

@@ -407,6 +407,21 @@ bool isDead(Ctx& c, uint64_t pseq) {
     return dead;
 }
 
+// A tag instance retired by TAG_TOMB (A2). Staged entries use the high bit.
+constexpr uint64_t kTagDeadBit = 1ull << 63;
+bool isTagDead(Ctx& c, uint64_t inst) {
+    if (stagedDeadGet(*c.sc, inst | kTagDeadBit, nullptr)) return true;
+    uint8_t k[8];
+    be8(k, inst);
+    bool dead = false;
+    const int32_t rc = committedPostings(c, kIxTagDead, k, 8, [&](const uint8_t*) {
+        dead = true;
+        return false;
+    });
+    if (rc < 0) c.err = rc;
+    return dead;
+}
+
 int32_t readRow(Ctx& c, uint64_t pseq, RecRow* out) {
     if (c.st && pseq >= c.st->firstPseq && pseq < c.st->nextPseq) {
         *out = c.sc->rows[pseq - c.st->firstPseq];
@@ -494,7 +509,7 @@ bool instanceLive(Ctx& c, uint64_t put, uint64_t h, const TagView& tag) {
     uint32_t alen;
     for (uint32_t i = 0; i < sc.nInst; i++) {
         if (sc.instPut[i] != put || sc.instHash[i] != h) continue;
-        if (stagedDeadGet(sc, sc.instPseq[i], nullptr)) continue;
+        if (stagedDeadGet(sc, sc.instPseq[i] | kTagDeadBit, nullptr)) continue;
         RecRow r;
         if (readRow(c, sc.instPseq[i], &r) < 0) continue;
         if (readAttrOf(c, r, buf, sizeof(buf), &alen) < 0) continue;
@@ -515,7 +530,7 @@ bool instanceLive(Ctx& c, uint64_t put, uint64_t h, const TagView& tag) {
         return false;
     }
     for (uint32_t i = 0; i < nc; i++) {
-        if (isDead(c, cands[i])) continue;
+        if (isTagDead(c, cands[i])) continue;
         RecRow r;
         if (readRow(c, cands[i], &r) < 0) continue;
         if (readAttrOf(c, r, buf, sizeof(buf), &alen) < 0) continue;
@@ -543,7 +558,7 @@ int32_t forEachLiveInstance(Ctx& c, uint64_t put, F&& visit) {
     std::sort(found, found + nf);
     nf = uint32_t(std::unique(found, found + nf) - found);
     for (uint32_t i = 0; i < nf; i++) {
-        if (isDead(c, found[i])) continue;
+        if (isTagDead(c, found[i])) continue;
         if (c.err) return c.err;
         if (!visit(found[i])) break;
     }
@@ -732,8 +747,8 @@ bool stageTagTomb(Ctx& c, uint64_t inst, const RecRow& ir, uint32_t putLen) {
     r->arrivalMs = now;
     uint8_t k[8];
     be8(k, inst);
-    if (!addPseqPosting(c, kIxDead, k, 8, r->pseq)) return false;
-    if (!stagedDeadPut(*c.sc, inst, r->pseq)) {
+    if (!addPseqPosting(c, kIxTagDead, k, 8, r->pseq)) return false;
+    if (!stagedDeadPut(*c.sc, inst | kTagDeadBit, r->pseq)) {
         c.err = FLATSQL_IO_ERR_GENERIC;
         return false;
     }
@@ -1377,7 +1392,7 @@ bool reconcileStep(Ctx& c) {
             tHotPathDepth = 0;
             rs.affected.push_back(put);
             tHotPathDepth = saved;
-            if (!isDead(c, inst) && !isDead(c, put)) {
+            if (!isTagDead(c, inst) && !isDead(c, put)) {
                 RecRow pr;
                 if (readRow(c, put, &pr) < 0) return false;
                 if (!stageTagTomb(c, inst, ir, pr.len)) return false;
@@ -1653,6 +1668,20 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
     const size_t framesMark = frames->used();
     Ctx c{w, e, p, sc, st, &w->io(), frames};
     HotPathScope hot;
+    // Merge pipeline ctl records (INTENT_MERGE queued by maintenance, and
+    // MERGE_DONE once the outputs are written; their syncs share this round).
+    if (p->nPendingCtl && sc->ctlBytes + p->pendingCtlBytes <= sizeof(sc->ctl)) {
+        std::memcpy(sc->ctl + sc->ctlBytes, p->pendingCtl, p->pendingCtlBytes);
+        sc->ctlBytes += p->pendingCtlBytes;
+        sc->nCtl += p->nPendingCtl;
+        st->consumedPendingCtl = true;
+    }
+    if (p->mergePhase == kMergeOutputsWritten) {
+        uint8_t body[40];
+        mergeDoneBody(p, body);
+        addCtl(c, kCtlMergeDone, body, sizeof(body));
+        st->mergeDone = true;
+    }
     // Type-level kills from the mailbox (A14).
     while (!p->kills.empty() && st->nTickets < 64) {
         PendingKill& k = p->kills.back();
@@ -1782,7 +1811,9 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
                     r = kStop;
                     break;
                 }
-                const uint64_t txnId = h.rseq;
+                // Transaction id: the first pseq it writes (unique forever,
+                // unlike ring sequence numbers, which restart with the ring).
+                const uint64_t txnId = st->nextPseq;
                 uint64_t q = pos + h.entryLen;
                 while (q < endPos && !c.err) {
                     EntryHeader ch;
@@ -1803,10 +1834,11 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
                 break;
             }
             case kEntCtl: {
-                r = stageCtl(c, h, pos, h.rseq, &rejectCode);
+                const uint64_t txnId = st->nextPseq;
+                r = stageCtl(c, h, pos, txnId, &rejectCode);
                 if (r == kConsumed) {
                     uint8_t body[8];
-                    putU64(body, h.rseq);
+                    putU64(body, txnId);
                     addCtl(c, kCtlTxnEnd, body, 8);
                 }
                 break;
@@ -1957,6 +1989,19 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
     const uint64_t firstPseq = st->firstPseq;
     const uint32_t nRows = uint32_t(st->nextPseq - st->firstPseq);
     if (st->batch) {
+        if (st->consumedPendingCtl) {
+            p->nPendingCtl = 0;
+            p->pendingCtlBytes = 0;
+            if (p->mergePhase == kMergeIntentQueued) {
+                p->intentSeg = p->mplan.seg;
+                p->intentGen = p->mplan.gen;
+                p->intentROff = p->mplan.rOff;
+                p->intentAOff = p->mplan.aOff;
+                p->intentThrough = p->mplan.through;
+                p->mergePhase = kMergeIntentDurable;
+            }
+        }
+        if (st->mergeDone) partitionMergeApply(w, p);
         p->commitSeq++;
         p->pseqHi = st->nextPseq - 1;
         p->mEnd = st->mOff + st->batchLen;
@@ -2058,6 +2103,12 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
     // Acks (§7): every entry consumed by this commit.
     if (st->consumed) {
         RingDesc* r = p->ring;
+        // Adaptive page supply: twice what this commit consumed, so a busy
+        // producer never waits for the writer's next iteration.
+        const uint64_t consumed = st->endPos - r->head.load(std::memory_order_relaxed);
+        const uint32_t pages = uint32_t(consumed / r->slabBytes) + 1;
+        const uint32_t capPages = uint32_t((r->cap + r->maxEntry) / r->slabBytes);
+        p->mapAheadPages = std::max<uint32_t>(2, std::min<uint32_t>(2 * pages + 1, capPages));
         ringRelease(r, e->pool(), st->endPos);
         r->ackedRseq.store(st->lastRseq, std::memory_order_release);
         r->ackGen.fetch_add(1, std::memory_order_release);
@@ -2067,7 +2118,11 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         if (st->tickets[i]->fetch_sub(1, std::memory_order_acq_rel) == 1)
             wakeU32(reinterpret_cast<std::atomic<uint32_t>*>(st->tickets[i]), -1);
     }
-    if (nRows && p->type) typePostNotice(p->type, p->pid);
+    if (nRows && p->type) {
+        typePostNotice(p->type, p->pid);
+        const uint32_t tw = p->type->ownerWriter.load(std::memory_order_relaxed);
+        if (tw != w->id() && tw < w->engine()->writerCount()) w->engine()->writer(tw)->ring();
+    }
     p->lastActivityNs = monoNs();
     p->st = nullptr;
 }

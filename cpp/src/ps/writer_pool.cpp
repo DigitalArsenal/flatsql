@@ -201,7 +201,10 @@ bool SyncPool::popAndRun() {
             if (deq_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
                 SyncJob job = s.job;
                 s.seq.store(pos + kCap, std::memory_order_release);
+                const int saved = tHotPathDepth;
+                tHotPathDepth = 0;  // host call
                 *job.result = job.io->sync(job.handle);
+                tHotPathDepth = saved;
                 if (job.remaining->fetch_sub(1, std::memory_order_acq_rel) == 1)
                     wakeU32(job.remaining, -1);
                 return true;
@@ -217,7 +220,10 @@ bool SyncPool::popAndRun() {
 void SyncPool::runAll(SyncJob* jobs, size_t n) {
     if (n == 0) return;
     if (threads_.empty() || n == 1) {
+        const int saved = tHotPathDepth;
+        tHotPathDepth = 0;  // host calls
         for (size_t i = 0; i < n; i++) *jobs[i].result = jobs[i].io->sync(jobs[i].handle);
+        tHotPathDepth = saved;
         return;
     }
     std::atomic<uint32_t> remaining{uint32_t(n)};
@@ -258,6 +264,7 @@ Writer::Writer(Engine* eng, uint8_t id) : eng_(eng), id_(id), io_(nullptr, nullp
     jobs_.reserve(4096);
     jobResults_.reserve(4096);
     jobOwners_.reserve(4096);
+    headSyncs_.reserve(4096);
     dirty_.reserve(4096);
     dirtyTypes_.reserve(1024);
 }
@@ -288,7 +295,10 @@ void Writer::runJobs() {
     jobResults_.assign(jobs_.size(), 0);
     for (size_t i = 0; i < jobs_.size(); i++) jobs_[i].result = &jobResults_[i];
     if (eng_->config().cooperative) {
+        const int saved = tHotPathDepth;
+        tHotPathDepth = 0;  // host calls
         for (auto& j : jobs_) *j.result = j.io->sync(j.handle);
+        tHotPathDepth = saved;
     } else {
         eng_->syncPool().runAll(jobs_.data(), jobs_.size());
     }
@@ -314,11 +324,23 @@ void Writer::commitRound() {
     const EngineConfig& cfg = eng_->config();
     const uint64_t t0 = monoNs();
     HotPathScope hot;
-    // Phase A: frames (d), lane frames (l), arrivals (g).
+    // Checkpoint heads written by the previous round are synced in this one.
+    for (const auto& hs : headSyncs_) {
+        if (hs.second == 3) queueSync(static_cast<Partition*>(hs.first)->h, hs.first, 3);
+        else queueSync(static_cast<TypeOwner*>(hs.first)->h, hs.first, 4);
+    }
+    headSyncs_.clear();
+    // Phase A: frames (d), lane frames (l), arrivals (g), merge outputs.
     for (Partition* p : dirty_) {
         Staged* st = p->st;
         st->commitStartNs = t0;
         if (!st->batch) continue;
+        if (st->mergeDone) {
+            queueSync(p->mplan.r, p, 1);
+            queueSync(p->mplan.a, p, 1);
+            queueSync(p->mplan.run.file, p, 1);
+            queueSync(p->mplan.mf, p, 1);
+        }
         if (st->dBytes) {
             int32_t rc = ensureExtent(&io_, p->d, &p->dExtent, st->dOff + st->dBytes, cfg.zeroFillStep);
             if (rc >= 0) rc = io_.write(p->d, st->frames, st->dBytes, st->dOff);
@@ -339,6 +361,10 @@ void Writer::commitRound() {
     }
     for (TypeOwner* t : dirtyTypes_) {
         StagedType* st = t->st;
+        if (st->mergeDone) {
+            queueSync(t->mergeRun.file, t, 2);
+            queueSync(t->mergeMf, t, 2);
+        }
         if (st->nArrivals) {
             const int32_t rc = io_.write(t->g, st->arrivals, size_t(st->nArrivals) * kArrivalBytes, st->gOff);
             if (rc < 0) {
@@ -402,7 +428,7 @@ void Writer::commitRound() {
                 p->quarantined = true;
                 p->ring->state.store(kRingQuarantined, std::memory_order_release);
             } else if (due) {
-                queueSync(p->h, p, 3);
+                headSyncs_.push_back({p, 3});  // synced in the next round (no third round)
                 p->lastCkptNs = nowNsV;
                 p->metaSinceCkpt = 0;
             }
@@ -446,11 +472,12 @@ void Writer::commitRound() {
                          t->metaSinceCkpt + st->batchLen >= cfg.ckptMetaBytes;
         typePublish(this, t, st);
         if (typeWriteHead(this, t, due) >= 0 && due) {
-            queueSync(t->h, t, 4);
+            headSyncs_.push_back({t, 4});
             t->lastCkptNs = nowNsV;
+            t->metaSinceCkpt = 0;
         }
     }
-    runJobs();  // checkpoint heads (when due)
+    lastCommitNs_ = monoNs();
     iterCommit_.fetch_add(1, std::memory_order_relaxed);
     dirty_.clear();
     dirtyTypes_.clear();
@@ -474,9 +501,14 @@ bool Writer::iterate(bool mayWait) {
             if (monoNs() - p->lastActivityNs > 100000000ull) r->state.store(kRingActive);
             else continue;
         }
-        ringMapAhead(r, eng_->pool(), reserve, 2);
         const bool backlog = r->tail.load(std::memory_order_acquire) != r->head.load(std::memory_order_acquire);
-        if (!backlog && !p->rec.active && p->kills.empty() && !p->sealPending) continue;
+        // Pages only for a ring with traffic or a producer asking: an idle
+        // partition holds zero slabs (§17).
+        if (backlog || r->wantPage.load(std::memory_order_acquire))
+            ringMapAhead(r, eng_->pool(), reserve, backlog ? p->mapAheadPages : 1);
+        if (!backlog && !p->rec.active && p->kills.empty() && !p->sealPending && !p->nPendingCtl &&
+            p->mergePhase != kMergeOutputsWritten)
+            continue;
         if (!p->warm && partitionWarm(this, p) < 0) {
             p->quarantined = true;
             r->state.store(kRingQuarantined, std::memory_order_release);
@@ -594,8 +626,20 @@ void Writer::processMailbox() {
     }
 }
 
+void Writer::flushHeadSyncs() {
+    for (const auto& hs : headSyncs_) {
+        if (hs.second == 3) queueSync(static_cast<Partition*>(hs.first)->h, hs.first, 3);
+        else queueSync(static_cast<TypeOwner*>(hs.first)->h, hs.first, 4);
+    }
+    headSyncs_.clear();
+    runJobs();
+}
+
 void Writer::releaseOwnership(Partition* p, uint8_t target) {
     // At an iteration boundary: the partition has no staged batch (A26).
+    // HANDOFF aborts in-flight maintenance; its INTENT is discarded as at open.
+    partitionMergeAbort(this, p);
+    flushHeadSyncs();
     RingDesc* r = p->ring;
     const uint64_t w = r->ownerWordV.load(std::memory_order_acquire);
     p->handoffTarget.store(target, std::memory_order_release);
@@ -622,23 +666,22 @@ void Writer::maintenance() {
     const int64_t nowMsV = eng_->nowMs();
     const uint64_t nowNsV = monoNs();
     const size_t n = owned_.size();
-    // One merge per iteration (bounded maintenance step).
-    for (size_t k = 0; k < n; k++) {
+    // Merge pipeline steps (bounded: a few output builds per iteration).
+    int outputs = 0;
+    for (size_t k = 0; k < n && outputs < 4; k++) {
         Partition* p = owned_[(maintRr_ + k) % n];
-        if (!partitionWantsMerge(eng_, p)) continue;
-        if (partitionMerge(this, p) < 0) {
+        const int32_t rc = partitionMergeStep(this, p);
+        if (rc < 0) {
             p->quarantined = true;
             p->ring->state.store(kRingQuarantined, std::memory_order_release);
+        } else if (rc > 0) {
+            outputs++;
         }
-        break;
     }
     maintRr_++;
-    for (TypeOwner* t : types_) {
-        if (t->nL0 >= cfg.mergeL0Blocks) {
-            typeMerge(this, t);
-            break;
-        }
-    }
+    for (TypeOwner* t : types_) typeMergeStep(this, t);
+    // Checkpoint heads waiting for a round that is not coming: sync now.
+    if (!headSyncs_.empty() && nowNsV - lastCommitNs_ > 2000000ull) flushHeadSyncs();
     for (Partition* p : owned_) {
         if (p->quarantined) continue;
         // Seal by age (§4.2) and next-segment pre-creation at 50%.
@@ -658,8 +701,8 @@ void Writer::maintenance() {
         // Idle partitions give back ring slabs, then handles and accelerators.
         const uint64_t idle = nowNsV - p->lastActivityNs;
         if (idle >= uint64_t(cfg.idleReclaimMs) * 1000000ull) ringReclaimIdle(p->ring, eng_->pool());
-        if (p->warm && !p->rec.active && idle >= uint64_t(cfg.idleCloseMs) * 1000000ull &&
-            p->ring->tail.load() == p->ring->head.load())
+        if (p->warm && !p->rec.active && p->mergePhase == kMergeIdle && !p->nPendingCtl &&
+            idle >= uint64_t(cfg.idleCloseMs) * 1000000ull && p->ring->tail.load() == p->ring->head.load())
             partitionCool(this, p);
     }
     for (TypeOwner* t : types_) {
@@ -737,6 +780,7 @@ int32_t Engine::stop(uint64_t deadlineMs) {
     syncPool_.stop();
     started_ = false;
     // Clean shutdown: durable heads, so the next open reads no tail.
+    for (auto& w : writers_) w->flushHeadSyncs();
     for (auto& w : writers_) {
         for (Partition* p : w->owned_) {
             if (p->metaSinceCkpt && p->h.valid() && !p->quarantined) {

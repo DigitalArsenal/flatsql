@@ -167,6 +167,8 @@ struct Staged {
     bool sealAfter = false;       // this batch carries SEAL; switch segment after
     uint64_t laneCkptOff = 0;     // absolute m offset of a LANE_CKPT body (0 = none)
     bool reconcileDone = false;
+    bool consumedPendingCtl = false;  // INTENT_MERGE (and friends) ride this batch
+    bool mergeDone = false;           // MERGE_DONE rides this batch
     uint64_t intentThrough = 0;   // merge intents / done carried in ctl
     int32_t err = 0;
     bool committed = false;
@@ -203,6 +205,7 @@ struct StagedType {
     uint32_t nLabels = 0;
     int32_t err = 0;
     bool committed = false;
+    bool mergeDone = false;
     std::atomic<int32_t>* tickets[64];
     uint32_t nTickets = 0;
 };
@@ -216,7 +219,10 @@ int32_t partitionEnsureFiles(Writer* w, Partition* p);
 int32_t partitionWriteHead(Writer* w, Partition* p, bool durable);
 void partitionPublish(Writer* w, Partition* p, Staged* st);
 void partitionRollback(Writer* w, Partition* p, Staged* st);
-int32_t partitionMerge(Writer* w, Partition* p);
+int32_t partitionMergeStep(Writer* w, Partition* p);   // maintenance
+void partitionMergeApply(Writer* w, Partition* p);     // publish of MERGE_DONE
+void partitionMergeAbort(Writer* w, Partition* p);     // handoff / failure
+void mergeDoneBody(const Partition* p, uint8_t body[40]);
 bool partitionWantsMerge(const Engine* e, const Partition* p);
 int32_t partitionPrecreate(Writer* w, Partition* p);
 int32_t ensureExtent(IoCtx* io, const FileRef& f, uint64_t* extent, uint64_t end, uint64_t step);
@@ -232,7 +238,7 @@ void typeRollback(Writer* w, TypeOwner* t, StagedType* st);
 int32_t typeWriteHead(Writer* w, TypeOwner* t, bool durable);
 int32_t typeEnsureFiles(IoCtx* io, Engine* e, TypeOwner* t);
 int32_t typeWarm(Writer* w, TypeOwner* t);
-int32_t typeMerge(Writer* w, TypeOwner* t);
+int32_t typeMergeStep(Writer* w, TypeOwner* t);
 void typePostNotice(TypeOwner* t, uint32_t pid);
 void encodeTypeHead(const TypeOwner* t, uint8_t* slot, uint32_t* used, bool durable);
 

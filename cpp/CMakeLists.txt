@@ -781,11 +781,25 @@ else()
         test/ps/crash_fault_test.cpp
         test/io_fault.cpp
     )
-    target_link_libraries(flatsql_ps_test PRIVATE flatsql_ps)
+    # Test-only: the flatsql schema parser compiles the test schemas at run
+    # time (no files from sibling repositories).
+    add_library(flatsql_ps_testutil STATIC
+        ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
+        ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
+        ${FLATBUFFERS_SRC_DIR}/util.cpp
+        ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
+        ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp
+        ${FLATBUFFERS_SRC_DIR}/options.cpp
+    )
+    target_include_directories(flatsql_ps_testutil PUBLIC ${FLATBUFFERS_INCLUDE_DIR})
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(flatsql_ps_testutil PRIVATE -w)
+    endif()
+    target_link_libraries(flatsql_ps_test PRIVATE flatsql_ps flatsql_ps_testutil)
     target_include_directories(flatsql_ps_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
     add_executable(flatsql_ps_bench test/ps/bench_main.cpp test/io_fault.cpp)
-    target_link_libraries(flatsql_ps_bench PRIVATE flatsql_ps)
+    target_link_libraries(flatsql_ps_bench PRIVATE flatsql_ps flatsql_ps_testutil)
     target_include_directories(flatsql_ps_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
     target_compile_options(flatsql_ps_bench PRIVATE -O2)
 

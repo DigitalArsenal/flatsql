@@ -497,24 +497,31 @@ int32_t Engine::openTypes(std::string* err) {
             }
             t->manifestGenLoaded = h.manifestGen;
         }
-        // Label checkpoint (A10, > 128 pids): the FULL_LABELS batch.
+        // Label checkpoint (A10, > 128 pids): the FULL_LABELS batch, then the
+        // label deltas of every later batch up to the head (bounded by the
+        // checkpoint interval).
         if (!labelsInline) {
             PathBuf mp;
             pathTypeSeg(&mp, cfg_.root.c_str(), t->fid, 'm', labelCkptSeg, "fsl");
             FileRef mf;
             if (io->open(mp.c_str(), mp.len, FLATSQL_IO_READ, FileClass::TypeMeta, &mf) == 0) {
-                TypeBatchHeader bh;
-                if (io->read(mf, &bh, sizeof(bh), labelCkptOff) == int64_t(sizeof(bh)) &&
-                    bh.magic == kMagicTypeBatch) {
+                uint64_t off = labelCkptOff;
+                const uint64_t end = labelCkptSeg == t->mSeg ? t->mEnd : uint64_t(io->size(mf));
+                while (off + sizeof(TypeBatchHeader) <= end) {
+                    TypeBatchHeader bh;
+                    if (io->read(mf, &bh, sizeof(bh), off) != int64_t(sizeof(bh)) || bh.magic != kMagicTypeBatch ||
+                        bh.batchLen < sizeof(bh) + 8 || off + bh.batchLen > end)
+                        break;
                     std::vector<uint8_t> labels(size_t(bh.nLabel) * sizeof(LabelEntry));
-                    if (io->read(mf, labels.data(), labels.size(), labelCkptOff + sizeof(bh)) ==
-                        int64_t(labels.size())) {
-                        for (uint32_t i = 0; i < bh.nLabel; i++) {
-                            LabelEntry le;
-                            std::memcpy(&le, labels.data() + size_t(i) * sizeof(le), sizeof(le));
-                            t->labeled[le.pid] = le.labeledThrough;
-                        }
+                    if (bh.nLabel && io->read(mf, labels.data(), labels.size(), off + sizeof(bh)) !=
+                                         int64_t(labels.size()))
+                        break;
+                    for (uint32_t i = 0; i < bh.nLabel; i++) {
+                        LabelEntry le;
+                        std::memcpy(&le, labels.data() + size_t(i) * sizeof(le), sizeof(le));
+                        t->labeled[le.pid] = le.labeledThrough;
                     }
+                    off += bh.batchLen;
                 }
                 io->close(&mf);
             }
@@ -570,21 +577,24 @@ int32_t Engine::openTypes(std::string* err) {
                     t->labelCkptSeg = t->mSeg;
                 }
                 if (h.flags & 4) {
-                    // MERGE_DONE: every earlier L0 block is in the new run.
-                    t->nL0 = 0;
-                    t->manifestGenLoaded = uint32_t(h.firstGseq);
-                    if (uint32_t(h.firstGseq) + 1 > t->nextGen) t->nextGen = uint32_t(h.firstGseq) + 1;
-                } else {
-                    const uint32_t l0Len = h.batchLen - 8 - h.l0Off;
-                    if (l0Len && t->nL0 < kMaxTypeL0Dir) {
-                        TypeL0DirEntry& de = t->l0[t->nL0++];
-                        de.mSeg = t->mSeg;
-                        de.l0Len = l0Len;
-                        de.mOff = off;
-                        de.commitSeq = h.commitSeq;
-                        de.batchLen = h.batchLen;
-                        de.l0Off = h.l0Off;
-                    }
+                    // MERGE_DONE: L0 blocks of commits <= mergedThroughCommit
+                    // live in the run named by mergeGen.
+                    uint32_t k = 0;
+                    while (k < t->nL0 && t->l0[k].commitSeq <= h.mergedThroughCommit) k++;
+                    for (uint32_t i = 0; i + k < t->nL0; i++) t->l0[i] = t->l0[i + k];
+                    t->nL0 -= k;
+                    t->manifestGenLoaded = h.mergeGen;
+                    if (h.mergeGen + 1 > t->nextGen) t->nextGen = h.mergeGen + 1;
+                }
+                const uint32_t l0Len = h.batchLen - 8 - h.l0Off;
+                if (l0Len && t->nL0 < kMaxTypeL0Dir) {
+                    TypeL0DirEntry& de = t->l0[t->nL0++];
+                    de.mSeg = t->mSeg;
+                    de.l0Len = l0Len;
+                    de.mOff = off;
+                    de.commitSeq = h.commitSeq;
+                    de.batchLen = h.batchLen;
+                    de.l0Off = h.l0Off;
                 }
                 off += h.batchLen;
                 t->mEnd = off;

@@ -89,6 +89,8 @@ enum IndexKind : uint16_t {
     kIxTagOf = 15,         // (PUT pseq, tag hash) -> instance pseq (A2)
     kIxTagPS = 16,         // (provider_id, source_name) -> instance pseq (RECONCILE)
     kIxLicence = 17,       // licence key -> LICENCE pseq
+    kIxTagDead = 18,       // u64 tag-instance pseq -> TAG_TOMB pseq (A2; distinct
+                           // from DEAD: a PUT row is also its first instance)
     kIxColBase = 0x100,    // COL(n) = kIxColBase + n
     // Type-owner kinds (t/<fid>/): value layouts in type_owner.h.
     kIxTypeCid = 0x200,    // cid sort key -> {pid, pseq, tcs, label, gseq}
@@ -389,11 +391,11 @@ struct TypeBatchHeader {
     uint32_t batchLen;
     uint32_t l0Off;
     uint32_t incarnation;
-    uint32_t pad;
+    uint32_t mergeGen;             // MERGE_DONE: catalog manifest generation
     uint64_t firstLiveCount;
     uint64_t firstLiveBytes;
     uint64_t arrivalsCount;
-    uint64_t pad2;
+    uint64_t mergedThroughCommit;  // MERGE_DONE: L0 blocks of commits <= this are in the run
 };
 static_assert(sizeof(TypeBatchHeader) == 104, "TypeBatchHeader layout");
 

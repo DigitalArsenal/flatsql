@@ -19,6 +19,7 @@ bool isLookupKind(uint16_t kind) {
         case kIxCid:
         case kIxSupersede:
         case kIxDead:
+        case kIxTagDead:
         case kIxTagOf:
         case kIxLicence:
         case kIxTypeCid:
@@ -46,6 +47,7 @@ uint8_t keyTypeOf(uint16_t kind) {
         case kIxTypeCid: return kKeyCid;
         case kIxEpoch: return kKeyI64;
         case kIxDead:
+        case kIxTagDead:
         case kIxSpatial:
         case kIxTypeRehome: return kKeyU64;
         case kIxSourceEpoch:
