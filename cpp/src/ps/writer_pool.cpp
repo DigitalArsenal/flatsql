@@ -525,10 +525,14 @@ bool Writer::iterate(bool mayWait) {
         }
     }
     if (!dirty_.empty() || !dirtyTypes_.empty()) {
+        const uint64_t c0 = monoNs();
         commitRound();
         lastWorkNs_ = monoNs();
+        if (eng_->config().lockStats) eng_->commitHist().record(lastWorkNs_ - c0);
     }
+    const uint64_t m0 = eng_->config().lockStats ? monoNs() : 0;
     maintenance();
+    if (m0) eng_->maintHist().record(monoNs() - m0);
     if (!any && mayWait && !eng_->stopping()) {
         const uint64_t idleFor = monoNs() - lastWorkNs_;
         const uint64_t timeoutNs = idleFor > 1000000000ull ? uint64_t(eng_->config().idleWaitUs) * 1000
@@ -755,9 +759,35 @@ void Engine::typeAddPartition(TypeOwner* t, Partition* p) {
     t->nParts.store(i + 1, std::memory_order_release);
 }
 
+void Engine::submitMaintenance(std::function<void(IoCtx*)> job) {
+    {
+        std::lock_guard<std::mutex> g(helperMu_);
+        helperJobs_.push_back(std::move(job));
+    }
+    helperCv_.notify_one();
+}
+
 int32_t Engine::start() {
     if (cfg_.cooperative || started_) return 0;
-    syncPool_.start(cfg_.syncThreads);
+    helperStop_ = false;
+    for (uint32_t i = 0; i < cfg_.mergeHelpers; i++) {
+        helpers_.emplace_back([this] {
+            for (;;) {
+                std::function<void(IoCtx*)> job;
+                {
+                    std::unique_lock<std::mutex> lk(helperMu_);
+                    helperCv_.wait(lk, [this] { return helperStop_ || !helperJobs_.empty(); });
+                    if (helperJobs_.empty()) return;  // stopping, queue drained
+                    job = std::move(helperJobs_.front());
+                    helperJobs_.pop_front();
+                }
+                job(helperIo_.get());
+            }
+        });
+    }
+    const uint32_t syncThreads =
+        cfg_.syncThreads ? cfg_.syncThreads : std::min<uint32_t>(8, std::max<uint32_t>(4, cfg_.writers));
+    syncPool_.start(syncThreads);
     for (auto& w : writers_) {
         Writer* wp = w.get();
         wp->thread_ = std::thread([wp] { wp->threadMain(); });
@@ -774,8 +804,19 @@ int32_t Engine::stop(uint64_t deadlineMs) {
     for (auto& w : writers_) w->ring();
     for (auto& w : writers_)
         if (w->thread_.joinable()) w->thread_.join();
+    {
+        std::lock_guard<std::mutex> g(helperMu_);
+        helperStop_ = true;
+    }
+    helperCv_.notify_all();
+    for (auto& h : helpers_)
+        if (h.joinable()) h.join();
+    helpers_.clear();
     syncPool_.stop();
     started_ = false;
+    // Merges still in flight are abandoned: their INTENT is discarded at open.
+    for (auto& w : writers_)
+        for (Partition* p : w->owned_) partitionMergeAbort(w.get(), p);
     // Clean shutdown: durable heads, so the next open reads no tail.
     for (auto& w : writers_) w->flushHeadSyncs();
     for (auto& w : writers_) {
@@ -818,6 +859,14 @@ void Engine::abandon() {
     for (auto& w : writers_) w->ring();
     for (auto& w : writers_)
         if (w->thread_.joinable()) w->thread_.join();
+    {
+        std::lock_guard<std::mutex> g(helperMu_);
+        helperStop_ = true;
+    }
+    helperCv_.notify_all();
+    for (auto& h : helpers_)
+        if (h.joinable()) h.join();
+    helpers_.clear();
     syncPool_.stop();
     started_ = false;
     for (auto& w : writers_) {
@@ -971,6 +1020,7 @@ void Engine::totalIo(IoStats* out) const {
         }
     };
     add(openIoStats_);
+    add(helperIoStats_);
     for (const auto& w : writers_) add(w->ioStats_);
 }
 

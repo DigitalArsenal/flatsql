@@ -8,6 +8,7 @@
 // reads partition rows only from durable batches (durablePseqHi) and
 // publishes nothing before its own batch is durable.
 #include <algorithm>
+#include <unordered_map>
 
 #include "internal.h"
 
@@ -818,73 +819,49 @@ void typeRollback(Writer* w, TypeOwner* t, StagedType* st) {
 // blocks between rounds; the run and manifest are synced in the next round's
 // first phase and MERGE_DONE rides that round's type batch. Outputs are named
 // by the generation counter (never reused once a head records it).
-int32_t typeMergeStep(Writer* w, TypeOwner* t) {
-    Engine* e = w->engine();
-    if (t->mergePhase != 0 || t->nL0 < e->config().mergeL0Blocks) return 0;
-    int32_t rc = typeWarm(w, t);
-    if (rc < 0) return rc;
-    const uint32_t k = t->nL0;
-    const uint32_t gen = t->nextGen++;
+namespace {
+// Builds a planned catalog merge's run and manifest (no sync). Reads only the
+// plan and immutable files: may run on a helper thread.
+int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t) {
+    const uint32_t k = t->mergeK;
+    const uint32_t gen = t->mergeGen;
     std::vector<std::vector<uint8_t>> blocks(k);
+    int32_t rc = 0;
+    std::unordered_map<uint32_t, FileRef> mfiles;
     for (uint32_t i = 0; i < k && rc >= 0; i++) {
-        const TypeL0DirEntry& de = t->l0[i];
-        FileRef tmp;
-        FileRef* f = &t->m;
-        if (de.mSeg != t->mSeg) {
+        const TypeL0DirEntry& de = t->mergeBatches[i];
+        auto it = mfiles.find(de.mSeg);
+        if (it == mfiles.end()) {
             PathBuf path;
-            pathTypeSeg(&path, w->eng_root(), t->fid, 'm', de.mSeg, "fsl");
-            rc = w->io().open(path.c_str(), path.len, FLATSQL_IO_READ, FileClass::TypeMeta, &tmp);
+            pathTypeSeg(&path, root, t->fid, 'm', de.mSeg, "fsl");
+            FileRef f;
+            rc = io->open(path.c_str(), path.len, FLATSQL_IO_READ, FileClass::TypeMeta, &f);
             if (rc < 0) break;
-            f = &tmp;
+            it = mfiles.emplace(de.mSeg, f).first;
         }
         blocks[i].resize(de.l0Len);
-        if (w->io().read(*f, blocks[i].data(), de.l0Len, de.mOff + de.l0Off) != int64_t(de.l0Len))
+        if (io->read(it->second, blocks[i].data(), de.l0Len, de.mOff + de.l0Off) != int64_t(de.l0Len))
             rc = FLATSQL_IO_ERR_IO;
-        if (tmp.valid()) w->io().close(&tmp);
     }
+    for (auto& kv : mfiles) io->close(&kv.second);
     if (rc < 0) return rc;
-    // Fold the newest catalog runs while each is at most twice what is being
-    // merged (O(log n) runs; folded files stay until reclamation).
-    uint64_t newEntries = 0;
-    for (uint32_t i = 0; i < k; i++) {
-        L0KindInfo ki[L0Accel::kMaxKinds];
-        size_t nk = 0;
-        if (parseL0Block(blocks[i].data(), blocks[i].size(), ki, L0Accel::kMaxKinds, &nk))
-            for (size_t j = 0; j < nk; j++) newEntries += ki[j].n;
-    }
-    uint32_t fold = 0, cand = 0;
-    uint64_t acc = newEntries;
-    for (size_t i = t->runs.size(); i-- > 0;) {
-        if (!t->runs[i].run || t->runs[i].run->entries() > 2 * acc) break;
-        acc += t->runs[i].run->entries();
-        cand++;
-    }
-    if (cand >= 3) fold = cand;  // tiered, fanout 4
     PathBuf xp;
-    pathTypeRun(&xp, w->eng_root(), t->fid, gen);
-    SegRun run;
+    pathTypeRun(&xp, root, t->fid, gen);
+    SegRun& run = t->mergeRun;
     run.gen = gen;
-    rc = w->io().open(xp.c_str(), xp.len,
-                      kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
-                      FileClass::Index, &run.file);
+    rc = io->open(xp.c_str(), xp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
+                  FileClass::Index, &run.file);
     if (rc < 0) return rc;
     std::vector<MergeL0Input> l0s;
     for (uint32_t i = 0; i < k; i++) l0s.push_back({blocks[i].data(), blocks[i].size()});
-    std::vector<MergeRunInput> folded;
-    for (size_t i = t->runs.size() - fold; i < t->runs.size(); i++)
-        folded.push_back({t->runs[i].run.get(), t->runs[i].file});
     uint64_t nEntries = 0;
-    const int64_t xLen = mergeToL1(&w->io(), run.file, 0, gen, uint16_t(fold ? 1 : 0), t->l0[0].commitSeq,
-                                   t->l0[k - 1].commitSeq, l0s, folded, &nEntries);
-    if (xLen < 0) {
-        w->io().close(&run.file);
-        return int32_t(xLen);
-    }
+    const int64_t xLen = mergeToL1(io, run.file, 0, gen, uint16_t(t->mergeFold ? 1 : 0), t->mergeBatches[0].commitSeq,
+                                   t->mergeBatches[k - 1].commitSeq, l0s, t->mergeFoldRuns, &nEntries);
+    if (xLen < 0) return int32_t(xLen);
     run.fileLen = uint64_t(xLen);
-    // Manifest: live catalog runs after this merge.
     std::vector<uint8_t> man(16);
     putU32(man.data(), kMagicManifest);
-    putU32(man.data() + 4, uint32_t(t->runs.size() - fold + 1));
+    putU32(man.data() + 4, uint32_t(t->mergeKeepRuns.size() + 1));
     putU32(man.data() + 8, gen);
     putU32(man.data() + 12, 0);
     auto addRun = [&](uint32_t g, uint64_t len) {
@@ -894,7 +871,7 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
         putU32(man.data() + at + 4, 0);
         putU64(man.data() + at + 8, len);
     };
-    for (size_t i = 0; i + fold < t->runs.size(); i++) addRun(t->runs[i].gen, t->runs[i].fileLen);
+    for (const auto& r : t->mergeKeepRuns) addRun(r.first, r.second);
     addRun(gen, run.fileLen);
     const size_t at = man.size();
     man.resize(at + 8, 0);
@@ -902,29 +879,84 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
     PathBuf mp;
     char name[32];
     snprintf(name, sizeof(name), "mf-%06x.fsm", gen);
-    pathType(&mp, w->eng_root(), t->fid, name);
-    rc = w->io().open(mp.c_str(), mp.len,
-                      kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
-                      FileClass::Manifest, &t->mergeMf);
-    if (rc >= 0) rc = w->io().write(t->mergeMf, man.data(), man.size(), 0);
+    pathType(&mp, root, t->fid, name);
+    rc = io->open(mp.c_str(), mp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
+                  FileClass::Manifest, &t->mergeMf);
+    if (rc >= 0) rc = io->write(t->mergeMf, man.data(), man.size(), 0);
     if (rc >= 0) {
         run.run.reset(new L1Run());
-        rc = run.run->load(&w->io(), run.file, run.fileLen);
+        rc = run.run->load(io, run.file, run.fileLen);
     }
-    if (rc < 0) {
-        w->io().close(&run.file);
-        w->io().close(&t->mergeMf);
-        return rc;
+    return rc;
+}
+}  // namespace
+
+// Type merge pipeline: planned on the owner, built on a helper (or inline),
+// synced in the next round's first phase; MERGE_DONE rides that round's type
+// batch. Outputs are named by the generation counter.
+int32_t typeMergeStep(Writer* w, TypeOwner* t) {
+    Engine* e = w->engine();
+    if (t->mergePhase == 2) {
+        const int32_t res = t->mergeResult.load(std::memory_order_acquire);
+        if (res == 0) return 0;
+        if (res < 0) {
+            w->io().close(&t->mergeRun.file);
+            w->io().close(&t->mergeMf);
+            t->mergeRun = SegRun();
+            t->mergePhase = 0;
+            return res;
+        }
+        t->mergePhase = 1;
+        t->dirty.store(1, std::memory_order_release);
+        return 1;
+    }
+    if (t->mergePhase != 0) return 0;
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < t->nL0; i++) bytes += t->l0[i].batchLen;
+    const bool want = t->nL0 >= kMaxTypeL0Dir - 8 ||
+                      (t->nL0 >= e->config().mergeL0Blocks && bytes >= e->config().mergeMinL0Bytes) ||
+                      bytes >= e->config().mergeL0Bytes;
+    if (!want) return 0;
+    int32_t rc = typeWarm(w, t);
+    if (rc < 0) return rc;
+    const uint32_t k = t->nL0;
+    t->mergeK = k;
+    t->mergeGen = t->nextGen++;
+    t->mergeThroughCommit = t->l0[k - 1].commitSeq;
+    t->mergeBatches.assign(t->l0, t->l0 + k);
+    uint64_t newEntries = 1;
+    for (uint32_t i = 0; i < k; i++)
+        for (int j = 0; j < t->acc[i].nKinds; j++) newEntries += t->acc[i].kinds[j].n;
+    uint32_t cand = 0;
+    uint64_t acc = newEntries;
+    for (size_t i = t->runs.size(); i-- > 0;) {
+        if (!t->runs[i].run || t->runs[i].run->entries() > 2 * acc) break;
+        acc += t->runs[i].run->entries();
+        cand++;
+    }
+    t->mergeFold = cand >= 3 ? cand : 0;  // tiered, fanout 4
+    t->mergeFoldRuns.clear();
+    t->mergeKeepRuns.clear();
+    for (size_t i = 0; i < t->runs.size(); i++) {
+        if (i + t->mergeFold >= t->runs.size()) t->mergeFoldRuns.push_back({t->runs[i].run.get(), t->runs[i].file});
+        else t->mergeKeepRuns.push_back({t->runs[i].gen, t->runs[i].fileLen});
     }
     t->runs.reserve(t->runs.size() + 1);
-    t->mergeRun = std::move(run);
-    t->mergeGen = gen;
-    t->mergeK = k;
-    t->mergeFold = fold;
-    t->mergeThroughCommit = t->l0[k - 1].commitSeq;
-    t->mergePhase = 1;
-    t->dirty.store(1, std::memory_order_release);
-    return 1;
+    t->mergeRun = SegRun();
+    t->mergeResult.store(0, std::memory_order_release);
+    t->mergePhase = 2;
+    if (e->config().mergeHelpers && !e->config().cooperative) {
+        Writer* owner = w;
+        e->submitMaintenance([t, owner](IoCtx* io) {
+            const int32_t r = writeTypeMergeOutputs(io, owner->eng_root(), t);
+            t->mergeResult.store(r < 0 ? r : 1, std::memory_order_release);
+            owner->ring();
+        });
+        return 1;
+    }
+    rc = writeTypeMergeOutputs(&w->io(), w->eng_root(), t);
+    t->mergeResult.store(rc < 0 ? rc : 1, std::memory_order_release);
+    return typeMergeStep(w, t);
 }
 
 }  // namespace ps

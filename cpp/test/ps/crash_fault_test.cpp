@@ -95,6 +95,8 @@ struct Harness {
         : rng(seed), s(true, 4, true), nTypes(types), nParts(partitions) {
         s.cfg.mergeL0Blocks = 4;      // frequent merges: A11 crash points
         s.cfg.mergeL0Bytes = 256u << 10;
+        s.cfg.mergeMinL0Bytes = 0;
+        s.cfg.mergeHelpers = (seed & 4) ? 0 : 1;  // helper-built and inline merges
         s.cfg.poolBytes = 96ull << 20;
         s.cfg.ckptIntervalMs = 20;
         s.cfg.ckptMetaBytes = 16u << 10;

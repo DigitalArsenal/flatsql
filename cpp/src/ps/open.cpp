@@ -252,6 +252,7 @@ int32_t Engine::open(const EngineConfig& cfgIn, std::unique_ptr<Engine>* out, st
     if (!cfg.io) cfg.io = importIo();
     e->openIoHolder_.reset(new IoCtx(cfg.io, &e->openIoStats_));
     e->openIo_ = e->openIoHolder_.get();
+    e->helperIo_.reset(new IoCtx(cfg.io, &e->helperIoStats_));
     if (!e->pool_.init(cfg.poolBytes, cfg.slabBytes)) {
         if (err) *err = "slab pool allocation failed";
         return FLATSQL_IO_ERR_NOSPACE;

@@ -115,7 +115,7 @@ struct Bench {
 
     Bench(uint32_t writers, bool memIo) {
         cfg.writers = writers;
-        cfg.syncThreads = uint32_t(argInt("sync-threads", 4));
+        cfg.syncThreads = uint32_t(argInt("sync-threads", 0));
         cfg.poolBytes = uint64_t(argInt("pool-mb", 192)) << 20;
         cfg.arenaBytes = 24ull << 20;
         cfg.zeroFillStep = uint64_t(argInt("zero-fill-kb", 1024)) << 10;
@@ -239,8 +239,26 @@ std::vector<double> openLoop(Bench& b, double rate, uint32_t nDirty, double secs
     lat.reserve(size_t(rate * secs) + 16);
     std::atomic<bool> done{false};
     std::thread poller([&] {
+        uint64_t doneAt = 0;
         while (true) {
             const bool finish = done.load();
+            if (finish && !doneAt) doneAt = monoNs();
+            if (doneAt && monoNs() - doneAt > 10000000000ull) {
+                // Diagnostics for a stall: ring positions and writer liveness.
+                std::lock_guard<std::mutex> g(mu);
+                for (uint32_t i = 0; i < nDirty; i++) {
+                    RingDesc* r = ps[i]->ringDesc();
+                    if (pending[i].empty()) continue;
+                    std::fprintf(stderr, "STALL pid=%u tail=%llu head=%llu acked=%llu pendingFront=%llu state=%u mapped=%u want=%u\n",
+                                 b.pids[i], (unsigned long long)r->tail.load(), (unsigned long long)r->head.load(),
+                                 (unsigned long long)r->ackedRseq.load(), (unsigned long long)pending[i].front().rseq,
+                                 r->state.load(), r->mappedPages.load(), r->wantPage.load());
+                }
+                for (uint32_t w = 0; w < b.e->writerCount(); w++)
+                    std::fprintf(stderr, "STALL writer %u heartbeat=%llu\n", w,
+                                 (unsigned long long)b.e->writer(w)->heartbeat());
+                doneAt = monoNs();
+            }
             {
                 std::lock_guard<std::mutex> g(mu);
                 const uint64_t now = monoNs();
@@ -264,11 +282,17 @@ std::vector<double> openLoop(Bench& b, double rate, uint32_t nDirty, double secs
     const uint64_t total = uint64_t(rate * secs);
     const double interval = 1e9 / rate;
     uint64_t sent = 0;
+    uint64_t lastReport = start;
     for (uint64_t n = 0; n < total; n++) {
+        if (monoNs() - lastReport > 2000000000ull) {
+            lastReport = monoNs();
+            std::fprintf(stderr, "PROGRESS n=%llu of %llu\n", (unsigned long long)n, (unsigned long long)total);
+        }
         const uint64_t due = start + uint64_t(double(n) * interval);
-        while (monoNs() < due) {
-            const uint64_t left = due - monoNs();
+        for (uint64_t now = monoNs(); now < due; now = monoNs()) {
+            const uint64_t left = due - now;
             if (left > 200000) sleepNs(left - 100000);
+            else cpuRelax();
         }
         const uint32_t k = uint32_t(n % nDirty);
         const auto& f = ff.next((uint64_t(0x5a) << 48) | n, b.types[b.pidType[k]].fid);
@@ -310,6 +334,19 @@ void reportSyncs(Engine* e, const char* prefix) {
            "fsyncs");
     std::snprintf(key, sizeof(key), "%s_m_fsyncs_per_partition_batch", prefix);
     report(key, st.partitionBatches ? double(io.syncs(FileClass::Meta)) / double(st.partitionBatches) : 0, "fsyncs");
+    std::snprintf(key, sizeof(key), "%s_records_per_framed_commit", prefix);
+    report(key, st.partitionCommitsWithFrames ? double(st.rowsAppended) / double(st.partitionCommitsWithFrames) : 0,
+           "records");
+    std::snprintf(key, sizeof(key), "%s_total_fsyncs", prefix);
+    report(key, double(io.totalSyncs()), "fsyncs");
+    std::snprintf(key, sizeof(key), "%s_maintenance_step_max_ms", prefix);
+    report(key, double(e->maintHist().maxNs.load()) / 1e6, "ms");
+    std::snprintf(key, sizeof(key), "%s_maintenance_step_p99_ms", prefix);
+    report(key, double(e->maintHist().percentileNs(0.99)) / 1e6, "ms");
+    std::snprintf(key, sizeof(key), "%s_commit_round_max_ms", prefix);
+    report(key, double(e->commitHist().maxNs.load()) / 1e6, "ms");
+    std::snprintf(key, sizeof(key), "%s_commit_round_p99_ms", prefix);
+    report(key, double(e->commitHist().percentileNs(0.99)) / 1e6, "ms");
 }
 
 int modeScaling() {

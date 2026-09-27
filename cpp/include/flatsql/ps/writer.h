@@ -13,7 +13,10 @@
 #define FLATSQL_PS_WRITER_H
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -42,7 +45,7 @@ struct StageScratch;
 struct EngineConfig {
     std::string root;               // store directory; the engine uses <root>/fsql2
     uint32_t writers = 1;           // N writer threads (clamp(cores-2, 1, 16) in production)
-    uint32_t syncThreads = 4;       // A8 concurrent sync pool (0 = writer syncs inline)
+    uint32_t syncThreads = 0;       // A8 concurrent sync pool; 0 = auto: clamp(writers, 4, 8)
     uint64_t poolBytes = 192ull << 20;
     uint32_t slabBytes = 64u << 10;
     uint64_t reserveBytes = 16ull << 20;   // control partition / registrations
@@ -58,6 +61,8 @@ struct EngineConfig {
     uint64_t ckptMetaBytes = 64u << 10;
     uint32_t mergeL0Blocks = 16;
     uint64_t mergeL0Bytes = 1ull << 20;
+    uint64_t mergeMinL0Bytes = 64u << 10;  // below this, wait for more blocks (tiny commits)
+    uint32_t mergeHelpers = 1;             // 0 = merges build on the writer thread
     uint64_t zeroFillStep = 1ull << 20;    // A8 zero-fill ahead (0 = off)
     uint32_t noticeQueue = 1024;           // A25 (a full queue drops the notice)
     uint32_t typeCommitRows = 8192;        // rows labeled per type commit
@@ -256,7 +261,23 @@ enum MergePhase : uint8_t {
     kMergeIdle = 0,
     kMergeIntentQueued,    // INTENT_MERGE queued for the next batch
     kMergeIntentDurable,   // outputs may be written
+    kMergeBuilding,        // a helper thread is writing the outputs
     kMergeOutputsWritten,  // outputs written (unsynced); DONE rides the next batch
+};
+
+// Snapshot of one segment for the manifest a merge writes (taken on the
+// owner at plan time; the helper never reads live partition state).
+struct SegSnap {
+    uint32_t seg = 0;
+    bool sealed = false;
+    uint64_t firstPseq = 0, endPseq = 0, mergedEnd = 0, dLen = 0, rLen = 0, aLen = 0;
+    int64_t minEpoch = INT64_MAX, maxEpoch = INT64_MIN;
+    struct Run {
+        uint32_t gen;
+        uint64_t nEntries;
+        uint64_t fileLen;
+    };
+    std::vector<Run> runs;
 };
 
 struct MergePlan {
@@ -272,8 +293,14 @@ struct MergePlan {
     int64_t minEpoch = INT64_MAX;
     int64_t maxEpoch = INT64_MIN;
     uint32_t fold = 0;          // newest runs of the segment folded into the new one
+    uint64_t segFirstPseq = 0;
+    uint32_t ownerEpoch = 0;    // A26: the helper's result is applied only under it
+    std::vector<L0DirEntry> batches;      // the merged batches (copy)
+    std::vector<MergeRunInput> foldRuns;  // folded runs (immutable while in flight)
+    std::vector<SegSnap> snap;            // manifest input
     FileRef r, a, mf;
     SegRun run;                 // the new L1 run, accelerators preloaded
+    std::atomic<int32_t> result{0};   // helper: 0 running, 1 done, < 0 error
 };
 
 struct PendingKill {
@@ -400,6 +427,10 @@ struct TypeOwner {
     uint32_t mergeGen = 0;
     uint32_t mergeK = 0;
     uint32_t mergeFold = 0;          // newest catalog runs folded into the new one
+    std::vector<TypeL0DirEntry> mergeBatches;
+    std::vector<MergeRunInput> mergeFoldRuns;
+    std::vector<std::pair<uint32_t, uint64_t>> mergeKeepRuns;  // (gen, fileLen) kept in the manifest
+    std::atomic<int32_t> mergeResult{0};
     uint64_t mergeThroughCommit = 0;
     SegRun mergeRun;
     FileRef mergeMf;
@@ -672,6 +703,8 @@ public:
     // Instrumentation
     LockHist& lockHist() { return lockHist_; }        // registration lock holds
     LockHist& seqlockHist() { return seqlockHist_; }  // partition seqlock writer sections
+    LockHist& maintHist() { return maintHist_; }      // writer maintenance step durations
+    LockHist& commitHist() { return commitHist_; }    // commit round durations
     std::vector<AuditRecord> auditLog() const;
     void auditAppend(const AuditRecord& r);
 
@@ -683,6 +716,9 @@ public:
 
     // Internals shared by the implementation files.
     SyncPool& syncPool() { return syncPool_; }
+    // Maintenance helper: builds merge outputs off the writer threads.
+    void submitMaintenance(std::function<void(IoCtx*)> job);
+    IoCtx* helperIo() { return helperIo_.get(); }
     std::mutex& regMutex() { return regMutex_; }
     Registry& registry() { return registry_; }
     uint8_t leastLoadedWriter() const;
@@ -714,6 +750,13 @@ private:
     std::unordered_map<uint32_t, TypeOwner*> typeByFid_;
     std::vector<std::unique_ptr<Writer>> writers_;
     SyncPool syncPool_;
+    IoStats helperIoStats_;
+    std::unique_ptr<IoCtx> helperIo_;
+    std::mutex helperMu_;               // maintenance queue (never on a record path)
+    std::condition_variable helperCv_;
+    std::deque<std::function<void(IoCtx*)>> helperJobs_;
+    std::vector<std::thread> helpers_;
+    bool helperStop_ = false;
     std::atomic<uint64_t> gseqNext_{1};
     uint32_t incarnation_ = 0;
     std::atomic<bool> stop_{false};
@@ -721,6 +764,8 @@ private:
     bool closed_ = false;
     LockHist lockHist_;
     LockHist seqlockHist_;
+    LockHist maintHist_;
+    LockHist commitHist_;
     mutable std::mutex auditMutex_;
     std::vector<AuditRecord> audit_;
 };

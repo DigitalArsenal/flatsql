@@ -343,6 +343,7 @@ static void rebalanceRun(double seconds, uint32_t writers, uint32_t partitions) 
     Store s(true, writers, true);
     s.cfg.audit = true;
     s.cfg.mergeL0Blocks = 4;  // merges during rebalancing (A26)
+    s.cfg.mergeMinL0Bytes = 0;
     REQUIRE(s.open() == 0);
     s.registerTypes({&ommType(), &mpeType()});
     std::vector<uint32_t> pids;
