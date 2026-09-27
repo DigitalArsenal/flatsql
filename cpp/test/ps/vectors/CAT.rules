@@ -1,0 +1,8 @@
+# extractIndexedFields, case "CAT.fbs"; supersede = record_supersede.go
+# recordSupersedeKey.
+col 0 u64pos:NORAD_CAT_ID
+col 1 str:OBJECT_ID
+col 2 enum:OBJECT_TYPE
+col 3 enum:OPS_STATUS_CODE
+object 0,1
+supersede pair:uri:CATALOG_URI,CATALOG_OBJECT_ID|u64:norad:NORAD_CAT_ID|str:object:OBJECT_ID

@@ -1,0 +1,8 @@
+# extractIndexedFields, case "OEM.fbs": the first block's OBJECT is required;
+# epoch = START_TIME, else the first data line's EPOCH.
+require EPHEMERIS_DATA_BLOCK[0].OBJECT
+epoch str:EPHEMERIS_DATA_BLOCK[0].START_TIME|str:EPHEMERIS_DATA_BLOCK[0].EPHEMERIS_DATA_LINES[0].EPOCH
+col 0 u64pos:EPHEMERIS_DATA_BLOCK[0].OBJECT.NORAD_CAT_ID
+col 1 str:EPHEMERIS_DATA_BLOCK[0].OBJECT.OBJECT_ID
+epoch_day 4
+object 0,1

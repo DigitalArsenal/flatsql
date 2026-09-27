@@ -798,6 +798,8 @@ else()
     endif()
     target_link_libraries(flatsql_ps_test PRIVATE flatsql_ps flatsql_ps_testutil)
     target_include_directories(flatsql_ps_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    target_compile_definitions(flatsql_ps_test PRIVATE
+        PS_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/ps/vectors")
 
     add_executable(flatsql_ps_bench test/ps/bench_main.cpp test/ps/ps_fixtures.cpp test/io_fault.cpp)
     target_link_libraries(flatsql_ps_bench PRIVATE flatsql_ps flatsql_ps_testutil)

@@ -1,0 +1,2 @@
+# extractIndexedFields, case "PNM.fbs".
+col 1 str:FILE_ID

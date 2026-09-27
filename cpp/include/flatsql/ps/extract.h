@@ -14,6 +14,9 @@
 //                enum:<path>    enum name, trimmed; "" and "UNKNOWN" absent
 //   epoch_day <n>              COL(n) = UTC "YYYY-MM-DD" of the epoch seconds
 //   object <n>[,<n>...]        OBJECT_EPOCH key: first present COL of these
+//   require <path>             the table at <path> must be present, else the
+//                              record contributes no epoch and no COLs (OEM:
+//                              a block without OBJECT has no identity)
 //   supersede <alt>|<alt>...   object identity (record_supersede.go parity)
 //           alt: pair:<prefix>:<pathA>,<pathB> | u64:<prefix>:<path>
 //                | str:<prefix>:<path>
@@ -145,6 +148,7 @@ private:
     std::string resolve(const std::string& text, Path* out) const;
     // Walks a path to its leaf table and field address. Returns false when absent.
     bool leaf(const uint8_t* root, const Path& p, const uint8_t** table, const Step** last) const;
+    bool present(const uint8_t* root, const Path& p) const;
     bool readString(const uint8_t* root, const Path& p, const uint8_t** s, size_t* n) const;
     bool readU64(const uint8_t* root, const Path& p, uint64_t* v) const;
     bool readI64(const uint8_t* root, const Path& p, int64_t* v) const;
@@ -166,6 +170,7 @@ private:
     uint32_t nCols_ = 0;
     int epochDayCol_ = -1;
     std::vector<int> objectCols_;
+    std::vector<Path> require_;
     std::vector<Alt> supersede_;
 };
 

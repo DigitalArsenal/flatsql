@@ -458,6 +458,7 @@ std::string TypeConfig::compile(const std::string& rules) {
     for (auto& c : cols_) c.clear();
     supersede_.clear();
     objectCols_.clear();
+    require_.clear();
     nCols_ = 0;
     epochDayCol_ = -1;
     for (const std::string& rawLine : split(rules, '\n')) {
@@ -514,6 +515,12 @@ std::string TypeConfig::compile(const std::string& rules) {
                 if (n < 0 || n >= int(kMaxCols)) return "object col out of range";
                 objectCols_.push_back(n);
             }
+        } else if (cmd == "require") {
+            Path p;
+            const std::string err = resolve(rest, &p);
+            if (!err.empty()) return err;
+            if (p.steps.back().baseType != reflection::Obj) return "require needs a table: " + rest;
+            require_.push_back(p);
         } else if (cmd == "supersede") {
             for (const std::string& a : split(rest, '|')) {
                 const std::vector<std::string> parts = split(a, ':');
@@ -586,6 +593,14 @@ bool TypeConfig::leaf(const uint8_t* root, const Path& p, const uint8_t** table,
     *table = reinterpret_cast<const uint8_t*>(t);
     *last = &p.steps.back();
     return true;
+}
+
+bool TypeConfig::present(const uint8_t* root, const Path& p) const {
+    const uint8_t* tb;
+    const Step* st;
+    if (!leaf(root, p, &tb, &st)) return false;
+    const auto* t = reinterpret_cast<const flatbuffers::Table*>(tb);
+    return t->GetPointer<const flatbuffers::Table*>(st->voffset) != nullptr;
 }
 
 bool TypeConfig::readString(const uint8_t* root, const Path& p, const uint8_t** s,
@@ -703,8 +718,16 @@ void TypeConfig::extract(const uint8_t* frame, size_t len, Extracted* out, uint8
         used += n;
         return p;
     };
+    bool keyed = true;
+    for (const Path& p : require_) {
+        if (!present(root, p)) {
+            keyed = false;
+            break;
+        }
+    }
     // Epoch
-    for (const Alt& a : epoch_) {
+    for (size_t ai = 0; keyed && ai < epoch_.size(); ai++) {
+        const Alt& a = epoch_[ai];
         if (a.kind == kAltEpochStr) {
             const uint8_t* s;
             size_t n;
@@ -744,7 +767,7 @@ void TypeConfig::extract(const uint8_t* frame, size_t len, Extracted* out, uint8
         }
     }
     // Columns
-    for (uint32_t c = 0; c < nCols_; c++) {
+    for (uint32_t c = 0; keyed && c < nCols_; c++) {
         ColValue& cv = out->cols[c];
         if (int(c) == epochDayCol_) {
             if (out->hasEpoch) {

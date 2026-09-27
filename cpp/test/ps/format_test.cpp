@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <random>
 
+#include "flatbuffers/reflection.h"
 #include "flatsql/ps/extract.h"
 #include "flatsql/ps/index.h"
 #include "flatsql/ps/platform.h"
@@ -401,4 +402,177 @@ PS_TEST(ring_producer_consumer_straddles_pages) {
     CHECK_EQ(r->mappedPages.load(), 0u);
     CHECK_EQ(pool.inUse(), 0u);
     ringDestroy(r);
+}
+
+// ---------------------------------------------------------------------------
+// A19 golden vectors: the per-type rule texts in test/ps/vectors/<T>.rules
+// reproduce sdn-server extractIndexedFields + recordSupersedeKey over frames
+// built from the published SDS 1.226.0 schemas (vectors/gen).
+// ---------------------------------------------------------------------------
+namespace {
+
+std::vector<uint8_t> readVectorFile(const std::string& name) {
+    const std::string path = std::string(PS_VECTOR_DIR) + "/" + name;
+    std::vector<uint8_t> out;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return out;
+    uint8_t buf[65536];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.insert(out.end(), buf, buf + n);
+    std::fclose(f);
+    return out;
+}
+
+// One expected cell: null, an integer, or a string.
+struct Cell {
+    bool null = true;
+    bool isInt = false;
+    int64_t i = 0;
+    std::string s;
+};
+
+bool parseJsonRow(const std::string& line, std::vector<Cell>* row) {
+    row->clear();
+    size_t p = 0;
+    auto ws = [&] { while (p < line.size() && line[p] == ' ') p++; };
+    ws();
+    if (p >= line.size() || line[p++] != '[') return false;
+    for (;;) {
+        ws();
+        Cell c;
+        if (line.compare(p, 4, "null") == 0) {
+            p += 4;
+        } else if (line[p] == '"') {
+            p++;
+            c.null = false;
+            while (p < line.size() && line[p] != '"') {
+                if (line[p] == '\\') {
+                    p++;
+                    const char e = line[p++];
+                    if (e == 'u') {
+                        const unsigned v = unsigned(std::stoul(line.substr(p, 4), nullptr, 16));
+                        p += 4;
+                        if (v >= 0x80) return false;  // vectors carry ASCII escapes only
+                        c.s.push_back(char(v));
+                    } else if (e == 'n') {
+                        c.s.push_back('\n');
+                    } else if (e == 't') {
+                        c.s.push_back('\t');
+                    } else {
+                        c.s.push_back(e);
+                    }
+                } else {
+                    c.s.push_back(line[p++]);
+                }
+            }
+            p++;
+        } else {
+            size_t used = 0;
+            c.i = std::stoll(line.substr(p), &used);
+            p += used;
+            c.null = false;
+            c.isInt = true;
+        }
+        row->push_back(c);
+        ws();
+        if (p < line.size() && line[p] == ',') {
+            p++;
+            continue;
+        }
+        return p < line.size() && line[p] == ']';
+    }
+}
+
+std::string colText(const ColValue& cv) {
+    if (!cv.present) return "<absent>";
+    if (cv.isU64) return "u" + std::to_string(cv.u);
+    return "s" + std::string(reinterpret_cast<const char*>(cv.s), cv.n);
+}
+
+std::string cellText(const Cell& c, bool asU64) {
+    if (c.null) return "<absent>";
+    if (c.isInt) return (asU64 ? "u" : "i") + std::to_string(c.i);
+    return "s" + c.s;
+}
+
+}  // namespace
+
+PS_TEST(format_extraction_golden_vectors_A19) {
+    const char* types[] = {"OMM", "MPE", "OEM", "CAT", "PNM", "RFB"};
+    size_t total = 0;
+    for (const char* t : types) {
+        const std::vector<uint8_t> bfbs = readVectorFile(std::string(t) + ".bfbs");
+        const std::vector<uint8_t> rulesBytes = readVectorFile(std::string(t) + ".rules");
+        const std::vector<uint8_t> frames = readVectorFile(std::string(t) + ".frames");
+        const std::vector<uint8_t> expectedBytes =
+            readVectorFile(std::string(t) + ".expected.jsonl");
+        CHECK(!bfbs.empty() && !rulesBytes.empty() && !frames.empty() && !expectedBytes.empty());
+        if (bfbs.empty() || frames.size() < 12) continue;
+        const reflection::Schema* schema = reflection::GetSchema(bfbs.data());
+        CHECK(schema->file_ident() && schema->file_ident()->size() == 4);
+        const std::string rules(rulesBytes.begin(), rulesBytes.end());
+        const std::vector<uint8_t> blob = TypeConfig::build(
+            std::string(t) + ".fbs", reinterpret_cast<const uint8_t*>(schema->file_ident()->c_str()),
+            bfbs, rules, 1u << 20, 4u << 20, TypeConfig::kVerifyBfbs | TypeConfig::kVerifyCid);
+        TypeConfig cfg;
+        const std::string err = cfg.parse(blob.data(), blob.size());
+        if (!err.empty()) std::fprintf(stderr, "  %s rules: %s\n", t, err.c_str());
+        CHECK(err.empty());
+        if (!err.empty()) continue;
+        std::vector<std::string> lines;
+        {
+            std::string cur;
+            for (uint8_t b : expectedBytes) {
+                if (b == '\n') {
+                    lines.push_back(cur);
+                    cur.clear();
+                } else {
+                    cur.push_back(char(b));
+                }
+            }
+            if (!cur.empty()) lines.push_back(cur);
+        }
+        size_t off = 0, idx = 0, mismatches = 0;
+        uint8_t scratch[2048];
+        std::vector<Cell> row;
+        while (off + 4 <= frames.size()) {
+            const size_t len = 4 + (uint32_t(frames[off]) | uint32_t(frames[off + 1]) << 8 |
+                                    uint32_t(frames[off + 2]) << 16 |
+                                    uint32_t(frames[off + 3]) << 24);
+            CHECK(off + len <= frames.size());
+            if (off + len > frames.size()) break;
+            const uint8_t* frame = frames.data() + off;
+            off += len;
+            CHECK(idx < lines.size());
+            if (idx >= lines.size()) break;
+            CHECK(parseJsonRow(lines[idx], &row) && row.size() == 7);
+            CHECK_EQ(cfg.checkFrame(frame, len), 0);
+            Extracted ex;
+            cfg.extract(frame, len, &ex, scratch, sizeof(scratch));
+            // [norad, entity, objectType, opsStatus, epoch_unix, epoch_day, supersede]
+            std::string got[7], want[7];
+            for (int c = 0; c < 4; c++) {
+                got[c] = colText(ex.cols[c]);
+                want[c] = cellText(row[size_t(c)], c == 0);
+            }
+            got[4] = ex.hasEpoch ? "i" + std::to_string(ex.epochSec) : "<absent>";
+            want[4] = cellText(row[4], false);
+            got[5] = colText(ex.cols[4]);
+            want[5] = cellText(row[5], false);
+            got[6] = "s" + std::string(reinterpret_cast<const char*>(ex.identity), ex.identityLen);
+            want[6] = cellText(row[6], false);
+            for (int c = 0; c < 7; c++) {
+                if (got[c] != want[c]) {
+                    if (mismatches++ < 10)
+                        std::fprintf(stderr, "  %s #%zu column %d: engine %s, Go %s\n", t, idx, c,
+                                     got[c].c_str(), want[c].c_str());
+                }
+            }
+            idx++;
+        }
+        CHECK_EQ(mismatches, size_t(0));
+        CHECK_EQ(idx, lines.size());
+        total += idx;
+    }
+    report("golden_records", double(total), "records");
 }

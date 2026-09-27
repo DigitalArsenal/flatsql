@@ -1,0 +1,6 @@
+# sdn-server internal/storage/flatsql.go extractIndexedFields, case "OMM.fbs".
+epoch str:EPOCH|str:CREATION_DATE
+col 0 u64pos:NORAD_CAT_ID
+col 1 str:OBJECT_ID
+epoch_day 4
+object 0,1

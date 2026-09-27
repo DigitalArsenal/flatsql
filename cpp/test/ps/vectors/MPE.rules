@@ -1,0 +1,5 @@
+# extractIndexedFields, case "MPE.fbs": floor(EPOCH) seconds, 0 = absent.
+epoch f64floor:EPOCH
+col 1 str:ENTITY_ID
+epoch_day 4
+object 1

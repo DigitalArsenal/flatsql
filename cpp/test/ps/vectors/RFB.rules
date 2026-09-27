@@ -1,0 +1,3 @@
+# extractIndexedFields, case "RFB.fbs": transmitter, else ID; no epoch.
+col 0 u64pos:NORAD_CAT_ID
+col 1 str:ID_TRANSMITTER|str:ID
