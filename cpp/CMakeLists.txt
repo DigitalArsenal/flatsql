@@ -448,7 +448,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
             ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
             ${FLATBUFFERS_SRC_DIR}/reflection.cpp
-            ${FLATBUFFERS_SRC_DIR}/util.cpp
             ${FLATBUFFERS_SRC_DIR}/options.cpp
             src/sdn_node.cpp
             ${FLATSQL_SDN_NODE_GENERATED_DIR}/invoke_support.cpp
@@ -740,6 +739,56 @@ else()
         ${SQLITE_DIR}
     )
 
+    # ------------------------------------------------------------------
+    # Partition store (format 2): docs/PARTITION-STORE.md
+    # The engine core is host-neutral C++ (no SQLite): it reaches the host
+    # only through the seven flatsql_io_* imports, so the same sources build
+    # the wasm32-wasip1-threads artifact (T4).
+    # ------------------------------------------------------------------
+    set(FLATSQL_PS_SOURCES
+        src/ps/platform.cpp
+        src/ps/io.cpp
+        src/ps/format.cpp
+        src/ps/index_l0.cpp
+        src/ps/index_l1.cpp
+        src/ps/ring.cpp
+        src/ps/extract.cpp
+        src/ps/registry.cpp
+        src/ps/partition_log.cpp
+        src/ps/merge.cpp
+        src/ps/type_owner.cpp
+        src/ps/writer_pool.cpp
+        src/ps/open.cpp
+        src/ps/capi_ps.cpp
+        ${FLATBUFFERS_SRC_DIR}/reflection.cpp
+    )
+    add_library(flatsql_ps STATIC ${FLATSQL_PS_SOURCES} src/flatsql_io_native.cpp)
+    target_include_directories(flatsql_ps PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+    )
+    target_link_libraries(flatsql_ps PUBLIC Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(flatsql_ps PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+
+    add_executable(flatsql_ps_test
+        test/ps/ps_test_main.cpp
+        test/ps/format_test.cpp
+        test/ps/writer_pool_test.cpp
+        test/ps/type_owner_test.cpp
+        test/ps/open_test.cpp
+        test/ps/crash_fault_test.cpp
+        test/io_fault.cpp
+    )
+    target_link_libraries(flatsql_ps_test PRIVATE flatsql_ps)
+    target_include_directories(flatsql_ps_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+    add_executable(flatsql_ps_bench test/ps/bench_main.cpp test/io_fault.cpp)
+    target_link_libraries(flatsql_ps_bench PRIVATE flatsql_ps)
+    target_include_directories(flatsql_ps_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    target_compile_options(flatsql_ps_bench PRIVATE -O2)
+
     add_executable(flatsql_full_text_search_test tests/full_text_search_test.cpp)
     target_link_libraries(flatsql_full_text_search_test PRIVATE flatsql_lib)
 
@@ -756,4 +805,5 @@ else()
     add_test(NAME FlatSQLSocketTest COMMAND flatsql_socket_test)
     add_test(NAME FlatSQLRoundTripTest COMMAND flatsql_roundtrip_test)
     add_test(NAME FlatSQLGeoTest COMMAND flatsql_geo_test)
+    add_test(NAME FlatSQLPartitionStoreTest COMMAND flatsql_ps_test)
 endif()

@@ -1,0 +1,995 @@
+// FlatSQL partition store: open, recovery and registration (design §10,
+// amended by A4, A9, A10, A11; §4.7 intent rule).
+//
+// Open reads STORE, MIGRATED, the registry, then per type and per partition
+// the head (two slots, the used prefix only) and the meta-log tail past the
+// head. It never reads a d-* byte and never parses a frame. A tail batch is
+// adopted only after the data and meta files are fsynced and a DURABLE_CKPT
+// head is written and fsynced (A4): nothing written before a crash becomes
+// visible (or labelled, or published) unless it is durable.
+#include <algorithm>
+
+#include "internal.h"
+
+namespace flatsql {
+namespace ps {
+
+namespace {
+
+constexpr int32_t kOpenRW = FLATSQL_IO_READ | FLATSQL_IO_WRITE;
+
+int32_t readHeadSlots(IoCtx* io, const FileRef& f, uint16_t kind, std::vector<uint8_t>* best) {
+    int bestSlot = -1;
+    uint64_t bestGen = 0;
+    uint8_t slots[2][kHeadSlotBytes];
+    for (int s = 0; s < 2; s++) {
+        int64_t n = io->read(f, slots[s], kHeadReadBytes, uint64_t(s) * kHeadSlotBytes);
+        if (n < int64_t(sizeof(HeadPrefix))) continue;
+        HeadPrefix hp;
+        std::memcpy(&hp, slots[s], sizeof(hp));
+        if (hp.magic != kMagicHead || hp.kind != kind || hp.usedLen > kHeadSlotBytes) continue;
+        if (hp.usedLen > n) {
+            const int64_t more = io->read(f, slots[s] + n, hp.usedLen - size_t(n), uint64_t(s) * kHeadSlotBytes + n);
+            if (more < 0 || n + more < hp.usedLen) continue;
+            n += more;
+        }
+        if (!validHeadSlot(slots[s], size_t(n), kind)) continue;
+        if (bestSlot < 0 || hp.gen > bestGen) {
+            bestSlot = s;
+            bestGen = hp.gen;
+        }
+    }
+    if (bestSlot < 0) return 0;
+    HeadPrefix hp;
+    std::memcpy(&hp, slots[bestSlot], sizeof(hp));
+    best->assign(slots[bestSlot], slots[bestSlot] + hp.usedLen);
+    return 1;
+}
+
+bool validBatchHeader(const BatchHeader& h, uint64_t off, int64_t size) {
+    return h.magic == kMagicBatch && h.ver == 1 &&
+           h.batchLen >= sizeof(BatchHeader) + sizeof(BatchTrailer) &&
+           off + h.batchLen <= uint64_t(size) && (h.batchLen & 7) == 0 &&
+           uint64_t(h.nRows) * sizeof(RecRow) + sizeof(BatchHeader) + sizeof(BatchTrailer) <= h.batchLen;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Partition tail replay (shared by open and the -3 rebuild)
+// ---------------------------------------------------------------------------
+struct TailReplay {
+    uint32_t adopted = 0;
+    uint32_t maxIncarnation = 0;
+    bool touchedSegs[2] = {false, false};
+    std::vector<uint32_t> dSegs;  // data segments whose d must be fsynced
+};
+
+// Applies one validated batch to the in-memory partition state.
+static void applyBatch(Partition* p, const uint8_t* b, uint64_t mOff, TailReplay* tr,
+                       std::vector<std::pair<uint16_t, std::vector<uint8_t>>>* ctls) {
+    BatchHeader h;
+    std::memcpy(&h, b, sizeof(h));
+    BatchTrailer t;
+    std::memcpy(&t, b + h.batchLen - sizeof(BatchTrailer), sizeof(t));
+    p->commitSeq = t.commitSeq;
+    p->pseqHi = t.pseqHi;
+    p->counters.totalCount = t.counters.totalCount;
+    p->counters.totalBytes = t.counters.totalBytes;
+    p->counters.liveCount = t.counters.liveCount;
+    p->counters.liveBytes = t.counters.liveBytes;
+    p->counters.tombCount = t.counters.tombCount;
+    p->counters.minEpoch = t.counters.minEpoch;
+    p->counters.maxEpoch = t.counters.maxEpoch;
+    p->counters.latestArrival = t.counters.latestArrival;
+    p->dLen = t.dCommitted;
+    p->mEnd = mOff + h.batchLen;
+    p->incarnation = t.incarnation;
+    if (t.incarnation > tr->maxIncarnation) tr->maxIncarnation = t.incarnation;
+    if (h.dLen) tr->dSegs.push_back(h.dSeg);
+    const size_t rowsLen = size_t(h.nRows) * sizeof(RecRow);
+    size_t off = sizeof(BatchHeader) + rowsLen + h.attrBytes;
+    if (h.nRows && p->nL0 < kMaxL0Dir) {
+        L0DirEntry& e = p->l0[p->nL0++];
+        e.mSeg = p->mSeg;
+        e.nRows = h.nRows;
+        e.mOff = mOff;
+        e.firstPseq = h.firstPseq;
+        e.batchLen = h.batchLen;
+        e.l0Off = uint32_t(off);
+        p->segRecords += h.nRows;
+    }
+    off += h.l0Bytes;
+    // Lane deltas (by lane id; tuples load lazily from l.fsl).
+    const uint32_t nd = getU32(b + off);
+    for (uint32_t i = 0; i < nd; i++) {
+        LaneDelta d;
+        std::memcpy(&d, b + off + 4 + size_t(i) * sizeof(LaneDelta), sizeof(d));
+        Lane* lane = nullptr;
+        for (auto& l : p->lanes)
+            if (l.id == d.laneId) lane = &l;
+        if (!lane) {
+            p->lanes.emplace_back();
+            lane = &p->lanes.back();
+            lane->id = d.laneId;
+            lane->c.laneId = d.laneId;
+        }
+        lane->c.count += d.dCount;
+        lane->c.bytes += d.dBytes;
+        if (d.maxPseq > lane->c.maxPseq) lane->c.maxPseq = d.maxPseq;
+        if (d.dCount > 0 && (lane->c.firstSeen == 0 || d.firstSeen < lane->c.firstSeen))
+            lane->c.firstSeen = d.firstSeen;
+        if (d.updated > lane->c.updated) lane->c.updated = d.updated;
+        if (d.laneId >= p->nextLaneId) p->nextLaneId = d.laneId + 1;
+    }
+    off += pad8(4 + size_t(nd) * sizeof(LaneDelta));
+    const uint32_t nc = getU32(b + off);
+    size_t q = off + 4;
+    for (uint32_t i = 0; i < nc; i++) {
+        const uint16_t kind = getU16(b + q);
+        const uint16_t len = getU16(b + q + 2);
+        ctls->push_back({kind, std::vector<uint8_t>(b + q + 4, b + q + 4 + len)});
+        if (kind == kCtlLaneCkpt) {
+            // Full table of non-zero lanes after this batch.
+            const uint8_t* body = b + q + 4;
+            const uint32_t n = getU32(body);
+            for (auto& l : p->lanes) l.c.count = 0, l.c.bytes = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                LaneCounter c;
+                std::memcpy(&c, body + 4 + size_t(k) * sizeof(LaneCounter), sizeof(c));
+                Lane* lane = nullptr;
+                for (auto& l : p->lanes)
+                    if (l.id == c.laneId) lane = &l;
+                if (!lane) {
+                    p->lanes.emplace_back();
+                    lane = &p->lanes.back();
+                    lane->id = c.laneId;
+                }
+                lane->c = c;
+            }
+        }
+        q += 4 + len;
+    }
+}
+
+// Applies ctl records that move state across files (seal, merges).
+static void applyCtls(Partition* p, const std::vector<std::pair<uint16_t, std::vector<uint8_t>>>& ctls,
+                      bool* sealed) {
+    for (const auto& c : ctls) {
+        const uint8_t* b = c.second.data();
+        switch (c.first) {
+            case kCtlSeal:
+                *sealed = true;
+                break;
+            case kCtlIntentMerge:
+                p->intentSeg = getU32(b);
+                p->intentGen = getU32(b + 4);
+                p->intentROff = getU64(b + 8);
+                p->intentAOff = getU64(b + 16);
+                p->intentThrough = getU64(b + 24);
+                if (p->intentGen + 1 > p->nextGen) p->nextGen = p->intentGen + 1;
+                break;
+            case kCtlMergeDone: {
+                const uint32_t gen = getU32(b + 4);
+                const uint64_t through = getU64(b + 8);
+                p->mergedThrough = through;
+                p->manifestGen = getU32(b + 32);
+                p->intentGen = 0;
+                p->intentSeg = 0;
+                if (gen + 1 > p->nextGen) p->nextGen = gen + 1;
+                uint32_t k = 0;
+                while (k < p->nL0 && p->l0[k].firstPseq + p->l0[k].nRows - 1 <= through) k++;
+                for (uint32_t i = 0; i + k < p->nL0; i++) p->l0[i] = p->l0[i + k];
+                p->nL0 -= k;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
+static int32_t replayPartitionTail(Engine* e, IoCtx* io, Partition* p, uint32_t incFloor, TailReplay* tr) {
+    const std::string& root = e->root();
+    uint32_t lastInc = incFloor;
+    for (;;) {
+        PathBuf mp;
+        pathPartitionSeg(&mp, root.c_str(), p->pid, 'm', p->mSeg, "fsl");
+        FileRef mf;
+        int32_t rc = io->open(mp.c_str(), mp.len, FLATSQL_IO_READ, FileClass::Meta, &mf);
+        if (rc == FLATSQL_IO_ERR_NOENT) return 0;
+        if (rc < 0) return rc;
+        const int64_t size = io->size(mf);
+        bool sealed = false;
+        uint64_t off = p->mEnd;
+        std::vector<uint8_t> batch;
+        while (off + sizeof(BatchHeader) <= uint64_t(size)) {
+            BatchHeader h;
+            if (io->read(mf, &h, sizeof(h), off) != int64_t(sizeof(h))) break;
+            if (!validBatchHeader(h, off, size) || h.commitSeq != p->commitSeq + 1 ||
+                h.firstPseq != p->pseqHi + 1 || h.dSeg != p->mSeg)
+                break;
+            batch.resize(h.batchLen);
+            if (io->read(mf, batch.data(), h.batchLen, off) != int64_t(h.batchLen)) break;
+            BatchTrailer t;
+            std::memcpy(&t, batch.data() + h.batchLen - sizeof(t), sizeof(t));
+            if (t.magic != kMagicTrailer || t.batchLen != h.batchLen || t.commitSeq != h.commitSeq)
+                break;
+            if (crc32c(batch.data(), h.batchLen - sizeof(t) + offsetof(BatchTrailer, crc)) != t.crc) break;
+            // Stale batches of an older incarnation never chain (open never
+            // zeroes: the incarnation does).
+            if (t.incarnation < lastInc) break;
+            lastInc = t.incarnation;
+            std::vector<std::pair<uint16_t, std::vector<uint8_t>>> ctls;
+            applyBatch(p, batch.data(), off, tr, &ctls);
+            applyCtls(p, ctls, &sealed);
+            tr->adopted++;
+            off += h.batchLen;
+            if (sealed) break;
+        }
+        io->close(&mf);
+        if (!sealed) return 0;
+        // Continue in the next segment (minor 3).
+        p->mSeg = p->nextSeg;
+        p->dSeg = p->nextSeg;
+        p->nextSeg++;
+        p->mEnd = 0;
+        p->dLen = 0;
+        p->segFirstPseq = p->pseqHi + 1;
+        p->segRecords = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Engine::open
+// ---------------------------------------------------------------------------
+int32_t Engine::open(const EngineConfig& cfgIn, std::unique_ptr<Engine>* out, std::string* err) {
+    std::unique_ptr<Engine> e(new Engine());
+    e->cfg_ = cfgIn;
+    EngineConfig& cfg = e->cfg_;
+    if (cfg.writers == 0) cfg.writers = 1;
+    if (cfg.writers > 64) cfg.writers = 64;
+    if (!cfg.io) cfg.io = importIo();
+    e->openIoHolder_.reset(new IoCtx(cfg.io, &e->openIoStats_));
+    e->openIo_ = e->openIoHolder_.get();
+    if (!e->pool_.init(cfg.poolBytes, cfg.slabBytes)) {
+        if (err) *err = "slab pool allocation failed";
+        return FLATSQL_IO_ERR_NOSPACE;
+    }
+    e->reserveSlabs_ = uint32_t(cfg.reserveBytes / cfg.slabBytes);
+    e->partsCap_ = 1u << 16;
+    e->parts_.reset(new std::atomic<Partition*>[e->partsCap_]);
+    for (uint32_t i = 0; i < e->partsCap_; i++) e->parts_[i].store(nullptr, std::memory_order_relaxed);
+    for (uint32_t i = 0; i < cfg.writers; i++) e->writers_.emplace_back(new Writer(e.get(), uint8_t(i)));
+    int32_t rc = e->openStore(err);
+    if (rc < 0) return rc;
+    rc = e->openTypes(err);
+    if (rc < 0) return rc;
+    rc = e->openPartitions(err);
+    if (rc < 0) return rc;
+    // New incarnation: strictly above every incarnation any batch carries.
+    uint32_t inc = e->registry_.incarnation();
+    for (const auto& p : e->partStore_)
+        if (p && p->incarnation > inc) inc = p->incarnation;
+    for (const auto& t : e->typeStore_)
+        if (t->incarnation > inc) inc = t->incarnation;
+    e->incarnation_ = inc + 1;
+    rc = e->registry_.beginIncarnation(e->incarnation_);
+    if (rc < 0) {
+        if (err) *err = "registry head write failed";
+        return rc;
+    }
+    // Pin types, then partitions, to the least-loaded writer (§5.2).
+    for (auto& t : e->typeStore_) {
+        const uint8_t w = e->leastLoadedWriter();
+        t->ownerWriter.store(w);
+        e->writers_[w]->types_.push_back(t.get());
+        e->writers_[w]->pinned_.fetch_add(1);
+    }
+    for (auto& p : e->partStore_) {
+        if (!p) continue;
+        const uint8_t w = e->leastLoadedWriter();
+        p->ownerWriter.store(w);
+        p->ring->ownerWordV.store(ownerWord(p->ownerEpoch, w, kOwnOwned));
+        e->writers_[w]->owned_.push_back(p.get());
+        e->writers_[w]->ownedCount_.fetch_add(1);
+        e->writers_[w]->pinned_.fetch_add(1);
+    }
+    *out = std::move(e);
+    return 0;
+}
+
+int32_t Engine::openStore(std::string* err) {
+    IoCtx* io = openIo_;
+    PathBuf sp, mp;
+    pathStore(&sp, cfg_.root.c_str(), "STORE");
+    pathStore(&mp, cfg_.root.c_str(), "MIGRATED");
+    StoreFile sf{};
+    bool fresh = false;
+    FileRef f;
+    int32_t rc = io->open(sp.c_str(), sp.len, FLATSQL_IO_READ, FileClass::Store, &f);
+    if (rc == 0) {
+        const int64_t n = io->read(f, &sf, sizeof(sf), 0);
+        io->close(&f);
+        const bool valid = n == int64_t(sizeof(sf)) && sf.magic == kMagicStore && sf.format == kFormat &&
+                           sf.crc == crc32c(&sf, offsetof(StoreFile, crc));
+        if (!valid) {
+            // A torn STORE can only come from a crash while creating a fresh
+            // store (it is written once, before anything else). With no
+            // registry frames it is recreated; otherwise refuse.
+            PathBuf rp;
+            pathStore(&rp, cfg_.root.c_str(), "registry.fsl");
+            FileRef rf;
+            bool empty = true;
+            if (io->open(rp.c_str(), rp.len, FLATSQL_IO_READ, FileClass::Registry, &rf) == 0) {
+                empty = io->size(rf) == 0;
+                io->close(&rf);
+            }
+            if (!empty || !cfg_.create) {
+                if (err) *err = "STORE is corrupt";
+                return FLATSQL_IO_ERR_IO;
+            }
+            io->unlink(sp.c_str(), sp.len, false);
+            io->unlink(mp.c_str(), mp.len, false);
+            fresh = true;
+        }
+    } else if (rc == FLATSQL_IO_ERR_NOENT) {
+        if (!cfg_.create) {
+            if (err) *err = "no store at root";
+            return rc;
+        }
+        fresh = true;
+    } else {
+        if (err) *err = "cannot open STORE";
+        return rc;
+    }
+    if (fresh) {
+        sf = StoreFile{};
+        sf.magic = kMagicStore;
+        sf.format = kFormat;
+        const uint64_t a = hash64(cfg_.root.data(), cfg_.root.size(), uint64_t(nowMs()));
+        const uint64_t b = hash64(&a, 8, monoNs());
+        std::memcpy(sf.uuid, &a, 8);
+        std::memcpy(sf.uuid + 8, &b, 8);
+        sf.createdMs = nowMs();
+        sf.gseqFloor = 1;
+        sf.migratedFrom = 0;
+        sf.crc = crc32c(&sf, offsetof(StoreFile, crc));
+        rc = io->open(sp.c_str(), sp.len,
+                      kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_EXCL | FLATSQL_IO_CREATE_PARENTS,
+                      FileClass::Store, &f);
+        if (rc < 0) {
+            if (err) *err = "cannot create STORE";
+            return rc;
+        }
+        rc = io->write(f, &sf, sizeof(sf), 0);
+        if (rc >= 0) rc = io->sync(f);
+        io->close(&f);
+        if (rc < 0) {
+            if (err) *err = "cannot write STORE";
+            return rc;
+        }
+        if (cfg_.freshMarksMigrated) {
+            MigratedFile m{};
+            m.magic = kMagicMigrated;
+            m.format = kFormat;
+            std::memcpy(m.uuid, sf.uuid, 16);
+            m.migratedMs = sf.createdMs;
+            m.crc = crc32c(&m, offsetof(MigratedFile, crc));
+            rc = io->open(mp.c_str(), mp.len,
+                          kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_EXCL | FLATSQL_IO_CREATE_PARENTS,
+                          FileClass::Store, &f);
+            if (rc >= 0) rc = io->write(f, &m, sizeof(m), 0);
+            if (rc >= 0) rc = io->sync(f);
+            io->close(&f);
+            if (rc < 0) {
+                if (err) *err = "cannot write MIGRATED";
+                return rc;
+            }
+        }
+    }
+    if (cfg_.requireMigrated) {
+        MigratedFile m{};
+        rc = io->open(mp.c_str(), mp.len, FLATSQL_IO_READ, FileClass::Store, &f);
+        bool ok = false;
+        if (rc == 0) {
+            ok = io->read(f, &m, sizeof(m), 0) == int64_t(sizeof(m)) && m.magic == kMagicMigrated &&
+                 m.crc == crc32c(&m, offsetof(MigratedFile, crc)) &&
+                 std::memcmp(m.uuid, sf.uuid, 16) == 0;
+            io->close(&f);
+        }
+        if (!ok) {
+            if (err) *err = "store is not MIGRATED (format 2 refuses to start)";
+            return FLATSQL_IO_ERR_ACCESS;
+        }
+    }
+    gseqNext_.store(sf.gseqFloor ? sf.gseqFloor : 1);
+    return registry_.open(io, cfg_.root, cfg_.create || fresh, err);
+}
+
+int32_t Engine::loadTypeConfig(const TypeEntry& te, std::string* err) {
+    IoCtx* io = openIo_;
+    PathBuf cp;
+    pathTypeConfig(&cp, cfg_.root.c_str(), te.fid, te.configFp);
+    FileRef f;
+    int32_t rc = io->open(cp.c_str(), cp.len, FLATSQL_IO_READ, FileClass::Config, &f);
+    if (rc < 0) {
+        if (err) *err = "type config missing";
+        return rc;
+    }
+    const int64_t size = io->size(f);
+    std::vector<uint8_t> buf(size > 0 ? size_t(size) : 0);
+    const bool readOk = size >= 16 && io->read(f, buf.data(), buf.size(), 0) == size;
+    io->close(&f);
+    if (!readOk || getU32(buf.data()) != kMagicTypeConfig ||
+        getU32(buf.data() + 8) != buf.size() - 16 ||
+        crc32c(buf.data() + 16, buf.size() - 16) != getU32(buf.data() + 12)) {
+        if (err) *err = "type config corrupt";
+        return FLATSQL_IO_ERR_IO;
+    }
+    auto cfg = std::make_shared<TypeConfig>();
+    const std::string perr = cfg->parse(buf.data() + 16, buf.size() - 16);
+    if (!perr.empty()) {
+        if (err) *err = perr;
+        return FLATSQL_IO_ERR_GENERIC;
+    }
+    std::unique_ptr<TypeOwner> t(new TypeOwner());
+    std::memcpy(t->fid, te.fid, 4);
+    t->cfg = cfg;
+    t->noticeCap = cfg_.noticeQueue;
+    t->notices.reset(new std::atomic<uint32_t>[t->noticeCap ? t->noticeCap : 1]);
+    typeByFid_[fidU32(te.fid)] = t.get();
+    typeStore_.push_back(std::move(t));
+    return 0;
+}
+
+int32_t Engine::openTypes(std::string* err) {
+    IoCtx* io = openIo_;
+    for (const TypeEntry& te : registry_.types()) {
+        int32_t rc = loadTypeConfig(te, err);
+        if (rc < 0) return rc;
+        TypeOwner* t = typeStore_.back().get();
+        PathBuf hp;
+        pathType(&hp, cfg_.root.c_str(), t->fid, "h.fsh");
+        FileRef hf;
+        rc = io->open(hp.c_str(), hp.len, FLATSQL_IO_READ, FileClass::TypeHead, &hf);
+        std::vector<uint8_t> head;
+        if (rc == 0) {
+            readHeadSlots(io, hf, kHeadType, &head);
+            io->close(&hf);
+        }
+        uint32_t incFloor = 0;
+        uint64_t labelCkptOff = 0;
+        uint32_t labelCkptSeg = 0;
+        bool labelsInline = true;
+        if (!head.empty()) {
+            TypeHeadFixed h;
+            std::memcpy(&h, head.data(), sizeof(h));
+            t->headGen = h.p.gen;
+            t->commitSeq = h.commitSeq;
+            t->gseqHi = h.gseqHi;
+            t->gSeg = h.gSeg;
+            t->incarnation = h.incarnation;
+            incFloor = h.incarnation;
+            t->gLen = h.gLen;
+            t->mSeg = h.mSeg;
+            t->nextSeg = h.nextSeg ? h.nextSeg : 1;
+            t->mEnd = h.mEnd;
+            t->arrivalsCount = h.arrivalsCount;
+            t->firstLiveCount = h.firstLiveCount;
+            t->firstLiveBytes = h.firstLiveBytes;
+            t->nextGen = h.nextGen ? h.nextGen : 1;
+            t->gSegFirstGseq = h.gSegFirstGseq;
+            t->nL0 = h.nL0 <= kMaxTypeL0Dir ? h.nL0 : 0;
+            size_t off = sizeof(h);
+            std::memcpy(t->l0, head.data() + off, sizeof(TypeL0DirEntry) * t->nL0);
+            off += sizeof(TypeL0DirEntry) * h.nL0;
+            if (h.nLabels != 0xffff) {
+                for (uint16_t i = 0; i < h.nLabels; i++) {
+                    LabelEntry le;
+                    std::memcpy(&le, head.data() + off + size_t(i) * sizeof(le), sizeof(le));
+                    t->labeled[le.pid] = le.labeledThrough;
+                }
+            } else {
+                labelsInline = false;
+                labelCkptOff = h.labelCkptOff;
+                labelCkptSeg = h.labelCkptSeg;
+            }
+            t->manifestGenLoaded = h.manifestGen;
+        }
+        // Label checkpoint (A10, > 128 pids): the FULL_LABELS batch.
+        if (!labelsInline) {
+            PathBuf mp;
+            pathTypeSeg(&mp, cfg_.root.c_str(), t->fid, 'm', labelCkptSeg, "fsl");
+            FileRef mf;
+            if (io->open(mp.c_str(), mp.len, FLATSQL_IO_READ, FileClass::TypeMeta, &mf) == 0) {
+                TypeBatchHeader bh;
+                if (io->read(mf, &bh, sizeof(bh), labelCkptOff) == int64_t(sizeof(bh)) &&
+                    bh.magic == kMagicTypeBatch) {
+                    std::vector<uint8_t> labels(size_t(bh.nLabel) * sizeof(LabelEntry));
+                    if (io->read(mf, labels.data(), labels.size(), labelCkptOff + sizeof(bh)) ==
+                        int64_t(labels.size())) {
+                        for (uint32_t i = 0; i < bh.nLabel; i++) {
+                            LabelEntry le;
+                            std::memcpy(&le, labels.data() + size_t(i) * sizeof(le), sizeof(le));
+                            t->labeled[le.pid] = le.labeledThrough;
+                        }
+                    }
+                }
+                io->close(&mf);
+            }
+            t->labelCkptOff = labelCkptOff;
+            t->labelCkptSeg = labelCkptSeg;
+        }
+        // Tail of the type log (A4, A10).
+        PathBuf mp, gp;
+        pathTypeSeg(&mp, cfg_.root.c_str(), t->fid, 'm', t->mSeg, "fsl");
+        pathTypeSeg(&gp, cfg_.root.c_str(), t->fid, 'g', t->gSeg, "fsg");
+        FileRef mf, gf;
+        uint32_t adopted = 0;
+        if (io->open(mp.c_str(), mp.len, kOpenRW, FileClass::TypeMeta, &mf) == 0) {
+            io->open(gp.c_str(), gp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS,
+                     FileClass::Arrivals, &gf);
+            const int64_t size = io->size(mf);
+            uint64_t off = t->mEnd;
+            uint32_t lastInc = incFloor;
+            std::vector<uint8_t> b;
+            while (off + sizeof(TypeBatchHeader) <= uint64_t(size)) {
+                TypeBatchHeader h;
+                if (io->read(mf, &h, sizeof(h), off) != int64_t(sizeof(h))) break;
+                if (h.magic != kMagicTypeBatch || h.ver != 1 || h.commitSeq != t->commitSeq + 1 ||
+                    h.batchLen < sizeof(h) + 8 || off + h.batchLen > uint64_t(size) ||
+                    h.incarnation < lastInc || h.gSeg != t->gSeg)
+                    break;
+                b.resize(h.batchLen);
+                if (io->read(mf, b.data(), h.batchLen, off) != int64_t(h.batchLen)) break;
+                if (crc32c(b.data(), h.batchLen - 8) != getU32(b.data() + h.batchLen - 8)) break;
+                // Arrivals must be durable too: validate them by their CRC.
+                if (h.nArrivals) {
+                    std::vector<uint8_t> g(size_t(h.nArrivals) * kArrivalBytes);
+                    if (!gf.valid() || io->read(gf, g.data(), g.size(), h.gOff) != int64_t(g.size()) ||
+                        crc32c(g.data(), g.size()) != h.gCrc)
+                        break;
+                    if (h.gOff != t->gLen) break;
+                }
+                lastInc = h.incarnation;
+                t->commitSeq = h.commitSeq;
+                t->incarnation = h.incarnation;
+                if (h.gseqHi > t->gseqHi) t->gseqHi = h.gseqHi;
+                t->gLen = h.gOff + uint64_t(h.nArrivals) * kArrivalBytes;
+                t->arrivalsCount = h.arrivalsCount;
+                t->firstLiveCount = h.firstLiveCount;
+                t->firstLiveBytes = h.firstLiveBytes;
+                for (uint32_t i = 0; i < h.nLabel; i++) {
+                    LabelEntry le;
+                    std::memcpy(&le, b.data() + sizeof(h) + size_t(i) * sizeof(le), sizeof(le));
+                    t->labeled[le.pid] = le.labeledThrough;
+                }
+                if (h.flags & 1) {
+                    t->labelCkptOff = off;
+                    t->labelCkptSeg = t->mSeg;
+                }
+                if (h.flags & 4) {
+                    // MERGE_DONE: every earlier L0 block is in the new run.
+                    t->nL0 = 0;
+                    t->manifestGenLoaded = uint32_t(h.firstGseq);
+                    if (uint32_t(h.firstGseq) + 1 > t->nextGen) t->nextGen = uint32_t(h.firstGseq) + 1;
+                } else {
+                    const uint32_t l0Len = h.batchLen - 8 - h.l0Off;
+                    if (l0Len && t->nL0 < kMaxTypeL0Dir) {
+                        TypeL0DirEntry& de = t->l0[t->nL0++];
+                        de.mSeg = t->mSeg;
+                        de.l0Len = l0Len;
+                        de.mOff = off;
+                        de.commitSeq = h.commitSeq;
+                        de.batchLen = h.batchLen;
+                        de.l0Off = h.l0Off;
+                    }
+                }
+                off += h.batchLen;
+                t->mEnd = off;
+                adopted++;
+            }
+            if (adopted) {
+                // A4: make the adopted tail durable before anything is published.
+                if ((gf.valid() && io->sync(gf) < 0) || io->sync(mf) < 0) {
+                    if (err) *err = "type tail fsync failed";
+                    return FLATSQL_IO_ERR_IO;
+                }
+            }
+            io->close(&mf);
+            if (gf.valid()) io->close(&gf);
+        }
+        // Type manifest: live catalog runs.
+        if (t->manifestGenLoaded) {
+            PathBuf mfp;
+            char name[32];
+            snprintf(name, sizeof(name), "mf-%06x.fsm", t->manifestGenLoaded);
+            pathType(&mfp, cfg_.root.c_str(), t->fid, name);
+            FileRef f;
+            if (io->open(mfp.c_str(), mfp.len, FLATSQL_IO_READ, FileClass::Manifest, &f) == 0) {
+                const int64_t size = io->size(f);
+                std::vector<uint8_t> man(size > 0 ? size_t(size) : 0);
+                if (size >= 24 && io->read(f, man.data(), man.size(), 0) == size &&
+                    getU32(man.data()) == kMagicManifest) {
+                    const uint32_t n = getU32(man.data() + 4);
+                    const size_t body = 16 + size_t(n) * 16;
+                    if (body + 8 <= man.size() && crc32c(man.data(), body) == getU32(man.data() + body)) {
+                        for (uint32_t i = 0; i < n; i++) {
+                            SegRun r;
+                            r.gen = getU32(man.data() + 16 + size_t(i) * 16);
+                            r.fileLen = getU64(man.data() + 16 + size_t(i) * 16 + 8);
+                            t->runs.push_back(std::move(r));
+                        }
+                    }
+                }
+                io->close(&f);
+            }
+        }
+        const uint64_t floor = t->gseqHi + 1;
+        if (floor > gseqNext_.load()) gseqNext_.store(floor);
+        if (adopted) {
+            adoptedBatches += adopted;
+            rc = typeEnsureFiles(io, this, t);
+            if (rc >= 0) {
+                uint8_t slot[kHeadSlotBytes];
+                t->headGen++;
+                uint32_t used;
+                encodeTypeHead(t, slot, &used, true);
+                rc = io->write(t->h, slot, used, (t->headGen % 2) * kHeadSlotBytes);
+                if (rc >= 0) rc = io->sync(t->h);
+            }
+            if (rc < 0) {
+                if (err) *err = "type head write failed";
+                return rc;
+            }
+            io->close(&t->h);
+            io->close(&t->m);
+            io->close(&t->g);
+        }
+        t->publishedGseqHi.store(t->gseqHi);
+        t->publishedArrivals.store(t->arrivalsCount);
+    }
+    return 0;
+}
+
+Partition* Engine::makePartition(const PartitionEntry& e, uint8_t writer) {
+    std::unique_ptr<Partition> p(new Partition());
+    p->pid = e.pid;
+    std::memcpy(p->fid, e.fid, 4);
+    p->token = e.token;
+    p->type = type(e.fid);
+    const uint64_t cap = p->type && p->type->cfg && p->type->cfg->ringCap() ? p->type->cfg->ringCap()
+                                                                            : cfg_.defaultRingCap;
+    p->ring = ringCreate(e.pid, cap, cfg_.maxEntryBytes, cfg_.slabBytes);
+    p->ownerWriter.store(writer);
+    p->ring->ownerWordV.store(ownerWord(1, writer, kOwnOwned));
+    p->segOpenedMs = nowMs();
+    Partition* raw = p.get();
+    if (partStore_.size() <= e.pid) partStore_.resize(e.pid + 1);
+    partStore_[e.pid] = std::move(p);
+    if (e.pid < partsCap_) parts_[e.pid].store(raw, std::memory_order_release);
+    nParts_.fetch_add(1);
+    if (raw->type) typeAddPartition(raw->type, raw);
+    std::string key = raw->token;
+    key.append(reinterpret_cast<const char*>(e.fid), 4);
+    pidByKey_[key] = e.pid;
+    return raw;
+}
+
+int32_t Engine::openPartitions(std::string* err) {
+    IoCtx* io = openIo_;
+    for (const PartitionEntry& pe : registry_.partitions()) {
+        if (pe.dropped) continue;
+        Partition* p = makePartition(pe, 0);
+        p->quarantined = pe.quarantined;
+        PathBuf hp;
+        pathPartition(&hp, cfg_.root.c_str(), p->pid, "h.fsh");
+        FileRef hf;
+        int32_t rc = io->open(hp.c_str(), hp.len, FLATSQL_IO_READ, FileClass::Head, &hf);
+        std::vector<uint8_t> head;
+        if (rc == 0) {
+            readHeadSlots(io, hf, kHeadPartition, &head);
+            io->close(&hf);
+        }
+        uint32_t incFloor = 0;
+        if (!head.empty()) {
+            PartitionHeadFixed h;
+            std::memcpy(&h, head.data(), sizeof(h));
+            p->headGen = h.p.gen;
+            p->ownerEpoch = h.p.ownerEpoch ? h.p.ownerEpoch : 1;
+            p->commitSeq = h.commitSeq;
+            p->pseqHi = h.pseqHi;
+            p->mSeg = h.mSeg;
+            p->incarnation = h.incarnation;
+            incFloor = h.incarnation;
+            p->mEnd = h.mEnd;
+            p->dSeg = h.dSeg;
+            p->nextSeg = h.nextSeg ? h.nextSeg : h.mSeg + 1;
+            p->dLen = h.dLen;
+            p->mergedThrough = h.mergedThrough;
+            p->manifestGen = h.manifestGen;
+            p->nextGen = h.nextGen ? h.nextGen : 1;
+            p->counters = h.counters;
+            p->nextLaneId = h.nextLaneId ? h.nextLaneId : 1;
+            p->segFirstPseq = h.segFirstPseq ? h.segFirstPseq : 1;
+            p->intentSeg = h.intentSeg;
+            p->intentGen = h.intentGen;
+            p->intentROff = h.intentROff;
+            p->intentAOff = h.intentAOff;
+            p->intentThrough = h.intentThrough;
+            p->nL0 = h.nL0 <= kMaxL0Dir ? h.nL0 : 0;
+            size_t off = sizeof(h);
+            std::memcpy(p->l0, head.data() + off, sizeof(L0DirEntry) * p->nL0);
+            off += sizeof(L0DirEntry) * h.nL0;
+            if (h.nLanes != 0xffff) {
+                for (uint16_t i = 0; i < h.nLanes; i++) {
+                    Lane l;
+                    std::memcpy(&l.c, head.data() + off + size_t(i) * sizeof(LaneCounter), sizeof(LaneCounter));
+                    l.id = l.c.laneId;
+                    p->lanes.push_back(std::move(l));
+                }
+            } else if (h.lanesOverflowOff) {
+                PathBuf mp;
+                pathPartitionSeg(&mp, cfg_.root.c_str(), p->pid, 'm', h.lanesOverflowSeg, "fsl");
+                FileRef mf;
+                if (io->open(mp.c_str(), mp.len, FLATSQL_IO_READ, FileClass::Meta, &mf) == 0) {
+                    uint8_t nb[4];
+                    if (io->read(mf, nb, 4, h.lanesOverflowOff) == 4) {
+                        const uint32_t n = getU32(nb);
+                        std::vector<LaneCounter> lc(n);
+                        if (io->read(mf, lc.data(), n * sizeof(LaneCounter), h.lanesOverflowOff + 4) ==
+                            int64_t(n * sizeof(LaneCounter))) {
+                            for (const auto& c : lc) {
+                                Lane l;
+                                l.id = c.laneId;
+                                l.c = c;
+                                p->lanes.push_back(std::move(l));
+                            }
+                        }
+                    }
+                    io->close(&mf);
+                }
+            }
+        } else {
+            // No valid head: an empty partition, or both slots torn (-3):
+            // rebuild from the meta log alone (still no payload byte).
+            p->mSeg = 0;
+            p->dSeg = 0;
+            p->nextSeg = 1;
+            p->segFirstPseq = 1;
+        }
+        TailReplay tr;
+        rc = replayPartitionTail(this, io, p, incFloor, &tr);
+        if (rc < 0) {
+            if (err) *err = "partition tail scan failed";
+            return rc;
+        }
+        if (tr.adopted) {
+            // A4: fsync d and m before adopting, then a durable checkpoint head.
+            std::sort(tr.dSegs.begin(), tr.dSegs.end());
+            tr.dSegs.erase(std::unique(tr.dSegs.begin(), tr.dSegs.end()), tr.dSegs.end());
+            bool ok = true;
+            for (uint32_t seg : tr.dSegs) {
+                PathBuf dp;
+                pathPartitionSeg(&dp, cfg_.root.c_str(), p->pid, 'd', seg, "fsd");
+                FileRef df;
+                if (io->open(dp.c_str(), dp.len, kOpenRW, FileClass::Data, &df) == 0) {
+                    ok = ok && io->sync(df) == 0;
+                    io->close(&df);
+                }
+            }
+            for (uint32_t seg = (tr.dSegs.empty() ? p->mSeg : tr.dSegs.front()); seg <= p->mSeg; seg++) {
+                PathBuf mp;
+                pathPartitionSeg(&mp, cfg_.root.c_str(), p->pid, 'm', seg, "fsl");
+                FileRef mf;
+                if (io->open(mp.c_str(), mp.len, kOpenRW, FileClass::Meta, &mf) == 0) {
+                    ok = ok && io->sync(mf) == 0;
+                    io->close(&mf);
+                }
+            }
+            if (!ok) {
+                // Never adopt what cannot be made durable (A4): quarantine.
+                p->quarantined = true;
+                p->ring->state.store(kRingQuarantined);
+            } else {
+                adoptedBatches += tr.adopted;
+                FileRef h;
+                rc = io->open(hp.c_str(), hp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS,
+                              FileClass::Head, &h);
+                if (rc >= 0) {
+                    uint8_t slot[kHeadSlotBytes];
+                    p->headGen++;
+                    uint32_t used;
+                    encodePartitionHead(p, slot, &used, true);
+                    rc = io->write(h, slot, used, (p->headGen % 2) * kHeadSlotBytes);
+                    if (rc >= 0) rc = io->sync(h);
+                    io->close(&h);
+                }
+                if (rc < 0) {
+                    if (err) *err = "partition checkpoint head write failed";
+                    return rc;
+                }
+            }
+        }
+        // A11: outputs of a merge INTENT without MERGE_DONE are discarded, and
+        // r/a are cut back to the extents the last MERGE_DONE covers.
+        if (p->intentGen) {
+            PathBuf xp, mfp, rp, ap;
+            pathPartitionRun(&xp, cfg_.root.c_str(), p->pid, p->intentSeg, p->intentGen);
+            pathPartitionManifest(&mfp, cfg_.root.c_str(), p->pid, p->intentGen);
+            io->unlink(xp.c_str(), xp.len, false);
+            io->unlink(mfp.c_str(), mfp.len, false);
+            pathPartitionSeg(&rp, cfg_.root.c_str(), p->pid, 'r', p->intentSeg, "fsr");
+            pathPartitionSeg(&ap, cfg_.root.c_str(), p->pid, 'a', p->intentSeg, "fsa");
+            FileRef rf, af;
+            if (io->open(rp.c_str(), rp.len, kOpenRW, FileClass::Rows, &rf) == 0) {
+                if (io->size(rf) > int64_t(p->intentROff)) io->truncate(rf, p->intentROff);
+                io->sync(rf);
+                io->close(&rf);
+            }
+            if (io->open(ap.c_str(), ap.len, kOpenRW, FileClass::Attrs, &af) == 0) {
+                if (io->size(af) > int64_t(p->intentAOff)) io->truncate(af, p->intentAOff);
+                io->sync(af);
+                io->close(&af);
+            }
+            PathBuf dir;
+            pathPartitionDir(&dir, cfg_.root.c_str(), p->pid);
+            FileRef df;
+            if (io->open(dir.c_str(), dir.len, FLATSQL_IO_DIRECTORY, FileClass::Directory, &df) == 0) {
+                io->sync(df);
+                io->close(&df);
+            }
+            p->intentGen = 0;
+            p->intentSeg = 0;
+        }
+        p->pub.commitSeq = p->commitSeq;
+        p->pub.pseqHi = p->pseqHi;
+        p->pub.nL0 = p->nL0;
+        std::memcpy(p->pub.l0, p->l0, sizeof(L0DirEntry) * p->nL0);
+        p->durablePseqHi.store(p->pseqHi);
+        p->durableCommitSeq.store(p->commitSeq);
+        p->durableMEnd.store(p->mEnd);
+        if (p->type) {
+            auto it = p->type->labeled.find(p->pid);
+            p->labeledThrough.store(it == p->type->labeled.end() ? 0 : it->second);
+        }
+        p->lastCkptNs = monoNs();
+        p->lastActivityNs = monoNs();
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Registration (rare; the registration lock is not on any record path)
+// ---------------------------------------------------------------------------
+int32_t Engine::registerType(const std::vector<uint8_t>& config, std::string* err) {
+    auto cfg = std::make_shared<TypeConfig>();
+    const std::string perr = cfg->parse(config.data(), config.size());
+    if (!perr.empty()) {
+        if (err) *err = perr;
+        return FLATSQL_IO_ERR_GENERIC;
+    }
+    const uint64_t t0 = monoNs();
+    std::lock_guard<std::mutex> guard(regMutex_);
+    TypeOwner* existing = type(cfg->fid());
+    if (existing && existing->cfg->fingerprint() == cfg->fingerprint()) return 0;
+    if (existing) {
+        if (err) *err = "schema change of a registered type is a separate operation";
+        return FLATSQL_IO_ERR_GENERIC;
+    }
+    IoCtx* io = openIo_;
+    PathBuf cp;
+    pathTypeConfig(&cp, cfg_.root.c_str(), cfg->fid(), cfg->fingerprint());
+    FileRef f;
+    int32_t rc = io->open(cp.c_str(), cp.len,
+                          kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
+                          FileClass::Config, &f);
+    if (rc < 0) return rc;
+    std::vector<uint8_t> file(16 + config.size());
+    putU32(file.data(), kMagicTypeConfig);
+    putU32(file.data() + 4, 1);
+    putU32(file.data() + 8, uint32_t(config.size()));
+    putU32(file.data() + 12, crc32c(config.data(), config.size()));
+    std::memcpy(file.data() + 16, config.data(), config.size());
+    rc = io->write(f, file.data(), file.size(), 0);
+    if (rc >= 0) rc = io->sync(f);
+    io->close(&f);
+    if (rc < 0) return rc;
+    TypeEntry te;
+    std::memcpy(te.fid, cfg->fid(), 4);
+    te.schemaName = cfg->schemaName();
+    te.configFp = cfg->fingerprint();
+    rc = registry_.appendType(te);
+    if (rc < 0) return rc;
+    std::unique_ptr<TypeOwner> t(new TypeOwner());
+    std::memcpy(t->fid, te.fid, 4);
+    t->cfg = cfg;
+    t->noticeCap = cfg_.noticeQueue;
+    t->notices.reset(new std::atomic<uint32_t>[t->noticeCap ? t->noticeCap : 1]);
+    t->mSeg = 0;
+    t->gSeg = 0;
+    TypeOwner* raw = t.get();
+    typeByFid_[fidU32(te.fid)] = raw;
+    typeStore_.push_back(std::move(t));
+    const uint8_t w = leastLoadedWriter();
+    writers_[w]->pinned_.fetch_add(1);
+    raw->ownerWriter.store(w);
+    if (!started_) {
+        writers_[w]->types_.push_back(raw);
+    } else {
+        Cmd c;
+        c.kind = kCmdAdoptType;
+        c.ptr = raw;
+        while (!writers_[w]->mailbox().push(c)) cpuRelax();
+        writers_[w]->ring();
+    }
+    if (cfg_.lockStats) lockHist_.record(monoNs() - t0);
+    return 0;
+}
+
+int32_t Engine::registerPartition(const uint8_t* peer, size_t peerLen, const uint8_t fid[4], uint32_t* pidOut) {
+    const std::string token = producerToken(peer, peerLen);
+    std::string key = token;
+    key.append(reinterpret_cast<const char*>(fid), 4);
+    std::lock_guard<std::mutex> guard(regMutex_);
+    const uint64_t t0 = monoNs();
+    auto it = pidByKey_.find(key);
+    if (it != pidByKey_.end()) {
+        *pidOut = it->second;
+        return 0;
+    }
+    TypeOwner* t = type(fid);
+    if (!t) return FLATSQL_IO_ERR_NOENT;
+    PartitionEntry e;
+    e.pid = registry_.maxPid() + 1;
+    if (e.pid >= partsCap_) return FLATSQL_IO_ERR_NOSPACE;
+    std::memcpy(e.fid, fid, 4);
+    e.token = token;
+    std::string typeName = t->cfg->schemaName();
+    const size_t dot = typeName.find('.');
+    if (dot != std::string::npos) typeName = typeName.substr(0, dot);
+    e.sqlName = "sds_p_" + token + "__" + typeName;
+    e.schemaFp = t->cfg->fingerprint();
+    e.ordinal = registry_.maxPid();
+    e.ctimeMs = nowMs();
+    // Intent rule (§4.7): the frame is durable before p/<pid>/ exists.
+    int32_t rc = registry_.appendPartition(e);
+    if (rc < 0) return rc;
+    PathBuf hp;
+    pathPartition(&hp, cfg_.root.c_str(), e.pid, "h.fsh");
+    FileRef h;
+    // A10: created with EXCL; EEXIST (a reused pid) fails the REGISTER.
+    rc = openIo_->open(hp.c_str(), hp.len,
+                       kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_EXCL | FLATSQL_IO_CREATE_PARENTS,
+                       FileClass::Head, &h);
+    if (rc < 0) return rc;
+    openIo_->close(&h);
+    const uint8_t w = leastLoadedWriter();
+    Partition* p = makePartition(e, w);
+    p->mSeg = 0;
+    p->dSeg = 0;
+    p->nextSeg = 1;
+    p->segFirstPseq = 1;
+    p->lanesLoaded = false;
+    p->lastCkptNs = monoNs();
+    p->lastActivityNs = monoNs();
+    writers_[w]->pinned_.fetch_add(1);
+    if (!started_) {
+        writers_[w]->owned_.push_back(p);
+        writers_[w]->ownedCount_.fetch_add(1);
+    } else {
+        Cmd c;
+        c.kind = kCmdAdoptPartition;
+        c.a = e.pid;
+        c.b = 0;
+        while (!writers_[w]->mailbox().push(c)) cpuRelax();
+        writers_[w]->ring();
+    }
+    *pidOut = e.pid;
+    if (cfg_.lockStats) lockHist_.record(monoNs() - t0);
+    return 0;
+}
+
+}  // namespace ps
+}  // namespace flatsql

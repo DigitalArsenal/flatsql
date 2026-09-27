@@ -1,0 +1,41 @@
+// FlatSQL partition store: per-record attributes (docs/PARTITION-STORE.md §4).
+//
+// The router builds one RecordAttr per ring entry. The writer stores the bytes
+// verbatim in the meta log (ATTR_IN_M) and, after a merge, in a-<seg>.fsa.
+// A RecordAttr carries at most ONE SourceTag: every tag instance is its own
+// row (the PUT that first stored the record, or a RETAG), so RECONCILE can
+// retire one instance without touching the others (design A2).
+//
+// Regenerate the C++ header with the published DA-fork compiler:
+//   npx flatc-wasm --cpp -o cpp/include/flatsql/ps schemas/flatsql_attr.fbs
+// (scripts: docs/PARTITION-STORE.md "Generated code").
+
+namespace flatsql.ps.fb;
+
+table SourceTag {
+  provider_id: string;
+  source_name: string;
+  source_url: string;
+  batch_id: string;
+  content_key_id: string;
+  producer_peer_id: string;
+  producer_public_key: string;
+}
+
+table RecordAttr {
+  // Raw bytes of the peer id the storing call received (design A3). The
+  // partition token is derived from these bytes by the engine.
+  peer_id: [ubyte];
+  signature: [ubyte];
+  // The stored supersede key, when the router or store-migrate supplies it
+  // verbatim (design §22.3a minor 9). Absent: the engine derives it.
+  supersede_key: string;
+  // Legacy source_timestamp (unix seconds at ingest); 0 = absent.
+  source_timestamp: long;
+  // (provider, source, batch) key of the LICENCE frame that covers the record.
+  licence_key: string;
+  tags: [SourceTag];
+}
+
+root_type RecordAttr;
+file_identifier "FSRA";

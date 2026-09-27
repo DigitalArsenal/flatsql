@@ -52,6 +52,26 @@
 #define FLATSQL_IO_PROBE      0x0040  /* xAccess: does the path exist?      */
 #define FLATSQL_IO_UNLINK     0x0080  /* xDelete: remove the path           */
 
+/* Partition store flags (docs/PARTITION-STORE.md §5.4, design A12/A38).
+ * They are flags, not imports: the import set stays seven.
+ *
+ * CREATE_PARENTS: create every missing parent directory (fsyncing the parent
+ *   of each one created) and, when the file itself is newly created, fsync its
+ *   parent directory before returning. A handle returned for a new file names
+ *   a durable directory entry.
+ * UNLINK_IF_UNUSED: with UNLINK, refuse with FLATSQL_IO_ERR_BUSY while any
+ *   handle on the path is open. After a successful unlink the host fsyncs the
+ *   parent directory.
+ * OPEN_DEFERRED: the browser may return a pending handle whose first read or
+ *   write blocks until the open resolves. Synchronous hosts ignore it.
+ * DIRECTORY: open a directory for flatsql_io_sync (directory durability). The
+ *   handle supports only sync and close. Hosts without directory durability
+ *   (OPFS) return a handle whose sync succeeds as a no-op. */
+#define FLATSQL_IO_CREATE_PARENTS   0x0100
+#define FLATSQL_IO_UNLINK_IF_UNUSED 0x0200
+#define FLATSQL_IO_OPEN_DEFERRED    0x0400
+#define FLATSQL_IO_DIRECTORY        0x0800
+
 /* ---- status codes (all negative; every call may return any of them) ---- */
 #define FLATSQL_IO_ERR_GENERIC    (-1)
 #define FLATSQL_IO_ERR_NOENT      (-2)
@@ -59,6 +79,8 @@
 #define FLATSQL_IO_ERR_IO         (-4)
 #define FLATSQL_IO_ERR_NOSPACE    (-5)
 #define FLATSQL_IO_ERR_BADHANDLE  (-6)
+#define FLATSQL_IO_ERR_BUSY       (-7)  /* UNLINK_IF_UNUSED on a path in use */
+#define FLATSQL_IO_ERR_EXIST      (-8)  /* CREATE|EXCL on an existing path   */
 
 #if defined(__wasm__)
 #  define FLATSQL_IO_IMPORT(name) \

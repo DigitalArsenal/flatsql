@@ -1,0 +1,491 @@
+// FlatSQL partition store: on-disk format 2 (design §4, amendments A2, A9,
+// A10, A11, A17; implementation notes in docs/PARTITION-STORE.md).
+//
+// All integers are little-endian; every checksum is CRC32C. Structures are
+// packed and copied in and out of byte buffers with memcpy, never referenced
+// in place, so unaligned buffers are safe on every host.
+#ifndef FLATSQL_PS_FORMAT_H
+#define FLATSQL_PS_FORMAT_H
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+namespace flatsql {
+namespace ps {
+
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "format 2 is little-endian");
+
+constexpr uint16_t kFormat = 2;
+
+// ---- magics ---------------------------------------------------------------
+constexpr uint32_t fourcc(char a, char b, char c, char d) {
+    return uint32_t(uint8_t(a)) | (uint32_t(uint8_t(b)) << 8) | (uint32_t(uint8_t(c)) << 16) |
+           (uint32_t(uint8_t(d)) << 24);
+}
+constexpr uint32_t kMagicStore = fourcc('F', 'S', 'Q', '2');
+constexpr uint32_t kMagicMigrated = fourcc('F', 'S', 'Q', 'M');
+constexpr uint32_t kMagicHead = fourcc('F', 'S', 'H', '2');
+constexpr uint32_t kMagicBatch = fourcc('F', 'S', 'M', 'B');
+constexpr uint32_t kMagicTrailer = fourcc('F', 'S', 'M', 'T');
+constexpr uint32_t kMagicTypeBatch = fourcc('F', 'S', 'T', 'B');
+constexpr uint32_t kMagicL0 = fourcc('F', 'S', 'X', '0');
+constexpr uint32_t kMagicL1 = fourcc('F', 'S', 'X', '1');
+constexpr uint32_t kMagicL1Footer = fourcc('F', 'S', 'X', 'T');
+constexpr uint32_t kMagicManifest = fourcc('F', 'S', 'M', 'F');
+constexpr uint32_t kMagicTypeConfig = fourcc('F', 'S', 'T', 'C');
+constexpr uint32_t kMagicLane = fourcc('F', 'S', 'L', 'N');
+
+// ---- sizes ----------------------------------------------------------------
+constexpr uint32_t kHeadSlotBytes = 4096;
+constexpr uint32_t kHeadReadBytes = 1024;  // speculative first read per slot
+constexpr uint32_t kCidLen = 36;           // CIDv1 raw sha2-256, binary
+constexpr uint32_t kCidKeyLen = 37;        // A17 text-order sort key
+constexpr uint32_t kMaxKeyLen = 512;       // longer string keys: prefix + hash
+constexpr uint32_t kMaxL0Dir = 48;         // unmerged batches listed in a head
+constexpr uint32_t kMaxInlineLanes = 32;
+constexpr uint32_t kMaxTypeL0Dir = 48;
+constexpr uint32_t kMaxInlineLabels = 128;
+constexpr uint32_t kArrivalBytes = 24;
+
+// ---- row kinds and flags (RecRow.kind / .flags) ----------------------------
+enum RowKind : uint8_t {
+    kRowPut = 1,
+    kRowTomb = 2,
+    kRowLicence = 3,
+    kRowCtl = 4,
+    kRowCtlTomb = 5,
+    kRowRetag = 6,    // A2: another tag instance of a live PUT (target_pseq)
+    kRowTagTomb = 7,  // A2: retires one tag instance (target_pseq = instance)
+};
+
+enum RowFlag : uint8_t {
+    kRowSealed = 0x01,
+    kRowHasAttr = 0x02,
+    kRowAttrInM = 0x04,
+    kRowSupersedes = 0x08,
+    kRowJumbo = 0x10,
+    kRowCidVerified = 0x20,
+    kRowTxn = 0x40,
+};
+
+// ---- index kinds (L0 / L1 postings) ----------------------------------------
+// Partition kinds map key -> pseq (8-byte big-endian value).
+enum IndexKind : uint16_t {
+    kIxCid = 1,            // cid sort key (A17) -> PUT pseq
+    kIxEpoch = 2,          // i64 epoch_ms -> pseq
+    kIxTagProvider = 3,    // provider_id -> instance pseq
+    kIxTagSource = 4,
+    kIxTagBatch = 5,
+    kIxTagPeer = 6,
+    kIxTagPubkey = 7,
+    kIxSourceEpoch = 8,    // (source_name, epoch_ms)
+    kIxProviderEpoch = 9,  // (provider_id, epoch_ms)
+    kIxSupersede = 10,     // stored supersede key -> PUT pseq
+    kIxDead = 11,          // u64 target pseq -> killer pseq
+    kIxSpatial = 12,       // u64 cell
+    kIxText = 13,          // token (T8)
+    kIxObjectEpoch = 14,   // (object key, epoch_ms) (A18)
+    kIxTagOf = 15,         // (PUT pseq, tag hash) -> instance pseq (A2)
+    kIxTagPS = 16,         // (provider_id, source_name) -> instance pseq (RECONCILE)
+    kIxLicence = 17,       // licence key -> LICENCE pseq
+    kIxColBase = 0x100,    // COL(n) = kIxColBase + n
+    // Type-owner kinds (t/<fid>/): value layouts in type_owner.h.
+    kIxTypeCid = 0x200,    // cid sort key -> {pid, pseq, tcs, label, gseq}
+    kIxTypeLabel = 0x201,  // (pid, pseq) -> {tcs, gseq, label} (A16)
+    kIxTypeRehome = 0x202, // gseq -> {pid, pseq, tcs} (A14)
+    kIxTypeRepeat = 0x203, // (pid, pseq) -> {} REPEAT run
+};
+
+enum KeyType : uint8_t {
+    kKeyBytes = 0,
+    kKeyI64 = 1,
+    kKeyF64 = 2,
+    kKeyU64 = 3,
+    kKeyStrI64 = 4,
+    kKeyCid = 5,
+    kKeyU32U64 = 6,
+    kKeyU64U64 = 7,
+};
+
+// ---- ctl records inside a meta batch ---------------------------------------
+enum CtlKind : uint16_t {
+    kCtlSeal = 1,          // {seg u32, d_len u64, end_pseq u64}
+    kCtlMergeDone = 2,     // {seg u32, gen u32, through u64, r_len u64, a_len u64, manifest_gen u32}
+    kCtlIntentCompact = 3,
+    kCtlSwap = 4,
+    kCtlRetire = 5,
+    kCtlSplit = 6,
+    kCtlReconcileDone = 7, // {rseq u64}
+    kCtlTxnEnd = 8,        // {txn_id u64}
+    kCtlIntentMerge = 9,   // A11 {seg, gen, r_off, a_off, through, first_pseq}
+    kCtlUnlinked = 10,     // A12
+    kCtlLaneCkpt = 11,     // full lane counter table (overflow past 32 inline)
+    kCtlQuarantine = 12,
+};
+
+// ---- registry frame kinds (A10, §4.7) --------------------------------------
+enum RegistryKind : uint16_t {
+    kRegPartitionAdd = 1,
+    kRegTypeAdd = 2,
+    kRegQuarantine = 3,
+    kRegUnquarantine = 4,
+    kRegSplit = 5,
+    kRegDrop = 6,
+    kRegSchemaChange = 7,
+    kRegWriterIncarnation = 8,
+};
+
+enum HeadKind : uint16_t { kHeadPartition = 1, kHeadType = 2, kHeadRegistry = 3 };
+enum HeadFlag : uint32_t { kHeadDurableCkpt = 1, kHeadQuarantined = 2 };
+
+#pragma pack(push, 1)
+
+struct Counters {
+    uint64_t totalCount = 0;  // PUT rows ever appended
+    uint64_t totalBytes = 0;  // sum(len - 4) of those PUTs
+    uint64_t liveCount = 0;   // PUT rows not dead
+    uint64_t liveBytes = 0;   // sum(len - 4) of live PUTs (minor 10)
+    uint64_t tombCount = 0;   // TOMB rows
+    uint64_t diskBytes = 0;   // bytes of the partition's files (§13)
+    int64_t minEpoch = INT64_MAX;
+    int64_t maxEpoch = INT64_MIN;
+    int64_t latestArrival = INT64_MIN;
+};
+static_assert(sizeof(Counters) == 72, "Counters layout");
+
+// RecRow: 128 bytes, fixed (§4.3 plus A2's RETAG / TAG_TOMB).
+struct RecRow {
+    uint64_t pseq;
+    uint32_t seg;
+    uint32_t off;
+    uint32_t len;          // includes the 4-byte size prefix
+    uint8_t kind;
+    uint8_t flags;
+    uint8_t fid[4];
+    uint8_t cidLen;
+    uint8_t pad0;
+    uint32_t dataCrc;      // CRC32C of the frame bytes [off, off+len)
+    int64_t epochMs;       // COALESCE(payload epoch, arrival_ms)
+    int64_t arrivalMs;
+    uint64_t targetPseq;   // TOMB/RETAG/TAG_TOMB target; PUT+SUPERSEDES: superseded
+    uint64_t attrOff;      // offset in a-<seg> or, with ATTR_IN_M, in m-<seg>
+    uint32_t attrLen;
+    uint32_t laneId;       // lane of this row's tag instance (0 = none)
+    uint8_t cid[36];
+    uint64_t supersedeHash;
+    uint64_t tagHash;      // A2 tag-tuple identity hash (0 = no tag)
+    uint32_t aux;          // CTL: txn id low bits; otherwise 0
+};
+static_assert(sizeof(RecRow) == 128, "RecRow is 128 bytes");
+static_assert(offsetof(RecRow, cid) == 72, "RecRow.cid at 72");
+static_assert(offsetof(RecRow, supersedeHash) == 108, "RecRow.supersedeHash at 108");
+
+struct BatchHeader {
+    uint32_t magic;
+    uint16_t ver;
+    uint16_t flags;
+    uint64_t commitSeq;
+    uint64_t firstPseq;
+    uint32_t nRows;
+    uint32_t nAttr;
+    uint32_t dSeg;
+    uint32_t batchLen;     // whole batch including trailer
+    uint64_t dOff;
+    uint64_t dLen;
+    uint32_t attrBytes;
+    uint32_t l0Bytes;
+};
+static_assert(sizeof(BatchHeader) == 64, "BatchHeader is 64 bytes");
+
+struct BatchTrailer {
+    uint32_t magic;
+    uint32_t batchLen;
+    uint64_t commitSeq;
+    uint64_t pseqHi;
+    uint64_t dCommitted;   // committed end of the batch's data segment
+    uint32_t activeSeg;
+    uint32_t ownerEpoch;
+    Counters counters;     // cumulative after this batch (disk bytes excluded)
+    uint32_t incarnation;  // store open counter: stale batches never chain
+    uint8_t writerId;
+    uint8_t pad[3];
+    uint32_t crc;          // CRC32C of header .. trailer[0..crc)
+    uint32_t pad2;
+};
+static_assert(sizeof(BatchTrailer) == 128, "BatchTrailer is 128 bytes");
+
+struct HeadPrefix {
+    uint32_t magic;
+    uint16_t format;
+    uint16_t kind;
+    uint64_t gen;
+    uint32_t ownerEpoch;
+    uint32_t id;           // pid, fid (as u32) or 0
+    uint32_t usedLen;      // bytes covered by the slot, crc included
+    uint32_t flags;
+};
+static_assert(sizeof(HeadPrefix) == 32, "HeadPrefix is 32 bytes");
+
+struct L0DirEntry {
+    uint32_t mSeg;
+    uint32_t nRows;
+    uint64_t mOff;
+    uint64_t firstPseq;
+    uint32_t batchLen;
+    uint32_t l0Off;        // offset of the L0 block within the batch
+};
+static_assert(sizeof(L0DirEntry) == 32, "L0DirEntry is 32 bytes");
+
+struct LaneCounter {
+    uint32_t laneId;
+    uint32_t pad;
+    int64_t count;
+    int64_t bytes;
+    uint64_t maxPseq;
+    uint64_t maxGseq;      // not maintained by the partition writer (0 = absent)
+    int64_t firstSeen;
+    int64_t updated;
+};
+static_assert(sizeof(LaneCounter) == 56, "LaneCounter is 56 bytes");
+
+struct LaneDelta {
+    uint32_t laneId;
+    uint32_t pad;
+    int64_t dCount;
+    int64_t dBytes;
+    uint64_t maxPseq;
+    int64_t firstSeen;
+    int64_t updated;
+};
+static_assert(sizeof(LaneDelta) == 48, "LaneDelta is 48 bytes");
+
+struct PartitionHeadFixed {
+    HeadPrefix p;
+    uint64_t commitSeq;
+    uint64_t pseqHi;
+    uint32_t mSeg;
+    uint32_t incarnation;
+    uint64_t mEnd;
+    uint32_t dSeg;
+    uint32_t nextSeg;
+    uint64_t dLen;
+    uint64_t mergedThrough;
+    uint32_t manifestGen;
+    uint16_t nL0;
+    uint16_t nLanes;
+    uint32_t firstLiveMSeg;
+    uint32_t nextGen;
+    uint64_t schemaFp;
+    uint64_t producerHash;
+    Counters counters;
+    uint32_t nextLaneId;
+    uint32_t lanesOverflowSeg;
+    uint64_t segFirstPseq;
+    uint32_t intentSeg;    // A11 outstanding merge intent (intentGen 0 = none)
+    uint32_t intentGen;
+    uint64_t intentROff;
+    uint64_t intentAOff;
+    uint64_t intentThrough;
+    uint64_t lanesOverflowOff;  // LANE_CKPT offset in m-<lanesOverflowSeg> (0 = none)
+    uint64_t rLen;         // committed r-<dSeg> length
+    uint64_t aLen;         // committed a-<dSeg> length
+};
+static_assert(sizeof(PartitionHeadFixed) == 264, "PartitionHeadFixed layout");
+
+struct TypeHeadFixed {
+    HeadPrefix p;
+    uint64_t commitSeq;
+    uint64_t gseqHi;       // published: every gseq <= this is durable
+    uint32_t gSeg;
+    uint32_t incarnation;
+    uint64_t gLen;         // arrivals bytes in g-<gSeg>
+    uint32_t mSeg;
+    uint32_t nextSeg;
+    uint64_t mEnd;
+    uint64_t arrivalsCount;
+    uint32_t manifestGen;
+    uint16_t nL0;
+    uint16_t nLabels;
+    uint64_t firstLiveCount;
+    uint64_t firstLiveBytes;
+    uint64_t labelCkptOff; // A10: labeled_through checkpoint block (0 = inline)
+    uint32_t labelCkptSeg;
+    uint32_t nextGen;
+    uint64_t mergedThroughCommit;
+    uint64_t gSegFirstGseq;
+    uint64_t tcsHi;        // highest type commit sequence (== commitSeq)
+    uint64_t reserved;
+};
+static_assert(sizeof(TypeHeadFixed) == 160, "TypeHeadFixed layout");
+
+struct TypeL0DirEntry {
+    uint32_t mSeg;
+    uint32_t l0Len;
+    uint64_t mOff;
+    uint64_t commitSeq;
+    uint32_t batchLen;
+    uint32_t l0Off;
+};
+static_assert(sizeof(TypeL0DirEntry) == 32, "TypeL0DirEntry is 32 bytes");
+
+struct LabelEntry {
+    uint32_t pid;
+    uint32_t pad;
+    uint64_t labeledThrough;
+};
+static_assert(sizeof(LabelEntry) == 16, "LabelEntry is 16 bytes");
+
+struct RegistryHeadFixed {
+    HeadPrefix p;
+    uint64_t frameCount;
+    uint64_t fslEnd;
+    uint32_t maxPid;
+    uint32_t incarnation;
+    uint32_t nTypes;
+    uint32_t nPartitions;
+};
+static_assert(sizeof(RegistryHeadFixed) == 64, "RegistryHeadFixed layout");
+
+struct StoreFile {
+    uint32_t magic;
+    uint16_t format;
+    uint16_t flags;
+    uint8_t uuid[16];
+    int64_t createdMs;
+    uint64_t gseqFloor;
+    uint32_t migratedFrom;  // 0 = fresh store, 1 = legacy flatsql
+    uint32_t rsv;
+    uint64_t rsv2;
+    uint32_t crc;
+    uint32_t pad;
+};
+static_assert(sizeof(StoreFile) == 64, "StoreFile layout");
+
+struct MigratedFile {
+    uint32_t magic;
+    uint16_t format;
+    uint16_t rsv;
+    uint8_t uuid[16];
+    int64_t migratedMs;
+    uint32_t crc;
+    uint32_t pad;
+};
+static_assert(sizeof(MigratedFile) == 40, "MigratedFile layout");
+
+// Type batch (A10): arrivals written to g, the batch to the type m log.
+struct TypeBatchHeader {
+    uint32_t magic;
+    uint16_t ver;
+    uint16_t flags;
+    uint64_t commitSeq;
+    uint64_t firstGseq;    // 0 when n_arrivals == 0
+    uint32_t nArrivals;
+    uint32_t gSeg;
+    uint64_t gOff;
+    uint32_t gCrc;         // CRC32C of the arrivals bytes [g_off, g_off + 24n)
+    uint32_t nLabel;
+    uint64_t gseqHi;
+    uint32_t batchLen;
+    uint32_t l0Off;
+    uint32_t incarnation;
+    uint32_t pad;
+    uint64_t firstLiveCount;
+    uint64_t firstLiveBytes;
+    uint64_t arrivalsCount;
+    uint64_t pad2;
+};
+static_assert(sizeof(TypeBatchHeader) == 104, "TypeBatchHeader layout");
+
+struct ArrivalEntry {
+    uint64_t gseq;
+    uint32_t pid;
+    uint16_t flags;        // FIRST=1, PROMOTED=2
+    uint16_t rsv;
+    uint64_t pseq;
+};
+static_assert(sizeof(ArrivalEntry) == 24, "ArrivalEntry is 24 bytes");
+
+#pragma pack(pop)
+
+enum ArrivalFlag : uint16_t { kArrivalFirst = 1, kArrivalPromoted = 2 };
+
+// ---- little-endian helpers -------------------------------------------------
+inline void putU16(uint8_t* p, uint16_t v) { std::memcpy(p, &v, 2); }
+inline void putU32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
+inline void putU64(uint8_t* p, uint64_t v) { std::memcpy(p, &v, 8); }
+inline uint16_t getU16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
+inline uint32_t getU32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
+inline uint64_t getU64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
+inline void putBE64(uint8_t* p, uint64_t v) {
+    for (int i = 7; i >= 0; i--) { p[i] = uint8_t(v); v >>= 8; }
+}
+inline uint64_t getBE64(const uint8_t* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+    return v;
+}
+inline void putBE32(uint8_t* p, uint32_t v) {
+    for (int i = 3; i >= 0; i--) { p[i] = uint8_t(v); v >>= 8; }
+}
+inline uint32_t getBE32(const uint8_t* p) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) v = (v << 8) | p[i];
+    return v;
+}
+inline size_t pad8(size_t n) { return (n + 7) & ~size_t(7); }
+
+// ---- order-preserving key encodings (§4.3) ---------------------------------
+inline void encI64(uint8_t* out, int64_t v) { putBE64(out, uint64_t(v) ^ 0x8000000000000000ull); }
+inline int64_t decI64(const uint8_t* in) { return int64_t(getBE64(in) ^ 0x8000000000000000ull); }
+void encF64(uint8_t* out, double v);
+// Escaped string + 0x00 0x01 terminator + i64: (string, i64) composite.
+// Returns bytes written; out must hold 2*len + 10.
+size_t encStrI64(uint8_t* out, const uint8_t* s, size_t len, int64_t v);
+// Caps a string key at kMaxKeyLen: longer keys keep a prefix + 8-byte hash.
+size_t capKey(uint8_t* out, const uint8_t* s, size_t len);
+
+// A17: the CID sort key. Base32-lower text of the binary CID (without the
+// multibase 'b'), each symbol replaced by its ASCII rank ('2'-'7' -> 0-5,
+// 'a'-'z' -> 6-31), packed 5 bits per symbol. Byte order == text order.
+void cidSortKey(const uint8_t cid[kCidLen], uint8_t out[kCidKeyLen]);
+void cidFromSortKey(const uint8_t key[kCidKeyLen], uint8_t cid[kCidLen]);
+// "b" + base32 lower text of a binary CID (tests and diagnostics).
+size_t cidText(const uint8_t* cid, size_t len, char* out /* >= 2 + len*8/5 + 1 */);
+
+// CIDv1 raw sha2-256 of bytes: 0x01 0x55 0x12 0x20 + digest.
+void computeCid(const void* data, size_t len, uint8_t out[kCidLen]);
+
+// ---- head slots -------------------------------------------------------------
+// Seal a slot image: fills usedLen, gen, crc (last 4 bytes of the used length).
+void sealHeadSlot(uint8_t* slot, uint32_t usedLen);
+// Validates magic, kind, format, bounds and crc. Returns usedLen or 0.
+uint32_t validHeadSlot(const uint8_t* slot, size_t avail, uint16_t kind);
+
+// ---- paths ------------------------------------------------------------------
+struct PathBuf {
+    char buf[480];
+    size_t len = 0;
+    const char* c_str() const { return buf; }
+};
+// <root>/fsql2/<rel>
+void pathStore(PathBuf* out, const char* root, const char* rel);
+void pathPartition(PathBuf* out, const char* root, uint32_t pid, const char* name);
+void pathPartitionSeg(PathBuf* out, const char* root, uint32_t pid, char letter,
+                      uint32_t seg, const char* ext);
+void pathPartitionRun(PathBuf* out, const char* root, uint32_t pid, uint32_t seg, uint32_t gen);
+void pathPartitionManifest(PathBuf* out, const char* root, uint32_t pid, uint32_t gen);
+void pathType(PathBuf* out, const char* root, const uint8_t fid[4], const char* name);
+void pathTypeSeg(PathBuf* out, const char* root, const uint8_t fid[4], char letter,
+                 uint32_t seg, const char* ext);
+void pathTypeRun(PathBuf* out, const char* root, const uint8_t fid[4], uint32_t gen);
+void pathTypeConfig(PathBuf* out, const char* root, const uint8_t fid[4], uint64_t fp);
+void pathPartitionDir(PathBuf* out, const char* root, uint32_t pid);
+void pathTypeDir(PathBuf* out, const char* root, const uint8_t fid[4]);
+
+inline uint32_t fidU32(const uint8_t fid[4]) { return getU32(fid); }
+
+}  // namespace ps
+}  // namespace flatsql
+
+#endif

@@ -1,0 +1,963 @@
+// FlatSQL partition store: type owners (design §4.8 amended by A6, A10, A14,
+// A15, A16, A25).
+//
+// A type owner labels every PUT of its partitions FIRST (first copy of a cid
+// in the type: gets a gseq and an arrivals entry) or REPEAT, keeps the cid
+// catalog (cid -> copies), the LABEL run ((pid, pseq) -> (gseq, label)), the
+// REPEAT run and the REHOME run (A14: a promoted REPEAT keeps the gseq). It
+// reads partition rows only from durable batches (durablePseqHi) and
+// publishes nothing before its own batch is durable.
+#include <algorithm>
+
+#include "internal.h"
+
+namespace flatsql {
+namespace ps {
+
+namespace {
+
+enum Label : uint8_t { kLabelFirst = 1, kLabelRepeat = 2, kLabelDead = 3, kLabelPromoted = 4 };
+constexpr int32_t kOpenRW = FLATSQL_IO_READ | FLATSQL_IO_WRITE;
+constexpr uint16_t kTypeFlagFullLabels = 1;
+constexpr uint16_t kTypeFlagMergeIntent = 2;
+constexpr uint16_t kTypeFlagMergeDone = 4;
+
+bool isLive(uint8_t label) { return label == kLabelFirst || label == kLabelRepeat || label == kLabelPromoted; }
+bool isFirst(uint8_t label) { return label == kLabelFirst || label == kLabelPromoted; }
+
+void encCatVal(uint8_t* v, uint32_t pid, uint64_t pseq, uint64_t tcs, uint8_t label, uint64_t gseq,
+               uint32_t len) {
+    putBE32(v, pid);
+    putBE64(v + 4, pseq);
+    putBE64(v + 12, tcs);
+    v[20] = label;
+    putBE64(v + 21, gseq);
+    putBE32(v + 29, len);
+}
+
+struct TCtx {
+    Writer* w;
+    Engine* e;
+    TypeOwner* t;
+    StageScratch* sc;
+    StagedType* st;
+    IoCtx* io;
+    int32_t err = 0;
+};
+
+bool addPosting(TCtx& c, uint16_t kind, const uint8_t* key, size_t klen, const uint8_t* val,
+                uint8_t vlen) {
+    StageScratch& sc = *c.sc;
+    if (sc.nEntries >= sc.capEntries || sc.keyBytes + klen + vlen > sc.capKeys) return false;
+    uint8_t* k = sc.keys + sc.keyBytes;
+    std::memcpy(k, key, klen);
+    std::memcpy(k + klen, val, vlen);
+    sc.keyBytes += uint32_t(klen + vlen);
+    StagedEntry& e = sc.entries[sc.nEntries++];
+    e.kind = kind;
+    e.klen = uint16_t(klen);
+    e.vlen = vlen;
+    e.key = k;
+    e.val = k + klen;
+    return true;
+}
+
+FileRef* typeMHandle(TCtx& c, uint32_t mSeg, FileRef* tmp) {
+    if (mSeg == c.t->mSeg && c.t->m.valid()) return &c.t->m;
+    PathBuf path;
+    pathTypeSeg(&path, c.w->eng_root(), c.t->fid, 'm', mSeg, "fsl");
+    if (c.io->open(path.c_str(), path.len, FLATSQL_IO_READ, FileClass::TypeMeta, tmp) < 0) return nullptr;
+    return tmp;
+}
+
+// Committed catalog postings for a cid: unmerged type L0 blocks, then runs.
+template <typename F>
+int32_t committedCatalog(TCtx& c, const uint8_t* key, F&& visit) {
+    TypeOwner* t = c.t;
+    for (uint32_t i = 0; i < t->nL0; i++) {
+        const L0Accel& a = t->acc[i];
+        const L0Accel::Kind* k = a.find(kIxTypeCid);
+        if (!k || k->n == 0) continue;
+        if (k->bloom && !bloomTest(k->bloom, k->bloomBytes, key, kCidKeyLen)) continue;
+        FileRef tmp;
+        FileRef* f = typeMHandle(c, a.mSeg, &tmp);
+        if (!f) return FLATSQL_IO_ERR_IO;
+        uint64_t off = 0;
+        int32_t rc = 0;
+        bool past = false;
+        while (off < k->entriesBytes && !past) {
+            const uint64_t want = std::min<uint64_t>(c.sc->capSection, k->entriesBytes - off);
+            const int64_t n = c.io->read(*f, c.sc->section, size_t(want), k->entriesOff + off);
+            if (n != int64_t(want)) {
+                rc = n < 0 ? int32_t(n) : FLATSQL_IO_ERR_IO;
+                break;
+            }
+            EntryIter it;
+            it.p = c.sc->section;
+            it.end = c.sc->section + want;
+            it.vlen = k->vlen;
+            const uint8_t *ek, *ev;
+            uint16_t el;
+            const uint8_t* last = it.p;
+            while (it.next(&ek, &el, &ev)) {
+                last = it.p;
+                const int cmp = keyCmp(ek, el, key, kCidKeyLen);
+                if (cmp < 0) continue;
+                if (cmp > 0) {
+                    past = true;
+                    break;
+                }
+                visit(ev);
+            }
+            if (last == c.sc->section) {
+                rc = FLATSQL_IO_ERR_IO;
+                break;
+            }
+            off += uint64_t(last - c.sc->section);
+        }
+        if (tmp.valid()) c.io->close(&tmp);
+        if (rc < 0) return rc;
+    }
+    for (auto& run : t->runs) {
+        if (!run.run || !run.run->mayContain(kIxTypeCid, key, kCidKeyLen)) continue;
+        const int64_t rc = run.run->lookup(c.io, run.file, kIxTypeCid, key, kCidKeyLen,
+                                           c.w->lookupScratch(),
+                                           [&](const uint8_t*, uint16_t, const uint8_t* ev) { visit(ev); });
+        if (rc < 0) return int32_t(rc);
+    }
+    return 0;
+}
+
+// Upserts a copy in the per-batch cid state (latest tcs wins per (pid, pseq)).
+void upsertCopy(StageScratch& sc, StageScratch::TCid* tc, uint32_t pid, uint64_t pseq, uint64_t tcs,
+                uint8_t label, uint64_t gseq, uint32_t len) {
+    for (int32_t i = tc->copies; i >= 0; i = sc.tcopies[i].next) {
+        StageScratch::TCopy& cp = sc.tcopies[i];
+        if (cp.pid == pid && cp.pseq == pseq) {
+            if (tcs >= cp.tcs) {
+                cp.tcs = tcs;
+                cp.label = label;
+                cp.gseq = gseq;
+                cp.len = len;
+            }
+            return;
+        }
+    }
+    if (sc.nTCopies >= StageScratch::kTCopyCap) return;
+    StageScratch::TCopy& cp = sc.tcopies[sc.nTCopies];
+    cp.pid = pid;
+    cp.pseq = pseq;
+    cp.tcs = tcs;
+    cp.label = label;
+    cp.gseq = gseq;
+    cp.len = len;
+    cp.next = tc->copies;
+    tc->copies = int32_t(sc.nTCopies);
+    sc.nTCopies++;
+}
+
+StageScratch::TCid* catalogState(TCtx& c, const uint8_t key[kCidKeyLen]) {
+    StageScratch& sc = *c.sc;
+    const uint32_t b = uint32_t(hash64(key, kCidKeyLen) % StageScratch::kCidBuckets);
+    for (int32_t i = sc.tcidBuckets[b]; i >= 0; i = sc.tcids[i].next)
+        if (std::memcmp(sc.tcids[i].key, key, kCidKeyLen) == 0) return &sc.tcids[i];
+    if (sc.nTCids >= StageScratch::kTCidCap || sc.nTCopies + 64 > StageScratch::kTCopyCap) return nullptr;
+    StageScratch::TCid& tc = sc.tcids[sc.nTCids];
+    std::memcpy(tc.key, key, kCidKeyLen);
+    tc.copies = -1;
+    const int32_t rc = committedCatalog(c, key, [&](const uint8_t* v) {
+        upsertCopy(sc, &tc, getBE32(v), getBE64(v + 4), getBE64(v + 12), v[20], getBE64(v + 21),
+                   getBE32(v + 29));
+    });
+    if (rc < 0) {
+        c.err = rc;
+        return nullptr;
+    }
+    tc.next = sc.tcidBuckets[b];
+    sc.tcidBuckets[b] = int32_t(sc.nTCids);
+    sc.nTCids++;
+    return &tc;
+}
+
+bool postCatalog(TCtx& c, const uint8_t* key, uint32_t pid, uint64_t pseq, uint64_t tcs, uint8_t label,
+                 uint64_t gseq, uint32_t len) {
+    uint8_t v[33];
+    encCatVal(v, pid, pseq, tcs, label, gseq, len);
+    return addPosting(c, kIxTypeCid, key, kCidKeyLen, v, 33);
+}
+
+bool postLabel(TCtx& c, uint32_t pid, uint64_t pseq, uint64_t tcs, uint64_t gseq, uint8_t label) {
+    uint8_t k[12], v[17];
+    putBE32(k, pid);
+    putBE64(k + 4, pseq);
+    putBE64(v, tcs);
+    putBE64(v + 8, gseq);
+    v[16] = label;
+    return addPosting(c, kIxTypeLabel, k, 12, v, 17);
+}
+
+void resetTypeScratch(StageScratch& sc) {
+    for (uint32_t i = 0; i < sc.nTCids; i++) {
+        const uint32_t b = uint32_t(hash64(sc.tcids[i].key, kCidKeyLen) % StageScratch::kCidBuckets);
+        sc.tcidBuckets[b] = -1;
+    }
+    sc.nTCids = 0;
+    sc.nTCopies = 0;
+    sc.nArrivals = 0;
+    sc.nEntries = 0;
+    sc.keyBytes = 0;
+}
+
+// One partition row seen by the type owner.
+bool labelRow(TCtx& c, Partition* p, const RecRow& r) {
+    StageScratch& sc = *c.sc;
+    const uint64_t tcs = c.st->commitSeq;
+    // Capacity first: a row is labeled completely or not at all.
+    if (sc.nEntries + 8 > sc.capEntries || sc.keyBytes + 8 * 64 > sc.capKeys ||
+        sc.nArrivals + 1 > StageScratch::kArrivalCap || sc.nTCopies + 64 > StageScratch::kTCopyCap ||
+        sc.nTCids + 1 > StageScratch::kTCidCap)
+        return false;
+    if (r.kind == kRowPut) {
+        uint8_t key[kCidKeyLen];
+        cidSortKey(r.cid, key);
+        StageScratch::TCid* tc = catalogState(c, key);
+        if (!tc) return false;
+        // Idempotent catch-up: a copy already labeled keeps its label.
+        for (int32_t i = tc->copies; i >= 0; i = sc.tcopies[i].next)
+            if (sc.tcopies[i].pid == p->pid && sc.tcopies[i].pseq == r.pseq) return true;
+        uint64_t firstGseq = 0;
+        for (int32_t i = tc->copies; i >= 0; i = sc.tcopies[i].next)
+            if (isFirst(sc.tcopies[i].label)) firstGseq = sc.tcopies[i].gseq;
+        if (firstGseq) {
+            upsertCopy(sc, tc, p->pid, r.pseq, tcs, kLabelRepeat, firstGseq, r.len);
+            uint8_t k[12], v[8];
+            putBE32(k, p->pid);
+            putBE64(k + 4, r.pseq);
+            putBE64(v, tcs);
+            if (!postCatalog(c, key, p->pid, r.pseq, tcs, kLabelRepeat, firstGseq, r.len) ||
+                !postLabel(c, p->pid, r.pseq, tcs, firstGseq, kLabelRepeat) ||
+                !addPosting(c, kIxTypeRepeat, k, 12, v, 8))
+                return false;
+            c.e->cRepeat.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (sc.nArrivals >= StageScratch::kArrivalCap) return false;
+        const uint64_t gseq = c.e->allocGseq(1);
+        ArrivalEntry& a = sc.arrivals[sc.nArrivals++];
+        a.gseq = gseq;
+        a.pid = p->pid;
+        a.flags = kArrivalFirst;
+        a.rsv = 0;
+        a.pseq = r.pseq;
+        if (!c.st->firstGseq) c.st->firstGseq = gseq;
+        if (gseq > c.st->gseqHi) c.st->gseqHi = gseq;
+        upsertCopy(sc, tc, p->pid, r.pseq, tcs, kLabelFirst, gseq, r.len);
+        if (!postCatalog(c, key, p->pid, r.pseq, tcs, kLabelFirst, gseq, r.len) ||
+            !postLabel(c, p->pid, r.pseq, tcs, gseq, kLabelFirst))
+            return false;
+        c.st->firstLiveCount++;
+        c.st->firstLiveBytes += r.len - 4;
+        c.st->arrivalsCount++;
+        c.e->cFirst.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    if (r.kind == kRowTomb) {
+        uint8_t key[kCidKeyLen];
+        cidSortKey(r.cid, key);
+        StageScratch::TCid* tc = catalogState(c, key);
+        if (!tc) return false;
+        StageScratch::TCopy* dying = nullptr;
+        for (int32_t i = tc->copies; i >= 0; i = sc.tcopies[i].next)
+            if (sc.tcopies[i].pid == p->pid && sc.tcopies[i].pseq == r.targetPseq) dying = &sc.tcopies[i];
+        if (!dying || !isLive(dying->label)) return true;  // not a labeled PUT copy
+        const bool wasFirst = isFirst(dying->label);
+        const uint64_t gseq = dying->gseq;
+        const uint32_t len = dying->len;
+        dying->label = kLabelDead;
+        dying->tcs = tcs;
+        if (!postCatalog(c, key, p->pid, r.targetPseq, tcs, kLabelDead, gseq, len)) return false;
+        if (!wasFirst) return true;
+        // A14 promotion: the earliest-labeled live REPEAT keeps the gseq.
+        StageScratch::TCopy* heir = nullptr;
+        for (int32_t i = tc->copies; i >= 0; i = sc.tcopies[i].next) {
+            StageScratch::TCopy& cp = sc.tcopies[i];
+            if (cp.label != kLabelRepeat) continue;
+            if (!heir || cp.tcs < heir->tcs || (cp.tcs == heir->tcs && (cp.pid < heir->pid ||
+                                                (cp.pid == heir->pid && cp.pseq < heir->pseq))))
+                heir = &cp;
+        }
+        if (heir) {
+            heir->label = kLabelPromoted;
+            heir->tcs = tcs;
+            uint8_t rk[8], rv[20];
+            putBE64(rk, gseq);
+            putBE64(rv, tcs);
+            putBE32(rv + 8, heir->pid);
+            putBE64(rv + 12, heir->pseq);
+            if (!addPosting(c, kIxTypeRehome, rk, 8, rv, 20) ||
+                !postCatalog(c, key, heir->pid, heir->pseq, tcs, kLabelPromoted, gseq, heir->len) ||
+                !postLabel(c, heir->pid, heir->pseq, tcs, gseq, kLabelFirst))
+                return false;
+            c.st->firstLiveBytes += int64_t(heir->len) - int64_t(len);
+            c.e->cPromotions.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            c.st->firstLiveCount--;
+            c.st->firstLiveBytes -= len - 4;
+        }
+        return true;
+    }
+    return true;  // RETAG, TAG_TOMB, LICENCE, CTL: no type-level effect
+}
+
+}  // namespace
+
+void typePostNotice(TypeOwner* t, uint32_t pid) {
+    // A25: never blocks; a full queue drops the notice (catch-up compares
+    // labeled_through with each partition's durable pseq_hi anyway).
+    const uint64_t tail = t->noticeTail.load(std::memory_order_relaxed);
+    const uint64_t head = t->noticeHead.load(std::memory_order_acquire);
+    if (t->noticeCap && tail - head < t->noticeCap) {
+        uint64_t expect = tail;
+        if (t->noticeTail.compare_exchange_strong(expect, tail + 1, std::memory_order_acq_rel))
+            t->notices[tail % t->noticeCap].store(pid, std::memory_order_release);
+        else
+            t->noticesDropped.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        t->noticesDropped.fetch_add(1, std::memory_order_relaxed);
+    }
+    t->dirty.store(1, std::memory_order_release);
+}
+
+void encodeTypeHead(const TypeOwner* t, uint8_t* slot, uint32_t* used, bool durable) {
+    TypeHeadFixed h{};
+    h.p.magic = kMagicHead;
+    h.p.format = kFormat;
+    h.p.kind = kHeadType;
+    h.p.gen = t->headGen;
+    h.p.id = fidU32(t->fid);
+    h.p.flags = durable ? kHeadDurableCkpt : 0;
+    h.commitSeq = t->commitSeq;
+    h.gseqHi = t->gseqHi;
+    h.gSeg = t->gSeg;
+    h.incarnation = t->incarnation;
+    h.gLen = t->gLen;
+    h.mSeg = t->mSeg;
+    h.nextSeg = t->nextSeg;
+    h.mEnd = t->mEnd;
+    h.arrivalsCount = t->arrivalsCount;
+    h.manifestGen = t->manifestGenLoaded;
+    h.nL0 = uint16_t(t->nL0);
+    h.firstLiveCount = t->firstLiveCount;
+    h.firstLiveBytes = t->firstLiveBytes;
+    h.nextGen = t->nextGen;
+    h.gSegFirstGseq = t->gSegFirstGseq;
+    h.tcsHi = t->commitSeq;
+    size_t off = sizeof(h);
+    std::memcpy(slot + off, t->l0, sizeof(TypeL0DirEntry) * t->nL0);
+    off += sizeof(TypeL0DirEntry) * t->nL0;
+    if (t->labeled.size() <= kMaxInlineLabels) {
+        std::vector<std::pair<uint32_t, uint64_t>> labels(t->labeled.begin(), t->labeled.end());
+        std::sort(labels.begin(), labels.end());
+        h.nLabels = uint16_t(labels.size());
+        for (const auto& l : labels) {
+            LabelEntry le{};
+            le.pid = l.first;
+            le.labeledThrough = l.second;
+            std::memcpy(slot + off, &le, sizeof(le));
+            off += sizeof(le);
+        }
+    } else {
+        h.nLabels = 0xffff;  // labels live in the type log (full checkpoint + deltas)
+        h.labelCkptOff = t->labelCkptOff;
+        h.labelCkptSeg = t->labelCkptSeg;
+    }
+    std::memcpy(slot, &h, sizeof(h));
+    *used = uint32_t(off + 4);
+    sealHeadSlot(slot, *used);
+}
+
+int32_t typeWriteHead(Writer* w, TypeOwner* t, bool durable) {
+    uint8_t slot[kHeadSlotBytes];
+    t->headGen++;
+    uint32_t used;
+    encodeTypeHead(t, slot, &used, durable);
+    return w->io().write(t->h, slot, used, (t->headGen % 2) * kHeadSlotBytes);
+}
+
+int32_t typeEnsureFiles(IoCtx* io, Engine* e, TypeOwner* t) {
+    int32_t rc;
+    if (!t->h.valid()) {
+        PathBuf path;
+        pathType(&path, e->root().c_str(), t->fid, "h.fsh");
+        rc = io->open(path.c_str(), path.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS,
+                      FileClass::TypeHead, &t->h);
+        if (rc < 0) return rc;
+    }
+    if (!t->m.valid()) {
+        PathBuf path;
+        pathTypeSeg(&path, e->root().c_str(), t->fid, 'm', t->mSeg, "fsl");
+        rc = io->open(path.c_str(), path.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS,
+                      FileClass::TypeMeta, &t->m);
+        if (rc < 0) return rc;
+        const int64_t sz = io->size(t->m);
+        t->mExtent = sz > 0 ? uint64_t(sz) : 0;
+        if (t->mExtent < t->mEnd) t->mExtent = t->mEnd;
+    }
+    if (!t->g.valid()) {
+        PathBuf path;
+        pathTypeSeg(&path, e->root().c_str(), t->fid, 'g', t->gSeg, "fsg");
+        rc = io->open(path.c_str(), path.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS,
+                      FileClass::Arrivals, &t->g);
+        if (rc < 0) return rc;
+        const int64_t sz = io->size(t->g);
+        t->gExtent = sz > 0 ? uint64_t(sz) : 0;
+        if (t->gExtent < t->gLen) t->gExtent = t->gLen;
+    }
+    return 0;
+}
+
+int32_t typeWarm(Writer* w, TypeOwner* t) {
+    if (t->warm) return 0;
+    const int saved = tHotPathDepth;
+    tHotPathDepth = 0;
+    int32_t rc = typeEnsureFiles(&w->io(), w->engine(), t);
+    for (uint32_t i = 0; rc >= 0 && i < t->nL0; i++) {
+        const TypeL0DirEntry& de = t->l0[i];
+        L0Accel& a = t->acc[i];
+        a.mSeg = de.mSeg;
+        a.mOff = de.mOff;
+        a.l0Off = de.mOff + de.l0Off;
+        a.l0Len = de.l0Len;
+        a.chainPos = 0;
+        a.nKinds = 0;
+        FileRef tmp;
+        FileRef* f = &t->m;
+        if (de.mSeg != t->mSeg) {
+            PathBuf path;
+            pathTypeSeg(&path, w->eng_root(), t->fid, 'm', de.mSeg, "fsl");
+            rc = w->io().open(path.c_str(), path.len, FLATSQL_IO_READ, FileClass::TypeMeta, &tmp);
+            if (rc < 0) break;
+            f = &tmp;
+        }
+        std::vector<uint8_t> block(de.l0Len);
+        if (w->io().read(*f, block.data(), block.size(), a.l0Off) != int64_t(block.size())) {
+            rc = FLATSQL_IO_ERR_IO;
+        } else {
+            L0KindInfo kinds[L0Accel::kMaxKinds];
+            size_t nk = 0;
+            if (!parseL0Block(block.data(), block.size(), kinds, L0Accel::kMaxKinds, &nk)) {
+                rc = FLATSQL_IO_ERR_IO;
+            } else {
+                for (size_t k = 0; k < nk; k++) {
+                    L0Accel::Kind& kk = a.kinds[a.nKinds++];
+                    kk.kind = kinds[k].kind;
+                    kk.vlen = kinds[k].vlen;
+                    kk.n = kinds[k].n;
+                    kk.entriesOff = a.l0Off + kinds[k].entriesOff;
+                    kk.entriesBytes = kinds[k].entriesBytes;
+                    kk.bloom = nullptr;
+                    kk.bloomBytes = 0;
+                    if (kinds[k].bloomBytes) {
+                        uint64_t pos;
+                        void* mem = t->chain.alloc(w->engine()->pool(), kinds[k].bloomBytes, &pos);
+                        if (mem) {
+                            if (!a.chainPos) a.chainPos = pos;
+                            std::memcpy(mem, block.data() + kinds[k].bloomOff, kinds[k].bloomBytes);
+                            kk.bloom = static_cast<const uint8_t*>(mem);
+                            kk.bloomBytes = kinds[k].bloomBytes;
+                        }
+                    }
+                }
+            }
+        }
+        if (tmp.valid()) w->io().close(&tmp);
+    }
+    for (auto& run : t->runs) {
+        if (rc < 0 || run.run) continue;
+        PathBuf rp;
+        pathTypeRun(&rp, w->eng_root(), t->fid, run.gen);
+        if (!run.file.valid()) rc = w->io().open(rp.c_str(), rp.len, FLATSQL_IO_READ, FileClass::Index, &run.file);
+        if (rc < 0) break;
+        run.run.reset(new L1Run());
+        rc = run.run->load(&w->io(), run.file, run.fileLen);
+    }
+    tHotPathDepth = saved;
+    if (rc < 0) return rc;
+    t->warm = true;
+    return 0;
+}
+
+bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* batches) {
+    Engine* e = w->engine();
+    // Anything to label? (A25: compare with each partition's durable HWM.)
+    const uint32_t nParts = t->nParts.load(std::memory_order_acquire);
+    bool work = !t->deletes.empty();
+    for (uint32_t i = 0; i < nParts && !work; i++) {
+        Partition* p = t->partAt(i);
+        auto it = t->labeled.find(p->pid);
+        const uint64_t lt = it == t->labeled.end() ? 0 : it->second;
+        if (p->durablePseqHi.load(std::memory_order_acquire) > lt) work = true;
+    }
+    t->dirty.store(0, std::memory_order_relaxed);
+    t->noticeHead.store(t->noticeTail.load(std::memory_order_acquire), std::memory_order_release);
+    if (!work) return false;
+    if (typeWarm(w, t) < 0) return false;
+    StagedType* st = batches->make<StagedType>();
+    if (!st) return false;
+    resetTypeScratch(*sc);
+    st->t = t;
+    st->commitSeq = t->commitSeq + 1;
+    st->firstLiveCount = t->firstLiveCount;
+    st->firstLiveBytes = t->firstLiveBytes;
+    st->arrivalsCount = t->arrivalsCount;
+    st->gseqHi = t->gseqHi;
+    TCtx c{w, e, t, sc, st, &w->io()};
+    HotPathScope hot;
+    const uint32_t budget = e->config().typeCommitRows;
+    uint32_t done = 0;
+    st->labels = static_cast<StagedType::Label*>(batches->alloc(sizeof(StagedType::Label) * (nParts + 1), 8));
+    if (!st->labels) return false;
+    for (uint32_t i = 0; i < nParts && done < budget && !c.err; i++) {
+        Partition* p = t->partAt(i);
+        auto it = t->labeled.find(p->pid);
+        const uint64_t lt = it == t->labeled.end() ? 0 : it->second;
+        const uint64_t hi = p->durablePseqHi.load(std::memory_order_acquire);
+        if (hi <= lt) continue;
+        // Published batch directory of the partition (seqlock).
+        PublishedPart pub;
+        uint32_t s;
+        do {
+            s = p->pubLock.readBegin();
+            pub.commitSeq = p->pub.commitSeq;
+            pub.pseqHi = p->pub.pseqHi;
+            pub.nL0 = p->pub.nL0;
+            std::memcpy(pub.l0, p->pub.l0, sizeof(L0DirEntry) * (pub.nL0 <= kMaxL0Dir ? pub.nL0 : 0));
+        } while (p->pubLock.readRetry(s));
+        const uint64_t upTo = std::min(hi, pub.pseqHi);
+        uint64_t through = lt;
+        for (uint32_t b = 0; b < pub.nL0 && done < budget && !c.err; b++) {
+            const L0DirEntry& de = pub.l0[b];
+            const uint64_t bFirst = de.firstPseq;
+            const uint64_t bLast = de.firstPseq + de.nRows - 1;
+            if (bLast <= through) continue;
+            if (bFirst > through + 1) {
+                // Rows before this batch are not in the directory (merged
+                // before labeling): cannot happen, merges wait for labels.
+                c.err = FLATSQL_IO_ERR_IO;
+                break;
+            }
+            if (bFirst > upTo) break;
+            const uint64_t from = through + 1;
+            uint64_t to = std::min(bLast, upTo);
+            if (to - from + 1 > StageScratch::kTRowCap) to = from + StageScratch::kTRowCap - 1;
+            if (done + (to - from + 1) > budget && done > 0) break;
+            // Read the rows (type owner's own read handle on m-<seg>).
+            const uint64_t hkey = (uint64_t(p->pid) << 32) | de.mSeg;
+            FileRef* f = nullptr;
+            auto fit = t->partM.find(hkey);
+            if (fit != t->partM.end()) {
+                f = &fit->second;
+            } else {
+                const int saved = tHotPathDepth;
+                tHotPathDepth = 0;
+                PathBuf path;
+                pathPartitionSeg(&path, w->eng_root(), p->pid, 'm', de.mSeg, "fsl");
+                FileRef handle;
+                const int32_t orc = w->io().open(path.c_str(), path.len, FLATSQL_IO_READ, FileClass::Meta, &handle);
+                if (orc >= 0) f = &t->partM.emplace(hkey, handle).first->second;
+                tHotPathDepth = saved;
+                if (orc < 0) {
+                    c.err = orc;
+                    break;
+                }
+            }
+            const size_t nRows = size_t(to - from + 1);
+            const uint64_t off = de.mOff + sizeof(BatchHeader) + (from - bFirst) * sizeof(RecRow);
+            const int64_t n = w->io().read(*f, sc->trows, nRows * sizeof(RecRow), off);
+            if (n != int64_t(nRows * sizeof(RecRow))) {
+                c.err = n < 0 ? int32_t(n) : FLATSQL_IO_ERR_IO;
+                break;
+            }
+            size_t r = 0;
+            for (; r < nRows; r++) {
+                if (sc->trows[r].pseq != from + r) {
+                    c.err = FLATSQL_IO_ERR_IO;
+                    break;
+                }
+                if (!labelRow(c, p, sc->trows[r])) break;  // scratch full or I/O error
+            }
+            if (r > 0) through = from + r - 1;
+            done += uint32_t(r);
+            if (r < nRows) break;
+        }
+        if (c.err) break;
+        if (through > lt) st->labels[st->nLabels++] = {p, through};
+    }
+    // Type-level deletes (A14): every live copy after labeling.
+    if (!c.err) {
+        const int saved = tHotPathDepth;
+        tHotPathDepth = 0;
+        std::vector<TypeOwner::Delete> keep;
+        for (auto& d : t->deletes) {
+            uint8_t key[kCidKeyLen];
+            cidSortKey(d.cid, key);
+            StageScratch::TCid* tc = catalogState(c, key);
+            if (!tc) {
+                keep.push_back(d);
+                continue;
+            }
+            int32_t copies = 0;
+            for (int32_t i = tc->copies; i >= 0; i = sc->tcopies[i].next)
+                if (isLive(sc->tcopies[i].label)) copies++;
+            if (d.remaining) d.remaining->fetch_add(copies, std::memory_order_acq_rel);
+            for (int32_t i = tc->copies; i >= 0; i = sc->tcopies[i].next) {
+                if (!isLive(sc->tcopies[i].label)) continue;
+                Partition* p = e->partition(sc->tcopies[i].pid);
+                Cmd cmd;
+                cmd.kind = kCmdKillCid;
+                cmd.a = sc->tcopies[i].pid;
+                cmd.ticket = d.remaining;
+                std::memcpy(cmd.data, d.cid, kCidLen);
+                const uint32_t owner = p ? p->ownerWriter.load(std::memory_order_acquire) : 0;
+                while (!e->writer(owner)->mailbox().push(cmd)) cpuRelax();
+                e->writer(owner)->ring();
+            }
+            if (d.remaining && d.remaining->fetch_sub(1, std::memory_order_acq_rel) == 1)
+                wakeU32(reinterpret_cast<std::atomic<uint32_t>*>(d.remaining), -1);
+        }
+        t->deletes.swap(keep);
+        tHotPathDepth = saved;
+    }
+    if (c.err || (st->nLabels == 0 && sc->nArrivals == 0 && sc->nEntries == 0)) return false;
+    // Arrivals bytes (frames arena).
+    const uint32_t gBytes = sc->nArrivals * kArrivalBytes;
+    if (gBytes) {
+        st->arrivals = static_cast<uint8_t*>(frames->alloc(gBytes, 8));
+        if (!st->arrivals) return false;
+        std::memcpy(st->arrivals, sc->arrivals, gBytes);
+    }
+    st->nArrivals = sc->nArrivals;
+    st->gOff = t->gLen;
+    st->gSeg = t->gSeg;
+    // Type batch (A10).
+    for (uint32_t i = 0; i < sc->nEntries; i++) sc->order[i] = &sc->entries[i];
+    sortStaged(sc->order, sc->nEntries);
+    const size_t l0Len = sc->nEntries ? l0BlockSize(sc->order, sc->nEntries) : 0;
+    const bool full = t->labeled.size() + st->nLabels > kMaxInlineLabels &&
+                      (t->labelCkptOff == 0 || t->metaSinceCkpt >= e->config().ckptMetaBytes);
+    uint32_t nLabelEntries = st->nLabels;
+    if (full) {
+        nLabelEntries = uint32_t(t->labeled.size());
+        for (uint32_t i = 0; i < st->nLabels; i++)
+            if (!t->labeled.count(st->labels[i].p->pid)) nLabelEntries++;
+    }
+    const size_t labelsLen = size_t(nLabelEntries) * sizeof(LabelEntry);
+    const size_t batchLen = sizeof(TypeBatchHeader) + labelsLen + l0Len + 8;
+    uint8_t* b = static_cast<uint8_t*>(batches->alloc(batchLen, 8));
+    if (!b) return false;
+    TypeBatchHeader h{};
+    h.magic = kMagicTypeBatch;
+    h.ver = 1;
+    h.flags = full ? kTypeFlagFullLabels : 0;
+    h.commitSeq = st->commitSeq;
+    h.firstGseq = st->firstGseq;
+    h.nArrivals = st->nArrivals;
+    h.gSeg = st->gSeg;
+    h.gOff = st->gOff;
+    h.gCrc = gBytes ? crc32c(st->arrivals, gBytes) : 0;
+    h.nLabel = nLabelEntries;
+    h.gseqHi = st->gseqHi;
+    h.batchLen = uint32_t(batchLen);
+    h.l0Off = uint32_t(sizeof(TypeBatchHeader) + labelsLen);
+    h.incarnation = e->incarnation();
+    h.firstLiveCount = st->firstLiveCount;
+    h.firstLiveBytes = st->firstLiveBytes;
+    h.arrivalsCount = st->arrivalsCount;
+    std::memcpy(b, &h, sizeof(h));
+    size_t off = sizeof(h);
+    auto putLabel = [&](uint32_t pid, uint64_t through) {
+        LabelEntry le{};
+        le.pid = pid;
+        le.labeledThrough = through;
+        std::memcpy(b + off, &le, sizeof(le));
+        off += sizeof(le);
+    };
+    if (full) {
+        std::vector<std::pair<uint32_t, uint64_t>> all(t->labeled.begin(), t->labeled.end());
+        for (uint32_t i = 0; i < st->nLabels; i++) {
+            bool found = false;
+            for (auto& x : all)
+                if (x.first == st->labels[i].p->pid) {
+                    x.second = st->labels[i].through;
+                    found = true;
+                }
+            if (!found) all.push_back({st->labels[i].p->pid, st->labels[i].through});
+        }
+        std::sort(all.begin(), all.end());
+        for (const auto& x : all) putLabel(x.first, x.second);
+    } else {
+        for (uint32_t i = 0; i < st->nLabels; i++) putLabel(st->labels[i].p->pid, st->labels[i].through);
+    }
+    st->l0Off = uint32_t(off);
+    st->l0Len = uint32_t(l0Len);
+    if (l0Len) off += writeL0Block(b + off, sc->order, sc->nEntries, st->commitSeq, st->commitSeq);
+    putU32(b + off, crc32c(b, off));
+    putU32(b + off + 4, 0);
+    st->batch = b;
+    st->batchLen = uint32_t(batchLen);
+    st->mOff = t->mEnd;
+    st->mSeg = t->mSeg;
+    t->st = st;
+    return true;
+}
+
+void typePublish(Writer* w, TypeOwner* t, StagedType* st) {
+    Engine* e = w->engine();
+    t->commitSeq = st->commitSeq;
+    t->gseqHi = st->gseqHi;
+    t->gLen = st->gOff + uint64_t(st->nArrivals) * kArrivalBytes;
+    t->mEnd = st->mOff + st->batchLen;
+    t->arrivalsCount = st->arrivalsCount;
+    t->firstLiveCount = st->firstLiveCount;
+    t->firstLiveBytes = st->firstLiveBytes;
+    t->incarnation = e->incarnation();
+    t->metaSinceCkpt += st->batchLen;
+    TypeBatchHeader h;
+    std::memcpy(&h, st->batch, sizeof(h));
+    if (h.flags & kTypeFlagFullLabels) {
+        t->labelCkptOff = st->mOff;
+        t->labelCkptSeg = st->mSeg;
+        t->metaSinceCkpt = 0;
+    }
+    for (uint32_t i = 0; i < st->nLabels; i++) {
+        t->labeled[st->labels[i].p->pid] = st->labels[i].through;
+        st->labels[i].p->labeledThrough.store(st->labels[i].through, std::memory_order_release);
+    }
+    if (st->l0Len) {
+        const uint32_t idx = t->nL0;
+        if (idx < kMaxTypeL0Dir) {
+            TypeL0DirEntry& de = t->l0[idx];
+            de.mSeg = st->mSeg;
+            de.l0Len = st->l0Len;
+            de.mOff = st->mOff;
+            de.commitSeq = st->commitSeq;
+            de.batchLen = st->batchLen;
+            de.l0Off = st->l0Off;
+            L0Accel& a = t->acc[idx];
+            a.mSeg = st->mSeg;
+            a.mOff = st->mOff;
+            a.l0Off = st->mOff + st->l0Off;
+            a.l0Len = st->l0Len;
+            a.chainPos = 0;
+            a.nKinds = 0;
+            L0KindInfo kinds[L0Accel::kMaxKinds];
+            size_t nk = 0;
+            if (parseL0Block(st->batch + st->l0Off, st->l0Len, kinds, L0Accel::kMaxKinds, &nk)) {
+                for (size_t k = 0; k < nk; k++) {
+                    L0Accel::Kind& kk = a.kinds[a.nKinds++];
+                    kk.kind = kinds[k].kind;
+                    kk.vlen = kinds[k].vlen;
+                    kk.n = kinds[k].n;
+                    kk.entriesOff = a.l0Off + kinds[k].entriesOff;
+                    kk.entriesBytes = kinds[k].entriesBytes;
+                    kk.bloom = nullptr;
+                    kk.bloomBytes = 0;
+                    if (kinds[k].bloomBytes) {
+                        uint64_t pos;
+                        void* mem = t->chain.alloc(e->pool(), kinds[k].bloomBytes, &pos);
+                        if (mem) {
+                            if (!a.chainPos) a.chainPos = pos;
+                            std::memcpy(mem, st->batch + st->l0Off + kinds[k].bloomOff, kinds[k].bloomBytes);
+                            kk.bloom = static_cast<const uint8_t*>(mem);
+                            kk.bloomBytes = kinds[k].bloomBytes;
+                        }
+                    }
+                }
+            }
+            t->nL0++;
+        }
+    }
+    t->publishedGseqHi.store(t->gseqHi, std::memory_order_release);
+    t->publishedArrivals.store(t->arrivalsCount, std::memory_order_release);
+    for (uint32_t i = 0; i < st->nTickets; i++)
+        if (st->tickets[i]->fetch_sub(1, std::memory_order_acq_rel) == 1)
+            wakeU32(reinterpret_cast<std::atomic<uint32_t>*>(st->tickets[i]), -1);
+    e->cTypeCommits.fetch_add(1, std::memory_order_relaxed);
+    t->st = nullptr;
+}
+
+void typeRollback(Writer* w, TypeOwner* t, StagedType* st) {
+    (void)w;
+    (void)st;
+    // Allocated gseqs were never published; they are simply not used (A6).
+    t->st = nullptr;
+}
+
+// Merges the unmerged type L0 blocks into one catalog run (A11 intent rule:
+// the run and manifest are named by the generation counter; an abandoned
+// generation is never reused).
+int32_t typeMerge(Writer* w, TypeOwner* t) {
+    Engine* e = w->engine();
+    if (t->nL0 < e->config().mergeL0Blocks) return 0;
+    int32_t rc = typeWarm(w, t);
+    if (rc < 0) return rc;
+    const uint32_t k = t->nL0;
+    const uint32_t gen = t->nextGen++;
+    std::vector<std::vector<uint8_t>> blocks(k);
+    for (uint32_t i = 0; i < k && rc >= 0; i++) {
+        const TypeL0DirEntry& de = t->l0[i];
+        FileRef tmp;
+        FileRef* f = &t->m;
+        if (de.mSeg != t->mSeg) {
+            PathBuf path;
+            pathTypeSeg(&path, w->eng_root(), t->fid, 'm', de.mSeg, "fsl");
+            rc = w->io().open(path.c_str(), path.len, FLATSQL_IO_READ, FileClass::TypeMeta, &tmp);
+            if (rc < 0) break;
+            f = &tmp;
+        }
+        blocks[i].resize(de.l0Len);
+        if (w->io().read(*f, blocks[i].data(), de.l0Len, de.mOff + de.l0Off) != int64_t(de.l0Len))
+            rc = FLATSQL_IO_ERR_IO;
+        if (tmp.valid()) w->io().close(&tmp);
+    }
+    if (rc < 0) return rc;
+    PathBuf xp;
+    pathTypeRun(&xp, w->eng_root(), t->fid, gen);
+    FileRef xf;
+    rc = w->io().open(xp.c_str(), xp.len,
+                      kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
+                      FileClass::Index, &xf);
+    if (rc < 0) return rc;
+    struct Ent {
+        const uint8_t* key;
+        uint16_t klen;
+        const uint8_t* val;
+    };
+    std::vector<std::vector<L0KindInfo>> infos(k);
+    std::vector<uint16_t> kinds;
+    for (uint32_t i = 0; i < k; i++) {
+        L0KindInfo ki[L0Accel::kMaxKinds];
+        size_t nk = 0;
+        if (!parseL0Block(blocks[i].data(), blocks[i].size(), ki, L0Accel::kMaxKinds, &nk)) {
+            w->io().close(&xf);
+            return FLATSQL_IO_ERR_IO;
+        }
+        infos[i].assign(ki, ki + nk);
+        for (size_t j = 0; j < nk; j++) kinds.push_back(ki[j].kind);
+    }
+    std::sort(kinds.begin(), kinds.end());
+    kinds.erase(std::unique(kinds.begin(), kinds.end()), kinds.end());
+    L1Writer lw(&w->io(), xf, 0, gen, 0, t->l0[0].commitSeq, t->l0[k - 1].commitSeq);
+    std::vector<Ent> ents;
+    for (uint16_t kind : kinds) {
+        ents.clear();
+        uint8_t vlen = valueLenOf(kind);
+        for (uint32_t i = 0; i < k; i++)
+            for (const auto& ki : infos[i]) {
+                if (ki.kind != kind) continue;
+                vlen = ki.vlen;
+                EntryIter it;
+                it.p = blocks[i].data() + ki.entriesOff;
+                it.end = it.p + ki.entriesBytes;
+                it.vlen = ki.vlen;
+                const uint8_t *ek, *ev;
+                uint16_t el;
+                while (it.next(&ek, &el, &ev)) ents.push_back({ek, el, ev});
+            }
+        std::sort(ents.begin(), ents.end(), [vlen](const Ent& a, const Ent& b) {
+            const int c = keyCmp(a.key, a.klen, b.key, b.klen);
+            if (c) return c < 0;
+            return std::memcmp(a.val, b.val, vlen) < 0;
+        });
+        rc = lw.beginKind(kind, ents.size());
+        for (const auto& en : ents) {
+            if (rc < 0) break;
+            rc = lw.add(en.key, en.klen, en.val);
+        }
+        if (rc >= 0) rc = lw.endKind();
+        if (rc < 0) break;
+    }
+    int64_t xLen = rc >= 0 ? lw.finish() : rc;
+    if (xLen < 0 || w->io().sync(xf) < 0) {
+        w->io().close(&xf);
+        return xLen < 0 ? int32_t(xLen) : FLATSQL_IO_ERR_IO;
+    }
+    // Type manifest: the list of live catalog runs.
+    std::vector<uint8_t> man(16);
+    putU32(man.data(), kMagicManifest);
+    putU32(man.data() + 4, uint32_t(t->runs.size() + 1));
+    putU32(man.data() + 8, gen);
+    putU32(man.data() + 12, 0);
+    auto addRun = [&](uint32_t g, uint64_t len) {
+        const size_t at = man.size();
+        man.resize(at + 16);
+        putU32(man.data() + at, g);
+        putU32(man.data() + at + 4, 0);
+        putU64(man.data() + at + 8, len);
+    };
+    for (const auto& r : t->runs) addRun(r.gen, r.fileLen);
+    addRun(gen, uint64_t(xLen));
+    const size_t at = man.size();
+    man.resize(at + 8, 0);
+    putU32(man.data() + at, crc32c(man.data(), at));
+    PathBuf mp;
+    char name[32];
+    snprintf(name, sizeof(name), "mf-%06x.fsm", gen);
+    pathType(&mp, w->eng_root(), t->fid, name);
+    FileRef mff;
+    rc = w->io().open(mp.c_str(), mp.len,
+                      kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
+                      FileClass::Manifest, &mff);
+    if (rc >= 0) rc = w->io().write(mff, man.data(), man.size(), 0);
+    if (rc >= 0) rc = w->io().sync(mff);
+    w->io().close(&mff);
+    if (rc < 0) {
+        w->io().close(&xf);
+        return rc;
+    }
+    // MERGE_DONE: a type batch with no entries, flagged, naming the manifest.
+    const size_t batchLen = sizeof(TypeBatchHeader) + 8;
+    std::vector<uint8_t> b(batchLen, 0);
+    TypeBatchHeader h{};
+    h.magic = kMagicTypeBatch;
+    h.ver = 1;
+    h.flags = kTypeFlagMergeDone;
+    h.commitSeq = t->commitSeq + 1;
+    h.gSeg = t->gSeg;
+    h.gOff = t->gLen;
+    h.gseqHi = t->gseqHi;
+    h.batchLen = uint32_t(batchLen);
+    h.l0Off = uint32_t(sizeof(TypeBatchHeader));
+    h.incarnation = e->incarnation();
+    h.firstLiveCount = t->firstLiveCount;
+    h.firstLiveBytes = t->firstLiveBytes;
+    h.arrivalsCount = t->arrivalsCount;
+    h.firstGseq = gen;  // manifest generation (MERGE_DONE batches carry no arrivals)
+    std::memcpy(b.data(), &h, sizeof(h));
+    putU32(b.data() + sizeof(h), crc32c(b.data(), sizeof(h)));
+    rc = ensureExtent(&w->io(), t->m, &t->mExtent, t->mEnd + batchLen, e->config().zeroFillStep);
+    if (rc >= 0) rc = w->io().write(t->m, b.data(), batchLen, t->mEnd);
+    if (rc >= 0) rc = w->io().sync(t->m);
+    if (rc < 0) {
+        w->io().close(&xf);
+        return rc;
+    }
+    t->commitSeq++;
+    t->mEnd += batchLen;
+    t->incarnation = e->incarnation();
+    SegRun run;
+    run.gen = gen;
+    run.file = xf;
+    run.fileLen = uint64_t(xLen);
+    run.run.reset(new L1Run());
+    rc = run.run->load(&w->io(), run.file, run.fileLen);
+    t->runs.push_back(std::move(run));
+    t->manifestGenLoaded = gen;
+    t->nL0 = 0;
+    t->chain.freeAll(e->pool());
+    if (rc < 0) return rc;
+    return typeWriteHead(w, t, false);
+}
+
+}  // namespace ps
+}  // namespace flatsql
