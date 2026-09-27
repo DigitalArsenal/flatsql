@@ -404,6 +404,7 @@ int32_t planMerge(Writer* w, Partition* p) {
     m.minEpoch = si->minEpoch;
     m.maxEpoch = si->maxEpoch;
     m.ownerEpoch = p->ownerEpoch;
+    m.ownerWord = &p->ring->ownerWordV;
     m.batches.assign(p->l0, p->l0 + k);
     // Tiered folding (fanout 4), decided from the accelerators' entry counts.
     uint64_t newEntries = 0;
@@ -496,6 +497,16 @@ std::vector<uint8_t> encodeSnapManifest(uint32_t pid, uint32_t gen, const std::v
 // Builds a planned merge's outputs (rows, attributes, the L1 run, the
 // manifest) without syncing them. Reads only the plan and immutable files, so
 // it may run on a helper thread.
+// A26: a helper result is written only while the plan's epoch still owns the
+// partition. (HANDOFF waits for an in-flight helper, so a revoked epoch here is
+// a defect; it is counted and the outputs are abandoned like an INTENT.)
+constexpr int32_t kMergeNotOwner = -1000;
+bool planStillOwns(const MergePlan& m) {
+    if (!m.ownerWord) return true;
+    const uint64_t w = m.ownerWord->load(std::memory_order_acquire);
+    return ownerEpoch(w) == m.ownerEpoch && ownerState(w) == kOwnOwned;
+}
+
 int32_t writeMergeOutputs(IoCtx* io, const char* root, uint32_t pid, MergePlan& m) {
     int32_t rc = 0;
     FileRef mf;
@@ -536,9 +547,12 @@ int32_t writeMergeOutputs(IoCtx* io, const char* root, uint32_t pid, MergePlan& 
     if (rc < 0) return rc;
     // Rows and attributes at offsets derived from the plan: a redo is
     // idempotent (A11).
+    if (!planStillOwns(m)) return kMergeNotOwner;
     rc = openSegAt(io, root, pid, 'r', m.seg, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS, &m.r);
     if (rc >= 0) rc = openSegAt(io, root, pid, 'a', m.seg, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS, &m.a);
+    if (rc >= 0 && !planStillOwns(m)) rc = kMergeNotOwner;
     if (rc >= 0 && !rbuf.empty()) rc = io->write(m.r, rbuf.data(), rbuf.size(), m.rOff);
+    if (rc >= 0 && !planStillOwns(m)) rc = kMergeNotOwner;
     if (rc >= 0 && !abuf.empty()) rc = io->write(m.a, abuf.data(), abuf.size(), m.aOff);
     m.rLen = m.rOff + rbuf.size();
     m.aLen = m.aOff + abuf.size();
@@ -547,6 +561,7 @@ int32_t writeMergeOutputs(IoCtx* io, const char* root, uint32_t pid, MergePlan& 
     // holding an older manifest keep reading them.
     PathBuf xp;
     pathPartitionRun(&xp, root, pid, m.seg, m.gen);
+    if (rc >= 0 && !planStillOwns(m)) rc = kMergeNotOwner;
     if (rc >= 0)
         rc = io->open(xp.c_str(), xp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
                       FileClass::Index, &m.run.file);
@@ -575,7 +590,9 @@ int32_t writeMergeOutputs(IoCtx* io, const char* root, uint32_t pid, MergePlan& 
         const std::vector<uint8_t> man = encodeSnapManifest(pid, m.gen, m.snap);
         PathBuf mp;
         pathPartitionManifest(&mp, root, pid, m.gen);
-        rc = io->open(mp.c_str(), mp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
+        if (!planStillOwns(m)) rc = kMergeNotOwner;
+        if (rc >= 0)
+            rc = io->open(mp.c_str(), mp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
                       FileClass::Manifest, &m.mf);
         if (rc >= 0) rc = io->write(m.mf, man.data(), man.size(), 0);
     }
@@ -597,6 +614,8 @@ void partitionMergeAbort(Writer* w, Partition* p) {
     MergePlan& m = p->mplan;
     if (p->mergePhase == kMergeBuilding) {
         // The helper owns the plan until it finishes.
+        if (m.result.load(std::memory_order_acquire) == 0)
+            w->engine()->cHandoffHelperWaits.fetch_add(1, std::memory_order_relaxed);
         while (m.result.load(std::memory_order_acquire) == 0) sleepNs(1000000);
     }
     w->io().close(&m.r);
@@ -645,8 +664,15 @@ int32_t partitionMergeStep(Writer* w, Partition* p) {
         if (e->config().mergeHelpers && !e->config().cooperative) {
             p->mergePhase = kMergeBuilding;
             Writer* owner = w;
-            e->submitMaintenance([m, pid, owner](IoCtx* io) {
+            e->submitMaintenance([m, pid, owner, e](IoCtx* io) {
+                const EngineConfig& cfg = e->config();
+                if (cfg.testHelperStallNs && cfg.testHelperStallEvery &&
+                    e->cHelperJobs.fetch_add(1, std::memory_order_relaxed) % cfg.testHelperStallEvery == 0) {
+                    e->cHelperStalls.fetch_add(1, std::memory_order_relaxed);
+                    sleepNs(cfg.testHelperStallNs);
+                }
                 const int32_t rc = writeMergeOutputs(io, owner->eng_root(), pid, *m);
+                if (rc == kMergeNotOwner) e->cMergeNotOwner.fetch_add(1, std::memory_order_relaxed);
                 m->result.store(rc < 0 ? rc : 1, std::memory_order_release);
                 owner->ring();
             });
@@ -661,7 +687,7 @@ int32_t partitionMergeStep(Writer* w, Partition* p) {
         if (res == 0) return 0;
         if (res < 0 || p->mplan.ownerEpoch != p->ownerEpoch) {
             partitionMergeAbort(w, p);
-            return res < 0 ? res : 0;
+            return res < 0 && res != kMergeNotOwner ? res : 0;
         }
         p->mergePhase = kMergeOutputsWritten;
         return 1;

@@ -78,6 +78,10 @@ struct EngineConfig {
     bool audit = false;             // single-writer audit log (tests, T1 #4)
     uint32_t auditCapacity = 1u << 20;
     bool lockStats = false;         // instrument shared critical sections (T1 #8)
+    // Tests (A26): every Nth merge helper job stalls this long before writing,
+    // standing in for a SIGSTOPped helper.
+    uint64_t testHelperStallNs = 0;
+    uint32_t testHelperStallEvery = 0;
     Io* io = nullptr;               // default: the seven imports
     int64_t (*clockMs)(void*) = nullptr;  // injectable wall clock
     void* clockCtx = nullptr;
@@ -295,6 +299,9 @@ struct MergePlan {
     uint32_t fold = 0;          // newest runs of the segment folded into the new one
     uint64_t segFirstPseq = 0;
     uint32_t ownerEpoch = 0;    // A26: the helper's result is applied only under it
+    // A26: the helper re-validates {epoch, OWNED} with an acquire load before
+    // every file mutation.
+    const std::atomic<uint64_t>* ownerWord = nullptr;
     std::vector<L0DirEntry> batches;      // the merged batches (copy)
     std::vector<MergeRunInput> foldRuns;  // folded runs (immutable while in flight)
     std::vector<SegSnap> snap;            // manifest input
@@ -635,6 +642,9 @@ struct EngineStats {
     uint64_t firstLabels = 0;
     uint64_t repeatLabels = 0;
     uint64_t promotions = 0;
+    uint64_t mergeNotOwner = 0;          // helper found its epoch revoked (A26)
+    uint64_t helperStalls = 0;           // injected helper stalls (tests)
+    uint64_t handoffHelperWaits = 0;     // aborts that waited for an in-flight helper
     uint64_t noticesDropped = 0;
     uint64_t framesParsedAtOpen = 0;
     uint64_t openReadBytes = 0;
@@ -710,7 +720,8 @@ public:
 
     // Counters (relaxed)
     std::atomic<uint64_t> cRows{0}, cDedupe{0}, cRetags{0}, cTombs{0}, cRejects{0}, cMerges{0},
-        cSeals{0}, cTypeCommits{0}, cFirst{0}, cRepeat{0}, cPromotions{0};
+        cSeals{0}, cTypeCommits{0}, cFirst{0}, cRepeat{0}, cPromotions{0}, cMergeNotOwner{0},
+        cHelperStalls{0}, cHelperJobs{0}, cHandoffHelperWaits{0};
     uint64_t framesParsedAtOpen = 0;
     uint64_t adoptedBatches = 0;
 

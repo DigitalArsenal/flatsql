@@ -967,6 +967,9 @@ EngineStats Engine::stats() const {
     s.firstLabels = cFirst.load();
     s.repeatLabels = cRepeat.load();
     s.promotions = cPromotions.load();
+    s.mergeNotOwner = cMergeNotOwner.load();
+    s.helperStalls = cHelperStalls.load();
+    s.handoffHelperWaits = cHandoffHelperWaits.load();
     for (const auto& t : typeStore_) s.noticesDropped += t->noticesDropped.load();
     s.framesParsedAtOpen = framesParsedAtOpen;
     s.openReadBytes = openIoStats_.totalReadBytes();

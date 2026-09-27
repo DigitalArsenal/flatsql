@@ -339,11 +339,14 @@ PS_TEST(writer_backpressure_flood_T1_5) {
     s.close();
 }
 
-static void rebalanceRun(double seconds, uint32_t writers, uint32_t partitions) {
+static void rebalanceRun(double seconds, uint32_t writers, uint32_t partitions, bool requireHelperOverlap) {
     Store s(true, writers, true);
     s.cfg.audit = true;
     s.cfg.mergeL0Blocks = 4;  // merges during rebalancing (A26)
     s.cfg.mergeMinL0Bytes = 0;
+    s.cfg.mergeHelpers = 1;
+    s.cfg.testHelperStallNs = 100000000;  // A26: helpers stalled for 100 ms
+    s.cfg.testHelperStallEvery = 8;
     REQUIRE(s.open() == 0);
     s.registerTypes({&ommType(), &mpeType()});
     std::vector<uint32_t> pids;
@@ -387,8 +390,17 @@ static void rebalanceRun(double seconds, uint32_t writers, uint32_t partitions) 
     for (auto& t : producers) t.join();
     rebalancer.join();
     const auto audit = s.e->auditLog();
+    const EngineStats es = s.e->stats();
     s.close();
     report("rebalance_moves", double(moves.load()), "moves");
+    report("rebalance_merges", double(es.merges), "merges");
+    report("rebalance_helper_stalls_100ms", double(es.helperStalls), "stalls");
+    report("rebalance_non_owner_helper_writes", double(es.mergeNotOwner), "writes");
+    report("rebalance_handoffs_during_helper_merge", double(es.handoffHelperWaits), "handoffs");
+    CHECK(es.merges > 0);
+    CHECK(es.helperStalls > 0);
+    CHECK_EQ(es.mergeNotOwner, uint64_t(0));
+    if (requireHelperOverlap) CHECK(es.handoffHelperWaits > 0);
     report("rebalance_commits_audited", double(audit.size()), "commits");
     // Per partition: pseq ranges contiguous, one (writer, thread) per epoch,
     // epochs non-decreasing, commit intervals never overlap.
@@ -432,8 +444,8 @@ static void rebalanceRun(double seconds, uint32_t writers, uint32_t partitions) 
     s.close();
 }
 
-PS_TEST(writer_single_writer_under_rebalance_T1_4) { rebalanceRun(double(argInt("rebalance-seconds", 8)), 4, 16); }
-PS_SLOW_TEST(writer_single_writer_under_rebalance_T1_4_full) { rebalanceRun(600.0, 8, 64); }
+PS_TEST(writer_single_writer_under_rebalance_T1_4) { rebalanceRun(double(argInt("rebalance-seconds", 8)), 4, 16, true); }
+PS_SLOW_TEST(writer_single_writer_under_rebalance_T1_4_full) { rebalanceRun(600.0, 8, 64, true); }
 
 PS_TEST(writer_memory_2048_partitions_64_active_T1_9) {
     Store s(true, 1, true);
