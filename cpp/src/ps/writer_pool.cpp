@@ -166,16 +166,22 @@ bool CmdQueue::empty() const {
 SyncPool::~SyncPool() { stop(); }
 
 void SyncPool::start(uint32_t threads) {
-    slots_.reset(new Slot[kCap]);
-    for (uint32_t i = 0; i < kCap; i++) slots_[i].seq.store(i, std::memory_order_relaxed);
     stop_.store(false);
     for (uint32_t i = 0; i < threads; i++) {
-        threads_.emplace_back([this] {
+        threads_.emplace_back([this, i] {
+            uint32_t rr = i;
             while (!stop_.load(std::memory_order_acquire)) {
-                if (popAndRun()) continue;
                 const uint32_t w = work_.load(std::memory_order_acquire);
-                if (popAndRun()) continue;
-                waitU32(&work_, w, 5000000);
+                bool progress = false;
+                for (uint32_t k = 0; k < kMaxWriters; k++) {
+                    Slot& s = slots_[(rr + k) % kMaxWriters];
+                    if (helpOne(s)) {
+                        progress = true;
+                        rr = (rr + k + 1) % kMaxWriters;
+                        break;
+                    }
+                }
+                if (!progress) waitU32(&work_, w, 5000000);
             }
         });
     }
@@ -190,65 +196,50 @@ void SyncPool::stop() {
     threads_.clear();
 }
 
-bool SyncPool::popAndRun() {
-    if (!slots_) return false;
-    uint64_t pos = deq_.load(std::memory_order_relaxed);
+bool SyncPool::helpOne(Slot& s) {
+    uint64_t c = s.claim.load(std::memory_order_acquire);
     for (;;) {
-        Slot& s = slots_[pos & (kCap - 1)];
-        const uint64_t seq = s.seq.load(std::memory_order_acquire);
-        const int64_t dif = int64_t(seq) - int64_t(pos + 1);
-        if (dif == 0) {
-            if (deq_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                SyncJob job = s.job;
-                s.seq.store(pos + kCap, std::memory_order_release);
-                const int saved = tHotPathDepth;
-                tHotPathDepth = 0;  // host call
-                *job.result = job.io->sync(job.handle);
-                tHotPathDepth = saved;
-                if (job.remaining->fetch_sub(1, std::memory_order_acq_rel) == 1)
-                    wakeU32(job.remaining, -1);
-                return true;
-            }
-        } else if (dif < 0) {
-            return false;
-        } else {
-            pos = deq_.load(std::memory_order_relaxed);
-        }
+        const uint32_t idx = uint32_t(c);
+        const uint32_t n = s.n.load(std::memory_order_acquire);
+        if (idx >= n) return false;
+        SyncJob* jobs = s.jobs;
+        if (!s.claim.compare_exchange_weak(c, c + 1, std::memory_order_acq_rel)) continue;
+        SyncJob& job = jobs[idx];
+        const int saved = tHotPathDepth;
+        tHotPathDepth = 0;  // host call
+        *job.result = job.io->sync(job.handle);
+        tHotPathDepth = saved;
+        if (s.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) wakeU32(&s.remaining, -1);
+        return true;
     }
 }
 
-void SyncPool::runAll(SyncJob* jobs, size_t n) {
+void SyncPool::runAll(uint32_t writer, SyncJob* jobs, size_t n) {
     if (n == 0) return;
-    if (threads_.empty() || n == 1) {
+    if (threads_.empty() || n == 1 || writer >= kMaxWriters) {
         const int saved = tHotPathDepth;
         tHotPathDepth = 0;  // host calls
         for (size_t i = 0; i < n; i++) *jobs[i].result = jobs[i].io->sync(jobs[i].handle);
         tHotPathDepth = saved;
         return;
     }
-    std::atomic<uint32_t> remaining{uint32_t(n)};
-    size_t pushed = 0;
-    while (pushed < n) {
-        uint64_t pos = enq_.load(std::memory_order_relaxed);
-        Slot& s = slots_[pos & (kCap - 1)];
-        const uint64_t seq = s.seq.load(std::memory_order_acquire);
-        if (int64_t(seq) - int64_t(pos) == 0 &&
-            enq_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-            s.job = jobs[pushed];
-            s.job.remaining = &remaining;
-            s.seq.store(pos + 1, std::memory_order_release);
-            pushed++;
-        } else if (int64_t(seq) - int64_t(pos) < 0) {
-            popAndRun();  // queue full: help
-        }
-    }
+    Slot& s = slots_[writer];
+    // Publish the round: n first, then a new generation with next = 0.
+    s.n.store(0, std::memory_order_release);
+    const uint64_t gen = (s.claim.load(std::memory_order_relaxed) >> 32) + 1;
+    s.claim.store(gen << 32, std::memory_order_release);
+    s.jobs = jobs;
+    s.remaining.store(uint32_t(n), std::memory_order_release);
+    s.n.store(uint32_t(n), std::memory_order_release);
     work_.fetch_add(1, std::memory_order_release);
-    wakeU32(&work_, int(n));
-    while (true) {
-        const uint32_t r = remaining.load(std::memory_order_acquire);
+    wakeU32(&work_, int(n - 1));
+    while (helpOne(s)) {}
+    for (;;) {
+        const uint32_t r = s.remaining.load(std::memory_order_acquire);
         if (r == 0) break;
-        if (!popAndRun()) waitU32(&remaining, r, 1000000);
+        waitU32(&s.remaining, r, 1000000);
     }
+    s.n.store(0, std::memory_order_release);
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +291,7 @@ void Writer::runJobs() {
         for (auto& j : jobs_) *j.result = j.io->sync(j.handle);
         tHotPathDepth = saved;
     } else {
-        eng_->syncPool().runAll(jobs_.data(), jobs_.size());
+        eng_->syncPool().runAll(id_, jobs_.data(), jobs_.size());
     }
     syncRounds_.fetch_add(1, std::memory_order_relaxed);
     // A failed sync is never retried (fsyncgate): the owner is quarantined.
@@ -342,6 +333,7 @@ void Writer::commitRound() {
             queueSync(p->mplan.mf, p, 1);
         }
         if (st->dBytes) {
+            framedCommits_.fetch_add(1, std::memory_order_relaxed);
             int32_t rc = ensureExtent(&io_, p->d, &p->dExtent, st->dOff + st->dBytes, cfg.zeroFillStep);
             if (rc >= 0) rc = io_.write(p->d, st->frames, st->dBytes, st->dOff);
             if (rc < 0) {
@@ -374,6 +366,7 @@ void Writer::commitRound() {
             queueSync(t->g, t, 2);
         }
     }
+    commitSyncRounds_.fetch_add(jobs_.empty() ? 0 : 1, std::memory_order_relaxed);
     runJobs();  // sync round 1
     // Phase B: meta batches (partition m, type m).
     for (Partition* p : dirty_) {
@@ -386,6 +379,7 @@ void Writer::commitRound() {
             continue;
         }
         queueSync(p->m, p, 1);
+        batches_.fetch_add(1, std::memory_order_relaxed);
     }
     for (TypeOwner* t : dirtyTypes_) {
         StagedType* st = t->st;
@@ -398,6 +392,7 @@ void Writer::commitRound() {
         }
         queueSync(t->m, t, 2);
     }
+    commitSyncRounds_.fetch_add(jobs_.empty() ? 0 : 1, std::memory_order_relaxed);
     runJobs();  // sync round 2
     // Publish: heads, then acks (§6.4 steps 5-6); checkpoint heads are synced.
     const uint64_t nowNsV = monoNs();
@@ -724,7 +719,7 @@ void Writer::maintenance() {
 int64_t Engine::wallMsNow() { return wallMs(); }
 
 Engine::~Engine() {
-    if (started_) stop(0);
+    if (!closed_) stop(0);
     for (auto& p : partStore_) {
         if (!p) continue;
         ringDestroy(p->ring);
@@ -773,6 +768,8 @@ int32_t Engine::start() {
 
 int32_t Engine::stop(uint64_t deadlineMs) {
     (void)deadlineMs;
+    if (closed_) return 0;
+    closed_ = true;
     stop_.store(true, std::memory_order_release);
     for (auto& w : writers_) w->ring();
     for (auto& w : writers_)
@@ -815,6 +812,8 @@ int32_t Engine::stop(uint64_t deadlineMs) {
 }
 
 void Engine::abandon() {
+    if (closed_) return;
+    closed_ = true;
     stop_.store(true, std::memory_order_release);
     for (auto& w : writers_) w->ring();
     for (auto& w : writers_)
@@ -903,6 +902,9 @@ EngineStats Engine::stats() const {
         s.commits += w->commits();
         s.syncRounds += w->syncRounds();
         s.iterationsWithCommit += w->iterationsWithCommit();
+        s.commitSyncRounds += w->commitSyncRounds();
+        s.partitionCommitsWithFrames += w->partitionCommitsWithFrames();
+        s.partitionBatches += w->partitionBatches();
         s.arenaHighWater += w->arena_.highWater() + w->framesArena_.highWater();
     }
     s.rowsAppended = cRows.load();
@@ -1074,6 +1076,7 @@ int32_t Producer::enqueue(uint16_t kind, uint16_t flags, int64_t arrivalMs, cons
         }
         r->prodBusy.fetch_sub(1, std::memory_order_seq_cst);
         eng_->ringOwner(pid_);
+        creditWaits_++;
         if (!wait) return FLATSQL_IO_ERR_BUSY;
         // Zero credits: wait for an ack (space) or a mapping (pages).
         r->prodWaiting.store(1, std::memory_order_release);

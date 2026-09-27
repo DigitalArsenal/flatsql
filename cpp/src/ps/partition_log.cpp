@@ -321,11 +321,12 @@ template <typename F>
 int32_t committedPostings(Ctx& c, uint16_t kind, const uint8_t* key, size_t klen, F&& visit) {
     Partition* p = c.p;
     bool stop = false;
+    const uint64_t h = bloomHash(key, klen);
     for (uint32_t i = 0; i < p->nL0 && !stop; i++) {
         const L0Accel& a = p->acc[i];
         const L0Accel::Kind* k = a.find(kind);
         if (!k || k->n == 0) continue;
-        if (k->bloom && !bloomTest(k->bloom, k->bloomBytes, key, klen)) continue;
+        if (k->bloom && !bloomTestHash(k->bloom, k->bloomBytes, h)) continue;
         const int32_t rc = scanL0Section(c, a, *k, [&](const uint8_t* ek, uint16_t el, const uint8_t* ev) {
             const int cmp = keyCmp(ek, el, key, klen);
             if (cmp < 0) return true;
@@ -342,7 +343,7 @@ int32_t committedPostings(Ctx& c, uint16_t kind, const uint8_t* key, size_t klen
         if (stop) break;
         for (auto& run : si.runs) {
             if (stop) break;
-            if (!run.run || !run.run->mayContain(kind, key, klen)) continue;
+            if (!run.run || !run.run->mayContainHash(kind, h)) continue;
             const int64_t rc = run.run->lookup(c.io, run.file, kind, key, klen, c.w->lookupScratch(),
                                                [&](const uint8_t*, uint16_t, const uint8_t* ev) {
                                                    if (!stop && !visit(ev)) stop = true;
@@ -2090,12 +2091,15 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
             p->sealPending = false;
             e->cSeals.fetch_add(1, std::memory_order_relaxed);
         }
+        const bool lockStats = e->config().lockStats;
+        const uint64_t l0 = lockStats ? monoNs() : 0;
         p->pubLock.writeBegin();
         p->pub.commitSeq = p->commitSeq;
         p->pub.pseqHi = p->pseqHi;
         p->pub.nL0 = p->nL0;
         std::memcpy(p->pub.l0, p->l0, sizeof(L0DirEntry) * p->nL0);
         p->pubLock.writeEnd();
+        if (lockStats) e->seqlockHist().record(monoNs() - l0);
         p->durablePseqHi.store(p->pseqHi, std::memory_order_release);
         p->durableCommitSeq.store(p->commitSeq, std::memory_order_release);
         p->durableMEnd.store(p->mEnd, std::memory_order_release);

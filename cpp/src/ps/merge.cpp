@@ -478,7 +478,30 @@ int32_t writeMergeOutputs(Writer* w, Partition* p) {
     if (rc >= 0 && !abuf.empty()) rc = w->io().write(m.a, abuf.data(), abuf.size(), m.aOff);
     m.rLen = m.rOff + rbuf.size();
     m.aLen = m.aOff + abuf.size();
-    // L1 run over the merged L0 blocks, kind by kind (fresh file, A11).
+    // L1 run over the merged L0 blocks (fresh file, A11), folding the newest
+    // runs of the segment while each is at most twice what is being merged:
+    // O(log n) runs per segment, O(n log n) total rewriting. Folded run files
+    // stay on disk until reclamation (T3); readers holding an older manifest
+    // keep reading them.
+    uint64_t newEntries = 0;
+    for (uint32_t i = 0; i < m.k; i++) {
+        L0KindInfo ki[L0Accel::kMaxKinds];
+        size_t nk = 0;
+        if (parseL0Block(blocks[i].data(), blocks[i].size(), ki, L0Accel::kMaxKinds, &nk))
+            for (size_t j = 0; j < nk; j++) newEntries += ki[j].n;
+    }
+    // Tiered with fanout 4: fold only when at least three similar-sized
+    // tail runs exist (write amplification ~log4 of the segment's runs).
+    m.fold = 0;
+    uint64_t acc = newEntries;
+    uint32_t cand = 0;
+    for (size_t i = si->runs.size(); i-- > 0;) {
+        const SegRun& r = si->runs[i];
+        if (!r.run || r.run->entries() > 2 * acc) break;
+        acc += r.run->entries();
+        cand++;
+    }
+    if (cand >= 3) m.fold = cand;
     PathBuf xp;
     pathPartitionRun(&xp, w->eng_root(), p->pid, m.seg, m.gen);
     if (rc >= 0)
@@ -487,60 +510,16 @@ int32_t writeMergeOutputs(Writer* w, Partition* p) {
                           FileClass::Index, &m.run.file);
     int64_t xLen = 0;
     if (rc >= 0) {
-        struct Ent {
-            const uint8_t* key;
-            uint16_t klen;
-            const uint8_t* val;
-        };
-        std::vector<std::vector<L0KindInfo>> infos(m.k);
-        std::vector<uint16_t> kinds;
-        for (uint32_t i = 0; i < m.k; i++) {
-            L0KindInfo ki[L0Accel::kMaxKinds];
-            size_t nk = 0;
-            if (!parseL0Block(blocks[i].data(), blocks[i].size(), ki, L0Accel::kMaxKinds, &nk)) {
-                rc = FLATSQL_IO_ERR_IO;
-                break;
-            }
-            infos[i].assign(ki, ki + nk);
-            for (size_t j = 0; j < nk; j++) kinds.push_back(ki[j].kind);
-        }
-        std::sort(kinds.begin(), kinds.end());
-        kinds.erase(std::unique(kinds.begin(), kinds.end()), kinds.end());
-        L1Writer lw(&w->io(), m.run.file, m.seg, m.gen, 0, m.firstPseq, m.through);
-        std::vector<Ent> ents;
-        for (uint16_t kind : kinds) {
-            if (rc < 0) break;
-            ents.clear();
-            uint8_t vlen = valueLenOf(kind);
-            for (uint32_t i = 0; i < m.k; i++) {
-                for (const auto& ki : infos[i]) {
-                    if (ki.kind != kind) continue;
-                    vlen = ki.vlen;
-                    EntryIter it;
-                    it.p = blocks[i].data() + ki.entriesOff;
-                    it.end = it.p + ki.entriesBytes;
-                    it.vlen = ki.vlen;
-                    const uint8_t *ek, *ev;
-                    uint16_t el;
-                    while (it.next(&ek, &el, &ev)) ents.push_back({ek, el, ev});
-                }
-            }
-            std::sort(ents.begin(), ents.end(), [vlen](const Ent& a, const Ent& b) {
-                const int c = keyCmp(a.key, a.klen, b.key, b.klen);
-                if (c) return c < 0;
-                return std::memcmp(a.val, b.val, vlen) < 0;
-            });
-            rc = lw.beginKind(kind, ents.size());
-            for (const auto& en : ents) {
-                if (rc < 0) break;
-                rc = lw.add(en.key, en.klen, en.val);
-            }
-            if (rc >= 0) rc = lw.endKind();
-        }
-        if (rc >= 0) {
-            xLen = lw.finish();
-            if (xLen < 0) rc = int32_t(xLen);
-        }
+        std::vector<MergeL0Input> l0s;
+        for (uint32_t i = 0; i < m.k; i++) l0s.push_back({blocks[i].data(), blocks[i].size()});
+        std::vector<MergeRunInput> folded;
+        for (size_t i = si->runs.size() - m.fold; i < si->runs.size(); i++)
+            folded.push_back({si->runs[i].run.get(), si->runs[i].file});
+        const uint64_t first = m.fold ? si->firstPseq : m.firstPseq;
+        uint64_t n = 0;
+        xLen = mergeToL1(&w->io(), m.run.file, m.seg, m.gen, uint16_t(m.fold ? 1 : 0), first, m.through, l0s,
+                         folded, &n);
+        if (xLen < 0) rc = int32_t(xLen);
     }
     m.run.gen = m.gen;
     m.run.fileLen = uint64_t(xLen > 0 ? xLen : 0);
@@ -557,13 +536,17 @@ int32_t writeMergeOutputs(Writer* w, Partition* p) {
         si->aLen = m.aLen;
         si->minEpoch = m.minEpoch;
         si->maxEpoch = m.maxEpoch;
+        // Temporarily present the post-merge run list to the encoder.
+        std::vector<SegRun> kept;
+        for (size_t i = si->runs.size() - m.fold; i < si->runs.size(); i++) kept.push_back(std::move(si->runs[i]));
+        si->runs.resize(si->runs.size() - m.fold);
         SegRun probe;
         probe.gen = m.gen;
         probe.fileLen = m.run.fileLen;
-        L1Run tmpRun;
         si->runs.push_back(std::move(probe));
         std::vector<uint8_t> man = encodeManifest(p, m.gen);
         si->runs.pop_back();
+        for (auto& r : kept) si->runs.push_back(std::move(r));
         si->mergedEnd = saved.mergedEnd;
         si->rLen = saved.rLen;
         si->aLen = saved.aLen;
@@ -602,8 +585,10 @@ void partitionMergeAbort(Writer* w, Partition* p) {
         PathBuf xp, mfp, rp, ap;
         pathPartitionRun(&xp, w->eng_root(), p->pid, m.seg, m.gen);
         pathPartitionManifest(&mfp, w->eng_root(), p->pid, m.gen);
-        w->io().unlink(xp.c_str(), xp.len, false);
-        w->io().unlink(mfp.c_str(), mfp.len, false);
+        // Closed above; a BUSY (another holder) leaves an orphan for open to
+        // discard with the INTENT.
+        w->io().unlink(xp.c_str(), xp.len, true);
+        w->io().unlink(mfp.c_str(), mfp.len, true);
         FileRef rf, af;
         if (openSeg(w, p, 'r', m.seg, kOpenRW, &rf) == 0) {
             if (w->io().size(rf) > int64_t(m.rOff)) w->io().truncate(rf, m.rOff);
@@ -655,6 +640,10 @@ void partitionMergeApply(Writer* w, Partition* p) {
     si->aLen = m.aLen;
     si->minEpoch = m.minEpoch;
     si->maxEpoch = m.maxEpoch;
+    for (uint32_t i = 0; i < m.fold && !si->runs.empty(); i++) {
+        w->io().close(&si->runs.back().file);
+        si->runs.pop_back();  // unique_ptr release: maintenance-sized, not per record
+    }
     si->runs.push_back(std::move(m.run));
     m.run = SegRun();
     w->io().close(&m.r);

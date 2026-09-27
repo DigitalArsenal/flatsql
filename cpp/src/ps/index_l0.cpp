@@ -77,8 +77,13 @@ void bloomAdd(uint8_t* bits, size_t bytes, const uint8_t* key, size_t klen) {
     }
 }
 
+uint64_t bloomHash(const uint8_t* key, size_t klen) { return hash64(key, klen, 0x626c6f6f6d); }
+
 bool bloomTest(const uint8_t* bits, size_t bytes, const uint8_t* key, size_t klen) {
-    const uint64_t h = hash64(key, klen, 0x626c6f6f6d);
+    return bloomTestHash(bits, bytes, bloomHash(key, klen));
+}
+
+bool bloomTestHash(const uint8_t* bits, size_t bytes, uint64_t h) {
     const uint64_t m = uint64_t(bytes) * 8;
     const uint64_t h1 = h & 0xffffffffull;
     const uint64_t h2 = (h >> 32) | 1;

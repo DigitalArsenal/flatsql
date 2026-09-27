@@ -42,6 +42,9 @@ uint8_t keyTypeOf(uint16_t kind);
 size_t bloomBytesFor(uint32_t nKeys);
 void bloomAdd(uint8_t* bits, size_t bytes, const uint8_t* key, size_t klen);
 bool bloomTest(const uint8_t* bits, size_t bytes, const uint8_t* key, size_t klen);
+// The same test with the key hash computed once (bloomHash) for many blooms.
+uint64_t bloomHash(const uint8_t* key, size_t klen);
+bool bloomTestHash(const uint8_t* bits, size_t bytes, uint64_t h);
 
 struct StagedEntry {
     uint16_t kind;
@@ -199,6 +202,7 @@ class L1Run {
 public:
     int32_t load(IoCtx* io, const FileRef& f, uint64_t fileLen);
     bool mayContain(uint16_t kind, const uint8_t* key, size_t klen) const;
+    bool mayContainHash(uint16_t kind, uint64_t h) const;
     // Calls visit(key, klen, val) for every entry whose key == key. Reads the
     // candidate blocks into `scratch` (>= kL1BlockBytes). Returns entries
     // visited or < 0 on I/O error.
@@ -219,6 +223,11 @@ public:
     uint16_t level() const { return level_; }
     uint64_t memoryBytes() const;
     bool hasKind(uint16_t kind) const { return findKind(kind) != nullptr; }
+    std::vector<uint16_t> kinds() const;
+    uint64_t kindEntries(uint16_t kind) const;
+    // Block offsets of a kind in order (streaming merges).
+    const std::vector<L1Fence>* fences(uint16_t kind) const;
+    uint8_t kindVlen(uint16_t kind) const;
 
 private:
     struct KindView {
@@ -234,6 +243,21 @@ private:
     uint32_t gen_ = 0;
     uint16_t level_ = 0;
 };
+
+// Streaming k-way merge of L0 kind sections and existing L1 runs into a new
+// L1 run (maintenance only; memory O(inputs x one block)).
+struct MergeL0Input {
+    const uint8_t* block;
+    size_t len;
+};
+struct MergeRunInput {
+    const L1Run* run;
+    FileRef file;
+};
+// Returns the new file length (< 0 on error); *entries receives the count.
+int64_t mergeToL1(IoCtx* io, FileRef out, uint32_t seg, uint32_t gen, uint16_t level, uint64_t first,
+                  uint64_t last, const std::vector<MergeL0Input>& l0s, const std::vector<MergeRunInput>& runs,
+                  uint64_t* entries);
 
 // Validates a 4 KiB L1 block and iterates its entries.
 bool l1BlockValid(const uint8_t* block);

@@ -271,6 +271,7 @@ struct MergePlan {
     uint64_t aLen = 0;
     int64_t minEpoch = INT64_MAX;
     int64_t maxEpoch = INT64_MIN;
+    uint32_t fold = 0;          // newest runs of the segment folded into the new one
     FileRef r, a, mf;
     SegRun run;                 // the new L1 run, accelerators preloaded
 };
@@ -398,6 +399,7 @@ struct TypeOwner {
     uint8_t mergePhase = 0;          // 0 idle, 1 outputs written (DONE rides the next batch)
     uint32_t mergeGen = 0;
     uint32_t mergeK = 0;
+    uint32_t mergeFold = 0;          // newest catalog runs folded into the new one
     uint64_t mergeThroughCommit = 0;
     SegRun mergeRun;
     FileRef mergeMf;
@@ -477,25 +479,28 @@ struct SyncJob {
     std::atomic<uint32_t>* remaining = nullptr;
 };
 
+// Fair sync pool (A8): each writer publishes its round's jobs in its own
+// slot and always runs its own jobs; pool threads help any writer,
+// round-robin, so one writer's slow syncs never queue another's.
 class SyncPool {
 public:
+    static constexpr uint32_t kMaxWriters = 64;
     ~SyncPool();
     void start(uint32_t threads);
     void stop();
-    // Runs every job; returns when all finished. The caller helps.
-    void runAll(SyncJob* jobs, size_t n);
+    // Runs every job of `writer`'s round; returns when all finished.
+    void runAll(uint32_t writer, SyncJob* jobs, size_t n);
     uint32_t threads() const { return uint32_t(threads_.size()); }
 
 private:
-    bool popAndRun();
-    struct Slot {
-        std::atomic<uint64_t> seq;
-        SyncJob job;
+    struct alignas(64) Slot {
+        std::atomic<uint64_t> claim{0};     // (generation << 32) | next index
+        std::atomic<uint32_t> n{0};
+        std::atomic<uint32_t> remaining{0};
+        SyncJob* jobs = nullptr;
     };
-    static constexpr uint32_t kCap = 4096;
-    std::unique_ptr<Slot[]> slots_;
-    alignas(64) std::atomic<uint64_t> enq_{0};
-    alignas(64) std::atomic<uint64_t> deq_{0};
+    bool helpOne(Slot& s);
+    Slot slots_[kMaxWriters];
     std::atomic<uint32_t> work_{0};
     std::atomic<bool> stop_{false};
     std::vector<std::thread> threads_;
@@ -523,6 +528,9 @@ public:
     uint64_t commits() const { return commits_.load(std::memory_order_relaxed); }
     uint64_t syncRounds() const { return syncRounds_.load(std::memory_order_relaxed); }
     uint64_t iterationsWithCommit() const { return iterCommit_.load(std::memory_order_relaxed); }
+    uint64_t commitSyncRounds() const { return commitSyncRounds_.load(std::memory_order_relaxed); }
+    uint64_t partitionCommitsWithFrames() const { return framedCommits_.load(std::memory_order_relaxed); }
+    uint64_t partitionBatches() const { return batches_.load(std::memory_order_relaxed); }
     uint8_t* lookupScratch() { return lookupScratch_.data(); }
 
 private:
@@ -570,6 +578,9 @@ private:
     std::atomic<uint64_t> commits_{0};
     std::atomic<uint64_t> syncRounds_{0};
     std::atomic<uint64_t> iterCommit_{0};
+    std::atomic<uint64_t> commitSyncRounds_{0};
+    std::atomic<uint64_t> framedCommits_{0};
+    std::atomic<uint64_t> batches_{0};
     std::thread thread_;
     uint32_t osTid_ = 0;
 };
@@ -579,6 +590,9 @@ struct EngineStats {
     uint64_t commits = 0;
     uint64_t syncRounds = 0;
     uint64_t iterationsWithCommit = 0;
+    uint64_t commitSyncRounds = 0;       // sync rounds issued by commit rounds
+    uint64_t partitionCommitsWithFrames = 0;
+    uint64_t partitionBatches = 0;       // committed partition meta batches
     uint64_t rowsAppended = 0;
     uint64_t dedupeHits = 0;
     uint64_t retags = 0;
@@ -656,7 +670,8 @@ public:
     uint32_t reserveSlabs() const { return reserveSlabs_; }
 
     // Instrumentation
-    LockHist& lockHist() { return lockHist_; }
+    LockHist& lockHist() { return lockHist_; }        // registration lock holds
+    LockHist& seqlockHist() { return seqlockHist_; }  // partition seqlock writer sections
     std::vector<AuditRecord> auditLog() const;
     void auditAppend(const AuditRecord& r);
 
@@ -703,7 +718,9 @@ private:
     uint32_t incarnation_ = 0;
     std::atomic<bool> stop_{false};
     bool started_ = false;
+    bool closed_ = false;
     LockHist lockHist_;
+    LockHist seqlockHist_;
     mutable std::mutex auditMutex_;
     std::vector<AuditRecord> audit_;
 };
@@ -726,6 +743,8 @@ public:
     int32_t rejectCode(uint64_t rseq);
     uint64_t credits() const;
     RingDesc* ringDesc() const { return ring_; }
+    // Times an entry found no credit (ring cap, pool, or unmapped pages).
+    uint64_t creditWaits() const { return creditWaits_; }
 
 private:
     Engine* eng_;
@@ -733,6 +752,7 @@ private:
     RingDesc* ring_;
     std::vector<uint8_t> scratch_;
     std::unordered_map<uint64_t, int32_t> rejects_;
+    uint64_t creditWaits_ = 0;
 };
 
 // RecordAttr helpers (flatsql_attr.fbs), router side and engine side.

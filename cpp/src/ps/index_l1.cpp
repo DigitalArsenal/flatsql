@@ -1,5 +1,7 @@
 // FlatSQL partition store: L1 runs (see ps/index.h). Built and loaded only
 // on maintenance paths (merge, seal, partition activation), never per record.
+#include <algorithm>
+
 #include "flatsql/ps/index.h"
 #include "flatsql/ps/platform.h"
 
@@ -223,10 +225,148 @@ size_t L1Run::firstCandidate(const KindView& k, const uint8_t* key, size_t klen)
     return lo == 0 ? 0 : lo - 1;
 }
 
+bool L1Run::mayContainHash(uint16_t kind, uint64_t h) const {
+    const KindView* k = findKind(kind);
+    if (!k || k->fences.empty()) return false;
+    if (k->bloom.empty()) return true;
+    return bloomTestHash(k->bloom.data(), k->bloom.size(), h);
+}
+
 uint64_t L1Run::memoryBytes() const {
     uint64_t b = 0;
     for (const auto& k : kinds_) b += k.fences.size() * sizeof(L1Fence) + k.bloom.size();
     return b;
+}
+
+std::vector<uint16_t> L1Run::kinds() const {
+    std::vector<uint16_t> out;
+    for (const auto& k : kinds_) out.push_back(k.toc.kind);
+    return out;
+}
+
+uint64_t L1Run::kindEntries(uint16_t kind) const {
+    const KindView* k = findKind(kind);
+    return k ? k->toc.nEntries : 0;
+}
+
+const std::vector<L1Fence>* L1Run::fences(uint16_t kind) const {
+    const KindView* k = findKind(kind);
+    return k ? &k->fences : nullptr;
+}
+
+uint8_t L1Run::kindVlen(uint16_t kind) const {
+    const KindView* k = findKind(kind);
+    return k ? k->toc.vlen : valueLenOf(kind);
+}
+
+namespace {
+struct Cursor {
+    // L0 section or L1 run blocks.
+    EntryIter it;
+    const L1Run* run = nullptr;
+    FileRef file;
+    const std::vector<L1Fence>* fences = nullptr;
+    size_t block = 0;
+    std::vector<uint8_t> buf;
+    uint8_t vlen = 0;
+    const uint8_t* key = nullptr;
+    const uint8_t* val = nullptr;
+    uint16_t klen = 0;
+    bool valid = false;
+    int32_t err = 0;
+    bool advance(IoCtx* io) {
+        for (;;) {
+            if (it.next(&key, &klen, &val)) return valid = true;
+            if (!run || !fences || block >= fences->size()) return valid = false;
+            buf.resize(kL1BlockBytes);
+            const int64_t n = io->read(file, buf.data(), kL1BlockBytes, (*fences)[block].blockOff);
+            block++;
+            if (n != int64_t(kL1BlockBytes) || !l1BlockValid(buf.data())) {
+                err = FLATSQL_IO_ERR_IO;
+                return valid = false;
+            }
+            it = l1BlockIter(buf.data(), vlen);
+        }
+    }
+};
+}  // namespace
+
+int64_t mergeToL1(IoCtx* io, FileRef out, uint32_t seg, uint32_t gen, uint16_t level, uint64_t first,
+                  uint64_t last, const std::vector<MergeL0Input>& l0s, const std::vector<MergeRunInput>& runs,
+                  uint64_t* entries) {
+    std::vector<std::vector<L0KindInfo>> infos(l0s.size());
+    std::vector<uint16_t> kinds;
+    for (size_t i = 0; i < l0s.size(); i++) {
+        L0KindInfo ki[64];
+        size_t nk = 0;
+        if (!parseL0Block(l0s[i].block, l0s[i].len, ki, 64, &nk)) return FLATSQL_IO_ERR_IO;
+        infos[i].assign(ki, ki + nk);
+        for (size_t j = 0; j < nk; j++) kinds.push_back(ki[j].kind);
+    }
+    for (const auto& r : runs)
+        for (uint16_t k : r.run->kinds()) kinds.push_back(k);
+    std::sort(kinds.begin(), kinds.end());
+    kinds.erase(std::unique(kinds.begin(), kinds.end()), kinds.end());
+    L1Writer w(io, out, seg, gen, level, first, last);
+    int32_t rc = 0;
+    for (uint16_t kind : kinds) {
+        std::vector<Cursor> cs;
+        uint64_t expected = 0;
+        uint8_t vlen = valueLenOf(kind);
+        for (size_t i = 0; i < l0s.size(); i++)
+            for (const auto& ki : infos[i]) {
+                if (ki.kind != kind) continue;
+                Cursor c;
+                c.it.p = l0s[i].block + ki.entriesOff;
+                c.it.end = c.it.p + ki.entriesBytes;
+                c.it.vlen = ki.vlen;
+                c.vlen = ki.vlen;
+                vlen = ki.vlen;
+                expected += ki.n;
+                cs.push_back(std::move(c));
+            }
+        for (const auto& r : runs) {
+            if (!r.run->hasKind(kind)) continue;
+            Cursor c;
+            c.run = r.run;
+            c.file = r.file;
+            c.fences = r.run->fences(kind);
+            c.vlen = r.run->kindVlen(kind);
+            vlen = c.vlen;
+            c.it.p = c.it.end = nullptr;
+            expected += r.run->kindEntries(kind);
+            cs.push_back(std::move(c));
+        }
+        for (auto& c : cs) {
+            c.advance(io);
+            if (c.err) return c.err;
+        }
+        rc = w.beginKind(kind, expected);
+        if (rc < 0) return rc;
+        // Linear-scan min over a handful of inputs (<= 16 L0 blocks + runs).
+        for (;;) {
+            Cursor* best = nullptr;
+            for (auto& c : cs) {
+                if (!c.valid) continue;
+                if (!best) {
+                    best = &c;
+                    continue;
+                }
+                const int k = keyCmp(c.key, c.klen, best->key, best->klen);
+                if (k < 0 || (k == 0 && std::memcmp(c.val, best->val, vlen) < 0)) best = &c;
+            }
+            if (!best) break;
+            rc = w.add(best->key, best->klen, best->val);
+            if (rc < 0) return rc;
+            best->advance(io);
+            if (best->err) return best->err;
+        }
+        rc = w.endKind();
+        if (rc < 0) return rc;
+    }
+    const int64_t len = w.finish();
+    if (entries) *entries = w.entries();
+    return len;
 }
 
 }  // namespace ps

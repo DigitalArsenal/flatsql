@@ -18,7 +18,8 @@
 //
 // Durability: darwin uses fcntl(F_FULLFSYNC) (plain fsync there does not
 // flush the drive cache), falling back to fsync where the file system refuses
-// it; Linux uses fdatasync. Directory handles use the same barrier.
+// it; Linux uses fdatasync. Directory entries are made durable by the
+// CREATE_PARENTS and UNLINK_IF_UNUSED flags (parent directory fsync).
 
 #if !defined(__wasm__)
 
@@ -45,7 +46,6 @@ constexpr int kMaxChunks = 1024;  // 1M handles
 struct NativeSlot {
     std::atomic<int> fd{-1};
     std::atomic<uint32_t> inUse{0};
-    bool isDir = false;
     std::string path;
 };
 
@@ -93,7 +93,6 @@ int32_t errnoToStatus(int e) {
 #endif
             return FLATSQL_IO_ERR_NOSPACE;
         case EIO:    return FLATSQL_IO_ERR_IO;
-        case EEXIST: return FLATSQL_IO_ERR_EXIST;
         case EBUSY:  return FLATSQL_IO_ERR_BUSY;
         default:     return FLATSQL_IO_ERR_GENERIC;
     }
@@ -154,7 +153,7 @@ int32_t createParents(const std::string& path) {
     return 0;
 }
 
-int32_t allocSlot(int fd, const std::string& name, bool isDir) {
+int32_t allocSlot(int fd, const std::string& name) {
     Table& t = table();
     std::lock_guard<std::mutex> guard(t.mutex);
     for (int pass = 0; pass < 2; pass++) {
@@ -164,7 +163,6 @@ int32_t allocSlot(int fd, const std::string& name, bool isDir) {
             NativeSlot* s = slotAt(i);
             if (s && !s->inUse.load(std::memory_order_relaxed)) {
                 s->path = name;
-                s->isDir = isDir;
                 s->fd.store(fd, std::memory_order_relaxed);
                 s->inUse.store(1, std::memory_order_release);
                 t.nextFree = i + 1;
@@ -180,7 +178,6 @@ int32_t allocSlot(int fd, const std::string& name, bool isDir) {
         t.chunks[c].store(new Chunk(), std::memory_order_release);
     NativeSlot* s = slotAt(index);
     s->path = name;
-    s->isDir = isDir;
     s->fd.store(fd, std::memory_order_relaxed);
     s->inUse.store(1, std::memory_order_release);
     t.highWater = index + 1;
@@ -216,22 +213,6 @@ int32_t flatsql_io_open(const char* path, int32_t pathLen, int32_t flags) {
         }
         return 0;
     }
-    if (flags & FLATSQL_IO_DIRECTORY) {
-        if (flags & FLATSQL_IO_CREATE_PARENTS) {
-            const int32_t rc = createParents(name + "/x");
-            if (rc < 0) return rc;
-        }
-        const int fd = ::open(name.c_str(), O_RDONLY
-#ifdef O_DIRECTORY
-                                                 | O_DIRECTORY
-#endif
-        );
-        if (fd < 0) return errnoToStatus(errno);
-        const int32_t h = allocSlot(fd, name, true);
-        if (h < 0) ::close(fd);
-        return h;
-    }
-
     int oflags = 0;
     if ((flags & FLATSQL_IO_WRITE) && (flags & FLATSQL_IO_READ)) oflags |= O_RDWR;
     else if (flags & FLATSQL_IO_WRITE)                           oflags |= O_WRONLY;
@@ -267,7 +248,7 @@ int32_t flatsql_io_open(const char* path, int32_t pathLen, int32_t flags) {
             return errnoToStatus(e);
         }
     }
-    const int32_t h = allocSlot(fd, name, false);
+    const int32_t h = allocSlot(fd, name);
     if (h < 0) ::close(fd);
     return h;
 }
@@ -275,7 +256,7 @@ int32_t flatsql_io_open(const char* path, int32_t pathLen, int32_t flags) {
 int32_t flatsql_io_read(int32_t handle, void* dst, int32_t len, double offset) {
     if (!dst || len < 0) return FLATSQL_IO_ERR_GENERIC;
     NativeSlot* slot = slotFor(handle);
-    if (!slot || slot->isDir) return FLATSQL_IO_ERR_BADHANDLE;
+    if (!slot) return FLATSQL_IO_ERR_BADHANDLE;
     size_t done = 0;
     while (done < size_t(len)) {
         const ssize_t n = ::pread(slot->fd.load(std::memory_order_relaxed),
@@ -295,7 +276,7 @@ int32_t flatsql_io_write(int32_t handle, const void* src, int32_t len,
                          double offset) {
     if (!src || len < 0) return FLATSQL_IO_ERR_GENERIC;
     NativeSlot* slot = slotFor(handle);
-    if (!slot || slot->isDir) return FLATSQL_IO_ERR_BADHANDLE;
+    if (!slot) return FLATSQL_IO_ERR_BADHANDLE;
     size_t done = 0;
     while (done < size_t(len)) {
         const ssize_t n = ::pwrite(slot->fd.load(std::memory_order_relaxed),
@@ -312,7 +293,7 @@ int32_t flatsql_io_write(int32_t handle, const void* src, int32_t len,
 
 int32_t flatsql_io_truncate(int32_t handle, double size) {
     NativeSlot* slot = slotFor(handle);
-    if (!slot || slot->isDir) return FLATSQL_IO_ERR_BADHANDLE;
+    if (!slot) return FLATSQL_IO_ERR_BADHANDLE;
     if (::ftruncate(slot->fd.load(std::memory_order_relaxed), static_cast<off_t>(size)) != 0)
         return errnoToStatus(errno);
     return 0;
@@ -327,7 +308,7 @@ int32_t flatsql_io_sync(int32_t handle) {
 
 double flatsql_io_size(int32_t handle) {
     NativeSlot* slot = slotFor(handle);
-    if (!slot || slot->isDir) return static_cast<double>(FLATSQL_IO_ERR_BADHANDLE);
+    if (!slot) return static_cast<double>(FLATSQL_IO_ERR_BADHANDLE);
     struct stat st;
     if (::fstat(slot->fd.load(std::memory_order_relaxed), &st) != 0)
         return static_cast<double>(errnoToStatus(errno));

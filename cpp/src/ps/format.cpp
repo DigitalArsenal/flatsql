@@ -46,22 +46,29 @@ constexpr int kCidSymbols = (kCidLen * 8 + 4) / 5;  // 58
 }  // namespace
 
 void cidSortKey(const uint8_t cid[kCidLen], uint8_t out[kCidKeyLen]) {
-    std::memset(out, 0, kCidKeyLen);
-    for (int i = 0; i < kCidSymbols; i++) {
-        // Base32 symbol i covers input bits [5i, 5i+5), MSB first, zero padded.
-        uint8_t v = 0;
-        for (int b = 0; b < 5; b++) {
-            const int bit = 5 * i + b;
-            uint8_t x = 0;
-            if (bit < int(kCidLen * 8)) x = (cid[bit >> 3] >> (7 - (bit & 7))) & 1;
-            v = uint8_t((v << 1) | x);
+    // Stream 5-bit base32 groups MSB-first through 64-bit accumulators.
+    static const uint8_t kRank[32] = {6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                                      22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 0,  1,  2,  3,  4,  5};
+    uint64_t in = 0, outAcc = 0;
+    int inBits = 0, outBits = 0;
+    size_t ii = 0, oi = 0;
+    for (int sym = 0; sym < kCidSymbols; sym++) {
+        if (inBits < 5) {
+            in = (in << 8) | (ii < kCidLen ? cid[ii] : 0);
+            ii++;
+            inBits += 8;
         }
-        const uint8_t r = rankOf(v);
-        for (int b = 0; b < 5; b++) {
-            const int bit = 5 * i + b;
-            if ((r >> (4 - b)) & 1) out[bit >> 3] |= uint8_t(1u << (7 - (bit & 7)));
+        const uint8_t v = uint8_t((in >> (inBits - 5)) & 31);
+        inBits -= 5;
+        outAcc = (outAcc << 5) | kRank[v];
+        outBits += 5;
+        while (outBits >= 8) {
+            out[oi++] = uint8_t(outAcc >> (outBits - 8));
+            outBits -= 8;
         }
     }
+    if (outBits) out[oi++] = uint8_t(outAcc << (8 - outBits));
+    while (oi < kCidKeyLen) out[oi++] = 0;
 }
 
 void cidFromSortKey(const uint8_t key[kCidKeyLen], uint8_t cid[kCidLen]) {

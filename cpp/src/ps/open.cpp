@@ -828,8 +828,8 @@ int32_t Engine::openPartitions(std::string* err) {
             PathBuf xp, mfp, rp, ap;
             pathPartitionRun(&xp, cfg_.root.c_str(), p->pid, p->intentSeg, p->intentGen);
             pathPartitionManifest(&mfp, cfg_.root.c_str(), p->pid, p->intentGen);
-            io->unlink(xp.c_str(), xp.len, false);
-            io->unlink(mfp.c_str(), mfp.len, false);
+            io->unlink(xp.c_str(), xp.len, true);   // durable; nothing holds them at open
+            io->unlink(mfp.c_str(), mfp.len, true);
             pathPartitionSeg(&rp, cfg_.root.c_str(), p->pid, 'r', p->intentSeg, "fsr");
             pathPartitionSeg(&ap, cfg_.root.c_str(), p->pid, 'a', p->intentSeg, "fsa");
             FileRef rf, af;
@@ -842,13 +842,6 @@ int32_t Engine::openPartitions(std::string* err) {
                 if (io->size(af) > int64_t(p->intentAOff)) io->truncate(af, p->intentAOff);
                 io->sync(af);
                 io->close(&af);
-            }
-            PathBuf dir;
-            pathPartitionDir(&dir, cfg_.root.c_str(), p->pid);
-            FileRef df;
-            if (io->open(dir.c_str(), dir.len, FLATSQL_IO_DIRECTORY, FileClass::Directory, &df) == 0) {
-                io->sync(df);
-                io->close(&df);
             }
             p->intentGen = 0;
             p->intentSeg = 0;

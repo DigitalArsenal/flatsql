@@ -243,14 +243,18 @@ PS_TEST(writer_backpressure_flood_T1_5) {
     s.cfg.reserveBytes = 4ull << 20;
     REQUIRE(s.open() == 0);
     s.fs->setSyncLatencyNs(uint64_t(argInt("bp-sync-us", 4000)) * 1000);  // a slow disk
-    s.registerTypes({&ommType()});
+    // The flood (OMM) and its type owner share one writer; the other
+    // partitions (MPE) and theirs share the other writer.
+    s.registerTypes({&ommType(), &mpeType()});
     const uint32_t flood = s.partition("flood", ommType());
     std::vector<uint32_t> others;
-    for (int i = 0; i < 6; i++) others.push_back(s.partition("other" + std::to_string(i), ommType()));
-    // The flooded partition keeps its own writer (partitions never share rings).
-    const uint32_t floodOwner = s.e->partition(flood)->ownerWriter.load();
+    for (int i = 0; i < 6; i++) others.push_back(s.partition("other" + std::to_string(i), mpeType()));
+    const uint32_t floodOwner = s.e->type(ommType().fid)->ownerWriter.load();
+    const uint32_t otherOwner = s.e->type(mpeType().fid)->ownerWriter.load();
+    CHECK(floodOwner != otherOwner);
+    if (s.e->partition(flood)->ownerWriter.load() != floodOwner) s.e->rebalance(flood, uint8_t(floodOwner));
     for (uint32_t pid : others)
-        if (s.e->partition(pid)->ownerWriter.load() == floodOwner) s.e->rebalance(pid, uint8_t(1 - floodOwner));
+        if (s.e->partition(pid)->ownerWriter.load() != otherOwner) s.e->rebalance(pid, uint8_t(otherOwner));
     sleepNs(100000000);
     const auto attr = buildRecordAttr("x", "p", "s", "b");
     uint64_t idBase = 1u << 30;
@@ -262,7 +266,7 @@ PS_TEST(writer_backpressure_flood_T1_5) {
             for (size_t k = 0; k < prods.size(); k++) {
                 const uint64_t t0 = monoNs();
                 const uint64_t r = send(s.e.get(), prods[k],
-                                        ommRecord(uint32_t(idBase++), "o", epochAt(i), 1.0 + i), attr, i);
+                                        mpeRecord("o" + std::to_string(idBase++), 1.7e9 + i, 1.0 + i), attr, i);
                 prods[k].waitAcked(r, 10000000000ull);
                 lat.push_back(double(monoNs() - t0) / 1e6);
             }
@@ -270,9 +274,9 @@ PS_TEST(writer_backpressure_flood_T1_5) {
         std::sort(lat.begin(), lat.end());
         return lat[size_t(lat.size() * 0.99)];
     };
-    const double base = measureOthers(60);
+    const double base = measureOthers(150);
     std::atomic<bool> stop{false};
-    std::atomic<uint64_t> maxUsed{0}, zeroCredits{0}, sent{0}, drainedAtStop{0};
+    std::atomic<uint64_t> maxUsed{0}, zeroCredits{0}, sent{0}, drainedAtStop{0}, floodWaits{0};
     const uint64_t cap = s.e->ring(flood)->cap;
     uint64_t floodStart = 0, floodEnd = 0;
     std::thread floodThread([&] {
@@ -289,6 +293,7 @@ PS_TEST(writer_backpressure_flood_T1_5) {
             }
         }
         floodEnd = monoNs();
+        floodWaits.store(p.creditWaits());
         drainedAtStop.store(p.ringDesc()->ackedRseq.load());
         p.waitAcked(last, 120000000000ull);
     });
@@ -298,12 +303,13 @@ PS_TEST(writer_backpressure_flood_T1_5) {
             const uint64_t u = s.e->ring(flood)->used();
             uint64_t m = maxUsed.load();
             while (u > m && !maxUsed.compare_exchange_weak(m, u)) {}
-            if (p.credits() == 0) zeroCredits.fetch_add(1);
+            // Zero credit = the next entry does not fit.
+            if (p.credits() < 1024) zeroCredits.fetch_add(1);
             sleepNs(100000);
         }
     });
     sleepNs(500000000);
-    const double flooded = measureOthers(60);
+    const double flooded = measureOthers(150);
     stop.store(true);
     floodThread.join();
     sampler.join();
@@ -315,11 +321,12 @@ PS_TEST(writer_backpressure_flood_T1_5) {
     report("backpressure_flood_ring_max_used", double(maxUsed.load()), "bytes");
     report("backpressure_flood_ring_cap", double(cap), "bytes");
     report("backpressure_zero_credit_samples", double(zeroCredits.load()), "samples");
+    report("backpressure_flood_credit_waits", double(floodWaits.load()), "waits");
     report("backpressure_flood_accepted_rate", double(sent.load()) / floodSecs, "records/s");
     report("backpressure_flood_drain_rate", double(drainedAtStop.load()) / floodSecs, "records/s");
     report("backpressure_pool_peak_slabs", double(s.e->pool().peakInUse()), "slabs");
     CHECK(maxUsed.load() <= cap);                         // ring at or under its cap
-    CHECK(zeroCredits.load() > 0);                        // credits went to 0
+    CHECK(zeroCredits.load() > 0 && floodWaits.load() > 0);  // credits went to 0
     CHECK(credits > 0);                                   // and recovered
     CHECK(s.e->pool().peakInUse() <= s.e->pool().total() - s.e->reserveSlabs());
     CHECK(flooded <= base * 1.2);                         // other partitions' commit p99

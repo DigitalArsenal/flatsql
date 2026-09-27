@@ -135,7 +135,39 @@ inline uint32_t load32le(const uint8_t* p) {
 
 }  // namespace
 
+#if !defined(__wasm__) && defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#  include <arm_acle.h>
+#  define PS_HW_CRC32C 1
+#elif !defined(__wasm__) && defined(__x86_64__) && defined(__SSE4_2__)
+#  include <nmmintrin.h>
+#  define PS_HW_CRC32C 2
+#endif
+
 uint32_t crc32c(uint32_t crc, const void* data, size_t len) {
+#if defined(PS_HW_CRC32C)
+    // Same polynomial, same result as the table path (and the wasm artifact).
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint32_t c = ~crc;
+    while (len >= 8) {
+        uint64_t w;
+        std::memcpy(&w, p, 8);
+#  if PS_HW_CRC32C == 1
+        c = __crc32cd(c, w);
+#  else
+        c = uint32_t(_mm_crc32_u64(c, w));
+#  endif
+        p += 8;
+        len -= 8;
+    }
+    while (len--) {
+#  if PS_HW_CRC32C == 1
+        c = __crc32cb(c, *p++);
+#  else
+        c = _mm_crc32_u8(c, *p++);
+#  endif
+    }
+    return ~c;
+#else
     const auto& T = crcTables().t;
     const uint8_t* p = static_cast<const uint8_t*>(data);
     uint32_t c = ~crc;
@@ -153,6 +185,7 @@ uint32_t crc32c(uint32_t crc, const void* data, size_t len) {
     }
     while (len--) c = T[0][(c ^ *p++) & 0xff] ^ (c >> 8);
     return ~c;
+#endif
 }
 
 // ---------------------------------------------------------------------------

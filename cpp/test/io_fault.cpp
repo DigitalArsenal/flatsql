@@ -81,9 +81,11 @@ int32_t FaultFs::open(const char* p, int32_t pathLen, int32_t flags) {
         std::lock_guard<std::mutex> g(mu_);
         auto it = ns_.find(path);
         if (it == ns_.end()) return FLATSQL_IO_ERR_NOENT;
+        // OPFS refuses to unlink an open path (BUSY); POSIX allows it. The
+        // fault host takes the strict side so no engine path can depend on it.
+        for (size_t i = 0; i < highWater_.load(); i++)
+            if (handles_[i].inUse.load() && handles_[i].path == path) return FLATSQL_IO_ERR_BUSY;
         if (flags & FLATSQL_IO_UNLINK_IF_UNUSED) {
-            for (size_t i = 0; i < highWater_.load(); i++)
-                if (handles_[i].inUse.load() && handles_[i].path == path) return FLATSQL_IO_ERR_BUSY;
             ns_.erase(it);  // durable (the host fsyncs the parent)
             return 0;
         }
@@ -92,7 +94,6 @@ int32_t FaultFs::open(const char* p, int32_t pathLen, int32_t flags) {
         return 0;
     }
     std::lock_guard<std::mutex> g(mu_);
-    if (flags & FLATSQL_IO_DIRECTORY) return allocHandle(nullptr, path, true);
     auto it = ns_.find(path);
     std::shared_ptr<File> file;
     if (it == ns_.end()) {
@@ -107,7 +108,7 @@ int32_t FaultFs::open(const char* p, int32_t pathLen, int32_t flags) {
         ns_[path] = e;
         unlinked_.erase(path);
     } else {
-        if ((flags & FLATSQL_IO_CREATE) && (flags & FLATSQL_IO_EXCL)) return FLATSQL_IO_ERR_EXIST;
+        if ((flags & FLATSQL_IO_CREATE) && (flags & FLATSQL_IO_EXCL)) return FLATSQL_IO_ERR_GENERIC;
         file = it->second.file;
         if (flags & FLATSQL_IO_TRUNC) {
             if (frozen_.load()) return FLATSQL_IO_ERR_IO;

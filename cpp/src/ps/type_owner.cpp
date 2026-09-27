@@ -73,11 +73,12 @@ FileRef* typeMHandle(TCtx& c, uint32_t mSeg, FileRef* tmp) {
 template <typename F>
 int32_t committedCatalog(TCtx& c, const uint8_t* key, F&& visit) {
     TypeOwner* t = c.t;
+    const uint64_t h = bloomHash(key, kCidKeyLen);
     for (uint32_t i = 0; i < t->nL0; i++) {
         const L0Accel& a = t->acc[i];
         const L0Accel::Kind* k = a.find(kIxTypeCid);
         if (!k || k->n == 0) continue;
-        if (k->bloom && !bloomTest(k->bloom, k->bloomBytes, key, kCidKeyLen)) continue;
+        if (k->bloom && !bloomTestHash(k->bloom, k->bloomBytes, h)) continue;
         FileRef tmp;
         FileRef* f = typeMHandle(c, a.mSeg, &tmp);
         if (!f) return FLATSQL_IO_ERR_IO;
@@ -118,7 +119,7 @@ int32_t committedCatalog(TCtx& c, const uint8_t* key, F&& visit) {
         if (rc < 0) return rc;
     }
     for (auto& run : t->runs) {
-        if (!run.run || !run.run->mayContain(kIxTypeCid, key, kCidKeyLen)) continue;
+        if (!run.run || !run.run->mayContainHash(kIxTypeCid, h)) continue;
         const int64_t rc = run.run->lookup(c.io, run.file, kIxTypeCid, key, kCidKeyLen,
                                            c.w->lookupScratch(),
                                            [&](const uint8_t*, uint16_t, const uint8_t* ev) { visit(ev); });
@@ -726,7 +727,12 @@ void typePublish(Writer* w, TypeOwner* t, StagedType* st) {
     for (uint32_t i = 0; i < st->nLabels; i++)
         st->labels[i].p->labeledThrough.store(st->labels[i].through, std::memory_order_release);
     if (st->mergeDone) {
-        // MERGE_DONE durable: the run replaces the merged L0 blocks.
+        // MERGE_DONE durable: the run replaces the merged L0 blocks and the
+        // folded runs.
+        for (uint32_t i = 0; i < t->mergeFold && !t->runs.empty(); i++) {
+            w->io().close(&t->runs.back().file);
+            t->runs.pop_back();
+        }
         t->runs.push_back(std::move(t->mergeRun));
         t->mergeRun = SegRun();
         w->io().close(&t->mergeMf);
@@ -837,6 +843,23 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
         if (tmp.valid()) w->io().close(&tmp);
     }
     if (rc < 0) return rc;
+    // Fold the newest catalog runs while each is at most twice what is being
+    // merged (O(log n) runs; folded files stay until reclamation).
+    uint64_t newEntries = 0;
+    for (uint32_t i = 0; i < k; i++) {
+        L0KindInfo ki[L0Accel::kMaxKinds];
+        size_t nk = 0;
+        if (parseL0Block(blocks[i].data(), blocks[i].size(), ki, L0Accel::kMaxKinds, &nk))
+            for (size_t j = 0; j < nk; j++) newEntries += ki[j].n;
+    }
+    uint32_t fold = 0, cand = 0;
+    uint64_t acc = newEntries;
+    for (size_t i = t->runs.size(); i-- > 0;) {
+        if (!t->runs[i].run || t->runs[i].run->entries() > 2 * acc) break;
+        acc += t->runs[i].run->entries();
+        cand++;
+    }
+    if (cand >= 3) fold = cand;  // tiered, fanout 4
     PathBuf xp;
     pathTypeRun(&xp, w->eng_root(), t->fid, gen);
     SegRun run;
@@ -845,56 +868,14 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
                       kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
                       FileClass::Index, &run.file);
     if (rc < 0) return rc;
-    struct Ent {
-        const uint8_t* key;
-        uint16_t klen;
-        const uint8_t* val;
-    };
-    std::vector<std::vector<L0KindInfo>> infos(k);
-    std::vector<uint16_t> kinds;
-    for (uint32_t i = 0; i < k && rc >= 0; i++) {
-        L0KindInfo ki[L0Accel::kMaxKinds];
-        size_t nk = 0;
-        if (!parseL0Block(blocks[i].data(), blocks[i].size(), ki, L0Accel::kMaxKinds, &nk)) {
-            rc = FLATSQL_IO_ERR_IO;
-            break;
-        }
-        infos[i].assign(ki, ki + nk);
-        for (size_t j = 0; j < nk; j++) kinds.push_back(ki[j].kind);
-    }
-    std::sort(kinds.begin(), kinds.end());
-    kinds.erase(std::unique(kinds.begin(), kinds.end()), kinds.end());
-    L1Writer lw(&w->io(), run.file, 0, gen, 0, t->l0[0].commitSeq, t->l0[k - 1].commitSeq);
-    std::vector<Ent> ents;
-    for (uint16_t kind : kinds) {
-        if (rc < 0) break;
-        ents.clear();
-        uint8_t vlen = valueLenOf(kind);
-        for (uint32_t i = 0; i < k; i++)
-            for (const auto& ki : infos[i]) {
-                if (ki.kind != kind) continue;
-                vlen = ki.vlen;
-                EntryIter it;
-                it.p = blocks[i].data() + ki.entriesOff;
-                it.end = it.p + ki.entriesBytes;
-                it.vlen = ki.vlen;
-                const uint8_t *ek, *ev;
-                uint16_t el;
-                while (it.next(&ek, &el, &ev)) ents.push_back({ek, el, ev});
-            }
-        std::sort(ents.begin(), ents.end(), [vlen](const Ent& a, const Ent& b) {
-            const int c = keyCmp(a.key, a.klen, b.key, b.klen);
-            if (c) return c < 0;
-            return std::memcmp(a.val, b.val, vlen) < 0;
-        });
-        rc = lw.beginKind(kind, ents.size());
-        for (const auto& en : ents) {
-            if (rc < 0) break;
-            rc = lw.add(en.key, en.klen, en.val);
-        }
-        if (rc >= 0) rc = lw.endKind();
-    }
-    const int64_t xLen = rc >= 0 ? lw.finish() : rc;
+    std::vector<MergeL0Input> l0s;
+    for (uint32_t i = 0; i < k; i++) l0s.push_back({blocks[i].data(), blocks[i].size()});
+    std::vector<MergeRunInput> folded;
+    for (size_t i = t->runs.size() - fold; i < t->runs.size(); i++)
+        folded.push_back({t->runs[i].run.get(), t->runs[i].file});
+    uint64_t nEntries = 0;
+    const int64_t xLen = mergeToL1(&w->io(), run.file, 0, gen, uint16_t(fold ? 1 : 0), t->l0[0].commitSeq,
+                                   t->l0[k - 1].commitSeq, l0s, folded, &nEntries);
     if (xLen < 0) {
         w->io().close(&run.file);
         return int32_t(xLen);
@@ -903,7 +884,7 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
     // Manifest: live catalog runs after this merge.
     std::vector<uint8_t> man(16);
     putU32(man.data(), kMagicManifest);
-    putU32(man.data() + 4, uint32_t(t->runs.size() + 1));
+    putU32(man.data() + 4, uint32_t(t->runs.size() - fold + 1));
     putU32(man.data() + 8, gen);
     putU32(man.data() + 12, 0);
     auto addRun = [&](uint32_t g, uint64_t len) {
@@ -913,7 +894,7 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
         putU32(man.data() + at + 4, 0);
         putU64(man.data() + at + 8, len);
     };
-    for (const auto& r : t->runs) addRun(r.gen, r.fileLen);
+    for (size_t i = 0; i + fold < t->runs.size(); i++) addRun(t->runs[i].gen, t->runs[i].fileLen);
     addRun(gen, run.fileLen);
     const size_t at = man.size();
     man.resize(at + 8, 0);
@@ -939,6 +920,7 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
     t->mergeRun = std::move(run);
     t->mergeGen = gen;
     t->mergeK = k;
+    t->mergeFold = fold;
     t->mergeThroughCommit = t->l0[k - 1].commitSeq;
     t->mergePhase = 1;
     t->dirty.store(1, std::memory_order_release);

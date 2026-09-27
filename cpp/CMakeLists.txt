@@ -774,6 +774,7 @@ else()
 
     add_executable(flatsql_ps_test
         test/ps/ps_test_main.cpp
+        test/ps/ps_fixtures.cpp
         test/ps/format_test.cpp
         test/ps/writer_pool_test.cpp
         test/ps/type_owner_test.cpp
@@ -798,7 +799,7 @@ else()
     target_link_libraries(flatsql_ps_test PRIVATE flatsql_ps flatsql_ps_testutil)
     target_include_directories(flatsql_ps_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
-    add_executable(flatsql_ps_bench test/ps/bench_main.cpp test/io_fault.cpp)
+    add_executable(flatsql_ps_bench test/ps/bench_main.cpp test/ps/ps_fixtures.cpp test/io_fault.cpp)
     target_link_libraries(flatsql_ps_bench PRIVATE flatsql_ps flatsql_ps_testutil)
     target_include_directories(flatsql_ps_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
     target_compile_options(flatsql_ps_bench PRIVATE -O2)
