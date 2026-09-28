@@ -14,9 +14,22 @@
 #include <openssl/hmac.h>
 #endif
 
+#if defined(__EMSCRIPTEN__)
+#include <malloc.h>
+#endif
+
 namespace flatsql {
 
 namespace {
+
+#if defined(__EMSCRIPTEN__)
+// dlmalloc extends the heap 64 KiB at a time, and on wasm every extension is
+// a memory.grow. A 90k-row result (~30 MB) therefore cost ~450 grows, which
+// V8 hosts (node, browsers) charged at ~1 ms each: a 550-800 ms stall the
+// first time a large result was materialized. Growing in 4 MiB steps makes it
+// a handful of grows; the most a heap can over-reserve is one step.
+const int kHeapGrowthStep = mallopt(M_GRANULARITY, 4 * 1024 * 1024);
+#endif
 
 bool readFlatBufferLayout(const uint8_t* data,
                           size_t length,
@@ -967,6 +980,18 @@ void FlatSQLDatabase::clearQueryResultCache() {
 }
 
 void FlatSQLDatabase::configureQueryResultCache(size_t maxEntries, size_t maxRows) {
+    size_t maxBytes;
+    {
+        std::shared_lock lock(*accessMutex_);
+        maxBytes = queryResultCacheMaxBytes_;
+    }
+    configureQueryResultCache(maxEntries, maxRows, maxBytes);
+}
+
+void FlatSQLDatabase::configureQueryResultCache(size_t maxEntries, size_t maxRows, size_t maxBytes) {
+    if (maxBytes == 0) {
+        throw std::runtime_error("query cache maxBytes must be greater than zero");
+    }
     if (maxEntries == 0) {
         throw std::runtime_error("query cache maxEntries must be greater than zero");
     }
@@ -977,6 +1002,7 @@ void FlatSQLDatabase::configureQueryResultCache(size_t maxEntries, size_t maxRow
     std::unique_lock lock(*accessMutex_);
     queryResultCacheMaxEntries_ = maxEntries;
     queryResultCacheMaxRows_ = maxRows;
+    queryResultCacheMaxBytes_ = maxBytes;
     invalidateQueryResultCacheUnlocked();
 }
 
@@ -988,43 +1014,86 @@ FlatSQLDatabase::QueryCacheStats FlatSQLDatabase::getQueryCacheStats() const {
         queryResultCache_.size(),
         queryCacheGeneration_,
         queryResultCacheMaxEntries_,
-        queryResultCacheMaxRows_
+        queryResultCacheMaxRows_,
+        queryResultCacheMaxBytes_,
+        queryResultCacheTotalBytes_
     };
 }
 
 void FlatSQLDatabase::invalidateQueryResultCacheUnlocked() {
     queryResultCache_.clear();
     queryResultCacheLru_.clear();
+    queryResultCacheTotalBytes_ = 0;
     rawStreamCache_.clear();
     rawStreamCacheLru_.clear();
     rawStreamCacheTotalBytes_ = 0;
     queryCacheGeneration_++;
 }
 
+namespace {
+
+// Heap bytes a cached QueryResult holds: the row vectors, every cell, and the
+// string/blob payloads. An estimate of allocator reality, but a monotone one:
+// twice the payload is always counted as more.
+size_t estimateQueryResultBytes(const QueryResult& result) {
+    size_t bytes = sizeof(QueryResult);
+    for (const auto& column : result.columns) {
+        bytes += sizeof(std::string) + column.size();
+    }
+    bytes += result.rows.capacity() * sizeof(std::vector<Value>);
+    for (const auto& row : result.rows) {
+        bytes += row.capacity() * sizeof(Value);
+        for (const auto& cell : row) {
+            if (const auto* text = std::get_if<std::string>(&cell)) {
+                bytes += text->capacity();
+            } else if (const auto* blob = std::get_if<std::vector<uint8_t>>(&cell)) {
+                bytes += blob->capacity();
+            }
+        }
+    }
+    return bytes;
+}
+
+}  // namespace
+
 void FlatSQLDatabase::storeCachedQueryResultUnlocked(const std::string& key,
                                                      const QueryResult& result) {
     if (result.rows.size() > queryResultCacheMaxRows_) {
         return;
     }
+    const size_t bytes = estimateQueryResultBytes(result);
+    if (bytes > queryResultCacheMaxBytes_) {
+        return;
+    }
 
     auto existing = queryResultCache_.find(key);
     if (existing != queryResultCache_.end()) {
+        queryResultCacheTotalBytes_ -= existing->second.bytes;
         existing->second.result = result;
+        existing->second.bytes = bytes;
+        queryResultCacheTotalBytes_ += bytes;
         queryResultCacheLru_.splice(
             queryResultCacheLru_.begin(),
             queryResultCacheLru_,
             existing->second.lruIt
         );
         existing->second.lruIt = queryResultCacheLru_.begin();
-        return;
+    } else {
+        queryResultCacheLru_.push_front(key);
+        queryResultCache_.emplace(key, CachedQueryResult{result, queryResultCacheLru_.begin(), bytes});
+        queryResultCacheTotalBytes_ += bytes;
     }
 
-    queryResultCacheLru_.push_front(key);
-    queryResultCache_.emplace(key, CachedQueryResult{result, queryResultCacheLru_.begin()});
-
-    while (queryResultCache_.size() > queryResultCacheMaxEntries_) {
+    // Evict least-recently-used entries until both bounds hold. The entry
+    // just stored is at the front and fits the budget by itself, so it stays.
+    while (queryResultCache_.size() > queryResultCacheMaxEntries_ ||
+           queryResultCacheTotalBytes_ > queryResultCacheMaxBytes_) {
         const std::string& evictedKey = queryResultCacheLru_.back();
-        queryResultCache_.erase(evictedKey);
+        auto evicted = queryResultCache_.find(evictedKey);
+        if (evicted != queryResultCache_.end()) {
+            queryResultCacheTotalBytes_ -= evicted->second.bytes;
+            queryResultCache_.erase(evicted);
+        }
         queryResultCacheLru_.pop_back();
     }
 }

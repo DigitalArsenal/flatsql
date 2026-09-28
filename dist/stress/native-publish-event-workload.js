@@ -7,11 +7,14 @@ const BYTES_PER_GIB = 1024 * 1024 * 1024;
 const FULL_MODE_STORAGE_TARGET_PCT = 0.96;
 const FULL_MODE_RECORD_OVERHEAD_BYTES = 256;
 const MAX_DERIVED_PAYLOAD_BYTES = 1024 * 1024;
+// The same three indexes the TypeScript workload creates (FILE_ID, RECORD_ID,
+// EVENT_INDEX), declared the engine's way, so both runtimes answer the same
+// point, LIMIT and range queries with the same access paths.
 const PUBLISH_EVENT_SCHEMA = `
 table PublishEventRecord {
   FILE_ID: string (key);
-  RECORD_ID: string;
-  EVENT_INDEX: int;
+  RECORD_ID: string (index);
+  EVENT_INDEX: int (index);
   PAYLOAD_SIZE: int;
 }
 
@@ -35,8 +38,15 @@ function payloadSize(manifest, nodeId, recordIndex) {
     const derivedSize = Math.max(baseSize, targetBytesPerRecord - FULL_MODE_RECORD_OVERHEAD_BYTES);
     return Math.min(derivedSize, MAX_DERIVED_PAYLOAD_BYTES);
 }
+// BLOB cells come back from the engine as plain arrays of byte values; count
+// them as the bytes they are, not as the text of their digits.
+function isByteArray(cell) {
+    return Array.isArray(cell) && (cell.length === 0 || typeof cell[0] === 'number');
+}
 function resultCellBytes(cell) {
     if (cell instanceof Uint8Array)
+        return cell.length;
+    if (isByteArray(cell))
         return cell.length;
     if (typeof cell === 'bigint')
         return bytes(cell.toString());
@@ -50,7 +60,7 @@ function queryResultBytes(result) {
 }
 function rawFlatbufferBytes(result) {
     return result.rows.reduce((total, row) => total + row.reduce((cellTotal, cell) => {
-        return cellTotal + (cell instanceof Uint8Array ? cell.length : 0);
+        return cellTotal + (cell instanceof Uint8Array || isByteArray(cell) ? cell.length : 0);
     }, 0), 0);
 }
 function requestBytes(sql, params = []) {

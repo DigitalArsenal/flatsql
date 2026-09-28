@@ -1,5 +1,6 @@
 #include "flatsql/sqlite_vtab.h"
 #include "flatbuffers/encryption.h"
+#include <algorithm>
 #include <cstring>
 #include <sstream>
 
@@ -180,6 +181,7 @@ int FlatBufferVTabModule::xConnect(sqlite3* db, void* pAux, int argc, const char
     vtab->tombstones = info->tombstones;
     vtab->sourceRecordInfos = info->sourceRecordInfos;
     vtab->encryptionCtx = info->encryptionCtx;
+    vtab->stats = info->stats;
     vtab->sourceColumnIndex = static_cast<int>(tableDef.columns.size());  // _source is first virtual column
 
     *ppVTab = vtab;
@@ -196,97 +198,282 @@ int FlatBufferVTabModule::xDestroy(sqlite3_vtab* pVTab) {
     return xDisconnect(pVTab);
 }
 
+// ---------------------------------------------------------------------------
+// Plan encoding shared by xBestIndex and xFilter.
+//
+//   idxNum bits 0-3  strategy: 0 full scan, 1 rowid =, 2 index =, 3 index range
+//   idxNum bits 4-7  range flags: lower present, lower inclusive,
+//                                 upper present, upper inclusive
+//   idxNum bits 8+   column index of the index used (strategies 2 and 3)
+//
+// argv carries exactly the values of the constraints the plan uses, in this
+// order: the rowid or equality key; or the lower bound then the upper bound.
+// Every other constraint keeps argvIndex 0 and is evaluated by SQLite, so a
+// WHERE clause with several indexed terms is always answered correctly: the
+// index narrows, SQLite filters.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int kStrategyScan = 0;
+constexpr int kStrategyRowid = 1;
+constexpr int kStrategyEquality = 2;
+constexpr int kStrategyRange = 3;
+
+constexpr int kRangeLower = 1 << 4;
+constexpr int kRangeLowerInclusive = 1 << 5;
+constexpr int kRangeUpper = 1 << 6;
+constexpr int kRangeUpperInclusive = 1 << 7;
+
+bool isRangeOp(unsigned char op) {
+    return op == SQLITE_INDEX_CONSTRAINT_GT || op == SQLITE_INDEX_CONSTRAINT_GE ||
+           op == SQLITE_INDEX_CONSTRAINT_LT || op == SQLITE_INDEX_CONSTRAINT_LE;
+}
+
+bool isLowerOp(unsigned char op) {
+    return op == SQLITE_INDEX_CONSTRAINT_GT || op == SQLITE_INDEX_CONSTRAINT_GE;
+}
+
+// The index table compares keys with BINARY collation. A constraint under any
+// other collation (e.g. `COLLATE NOCASE`) must not be answered from it.
+bool usesBinaryCollation(sqlite3_index_info* info, int constraint) {
+    const char* coll = sqlite3_vtab_collation(info, constraint);
+    return coll == nullptr || sqlite3_stricmp(coll, "BINARY") == 0;
+}
+
+uint64_t tableRowCount(const FlatBufferVTab* vtab) {
+    if (vtab->sourceRecordInfos) {
+        return vtab->sourceRecordInfos->size();
+    }
+    if (vtab->store) {
+        const auto* infos = vtab->store->getRecordInfoVector(vtab->fileId);
+        if (infos) return infos->size();
+    }
+    return 0;
+}
+
+double log2Rows(uint64_t rows) {
+    double cost = 1.0;
+    while (rows > 1) {
+        rows >>= 1;
+        cost += 1.0;
+    }
+    return cost;
+}
+
+}  // namespace
+
 int FlatBufferVTabModule::xBestIndex(sqlite3_vtab* pVTab, sqlite3_index_info* pIdxInfo) {
     FlatBufferVTab* vtab = static_cast<FlatBufferVTab*>(pVTab);
+    const int realColumns = static_cast<int>(vtab->tableDef->columns.size());
 
-    // Analyze constraints to find best index strategy
-    // idxNum encoding (high bits = column index, low bits = strategy):
-    //   0 = full scan
-    //   1 = rowid equality
-    //   2 + (colIdx << 8) = index equality on column colIdx
-    //   3 + (colIdx << 8) = index range on column colIdx
+    auto indexedColumn = [&](int colIdx) -> bool {
+        if (colIdx < 0 || colIdx >= realColumns) return false;
+        auto it = vtab->indexes.find(vtab->tableDef->columns[colIdx].name);
+        return it != vtab->indexes.end() && it->second != nullptr;
+    };
 
-    int idxNum = 0;
-    double estimatedCost = 1000000.0;  // Full scan cost
-    int argvIndex = 1;
-    int usableConstraints = 0;
-
+    // Candidate plans. Constraints on the virtual columns (_source, _rowid,
+    // _offset, _data) are never claimed: SQLite evaluates them against
+    // xColumn, which is always correct (claiming _source with omit=1 once
+    // returned rows from every source partition).
+    int rowidEq = -1;
+    int pkEq = -1;
+    int anyEq = -1;
     for (int i = 0; i < pIdxInfo->nConstraint; i++) {
-        const auto& constraint = pIdxInfo->aConstraint[i];
-        if (!constraint.usable) continue;
-
-        int colIdx = constraint.iColumn;
-
-        // Check for rowid lookup (column -1 is rowid)
-        if (colIdx == -1 && constraint.op == SQLITE_INDEX_CONSTRAINT_EQ) {
-            idxNum = 1;
-            pIdxInfo->aConstraintUsage[i].argvIndex = argvIndex++;
-            pIdxInfo->aConstraintUsage[i].omit = 1;
-            estimatedCost = 1.0;
-            usableConstraints++;
+        const auto& c = pIdxInfo->aConstraint[i];
+        if (!c.usable || c.op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+        if (c.iColumn == -1) {
+            if (rowidEq < 0) rowidEq = i;
             continue;
         }
+        if (!indexedColumn(c.iColumn) || !usesBinaryCollation(pIdxInfo, i)) continue;
+        if (vtab->tableDef->columns[c.iColumn].primaryKey) {
+            if (pkEq < 0) pkEq = i;
+        } else if (anyEq < 0) {
+            anyEq = i;
+        }
+    }
 
-        // Skip virtual columns for index optimization.
-        //
-        // In particular, NEVER claim the `_source` equality constraint:
-        // xBestIndex used to assign it an argvIndex with omit=1 while
-        // xFilter ignored the argv entirely, so `WHERE _source = 'T@src'`
-        // returned rows from EVERY source partition (wrong results). By
-        // leaving the constraint unclaimed, SQLite evaluates it itself
-        // against the xColumn value, which is always correct.
-        if (colIdx >= static_cast<int>(vtab->tableDef->columns.size())) {
+    // Best range: prefer a column bounded on both sides.
+    int rangeCol = -1;
+    int rangeLower = -1;
+    int rangeUpper = -1;
+    for (int i = 0; i < pIdxInfo->nConstraint; i++) {
+        const auto& c = pIdxInfo->aConstraint[i];
+        if (!c.usable || !isRangeOp(c.op) || !indexedColumn(c.iColumn) ||
+            !usesBinaryCollation(pIdxInfo, i)) {
             continue;
         }
-
-        // Get column name
-        const std::string& colName = vtab->tableDef->columns[colIdx].name;
-
-        // Check if we have an index for this column
-        auto indexIt = vtab->indexes.find(colName);
-        if (indexIt != vtab->indexes.end() && indexIt->second != nullptr) {
-            if (constraint.op == SQLITE_INDEX_CONSTRAINT_EQ) {
-                // Encode column index in idxNum (strategy 2 + column << 8)
-                idxNum = 2 + (colIdx << 8);
-                pIdxInfo->aConstraintUsage[i].argvIndex = argvIndex++;
-                pIdxInfo->aConstraintUsage[i].omit = 1;
-                estimatedCost = 10.0;  // Index lookup cost
-                usableConstraints++;
-            } else if (constraint.op == SQLITE_INDEX_CONSTRAINT_GE ||
-                       constraint.op == SQLITE_INDEX_CONSTRAINT_GT ||
-                       constraint.op == SQLITE_INDEX_CONSTRAINT_LE ||
-                       constraint.op == SQLITE_INDEX_CONSTRAINT_LT) {
-                // Range query - encode column index in idxNum (strategy 3 + column << 8)
-                if ((idxNum & 0xFF) < 2) {  // Don't override equality
-                    idxNum = 3 + (colIdx << 8);
-                }
-                pIdxInfo->aConstraintUsage[i].argvIndex = argvIndex++;
-                pIdxInfo->aConstraintUsage[i].omit = 0;  // Don't omit - SQLite will double-check
-                estimatedCost = 100.0;  // Range scan cost
-                usableConstraints++;
+        int lower = -1;
+        int upper = -1;
+        for (int j = 0; j < pIdxInfo->nConstraint; j++) {
+            const auto& d = pIdxInfo->aConstraint[j];
+            if (!d.usable || d.iColumn != c.iColumn || !isRangeOp(d.op) ||
+                !usesBinaryCollation(pIdxInfo, j)) {
+                continue;
+            }
+            if (isLowerOp(d.op)) {
+                if (lower < 0) lower = j;
+            } else if (upper < 0) {
+                upper = j;
             }
         }
+        const int bounds = (lower >= 0) + (upper >= 0);
+        const int bestBounds = rangeCol < 0 ? 0 : (rangeLower >= 0) + (rangeUpper >= 0);
+        if (bounds > bestBounds) {
+            rangeCol = c.iColumn;
+            rangeLower = lower;
+            rangeUpper = upper;
+        }
+    }
+
+    const uint64_t rows = tableRowCount(vtab);
+    const double logRows = log2Rows(rows);
+    // Costs are structural, not data-driven: a statement is prepared once and
+    // cached, possibly while the table is still empty, so the ranking of
+    // plans must not flip with the row count. Rows feed join ordering only.
+    int idxNum = kStrategyScan;
+    double estimatedCost = 1000000.0;
+    sqlite3_int64 estimatedRows = static_cast<sqlite3_int64>(rows > 0 ? rows : 1);
+    int planColumn = -1;
+    bool planIsInList = false;
+    char* idxStr = nullptr;
+
+    auto claim = [&](int constraint, int argvIndex, bool omit) {
+        pIdxInfo->aConstraintUsage[constraint].argvIndex = argvIndex;
+        pIdxInfo->aConstraintUsage[constraint].omit = omit ? 1 : 0;
+    };
+
+    if (rowidEq >= 0) {
+        idxNum = kStrategyRowid;
+        claim(rowidEq, 1, true);
+        estimatedCost = 1.0;
+        estimatedRows = 1;
+        pIdxInfo->idxFlags |= SQLITE_INDEX_SCAN_UNIQUE;
+        idxStr = sqlite3_mprintf("rowid");
+    } else if (pkEq >= 0 || anyEq >= 0) {
+        const int chosen = pkEq >= 0 ? pkEq : anyEq;
+        planColumn = pIdxInfo->aConstraint[chosen].iColumn;
+        idxNum = kStrategyEquality | (planColumn << 8);
+        // Equality through the index uses SQLite's comparison on the bound
+        // value, exactly what the row-by-row check would do: omit it.
+        claim(chosen, 1, true);
+        // `col IN (...)` arrives as an equality that SQLite answers with one
+        // xFilter per list value; its order across values is SQLite's, so an
+        // ORDER BY is not ours to claim. sqlite3_vtab_in() only reports on
+        // the first 32 constraints, so beyond that assume the worst.
+        planIsInList = chosen >= 32 || sqlite3_vtab_in(pIdxInfo, chosen, -1) != 0;
+        estimatedCost = 2.0 + logRows;
+        estimatedRows = pkEq >= 0 ? 1 : 10;
+        idxStr = sqlite3_mprintf("eq:%s", vtab->tableDef->columns[planColumn].name.c_str());
+    } else if (rangeCol >= 0) {
+        planColumn = rangeCol;
+        int flags = 0;
+        int argv = 1;
+        const char* lowerOp = "";
+        const char* upperOp = "";
+        if (rangeLower >= 0) {
+            flags |= kRangeLower;
+            const bool inclusive =
+                pIdxInfo->aConstraint[rangeLower].op == SQLITE_INDEX_CONSTRAINT_GE;
+            if (inclusive) flags |= kRangeLowerInclusive;
+            lowerOp = inclusive ? ">=" : ">";
+            // Range bounds narrow the walk; SQLite re-checks every row.
+            claim(rangeLower, argv++, false);
+        }
+        if (rangeUpper >= 0) {
+            flags |= kRangeUpper;
+            const bool inclusive =
+                pIdxInfo->aConstraint[rangeUpper].op == SQLITE_INDEX_CONSTRAINT_LE;
+            if (inclusive) flags |= kRangeUpperInclusive;
+            upperOp = inclusive ? "<=" : "<";
+            claim(rangeUpper, argv++, false);
+        }
+        idxNum = kStrategyRange | flags | (planColumn << 8);
+        const bool bothBounds = rangeLower >= 0 && rangeUpper >= 0;
+        estimatedRows = static_cast<sqlite3_int64>(std::max<uint64_t>(1, rows / (bothBounds ? 16 : 4)));
+        estimatedCost = bothBounds ? 100.0 + logRows : 1000.0 + logRows;
+        idxStr = sqlite3_mprintf("range:%s:%s:%s",
+                                 vtab->tableDef->columns[planColumn].name.c_str(),
+                                 lowerOp, upperOp);
+    } else {
+        idxStr = sqlite3_mprintf("scan");
+    }
+
+    // The index yields (key, sequence) order. Under an equality every key is
+    // the same, so any ORDER BY on that column alone is already satisfied;
+    // under a range, a single ascending ORDER BY on the column is.
+    if (planColumn >= 0 && !planIsInList && pIdxInfo->nOrderBy > 0) {
+        bool consumed = true;
+        for (int i = 0; i < pIdxInfo->nOrderBy; i++) {
+            if (pIdxInfo->aOrderBy[i].iColumn != planColumn) consumed = false;
+        }
+        if ((idxNum & 0x0F) == kStrategyRange &&
+            (pIdxInfo->nOrderBy != 1 || pIdxInfo->aOrderBy[0].desc)) {
+            consumed = false;
+        }
+        if (consumed) pIdxInfo->orderByConsumed = 1;
     }
 
     pIdxInfo->idxNum = idxNum;
     pIdxInfo->estimatedCost = estimatedCost;
-
-    // If we have an index, indicate row count estimate
-    int strategy = idxNum & 0xFF;
-    if (vtab->store) {
-        if (strategy == 0) {
-            pIdxInfo->estimatedRows = vtab->store->getRecordCount();
-        } else if (strategy == 1) {
-            pIdxInfo->estimatedRows = 1;
-        } else if (strategy == 2) {
-            pIdxInfo->estimatedRows = 10;  // Estimate for equality lookup
-        } else {
-            pIdxInfo->estimatedRows = vtab->store->getRecordCount() / 10;  // Estimate for range
-        }
+    pIdxInfo->estimatedRows = estimatedRows;
+    if (idxStr) {
+        pIdxInfo->idxStr = idxStr;
+        pIdxInfo->needToFreeIdxStr = 1;
     }
-
     return SQLITE_OK;
 }
+
+namespace {
+
+void foldCursorStats(FlatBufferCursor* cursor) {
+    if (cursor->vtab && cursor->vtab->stats) {
+        cursor->vtab->stats->rowsVisited += cursor->rowsVisited;
+        cursor->vtab->stats->indexEntriesRead += cursor->indexEntriesRead;
+    }
+    cursor->rowsVisited = 0;
+    cursor->indexEntriesRead = 0;
+}
+
+// Position the cursor on the next live index entry, or at EOF.
+int advanceIndexScan(FlatBufferCursor* cursor) {
+    FlatBufferVTab* vtab = cursor->vtab;
+    uint64_t offset = 0;
+    uint64_t sequence = 0;
+    uint32_t indexedLength = 0;
+    for (;;) {
+        const int step = cursor->indexScan.next(offset, indexedLength, sequence);
+        if (step == 0) {
+            cursor->atEof = true;
+            return SQLITE_OK;
+        }
+        if (step < 0) {
+            cursor->atEof = true;
+            sqlite3_free(vtab->zErrMsg);
+            vtab->zErrMsg = sqlite3_mprintf("FlatSQL index scan failed");
+            cursor->indexScan.release();
+            return SQLITE_ERROR;
+        }
+        cursor->indexEntriesRead++;
+        if (cursor->hasTombstones && vtab->tombstones->count(sequence)) {
+            continue;
+        }
+        uint32_t len = 0;
+        const uint8_t* data = vtab->store->getDataAtOffset(offset, &len);
+        if (!data) {
+            continue;
+        }
+        cursor->currentOffset = offset;
+        cursor->currentSequence = sequence;
+        cursor->currentData = data;
+        cursor->currentLength = len;
+        cursor->rowsVisited++;
+        return SQLITE_OK;
+    }
+}
+
+}  // namespace
 
 int FlatBufferVTabModule::xOpen(sqlite3_vtab* pVTab, sqlite3_vtab_cursor** ppCursor) {
     FlatBufferVTab* vtab = static_cast<FlatBufferVTab*>(pVTab);
@@ -301,9 +488,14 @@ int FlatBufferVTabModule::xOpen(sqlite3_vtab* pVTab, sqlite3_vtab_cursor** ppCur
     cursor->currentLength = 0;
     cursor->atEof = true;
     cursor->scanType = ScanType::FullScan;
-    cursor->indexPosition = 0;
-    cursor->scanPosition = 0;
+    cursor->scanFileIndex = 0;
+    cursor->scanFileCount = 0;
+    cursor->scanRecordInfos = nullptr;
+    cursor->scanDataBuffer = nullptr;
+    cursor->rowsVisited = 0;
+    cursor->indexEntriesRead = 0;
     cursor->cacheValid = false;
+    cursor->hasTombstones = false;
     cursor->numRealColumns = static_cast<int>(vtab->tableDef->columns.size());
 
     // Pre-allocate column cache
@@ -318,6 +510,8 @@ int FlatBufferVTabModule::xOpen(sqlite3_vtab* pVTab, sqlite3_vtab_cursor** ppCur
 
 int FlatBufferVTabModule::xClose(sqlite3_vtab_cursor* pCursor) {
     FlatBufferCursor* cursor = static_cast<FlatBufferCursor*>(pCursor);
+    cursor->indexScan.release();
+    foldCursorStats(cursor);
     delete cursor;
     return SQLITE_OK;
 }
@@ -345,36 +539,33 @@ Value FlatBufferVTabModule::valueFromSqlite(sqlite3_value* val) {
 
 int FlatBufferVTabModule::xFilter(sqlite3_vtab_cursor* pCursor, int idxNum, const char* idxStr,
                                    int argc, sqlite3_value** argv) {
-    (void)idxStr;  // No longer used - column index encoded in idxNum
+    (void)idxStr;  // Diagnostic only (EXPLAIN QUERY PLAN); the plan is idxNum
     FlatBufferCursor* cursor = static_cast<FlatBufferCursor*>(pCursor);
     FlatBufferVTab* vtab = cursor->vtab;
 
     // Reset cursor state
+    cursor->indexScan.release();
+    foldCursorStats(cursor);
     cursor->atEof = false;
-    cursor->indexResults.clear();
-    cursor->indexPosition = 0;
-    cursor->scanRefs.clear();
-    cursor->scanPosition = 0;
     cursor->currentData = nullptr;
     cursor->currentLength = 0;
     cursor->cacheValid = false;
+    cursor->hasTombstones = vtab->tombstones && !vtab->tombstones->empty();
 
     if (!vtab->store) {
         cursor->atEof = true;
         return SQLITE_OK;
     }
 
-    int argIdx = 0;
-
-    // Decode idxNum: low byte = strategy, high bytes = column index
-    int strategy = idxNum & 0xFF;
-    int colIdx = idxNum >> 8;
+    const int strategy = idxNum & 0x0F;
+    const int flags = idxNum & 0xF0;
+    const int colIdx = idxNum >> 8;
+    VTabScanStats* stats = vtab->stats;
 
     switch (strategy) {
-        case 0: {
-            // Full scan - use indexed iteration with cached vector and buffer pointers
+        case kStrategyScan: {
+            if (stats) stats->fullScans++;
             cursor->scanType = ScanType::FullScan;
-            cursor->useLazyScan = false;
             cursor->scanFileIndex = 0;
             // Prefer source-specific record infos if available (for multi-source routing)
             if (vtab->sourceRecordInfos) {
@@ -384,13 +575,11 @@ int FlatBufferVTabModule::xFilter(sqlite3_vtab_cursor* pCursor, int idxNum, cons
             }
             cursor->scanFileCount = cursor->scanRecordInfos ? cursor->scanRecordInfos->size() : 0;
             cursor->scanDataBuffer = vtab->store->getDataBuffer();
-            cursor->hasTombstones = vtab->tombstones && !vtab->tombstones->empty();
 
             // Find first non-tombstoned record
             while (cursor->scanFileIndex < cursor->scanFileCount) {
                 const auto& info = (*cursor->scanRecordInfos)[cursor->scanFileIndex];
-                // Check tombstone
-                if (!vtab->tombstones || !vtab->tombstones->count(info.sequence)) {
+                if (!cursor->hasTombstones || !vtab->tombstones->count(info.sequence)) {
                     // Inline data access - read size prefix and compute pointer
                     const uint8_t* ptr = cursor->scanDataBuffer + info.offset;
                     uint32_t len = static_cast<uint32_t>(ptr[0]) |
@@ -401,6 +590,7 @@ int FlatBufferVTabModule::xFilter(sqlite3_vtab_cursor* pCursor, int idxNum, cons
                     cursor->currentSequence = info.sequence;
                     cursor->currentData = ptr + 4;  // Skip size prefix
                     cursor->currentLength = len;
+                    cursor->rowsVisited++;
                     break;
                 }
                 cursor->scanFileIndex++;
@@ -409,21 +599,20 @@ int FlatBufferVTabModule::xFilter(sqlite3_vtab_cursor* pCursor, int idxNum, cons
             if (cursor->scanFileIndex >= cursor->scanFileCount) {
                 cursor->atEof = true;
             }
-            break;
+            return SQLITE_OK;
         }
 
-        case 1: {
-            // Rowid lookup - direct pointer, no copy
+        case kStrategyRowid: {
+            if (stats) stats->rowidLookups++;
             cursor->scanType = ScanType::RowidLookup;
             if (argc < 1) {
                 cursor->atEof = true;
                 return SQLITE_OK;
             }
 
-            int64_t rowid = sqlite3_value_int64(argv[argIdx]);
+            int64_t rowid = sqlite3_value_int64(argv[0]);
 
-            // Check tombstone
-            if (vtab->tombstones && vtab->tombstones->count(static_cast<uint64_t>(rowid))) {
+            if (cursor->hasTombstones && vtab->tombstones->count(static_cast<uint64_t>(rowid))) {
                 cursor->atEof = true;
                 return SQLITE_OK;
             }
@@ -440,156 +629,76 @@ int FlatBufferVTabModule::xFilter(sqlite3_vtab_cursor* pCursor, int idxNum, cons
                     cursor->currentSequence = static_cast<uint64_t>(rowid);
                     cursor->currentData = data;
                     cursor->currentLength = len;
+                    cursor->rowsVisited++;
                 } else {
                     cursor->atEof = true;
                 }
             }
-            break;
+            return SQLITE_OK;
         }
 
-        case 2: {
-            // Index equality lookup - optimized fast path
-            if (argc < 1 || colIdx < 0 || colIdx >= static_cast<int>(vtab->tableDef->columns.size())) {
-                cursor->atEof = true;
-                return SQLITE_OK;
-            }
-
-            // SQL semantics: `col = NULL` never matches. This also keeps NULL
-            // (std::monostate) keys out of the b-tree search, which cannot
-            // order them and loops forever (unbound ? params arrive as NULL).
-            if (sqlite3_value_type(argv[argIdx]) == SQLITE_NULL) {
-                cursor->atEof = true;
-                return SQLITE_OK;
-            }
-
-            // Get column name and look up index directly using column index
-            const std::string& colName = vtab->tableDef->columns[colIdx].name;
-            auto indexIt = vtab->indexes.find(colName);
-            if (indexIt == vtab->indexes.end() || !indexIt->second) {
-                cursor->atEof = true;
-                return SQLITE_OK;
-            }
-
-            // Convert SQLite value to our Value type
-            Value searchValue = valueFromSqlite(argv[argIdx]);
-
-            // Check if this is a primary key column (unique index)
-            bool isPrimaryKey = vtab->tableDef->columns[colIdx].primaryKey;
-
-            // For primary key (unique) columns, use fast single-result path
-            // For non-unique indexed columns, must use search() to get all matches
-            if (isPrimaryKey && indexIt->second->searchFirst(searchValue, cursor->singleResult)) {
-                // Fast path for primary key: single result expected
-                if (!vtab->tombstones || !vtab->tombstones->count(cursor->singleResult.sequence)) {
-                    cursor->scanType = ScanType::IndexSingleLookup;
-                    cursor->singleResultReturned = false;
-
-                    uint32_t len = 0;
-                    const uint8_t* data = vtab->store->getDataAtOffset(cursor->singleResult.dataOffset, &len);
-                    if (data) {
-                        cursor->currentOffset = cursor->singleResult.dataOffset;
-                        cursor->currentSequence = cursor->singleResult.sequence;
-                        cursor->currentData = data;
-                        cursor->currentLength = len;
-                    } else {
-                        cursor->atEof = true;
-                    }
-                } else {
-                    // Tombstoned primary key - no match
-                    cursor->atEof = true;
-                }
-            } else {
-                // Non-unique index OR primary key with tombstone: search for all matches
-                cursor->scanType = ScanType::IndexEquality;
-                cursor->indexResults = indexIt->second->search(searchValue);
-
-                // Filter out tombstoned entries if needed
-                if (vtab->tombstones && !vtab->tombstones->empty()) {
-                    std::vector<IndexEntry> filtered;
-                    for (const auto& entry : cursor->indexResults) {
-                        if (!vtab->tombstones->count(entry.sequence)) {
-                            filtered.push_back(entry);
-                        }
-                    }
-                    cursor->indexResults = std::move(filtered);
-                }
-
-                cursor->indexPosition = 0;
-                if (cursor->indexResults.empty()) {
-                    cursor->atEof = true;
-                } else {
-                    const IndexEntry& entry = cursor->indexResults[0];
-                    uint32_t len = 0;
-                    const uint8_t* data = vtab->store->getDataAtOffset(entry.dataOffset, &len);
-                    if (data) {
-                        cursor->currentOffset = entry.dataOffset;
-                        cursor->currentSequence = entry.sequence;
-                        cursor->currentData = data;
-                        cursor->currentLength = len;
-                    } else {
-                        cursor->atEof = true;
-                    }
-                }
-            }
-            break;
-        }
-
-        case 3: {
-            // Index range query
-            cursor->scanType = ScanType::IndexRange;
+        case kStrategyEquality:
+        case kStrategyRange: {
             if (colIdx < 0 || colIdx >= static_cast<int>(vtab->tableDef->columns.size())) {
                 cursor->atEof = true;
                 return SQLITE_OK;
             }
-
-            const std::string& colName = vtab->tableDef->columns[colIdx].name;
-            cursor->constraintColumn = colName;
-
-            auto indexIt = vtab->indexes.find(colName);
+            auto indexIt = vtab->indexes.find(vtab->tableDef->columns[colIdx].name);
             if (indexIt == vtab->indexes.end() || !indexIt->second) {
                 cursor->atEof = true;
                 return SQLITE_OK;
             }
+            SqliteIndex* index = indexIt->second;
 
-            cursor->indexResults = indexIt->second->all();
-
-            // Filter out tombstoned entries
-            if (vtab->tombstones) {
-                std::vector<IndexEntry> filtered;
-                filtered.reserve(cursor->indexResults.size());
-                for (const auto& entry : cursor->indexResults) {
-                    if (!vtab->tombstones->count(entry.sequence)) {
-                        filtered.push_back(entry);
-                    }
-                }
-                cursor->indexResults = std::move(filtered);
-            }
-
-            cursor->indexPosition = 0;
-            if (cursor->indexResults.empty()) {
-                cursor->atEof = true;
-            } else {
-                const IndexEntry& entry = cursor->indexResults[0];
-                uint32_t len = 0;
-                const uint8_t* data = vtab->store->getDataAtOffset(entry.dataOffset, &len);
-                if (data) {
-                    cursor->currentOffset = entry.dataOffset;
-                    cursor->currentSequence = entry.sequence;
-                    cursor->currentData = data;
-                    cursor->currentLength = len;
-                } else {
+            bool opened = false;
+            if (strategy == kStrategyEquality) {
+                if (stats) stats->indexEqualityScans++;
+                cursor->scanType = ScanType::IndexEquality;
+                if (argc < 1) {
                     cursor->atEof = true;
+                    return SQLITE_OK;
                 }
+                opened = index->openEqual(argv[0], cursor->indexScan);
+            } else {
+                if (stats) stats->indexRangeScans++;
+                cursor->scanType = ScanType::IndexRange;
+                int arg = 0;
+                sqlite3_value* lower = nullptr;
+                sqlite3_value* upper = nullptr;
+                if (flags & kRangeLower) {
+                    lower = arg < argc ? argv[arg] : nullptr;
+                    arg++;
+                }
+                if (flags & kRangeUpper) {
+                    upper = arg < argc ? argv[arg] : nullptr;
+                    arg++;
+                }
+                if (arg > argc) {
+                    cursor->atEof = true;
+                    return SQLITE_OK;
+                }
+                opened = index->openRange(lower, (flags & kRangeLowerInclusive) != 0,
+                                          upper, (flags & kRangeUpperInclusive) != 0,
+                                          cursor->indexScan);
             }
-            break;
+            if (!opened) {
+                cursor->atEof = true;
+                sqlite3_free(vtab->zErrMsg);
+                vtab->zErrMsg = sqlite3_mprintf("FlatSQL index scan could not start: %s",
+                                                index->lastError());
+                return SQLITE_ERROR;
+            }
+            if (!cursor->indexScan.active()) {
+                cursor->atEof = true;  // NULL key or bound: nothing can match
+                return SQLITE_OK;
+            }
+            return advanceIndexScan(cursor);
         }
 
         default:
             cursor->atEof = true;
-            break;
+            return SQLITE_OK;
     }
-
-    return SQLITE_OK;
 }
 
 int FlatBufferVTabModule::xNext(sqlite3_vtab_cursor* pCursor) {
@@ -616,6 +725,7 @@ int FlatBufferVTabModule::xNext(sqlite3_vtab_cursor* pCursor) {
                     cursor->currentSequence = info.sequence;
                     cursor->currentData = ptr + 4;
                     cursor->currentLength = len;
+                    cursor->rowsVisited++;
                     return SQLITE_OK;
                 }
                 cursor->atEof = true;
@@ -635,6 +745,7 @@ int FlatBufferVTabModule::xNext(sqlite3_vtab_cursor* pCursor) {
                     cursor->currentSequence = info.sequence;
                     cursor->currentData = ptr + 4;
                     cursor->currentLength = len;
+                    cursor->rowsVisited++;
                     return SQLITE_OK;
                 }
                 cursor->scanFileIndex++;
@@ -645,31 +756,13 @@ int FlatBufferVTabModule::xNext(sqlite3_vtab_cursor* pCursor) {
         }
 
         case ScanType::RowidLookup:
-        case ScanType::IndexSingleLookup:
             // Only one result for these lookups
             cursor->atEof = true;
             break;
 
         case ScanType::IndexEquality:
-        case ScanType::IndexRange: {
-            cursor->indexPosition++;
-            if (cursor->indexPosition >= cursor->indexResults.size()) {
-                cursor->atEof = true;
-            } else {
-                const IndexEntry& entry = cursor->indexResults[cursor->indexPosition];
-                uint32_t len = 0;
-                const uint8_t* data = cursor->vtab->store->getDataAtOffset(entry.dataOffset, &len);
-                if (data) {
-                    cursor->currentOffset = entry.dataOffset;
-                    cursor->currentSequence = entry.sequence;
-                    cursor->currentData = data;
-                    cursor->currentLength = len;
-                } else {
-                    cursor->atEof = true;
-                }
-            }
-            break;
-        }
+        case ScanType::IndexRange:
+            return advanceIndexScan(cursor);
     }
 
     return SQLITE_OK;

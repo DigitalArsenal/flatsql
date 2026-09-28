@@ -305,6 +305,15 @@ public:
     bool statementIsReadOnlyNoThrow(const std::string& sql) const noexcept;
 
     /**
+     * Counters of what this connection's virtual tables did (full scans,
+     * index lookups, index entries read, records visited). Monotonic; diff
+     * two reads around a statement. Also exposed as the SQL function
+     * flatsql_scan_stats(), which returns the same numbers as JSON text.
+     */
+    const VTabScanStats& scanStats() const { return *scanStats_; }
+    void resetScanStats() { *scanStats_ = VTabScanStats{}; }
+
+    /**
      * Get last error message.
      */
     std::string getLastError() const;
@@ -383,6 +392,9 @@ private:
     mutable std::unordered_map<std::string, SourceInfo*> sourceNameCache_;
     mutable std::unordered_map<std::string, ParsedQuery> parsedQueryCache_;
     mutable std::unordered_map<std::string, std::vector<std::string>> columnNamesCache_;
+
+    // Heap-held so the vtab pointers survive a move of the engine.
+    std::unique_ptr<VTabScanStats> scanStats_;
 
     // Helper to build column list for CREATE VIEW
     std::string buildColumnList(const TableDef* tableDef) const;

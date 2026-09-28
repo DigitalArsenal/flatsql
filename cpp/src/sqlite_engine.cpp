@@ -155,6 +155,20 @@ static void stripIdentifierQuotes(std::string& identifier) {
     }
 }
 
+// The point fast paths answer `col = ?` with the FIRST index entry for the
+// key. That is only the whole answer for a unique (`id`) column; an indexed
+// non-unique column (`key`, `index`) can match many records and must go
+// through the virtual table, which returns every match.
+static bool isUniqueIndexedColumn(const TableDef* tableDef, const std::string& columnName) {
+    if (!tableDef) return false;
+    for (const auto& column : tableDef->columns) {
+        if (column.name == columnName) {
+            return column.primaryKey;
+        }
+    }
+    return false;
+}
+
 static bool parsePointPredicate(const std::string& whereClause, std::string& columnName) {
     size_t eqPos = whereClause.find(" = ?");
     size_t tokenLength = 4;
@@ -316,6 +330,34 @@ SQLiteEngine::SQLiteEngine(SQLiteConnectionOptions options)
         if (searchRc != SQLITE_OK) throw std::runtime_error("Unable to register FlatSQL record text extraction");
     }
 
+    // flatsql_scan_stats(): what this connection's virtual tables did, as
+    // JSON text. Tests and benchmarks diff two reads around a statement to
+    // see whether it used an index and how many records it touched.
+    scanStats_ = std::make_unique<VTabScanStats>();
+    const auto scanStatsFunction = [](sqlite3_context* context, int, sqlite3_value**) {
+        auto* engine = *static_cast<SQLiteEngine**>(sqlite3_user_data(context));
+        const VTabScanStats& st = engine->scanStats();
+        char buffer[320];
+        const int written = std::snprintf(buffer, sizeof(buffer),
+            "{\"fullScans\":%llu,\"rowidLookups\":%llu,\"indexEqualityScans\":%llu,"
+            "\"indexRangeScans\":%llu,\"indexEntriesRead\":%llu,\"rowsVisited\":%llu}",
+            static_cast<unsigned long long>(st.fullScans),
+            static_cast<unsigned long long>(st.rowidLookups),
+            static_cast<unsigned long long>(st.indexEqualityScans),
+            static_cast<unsigned long long>(st.indexRangeScans),
+            static_cast<unsigned long long>(st.indexEntriesRead),
+            static_cast<unsigned long long>(st.rowsVisited));
+        if (written <= 0 || written >= static_cast<int>(sizeof(buffer))) {
+            sqlite3_result_error(context, "scan stats do not fit", -1);
+            return;
+        }
+        sqlite3_result_text(context, buffer, written, SQLITE_TRANSIENT);
+    };
+    if (sqlite3_create_function_v2(db_, "flatsql_scan_stats", 0, SQLITE_UTF8 | SQLITE_DIRECTONLY,
+            functionOwner_.get(), scanStatsFunction, nullptr, nullptr, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("Unable to register flatsql_scan_stats");
+    }
+
     // Register custom geo/spatial functions
     registerGeoFunctions(db_);
 
@@ -398,7 +440,8 @@ SQLiteEngine::SQLiteEngine(SQLiteEngine&& other) noexcept
     , stmtCache_(std::move(other.stmtCache_))
     , sourceNameCache_(std::move(other.sourceNameCache_))
     , parsedQueryCache_(std::move(other.parsedQueryCache_))
-    , columnNamesCache_(std::move(other.columnNamesCache_)) {
+    , columnNamesCache_(std::move(other.columnNamesCache_))
+    , scanStats_(std::move(other.scanStats_)) {
     other.db_ = nullptr;
     if (functionOwner_) *functionOwner_ = this;
 }
@@ -420,6 +463,7 @@ SQLiteEngine& SQLiteEngine::operator=(SQLiteEngine&& other) noexcept {
         sourceNameCache_ = std::move(other.sourceNameCache_);
         parsedQueryCache_ = std::move(other.parsedQueryCache_);
         columnNamesCache_ = std::move(other.columnNamesCache_);
+        scanStats_ = std::move(other.scanStats_);
         other.db_ = nullptr;
     }
     return *this;
@@ -484,6 +528,7 @@ bool SQLiteEngine::registerSourceNoThrow(
     sourceInfo->vtabInfo.indexes = indexes;
     sourceInfo->vtabInfo.tombstones = &sourceInfo->tombstones;
     sourceInfo->vtabInfo.sourceRecordInfos = sourceRecordInfos;
+    sourceInfo->vtabInfo.stats = scanStats_.get();
 
     // Store before registering (so pointers are stable)
     SourceInfo* infoPtr = sourceInfo.get();
@@ -1528,7 +1573,8 @@ bool SQLiteEngine::tryFastPathCount(const std::string& sql, const std::vector<Va
         }
 
         auto indexIt = source->indexes.find(parsed->columnName);
-        if (indexIt == source->indexes.end() || !indexIt->second) {
+        if (indexIt == source->indexes.end() || !indexIt->second ||
+            !isUniqueIndexedColumn(source->tableDef, parsed->columnName)) {
             return false;
         }
 
@@ -1539,8 +1585,8 @@ bool SQLiteEngine::tryFastPathCount(const std::string& sql, const std::vector<Va
         }
 
         if (!source->tombstones.empty() && source->tombstones.count(entry.sequence)) {
-            count = 0;
-            return true;
+            // A later live record may carry the same key: let the vtab walk it.
+            return false;
         }
 
         count = 1;
@@ -1746,7 +1792,8 @@ bool SQLiteEngine::tryFastPath(const std::string& sql, const std::vector<Value>&
     }
 
     auto indexIt = source->indexes.find(parsed->columnName);
-    if (indexIt == source->indexes.end() || !indexIt->second) {
+    if (indexIt == source->indexes.end() || !indexIt->second ||
+        !isUniqueIndexedColumn(source->tableDef, parsed->columnName)) {
         return false;
     }
 
@@ -1765,9 +1812,8 @@ bool SQLiteEngine::tryFastPath(const std::string& sql, const std::vector<Value>&
 
     // Check tombstone only if there are any
     if (!source->tombstones.empty() && source->tombstones.count(entry.sequence)) {
-        // Tombstoned - return empty result
-        result.columns = getCachedColumnNames(source);
-        return true;
+        // A later live record may carry the same key: let the vtab walk it.
+        return false;
     }
 
     // Get the data
@@ -1849,10 +1895,11 @@ bool SQLiteEngine::tryFastPathMinimal(const std::string& sql, const std::vector<
         return false;
     }
 
-    // Check if we have an index on this column
+    // Check if we have a unique index on this column
     auto indexIt = source->indexes.find(columnName);
-    if (indexIt == source->indexes.end() || !indexIt->second) {
-        return false;  // No index, fall back to VTable
+    if (indexIt == source->indexes.end() || !indexIt->second ||
+        !isUniqueIndexedColumn(source->tableDef, columnName)) {
+        return false;  // No unique index, fall back to VTable
     }
 
     SqliteIndex* index = indexIt->second;

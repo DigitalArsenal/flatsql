@@ -24,7 +24,7 @@ function detectFindings(manifest) {
             status: 'External per-schema SDN index profiles are not loaded by this harness slice.',
         },
         expectedPressurePoints: [
-            'Native query result cache defaults to 1024 entries and 1000 rows per result; production FILE_ID profiles should tune maxEntries and maxRows for hot/cold traffic shape.',
+            'Native query result cache defaults to 1024 entries within a 64 MiB byte budget (LRU); production FILE_ID profiles should tune maxEntries and maxRows for hot/cold traffic shape.',
             'Large FILE_ID responses still need paging, raw streaming, or response artifacts rather than assuming every SQL result should stay resident in process memory.',
             'Per-schema query speed depends on external SDN index profiles, not database-specific annotations in canonical schemas.',
             'Cache hits reduce native query work but still return response bytes unless callers use narrower projections, raw binary paths, compression, or edge-local aggregation.',

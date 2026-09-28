@@ -198,6 +198,7 @@ SqliteIndex::SqliteIndex(sqlite3* db, const std::string& tableName,
 }
 
 SqliteIndex::~SqliteIndex() {
+    finalizeScanPool();
     if (insertStmt_) sqlite3_finalize(insertStmt_);
     if (searchStmt_) sqlite3_finalize(searchStmt_);
     if (searchFirstStmt_) sqlite3_finalize(searchFirstStmt_);
@@ -220,6 +221,8 @@ SqliteIndex::SqliteIndex(SqliteIndex&& other) noexcept
     , countStmt_(other.countStmt_)
     , clearStmt_(other.clearStmt_)
 {
+    scanPool_ = std::move(other.scanPool_);
+    for (auto& pool : other.scanPool_) pool.clear();
     other.db_ = nullptr;
     other.insertStmt_ = nullptr;
     other.searchStmt_ = nullptr;
@@ -233,6 +236,7 @@ SqliteIndex::SqliteIndex(SqliteIndex&& other) noexcept
 SqliteIndex& SqliteIndex::operator=(SqliteIndex&& other) noexcept {
     if (this != &other) {
         // Clean up existing statements
+        finalizeScanPool();
         if (insertStmt_) sqlite3_finalize(insertStmt_);
         if (searchStmt_) sqlite3_finalize(searchStmt_);
         if (searchFirstStmt_) sqlite3_finalize(searchFirstStmt_);
@@ -253,6 +257,8 @@ SqliteIndex& SqliteIndex::operator=(SqliteIndex&& other) noexcept {
         allStmt_ = other.allStmt_;
         countStmt_ = other.countStmt_;
         clearStmt_ = other.clearStmt_;
+        scanPool_ = std::move(other.scanPool_);
+        for (auto& pool : other.scanPool_) pool.clear();
 
         other.db_ = nullptr;
         other.insertStmt_ = nullptr;
@@ -507,6 +513,145 @@ std::vector<IndexEntry> SqliteIndex::all() const {
     }
 
     return results;
+}
+
+// ==================== Lazy scans ====================
+
+void SqliteIndex::finalizeScanPool() noexcept {
+    for (auto& pool : scanPool_) {
+        for (sqlite3_stmt* stmt : pool) {
+            sqlite3_finalize(stmt);
+        }
+        pool.clear();
+    }
+}
+
+sqlite3_stmt* SqliteIndex::acquireScanStmt(int shape) noexcept {
+    if (shape < 0 || shape >= kScanShapes || !db_) {
+        return nullptr;
+    }
+    auto& pool = scanPool_[shape];
+    if (!pool.empty()) {
+        sqlite3_stmt* stmt = pool.back();
+        pool.pop_back();
+        return stmt;
+    }
+
+    // Only the offset, length and sequence are read: the key is never copied
+    // out of the b-tree. Rows come back in (key, sequence) order, which is
+    // the WITHOUT ROWID primary key, so no sort step is compiled in.
+    std::string sql = "SELECT data_offset, data_length, sequence FROM \"" +
+        indexTableName_ + "\"";
+    if (shape == 0) {
+        sql += " WHERE key = ?1";
+    } else {
+        const int lower = (shape - 1) / 3;
+        const int upper = (shape - 1) % 3;
+        const char* joiner = " WHERE ";
+        if (lower != 0) {
+            sql += joiner;
+            sql += lower == 2 ? "key >= ?1" : "key > ?1";
+            joiner = " AND ";
+        }
+        if (upper != 0) {
+            sql += joiner;
+            sql += upper == 2 ? "key <= ?2" : "key < ?2";
+        }
+    }
+    sql += " ORDER BY key, sequence";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        if (stmt) sqlite3_finalize(stmt);
+        return nullptr;
+    }
+    return stmt;
+}
+
+void SqliteIndex::returnScanStmt(int shape, sqlite3_stmt* stmt) noexcept {
+    if (!stmt) return;
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    if (shape >= 0 && shape < kScanShapes && scanPool_[shape].size() < kPooledPerShape) {
+        try {
+            scanPool_[shape].push_back(stmt);
+            return;
+        } catch (...) {
+        }
+    }
+    sqlite3_finalize(stmt);
+}
+
+const char* SqliteIndex::lastError() const noexcept {
+    return db_ ? sqlite3_errmsg(db_) : "index closed";
+}
+
+bool SqliteIndex::openEqual(sqlite3_value* key, SqliteIndexScan& scan) noexcept {
+    scan.release();
+    if (!key || sqlite3_value_type(key) == SQLITE_NULL) {
+        return true;  // `col = NULL` never matches
+    }
+    sqlite3_stmt* stmt = acquireScanStmt(0);
+    if (!stmt) return false;
+    if (sqlite3_bind_value(stmt, 1, key) != SQLITE_OK) {
+        returnScanStmt(0, stmt);
+        return false;
+    }
+    scan.owner_ = this;
+    scan.stmt_ = stmt;
+    scan.shape_ = 0;
+    return true;
+}
+
+bool SqliteIndex::openRange(sqlite3_value* lower, bool lowerInclusive,
+                            sqlite3_value* upper, bool upperInclusive,
+                            SqliteIndexScan& scan) noexcept {
+    scan.release();
+    if ((lower && sqlite3_value_type(lower) == SQLITE_NULL) ||
+        (upper && sqlite3_value_type(upper) == SQLITE_NULL)) {
+        return true;  // a comparison against NULL is never true
+    }
+    const int lowerKind = lower ? (lowerInclusive ? 2 : 1) : 0;
+    const int upperKind = upper ? (upperInclusive ? 2 : 1) : 0;
+    const int shape = 1 + lowerKind * 3 + upperKind;
+    sqlite3_stmt* stmt = acquireScanStmt(shape);
+    if (!stmt) return false;
+    if ((lower && sqlite3_bind_value(stmt, 1, lower) != SQLITE_OK) ||
+        (upper && sqlite3_bind_value(stmt, 2, upper) != SQLITE_OK)) {
+        returnScanStmt(shape, stmt);
+        return false;
+    }
+    scan.owner_ = this;
+    scan.stmt_ = stmt;
+    scan.shape_ = shape;
+    return true;
+}
+
+int SqliteIndexScan::next(uint64_t& dataOffset, uint32_t& dataLength, uint64_t& sequence) noexcept {
+    if (!stmt_) return 0;
+    const int rc = sqlite3_step(stmt_);
+    if (rc == SQLITE_ROW) {
+        dataOffset = static_cast<uint64_t>(sqlite3_column_int64(stmt_, 0));
+        dataLength = static_cast<uint32_t>(sqlite3_column_int64(stmt_, 1));
+        sequence = static_cast<uint64_t>(sqlite3_column_int64(stmt_, 2));
+        return 1;
+    }
+    if (rc == SQLITE_DONE) {
+        release();
+        return 0;
+    }
+    return -1;
+}
+
+void SqliteIndexScan::release() noexcept {
+    if (stmt_ && owner_) {
+        owner_->returnScanStmt(shape_, stmt_);
+    } else if (stmt_) {
+        sqlite3_finalize(stmt_);
+    }
+    stmt_ = nullptr;
+    owner_ = nullptr;
+    shape_ = 0;
 }
 
 void SqliteIndex::clear() {

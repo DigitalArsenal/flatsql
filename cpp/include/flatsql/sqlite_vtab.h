@@ -31,10 +31,25 @@ using BatchExtractor = void(*)(const uint8_t* data, size_t length, std::vector<V
 // Scan type for cursor
 enum class ScanType {
     FullScan,           // Iterate all records
-    IndexEquality,      // Use index for = lookup (may return multiple)
-    IndexSingleLookup,  // Fast path for unique index = lookup (single result)
-    IndexRange,         // Use index for range query
+    IndexEquality,      // Lazy index walk for `col = ?`
+    IndexRange,         // Lazy index walk for a bounded key range
     RowidLookup         // Lookup by rowid (sequence)
+};
+
+/**
+ * What the virtual tables of one connection actually did. These are
+ * computable outcomes for tests and benchmarks: a point lookup that reads one
+ * record, a `LIMIT 1` that stops after one index entry, a range that touches
+ * only its keys. Read through SQLiteEngine::scanStats() or, from any lane, the
+ * SQL function flatsql_scan_stats() (JSON text).
+ */
+struct VTabScanStats {
+    uint64_t fullScans = 0;          // xFilter calls that walked the table
+    uint64_t rowidLookups = 0;       // xFilter calls answered by rowid
+    uint64_t indexEqualityScans = 0; // xFilter calls answered by `col = ?`
+    uint64_t indexRangeScans = 0;    // xFilter calls answered by a key range
+    uint64_t indexEntriesRead = 0;   // index entries stepped (tombstoned too)
+    uint64_t rowsVisited = 0;        // records positioned for SQLite to read
 };
 
 // Index info for optimization
@@ -66,6 +81,9 @@ struct FlatBufferVTab : public sqlite3_vtab {
 
     // Encryption context for field-level decryption (not owned, may be nullptr)
     const flatbuffers::EncryptionContext* encryptionCtx = nullptr;
+
+    // Per-connection scan counters (not owned, may be nullptr)
+    VTabScanStats* stats = nullptr;
 };
 
 /**
@@ -95,32 +113,18 @@ struct FlatBufferCursor : public sqlite3_vtab_cursor {
     // Scan configuration
     ScanType scanType;
 
-    // For index-based scans (multi-result)
-    std::vector<IndexEntry> indexResults;
-    size_t indexPosition;
+    // For index-based scans: one index entry per xNext, never materialized
+    SqliteIndexScan indexScan;
 
-    // For single lookup - no allocation
-    IndexEntry singleResult;
-    bool singleResultReturned;
-
-    // For full scan - lightweight references (no data copy)
-    // Only used as fallback; prefer lazy iteration
-    std::vector<RecordRef> scanRefs;
-    size_t scanPosition;
-
-    // For indexed full scan iteration (O(1) per record)
+    // For full scan iteration (O(1) per record)
     size_t scanFileIndex;
     size_t scanFileCount;
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* scanRecordInfos;
     const uint8_t* scanDataBuffer;  // Cached data buffer pointer for inline access
 
-    // For lazy full scan iteration (legacy)
-    bool useLazyScan;
-
-    // Constraint values for filtering
-    Value constraintValue;
-    Value constraintValue2;  // For BETWEEN
-    std::string constraintColumn;
+    // Counted locally on the hot path, folded into vtab->stats on reset/close
+    uint64_t rowsVisited;
+    uint64_t indexEntriesRead;
 
     // Column value cache - avoids re-extracting values for same row
     std::vector<Value> columnCache;
@@ -194,6 +198,8 @@ struct VTabCreateInfo {
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos = nullptr;
     // Encryption context for field-level decryption (not owned)
     const flatbuffers::EncryptionContext* encryptionCtx = nullptr;
+    // Per-connection scan counters (not owned)
+    VTabScanStats* stats = nullptr;
 };
 
 }  // namespace flatsql

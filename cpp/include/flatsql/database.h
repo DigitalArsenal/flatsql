@@ -216,6 +216,8 @@ public:
         uint64_t generation = 0;
         size_t maxEntries = 0;
         size_t maxRows = 0;
+        size_t maxBytes = 0;     // budget for all retained results together
+        size_t totalBytes = 0;   // what the retained results hold now
     };
 
     // Register a named SQL template for native cached execution.
@@ -236,8 +238,18 @@ public:
     // Clear cached query results without unregistering templates.
     void clearQueryResultCache();
 
-    // Configure bounded native query-result caching.
+    // Configure bounded native query-result caching. Retention is bounded by
+    // bytes, not rows: maxBytes caps everything the cache holds (LRU entries
+    // are evicted to stay under it), maxRows caps any single result, and a
+    // result larger than the whole budget is never retained. A row count says
+    // nothing about memory (1000 rows of 1 MiB blobs vs 90k 300-byte rows),
+    // so the default row cap is high and the byte budget does the bounding.
     void configureQueryResultCache(size_t maxEntries, size_t maxRows);
+    void configureQueryResultCache(size_t maxEntries, size_t maxRows, size_t maxBytes);
+
+    static constexpr size_t kDefaultQueryCacheMaxEntries = 1024;
+    static constexpr size_t kDefaultQueryCacheMaxRows = 1000000;
+    static constexpr size_t kDefaultQueryCacheMaxBytes = 64u * 1024u * 1024u;
 
     QueryCacheStats getQueryCacheStats() const;
 
@@ -653,6 +665,7 @@ private:
     struct CachedQueryResult {
         QueryResult result;
         std::list<std::string>::iterator lruIt;
+        size_t bytes = 0;
     };
 
     struct CachedRawStream {
@@ -719,8 +732,10 @@ private:
     uint64_t queryCacheHits_ = 0;
     uint64_t queryCacheMisses_ = 0;
 
-    size_t queryResultCacheMaxEntries_ = 1024;
-    size_t queryResultCacheMaxRows_ = 1000;
+    size_t queryResultCacheMaxEntries_ = kDefaultQueryCacheMaxEntries;
+    size_t queryResultCacheMaxRows_ = kDefaultQueryCacheMaxRows;
+    size_t queryResultCacheMaxBytes_ = kDefaultQueryCacheMaxBytes;
+    size_t queryResultCacheTotalBytes_ = 0;
 
     // Raw-stream response artifact cache (see public section above).
     std::list<std::string> rawStreamCacheLru_;

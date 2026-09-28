@@ -183,7 +183,7 @@ await builder.queryTemplate('userByEmail', ['alice@example.com']); // hit
 console.log(await builder.getQueryCacheStats());
 ```
 
-The native cache defaults to 1024 entries and 1000 rows per cached result. Tune `maxEntries` and `maxRows` for production FILE_ID traffic instead of recompiling the C++ core.
+The native cache holds up to 1024 results within a 64 MiB budget, evicting the least recently used result to stay under it; a result bigger than the whole budget is not cached. `maxRows` caps any single result (default 1,000,000 rows). Tune `maxEntries` and `maxRows` for production FILE_ID traffic instead of recompiling the C++ core.
 
 For WasmEdge, build the small host runner and pass it to the same builder. The runner keeps one WASI module instance resident so cache state survives across requests.
 
