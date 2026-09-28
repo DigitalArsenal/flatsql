@@ -269,6 +269,11 @@ public:
     void wakeIdleLane();
     void wakeLane(uint32_t lane);
     std::atomic<uint32_t>& workSeq() { return workSeq_; }
+    // Mailbox internals for the C ABI layout (capi_ps.cpp).
+    const void* queueCells() const { return q_.get(); }
+    uint64_t queueMask() const { return qMask_; }
+    const void* queueEnq() const { return &qEnq_; }
+    const void* queueDeq() const { return &qDeq_; }
 
     // A12: the oldest running statement's start time across every lane
     // (monoNs), or UINT64_MAX when none runs. A file retired by a SWAP at

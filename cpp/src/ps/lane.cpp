@@ -763,6 +763,7 @@ int32_t ReaderInstance::open(const ReaderConfig& cfgIn, std::unique_ptr<ReaderIn
         h->reqCap = cfg.reqBytes;
         h->ringCap = cfg.ringBytes;
     }
+    static_assert(sizeof(QCell) == 16, "the C ABI documents 16-byte queue cells");
     uint64_t qcap = 1;
     while (qcap < uint64_t(cfg.slots) * 2) qcap <<= 1;
     inst->q_.reset(new QCell[qcap]);

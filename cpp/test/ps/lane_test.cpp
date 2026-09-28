@@ -242,3 +242,85 @@ PS_TEST(lane_sandbox_contract_A28) {
     CHECK_EQ(r.status, int32_t(kRsNeedsBulk));
     s.close();
 }
+
+// The reader C ABI (flatsql_ps.h): a statement driven through raw memory the
+// way the Go router does it (claim, write, queue, doorbell, read the ring).
+#include <filesystem>
+
+#include "flatsql/ps/flatsql_ps.h"
+
+PS_TEST(lane_c_abi_mailbox_protocol) {
+    const std::string dir = std::filesystem::temp_directory_path().string() + "/flatsql-ps-capi-" +
+                            std::to_string(monoNs());
+    std::filesystem::create_directories(dir);
+    {
+        Store s(false, 1, true);
+        s.cfg.io = nullptr;  // the native seven-import host
+        s.cfg.root = dir;
+        s.root = dir;
+        REQUIRE(s.open() == 0);
+        s.registerTypes({&ommType()});
+        const uint32_t p1 = s.partition("capi", ommType());
+        Producer a(s.e.get(), p1);
+        const auto attr = buildRecordAttr("capi", "prov", "src", "b1");
+        uint64_t last = 0;
+        for (int i = 0; i < 50; i++) last = send(s.e.get(), a, ommRecord(uint32_t(i + 1), "C", ep(i), 1.0), attr, i);
+        CHECK_EQ(a.waitAcked(last, 10000000000ull), 0);
+        s.close();
+    }
+    std::vector<uint8_t> cfg;
+    auto tlv = [&](uint16_t tag, const void* v, uint32_t n) {
+        const size_t at = cfg.size();
+        cfg.resize(at + 6 + n);
+        putU16(cfg.data() + at, tag);
+        putU32(cfg.data() + at + 2, n);
+        std::memcpy(cfg.data() + at + 6, v, n);
+    };
+    tlv(1, dir.data(), uint32_t(dir.size()));
+    const uint32_t lanes = 2;
+    tlv(20, &lanes, 4);
+    REQUIRE(flatsql_ps_init(FLATSQL_PS_ROLE_READER_INTERACTIVE, cfg.data(), int32_t(cfg.size())) == 0);
+    REQUIRE(flatsql_ps_start() == 0);
+    FlatsqlPsReaderLayout L;
+    REQUIRE(flatsql_ps_reader_layout(&L) == int32_t(sizeof(L)));
+    CHECK_EQ(L.nLanes, 2u);
+    // Layout addresses are wasm32 offsets (the low 32 bits natively): this
+    // native test drives an instance opened the same way through the
+    // layout's field offsets, which must match the struct they describe.
+    CHECK_EQ(L.offState, uint32_t(offsetof(SlotHeader, state)));
+    CHECK_EQ(L.headerSize, uint32_t(sizeof(SlotHeader)));
+    // Drive slot 0 through raw offsets on a ReaderInstance opened the same way.
+    ReaderConfig rc;
+    rc.root = dir;
+    rc.lanes = 1;
+    Reader r(rc);
+    REQUIRE(r.inst);
+    uint8_t* slot = reinterpret_cast<uint8_t*>(r.inst->slot(0));
+    auto u32at = [&](uint32_t off) { return reinterpret_cast<std::atomic<uint32_t>*>(slot + off); };
+    auto u64at = [&](uint32_t off) { return reinterpret_cast<std::atomic<uint64_t>*>(slot + off); };
+    uint32_t expect = kSlotFree;
+    REQUIRE(u32at(L.offState)->compare_exchange_strong(expect, kSlotClaimed));
+    const std::string sql = "SELECT count(*), sum(live_count) FROM flatsql_partitions";
+    std::memcpy(slot + L.headerSize, sql.data(), sql.size());
+    putU32(slot + L.offSqlLen, uint32_t(sql.size()));
+    putU32(slot + L.offParamsLen, 0);
+    putU32(slot + L.offFlags, 0);
+    u64at(L.offRingHead)->store(0);
+    u64at(L.offRingTail)->store(0);
+    u32at(L.offState)->store(kSlotQueued);
+    REQUIRE(r.inst->enqueue(0) == 0);
+    const uint64_t until = monoNs() + 5000000000ull;
+    while (u32at(L.offState)->load() != kSlotDone && monoNs() < until) sleepNs(100000);
+    REQUIRE(u32at(L.offState)->load() == kSlotDone);
+    const uint64_t tail = u64at(L.offRingTail)->load();
+    const uint8_t* ring = slot + L.headerSize + r.inst->config().reqBytes;
+    rb1::Decoder d;
+    CHECK(d.feed(ring, size_t(tail)) && d.done());
+    REQUIRE(d.rows().size() == 1);
+    CHECK_EQ(d.rows()[0][0].i, 1);
+    CHECK_EQ(d.rows()[0][1].i, 50);
+    CHECK_EQ(int32_t(getU32(slot + L.offStatus)), 0);
+    u32at(L.offState)->store(kSlotFree);
+    CHECK_EQ(flatsql_ps_stop(5000), 0);
+    std::filesystem::remove_all(dir);
+}

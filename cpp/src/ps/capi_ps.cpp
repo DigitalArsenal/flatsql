@@ -6,12 +6,55 @@
 #include <memory>
 
 #include "flatsql/ps/platform.h"
+#include "flatsql/ps/lane.h"
 #include "flatsql/ps/writer.h"
 
 namespace {
 std::unique_ptr<flatsql::ps::Engine>& instance() {
     static std::unique_ptr<flatsql::ps::Engine> e;
     return e;
+}
+std::unique_ptr<flatsql::ps::ReaderInstance>& reader() {
+    static std::unique_ptr<flatsql::ps::ReaderInstance> r;
+    return r;
+}
+inline uint32_t addr(const void* p) { return uint32_t(reinterpret_cast<uintptr_t>(p)); }
+
+int32_t initReader(int32_t role, const uint8_t* cfg, int32_t cfgLen) {
+    using namespace flatsql::ps;
+    if (reader() || instance()) return FLATSQL_IO_ERR_BUSY;
+    ReaderConfig c;
+    c.cls = role == FLATSQL_PS_ROLE_READER_BULK      ? LaneClass::Bulk
+            : role == FLATSQL_PS_ROLE_READER_SANDBOX ? LaneClass::Sandbox
+                                                     : LaneClass::Interactive;
+    int32_t off = 0;
+    while (cfg && off + 6 <= cfgLen) {
+        const uint16_t tag = getU16(cfg + off);
+        const uint32_t len = getU32(cfg + off + 2);
+        if (off + 6 + int64_t(len) > cfgLen) return FLATSQL_IO_ERR_GENERIC;
+        const uint8_t* v = cfg + off + 6;
+        auto u32 = [&]() { return len >= 4 ? getU32(v) : 0u; };
+        auto u64 = [&]() { return len >= 8 ? getU64(v) : 0ull; };
+        switch (tag) {
+            case 1: c.root.assign(reinterpret_cast<const char*>(v), len); break;
+            case 20: c.lanes = u32(); break;
+            case 21: c.arenaBytes = u64(); break;
+            case 22: c.cacheBytes = u64(); break;
+            case 23: c.maxParked = u32(); break;
+            case 24: c.slots = u32(); break;
+            case 25: c.reqBytes = u32(); break;
+            case 26: c.ringBytes = u32(); break;
+            case 27: c.laneCacheBytes = u64(); break;
+            case 28: c.stackBytes = u64(); break;
+            case 29: c.sandboxMaxRowsExamined = u64(); break;
+            case 30: c.sandboxMaxBytesRead = u64(); break;
+            default: break;
+        }
+        off += 6 + int32_t(len);
+    }
+    if (c.root.empty()) return FLATSQL_IO_ERR_GENERIC;
+    std::string err;
+    return ReaderInstance::open(c, &reader(), &err);
 }
 }  // namespace
 
@@ -20,8 +63,10 @@ using namespace flatsql::ps;
 extern "C" {
 
 int32_t flatsql_ps_init(int32_t role, const uint8_t* cfg, int32_t cfgLen) {
+    if (role >= FLATSQL_PS_ROLE_READER_INTERACTIVE && role <= FLATSQL_PS_ROLE_READER_SANDBOX)
+        return initReader(role, cfg, cfgLen);
     if (role != FLATSQL_PS_ROLE_WRITER) return FLATSQL_IO_ERR_GENERIC;
-    if (instance()) return FLATSQL_IO_ERR_BUSY;
+    if (instance() || reader()) return FLATSQL_IO_ERR_BUSY;
     EngineConfig c;
     int32_t off = 0;
     while (cfg && off + 6 <= cfgLen) {
@@ -54,7 +99,62 @@ int32_t flatsql_ps_init(int32_t role, const uint8_t* cfg, int32_t cfgLen) {
 }
 
 int32_t flatsql_ps_start(void) {
+    if (reader()) return reader()->start();
     return instance() ? instance()->start() : FLATSQL_IO_ERR_BADHANDLE;
+}
+
+int32_t flatsql_ps_reader_layout(FlatsqlPsReaderLayout* out) {
+    ReaderInstance* r = reader().get();
+    if (!r || !out) return FLATSQL_IO_ERR_BADHANDLE;
+    std::memset(out, 0, sizeof(*out));
+    const ReaderConfig& c = r->config();
+    out->version = 1;
+    out->nLanes = r->laneCount();
+    out->nSlots = r->slotCount();
+    out->slotBase = addr(r->slot(0));
+    out->slotStride = uint32_t(r->slotStride());
+    out->headerSize = sizeof(SlotHeader);
+    out->reqBytes = c.reqBytes;
+    out->ringBytes = c.ringBytes;
+    out->offState = offsetof(SlotHeader, state);
+    out->offCancel = offsetof(SlotHeader, cancel);
+    out->offOutSeq = offsetof(SlotHeader, outSeq);
+    out->offSpaceSeq = offsetof(SlotHeader, spaceSeq);
+    out->offFlags = offsetof(SlotHeader, flags);
+    out->offLane = offsetof(SlotHeader, lane);
+    out->offReqId = offsetof(SlotHeader, reqId);
+    out->offSqlLen = offsetof(SlotHeader, sqlLen);
+    out->offParamsLen = offsetof(SlotHeader, paramsLen);
+    out->offReqCap = offsetof(SlotHeader, reqCap);
+    out->offRingCap = offsetof(SlotHeader, ringCap);
+    out->offMaxRowsExamined = offsetof(SlotHeader, maxRowsExamined);
+    out->offMaxBytesRead = offsetof(SlotHeader, maxBytesRead);
+    out->offMaxResultRows = offsetof(SlotHeader, maxResultRows);
+    out->offMaxResultBytes = offsetof(SlotHeader, maxResultBytes);
+    out->offRingHead = offsetof(SlotHeader, ringHead);
+    out->offRingTail = offsetof(SlotHeader, ringTail);
+    out->offStatus = offsetof(SlotHeader, status);
+    out->offErrLen = offsetof(SlotHeader, errLen);
+    out->offRowsOut = offsetof(SlotHeader, rowsOut);
+    out->offRowsExamined = offsetof(SlotHeader, rowsExamined);
+    out->offBytesRead = offsetof(SlotHeader, bytesRead);
+    out->offIndexEntries = offsetof(SlotHeader, indexEntries);
+    out->offFenceReads = offsetof(SlotHeader, fenceReads);
+    out->offSubmitNs = offsetof(SlotHeader, submitNs);
+    out->offStartNs = offsetof(SlotHeader, startNs);
+    out->offEndNs = offsetof(SlotHeader, endNs);
+    out->offErr = offsetof(SlotHeader, err);
+    out->queueCells = addr(r->queueCells());
+    out->queueMask = uint32_t(r->queueMask());
+    out->queueEnq = addr(r->queueEnq());
+    out->queueDeq = addr(r->queueDeq());
+    out->stopWord = addr(&r->stopWord());
+    for (uint32_t i = 0; i < r->laneCount() && i < 64; i++) {
+        out->laneDoorbell[i] = addr(&r->laneShared(i).doorbell);
+        out->laneState[i] = addr(&r->laneShared(i).state);
+        out->laneAnnounce[i] = addr(&r->laneShared(i).announce);
+    }
+    return int32_t(sizeof(*out));
 }
 
 int32_t flatsql_ps_layout(FlatsqlPsLayout* out) {
@@ -106,6 +206,11 @@ int32_t flatsql_ps_pump(double budgetUs) {
 }
 
 int32_t flatsql_ps_stop(double deadlineMs) {
+    if (reader()) {
+        const int32_t rc = reader()->stop(uint64_t(deadlineMs));
+        reader().reset();
+        return rc;
+    }
     if (!instance()) return FLATSQL_IO_ERR_BADHANDLE;
     const int32_t rc = instance()->stop(uint64_t(deadlineMs));
     instance().reset();
@@ -113,6 +218,15 @@ int32_t flatsql_ps_stop(double deadlineMs) {
 }
 
 int32_t flatsql_ps_stats(uint8_t* out, int32_t len) {
+    if (ReaderInstance* r = reader().get()) {
+        const ReaderStats st = r->stats();
+        const uint64_t v[] = {st.statements, st.parks,    st.needsBulk, st.noMem,
+                              st.snapshotGone, st.cancelled, st.timeouts, st.errors};
+        const int32_t n = int32_t(sizeof(v));
+        if (!out || len < n) return n;
+        for (size_t i = 0; i < sizeof(v) / 8; i++) putU64(out + i * 8, v[i]);
+        return n;
+    }
     Engine* e = instance().get();
     if (!e) return FLATSQL_IO_ERR_BADHANDLE;
     const EngineStats s = e->stats();

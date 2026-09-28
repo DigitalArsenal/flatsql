@@ -1,7 +1,8 @@
 /* FlatSQL partition store: the instance C ABI (design §6.3).
  *
  * i32 and f64 only; everything else lives in shared memory. One instance per
- * wasm module (the writer instance in T1; reader instances arrive with T2).
+ * wasm module: the writer instance, or a reader instance (T2: interactive,
+ * bulk or sandbox lanes).
  * Go never calls a guest export on a hot path: producers write rings in
  * shared memory, ring doorbells with flatsql_ps_wake, and poll ack words.
  * Registration and ring lookup are control calls on the instance's exec
@@ -28,7 +29,52 @@
 extern "C" {
 #endif
 
-enum { FLATSQL_PS_ROLE_WRITER = 1 };
+enum {
+    FLATSQL_PS_ROLE_WRITER = 1,
+    FLATSQL_PS_ROLE_READER_INTERACTIVE = 2,
+    FLATSQL_PS_ROLE_READER_BULK = 3,
+    FLATSQL_PS_ROLE_READER_SANDBOX = 4,
+};
+
+/* Reader config TLV tags (flatsql_ps_init with a reader role):
+ *   1 root (utf-8)      20 lanes u32        21 arena bytes u64 (per lane)
+ *  22 shared cache u64  23 max parked u32   24 slots u32
+ *  25 request bytes u32 26 ring bytes u32   27 lane cache bytes u64
+ *  28 stack bytes u64   29 sandbox rows u64 30 sandbox bytes u64
+ *
+ * The mailbox (ps/lane.h) lives in the instance's memory; the router
+ * programs against flatsql_ps_reader_layout:
+ *   submit: claim a slot (CAS state FREE->CLAIMED), write SQL then RB1
+ *   parameters at slotBase + i*slotStride + headerSize, set the header
+ *   fields, store state QUEUED, push the slot index on the MPMC queue
+ *   (Vyukov: cell i at queueCells + (pos & queueMask) * 16 holds
+ *   {seq u64, value u32}; enqueue CASes the u64 at queueEnq), then bump an
+ *   idle lane's doorbell (laneState 0 or 3) and flatsql_ps_wake it;
+ *   read: the SPSC ring after the request area (ringHead/ringTail u64);
+ *   done: state DONE, then status and counters; free: store state FREE. */
+typedef struct FlatsqlPsReaderLayout {
+    uint32_t version;
+    uint32_t nLanes;
+    uint32_t nSlots;
+    uint32_t slotBase;
+    uint32_t slotStride;
+    uint32_t headerSize;
+    uint32_t reqBytes;
+    uint32_t ringBytes;
+    uint32_t offState, offCancel, offOutSeq, offSpaceSeq, offFlags, offLane, offReqId;
+    uint32_t offSqlLen, offParamsLen, offReqCap, offRingCap;
+    uint32_t offMaxRowsExamined, offMaxBytesRead, offMaxResultRows, offMaxResultBytes;
+    uint32_t offRingHead, offRingTail, offStatus, offErrLen, offRowsOut, offRowsExamined;
+    uint32_t offBytesRead, offIndexEntries, offFenceReads, offSubmitNs, offStartNs, offEndNs, offErr;
+    uint32_t queueCells;
+    uint32_t queueMask;
+    uint32_t queueEnq;
+    uint32_t queueDeq;
+    uint32_t stopWord;
+    uint32_t laneDoorbell[64];
+    uint32_t laneState[64];
+    uint32_t laneAnnounce[64];
+} FlatsqlPsReaderLayout;
 
 /* Layout block written by flatsql_ps_layout (all u32: addresses/offsets). */
 typedef struct FlatsqlPsLayout {
@@ -63,6 +109,8 @@ int32_t flatsql_ps_stop(double deadlineMs);
 FLATSQL_PS_EXPORT("flatsql_ps_stats")
 int32_t flatsql_ps_stats(uint8_t* out, int32_t len);
 /* Control calls. */
+FLATSQL_PS_EXPORT("flatsql_ps_reader_layout")
+int32_t flatsql_ps_reader_layout(FlatsqlPsReaderLayout* out);
 FLATSQL_PS_EXPORT("flatsql_ps_register_type")
 int32_t flatsql_ps_register_type(const uint8_t* cfg, int32_t cfgLen);
 /* Returns the pid (> 0) or a negative status. */

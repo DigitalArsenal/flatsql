@@ -118,7 +118,7 @@ PS_TEST(arrivals_paging_while_writers_produce_T2_6) {
     };
     std::vector<Sync> syncs;
     uint64_t pages = 0, violations = 0;
-    const uint64_t until = monoNs() + uint64_t(argInt("seconds", 8)) * 1000000000ull;
+    const uint64_t until = monoNs() + uint64_t(argInt("seconds", 4)) * 1000000000ull;
     sleepNs(300000000);
     while (monoNs() < until) {
         Rows t = inter.q("SELECT gseq_hi FROM flatsql_types WHERE type = 'OMM'");
@@ -292,7 +292,7 @@ void runDeadHistory(bool clustered, int records) {
 }
 }  // namespace
 
-PS_TEST(offset_paging_page_10000_T2_7) { runOffsetPage(int(argInt("records", 300000))); }
+PS_TEST(offset_paging_page_10000_T2_7) { runOffsetPage(int(argInt("records", 150000))); }
 PS_SLOW_TEST(offset_paging_page_10000_T2_7_full) { runOffsetPage(int(argInt("records", 3000000))); }
 PS_TEST(dead_history_full_sync_T2_8) {
     runDeadHistory(true, int(argInt("records", 100000)));

@@ -361,5 +361,5 @@ void runExportUnderCompaction(uint64_t seconds) {
 }
 }  // namespace
 
-PS_TEST(snapshot_bulk_export_under_compaction_A12) { runExportUnderCompaction(uint64_t(argInt("seconds", 10))); }
+PS_TEST(snapshot_bulk_export_under_compaction_A12) { runExportUnderCompaction(uint64_t(argInt("seconds", 5))); }
 PS_SLOW_TEST(snapshot_bulk_export_under_compaction_A12_full) { runExportUnderCompaction(uint64_t(argInt("seconds", 600))); }

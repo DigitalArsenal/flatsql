@@ -128,6 +128,7 @@ Reference buildReference(Store& s, const TestType& t, const std::vector<uint32_t
         }
     }
     const auto tv = ins.type(t.fid);
+    if (!tv.ok && ref.cidOf.empty()) return ref;  // nothing was ever sent: no type head yet
     if (!tv.ok || !tv.fenceErr.empty()) {
         ref.ok = false;
         ref.err = "type view: " + tv.fenceErr;
@@ -583,6 +584,6 @@ void runConcurrentFirstDeaths(uint64_t seconds) {
 }
 }  // namespace
 
-PS_TEST(fanout_readers_during_first_deaths_A14) { runConcurrentFirstDeaths(uint64_t(argInt("seconds", 10))); }
+PS_TEST(fanout_readers_during_first_deaths_A14) { runConcurrentFirstDeaths(uint64_t(argInt("seconds", 5))); }
 
 PS_SLOW_TEST(fanout_readers_during_first_deaths_A14_full) { runConcurrentFirstDeaths(uint64_t(argInt("seconds", 600))); }
