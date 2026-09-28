@@ -858,6 +858,11 @@ int32_t Engine::openPartitions(std::string* err) {
                     p->lanes.push_back(std::move(l));
                 }
             } else if (h.lanesOverflowOff) {
+                // The head written after this open points at the same table
+                // unless a batch carries a new one (a MERGE_DONE, SEAL or SWAP
+                // batch has no lane deltas and writes none).
+                p->lanesOverflowSeg = h.lanesOverflowSeg;
+                p->lanesOverflowOff = h.lanesOverflowOff;
                 PathBuf mp;
                 pathPartitionSeg(&mp, cfg_.root.c_str(), p->pid, 'm', h.lanesOverflowSeg, "fsl");
                 FileRef mf;

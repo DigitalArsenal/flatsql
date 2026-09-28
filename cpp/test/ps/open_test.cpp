@@ -224,3 +224,38 @@ PS_TEST(open_refuses_store_without_migrated_marker) {
     CHECK_EQ(s.open(&err), int32_t(FLATSQL_IO_ERR_ACCESS));
     CHECK(err.find("MIGRATED") != std::string::npos);
 }
+
+// A partition with more than 32 live lanes keeps its lane table after an
+// open whose first head comes from a batch without lane deltas (MERGE_DONE):
+// the head must still point at the LANE_CKPT record (found by T4 under the
+// Node host: "lane checkpoint out of bounds (seg 0 off 0 ...)").
+PS_TEST(open_lane_checkpoint_pointer_survives_merge_after_open) {
+    Store s(true, 1, true);
+    s.cfg.mergeL0Blocks = 1000;  // no merges in the first session
+    s.cfg.mergeMinL0Bytes = 0;
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const uint32_t pid = s.partition("lanes", ommType());
+    {
+        Producer p(s.e.get(), pid);
+        for (int i = 0; i < 400; i++) {
+            const uint64_t r = send(s.e.get(), p, ommRecord(uint32_t(90000 + i), "L", "2026-09-01T00:00:00Z", 15.0),
+                                    buildRecordAttr("peer", "prov", "src" + std::to_string(i % 40), "b"), i);
+            if (i % 20 == 19) REQUIRE(p.waitAcked(r, 10000000000ull) == 0);  // many L0 blocks
+        }
+    }
+    s.close();
+    s.cfg.mergeL0Blocks = 2;  // the next open merges at once: MERGE_DONE carries no lane deltas
+    REQUIRE(s.open() == 0);
+    for (int i = 0; i < 200 && s.e->partition(pid)->nL0 > 1; i++) sleepNs(10000000);
+    s.close();
+    REQUIRE(s.open() == 0);
+    s.close();
+    Inspector ins(s.fs.get(), s.root);
+    PartView v = ins.partition(pid);
+    if (!v.ok || !v.err.empty()) std::fprintf(stderr, "  inspector: %s\n", v.err.c_str());
+    CHECK(v.ok && v.err.empty());
+    size_t live = 0;
+    for (const auto& l : v.lanes) live += l.count ? 1 : 0;
+    CHECK_EQ(live, size_t(40));
+}
