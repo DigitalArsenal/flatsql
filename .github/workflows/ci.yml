@@ -141,6 +141,8 @@ jobs:
     - name: Deterministic parity under the SDK WasmEdge C runner
       env:
         FLATSQL_PS_WASMEDGE: '1'
+        # The SDK compiles its runner with clang-only warning flags.
+        CC: clang
       run: >
         node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand
         --runTestsByPath test/ps-parity-vectors.test.ts -t 'C runner'
