@@ -332,6 +332,9 @@ int32_t Engine::open(const EngineConfig& cfgIn, std::unique_ptr<Engine>* out, st
     e->journalMeta_.clear();
     rc = e->writeOpenTypeHeads(err);
     if (rc < 0) return rc;
+    // T3: the planner's state and the ballast (A13).
+    rc = engineOpenQuota(e.get(), e->openIo_, err);
+    if (rc < 0) return rc;
     // New incarnation: strictly above every incarnation any batch carries.
     uint32_t inc = e->registry_.incarnation();
     for (const auto& p : e->partStore_)

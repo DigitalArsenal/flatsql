@@ -576,3 +576,58 @@ PS_TEST(format_extraction_golden_vectors_A19) {
     }
     report("golden_records", double(total), "records");
 }
+
+// RecordAttr bytes are deterministic (22.3a-6: golden vectors shared by Go
+// and TS). The builder creates each string in field order; a nested
+// CreateString argument list once made GCC on x86_64 and clang disagree.
+// --regen-record-attr=1 rewrites vectors/record_attr.hex.
+PS_TEST(format_record_attr_golden_bytes) {
+    struct Case {
+        const char* name;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<Case> cases;
+    cases.push_back({"full", buildRecordAttr("12D3KooWPeer", "provider-a", "source-b", "batch-c", "content-d",
+                                             "12D3KooWProducer", "producer-key-e", "src:source-b\x00key-f",
+                                             1780000000123ll, "licence-g")});
+    cases.push_back({"tag_partial", buildRecordAttr("peer", "prov", "", "b1")});
+    cases.push_back({"no_tag", buildRecordAttr("peer-only", "", "", "")});
+    // Determinism within a build: the same inputs give the same bytes.
+    CHECK(buildRecordAttr("peer", "prov", "", "b1") == cases[1].bytes);
+    auto hex = [](const std::vector<uint8_t>& b) {
+        static const char* d = "0123456789abcdef";
+        std::string s;
+        for (uint8_t x : b) {
+            s += d[x >> 4];
+            s += d[x & 15];
+        }
+        return s;
+    };
+    const std::string path = std::string(PS_VECTOR_DIR) + "/record_attr.hex";
+    if (argInt("regen-record-attr", 0)) {
+        FILE* f = std::fopen(path.c_str(), "w");
+        REQUIRE(f);
+        std::fprintf(f, "# RecordAttr golden bytes (flatsql_attr.fbs), one case per line: <name> <hex>\n");
+        for (const auto& c : cases) std::fprintf(f, "%s %s\n", c.name, hex(c.bytes).c_str());
+        std::fclose(f);
+    }
+    const std::vector<uint8_t> file = readVectorFile("record_attr.hex");
+    REQUIRE(!file.empty());
+    std::map<std::string, std::string> golden;
+    std::string text(file.begin(), file.end());
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t nl = text.find('\n', at);
+        if (nl == std::string::npos) nl = text.size();
+        const std::string line = text.substr(at, nl - at);
+        at = nl + 1;
+        if (line.empty() || line[0] == '#') continue;
+        const size_t sp = line.find(' ');
+        if (sp != std::string::npos) golden[line.substr(0, sp)] = line.substr(sp + 1);
+    }
+    for (const auto& c : cases) {
+        const std::string got = hex(c.bytes);
+        if (golden[c.name] != got) std::fprintf(stderr, "  record_attr %s: %s\n", c.name, got.c_str());
+        CHECK(golden[c.name] == got);
+    }
+}

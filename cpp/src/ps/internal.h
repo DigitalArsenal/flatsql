@@ -300,6 +300,13 @@ int32_t partitionOpenReclaim(IoCtx* io, const char* root, Partition* p, const st
                              uint32_t* unlinked);
 int32_t partitionOpenLedger(IoCtx* io, const char* root, Partition* p);
 
+// ---- quota (quota.cpp), T3 ------------------------------------------------------
+uint64_t segmentDiskBytes(const Partition* p, const SegmentInfo& s);
+void partitionPublishSummary(Partition* p);        // owner: sealed segments for the planner
+int32_t engineOpenQuota(Engine* e, IoCtx* io, std::string* err);  // ballast
+void quotaStep(Writer* w);                         // writer 0's maintenance
+void quotaClose(Engine* e, IoCtx* io);
+
 // ---- type owner (type_owner.cpp) ---------------------------------------------
 bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* batches);
 void typePublish(Writer* w, TypeOwner* t, StagedType* st);

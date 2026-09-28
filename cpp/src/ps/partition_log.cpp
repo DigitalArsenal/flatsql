@@ -1723,8 +1723,14 @@ void tombRangeStep(Ctx& c) {
             }
         }
     }
-    const uint32_t step = c.e->config().reconcileStep;
+    const uint32_t step = c.e->config().tombRangeStep ? c.e->config().tombRangeStep : c.e->config().reconcileStep;
     const uint32_t rows0 = c.sc->nRows;
+    const uint64_t t0 = monoNs();
+    struct StepTime {
+        Engine* e;
+        uint64_t t0;
+        ~StepTime() { e->evictHist().record(monoNs() - t0); }
+    } stepTime{c.e, t0};
     uint64_t cur = tr.next;
     for (uint32_t examined = 0; cur < tr.end && examined < step; examined++) {
         if (c.sc->nRows + 4 > c.sc->capRows || c.sc->nEntries + 8 > c.sc->capEntries) break;
@@ -1883,7 +1889,10 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
     // T3: a segment of rows without frames (tombstones) seals too, so it can
     // be compacted once its targets are gone.
     if (p->sealPending && (p->dLen > 0 || p->segRecords > 0)) st->sealAfter = true;
-    while (!st->sealAfter && !c.err && pos + sizeof(EntryHeader) <= tail) {
+    // A13: in a space emergency record entries wait (zero credits; nothing
+    // is acked); kills, TOMB_RANGE and maintenance records still commit.
+    const bool noSpace = e->spaceEmergency();
+    while (!noSpace && !st->sealAfter && !c.err && pos + sizeof(EntryHeader) <= tail) {
         if (st->dBytes >= cfg.commitBytes || frames0 >= cfg.commitFrames) break;
         if (p->nL0 >= kMaxL0Dir - 1) break;  // wait for a merge (type labeling lags)
         if (nRej >= rejRoom) break;
@@ -2129,12 +2138,19 @@ int32_t partitionWriteHead(Writer* w, Partition* p, bool durable) {
     uint32_t used;
     encodePartitionHead(p, slot, &used, durable);
     const uint64_t at = (p->headGen % 2) * kHeadSlotBytes;
+    // Whole slots until the file holds both: the head never grows after
+    // that (a full disk cannot fail a head write, A13).
+    if (at + kHeadSlotBytes > p->hExtent) {
+        std::memset(slot + used, 0, kHeadSlotBytes - used);
+        used = kHeadSlotBytes;
+    }
     if (at + used > p->hExtent) {
         // The head file grows with this write: disk_bytes includes it (§13).
         p->hExtent = at + used;
         partitionPublishDisk(p);
-        encodePartitionHead(p, slot, &used, durable);
-        if (at + used > p->hExtent) p->hExtent = at + used;
+        uint32_t u2;
+        encodePartitionHead(p, slot, &u2, durable);
+        std::memset(slot + u2, 0, kHeadSlotBytes - u2);
     }
     int32_t rc = w->io().write(p->h, slot, used, at);
     if (rc < 0) return rc;
@@ -2361,6 +2377,8 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         p->durableCommitSeq.store(p->commitSeq, std::memory_order_release);
         p->durableMEnd.store(p->mEnd, std::memory_order_release);
         partitionPublishDisk(p);
+        if (st->mergeDone || st->swapCommit || st->sealAfter || st->retireSet || st->nUnlinked)
+            partitionPublishSummary(p);  // quota planner input (T3)
     }
     // Acks (§7): every entry consumed by this commit.
     if (st->consumed) {

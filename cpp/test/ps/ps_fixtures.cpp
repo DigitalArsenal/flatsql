@@ -282,6 +282,7 @@ Store::Store(bool tracking, uint32_t writers, bool threads) : fs(new FaultFs(tra
     cfg.arenaBytes = 16ull << 20;
     cfg.zeroFillStep = 64u << 10;
     cfg.reserveBytes = 2ull << 20;
+    cfg.ballastBytes = 0;  // A13 ballast: only the tests that fill the disk want one
 }
 
 int32_t Store::open(std::string* err) {

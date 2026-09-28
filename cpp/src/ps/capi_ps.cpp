@@ -89,13 +89,35 @@ int32_t flatsql_ps_init(int32_t role, const uint8_t* cfg, int32_t cfgLen) {
             case 10: c.zeroFillStep = u64(); break;
             case 11: c.arenaBytes = u64(); break;
             case 12: c.sealBytes = u64(); break;
+            case 13: c.quotaBytes = u64(); break;
+            case 14: c.ballastBytes = u64(); break;
+            case 15: c.reclaimGraceMs = u64(); break;
+            case 16: c.autoCompact = len && v[0]; break;
+            case 17: c.compactThreads = u32(); break;
+            case 18: c.commitJournal = len && v[0]; break;
             default: break;
         }
         off += 6 + int32_t(len);
     }
     if (c.root.empty()) return FLATSQL_IO_ERR_GENERIC;
     std::string err;
-    return Engine::open(c, &instance(), &err);
+    const int32_t rc = Engine::open(c, &instance(), &err);
+    if (rc >= 0 && c.quotaBytes) instance()->setQuota(c.quotaBytes);
+    return rc;
+}
+
+int32_t flatsql_ps_reader_gate(double oldestStartNs) {
+    Engine* e = instance().get();
+    if (!e) return FLATSQL_IO_ERR_BADHANDLE;
+    e->setHostReaderGate(oldestStartNs < 0 ? UINT64_MAX : uint64_t(oldestStartNs));
+    return 0;
+}
+
+int32_t flatsql_ps_set_quota(double bytes) {
+    Engine* e = instance().get();
+    if (!e) return FLATSQL_IO_ERR_BADHANDLE;
+    e->setQuota(bytes > 0 ? uint64_t(bytes) : 0);
+    return 0;
 }
 
 int32_t flatsql_ps_start(void) {

@@ -64,6 +64,11 @@ public:
     void failWrites(const std::string& needle, int count, int32_t code);
     // Latency injection for syncs (ns), e.g. to model a disk.
     void setSyncLatencyNs(uint64_t ns) { syncLatencyNs_ = ns; }
+    // A device of `bytes` (0: unlimited): a write or truncate that would grow
+    // the named files past it fails with NOSPACE and has no effect; unlinks
+    // and truncations give the space back (T3 #6, A13).
+    void setCapacity(uint64_t bytes);
+    uint64_t usedBytes() const { return uint64_t(used_.load()); }
 
     // Test-only introspection.
     bool exists(const std::string& path);
@@ -123,6 +128,10 @@ private:
     std::string failWriteNeedle_;
     std::atomic<int> failWriteCount_{0};
     int32_t failWriteCode_ = FLATSQL_IO_ERR_NOSPACE;
+    std::atomic<uint64_t> capacity_{0};
+    std::atomic<int64_t> used_{0};
+    bool reserveGrowth(int64_t grow);  // false: over capacity (nothing reserved)
+    void recountUsed();                // mu_ held
 };
 
 }  // namespace test

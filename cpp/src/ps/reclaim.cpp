@@ -384,6 +384,7 @@ int32_t partitionOpenLedger(IoCtx* io, const char* root, Partition* p) {
     // Retired files a reader still held at open stay counted until unlinked.
     for (const auto& r : p->retired) ledgerSet(p, r.it);
     partitionPublishDisk(p);
+    partitionPublishSummary(p);
     return 0;
 }
 

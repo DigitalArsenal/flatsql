@@ -5,10 +5,12 @@
 target_sources(flatsql_ps PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ps/compaction.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ps/reclaim.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ps/quota.cpp
 )
 if(TARGET flatsql_ps_test)
     target_sources(flatsql_ps_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/compaction_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/orphan_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/quota_test.cpp
     )
 endif()

@@ -120,6 +120,26 @@ int32_t flatsql_ps_register_partition(const uint8_t* peer, int32_t peerLen, cons
 FLATSQL_PS_EXPORT("flatsql_ps_ring")
 double flatsql_ps_ring(int32_t pid);
 
+/* T3 (A12): the reader gate. The host reads every reader instance's lane
+ * announcements (FlatsqlPsReaderLayout.laneAnnounce: the start, on the
+ * shared monotonic clock, of each lane's oldest running statement; 0 when
+ * idle) and passes the minimum here, or a negative value when no statement
+ * runs. Retired files are unlinked only once it is past their retirement,
+ * checked twice a grace apart. Until the host calls it, no reader is
+ * assumed to share the store. */
+FLATSQL_PS_EXPORT("flatsql_ps_reader_gate")
+int32_t flatsql_ps_reader_gate(double oldestStartNs);
+/* T3 (§13): the store's cap on on-disk bytes (0: none). */
+FLATSQL_PS_EXPORT("flatsql_ps_set_quota")
+int32_t flatsql_ps_set_quota(double bytes);
+
+/* Writer config TLV tags (flatsql_ps_init with the writer role):
+ *   1 root  2 writers u32  3 sync threads u32  4 pool bytes u64  5 slab bytes u32
+ *   6 ring cap u64  7 cooperative u8  8 create u8  9 require MIGRATED u8
+ *  10 zero-fill step u64  11 arena bytes u64  12 seal bytes u64
+ *  T3: 13 quota bytes u64  14 ballast bytes u64  15 reclaim grace ms u64
+ *      16 auto compaction u8  17 compaction threads u32  18 commit journal u8 */
+
 #ifdef __cplusplus
 }
 #endif

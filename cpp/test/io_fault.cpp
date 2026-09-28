@@ -28,6 +28,35 @@ void applyOp(std::vector<uint8_t>& img, const std::vector<uint8_t>& data, uint64
 }
 }  // namespace
 
+bool FaultFs::reserveGrowth(int64_t grow) {
+    if (grow <= 0) {
+        used_.fetch_add(grow);
+        return true;
+    }
+    const int64_t before = used_.fetch_add(grow);
+    const uint64_t cap = capacity_.load();
+    if (cap && uint64_t(before + grow) > cap) {
+        used_.fetch_sub(grow);
+        return false;
+    }
+    return true;
+}
+
+void FaultFs::recountUsed() {
+    int64_t n = 0;
+    for (auto& kv : ns_) {
+        std::lock_guard<std::mutex> fg(kv.second.file->mu);
+        n += int64_t(kv.second.file->cur.size());
+    }
+    used_.store(n);
+}
+
+void FaultFs::setCapacity(uint64_t bytes) {
+    std::lock_guard<std::mutex> g(mu_);
+    recountUsed();
+    capacity_.store(bytes);
+}
+
 bool FaultFs::countOp() {
     const uint64_t n = ops_.fetch_add(1) + 1;
     const uint64_t at = crashAt_.load();
@@ -85,6 +114,10 @@ int32_t FaultFs::open(const char* p, int32_t pathLen, int32_t flags) {
         // fault host takes the strict side so no engine path can depend on it.
         for (size_t i = 0; i < highWater_.load(); i++)
             if (handles_[i].inUse.load() && handles_[i].path == path) return FLATSQL_IO_ERR_BUSY;
+        {
+            std::lock_guard<std::mutex> fg(it->second.file->mu);
+            used_.fetch_sub(int64_t(it->second.file->cur.size()));
+        }
         if (flags & FLATSQL_IO_UNLINK_IF_UNUSED) {
             ns_.erase(it);  // durable (the host fsyncs the parent)
             return 0;
@@ -114,6 +147,7 @@ int32_t FaultFs::open(const char* p, int32_t pathLen, int32_t flags) {
             if (frozen_.load()) return FLATSQL_IO_ERR_IO;
             ops_.fetch_add(1);
             std::lock_guard<std::mutex> fg(file->mu);
+            used_.fetch_sub(int64_t(file->cur.size()));
             file->cur.clear();
             if (tracking_) {
                 Op op;
@@ -151,7 +185,10 @@ int32_t FaultFs::write(int32_t handle, const void* src, int32_t len, double offs
     }
     const uint64_t off = uint64_t(offset);
     std::lock_guard<std::mutex> g(f->mu);
-    if (off + size_t(len) > f->cur.size()) f->cur.resize(size_t(off) + size_t(len), 0);
+    if (off + size_t(len) > f->cur.size()) {
+        if (!reserveGrowth(int64_t(off + size_t(len) - f->cur.size()))) return FLATSQL_IO_ERR_NOSPACE;
+        f->cur.resize(size_t(off) + size_t(len), 0);
+    }
     std::memcpy(f->cur.data() + off, src, size_t(len));
     if (tracking_) {
         Op op;
@@ -171,6 +208,7 @@ int32_t FaultFs::truncate(int32_t handle, double size) {
     if (!f || isDir) return FLATSQL_IO_ERR_BADHANDLE;
     if (!countOp()) return FLATSQL_IO_ERR_IO;
     std::lock_guard<std::mutex> g(f->mu);
+    if (!reserveGrowth(int64_t(size) - int64_t(f->cur.size()))) return FLATSQL_IO_ERR_NOSPACE;
     f->cur.resize(size_t(size), 0);
     if (tracking_) {
         Op op;
@@ -302,6 +340,7 @@ void FaultFs::crash(CrashMode mode, uint64_t seed) {
     }
     for (auto& kv : ns_) kv.second.durableEntry = true;
     unlinked_.clear();
+    recountUsed();
     for (size_t i = 0; i < highWater_.load(); i++) {
         handles_[i].inUse.store(false);
         handles_[i].path.clear();

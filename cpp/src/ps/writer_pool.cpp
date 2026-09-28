@@ -433,6 +433,7 @@ void Writer::commitRound() {
     for (Partition* p : dirty_) {
         Staged* st = p->st;
         if (st->err) {
+            if (st->err == FLATSQL_IO_ERR_NOSPACE) eng_->signalNoSpace();  // A13
             partitionRollback(this, p, st);
             if (!p->quarantined) {
                 // Write errors (ENOSPC): pause the ring briefly; entries retry.
@@ -457,7 +458,10 @@ void Writer::commitRound() {
             st->killsTaken = 0;
             st->rangeStep = false;
             const int32_t hrc = partitionWriteHead(this, p, due);
-            if (hrc < 0) {
+            if (hrc == FLATSQL_IO_ERR_NOSPACE) {
+                // A13: the batch is durable; the next commit writes the head.
+                eng_->signalNoSpace();
+            } else if (hrc < 0) {
                 p->quarantined = true;
                 p->ring->state.store(kRingQuarantined, std::memory_order_release);
             } else if (due) {
@@ -473,7 +477,9 @@ void Writer::commitRound() {
             partitionPublish(this, p, &acks);
             if (st->sealAfter) {
                 const int32_t frc = partitionEnsureFiles(this, p);
-                if (frc < 0) {
+                if (frc == FLATSQL_IO_ERR_NOSPACE) {
+                    eng_->signalNoSpace();  // A13: created before the next staging
+                } else if (frc < 0) {
                     p->quarantined = true;
                     p->ring->state.store(kRingQuarantined, std::memory_order_release);
                 }
@@ -550,6 +556,8 @@ bool Writer::iterate(bool mayWait) {
         }
         if (arena_.remaining() < (1u << 20) || framesArena_.remaining() < eng_->config().maxEntryBytes + 4096)
             break;
+        // A13: segment files a full disk kept from being created after a seal.
+        if ((!p->m.valid() || !p->d.valid()) && partitionEnsureFiles(this, p) < 0) continue;
         if (partitionStage(this, p, sc_, &framesArena_, &arena_)) {
             dirty_.push_back(p);
             any = true;
@@ -762,7 +770,11 @@ void Writer::maintenance() {
             if (rrc < 0) rc = rrc;
         }
         if (rc >= 0) partitionRetireMetaStep(this, p);
-        if (rc < 0) {
+        if (rc == FLATSQL_IO_ERR_NOSPACE) {
+            // A13: a merge or compaction that found no room is abandoned and
+            // retried; the engine frees space first.
+            eng_->signalNoSpace();
+        } else if (rc < 0) {
             p->quarantined = true;
             p->ring->state.store(kRingQuarantined, std::memory_order_release);
         } else if (rc > 0) {
@@ -771,6 +783,7 @@ void Writer::maintenance() {
     }
     maintRr_++;
     for (TypeOwner* t : types_) typeMergeStep(this, t);
+    if (id_ == 0) quotaStep(this);  // §13: the planner runs on writer 0
     // Checkpoint heads waiting for a round that is not coming: sync now.
     if (!headSyncs_.empty() && nowNsV - lastCommitNs_ > 2000000ull) flushHeadSyncs();
     for (Partition* p : owned_) {
@@ -909,7 +922,11 @@ void Engine::setReaderGate(uint64_t (*fn)(void*), void* ctx) {
 
 uint64_t Engine::readerGateNs() const {
     uint64_t (*fn)(void*) = readerGate_.load(std::memory_order_acquire);
-    if (!fn) return UINT64_MAX;
+    if (!fn) {
+        if (!hostGateSet_.load(std::memory_order_acquire)) return UINT64_MAX;
+        const uint64_t v = hostGate_.load(std::memory_order_acquire);
+        return v == UINT64_MAX ? monoNs() : v;
+    }
     const uint64_t v = fn(readerGateCtx_.load(std::memory_order_acquire));
     // Nothing running: every retirement so far is past the gate.
     return v == UINT64_MAX ? monoNs() : v;
@@ -1059,6 +1076,7 @@ int32_t Engine::stop(uint64_t deadlineMs) {
             partitionMergeAbort(w.get(), p);
             partitionCompactAbort(w.get(), p);
         }
+    if (!writers_.empty()) quotaClose(this, &writers_[0]->io());
     // Clean shutdown: durable heads, so the next open reads no tail.
     for (auto& w : writers_) w->flushHeadSyncs();
     for (auto& w : writers_) {
@@ -1509,9 +1527,17 @@ std::vector<uint8_t> buildRecordAttr(const std::string& peerId, const std::strin
     const bool hasTag = !provider.empty() || !source.empty() || !batch.empty() || !producerPeer.empty() ||
                         !producerKey.empty() || !contentKey.empty();
     if (hasTag) {
-        auto tag = fb::CreateSourceTag(b, b.CreateString(provider), b.CreateString(source), 0,
-                                       b.CreateString(batch), b.CreateString(contentKey),
-                                       b.CreateString(producerPeer), b.CreateString(producerKey));
+        // One CreateString per statement, in field order: argument evaluation
+        // order is unspecified in C++ (GCC on x86_64 builds nested calls in the
+        // opposite order from clang), and the bytes must not depend on it
+        // (22.3a-6 golden vectors).
+        const auto providerS = b.CreateString(provider);
+        const auto sourceS = b.CreateString(source);
+        const auto batchS = b.CreateString(batch);
+        const auto contentKeyS = b.CreateString(contentKey);
+        const auto producerPeerS = b.CreateString(producerPeer);
+        const auto producerKeyS = b.CreateString(producerKey);
+        const auto tag = fb::CreateSourceTag(b, providerS, sourceS, 0, batchS, contentKeyS, producerPeerS, producerKeyS);
         tags = b.CreateVector(&tag, 1);
     }
     auto peer = b.CreateVector(reinterpret_cast<const uint8_t*>(peerId.data()), peerId.size());

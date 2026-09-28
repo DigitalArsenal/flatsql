@@ -31,6 +31,7 @@
 #include "flatsql/ps/format.h"
 #include "flatsql/ps/index.h"
 #include "flatsql/ps/io.h"
+#include "flatsql/ps/quota.h"
 #include "flatsql/ps/registry.h"
 #include "flatsql/ps/ring.h"
 
@@ -44,6 +45,7 @@ struct Staged;
 struct StagedType;
 struct StageScratch;
 struct CompactPlan;
+struct QuotaState;
 
 // ---- configuration -----------------------------------------------------------
 struct EngineConfig {
@@ -106,6 +108,11 @@ struct EngineConfig {
     uint64_t reclaimGraceMs = 60000;       // A12: two reader-gate checks this far apart
     uint32_t reclaimBatch = 64;            // unlinks per maintenance step
     bool retireMeta = true;                // A9: retire merged sealed m-<seg>
+    uint64_t quotaBytes = 0;               // §13: cap on the store's on-disk bytes (0: none)
+    double quotaLowWater = 0.85;           // §22.4-3: evict down to this share of the cap
+    uint32_t quotaIntervalMs = 100;        // planner cadence
+    uint32_t tombRangeStep = 512;          // rows examined per TOMB_RANGE step (each <= 10 ms, T3 #3)
+    uint64_t ballastBytes = 0;             // A13: released on ENOSPC (servers: 256 MiB; 0: none)
     Io* io = nullptr;               // default: the seven imports
     int64_t (*clockMs)(void*) = nullptr;  // injectable wall clock
     void* clockCtx = nullptr;
@@ -467,6 +474,10 @@ struct Partition {
     uint64_t pendingDurableHeadNs = 0;   // write time of the last DURABLE_CKPT head written
     bool forceLaneCkpt = false;          // A9: re-emit the lane table before retiring its m
     uint64_t lastCompactCheckNs = 0;
+    // T3 quota: sealed segments as last published (planner input).
+    std::mutex sumMu;                    // maintenance only (never a record path)
+    std::vector<SegSummary> summary;
+    std::atomic<uint64_t> retiredBytesPub{0};  // retired, waiting to be unlinked
     // Memory accounting published for stats() (owner writes, anyone reads).
     std::atomic<uint64_t> accelBytes{0};
     std::atomic<uint32_t> laneCount{0};
@@ -869,6 +880,12 @@ public:
     // are unlinked only once it is past t, checked twice a grace apart. Not
     // set: no reader shares the store (unit tests).
     void setReaderGate(uint64_t (*fn)(void*), void* ctx);
+    // The same gate as a value the host refreshes (C ABI flatsql_ps_reader_gate:
+    // the reader instances are other wasm instances). UINT64_MAX: none running.
+    void setHostReaderGate(uint64_t oldestStartNs) {
+        hostGate_.store(oldestStartNs, std::memory_order_release);
+        hostGateSet_.store(true, std::memory_order_release);
+    }
     uint64_t readerGateNs() const;
     // Disk bytes of a partition as its owner last published them (§13).
     uint64_t partitionDiskBytes(uint32_t pid) const;
@@ -876,6 +893,17 @@ public:
     uint64_t journalSafeNs() const;
     // Compaction builds run on their own threads.
     void submitCompaction(std::function<void(IoCtx*)> job);
+    // Quota (§13, §22.4-3) and the space emergency (A13).
+    void setQuota(uint64_t bytes) { quotaCap_.store(bytes, std::memory_order_release); }
+    uint64_t quotaCap() const { return quotaCap_.load(std::memory_order_acquire); }
+    void signalNoSpace();                  // a commit hit ENOSPC
+    bool spaceEmergency() const { return emergency_.load(std::memory_order_acquire); }
+    QuotaStats quotaStats() const;
+    QuotaState* quotaState() { return quota_.get(); }
+    void quotaAttach(std::shared_ptr<QuotaState> q) { quota_ = std::move(q); }
+    uint32_t maxPid() const { return maxPidPub_.load(std::memory_order_acquire); }
+    void setSpaceEmergency(bool on) { emergency_.store(on, std::memory_order_release); }
+    LockHist& evictHist() { return evictHist_; }  // TOMB_RANGE step durations
 
     // Doorbell for a partition's owner (and HANDOFF target, A24).
     void ringOwner(uint32_t pid);
@@ -1006,6 +1034,12 @@ private:
     bool compactStop_ = false;
     void stopCompactThreads();
     std::atomic<uint64_t (*)(void*)> readerGate_{nullptr};
+    std::atomic<uint64_t> quotaCap_{0};
+    std::atomic<uint64_t> hostGate_{UINT64_MAX};
+    std::atomic<bool> hostGateSet_{false};
+    std::atomic<bool> emergency_{false};
+    std::shared_ptr<QuotaState> quota_;
+    LockHist evictHist_;
     std::atomic<void*> readerGateCtx_{nullptr};
     std::mutex helperMu_;               // maintenance queue (never on a record path)
     std::condition_variable helperCv_;
