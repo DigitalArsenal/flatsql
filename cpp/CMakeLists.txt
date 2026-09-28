@@ -772,14 +772,40 @@ else()
         src/ps/writer_pool.cpp
         src/ps/open.cpp
         src/ps/capi_ps.cpp
+        src/ps/lane_arena.cpp
+        src/ps/snapshot.cpp
+        src/ps/result_block.cpp
+        src/ps/vtab_partition.cpp
+        src/ps/vtab_fanout.cpp
+        src/ps/vtab_meta.cpp
+        src/ps/admission.cpp
+        src/ps/lane.cpp
         ${FLATBUFFERS_SRC_DIR}/reflection.cpp
     )
+    # Reader lanes (T2): SQLite is only the per-lane in-memory SQL layer
+    # (ruling 1): multi-thread mode, no memory statistics, no WAL, temp
+    # storage in memory; allocation goes through the per-lane arenas.
+    add_library(sqlite3_ps STATIC ${SQLITE_DIR}/sqlite3.c)
+    target_include_directories(sqlite3_ps PUBLIC ${SQLITE_DIR})
+    target_compile_definitions(sqlite3_ps PRIVATE
+        SQLITE_THREADSAFE=2
+        SQLITE_DEFAULT_MEMSTATUS=0
+        SQLITE_OMIT_WAL=1
+        SQLITE_TEMP_STORE=3
+        SQLITE_OMIT_LOAD_EXTENSION=1
+        SQLITE_OMIT_DEPRECATED=1
+        SQLITE_OMIT_SHARED_CACHE=1
+        SQLITE_DQS=0
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(sqlite3_ps PRIVATE -w)
+    endif()
     add_library(flatsql_ps STATIC ${FLATSQL_PS_SOURCES} src/flatsql_io_native.cpp)
     target_include_directories(flatsql_ps PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${FLATBUFFERS_INCLUDE_DIR}
     )
-    target_link_libraries(flatsql_ps PUBLIC Threads::Threads)
+    target_link_libraries(flatsql_ps PUBLIC sqlite3_ps Threads::Threads)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(flatsql_ps PRIVATE -Wall -Wextra -Wno-unused-parameter)
     endif()

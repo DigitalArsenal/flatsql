@@ -33,16 +33,16 @@ struct sqlite3;
 namespace flatsql {
 namespace ps {
 
-class Lane;
+class ReaderLane;
 
 // Registers the flatsql_ps module on a lane's connection.
-int vtabRegister(sqlite3* db, Lane* lane);
+int vtabRegister(sqlite3* db, ReaderLane* lane);
 // Creates the virtual table for `name` if it names one (see above). Returns
 // 1 when created, 0 when the name is not a store table, < 0 on error.
 // `sandbox`: untrusted statements may not create flatsql_* meta tables.
-int vtabEnsure(Lane* lane, const std::string& name, bool sandbox, std::string* err);
+int vtabEnsure(ReaderLane* lane, const std::string& name, bool sandbox, std::string* err);
 // Whether a table name is part of the public (sandbox) surface.
-bool vtabPublicName(Lane* lane, const std::string& name);
+bool vtabPublicName(ReaderLane* lane, const std::string& name);
 
 }  // namespace ps
 }  // namespace flatsql

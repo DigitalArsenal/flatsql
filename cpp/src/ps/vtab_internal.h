@@ -42,12 +42,6 @@ enum MetaCol : int {
 };
 extern const char* const kMetaColNames[kMcCount];
 
-// New index kind (T2): (floor(epoch_ms/1000) descending, text CID ascending)
-// -> PUT pseq; the key is 8 bytes of complemented order-preserving seconds,
-// then the 37-byte A17 CID sort key. An ascending scan is the default order.
-void epochCidKey(int64_t epochMs, const uint8_t cidKey[kCidKeyLen], uint8_t out[8 + kCidKeyLen]);
-void epochCidBound(int64_t epochSec, bool upper, uint8_t out[8]);
-inline int64_t epochSecOf(int64_t ms) { return ms >= 0 ? ms / 1000 : -((-ms + 999) / 1000); }
 
 enum VtabKind : uint8_t { kVkPartition = 1, kVkType = 2, kVkAlias = 3, kVkCurrent = 4 };
 
@@ -83,7 +77,7 @@ struct Plan {
 };
 
 struct RecVtab : sqlite3_vtab {
-    Lane* lane = nullptr;
+    ReaderLane* lane = nullptr;
     VtabKind kind = kVkType;
     uint32_t pid = 0;                      // kVkPartition
     std::shared_ptr<const TypeInfo> type;  // columns, config
@@ -144,15 +138,15 @@ std::unique_ptr<RowSource> makeCidRowsPartition(const RowFilter& f, const uint8_
 std::unique_ptr<RowSource> makeMerger(std::vector<std::unique_ptr<RowSource>> subs, bool desc, bool dedupeCid,
                                       size_t groupPrefixTrim);
 std::unique_ptr<RowSource> makeConcat(std::vector<std::unique_ptr<RowSource>> subs);
-std::unique_ptr<RowSource> makeArrivalRows(Lane* lane, StmtCtx* stmt, TypeSnap* type, uint64_t lo, uint64_t hi,
+std::unique_ptr<RowSource> makeArrivalRows(ReaderLane* lane, StmtCtx* stmt, TypeSnap* type, uint64_t lo, uint64_t hi,
                                            bool desc, const std::string& source, bool hasSource,
                                            uint32_t onlyPid);
-std::unique_ptr<RowSource> makeCidRowsType(Lane* lane, StmtCtx* stmt, TypeSnap* type, const TypeInfo* ti,
+std::unique_ptr<RowSource> makeCidRowsType(ReaderLane* lane, StmtCtx* stmt, TypeSnap* type, const TypeInfo* ti,
                                            const uint8_t cid[kCidLen], const std::string& source, bool hasSource,
                                            uint64_t gseqFloor);
 
 // Sandbox window floor (A18): the gseq of the arrivals entry N from the tail.
-int32_t windowFloor(Lane* lane, StmtCtx* stmt, TypeSnap* type, uint64_t n, uint64_t* floor);
+int32_t windowFloor(ReaderLane* lane, StmtCtx* stmt, TypeSnap* type, uint64_t n, uint64_t* floor);
 
 // Cooperative poll every 4 K steps (A21/A28).
 inline int32_t pollEvery(LaneStore* st, uint32_t* counter) {

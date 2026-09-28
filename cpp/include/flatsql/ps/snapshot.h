@@ -323,7 +323,7 @@ public:
     std::shared_ptr<const RegistryView> registry() const { return reg_; }
 
     // §8 step 3: head (valid slot, highest gen) + manifest.
-    int32_t loadPart(uint32_t pid, PartSnap* out);
+    int32_t loadPart(uint32_t pid, PartSnap* out, bool withManifest = true);
     // §8 step 4 (taken before the partitions it bounds).
     int32_t loadType(const uint8_t fid[4], TypeSnap* out);
 
@@ -388,11 +388,13 @@ public:
     std::shared_ptr<const L0Parsed> l0Block(uint32_t pid, uint32_t mSeg, uint64_t off, uint32_t len,
                                             int32_t* rc);
     std::shared_ptr<const L0Parsed> typeL0Block(const uint8_t fid[4], const TypeL0DirEntry& e, int32_t* rc);
-    std::shared_ptr<const L1Run> run(uint32_t pid, uint32_t seg, uint32_t gen, uint64_t fileLen, FileRef* file,
+    // Sources keep file KEYS, never handles: a handle may be evicted and its
+    // number reused between two reads; a key is reopened by name.
+    std::shared_ptr<const L1Run> run(uint32_t pid, uint32_t seg, uint32_t gen, uint64_t fileLen, FileKey* key,
                                      int32_t* rc);
-    std::shared_ptr<const L1Run> typeRun(const uint8_t fid[4], uint32_t gen, uint64_t fileLen, FileRef* file,
+    std::shared_ptr<const L1Run> typeRun(const uint8_t fid[4], uint32_t gen, uint64_t fileLen, FileKey* key,
                                          int32_t* rc);
-    int32_t readBlock(const FileRef& f, uint64_t off, uint8_t* dst);  // one 4 KiB L1 block
+    int32_t readBlock(const FileKey& key, uint64_t off, uint8_t* dst);  // one 4 KiB L1 block
 
 private:
     int32_t readHead(const FileKey& key, uint16_t kind, std::vector<uint8_t>* slot, bool* missing);

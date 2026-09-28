@@ -91,6 +91,8 @@ enum IndexKind : uint16_t {
     kIxLicence = 17,       // licence key -> LICENCE pseq
     kIxTagDead = 18,       // u64 tag-instance pseq -> TAG_TOMB pseq (A2; distinct
                            // from DEAD: a PUT row is also its first instance)
+    kIxEpochCid = 19,      // (complemented floor(epoch_ms/1000), A17 cid key) -> PUT pseq:
+                           // ascending = the A19 default order (seconds DESC, CID ASC)
     kIxColBase = 0x100,    // COL(n) = kIxColBase + n
     // Type-owner kinds (t/<fid>/): value layouts in type_owner.h.
     kIxTypeCid = 0x200,    // cid sort key -> {pid, pseq, tcs, label, gseq}
@@ -108,7 +110,21 @@ enum KeyType : uint8_t {
     kKeyCid = 5,
     kKeyU32U64 = 6,
     kKeyU64U64 = 7,
+    kKeyEpochCid = 8,
 };
+
+// kIxEpochCid key: 8 bytes ~(floor(epoch_ms / 1000) ^ sign) big-endian, then
+// the 37-byte CID sort key (A17), so an ascending scan is seconds descending,
+// text CID ascending (A19's default order), and copies of one CID are adjacent.
+constexpr uint32_t kEpochCidKeyLen = 8 + kCidKeyLen;
+inline int64_t epochSecFloor(int64_t ms) { return ms >= 0 ? ms / 1000 : -((-ms + 999) / 1000); }
+inline void encEpochSecDesc(uint8_t out[8], int64_t sec) {
+    uint64_t v = ~(uint64_t(sec) ^ 0x8000000000000000ull);
+    for (int i = 7; i >= 0; i--) {
+        out[i] = uint8_t(v);
+        v >>= 8;
+    }
+}
 
 // ---- ctl records inside a meta batch ---------------------------------------
 enum CtlKind : uint16_t {

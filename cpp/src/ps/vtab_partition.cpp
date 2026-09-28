@@ -27,16 +27,6 @@ static const char* kMetaColTypes[kMcCount] = {"INTEGER", "TEXT",    "BLOB",    "
                                                "TEXT",    "BLOB",    "BLOB",    "BLOB",    "INTEGER",
                                                "INTEGER", "INTEGER", "INTEGER", "INTEGER"};
 
-void epochCidKey(int64_t epochMs, const uint8_t cidKey[kCidKeyLen], uint8_t out[8 + kCidKeyLen]) {
-    epochCidBound(epochSecOf(epochMs), false, out);
-    std::memcpy(out + 8, cidKey, kCidKeyLen);
-}
-
-void epochCidBound(int64_t epochSec, bool, uint8_t out[8]) {
-    // Complemented order-preserving seconds: ascending keys = descending time.
-    putBE64(out, ~(uint64_t(epochSec) ^ 0x8000000000000000ull));
-}
-
 // ---------------------------------------------------------------------------
 // Plans
 // ---------------------------------------------------------------------------
@@ -375,7 +365,7 @@ void mapColumns(RecVtab* vt) {
 }
 
 int recConnect(sqlite3* db, void* aux, int argc, const char* const* argv, sqlite3_vtab** out, char** err) {
-    Lane* lane = static_cast<Lane*>(aux);
+    ReaderLane* lane = static_cast<ReaderLane*>(aux);
     if (argc < 4) {
         *err = sqlite3_mprintf("flatsql_ps: missing argument");
         return SQLITE_ERROR;
@@ -678,7 +668,13 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
                 p.hiOp = uint8_t(info->aConstraint[epochHi].op);
             }
         }
-        p.desc = ord == kOrdEpochAsc;  // EPOCH_CID ascending = time descending
+        if (ord == kOrdEpochDesc || ord == kOrdEpochAsc) {
+            p.tagKind = 1;  // EPOCH (ms) index: exact _epoch order
+            p.desc = ord == kOrdEpochDesc;
+        } else {
+            p.tagKind = 0;  // EPOCH_CID: the default order (A19), ascending scan
+            p.desc = false;
+        }
         p.orderConsumed = ord == kOrdEpochDesc || ord == kOrdEpochAsc || ord == kOrdNone;
         const bool closed = p.aLo >= 0 && p.aHi >= 0;
         p.bounded = closed || limitC >= 0;
@@ -1028,6 +1024,7 @@ sqlite3_module gRecModule = {
     nullptr,  // xRename
     nullptr, nullptr, nullptr,  // xSavepoint, xRelease, xRollbackTo
     nullptr,  // xShadowName
+    nullptr,  // xIntegrity
 };
 
 // ---- building the row sources -----------------------------------------------------
@@ -1049,14 +1046,14 @@ bool cidArg(sqlite3_value* v, uint8_t cid[kCidLen]) {
 }  // namespace
 
 // Implemented in vtab_fanout.cpp for type-level plans.
-int32_t buildTypeSources(Lane* lane, StmtCtx* stmt, RecVtab* vt, const Plan& p, sqlite3_value** argv,
+int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Plan& p, sqlite3_value** argv,
                          std::unique_ptr<RowSource>* out);
 
 namespace {
 
 int32_t buildSources(RecCursor* c, sqlite3_value** argv, int argc) {
     RecVtab* vt = c->vt;
-    Lane* lane = vt->lane;
+    ReaderLane* lane = vt->lane;
     const Plan& p = c->plan;
     (void)argc;
     if (vt->kind != kVkPartition) return buildTypeSources(lane, c->stmt, vt, p, argv, &c->src);
@@ -1109,10 +1106,10 @@ int32_t buildSources(RecCursor* c, sqlite3_value** argv, int argc) {
 // ---------------------------------------------------------------------------
 // Registration and lazy creation
 // ---------------------------------------------------------------------------
-int registerMetaModule(sqlite3* db, Lane* lane);  // vtab_meta.cpp
-int metaEnsure(Lane* lane, const std::string& name, std::string* err);
+int registerMetaModule(sqlite3* db, ReaderLane* lane);  // vtab_meta.cpp
+int metaEnsure(ReaderLane* lane, const std::string& name, std::string* err);
 
-int vtabRegister(sqlite3* db, Lane* lane) {
+int vtabRegister(sqlite3* db, ReaderLane* lane) {
     int rc = sqlite3_create_module_v2(db, "flatsql_ps", &gRecModule, lane, nullptr);
     if (rc != SQLITE_OK) return rc;
     return registerMetaModule(db, lane);
@@ -1143,7 +1140,7 @@ std::string quoteLit(const std::string& s) {
 }
 }  // namespace
 
-bool vtabPublicName(Lane* lane, const std::string& name) {
+bool vtabPublicName(ReaderLane* lane, const std::string& name) {
     if (istarts(name, "flatsql_") || istarts(name, "sqlite_")) return false;
     const auto& allowed = lane->config().sandboxAllowed;
     if (!allowed.empty()) {
@@ -1159,7 +1156,7 @@ bool vtabPublicName(Lane* lane, const std::string& name) {
     return reg->typeByName(name) != nullptr || reg->partBySqlName(name) != nullptr;
 }
 
-int vtabEnsure(Lane* lane, const std::string& name, bool sandbox, std::string* err) {
+int vtabEnsure(ReaderLane* lane, const std::string& name, bool sandbox, std::string* err) {
     if (istarts(name, "flatsql_")) {
         if (sandbox) return 0;
         return metaEnsure(lane, name, err);
@@ -1193,6 +1190,7 @@ int vtabEnsure(Lane* lane, const std::string& name, bool sandbox, std::string* e
         sqlite3_free(msg);
         return rc == SQLITE_NOMEM ? kRsNoMem : kRsSqlError;
     }
+    lane->noteTable(name);
     return 1;
 }
 

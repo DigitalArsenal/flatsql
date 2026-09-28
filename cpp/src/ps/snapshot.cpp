@@ -378,7 +378,7 @@ struct L0Source : PostingScan::Source {
 // One kind of an L1 run: blocks read on demand (4 KiB each).
 struct L1Source : PostingScan::Source {
     std::shared_ptr<const L1Run> run;
-    FileRef file;
+    FileKey file;
     const std::vector<L1Fence>* fences = nullptr;
     int64_t block = -1;
     int64_t idx = -1;
@@ -419,7 +419,7 @@ struct L1Source : PostingScan::Source {
         done = desc ? beforeLo : pastHi;
         return true;
     }
-    bool init(LaneStore* st, std::shared_ptr<const L1Run> r, FileRef f, uint16_t kind, const std::string& l,
+    bool init(LaneStore* st, std::shared_ptr<const L1Run> r, const FileKey& f, uint16_t kind, const std::string& l,
               bool hl, const std::string& h, bool hh, bool d) {
         run = std::move(r);
         file = f;
@@ -642,7 +642,7 @@ int32_t LaneStore::loadTypeConfig(TypeInfo* t) {
     if (rc < 0) return rc;
     const int64_t size = io_.size(f);
     if (size < 16) return kRsCorrupt;
-    std::vector<uint8_t> buf(size_t(size));
+    std::vector<uint8_t> buf(static_cast<size_t>(size));
     if (io_.read(f, buf.data(), buf.size(), 0) != size) return FLATSQL_IO_ERR_IO;
     if (getU32(buf.data()) != kMagicTypeConfig || getU32(buf.data() + 8) != buf.size() - 16 ||
         crc32c(buf.data() + 16, buf.size() - 16) != getU32(buf.data() + 12))
@@ -776,7 +776,7 @@ int32_t LaneStore::loadManifest(uint32_t pid, uint32_t gen, std::shared_ptr<cons
     if (rc < 0) return rc;
     const int64_t size = io_.size(f);
     if (size < 32) return kRsCorrupt;
-    std::vector<uint8_t> buf(size_t(size));
+    std::vector<uint8_t> buf(static_cast<size_t>(size));
     if (io_.read(f, buf.data(), buf.size(), 0) != size) return FLATSQL_IO_ERR_IO;
     const size_t body = buf.size() - 8;
     if (getU32(buf.data()) != kMagicManifest || crc32c(buf.data(), body) != getU32(buf.data() + body))
@@ -822,7 +822,7 @@ int32_t LaneStore::loadManifest(uint32_t pid, uint32_t gen, std::shared_ptr<cons
     return 0;
 }
 
-int32_t LaneStore::loadPart(uint32_t pid, PartSnap* out) {
+int32_t LaneStore::loadPart(uint32_t pid, PartSnap* out, bool withManifest) {
     *out = PartSnap();
     out->pid = pid;
     if (reg_) {
@@ -852,7 +852,7 @@ int32_t LaneStore::loadPart(uint32_t pid, PartSnap* out) {
     }
     out->empty = false;
     out->visible = h.pseqHi;
-    if (h.manifestGen) {
+    if (h.manifestGen && withManifest) {
         rc = loadManifest(pid, h.manifestGen, &out->manifest);
         if (rc < 0) return rc;
     }
@@ -890,7 +890,7 @@ int32_t LaneStore::laneTuples(const PartSnap& s, std::vector<LaneTuple>* out) {
     if (rc < 0) return rc;
     const int64_t size = io_.size(f);
     if (size <= 0) return 0;
-    std::vector<uint8_t> buf(size_t(size));
+    std::vector<uint8_t> buf(static_cast<size_t>(size));
     if (io_.read(f, buf.data(), buf.size(), 0) != size) return FLATSQL_IO_ERR_IO;
     size_t off = 0;
     while (off + 8 <= buf.size()) {
@@ -1009,7 +1009,7 @@ int32_t LaneStore::loadType(const uint8_t fid[4], TypeSnap* out) {
             if (rc < 0) return rc;
             const int64_t size = io_.size(f);
             if (size < 24) return kRsCorrupt;
-            std::vector<uint8_t> man(size_t(size));
+            std::vector<uint8_t> man(static_cast<size_t>(size));
             if (io_.read(f, man.data(), man.size(), 0) != size) return FLATSQL_IO_ERR_IO;
             if (getU32(man.data()) != kMagicManifest) return kRsCorrupt;
             const uint32_t n = getU32(man.data() + 4);
@@ -1141,7 +1141,10 @@ int32_t LaneStore::readAttr(const PartSnap& s, const RecRow& r, std::vector<uint
     return 0;
 }
 
-int32_t LaneStore::readBlock(const FileRef& f, uint64_t off, uint8_t* dst) {
+int32_t LaneStore::readBlock(const FileKey& key, uint64_t off, uint8_t* dst) {
+    FileRef f;
+    const int32_t rc = io_.get(key, &f);
+    if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
     const int64_t n = io_.read(f, dst, kL1BlockBytes, off);
     if (n != int64_t(kL1BlockBytes)) return n < 0 ? int32_t(n) : kRsCorrupt;
     if (!l1BlockValid(dst)) return kRsCorrupt;
@@ -1214,20 +1217,23 @@ std::shared_ptr<const L0Parsed> LaneStore::typeL0Block(const uint8_t fid[4], con
     return b;
 }
 
-std::shared_ptr<const L1Run> LaneStore::run(uint32_t pid, uint32_t seg, uint32_t gen, uint64_t fileLen, FileRef* file,
+std::shared_ptr<const L1Run> LaneStore::run(uint32_t pid, uint32_t seg, uint32_t gen, uint64_t fileLen, FileKey* keyOut,
                                             int32_t* rc) {
     const FileKey key = pk('x', pid, seg, gen);
-    *rc = io_.get(key, file);
+    *keyOut = key;
+    FileKey ck = key;
+    ck.letter = 'X';
+    *rc = 0;
+    if (auto c = cacheGet(ck)) return std::static_pointer_cast<const L1Run>(c);
+    FileRef file;
+    *rc = io_.get(key, &file);
     if (*rc < 0) {
         if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
         return nullptr;
     }
-    FileKey ck = key;
-    ck.letter = 'X';
-    if (auto c = cacheGet(ck)) return std::static_pointer_cast<const L1Run>(c);
     auto r = std::make_shared<L1Run>();
     const uint64_t before = io_.ioStats().totalReadBytes();
-    if (r->load(&io_.ctx(), *file, fileLen) < 0) {
+    if (r->load(&io_.ctx(), file, fileLen) < 0) {
         *rc = kRsCorrupt;
         return nullptr;
     }
@@ -1240,20 +1246,23 @@ std::shared_ptr<const L1Run> LaneStore::run(uint32_t pid, uint32_t seg, uint32_t
     return r;
 }
 
-std::shared_ptr<const L1Run> LaneStore::typeRun(const uint8_t fid[4], uint32_t gen, uint64_t fileLen, FileRef* file,
+std::shared_ptr<const L1Run> LaneStore::typeRun(const uint8_t fid[4], uint32_t gen, uint64_t fileLen, FileKey* keyOut,
                                                 int32_t* rc) {
     const FileKey key = tk('x', fid, 0, gen);
-    *rc = io_.get(key, file);
+    *keyOut = key;
+    FileKey ck = key;
+    ck.letter = 'X';
+    *rc = 0;
+    if (auto c = cacheGet(ck)) return std::static_pointer_cast<const L1Run>(c);
+    FileRef file;
+    *rc = io_.get(key, &file);
     if (*rc < 0) {
         if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
         return nullptr;
     }
-    FileKey ck = key;
-    ck.letter = 'X';
-    if (auto c = cacheGet(ck)) return std::static_pointer_cast<const L1Run>(c);
     auto r = std::make_shared<L1Run>();
     const uint64_t before = io_.ioStats().totalReadBytes();
-    if (r->load(&io_.ctx(), *file, fileLen) < 0) {
+    if (r->load(&io_.ctx(), file, fileLen) < 0) {
         *rc = kRsCorrupt;
         return nullptr;
     }
@@ -1292,7 +1301,7 @@ PostingScan LaneStore::scan(const PartSnap& s, uint16_t kind, const uint8_t* lo,
     if (s.manifest) {
         for (const ManifestSegRef& m : s.manifest->segs) {
             for (const SegRunRef& rr : m.runs) {
-                FileRef f;
+                FileKey f;
                 int32_t rc = 0;
                 auto run = this->run(s.pid, m.seg, rr.gen, rr.fileLen, &f, &rc);
                 if (!run) {
@@ -1342,7 +1351,7 @@ PostingScan LaneStore::scanType(const TypeSnap& t, uint16_t kind, const uint8_t*
         ps.srcs_.push_back(std::move(src));
     }
     for (const SegRunRef& rr : t.runs) {
-        FileRef f;
+        FileKey f;
         int32_t rc = 0;
         auto run = typeRun(t.fid, rr.gen, rr.fileLen, &f, &rc);
         if (!run) {
@@ -1402,11 +1411,14 @@ int32_t LaneStore::lookup(const PartSnap& s, uint16_t kind, const uint8_t* key, 
     uint8_t scratch[kL1BlockBytes];
     for (const ManifestSegRef& m : s.manifest->segs) {
         for (const SegRunRef& rr : m.runs) {
-            FileRef f;
+            FileKey fk;
             int32_t rc = 0;
-            auto run = this->run(s.pid, m.seg, rr.gen, rr.fileLen, &f, &rc);
+            auto run = this->run(s.pid, m.seg, rr.gen, rr.fileLen, &fk, &rc);
             if (!run) return rc;
             if (!run->mayContainHash(kind, h)) continue;
+            FileRef f;
+            rc = io_.get(fk, &f);
+            if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
             const uint64_t before = io_.ioStats().totalReadBytes();
             bool stop = false;
             const int64_t n = run->lookup(&io_.ctx(), f, kind, key, klen, scratch,
@@ -1433,11 +1445,14 @@ int32_t LaneStore::lookupType(const TypeSnap& t, uint16_t kind, const uint8_t* k
     }
     uint8_t scratch[kL1BlockBytes];
     for (const SegRunRef& rr : t.runs) {
-        FileRef f;
+        FileKey fk;
         int32_t rc = 0;
-        auto run = typeRun(t.fid, rr.gen, rr.fileLen, &f, &rc);
+        auto run = typeRun(t.fid, rr.gen, rr.fileLen, &fk, &rc);
         if (!run) return rc;
         if (!run->mayContainHash(kind, h)) continue;
+        FileRef f;
+        rc = io_.get(fk, &f);
+        if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
         const uint64_t before = io_.ioStats().totalReadBytes();
         bool stop = false;
         const int64_t n = run->lookup(&io_.ctx(), f, kind, key, klen, scratch,

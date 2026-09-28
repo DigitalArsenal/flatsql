@@ -46,6 +46,7 @@ uint8_t keyTypeOf(uint16_t kind) {
         case kIxCid:
         case kIxTypeCid: return kKeyCid;
         case kIxEpoch: return kKeyI64;
+        case kIxEpochCid: return kKeyEpochCid;
         case kIxDead:
         case kIxTagDead:
         case kIxSpatial:

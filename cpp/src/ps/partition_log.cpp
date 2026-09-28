@@ -1172,6 +1172,9 @@ StepResult stageRecord(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* reje
     bool ok = addPseqPosting(c, kIxCid, cidKey, kCidKeyLen, pseq);
     encI64(key, epochMs);
     ok = ok && addPseqPosting(c, kIxEpoch, key, 8, pseq);
+    encEpochSecDesc(key, epochSecFloor(epochMs));
+    std::memcpy(key + 8, cidKey, kCidKeyLen);
+    ok = ok && addPseqPosting(c, kIxEpochCid, key, kEpochCidKeyLen, pseq);
     for (uint32_t ci = 0; ok && ci < cfg->nCols(); ci++) {
         const ColValue& cv = ex.cols[ci];
         if (!cv.present) continue;

@@ -73,6 +73,7 @@ struct ReaderConfig {
     // returns the SandboxCaps `timeout` code), per statement.
     uint64_t sandboxMaxRowsExamined = 1000000;
     uint64_t sandboxMaxBytesRead = 256ull << 20;
+    uint64_t sandboxMaxVmSteps = 200000000;  // CPU work without reads (e.g. recursive CTEs)
     // The public allow-list (A28): record vtab names only; flatsql_* meta
     // vtabs are never public. Empty = every record vtab.
     std::unordered_set<std::string> sandboxAllowed;
@@ -159,16 +160,17 @@ struct StmtCtx {
     int32_t vtabStatus = 0;        // a ReaderStatus raised inside a vtab (reported instead of SQLITE_*)
     std::string vtabMessage;
     bool rowEmitted = false;       // §8.8: re-snapshot only before the first row
+    uint64_t vmSteps = 0;          // sandbox: VM steps (progress handler, 4 K granularity)
     bool sandbox() const { return (flags & kReqSandbox) || cls == LaneClass::Sandbox; }
 };
 
 class ReaderInstance;
 
 // ---- a lane --------------------------------------------------------------------------
-class Lane {
+class ReaderLane {
 public:
-    Lane(ReaderInstance* inst, uint32_t id);
-    ~Lane();
+    ReaderLane(ReaderInstance* inst, uint32_t id);
+    ~ReaderLane();
     uint32_t id() const { return id_; }
     ReaderInstance* instance() const { return inst_; }
     LaneStore& store() { return *store_; }
@@ -185,6 +187,10 @@ public:
     void dropSnapshots(StmtCtx* s);
     uint64_t hotWindow(const std::string& typeName) const;
     LaneArena& arena() { return arena_; }
+    void runThread();
+    // Virtual tables this lane's connection has created (lower case).
+    bool hasTable(const char* name) const;
+    void noteTable(const std::string& name);
 
 private:
     friend class ReaderInstance;
@@ -206,6 +212,13 @@ private:
     sqlite3* db_ = nullptr;
     StmtCtx* cur_ = nullptr;
     std::vector<std::unique_ptr<Active>> active_;
+    std::unordered_set<std::string> tables_;
+    std::vector<std::shared_ptr<PartSnap>> retired_;       // dropped before the first row (§8.8)
+    std::vector<std::shared_ptr<TypeSnap>> retiredTypes_;
+    bool storeOpened_ = false;
+    void* stack_ = nullptr;
+    size_t stackBytes_ = 0;
+    volatile uint64_t* canary_ = nullptr;
     pthread_t thread_{};
     bool started_ = false;
 };
@@ -232,7 +245,7 @@ public:
 
     const ReaderConfig& config() const { return cfg_; }
     uint32_t laneCount() const { return uint32_t(lanes_.size()); }
-    Lane* lane(uint32_t i) { return lanes_[i].get(); }
+    ReaderLane* lane(uint32_t i) { return lanes_[i].get(); }
     LaneShared& laneShared(uint32_t i) { return shared_[i]; }
     std::atomic<uint32_t>& stopWord() { return stop_; }
 
@@ -247,6 +260,7 @@ public:
     // Queues a CLAIMED slot and rings an idle lane.
     int32_t enqueue(uint32_t slot);
     bool dequeue(uint32_t* slot);
+    bool queued() const;
     void wakeIdleLane();
     void wakeLane(uint32_t lane);
     std::atomic<uint32_t>& workSeq() { return workSeq_; }
@@ -261,10 +275,11 @@ public:
         cTimeouts{0}, cErrors{0};
 
 private:
-    friend class Lane;
+    friend class ReaderLane;
+    friend class ReaderClient;
     ReaderInstance() = default;
     ReaderConfig cfg_;
-    std::vector<std::unique_ptr<Lane>> lanes_;
+    std::vector<std::unique_ptr<ReaderLane>> lanes_;
     std::unique_ptr<LaneShared[]> shared_;
     uint8_t* slotBase_ = nullptr;
     size_t slotStride_ = 0;
