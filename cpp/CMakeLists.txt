@@ -824,4 +824,11 @@ else()
     add_test(NAME FlatSQLRoundTripTest COMMAND flatsql_roundtrip_test)
     add_test(NAME FlatSQLGeoTest COMMAND flatsql_geo_test)
     add_test(NAME FlatSQLPartitionStoreTest COMMAND flatsql_ps_test)
+    # Query regressions (task flatsql-query-regressions-20260928 adds the
+    # source; registered here once it exists).
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/query_regression_test.cpp)
+        add_executable(flatsql_query_regression_test test/query_regression_test.cpp)
+        target_link_libraries(flatsql_query_regression_test PRIVATE flatsql_lib)
+        add_test(NAME flatsql_query_regression_test COMMAND flatsql_query_regression_test)
+    endif()
 endif()
