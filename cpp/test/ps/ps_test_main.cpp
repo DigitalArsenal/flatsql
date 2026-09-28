@@ -105,6 +105,20 @@ void report(const char* key, double value, const char* unit) {
 }  // namespace pst
 
 int main(int argc, char** argv) {
+#if defined(__wasm__)
+    // Grow the heap once, on this thread, before any guest thread starts:
+    // V8 refreshes each thread's view of a shared memory's size lazily, so a
+    // thread touching memory another thread has just grown can fault. The
+    // allocator keeps the freed block (wasm memory never shrinks).
+    {
+        const char* mb = std::getenv("PS_WASM_HEAP_MB");
+        const size_t bytes = size_t(mb ? std::atol(mb) : 1536) << 20;
+        if (bytes) {
+            void* volatile p = std::malloc(bytes);  // volatile: not elided
+            std::free(p);
+        }
+    }
+#endif
     for (int i = 1; i < argc; i++) pst::gArgs.push_back(argv[i]);
     const std::string filter = pst::argStr("test", "");
     bool all = false;

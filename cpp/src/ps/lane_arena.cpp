@@ -36,6 +36,9 @@ constexpr uint64_t kPrevFree = 2;
 constexpr uint64_t kFlagMask = 15;
 constexpr size_t kHdr = 16;
 constexpr size_t kMinBlock = 32;
+// Largest request (256 GiB): in 64-bit arithmetic, so the bound also holds
+// where size_t is 32 bits (wasm32), where a size_t shift by 38 is undefined.
+constexpr uint64_t kMaxRequest = uint64_t(1) << 38;
 
 inline size_t align16(size_t n) { return (n + 15) & ~size_t(15); }
 inline int log2floor(uint64_t v) { return 63 - __builtin_clzll(v); }
@@ -134,7 +137,7 @@ LaneArena::Block* LaneArena::findFree(size_t size) {
 }
 
 void* LaneArena::alloc(size_t n) {
-    if (!base_ || n > (size_t(1) << 38)) {
+    if (!base_ || uint64_t(n) > kMaxRequest) {
         failures_.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
@@ -191,7 +194,7 @@ void LaneArena::free(void* p) {
 
 void* LaneArena::realloc(void* p, size_t n) {
     if (!p) return alloc(n);
-    if (n > (size_t(1) << 38)) return nullptr;
+    if (uint64_t(n) > kMaxRequest) return nullptr;
     Block* b = reinterpret_cast<Block*>(static_cast<uint8_t*>(p) - kHdr);
     uint8_t* raw = reinterpret_cast<uint8_t*>(b);
     size_t need = align16(n ? n : 1) + kHdr;

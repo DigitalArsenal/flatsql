@@ -277,7 +277,12 @@ PS_TEST(writer_backpressure_flood_T1_5) {
         std::sort(lat.begin(), lat.end());
         return lat[size_t(lat.size() * 0.99)];
     };
-    const double base = measureOthers(150);
+    // --bp-samples: acks timed per partition (default 150). The in-memory
+    // host keeps every flooded byte twice (page cache and device image), and
+    // the flood lasts as long as the flooded measurement: a wasm32 host (4 GiB)
+    // runs this test with fewer samples (docs/PARTITION-STORE-WASM.md).
+    const int samples = int(argInt("bp-samples", 150));
+    const double base = measureOthers(samples);
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> maxUsed{0}, zeroCredits{0}, sent{0}, drainedAtStop{0}, floodWaits{0};
     const uint64_t cap = s.e->ring(flood)->cap;
@@ -312,7 +317,7 @@ PS_TEST(writer_backpressure_flood_T1_5) {
         }
     });
     sleepNs(500000000);
-    const double flooded = measureOthers(150);
+    const double flooded = measureOthers(samples);
     stop.store(true);
     floodThread.join();
     sampler.join();
