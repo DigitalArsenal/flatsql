@@ -207,6 +207,7 @@ struct SegRun {
 struct SegmentInfo {
     uint32_t seg = 0;
     bool sealed = false;
+    uint32_t cgen = 0;        // T3 seam: rows/attrs/data live in c-<seg>-<cgen>.* (0: d/r/a-<seg>)
     uint64_t firstPseq = 0;
     uint64_t endPseq = 0;     // exclusive; merged rows cover [firstPseq, mergedEnd)
     uint64_t mergedEnd = 0;
@@ -284,6 +285,7 @@ enum MergePhase : uint8_t {
 struct SegSnap {
     uint32_t seg = 0;
     bool sealed = false;
+    uint32_t cgen = 0;
     uint64_t firstPseq = 0, endPseq = 0, mergedEnd = 0, dLen = 0, rLen = 0, aLen = 0;
     int64_t minEpoch = INT64_MAX, maxEpoch = INT64_MIN;
     struct Run {
@@ -332,6 +334,22 @@ struct TombRange {
     bool started = false;
     uint64_t next = 0;   // pseq cursor
     uint64_t end = 0;    // exclusive
+};
+
+// SWAP (design §11, the seam T3's compaction plugs into): a fully merged
+// sealed segment's rows, attributes and frames move to c-<seg>-<gen>.* and a
+// new manifest names them; the SWAP ctl record commits the manifest (the head's
+// manifest_gen advances). The previous files are RETIREd: the owner never
+// reads them again, and readers holding an older snapshot keep reading them
+// until the reclaimer (T3, A12) unlinks them once every reader announcement is
+// newer than the SWAP. The built-in copier writes the outputs verbatim (a
+// stand-in for T3's live-frame copy: rows stay dense by pseq either way).
+struct SwapResult {
+    std::atomic<int32_t> remaining{1};  // 0 when the SWAP is durable and its head written
+    int32_t status = 0;                 // < 0: no candidate segment or an I/O error
+    uint32_t seg = 0;
+    uint32_t oldCgen = 0;               // the retired files: c-<seg>-<oldCgen>.*, or d/r/a-<seg> when 0
+    uint32_t gen = 0;                   // the new manifest generation (and cgen)
 };
 
 struct PendingKill {
@@ -393,6 +411,9 @@ struct Partition {
     ReconcileState rec;
     std::vector<PendingKill> kills;  // type-level kills from the mailbox
     std::vector<TombRange> ranges;   // TOMB_RANGE commands, front first
+    std::vector<SwapResult*> swaps;  // SWAP requests (T3 seam), front first
+    SwapResult* swapInFlight = nullptr;  // SWAP ctl queued; applies at publish
+    uint32_t swapSeg = 0, swapGen = 0;
     // Memory accounting published for stats() (owner writes, anyone reads).
     std::atomic<uint64_t> accelBytes{0};
     std::atomic<uint32_t> laneCount{0};
@@ -516,6 +537,7 @@ enum CmdKind : uint32_t {
     kCmdTypeDelete = 5,       // ptr = TypeOwner*, cid in data, remaining ticket
     kCmdStop = 6,
     kCmdTombRange = 7,        // a = pid, b = seg, data[0..8) = epoch bound (ms), ticket
+    kCmdSwap = 8,             // a = pid, ptr = SwapResult*
 };
 
 struct Cmd {
@@ -771,6 +793,9 @@ public:
     // Quota planner command (T3 issues it): TOMB_RANGE{seg, epoch < beforeMs}
     // on one partition. `remaining` (set to 1) reaches 0 when it is done.
     int32_t tombRange(uint32_t pid, uint32_t seg, int64_t beforeMs, std::atomic<int32_t>* remaining);
+    // SWAP seam (see SwapResult): compacts the partition's oldest-generation
+    // fully merged sealed segment. `r->remaining` reaches 0 when done.
+    int32_t swapSegment(uint32_t pid, SwapResult* r);
 
     // Doorbell for a partition's owner (and HANDOFF target, A24).
     void ringOwner(uint32_t pid);

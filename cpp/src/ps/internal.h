@@ -233,6 +233,8 @@ void partitionRollback(Writer* w, Partition* p, Staged* st);
 int32_t partitionMergeStep(Writer* w, Partition* p);   // maintenance
 void partitionMergeApply(Writer* w, Partition* p);     // publish of MERGE_DONE
 void partitionMergeAbort(Writer* w, Partition* p);     // handoff / failure
+int32_t partitionSwapStep(Writer* w, Partition* p);    // maintenance: SWAP outputs + ctl (T3 seam)
+void partitionSwapApply(Writer* w, Partition* p);      // publish of the SWAP batch
 void mergeDoneBody(const Partition* p, uint8_t body[40]);
 bool partitionWantsMerge(const Engine* e, const Partition* p);
 int32_t partitionPrecreate(Writer* w, Partition* p);

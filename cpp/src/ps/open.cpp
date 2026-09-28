@@ -172,6 +172,13 @@ static void applyCtls(Partition* p, const std::vector<std::pair<uint16_t, std::v
                 p->intentThrough = getU64(b + 24);
                 if (p->intentGen + 1 > p->nextGen) p->nextGen = p->intentGen + 1;
                 break;
+            case kCtlSwap: {
+                // T3 seam: the manifest the SWAP committed (it names c-* files).
+                const uint32_t gen = getU32(b + 4);
+                p->manifestGen = gen;
+                if (gen + 1 > p->nextGen) p->nextGen = gen + 1;
+                break;
+            }
             case kCtlMergeDone: {
                 const uint32_t gen = getU32(b + 4);
                 const uint64_t through = getU64(b + 8);

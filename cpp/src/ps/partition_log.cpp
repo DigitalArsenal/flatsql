@@ -802,7 +802,8 @@ FileRef* openSegFile(Writer* w, Partition* p, SegmentInfo* si, char letter) {
     if (f->valid()) return f;
     PathBuf path;
     const char* ext = letter == 'r' ? "fsr" : letter == 'a' ? "fsa" : letter == 'd' ? "fsd" : "fsl";
-    pathPartitionSeg(&path, w->eng_root(), p->pid, letter, si->seg, ext);
+    if (si->cgen && letter != 'm') pathPartitionCompact(&path, w->eng_root(), p->pid, si->seg, si->cgen, ext);
+    else pathPartitionSeg(&path, w->eng_root(), p->pid, letter, si->seg, ext);
     const FileClass cls = letter == 'r' ? FileClass::Rows : letter == 'a' ? FileClass::Attrs
                           : letter == 'd' ? FileClass::Data : FileClass::Meta;
     if (w->io().open(path.c_str(), path.len, FLATSQL_IO_READ, cls, f) < 0) return nullptr;
@@ -1734,6 +1735,8 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
         sc->ctlBytes += p->pendingCtlBytes;
         sc->nCtl += p->nPendingCtl;
         st->consumedPendingCtl = true;
+        // A SWAP completes when its batch is durable and its head written.
+        if (p->swapInFlight) st->tickets[st->nTickets++] = &p->swapInFlight->remaining;
     }
     if (p->mergePhase == kMergeOutputsWritten) {
         uint8_t body[40];
@@ -2052,6 +2055,7 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         if (st->consumedPendingCtl) {
             p->nPendingCtl = 0;
             p->pendingCtlBytes = 0;
+            if (p->swapInFlight) partitionSwapApply(w, p);
             if (p->mergePhase == kMergeIntentQueued) {
                 p->intentSeg = p->mplan.seg;
                 p->intentGen = p->mplan.gen;

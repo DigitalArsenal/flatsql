@@ -440,3 +440,119 @@ PS_TEST(fanout_randomized_vs_bruteforce_T2_2) {
 PS_SLOW_TEST(fanout_randomized_vs_bruteforce_T2_2_full) {
     runFanoutWorkloads(int(argInt("workloads", 10000)), uint64_t(argInt("seed", 20260928)));
 }
+
+// A14 on the read side (T2 #2 and #6 additions): readers run while FIRST
+// copies die over and over. Two producers alternate: each round re-sends
+// the set to one partition (REPEAT copies, labeled), then RECONCILEs the
+// other partition's lane away, killing the FIRST copies; the type owner
+// promotes the REPEATs in the same type commit. Every CID stays live the
+// whole time, so no reader may ever miss one, and its gseq never changes.
+namespace {
+void runConcurrentFirstDeaths(uint64_t seconds) {
+    Store s(false, 2, true);
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const uint32_t pa = s.partition("alpha", ommType());
+    const uint32_t pb = s.partition("beta", ommType());
+    const int n = 64;
+    std::vector<std::vector<uint8_t>> recs;
+    for (int i = 0; i < n; i++) recs.push_back(makeRecord(ommType(), 0, 1, i, 0));
+    Producer prodA(s.e.get(), pa), prodB(s.e.get(), pb);
+    Producer* prods[2] = {&prodA, &prodB};
+    const uint32_t pids[2] = {pa, pb};
+    auto sendAll = [&](int k, int round) {
+        const auto attr = buildRecordAttr(k ? "beta" : "alpha", "prov", "src", "r" + std::to_string(round));
+        uint64_t last = 0;
+        for (int i = 0; i < n; i++) last = send(s.e.get(), *prods[k], recs[size_t(i)], attr, 1780000000000ll + round);
+        CHECK_EQ(prods[k]->waitAcked(last, 30000000000ull), 0);
+    };
+    sendAll(0, 0);
+    REQUIRE(waitLabeledEngine(s.e.get(), {pa, pb}, 30000000000ull));
+    REQUIRE(waitTypeVisible(s.fs.get(), s.root, ommType().fid, {pa, pb}, 30000000000ull));
+    Reader bulk(s, LaneClass::Bulk, 2);
+    Reader inter(s, LaneClass::Interactive, 2);
+    REQUIRE(bulk.inst && inter.inst);
+    // The gseq of every CID, fixed from the start.
+    std::map<std::string, int64_t> gseqOf;
+    {
+        Rows r = bulk.q("SELECT _cid, _gseq FROM OMM");
+        REQUIRE(r.status == 0 && r.rows.size() == size_t(n));
+        for (size_t i = 0; i < r.rows.size(); i++) gseqOf[r.s(i, 0)] = r.i(i, 1);
+    }
+    std::vector<std::string> cids;
+    for (const auto& f : recs) cids.push_back(cidTextOf(f));
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> queries{0}, missing{0}, gseqChanged{0}, errors{0};
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; t++) {
+        readers.emplace_back([&, t] {
+            std::mt19937_64 rng(uint64_t(t) + 1);
+            while (!stop.load()) {
+                const int kind = int(rng() % 3);
+                if (kind == 0) {
+                    Rows r = bulk.q("SELECT _cid, _gseq FROM OMM");
+                    if (r.status != 0) {
+                        errors++;
+                        continue;
+                    }
+                    std::set<std::string> seen;
+                    for (size_t i = 0; i < r.rows.size(); i++) {
+                        seen.insert(r.s(i, 0));
+                        auto it = gseqOf.find(r.s(i, 0));
+                        if (it == gseqOf.end() || it->second != r.i(i, 1)) gseqChanged++;
+                    }
+                    if (seen.size() != size_t(n) || r.rows.size() != size_t(n)) missing++;
+                } else if (kind == 1) {
+                    const std::string& cid = cids[rng() % cids.size()];
+                    Rows r = inter.q("SELECT _gseq FROM OMM WHERE _cid = ?", {Param::text(cid)});
+                    if (r.status != 0) {
+                        errors++;
+                        continue;
+                    }
+                    if (r.rows.size() != 1) missing++;
+                    else if (r.i(0, 0) != gseqOf[cid]) gseqChanged++;
+                } else {
+                    Rows r = bulk.q("SELECT _cid, _gseq FROM OMM ORDER BY _gseq");
+                    if (r.status != 0) {
+                        errors++;
+                        continue;
+                    }
+                    if (r.rows.size() != size_t(n)) missing++;
+                    for (size_t i = 0; i < r.rows.size(); i++)
+                        if (gseqOf[r.s(i, 0)] != r.i(i, 1)) gseqChanged++;
+                }
+                queries++;
+            }
+        });
+    }
+    const uint64_t until = monoNs() + seconds * 1000000000ull;
+    int round = 1;
+    uint64_t promotions0 = s.e->stats().promotions;
+    while (monoNs() < until) {
+        const int live = (round + 1) % 2;  // holds the FIRST copies now
+        const int next = round % 2;
+        sendAll(next, round);  // REPEAT copies, durable
+        REQUIRE(waitLabeledEngine(s.e.get(), {pa, pb}, 30000000000ull));
+        const uint64_t r = reconcile(*prods[live], "prov", "src", "none");
+        CHECK_EQ(prods[live]->waitAcked(r, 30000000000ull), 0);
+        REQUIRE(waitLabeledEngine(s.e.get(), {pa, pb}, 30000000000ull));
+        (void)pids;
+        round++;
+    }
+    stop = true;
+    for (auto& t : readers) t.join();
+    const uint64_t promotions = s.e->stats().promotions - promotions0;
+    report("a14_rounds", double(round - 1), "rounds");
+    report("a14_promotions", double(promotions), "promotions");
+    report("a14_reader_statements", double(queries.load()), "statements");
+    CHECK(promotions >= uint64_t(n) * uint64_t(round - 2));
+    CHECK_EQ(missing.load(), uint64_t(0));
+    CHECK_EQ(gseqChanged.load(), uint64_t(0));
+    CHECK_EQ(errors.load(), uint64_t(0));
+    s.close();
+}
+}  // namespace
+
+PS_TEST(fanout_readers_during_first_deaths_A14) { runConcurrentFirstDeaths(uint64_t(argInt("seconds", 10))); }
+
+PS_SLOW_TEST(fanout_readers_during_first_deaths_A14_full) { runConcurrentFirstDeaths(uint64_t(argInt("seconds", 600))); }

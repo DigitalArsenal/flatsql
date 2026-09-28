@@ -170,6 +170,9 @@ void pathPartitionManifest(PathBuf* out, const char* root, uint32_t pid, uint32_
     finish(out, snprintf(out->buf, sizeof(out->buf), "%s/fsql2/p/%08x/mf-%06x.fsm", root, pid,
                          gen));
 }
+void pathPartitionCompact(PathBuf* out, const char* root, uint32_t pid, uint32_t seg, uint32_t gen, const char* ext) {
+    finish(out, snprintf(out->buf, sizeof(out->buf), "%s/fsql2/p/%08x/c-%06x-%04x.%s", root, pid, seg, gen, ext));
+}
 void pathTypeDir(PathBuf* out, const char* root, const uint8_t fid[4]) {
     char hex[9];
     fidHex(fid, hex);

@@ -821,6 +821,9 @@ else()
         test/ps/reader_fixtures.cpp
         test/ps/lane_test.cpp
         test/ps/fanout_merge_test.cpp
+        test/ps/int64_exact_test.cpp
+        test/ps/lane_isolation_test.cpp
+        test/ps/snapshot_test.cpp
         test/io_fault.cpp
     )
     # Test-only: the flatsql schema parser compiles the test schemas at run

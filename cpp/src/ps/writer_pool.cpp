@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "flatsql/ps/flatsql_attr_generated.h"
+#include "flatsql/ps/lane_arena.h"
 #include "internal.h"
 
 #if !defined(__wasm__)
@@ -576,6 +577,7 @@ bool Writer::iterate(bool mayWait) {
 
 void Writer::threadMain() {
     osTid_ = osThreadId();
+    setThreadClass(ThreadClass::Writer);  // lock-set instrumentation (T2 #1)
     while (iterate(true)) {}
 }
 
@@ -659,6 +661,24 @@ void Writer::processMailbox() {
                 p->ranges.push_back(tr);
                 break;
             }
+            case kCmdSwap: {
+                Partition* p = eng_->partition(uint32_t(c.a));
+                SwapResult* r = static_cast<SwapResult*>(c.ptr);
+                if (!p) {
+                    r->status = FLATSQL_IO_ERR_NOENT;
+                    if (r->remaining.fetch_sub(1) == 1)
+                        wakeU32(reinterpret_cast<std::atomic<uint32_t>*>(&r->remaining), -1);
+                    break;
+                }
+                if (p->ownerWriter.load(std::memory_order_acquire) != id_) {
+                    Writer* o = eng_->writer(p->ownerWriter.load());
+                    while (!o->mailbox().push(c)) cpuRelax();
+                    o->ring();
+                    break;
+                }
+                p->swaps.push_back(r);
+                break;
+            }
             case kCmdTypeDelete: {
                 TypeOwner* t = static_cast<TypeOwner*>(c.ptr);
                 TypeOwner::Delete d;
@@ -719,7 +739,8 @@ void Writer::maintenance() {
     int outputs = 0;
     for (size_t k = 0; k < n && outputs < 4; k++) {
         Partition* p = owned_[(maintRr_ + k) % n];
-        const int32_t rc = partitionMergeStep(this, p);
+        int32_t rc = partitionMergeStep(this, p);
+        if (rc >= 0 && !p->swaps.empty()) rc = partitionSwapStep(this, p);
         if (rc < 0) {
             p->quarantined = true;
             p->ring->state.store(kRingQuarantined, std::memory_order_release);
@@ -1083,6 +1104,21 @@ int32_t Engine::tombRange(uint32_t pid, uint32_t seg, int64_t beforeMs, std::ato
     c.b = seg;
     c.ticket = remaining;
     std::memcpy(c.data, &beforeMs, 8);
+    Writer* w = writers_[p->ownerWriter.load() % writers_.size()].get();
+    if (!w->mailbox().push(c)) return FLATSQL_IO_ERR_BUSY;
+    w->ring();
+    return 0;
+}
+
+int32_t Engine::swapSegment(uint32_t pid, SwapResult* r) {
+    Partition* p = partition(pid);
+    if (!p || !r) return FLATSQL_IO_ERR_NOENT;
+    r->remaining.store(1, std::memory_order_release);
+    r->status = 0;
+    Cmd c;
+    c.kind = kCmdSwap;
+    c.a = pid;
+    c.ptr = r;
     Writer* w = writers_[p->ownerWriter.load() % writers_.size()].get();
     if (!w->mailbox().push(c)) return FLATSQL_IO_ERR_BUSY;
     w->ring();

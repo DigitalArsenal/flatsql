@@ -562,6 +562,8 @@ void pathPartitionSeg(PathBuf* out, const char* root, uint32_t pid, char letter,
                       uint32_t seg, const char* ext);
 void pathPartitionRun(PathBuf* out, const char* root, uint32_t pid, uint32_t seg, uint32_t gen);
 void pathPartitionManifest(PathBuf* out, const char* root, uint32_t pid, uint32_t gen);
+// Compaction outputs (T3 seam): c-<seg:06x>-<gen:04x>.<ext>
+void pathPartitionCompact(PathBuf* out, const char* root, uint32_t pid, uint32_t seg, uint32_t gen, const char* ext);
 void pathType(PathBuf* out, const char* root, const uint8_t fid[4], const char* name);
 void pathTypeSeg(PathBuf* out, const char* root, const uint8_t fid[4], char letter,
                  uint32_t seg, const char* ext);
