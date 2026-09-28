@@ -2188,6 +2188,7 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         const uint32_t tw = p->type->ownerWriter.load(std::memory_order_relaxed);
         if (tw != w->id() && tw < w->engine()->writerCount()) w->engine()->writer(tw)->ring();
     }
+    p->laneCount.store(uint32_t(p->lanes.size()), std::memory_order_relaxed);
     p->lastActivityNs = monoNs();
     p->st = nullptr;
 }

@@ -220,6 +220,9 @@ struct StagedType {
 
 // ---- partition log (partition_log.cpp) -----------------------------------
 int32_t partitionWarm(Writer* w, Partition* p);
+// Publishes the partition's accounted memory (L1 accelerators, lanes) for
+// Engine::stats, which never touches owner-thread structures.
+void partitionAccount(Partition* p);
 void partitionCool(Writer* w, Partition* p);
 bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Arena* batches);
 int32_t partitionReadRow(Writer* w, Partition* p, uint64_t pseq, RecRow* out);

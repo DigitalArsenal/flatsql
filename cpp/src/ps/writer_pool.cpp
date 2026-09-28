@@ -74,7 +74,7 @@ void* Arena::alloc(size_t n, size_t align) {
     if (align > 1) at = (at + align - 1) & ~(align - 1);
     if (at + n > cap_) return nullptr;
     used_ = at + n;
-    if (used_ > high_) high_ = used_;
+    if (used_ > high_.load(std::memory_order_relaxed)) high_.store(used_, std::memory_order_relaxed);
     return base_ + at;
 }
 
@@ -1058,7 +1058,11 @@ EngineStats Engine::stats() const {
     }
     s.journalReplayRecords = journalReplayRecords;
     s.openJournalBytes = openIoStats_.readBytes(FileClass::Journal);
-    for (const auto& t : typeStore_) s.noticesDropped += t->noticesDropped.load();
+    {
+        // typeStore_ grows under the registration lock.
+        std::lock_guard<std::mutex> g(const_cast<std::mutex&>(regMutex_));
+        for (const auto& t : typeStore_) s.noticesDropped += t->noticesDropped.load();
+    }
     s.framesParsedAtOpen = framesParsedAtOpen;
     s.openReadBytes = openIoStats_.totalReadBytes();
     s.openDataBytes = openIoStats_.readBytes(FileClass::Data);
@@ -1067,19 +1071,17 @@ EngineStats Engine::stats() const {
     s.poolSlabsInUse = pool_.inUse();
     s.poolSlabsPeak = pool_.peakInUse();
     s.poolCommittedBytes = pool_.committedBytes();
-    uint64_t desc = 0;
-    for (const auto& p : partStore_) {
+    // Only published values: writers own the partition structures.
+    uint64_t desc = 0, acc = 0;
+    const uint32_t maxPid = maxPidPub_.load(std::memory_order_acquire);
+    for (uint32_t pid = 1; pid <= maxPid && pid < partsCap_; pid++) {
+        const Partition* p = parts_[pid].load(std::memory_order_acquire);
         if (!p) continue;
-        desc += sizeof(Partition) + ringDescBytes(p->ring->nSlots) + p->lanes.size() * sizeof(Lane);
+        desc += sizeof(Partition) + ringDescBytes(p->ring->nSlots) +
+                uint64_t(p->laneCount.load(std::memory_order_relaxed)) * sizeof(Lane);
+        acc += p->accelBytes.load(std::memory_order_relaxed);
     }
     s.descriptorBytes = desc;
-    uint64_t acc = 0;
-    for (const auto& p : partStore_) {
-        if (!p) continue;
-        for (const auto& si : p->segs)
-            for (const auto& r : si.runs)
-                if (r.run) acc += r.run->memoryBytes();
-    }
     s.acceleratorBytes = acc;
     // Engine-accounted committed memory of the writer instance: touched pool
     // slabs, arenas and scratch, descriptors and L1 accelerators.

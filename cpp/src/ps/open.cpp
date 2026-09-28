@@ -130,7 +130,10 @@ static void applyBatch(Partition* p, const uint8_t* b, uint64_t mOff, TailReplay
         const uint16_t len = getU16(b + q + 2);
         ctls->push_back({kind, std::vector<uint8_t>(b + q + 4, b + q + 4 + len)});
         if (kind == kCtlLaneCkpt) {
-            // Full table of non-zero lanes after this batch.
+            // Full table of non-zero lanes after this batch; the head written
+            // after this open points at it (as publish does).
+            p->lanesOverflowSeg = p->mSeg;
+            p->lanesOverflowOff = mOff + q + 4;
             const uint8_t* body = b + q + 4;
             const uint32_t n = getU32(body);
             for (auto& l : p->lanes) l.c.count = 0, l.c.bytes = 0;
@@ -786,6 +789,7 @@ Partition* Engine::makePartition(const PartitionEntry& e, uint8_t writer) {
     if (partStore_.size() <= e.pid) partStore_.resize(e.pid + 1);
     partStore_[e.pid] = std::move(p);
     if (e.pid < partsCap_) parts_[e.pid].store(raw, std::memory_order_release);
+    if (e.pid > maxPidPub_.load(std::memory_order_relaxed)) maxPidPub_.store(e.pid, std::memory_order_release);
     nParts_.fetch_add(1);
     if (raw->type) typeAddPartition(raw->type, raw);
     std::string key = raw->token;

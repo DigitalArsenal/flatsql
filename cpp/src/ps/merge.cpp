@@ -297,7 +297,17 @@ int32_t partitionWarm(Writer* w, Partition* p) {
     tHotPathDepth = saved;
     if (rc < 0) return rc;
     p->warm = true;
+    partitionAccount(p);
     return 0;
+}
+
+void partitionAccount(Partition* p) {
+    uint64_t acc = 0;
+    for (const auto& si : p->segs)
+        for (const auto& r : si.runs)
+            if (r.run) acc += r.run->memoryBytes();
+    p->accelBytes.store(acc, std::memory_order_relaxed);
+    p->laneCount.store(uint32_t(p->lanes.size()), std::memory_order_relaxed);
 }
 
 void partitionCool(Writer* w, Partition* p) {
@@ -322,6 +332,7 @@ void partitionCool(Writer* w, Partition* p) {
     // The head handle stays: it is written on every commit, and closing it
     // would force a reopen on the next one.
     p->warm = false;
+    partitionAccount(p);
 }
 
 bool partitionWantsMerge(const Engine* e, const Partition* p) {
@@ -744,6 +755,7 @@ void partitionMergeApply(Writer* w, Partition* p) {
         p->chain.freeAll(w->engine()->pool());
     }
     p->mergePhase = kMergeIdle;
+    partitionAccount(p);
     w->engine()->cMerges.fetch_add(1, std::memory_order_relaxed);
 }
 

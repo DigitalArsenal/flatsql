@@ -139,14 +139,14 @@ public:
     }
     size_t used() const { return used_; }
     size_t capacity() const { return cap_; }
-    size_t highWater() const { return high_; }
+    size_t highWater() const { return high_.load(std::memory_order_relaxed); }
     size_t remaining() const { return cap_ - used_; }
 
 private:
     uint8_t* base_ = nullptr;
     size_t cap_ = 0;
     size_t used_ = 0;
-    size_t high_ = 0;
+    std::atomic<size_t> high_{0};  // read by Engine::stats from other threads
 };
 
 // FIFO allocator over pool slabs (L0 accelerators): allocations are freed in
@@ -392,6 +392,9 @@ struct Partition {
     ReconcileState rec;
     std::vector<PendingKill> kills;  // type-level kills from the mailbox
     std::vector<TombRange> ranges;   // TOMB_RANGE commands, front first
+    // Memory accounting published for stats() (owner writes, anyone reads).
+    std::atomic<uint64_t> accelBytes{0};
+    std::atomic<uint32_t> laneCount{0};
     uint64_t jCkptTag = 0;           // A8: (writer << 32 | checkpoint epoch) that tracks it
     uint32_t jCkptIdx = 0;           // its entry in that writer's list
     uint8_t mergePhase = kMergeIdle;
@@ -848,6 +851,7 @@ private:
     std::condition_variable regCv_;
     uint32_t reservedPid_ = 0;
     std::unique_ptr<std::atomic<Partition*>[]> parts_;
+    std::atomic<uint32_t> maxPidPub_{0};  // highest pid in parts_ (stats walk)
     uint32_t partsCap_ = 0;
     std::atomic<uint32_t> nParts_{0};
     std::vector<std::unique_ptr<Partition>> partStore_;

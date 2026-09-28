@@ -486,8 +486,17 @@ PartView Inspector::partition(uint32_t pid) {
         std::vector<uint8_t> m;
         PathBuf mp;
         pathPartitionSeg(&mp, root_.c_str(), pid, 'm', hd.lanesOverflowSeg, "fsl");
-        if (readFile(ctx_, mp, FileClass::Meta, &m) && hd.lanesOverflowOff + 4 <= m.size()) {
+        if (!readFile(ctx_, mp, FileClass::Meta, &m) || hd.lanesOverflowOff + 4 > m.size()) {
+            v.err = "lane checkpoint missing";
+            return v;
+        }
+        {
             const uint32_t n = getU32(m.data() + hd.lanesOverflowOff);
+            if (hd.lanesOverflowOff + 4 + uint64_t(n) * sizeof(LaneCounter) > m.size()) {
+                v.err = "lane checkpoint out of bounds (seg " + std::to_string(hd.lanesOverflowSeg) + " off " +
+                        std::to_string(hd.lanesOverflowOff) + " n " + std::to_string(n) + ")";
+                return v;
+            }
             for (uint32_t i = 0; i < n; i++) {
                 LaneCounter c;
                 std::memcpy(&c, m.data() + hd.lanesOverflowOff + 4 + size_t(i) * sizeof(c), sizeof(c));
