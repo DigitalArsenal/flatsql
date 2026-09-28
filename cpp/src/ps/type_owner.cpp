@@ -1036,9 +1036,12 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
     uint64_t bytes = 0;
     for (uint32_t i = 0; i < t->nL0; i++) bytes += t->l0[i].batchLen;
     // Type commits are frequent and small (a few labels each): the block
-    // count alone triggers a merge, well before the directory limit makes
-    // labeling wait (typeStage).
-    const bool want = t->nL0 >= e->config().mergeL0Blocks || bytes >= e->config().mergeL0Bytes;
+    // count alone triggers a merge, and near the head's L0 directory cap it
+    // always does, whatever mergeL0Blocks says: a full directory makes
+    // labeling wait (typeStage), partition merges wait for labels, and the
+    // partitions' writers stop at their own caps (acks stop for good).
+    const bool want = t->nL0 >= e->config().mergeL0Blocks || t->nL0 >= kMaxTypeL0Dir - 8 ||
+                      bytes >= e->config().mergeL0Bytes;
     if (!want) return 0;
     int32_t rc = typeWarm(w, t);
     if (rc < 0) return rc;

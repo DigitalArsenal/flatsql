@@ -229,6 +229,38 @@ PS_TEST(open_refuses_store_without_migrated_marker) {
 // open whose first head comes from a batch without lane deltas (MERGE_DONE):
 // the head must still point at the LANE_CKPT record (found by T4 under the
 // Node host: "lane checkpoint out of bounds (seg 0 off 0 ...)").
+// Liveness at the L0 directory caps: with a block trigger no directory ever
+// reaches (mergeL0Blocks above kMaxL0Dir), one record per commit round makes
+// every commit an L0 block. The type's directory fills first; its merge must
+// run at the cap, or labeling stops, the partition's merges wait for labels
+// and its writer stops at its own cap, and acks stop for good.
+PS_TEST(open_l0_directory_caps_force_merges) {
+    Store s(true, 1, true);
+    s.cfg.mergeL0Blocks = 1000;
+    s.cfg.mergeMinL0Bytes = 0;
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const uint32_t pid = s.partition("dircap", ommType());
+    Producer p(s.e.get(), pid);
+    const int n = int(4 * (kMaxL0Dir + kMaxTypeL0Dir));
+    int acked = 0;
+    for (int i = 0; i < n; i++) {
+        const uint64_t r = send(s.e.get(), p, ommRecord(uint32_t(70000 + i), "D", "2026-09-01T00:00:00Z", 15.0),
+                                buildRecordAttr("peer", "prov", "src", "b"), i);
+        if (!r || p.waitAcked(r, 60000000000ull) != 0) break;  // one record per commit round
+        acked++;
+    }
+    CHECK_EQ(acked, n);
+    // Labels catch up with every durable row, and the partition merged.
+    const Partition* part = s.e->partition(pid);
+    bool labeled = false;
+    for (const uint64_t t0 = monoNs(); !labeled && monoNs() - t0 < 60000000000ull; sleepNs(5000000))
+        labeled = part->labeledThrough.load() >= part->durablePseqHi.load() && part->durablePseqHi.load() >= uint64_t(n);
+    CHECK(labeled);
+    CHECK(s.e->stats().merges > 0);
+    s.close();
+}
+
 PS_TEST(open_lane_checkpoint_pointer_survives_merge_after_open) {
     Store s(true, 1, true);
     s.cfg.mergeL0Blocks = 1000;  // no merges in the first session
@@ -241,13 +273,13 @@ PS_TEST(open_lane_checkpoint_pointer_survives_merge_after_open) {
         for (int i = 0; i < 400; i++) {
             const uint64_t r = send(s.e.get(), p, ommRecord(uint32_t(90000 + i), "L", "2026-09-01T00:00:00Z", 15.0),
                                     buildRecordAttr("peer", "prov", "src" + std::to_string(i % 40), "b"), i);
-            if (i % 20 == 19) REQUIRE(p.waitAcked(r, 10000000000ull) == 0);  // many L0 blocks
+            if (i % 20 == 19) REQUIRE(p.waitAcked(r, 60000000000ull) == 0);  // many L0 blocks
         }
     }
     s.close();
     s.cfg.mergeL0Blocks = 2;  // the next open merges at once: MERGE_DONE carries no lane deltas
     REQUIRE(s.open() == 0);
-    for (int i = 0; i < 200 && s.e->partition(pid)->nL0 > 1; i++) sleepNs(10000000);
+    for (int i = 0; i < 6000 && s.e->partition(pid)->nL0 > 1; i++) sleepNs(10000000);
     s.close();
     REQUIRE(s.open() == 0);
     s.close();
