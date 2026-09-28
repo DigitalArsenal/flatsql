@@ -735,7 +735,8 @@ DirCheck checkPartitionDir(Io* io, FaultFs* fs, const std::string& root, uint32_
     };
     PathBuf pb;
     pathPartition(&pb, root.c_str(), pid, "h.fsh");
-    required.insert(std::string(pb.c_str(), pb.len));
+    // A partition registered durably whose first head never was has none.
+    (hd.p.magic == kMagicHead ? required : optional).insert(std::string(pb.c_str(), pb.len));
     pathPartition(&pb, root.c_str(), pid, "l.fsl");
     optional.insert(std::string(pb.c_str(), pb.len));
     if (hd.p.magic == kMagicHead) {
