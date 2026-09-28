@@ -73,6 +73,7 @@ struct EngineConfig {
     bool commitJournal = false;
     uint64_t journalCkptBytes = 8ull << 20;
     uint32_t journalCkptMs = 1000;
+    bool journalCkptPaced = true;          // checkpoint syncs at a 50% duty cycle
     uint32_t typeCommitRows = 8192;        // rows labeled per type commit
     uint32_t reconcileStep = 4096;         // instances per RECONCILE step
     uint32_t idleReclaimMs = 1000;         // ring slabs of idle partitions

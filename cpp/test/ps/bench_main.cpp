@@ -121,6 +121,9 @@ struct Bench {
         cfg.arenaBytes = 24ull << 20;
         cfg.zeroFillStep = uint64_t(argInt("zero-fill-kb", 1024)) << 10;
         cfg.commitJournal = argInt("journal", 0) != 0;  // A8 fallback mode
+        cfg.journalCkptMs = uint32_t(argInt("journal-ckpt-ms", 1000));
+        cfg.journalCkptBytes = uint64_t(argInt("journal-ckpt-mb", 8)) << 20;
+        cfg.journalCkptPaced = argInt("journal-paced", 1) != 0;
         cfg.lockStats = true;
         if (memIo) {
             mem.reset(new FaultFs(false));

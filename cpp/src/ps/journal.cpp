@@ -320,9 +320,14 @@ void Writer::journalMaintenance(bool final) {
     jCkptResult_ = result;
     jCkptInFlight_ = true;
     jLastCkptNs_ = now;
-    auto job = [paths = std::move(paths), jpath, result](IoCtx* io) {
+    // Paced (async only): after each file sync the helper idles as long as
+    // the sync took, so the device keeps headroom for the journal fsyncs acks
+    // wait on. The journal grows meanwhile; nothing waits for the checkpoint.
+    const bool paced = !(final || cfg.cooperative || cfg.mergeHelpers == 0) && cfg.journalCkptPaced;
+    auto job = [paths = std::move(paths), jpath, result, paced](IoCtx* io) {
         int32_t rc = 0;
         for (const std::string& p : paths) {
+            const uint64_t t0 = paced ? monoNs() : 0;
             FileRef f;
             const int32_t o = io->open(p.c_str(), p.size(), FLATSQL_IO_READ | FLATSQL_IO_WRITE, FileClass::Directory, &f);
             if (o == FLATSQL_IO_ERR_NOENT) continue;
@@ -335,6 +340,10 @@ void Writer::journalMaintenance(bool final) {
             if (s < 0) {
                 rc = s;
                 break;
+            }
+            if (paced) {
+                const uint64_t took = monoNs() - t0;
+                sleepNs(took < 20000000ull ? took : 20000000ull);
             }
         }
         if (rc >= 0) {
