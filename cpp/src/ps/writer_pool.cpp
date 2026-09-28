@@ -817,9 +817,47 @@ void Engine::submitMaintenance(std::function<void(IoCtx*)> job) {
     helperCv_.notify_one();
 }
 
+bool Engine::submitCheckpoint(std::function<void(IoCtx*)> job) {
+    if (!ckptActive_.load(std::memory_order_acquire)) return false;
+    {
+        std::lock_guard<std::mutex> g(ckptMu_);
+        ckptJobs_.push_back(std::move(job));
+    }
+    ckptCv_.notify_one();
+    return true;
+}
+
+void Engine::stopCheckpointThread() {
+    if (!ckptThread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> g(ckptMu_);
+        ckptStop_ = true;
+    }
+    ckptCv_.notify_all();
+    ckptThread_.join();  // drains the queue first
+    ckptActive_.store(false, std::memory_order_release);
+}
+
 int32_t Engine::start() {
     if (cfg_.cooperative || started_) return 0;
     helperStop_ = false;
+    if (cfg_.commitJournal) {
+        ckptStop_ = false;
+        ckptActive_.store(true, std::memory_order_release);
+        ckptThread_ = std::thread([this] {
+            for (;;) {
+                std::function<void(IoCtx*)> job;
+                {
+                    std::unique_lock<std::mutex> lk(ckptMu_);
+                    ckptCv_.wait(lk, [this] { return ckptStop_ || !ckptJobs_.empty(); });
+                    if (ckptJobs_.empty()) return;  // stopping, queue drained
+                    job = std::move(ckptJobs_.front());
+                    ckptJobs_.pop_front();
+                }
+                job(helperIo_.get());
+            }
+        });
+    }
     for (uint32_t i = 0; i < cfg_.mergeHelpers; i++) {
         helpers_.emplace_back([this] {
             for (;;) {
@@ -862,6 +900,7 @@ int32_t Engine::stop(uint64_t deadlineMs) {
     for (auto& h : helpers_)
         if (h.joinable()) h.join();
     helpers_.clear();
+    stopCheckpointThread();
     syncPool_.stop();
     started_ = false;
     // Merges still in flight are abandoned: their INTENT is discarded at open.
@@ -926,6 +965,7 @@ void Engine::abandon() {
     for (auto& h : helpers_)
         if (h.joinable()) h.join();
     helpers_.clear();
+    stopCheckpointThread();
     syncPool_.stop();
     started_ = false;
     for (auto& w : writers_) {

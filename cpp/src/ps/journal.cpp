@@ -323,7 +323,8 @@ void Writer::journalMaintenance(bool final) {
     // Paced (async only): after each file sync the helper idles as long as
     // the sync took, so the device keeps headroom for the journal fsyncs acks
     // wait on. The journal grows meanwhile; nothing waits for the checkpoint.
-    const bool paced = !(final || cfg.cooperative || cfg.mergeHelpers == 0) && cfg.journalCkptPaced;
+    const bool async = !final && eng_->checkpointThreadActive();
+    const bool paced = async && cfg.journalCkptPaced;
     auto job = [paths = std::move(paths), jpath, result, paced](IoCtx* io) {
         int32_t rc = 0;
         for (const std::string& p : paths) {
@@ -359,11 +360,9 @@ void Writer::journalMaintenance(bool final) {
     };
     const int saved = tHotPathDepth;
     tHotPathDepth = 0;
-    if (final || cfg.cooperative || cfg.mergeHelpers == 0) {
+    if (!async || !eng_->submitCheckpoint(job)) {
         job(&io_);
         settle(true);
-    } else {
-        eng_->submitMaintenance(std::move(job));
     }
     tHotPathDepth = saved;
     if (final) {

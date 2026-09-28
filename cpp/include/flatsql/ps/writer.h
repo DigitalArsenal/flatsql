@@ -810,6 +810,9 @@ public:
     // Maintenance helper: builds merge outputs off the writer threads.
     void submitMaintenance(std::function<void(IoCtx*)> job);
     IoCtx* helperIo() { return helperIo_.get(); }
+    // A8: queues a journal checkpoint; false when no checkpoint thread runs.
+    bool submitCheckpoint(std::function<void(IoCtx*)> job);
+    bool checkpointThreadActive() const { return ckptActive_.load(std::memory_order_acquire); }
     std::mutex& regMutex() { return regMutex_; }
     Registry& registry() { return registry_; }
     uint8_t leastLoadedWriter() const;
@@ -861,6 +864,15 @@ private:
     SyncPool syncPool_;
     IoStats helperIoStats_;
     std::unique_ptr<IoCtx> helperIo_;
+    // A8 journal checkpoints run on their own thread: a paced checkpoint must
+    // never delay the merges queued for the maintenance helpers.
+    std::mutex ckptMu_;
+    std::condition_variable ckptCv_;
+    std::deque<std::function<void(IoCtx*)>> ckptJobs_;
+    std::thread ckptThread_;
+    bool ckptStop_ = false;
+    std::atomic<bool> ckptActive_{false};
+    void stopCheckpointThread();
     std::mutex helperMu_;               // maintenance queue (never on a record path)
     std::condition_variable helperCv_;
     std::deque<std::function<void(IoCtx*)>> helperJobs_;
