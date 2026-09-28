@@ -392,6 +392,7 @@ int32_t openSegAt(IoCtx* io, const char* root, uint32_t pid, char letter, uint32
 // Plans a merge on the owner: everything the output build needs is copied
 // into the plan, so the build can run on a helper thread (A26).
 int32_t planMerge(Writer* w, Partition* p) {
+    Engine* e = w->engine();
     const uint64_t labeled = p->labeledThrough.load(std::memory_order_acquire);
     const uint32_t seg = p->l0[0].mSeg;
     uint32_t k = 0;
@@ -422,11 +423,16 @@ int32_t planMerge(Writer* w, Partition* p) {
     if (p->acc)
         for (uint32_t i = 0; i < k; i++)
             for (int j = 0; j < p->acc[i].nKinds; j++) newEntries += p->acc[i].kinds[j].n;
+    // A fold is capped at mergeFoldMaxEntries (and skipped when the L0
+    // directory is under pressure): a merge must finish before the directory
+    // fills, or the partition's staging waits for it. Bigger runs are T3's.
+    const uint64_t foldCap = e->config().mergeFoldMaxEntries;
+    const bool pressure = p->nL0 >= kMaxL0Dir / 2;
     uint64_t acc = newEntries ? newEntries : 1;
     uint32_t cand = 0;
-    for (size_t i = si->runs.size(); i-- > 0;) {
+    for (size_t i = si->runs.size(); i-- > 0 && !pressure;) {
         const SegRun& r = si->runs[i];
-        if (!r.run || r.run->entries() > 2 * acc) break;
+        if (!r.run || r.run->entries() > 2 * acc || acc + r.run->entries() > foldCap) break;
         acc += r.run->entries();
         cand++;
     }

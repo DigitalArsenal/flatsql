@@ -65,6 +65,7 @@ struct EngineConfig {
     uint64_t mergeL0Bytes = 1ull << 20;
     uint64_t mergeMinL0Bytes = 64u << 10;  // below this, wait for more blocks (tiny commits)
     uint32_t mergeHelpers = 1;             // 0 = merges build on the writer thread
+    uint64_t mergeFoldMaxEntries = 2000000;  // largest run a merge builds by folding
     uint64_t zeroFillStep = 1ull << 20;    // A8 zero-fill ahead (0 = off)
     uint32_t noticeQueue = 1024;           // A25 (a full queue drops the notice)
     uint64_t arrivalsSegBytes = 64ull << 20;  // A15: arrivals segment seal size
@@ -868,6 +869,17 @@ private:
     SyncPool syncPool_;
     IoStats helperIoStats_;
     std::unique_ptr<IoCtx> helperIo_;
+    // Urgent maintenance (type merges) has its own thread: a type merge gates
+    // labeling, and labeling gates partition merges, so it must never wait
+    // behind a long partition merge on the shared helpers.
+    std::mutex urgentMu_;
+    std::condition_variable urgentCv_;
+    std::deque<std::function<void(IoCtx*)>> urgentJobs_;
+    std::thread urgentThread_;
+    bool urgentStop_ = false;
+    std::unique_ptr<IoCtx> urgentIo_;
+    IoStats urgentIoStats_;
+    void stopUrgentThread();
     // A8 journal checkpoints run on their own thread: a paced checkpoint must
     // never delay the merges queued for the maintenance helpers.
     std::mutex ckptMu_;

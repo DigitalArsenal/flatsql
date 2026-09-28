@@ -810,12 +810,30 @@ void Engine::typeAddPartition(TypeOwner* t, Partition* p) {
 }
 
 void Engine::submitMaintenance(bool urgent, std::function<void(IoCtx*)> job) {
+    if (urgent && urgentThread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> g(urgentMu_);
+            urgentJobs_.push_back(std::move(job));
+        }
+        urgentCv_.notify_one();
+        return;
+    }
     {
         std::lock_guard<std::mutex> g(helperMu_);
         if (urgent) helperJobs_.push_front(std::move(job));
         else helperJobs_.push_back(std::move(job));
     }
     helperCv_.notify_one();
+}
+
+void Engine::stopUrgentThread() {
+    if (!urgentThread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> g(urgentMu_);
+        urgentStop_ = true;
+    }
+    urgentCv_.notify_all();
+    urgentThread_.join();  // drains the queue first
 }
 
 bool Engine::submitCheckpoint(std::function<void(IoCtx*)> job) {
@@ -842,6 +860,23 @@ void Engine::stopCheckpointThread() {
 int32_t Engine::start() {
     if (cfg_.cooperative || started_) return 0;
     helperStop_ = false;
+    if (cfg_.mergeHelpers) {
+        urgentStop_ = false;
+        if (!urgentIo_) urgentIo_.reset(new IoCtx(cfg_.io ? cfg_.io : importIo(), &urgentIoStats_));
+        urgentThread_ = std::thread([this] {
+            for (;;) {
+                std::function<void(IoCtx*)> job;
+                {
+                    std::unique_lock<std::mutex> lk(urgentMu_);
+                    urgentCv_.wait(lk, [this] { return urgentStop_ || !urgentJobs_.empty(); });
+                    if (urgentJobs_.empty()) return;  // stopping, queue drained
+                    job = std::move(urgentJobs_.front());
+                    urgentJobs_.pop_front();
+                }
+                job(urgentIo_.get());
+            }
+        });
+    }
     if (cfg_.commitJournal) {
         ckptStop_ = false;
         ckptActive_.store(true, std::memory_order_release);
@@ -901,6 +936,7 @@ int32_t Engine::stop(uint64_t deadlineMs) {
     for (auto& h : helpers_)
         if (h.joinable()) h.join();
     helpers_.clear();
+    stopUrgentThread();
     stopCheckpointThread();
     syncPool_.stop();
     started_ = false;
@@ -966,6 +1002,7 @@ void Engine::abandon() {
     for (auto& h : helpers_)
         if (h.joinable()) h.join();
     helpers_.clear();
+    stopUrgentThread();
     stopCheckpointThread();
     syncPool_.stop();
     started_ = false;
@@ -1158,6 +1195,7 @@ void Engine::totalIo(IoStats* out) const {
     };
     add(openIoStats_);
     add(helperIoStats_);
+    add(urgentIoStats_);
     for (const auto& w : writers_) add(w->ioStats_);
 }
 

@@ -1001,8 +1001,11 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
         for (int j = 0; j < t->acc[i].nKinds; j++) newEntries += t->acc[i].kinds[j].n;
     uint32_t cand = 0;
     uint64_t acc = newEntries;
+    // Folds are capped as for partitions: labeling waits on this merge.
+    const uint64_t foldCap = e->config().mergeFoldMaxEntries;
     for (size_t i = t->runs.size(); i-- > 0;) {
-        if (!t->runs[i].run || t->runs[i].run->entries() > 2 * acc) break;
+        if (!t->runs[i].run || t->runs[i].run->entries() > 2 * acc || acc + t->runs[i].run->entries() > foldCap)
+            break;
         acc += t->runs[i].run->entries();
         cand++;
     }
