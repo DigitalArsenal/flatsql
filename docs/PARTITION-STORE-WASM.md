@@ -173,10 +173,16 @@ Filled in when the release is published.
    under Node; the host-file vector is compared natively and under Node.
    Adding flatsql_io to the runner (as the SDN C host module does) is an SDK
    change.
-5. **Parity frames use exact values.** A fixture expression such as
-   `a + b * c` is contracted to a fused multiply-add on arm64 and not in wasm,
-   which changes the input bytes (1 ULP), not the engine's output; the parity
-   workload builds its frames from exact doubles. The canonical dump masks
+5. **Parity inputs are built deterministically.** A fixture expression such
+   as `a + b * c` is contracted to a fused multiply-add on arm64 and not in
+   wasm, which changes the input bytes (1 ULP), not the engine's output; the
+   parity workload builds its frames from exact doubles. `buildRecordAttr`
+   (`src/ps/writer_pool.cpp`) creates its strings inside one call's argument
+   list, whose evaluation order C++ leaves unspecified: GCC on x86_64 builds
+   them in the opposite order from clang and from GCC on arm64, so the same
+   attributes serialize to different bytes (measured on the CI runner and under
+   x86_64 emulation). The parity workload builds its attributes in a fixed
+   order; the helper itself belongs to the writer files T3 holds (reported). The canonical dump masks
    `kRowAttrInM` (where attributes are stored until a merge moves them, like
    offsets) and injects the engine's wall clock (TOMB arrival times).
 6. **Deterministic mode injects both clocks in the guest** (`setTestClock`,

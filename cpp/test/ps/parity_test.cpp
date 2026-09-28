@@ -24,6 +24,7 @@
 #include <sstream>
 #include <thread>
 
+#include "flatsql/ps/flatsql_attr_generated.h"
 #include "flatsql/ps/platform.h"
 #include "ps/reader_fixtures.h"
 #include "ps/ps_test.h"
@@ -104,10 +105,31 @@ std::vector<uint8_t> planFrame(size_t k, const Plan& p, uint32_t i) {
                      "N" + std::to_string(obj) + "-v" + std::to_string(i / 150));
 }
 
+// RecordAttr bytes with a fixed build order. buildRecordAttr creates its
+// strings inside one call's argument list, whose evaluation order C++ leaves
+// unspecified (GCC on x86_64 builds them in the opposite order from clang and
+// from GCC on arm64), so the same attributes serialize differently.
+std::vector<uint8_t> parityAttr(const std::string& peerId, const std::string& provider, const std::string& source,
+                                const std::string& batch) {
+    flatbuffers::FlatBufferBuilder b(256);
+    const auto p = b.CreateString(provider);
+    const auto s = b.CreateString(source);
+    const auto bt = b.CreateString(batch);
+    const auto ck = b.CreateString("");
+    const auto pp = b.CreateString("");
+    const auto pk = b.CreateString("");
+    const auto tag = fb::CreateSourceTag(b, p, s, 0, bt, ck, pp, pk);
+    const auto tags = b.CreateVector(&tag, 1);
+    const auto peer = b.CreateVector(reinterpret_cast<const uint8_t*>(peerId.data()), peerId.size());
+    const auto ra = fb::CreateRecordAttr(b, peer, 0, 0, 0, 0, tags);
+    fb::FinishRecordAttrBuffer(b, ra);
+    return std::vector<uint8_t>(b.GetBufferPointer(), b.GetBufferPointer() + b.GetSize());
+}
+
 std::vector<uint8_t> planAttr(size_t k, uint32_t i) {
     // Resent OMM records arrive from another source (a re-tag, A2).
-    return buildRecordAttr("peer" + std::to_string(k), "prov", "src" + std::to_string(i % 3),
-                           "batch" + std::to_string(i / 250));
+    return parityAttr("peer" + std::to_string(k), "prov", "src" + std::to_string(i % 3),
+                      "batch" + std::to_string(i / 250));
 }
 
 struct Registered {
