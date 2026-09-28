@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 import * as flatbuffers from './lib/flatbuffers.js';
-import { DirectAccessor, FlatSQLDatabase } from '../dist/index.js';
 import initFlatSQL from '../wasm/index.js';
 
 const { Builder, ByteBuffer } = flatbuffers;
@@ -24,7 +23,6 @@ const SCENARIOS = [
     rows: 10000,
     sorted: true,
     indexes: ['noradCatId'],
-    gate: 2.0,
   },
   {
     id: '100k-unsorted-3idx',
@@ -32,7 +30,6 @@ const SCENARIOS = [
     rows: 100000,
     sorted: false,
     indexes: ['noradCatId', 'objectId', 'epoch'],
-    gate: 1.5,
   },
   {
     id: 'sorted-1idx-easy',
@@ -40,7 +37,6 @@ const SCENARIOS = [
     rows: 25000,
     sorted: true,
     indexes: ['noradCatId'],
-    gate: 3.0, // stretch target
   },
 ];
 
@@ -147,41 +143,6 @@ function buildSizePrefixedStream(buffers) {
   return stream;
 }
 
-function createAccessor() {
-  const accessor = new DirectAccessor();
-  accessor.registerAccessor(TABLE_NAME, (data, path) => {
-    const field = path[path.length - 1];
-    const record = OMMBenchRecord.getRoot(data);
-
-    switch (field) {
-      case 'noradCatId':
-        return record.noradCatId();
-      case 'objectId':
-        return record.objectId();
-      case 'epoch':
-        return record.epoch();
-      case 'meanMotion':
-        return record.meanMotion();
-      default:
-        return undefined;
-    }
-  });
-  return accessor;
-}
-
-function measureFlatSQLJS(records, schema) {
-  const db = FlatSQLDatabase.fromSchema(schema, createAccessor(), 'flatjs-bench');
-  const midRecord = records[Math.floor(records.length / 2)];
-  const started = performance.now();
-  db.stream(TABLE_NAME, records.map((record) => record.flatbuffer));
-  const elapsed = performance.now() - started;
-
-  const query = db.query(`SELECT objectId FROM ${TABLE_NAME} WHERE noradCatId = ${midRecord.noradCatId}`);
-  assert.strictEqual(query.rowCount, 1);
-  assert.strictEqual(query.rows[0][0], midRecord.objectId);
-  return elapsed;
-}
-
 async function measureFlatSQLWASM(records, schema, flatSql, profileMode = false) {
   const db = flatSql.createDatabase(schema, `bench-${Date.now()}`);
   db.registerFileId(FILE_IDENTIFIER, TABLE_NAME);
@@ -225,7 +186,6 @@ async function run() {
   const caseFilter = process.argv.filter((arg) => arg.startsWith('--case='));
   const selectedCases = caseFilter.length ? caseFilter.map((arg) => arg.split('=')[1]) : SCENARIOS.map((s) => s.id);
   const showProfile = process.argv.includes('--profile');
-  let gateFailed = false;
   const summary = [];
 
   for (const scenario of SCENARIOS) {
@@ -235,7 +195,6 @@ async function run() {
 
     const records = buildRecords(scenario.rows, scenario.sorted);
     const schema = SCHEMA_TEMPLATE(scenario.indexes);
-    const jsRuns = [];
     const wasmRuns = [];
     const wasmPackRuns = [];
     const wasmIngestRuns = [];
@@ -245,7 +204,6 @@ async function run() {
     const wasmIndexRuns = [];
 
     for (let round = 0; round < 3; round++) {
-      jsRuns.push(measureFlatSQLJS(records, schema));
       const wasmRun = await measureFlatSQLWASM(records, schema, flatSql, showProfile);
       wasmRuns.push(wasmRun.totalElapsed);
       if (showProfile && wasmRun.profile) {
@@ -258,20 +216,12 @@ async function run() {
       }
     }
 
-    const jsMedian = median(jsRuns);
     const wasmMedian = median(wasmRuns);
-    const ratio = jsMedian / wasmMedian;
-
-    if (!showProfile && scenario.gate && ratio < scenario.gate) {
-      gateFailed = true;
-      console.error(`GATE FAILED: ${scenario.label} ratio ${ratio.toFixed(2)} < ${scenario.gate}`);
-    }
 
     summary.push({
       scenario: scenario.label,
-      jsMedian,
+      rows: scenario.rows,
       wasmMedian,
-      ratio,
       packMedian: showProfile ? median(wasmPackRuns) : 0,
       ingestMedian: showProfile ? median(wasmIngestRuns) : 0,
       verifyMedian: showProfile ? median(wasmVerifyRuns) : 0,
@@ -284,14 +234,13 @@ async function run() {
   console.table(
     summary.map((row) => ({
       Scenario: row.scenario,
-      'FlatSQL JS (ms)': row.jsMedian.toFixed(2),
-      'FlatSQL WASM (ms)': row.wasmMedian.toFixed(2),
-      'JS / WASM': row.ratio.toFixed(2),
+      'FlatSQL WASM ingest (ms)': row.wasmMedian.toFixed(2),
+      'Records/s': Math.round(row.rows / (row.wasmMedian / 1000)),
     })),
   );
 
   if (showProfile) {
-    console.log('Profiling mode is diagnostic and includes instrumentation overhead; use `npm run bench:perf` for merge gates.');
+    console.log('Profiling mode is diagnostic and includes instrumentation overhead; use `npm run bench:perf` for the plain medians.');
     console.table(
       summary.map((row) => ({
         Scenario: row.scenario,
@@ -303,10 +252,6 @@ async function run() {
         'Index (ms)': row.indexMedian.toFixed(2),
       })),
     );
-  }
-
-  if (gateFailed) {
-    process.exitCode = 1;
   }
 }
 

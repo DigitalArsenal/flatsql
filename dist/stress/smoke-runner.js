@@ -2,7 +2,6 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { discoverSdsSchemas } from './sds-discovery.js';
 import { reduceMetricEvents } from './metrics.js';
-import { buildMeasuredPublishEventMetrics } from './publish-event-workload.js';
 import { buildMeasuredStandalonePublishEventMetrics } from './native-publish-event-workload.js';
 import { buildDerivedStressReport } from './report.js';
 import { buildWorkloadManifest } from './workload.js';
@@ -40,9 +39,11 @@ export async function runSmokeHarness(options) {
         throw new Error(`No SDS schemas found under ${options.schemaRoot}`);
     }
     const manifest = buildWorkloadManifest({ ...options, mode: options.mode ?? 'smoke' }, schemas);
-    const metrics = manifest.runtime === 'standalone'
-        ? await buildMeasuredStandalonePublishEventMetrics(manifest)
-        : buildMeasuredPublishEventMetrics(manifest);
+    // The TypeScript engine is gone (3.0.0); only the WASI engine measures.
+    if (manifest.runtime !== 'standalone') {
+        throw new Error(`runtime ${manifest.runtime} has no in-process workload; use the standalone runtime`);
+    }
+    const metrics = await buildMeasuredStandalonePublishEventMetrics(manifest);
     const summary = reduceMetricEvents(metrics);
     const report = buildDerivedStressReport(manifest, metrics, summary);
     const findings = detectFindings(manifest);

@@ -1245,4 +1245,8 @@ export class FlatSQLDatabase {
     }
 }
 
+// The partition store artifact (flatsql-ps-threads.wasm): its URL, bytes and
+// integrity (docs/PARTITION-STORE-WASM.md).
+export * from './ps.js';
+
 export default initFlatSQL;

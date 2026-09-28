@@ -1,6 +1,10 @@
-import { createFlatSqlIoImports, createMemoryBackend } from './flatsql-io.js';
+// Test-only JS runtime for the legacy single-threaded WASI engine
+// (wasm/flatsql-wasi.wasm): formerly wasm/standalone.js, removed from the
+// package in 3.0.0 (docs/PARTITION-STORE-WASM.md §6). The legacy engine's own
+// tests and the stress harness keep using it until T8 retires that engine.
+import { createFlatSqlIoImports, createMemoryBackend } from '../../wasm/flatsql-io.js';
 
-const DEFAULT_STANDALONE_URL = new URL('./flatsql-wasi.wasm', import.meta.url);
+const DEFAULT_STANDALONE_URL = new URL('../../wasm/flatsql-wasi.wasm', import.meta.url);
 
 const PARAM_NULL = 0;
 const PARAM_BOOL = 1;

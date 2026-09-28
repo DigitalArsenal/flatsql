@@ -372,7 +372,7 @@ function buildBandwidthStreamingMetric(flatsql, manifest, fixture, nodeId) {
     });
 }
 export async function buildMeasuredStandalonePublishEventMetrics(manifest) {
-    const { loadFlatSQLStandalone } = await import(new URL('../../wasm/standalone.js', import.meta.url).href);
+    const { loadFlatSQLStandalone } = await import(new URL('../../test/support/legacy-standalone.js', import.meta.url).href);
     const flatsql = await loadFlatSQLStandalone();
     const metrics = [];
     for (const assignment of manifest.assignments) {

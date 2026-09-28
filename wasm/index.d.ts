@@ -524,4 +524,6 @@ export function wasIntegrityVerified(): boolean;
 
 export function __testWasmPointerToByteOffset(ptr: number): number;
 
+export * from './ps.js';
+
 export default initFlatSQL;

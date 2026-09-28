@@ -2,7 +2,7 @@ import {
   detectClusterEnvironment,
   describeClusterSupport,
   isClusterModeSupported,
-} from '../src/index.js';
+} from '../src/cluster/index.js';
 
 describe('Cluster mode detection', () => {
   test('Node runtime fails closed when browser features are absent', () => {

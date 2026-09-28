@@ -6,7 +6,6 @@ import { buildFullStressDockerCompose } from '../src/stress/docker-compose.js';
 import { discoverSdsSchemas, parseSchemaMetadata } from '../src/stress/sds-discovery.js';
 import { reduceMetricEvents } from '../src/stress/metrics.js';
 import { buildMeasuredStandalonePublishEventMetrics } from '../src/stress/native-publish-event-workload.js';
-import { buildMeasuredPublishEventMetrics } from '../src/stress/publish-event-workload.js';
 import { assertProductionReadiness } from '../src/stress/production-gate.js';
 import { buildDerivedStressReport } from '../src/stress/report.js';
 import { runSmokeHarness } from '../src/stress/smoke-runner.js';
@@ -848,7 +847,7 @@ describe('SDS stress harness', () => {
     await expect(readFile(join(outputDir, 'metrics.ndjson'), 'utf8')).resolves.toContain('"measurement":"measured"');
   });
 
-  test('bounds large result stress queries while staying above the native cache row cap', () => {
+  test('bounds large result stress queries while staying above the native cache row cap', async () => {
     const manifest = buildWorkloadManifest({
       runId: 'bounded-large-result',
       nodeCount: 1,
@@ -857,7 +856,7 @@ describe('SDS stress harness', () => {
       parseSchemaMetadata('PNM', 'table PNM { FILE_ID:string; } root_type PNM;', '/schema/PNM/main.fbs'),
     ]);
 
-    const metrics = buildMeasuredPublishEventMetrics(manifest);
+    const metrics = await buildMeasuredStandalonePublishEventMetrics(manifest);
     const largeResult = metrics.find((metric) => metric.useCase === 'large-result-query');
 
     expect(largeResult).toEqual(expect.objectContaining({
@@ -866,7 +865,7 @@ describe('SDS stress harness', () => {
     }));
   });
 
-  test('bounds cold FILE_ID fanout independently from storage-fill record count', () => {
+  test('bounds cold FILE_ID fanout independently from storage-fill record count', async () => {
     const manifest = buildWorkloadManifest({
       runId: 'bounded-cold-fanout',
       nodeCount: 1,
@@ -877,7 +876,7 @@ describe('SDS stress harness', () => {
       parseSchemaMetadata('PNM', 'table PNM { FILE_ID:string; } root_type PNM;', '/schema/PNM/main.fbs'),
     ]);
 
-    const metrics = buildMeasuredPublishEventMetrics(manifest);
+    const metrics = await buildMeasuredStandalonePublishEventMetrics(manifest);
     const coldFanout = metrics.find((metric) => metric.useCase === 'cold-file-id-fanout');
 
     expect(coldFanout).toEqual(expect.objectContaining({

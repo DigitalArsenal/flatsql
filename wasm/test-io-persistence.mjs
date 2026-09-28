@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadFlatSQLStandalone } from './standalone.js';
+import { loadFlatSQLStandalone } from '../test/support/legacy-standalone.js';
 import {
   createMemoryBackend,
   createNodeFsBackend,

@@ -4,7 +4,7 @@
 // flatsql_scan_stats() counters. cpp/test/query_regression_test.cpp covers the
 // same engine natively.
 import initFlatSQL from '../wasm/index.js';
-import { loadFlatSQLStandalone } from '../wasm/standalone.js';
+import { loadFlatSQLStandalone } from './support/legacy-standalone.js';
 
 const SCHEMA = `
 table PublishEventRecord {

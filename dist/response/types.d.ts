@@ -1,4 +1,10 @@
 export type QueryResponseFormat = 'json' | 'raw-flatbuffer-stream';
+/** A query result as the SQL engines return it (columns, rows, row count). */
+export interface QueryResult {
+    columns: string[];
+    rows: any[][];
+    rowCount: number;
+}
 export type QueryResponseEncoding = 'identity';
 export interface ResponseCacheKeyInput {
     schemaName?: string;

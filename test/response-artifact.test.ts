@@ -6,7 +6,7 @@ import {
   hashString,
   MemoryResponseArtifactCache,
 } from '../src/response/index.js';
-import type { QueryResult } from '../src/index.js';
+import type { QueryResult } from '../src/response/index.js';
 
 describe('response artifacts', () => {
   test('hashes strings with the SHA-256 standard vector', () => {

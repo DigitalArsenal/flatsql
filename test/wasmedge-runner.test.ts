@@ -3,13 +3,13 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { createStandaloneArtifactBuilder } from '../src/artifacts/index.js';
 import { decodeSizePrefixedStream } from '../src/artifacts/transport.js';
 import {
   buildFlatSQLWasmEdgeRunner,
+  createFlatSQLWasmEdgeProcessRuntime,
   hasWasmEdgeBuildInputs,
 } from '../src/standalone/index.js';
-import { loadFlatSQLStandalone } from '../wasm/standalone.js';
+import { loadFlatSQLStandalone } from './support/legacy-standalone.js';
 
 const USER_SCHEMA = `
 table User {
@@ -23,18 +23,17 @@ table User {
 describe('WasmEdge process runner', () => {
   const maybeTest = hasWasmEdgeBuildInputs() ? test : test.skip;
 
-  maybeTest('builds a persistent runner and uses the C++ query cache through the artifact builder', async () => {
+  maybeTest('builds a persistent runner and uses the C++ query cache through the process runtime', async () => {
     const buildDir = await mkdtemp(join(tmpdir(), 'flatsql-wasmedge-runner-'));
     const runnerPath = join(buildDir, process.platform === 'win32' ? 'flatsql-wasmedge-runner.exe' : 'flatsql-wasmedge-runner');
     const artifact = await buildFlatSQLWasmEdgeRunner({ outputPath: runnerPath });
     expect(existsSync(artifact.outputPath)).toBe(true);
 
     const flatsql = await loadFlatSQLStandalone();
-    const builder = await createStandaloneArtifactBuilder(USER_SCHEMA, {
-      dbName: 'wasmedge-runner-cache-test',
-      runtime: 'wasmedge',
-      wasmEdgeRunnerBinary: artifact.outputPath,
-    });
+    // The process runtime directly (the standalone artifact builder that
+    // wrapped it was removed in 3.0.0).
+    const runtime = createFlatSQLWasmEdgeProcessRuntime({ runnerPath: artifact.outputPath });
+    const builder = await runtime.createDatabase(USER_SCHEMA, 'wasmedge-runner-cache-test');
 
     try {
       await builder.registerFileId('USER', 'User');
@@ -46,10 +45,9 @@ describe('WasmEdge process runner', () => {
       await builder.configureQueryCache({ maxEntries: 16, maxRows: 8 });
       await builder.registerQueryTemplate('userByEmail', 'SELECT id FROM User WHERE email = ?', true);
 
-      await expect(builder.queryTemplate('userByEmail', ['alice@example.com'])).resolves.toEqual({
+      await expect(builder.queryTemplate('userByEmail', ['alice@example.com'])).resolves.toMatchObject({
         columns: ['id'],
         rows: [[1]],
-        rowCount: 1,
       });
       await expect(builder.getQueryCacheStats()).resolves.toMatchObject({
         hits: 0,
@@ -59,10 +57,9 @@ describe('WasmEdge process runner', () => {
         maxRows: 8,
       });
 
-      await expect(builder.queryTemplate('userByEmail', ['alice@example.com'])).resolves.toEqual({
+      await expect(builder.queryTemplate('userByEmail', ['alice@example.com'])).resolves.toMatchObject({
         columns: ['id'],
         rows: [[1]],
-        rowCount: 1,
       });
       await expect(builder.getQueryCacheStats()).resolves.toMatchObject({ hits: 1, misses: 1, size: 1 });
       await expect(builder.getFlatBufferByIndex('User', 'email', ['alice@example.com'])).resolves.toBeInstanceOf(Uint8Array);
@@ -74,7 +71,7 @@ describe('WasmEdge process runner', () => {
         flatsql.createTestUser(2, 'Bob', 'bob@example.com', 25),
       ]);
       await expect(
-        builder.buildResponseArtifactCacheKey('PNM', '2', ' SELECT   *   FROM PNM WHERE FILE_ID = ? ', {
+        runtime.buildResponseArtifactCacheKey('PNM', '2', ' SELECT   *   FROM PNM WHERE FILE_ID = ? ', {
           format: 'raw',
           publishEventKey: 'PNM-event-1',
           projection: ['FILE_ID'],
@@ -84,7 +81,8 @@ describe('WasmEdge process runner', () => {
         'flatsql:response:v1|s=504e4d|v=32|f=726177|e=504e4d2d6576656e742d31|q=53454c454354202a2046524f4d20504e4d2057484552452046494c455f4944203d203f|c=1:46494c455f4944|p=1:s=504e4d7c3432'
       );
     } finally {
-      await builder.close();
+      await builder.destroy();
+      await runtime.close();
     }
   }, 30000);
 });

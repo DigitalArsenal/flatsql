@@ -493,7 +493,7 @@ function buildBandwidthStreamingMetric(
 }
 
 export async function buildMeasuredStandalonePublishEventMetrics(manifest: WorkloadManifest): Promise<MetricEvent[]> {
-  const { loadFlatSQLStandalone } = await import(new URL('../../wasm/standalone.js', import.meta.url).href);
+  const { loadFlatSQLStandalone } = await import(new URL('../../test/support/legacy-standalone.js', import.meta.url).href);
   const flatsql = await loadFlatSQLStandalone() as StandaloneFlatSQL;
   const metrics: MetricEvent[] = [];
 

@@ -1,7 +1,7 @@
-import type { QueryResult } from '../core/database.js';
 import { sizePrefixedByteLength, writeSizePrefixedStream } from '../artifacts/transport.js';
 import { createResponseCacheKey, hashBytes } from './cache-key.js';
 import type {
+  QueryResult,
   QueryResponseArtifact,
   QueryResponseArtifactChunk,
   QueryResponseArtifactOptions,

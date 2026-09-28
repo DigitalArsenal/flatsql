@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import FlatSQLModule from './flatsql.js';
-import { loadFlatSQLStandalone } from './standalone.js';
+import { loadFlatSQLStandalone } from '../test/support/legacy-standalone.js';
 
 const schema = `
   table User {

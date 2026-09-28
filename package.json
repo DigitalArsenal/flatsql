@@ -1,26 +1,36 @@
 {
   "name": "flatsql",
-  "version": "2.0.3",
-  "description": "SQL queries over raw FlatBuffer storage - zero conversion, real-time indexing, pure streaming",
+  "version": "3.0.0",
+  "description": "SQL queries over raw FlatBuffer storage: the SQLite-backed wasm engine and the multithreaded partition store (flatsql-ps-threads.wasm)",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "wasm/index.js",
+  "types": "wasm/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "types": "./wasm/index.d.ts",
+      "import": "./wasm/index.js"
     },
     "./wasm": {
       "types": "./wasm/index.d.ts",
       "import": "./wasm/index.js"
     },
+    "./ps": {
+      "types": "./wasm/ps.d.ts",
+      "import": "./wasm/ps.js"
+    },
+    "./ps-threads.wasm": "./wasm/flatsql-ps-threads.wasm",
+    "./ps/node-host": {
+      "types": "./wasm/ps-node-host.d.mts",
+      "import": "./wasm/ps-node-host.mjs"
+    },
+    "./ps/fault": {
+      "types": "./wasm/ps-node-fault.d.mts",
+      "import": "./wasm/ps-node-fault.mjs"
+    },
+    "./integrity.json": "./wasm/integrity.json",
     "./wasi": {
       "types": "./wasm/wasi.d.ts",
       "import": "./wasm/wasi.js"
-    },
-    "./standalone": {
-      "types": "./wasm/standalone.d.ts",
-      "import": "./wasm/standalone.js"
     },
     "./io": {
       "types": "./wasm/flatsql-io.d.ts",
@@ -30,10 +40,6 @@
       "types": "./dist/artifacts/index.d.ts",
       "import": "./dist/artifacts/index.js"
     },
-    "./artifacts/standalone": {
-      "types": "./dist/artifacts/standalone-builder.d.ts",
-      "import": "./dist/artifacts/standalone-builder.js"
-    },
     "./response": {
       "types": "./dist/response/index.d.ts",
       "import": "./dist/response/index.js"
@@ -41,6 +47,22 @@
     "./standalone/wasmedge": {
       "types": "./dist/standalone/index.d.ts",
       "import": "./dist/standalone/index.js"
+    },
+    "./btree": {
+      "types": "./dist/btree/index.d.ts",
+      "import": "./dist/btree/index.js"
+    },
+    "./storage": {
+      "types": "./dist/storage/index.d.ts",
+      "import": "./dist/storage/index.js"
+    },
+    "./schema": {
+      "types": "./dist/schema/index.d.ts",
+      "import": "./dist/schema/index.js"
+    },
+    "./cluster": {
+      "types": "./dist/cluster/index.d.ts",
+      "import": "./dist/cluster/index.js"
     },
     "./wasi.wasm": "./wasm/flatsql-wasi.wasm",
     "./sdm": {
@@ -66,7 +88,14 @@
     "docs/response-artifacts.md",
     "docs/agents/*.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "wasm/ps-node-host.mjs",
+    "wasm/ps-node-guest.mjs",
+    "wasm/ps-node-imports.mjs",
+    "wasm/ps-node-fault.mjs",
+    "wasm/*.d.mts",
+    "docs/PARTITION-STORE-WASM.md",
+    "docs/PARTITION-STORE.md"
   ],
   "scripts": {
     "build": "tsc",
@@ -83,7 +112,7 @@
     "bench": "node bench/flatsql-perf.mjs",
     "bench:perf": "node bench/flatsql-perf.mjs",
     "bench:perf:profile": "node bench/flatsql-perf.mjs --profile",
-    "prepublishOnly": "npm run build && npm run check:dist && npm run test:wasi && npm run test:wasmedge && npm test -- --runInBand --runTestsByPath test/package-exports.test.ts test/wasm-generic-extractor.test.ts test/wasm-pointer.test.ts",
+    "prepublishOnly": "npm run build && npm run check:dist && npm run check:imports && npm run check:integrity && npm run test:wasi && npm test -- --runInBand --runTestsByPath test/package-exports.test.ts test/wasm-generic-extractor.test.ts test/wasm-pointer.test.ts test/ps-node-threads.test.ts",
     "emsdk:install": "bash scripts/install-emsdk.sh",
     "emsdk:env": "echo 'Run: source packages/emsdk/emsdk_env.sh'",
     "test:wasi": "node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasi.test.ts test/standalone-wasm-imports.test.ts",
@@ -128,14 +157,19 @@
   ],
   "author": "Edgesource Corporation <tj@edgesource.com>",
   "license": "PolyForm-Noncommercial-1.0.0",
-  "dependencies": {
-    "flatbuffers": "^25.9.23",
-    "flatc-wasm": "^26.1.32",
-    "sql.js": "^1.10.0"
+  "dependencies": {},
+  "peerDependencies": {
+    "space-data-module-sdk": ">=0.8.24 <0.9.0"
+  },
+  "peerDependenciesMeta": {
+    "space-data-module-sdk": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/jest": "^29.5.0",
     "@types/node": "^20.0.0",
+    "flatc-wasm": "^26.1.32",
     "jest": "^29.7.0",
     "space-data-module-sdk": "0.8.24",
     "ts-jest": "^29.1.0",

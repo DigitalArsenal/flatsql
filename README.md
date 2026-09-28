@@ -16,6 +16,31 @@ Try FlatSQL in your browser: **[https://digitalarsenal.github.io/flatsql/](https
 npm install flatsql
 ```
 
+### 3.0: the partition store
+
+`flatsql` 3.x ships the multithreaded partition store as one
+`wasm32-wasip1-threads` artifact, `flatsql/ps-threads.wasm`: one writer per
+(producer, SDS type) partition on a pinned pool of writer threads, durable
+acks, and reader lanes that read committed snapshots and never wait on writers.
+Hosts instantiate it over a shared memory and provide WASI preview1,
+`wasi.thread-spawn` and the seven `flatsql_io_*` imports; its sha256 is in
+`flatsql/integrity.json`.
+
+```javascript
+import { loadFlatSQLPsThreads, getFlatSQLPsThreadsURL } from 'flatsql';
+import { createPsNodeInstance } from 'flatsql/ps/node-host'; // Node; needs space-data-module-sdk >= 0.8.24
+
+const bytes = await loadFlatSQLPsThreads(); // checked against integrity.json
+const writer = await createPsNodeInstance(bytes, { root: './store-root' });
+```
+
+See [docs/PARTITION-STORE-WASM.md](docs/PARTITION-STORE-WASM.md) (artifact,
+Node host, acceptance) and [docs/PARTITION-STORE.md](docs/PARTITION-STORE.md)
+(the engine). 3.0.0 removed the TypeScript engine (`FlatSQLDatabase` from
+`src/`, `DirectAccessor`, `FlatcAccessor`), the `node:sqlite` artifact builder,
+`flatsql/standalone`, `flatsql/artifacts/standalone` and the `sql.js` and
+`flatbuffers` dependencies; the package root is the wasm bindings.
+
 ## Quick Start
 
 ```javascript
@@ -119,13 +144,12 @@ FlatBuffer and aligned-binary representations for the same schema identity.
 shared-memory views; durable, network, and fallback records remain canonical
 size-prefixed FlatBuffers.
 
-- Production should prefer the SQLite-backed native/WASM path (`initFlatSQL` → `FlatSQL` → `createDatabase`). The pure TypeScript `FlatSQLDatabase` is preserved only as an explicit fallback/reference implementation for environments that cannot load the WASM module.
-- Standalone deployments use the C++ WASI reactor at `flatsql/wasi.wasm`. Browser hosts load it through `flatsql/standalone`, while Node/WasmEdge hosts use a resident runner from `flatsql/standalone/wasmedge`.
+- The SQLite-backed WASM path is `initFlatSQL` → `FlatSQL` → `createDatabase` (the package root and `flatsql/wasm`).
+- Standalone deployments use the C++ WASI reactor at `flatsql/wasi.wasm`; Node/WasmEdge hosts use a resident runner from `flatsql/standalone/wasmedge`. The partition store is `flatsql/ps-threads.wasm` (Node host: `flatsql/ps/node-host`).
 - Artifact-builder cache behavior belongs to C++: query templates, result-cache keys, invalidation generation, hit/miss counters, SQL execution, and raw FlatBuffer lookup all live in the WASM database instance. JavaScript only marshals bytes and fills host capability gaps.
 - Use `db.ingestBuffers([...])` on the WASM path when your input is already a set of raw FlatBuffers. It feeds the native bulk-stream ingest path instead of looping through `ingestOne(...)`.
-- Run `npm run bench` (alias `npm run bench:perf`) as the single-command benchmark matrix for FlatSQL JS vs FlatSQL WASM. Use `npm run bench:perf:profile` to print the WASM ingest phase breakdown (`pack`, `decode`, `append`, `index`, `verify`) alongside the gate table.
-  Profiling mode is diagnostic and includes instrumentation overhead; use the non-profile benchmark for merge-gate decisions.
-- Run `npm run test:cluster` for the native WAL-backed cluster validation workload, or `npm run test:cluster:smoke` for the short preflight run.
+- Run `npm run bench` (alias `npm run bench:perf`) for the WASM ingest benchmark (medians and records/s). Use `npm run bench:perf:profile` to print the ingest phase breakdown (`pack`, `decode`, `append`, `index`, `verify`); profiling is diagnostic and slower by design.
+- Run `npm run test:cluster` for the native cluster validation workload, or `npm run test:cluster:smoke` for the short preflight run. See [docs/performance.md](docs/performance.md).
 
 ## SDS Stress Harness
 
@@ -159,19 +183,18 @@ Use these entrypoints when wiring agents or deployments:
 
 | Import | Runtime | Use for |
 |--------|---------|---------|
-| `flatsql/wasm` | Emscripten JS wrapper + C++ WASM | Existing browser/Node API |
-| `flatsql/standalone` | Raw `flatsql-wasi.wasm` + small JS WASI shim | Browser or Node direct WebAssembly API |
-| `flatsql/artifacts/standalone` | C++ artifact builder facade | Cache-centric artifact workflows |
+| `flatsql`, `flatsql/wasm` | Emscripten JS wrapper + C++ WASM | Browser/Node SQLite-backed engine |
+| `flatsql/ps-threads.wasm`, `flatsql/ps` | The partition store artifact and its locator | Multithreaded partition store hosts |
+| `flatsql/ps/node-host` | Node wasi-threads host (thread pool, WASI, flatsql_io, fault overlay) | Tests and Node processes |
 | `flatsql/response` | Response artifact bytes | ETags, chunks, and raw byte artifacts keyed by native runtime cache keys |
 | `flatsql/standalone/wasmedge` | Native WasmEdge runner builder/client | Persistent standalone runtime in Node |
-| `flatsql` `FlatSQLDatabase` | Pure TypeScript fallback | Reference or no-WASM environments only |
 
 For repeated FILE_ID-style traffic, register a cacheable query template once and call `queryTemplate(...)` with positional params. Identical query IDs and params hit the C++ result cache; ingest, load, template changes, and explicit `clearQueryCache()` invalidate stale entries by generation.
 
 ```javascript
-import { createStandaloneArtifactBuilder } from 'flatsql/artifacts/standalone';
+import { initFlatSQL } from 'flatsql';
 
-const builder = await createStandaloneArtifactBuilder(schema, { runtime: 'standalone' });
+const builder = (await initFlatSQL()).createDatabase(schema, 'users');
 await builder.registerFileId('USER', 'User');
 await builder.enableDemoExtractors();
 await builder.ingestBuffers(buffers);
@@ -185,20 +208,17 @@ console.log(await builder.getQueryCacheStats());
 
 The native cache holds up to 1024 results within a 64 MiB budget, evicting the least recently used result to stay under it; a result bigger than the whole budget is not cached. `maxRows` caps any single result (default 1,000,000 rows). Tune `maxEntries` and `maxRows` for production FILE_ID traffic instead of recompiling the C++ core.
 
-For WasmEdge, build the small host runner and pass it to the same builder. The runner keeps one WASI module instance resident so cache state survives across requests.
+For WasmEdge, build the small host runner and open a database through its process runtime. The runner keeps one WASI module instance resident so cache state survives across requests.
 
 ```javascript
-import { createStandaloneArtifactBuilder } from 'flatsql/artifacts/standalone';
-import { buildFlatSQLWasmEdgeRunner } from 'flatsql/standalone/wasmedge';
+import { buildFlatSQLWasmEdgeRunner, createFlatSQLWasmEdgeProcessRuntime } from 'flatsql/standalone/wasmedge';
 
 const runner = await buildFlatSQLWasmEdgeRunner({
   outputPath: './build/flatsql-wasmedge-runner',
 });
 
-const builder = await createStandaloneArtifactBuilder(schema, {
-  runtime: 'wasmedge',
-  wasmEdgeRunnerBinary: runner.outputPath,
-});
+const runtime = createFlatSQLWasmEdgeProcessRuntime({ runnerPath: runner.outputPath });
+const builder = await runtime.createDatabase(schema, 'users');
 ```
 
 WasmEdge must support WebAssembly exception handling for this artifact. The test runner uses `wasmedge --enable-exception-handling --reactor wasm/flatsql-wasi.wasm _initialize` for the smoke check and the native C API runner enables the same proposal programmatically. Some Node 24 builds require `node --experimental-wasm-exnref` when directly instantiating the standalone WASI artifact.
@@ -290,48 +310,19 @@ const exported = db.exportData();
 db.destroy();
 ```
 
-### TypeScript (Pure JavaScript)
+### TypeScript engine (removed)
 
-A TypeScript implementation for environments where WASM isn't available:
-
-```typescript
-import { FlatSQLDatabase, FlatcAccessor } from 'flatsql';
-import { FlatcRunner } from 'flatc-wasm';
-
-const flatc = await FlatcRunner.init();
-
-const schema = `
-  namespace App;
-
-  table User {
-    id: int (key);
-    name: string (required);
-    email: string;
-    age: int;
-  }
-`;
-
-const accessor = new FlatcAccessor(flatc, schema);
-const db = FlatSQLDatabase.fromSchema(schema, accessor, 'myapp');
-
-// Insert records
-db.insert('User', { id: 1, name: 'Alice', email: 'alice@example.com', age: 30 });
-db.insert('User', { id: 2, name: 'Bob', email: 'bob@example.com', age: 25 });
-
-// Query
-const result = db.query('SELECT name, email FROM User WHERE age > 20');
-console.log(result.rows);
-
-// Export as standard FlatBuffers
-const exported = db.exportData();
-```
+The pure TypeScript engine (`FlatSQLDatabase` with `DirectAccessor` /
+`FlatcAccessor`) was removed in 3.0.0; `flatsql` 2.x still carries it. The
+BTree, stacked store and schema parser remain as `flatsql/btree`,
+`flatsql/storage` and `flatsql/schema`.
 
 ### Cluster Runtime Detection
 
 Use the runtime guard helpers before attempting browser cluster mode:
 
 ```typescript
-import { detectClusterEnvironment, isClusterModeSupported } from 'flatsql';
+import { detectClusterEnvironment, isClusterModeSupported } from 'flatsql/cluster';
 
 const env = detectClusterEnvironment();
 if (!isClusterModeSupported(env)) {
@@ -504,17 +495,14 @@ const back = sdm.fromECEF(ecef.x, ecef.y, ecef.z);
 
 ## SQL Support
 
-FlatSQL ships two query engines. The WASM engine (`initFlatSQL()`) embeds
-SQLite and speaks full SQL. The pure-JS engine (`FlatSQLDatabase`, used where a
-WASM instance is not available) implements the focused subset below.
+The WASM engines (`initFlatSQL()`, the partition store's reader lanes) embed
+SQLite. (The pure-JS engine and its SQL subset were removed in 3.0.0.)
 
 ### Fail-closed guarantee
 
-Both engines reject what they cannot execute. In particular the JS engine
-**throws** on a `WHERE`, `ORDER BY`, or `LIMIT` clause its grammar does not
-understand. It never falls back to an unfiltered scan: a caller that asks for a
-subset must get that subset or an error, never the whole table with no
-indication that the filter was dropped.
+The engines reject what they cannot execute: a caller that asks for a subset
+gets that subset or an error, never the whole table with no indication that
+the filter was dropped.
 
 ### Supported
 
@@ -652,6 +640,8 @@ npm test -- --runInBand --runTestsByPath test/package-exports.test.ts
 ```
 
 Output: `wasm/flatsql.js`, `wasm/flatsql.wasm`, `wasm/flatsql-wasi.wasm`, `sdm/flatsql-spatial.wasm`, and docs copies for GitHub Pages.
+
+The partition store artifact `wasm/flatsql-ps-threads.wasm` needs wasi-sdk 30 (`WASI_SDK_PATH`) and builds with `npm run build:wasm:ps` (`npm run build:wasm:ps-tests` adds the wasm test commands); see docs/PARTITION-STORE-WASM.md.
 
 ### Run Demo Locally
 

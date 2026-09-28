@@ -1,4 +1,4 @@
-import { loadFlatSQLStandalone } from '../wasm/standalone.js';
+import { loadFlatSQLStandalone } from './support/legacy-standalone.js';
 import { decodeSizePrefixedStream } from '../src/artifacts/transport.js';
 
 const USER_SCHEMA = `
