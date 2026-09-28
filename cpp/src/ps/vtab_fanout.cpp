@@ -187,33 +187,29 @@ public:
     // Arrival entry -> its live FIRST copy (REHOME after promotion, A14).
     int32_t resolve(const ArrivalEntry& e, CurRow* out) {
         LaneStore& st = lane_->store();
-        uint32_t pid = e.pid;
-        uint64_t pseq = e.pseq;
-        uint32_t rpid;
-        uint64_t rpseq;
-        bool found = false;
-        int32_t rc = st.rehomeOf(*ts_, e.gseq, &rpid, &rpseq, &found);
+        int32_t rc = st.rehomeOf(*ts_, e.gseq, &cands_);
         if (rc < 0) return rc;
-        if (found) {
-            pid = rpid;
-            pseq = rpseq;
+        if (cands_.empty()) cands_.push_back({e.pid, e.pseq});
+        for (const auto& c : cands_) {
+            if (!allowed_.empty() && !std::binary_search(allowed_.begin(), allowed_.end(), c.first)) continue;
+            PartSnap* snap = nullptr;
+            rc = lane_->partForType(stmt_, c.first, ts_->fid, &snap);
+            if (rc < 0) return rc;
+            RowFilter f;
+            f.store = &st;
+            f.stmt = stmt_;
+            f.snap = snap;
+            f.bound = std::min(snap->pseqHi(), ts_->labeledThrough(c.first));
+            f.source = src_;
+            f.hasSource = hasSrc_;
+            rc = f.accept(c.second, out);
+            if (rc < 0) return rc;
+            if (rc == 0) continue;
+            out->gseq = e.gseq;
+            out->key.clear();
+            return 1;
         }
-        if (!allowed_.empty() && !std::binary_search(allowed_.begin(), allowed_.end(), pid)) return 0;
-        PartSnap* snap = nullptr;
-        rc = lane_->partForType(stmt_, pid, ts_->fid, &snap);
-        if (rc < 0) return rc;
-        RowFilter f;
-        f.store = &st;
-        f.stmt = stmt_;
-        f.snap = snap;
-        f.bound = std::min(snap->pseqHi(), ts_->labeledThrough(pid));
-        f.source = src_;
-        f.hasSource = hasSrc_;
-        rc = f.accept(pseq, out);
-        if (rc != 1) return rc;
-        out->gseq = e.gseq;
-        out->key.clear();
-        return 1;
+        return 0;
     }
 
 private:
@@ -225,6 +221,7 @@ private:
     std::string src_;
     bool hasSrc_;
     std::vector<uint32_t> allowed_;  // sorted; empty = every partition
+    std::vector<std::pair<uint32_t, uint64_t>> cands_;
     bool started_ = false;
     uint64_t begin_ = 0, end_ = 0, pos_ = 0;
     std::vector<ArrivalEntry> buf_;

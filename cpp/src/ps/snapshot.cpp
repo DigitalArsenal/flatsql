@@ -1501,7 +1501,9 @@ int32_t LaneStore::labelOf(const TypeSnap& t, uint32_t pid, uint64_t pseq, uint8
     uint64_t bestTcs = 0;
     const int32_t rc = lookupType(t, kIxTypeLabel, k, 12, [&](const uint8_t* v) {
         const uint64_t tcs = getBE64(v);
-        if (!*found || tcs > bestTcs) {
+        // Equal tcs (one type batch labeled the copy REPEAT, then promoted
+        // it): FIRST is the later state.
+        if (!*found || tcs > bestTcs || (tcs == bestTcs && v[16] == kLblFirst)) {
             bestTcs = tcs;
             *gseq = getBE64(v + 8);
             *label = v[16];
@@ -1512,19 +1514,21 @@ int32_t LaneStore::labelOf(const TypeSnap& t, uint32_t pid, uint64_t pseq, uint8
     return rc;
 }
 
-int32_t LaneStore::rehomeOf(const TypeSnap& t, uint64_t gseq, uint32_t* pid, uint64_t* pseq, bool* found) {
-    *found = false;
+int32_t LaneStore::rehomeOf(const TypeSnap& t, uint64_t gseq, std::vector<std::pair<uint32_t, uint64_t>>* cands) {
+    cands->clear();
     uint8_t k[8];
     putBE64(k, gseq);
     uint64_t bestTcs = 0;
+    // Every REHOME of the latest type commit that promoted this gseq: one
+    // batch can promote, kill and promote again; its entries share a tcs and
+    // at most one of them is still live (the caller checks).
     return lookupType(t, kIxTypeRehome, k, 8, [&](const uint8_t* v) {
         const uint64_t tcs = getBE64(v);
-        if (!*found || tcs > bestTcs) {
+        if (cands->empty() || tcs > bestTcs) {
             bestTcs = tcs;
-            *pid = getBE32(v + 8);
-            *pseq = getBE64(v + 12);
-            *found = true;
+            cands->clear();
         }
+        if (tcs == bestTcs) cands->push_back({getBE32(v + 8), getBE64(v + 12)});
         return true;
     });
 }
@@ -1543,7 +1547,10 @@ int32_t LaneStore::catalog(const TypeSnap& t, const uint8_t cid[kCidLen], std::v
         c.len = getBE32(v + 29);
         for (auto& e : *out) {
             if (e.pid == c.pid && e.pseq == c.pseq) {
-                if (c.tcs >= e.tcs) e = c;
+                // Equal tcs: the label that can only come later wins (the
+                // writer's rule, type_owner.cpp upsertCopy).
+                auto rank = [](uint8_t l) { return l == kLblDead ? 9 : int(l); };
+                if (c.tcs > e.tcs || (c.tcs == e.tcs && rank(c.label) >= rank(e.label))) e = c;
                 return true;
             }
         }

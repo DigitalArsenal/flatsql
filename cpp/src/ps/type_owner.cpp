@@ -129,13 +129,23 @@ int32_t committedCatalog(TCtx& c, const uint8_t* key, F&& visit) {
     return 0;
 }
 
+// One type batch may post several catalog entries for one copy (labeled
+// REPEAT, promoted, then killed by a later row of the same batch). They share
+// the batch's tcs, and postings sort by value, so the in-batch order is lost:
+// at equal tcs the label that can only come later wins (a copy never leaves
+// DEAD, and a REPEAT only ever becomes PROMOTED).
+int labelRank(uint8_t label) { return label == kLabelDead ? 9 : label; }
+bool supersedesCopy(uint64_t tcs, uint8_t label, uint64_t curTcs, uint8_t curLabel) {
+    return tcs > curTcs || (tcs == curTcs && labelRank(label) >= labelRank(curLabel));
+}
+
 // Upserts a copy in the per-batch cid state (latest tcs wins per (pid, pseq)).
 void upsertCopy(StageScratch& sc, StageScratch::TCid* tc, uint32_t pid, uint64_t pseq, uint64_t tcs,
                 uint8_t label, uint64_t gseq, uint32_t len) {
     for (int32_t i = tc->copies; i >= 0; i = sc.tcopies[i].next) {
         StageScratch::TCopy& cp = sc.tcopies[i];
         if (cp.pid == pid && cp.pseq == pseq) {
-            if (tcs >= cp.tcs) {
+            if (supersedesCopy(tcs, label, cp.tcs, cp.label)) {
                 cp.tcs = tcs;
                 cp.label = label;
                 cp.gseq = gseq;

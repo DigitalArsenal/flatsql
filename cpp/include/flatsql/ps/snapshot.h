@@ -353,7 +353,7 @@ public:
     // REHOME of a gseq; every catalog copy of a cid (latest tcs per copy).
     int32_t labelOf(const TypeSnap& t, uint32_t pid, uint64_t pseq, uint8_t* label, uint64_t* gseq,
                     bool* found);
-    int32_t rehomeOf(const TypeSnap& t, uint64_t gseq, uint32_t* pid, uint64_t* pseq, bool* found);
+    int32_t rehomeOf(const TypeSnap& t, uint64_t gseq, std::vector<std::pair<uint32_t, uint64_t>>* candidates);
     int32_t catalog(const TypeSnap& t, const uint8_t cid[kCidLen], std::vector<CatalogCopy>* out);
 
     // Arrivals (A15): entry at a position, and the first position whose
