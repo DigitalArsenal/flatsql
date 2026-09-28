@@ -492,3 +492,67 @@ readers and are covered by T1's suites as well as T2's.
 | Catalog precedence at equal tcs: DEAD > PROMOTED > REPEAT > FIRST (writer `upsertCopy`, reader `catalog`/`labelOf`; REHOME candidates of one tcs resolved by liveness) | **T1 defect** found by the fan-out oracle: a batch that promoted a REPEAT and then killed it left two entries with one tcs; value order made the copy read as live, and a returning copy was labeled REPEAT instead of FIRST. |
 | A cid's catalog is gathered, resolved per copy and loaded without its dead copies | **T1 defect** found by the A14 reader test: a cid killed and re-added over 1,000 times overflowed the per-batch copy table, dropped its live REPEAT, and died without an heir (63 of 64 promotions at round 1,027). |
 | Writer threads tag themselves for the lock report | Lock-set disjointness instrumentation (T2 #1). |
+
+## 20. Acceptance (§18 T2 as amended)
+
+ACCEPTANCE_TABLE_PLACEHOLDER
+
+## 21. Design deviations (T2)
+
+Each entry: what the design says, what was built, why, and the evidence.
+
+1. **Fan-out sub-cursors run inline; no idle-lane borrowing** (§5.3: "borrows
+   idle lanes … as sub-cursor producers … when no lane is idle, the
+   sub-cursors run inline"). Only the inline form is built. A partition
+   sub-cursor costs its sections' binary searches and one block per L1 run;
+   the measured window cost (§20 #1) is dominated by per-row label, liveness
+   and row reads that a producer lane would not remove. Borrowing is an
+   optimization T6 can add behind the same `RowSource` interface.
+2. **Type-level FIRST test per row, not a REPEAT merge-join** (§8.6). Index
+   order is not pseq order, so a merge-join with the REPEAT run applies only to
+   pseq scans. Rows test the REPEAT bloom (REPEAT became a lookup kind); only
+   rows with a REPEAT posting read their latest LABEL. Arrivals order does
+   merge-join (GONE, REHOME).
+3. **Offset paging by GONE counts in arrivals order, not per-block live-FIRST
+   counts in L1 fences** (§9, A17). T1's merges write each block's entry count
+   as its live count, and liveness changes after a merge; a new type kind,
+   GONE, is counted by fences instead (§18). Offset paging is pushed down for
+   `_gseq`/`_rowid` order (the data explorer's order); the default and CID
+   orders page through SQLite (O(offset)).
+4. **A15 #8 without arrivals compaction.** Arrivals compaction (dropping dead
+   entries) is T3's. Dead runs are skipped by galloping over GONE fence counts;
+   the bound holds for rows and for arrival entries examined, but a history
+   whose deaths are scattered one-in-a-hundred costs about 60 fence probes per
+   live row (§20 #8) until T3 compacts it.
+5. **RB1 cells are typed per cell** (§9: a type vector per block). SQLite
+   values are dynamically typed per row.
+6. **One result ring per request slot** (256 KiB default), parked per
+   statement, rather than one 1 MiB ring per lane (A28 parking is per
+   statement either way).
+7. **Sandbox work budget adds VM steps** to rows examined and bytes read, so a
+   statement that reads nothing (a recursive CTE) is bounded too; the A18
+   window counts the newest N arrivals entries (dead included), not N
+   FIRST-live records (one entry read instead of a count).
+8. **`<TYPE>@<source>` matches live tag instances of the FIRST copy's PUT** in
+   its partition. An untagged record never matches a source (the legacy
+   `_source` falls back to the producer token for untagged rows); T6's
+   equivalence run on a migrated copy decides whether that case exists.
+9. **Type-level visibility is labeled rows only**; the A20 read-your-writes
+   scan of the unlabeled gap belongs to `GetRecord` (T6), which can use the
+   partition vtab (partition-level visibility is the acked HWM).
+10. **Interactive lanes at nice −5 on ≤ 2 vCPU** (A28) needs privileges the
+    engine does not have natively; bulk lanes do take nice +10 on Linux. The
+    host (T5/T6) sets both.
+11. **Shared index cache, try-locked.** The design budgets a 16 MiB block cache
+    per reader instance; the built cache holds parsed index pieces (L0 sections,
+    fences, blooms) for all lanes of an instance and is only ever try-locked, so
+    lanes never wait on each other. Per-lane budgets (4 MiB) hold manifests and
+    run views; 4,096 host handles per lane (virtual handles; T5 bounds real fds).
+12. **SWAP seam built in the writer** (T3's scope). `Engine::swapSegment` copies
+    a fully merged sealed segment verbatim to `c-<seg>-<gen>.*`, commits SWAP
+    with a new manifest, and reports the retired files; it has no
+    INTENT_COMPACT (T3 adds it with crash handling). Rows stay dense by pseq.
+13. **Lock disjointness natively covers SQLite's mutexes and the shared
+    cache**; the host handle table is measured under WasmEdge (A29, T5/T6).
+14. **CounterReader reads heads** (O(partitions) preads), the A28 path without
+    a lane; the Go snapshot refreshed on every acked commit is T6's.

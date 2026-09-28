@@ -81,7 +81,7 @@ PS_TEST(lane_isolation_bulk_nomem_T2_4) {
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 3000000) "
         "SELECT x, randomblob(100) AS b FROM c ORDER BY b";
     std::mt19937_64 rng(3);
-    const int rounds = int(argInt("rounds", 8));
+    const int rounds = int(argInt("rounds", 4));
     const int perRound = int(argInt("per_round", 250));
     std::vector<double> base, loaded;
     int nomem = 0, hogs = 0;

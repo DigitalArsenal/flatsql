@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -36,9 +37,29 @@ struct Harness {
     std::vector<uint32_t> pids;
     std::vector<std::string> tokens;
     std::vector<std::atomic<int>> sent;  // records acked per partition
+    Io* io = nullptr;
+    std::string dir;
+    // --dir=<path>: a real file system (the native host); retired files are
+    // really unlinked, so long runs stay bounded on disk. Default: in memory.
     explicit Harness(int parts) : sent(size_t(parts)) {
         s.cfg.sealBytes = 256u << 10;  // many sealed segments
         s.cfg.mergeL0Blocks = 4;
+        io = s.fs.get();
+        dir = argStr("dir", "");
+        if (!dir.empty()) {
+            std::filesystem::remove_all(dir);
+            std::filesystem::create_directories(dir);
+            s.cfg.io = nullptr;
+            s.cfg.root = dir;
+            s.root = dir;
+            io = importIo();
+        }
+    }
+    ~Harness() {
+        if (!dir.empty()) {
+            s.close();
+            std::filesystem::remove_all(dir);
+        }
     }
     void fill(int perPart) {
         s.registerTypes({&ommType()});
@@ -69,7 +90,7 @@ struct Retired {
 
 void unlinkRetired(Harness& h, const Retired& r) {
     IoStats st;
-    IoCtx io(h.s.fs.get(), &st);
+    IoCtx io(h.io, &st);
     const char* exts[3] = {"fsd", "fsr", "fsa"};
     const char letters[3] = {'d', 'r', 'a'};
     for (int k = 0; k < 3; k++) {
@@ -103,7 +124,7 @@ void runSwapsUnderLoad(int targetSwaps, uint64_t maxSeconds) {
     REQUIRE(waitLabeledEngine(h.s.e.get(), h.pids, 60000000000ull));
     ReaderConfig rc;
     rc.root = h.s.root;
-    rc.io = h.s.fs.get();
+    rc.io = h.io;
     rc.cls = LaneClass::Bulk;
     rc.lanes = 3;
     rc.ringBytes = 64u << 10;
@@ -235,7 +256,7 @@ void runSwapsUnderLoad(int targetSwaps, uint64_t maxSeconds) {
     h.s.close();
     // The writer reopens on the SWAPped manifests (the owner reads c-* files).
     REQUIRE(h.s.open() == 0);
-    Reader again(h.s, LaneClass::Bulk, 1);
+    Reader again(h.io, h.s.root, LaneClass::Bulk, 1);
     for (size_t p = 0; p < h.pids.size(); p++) {
         Rows r = again.q("SELECT count(*) FROM sds_p_" + h.tokens[p] + "__OMM");
         CHECK_EQ(r.status, 0);
@@ -255,7 +276,7 @@ PS_TEST(snapshot_unlink_without_announce_is_snapshot_gone) {
     REQUIRE(waitLabeledEngine(h.s.e.get(), h.pids, 60000000000ull));
     ReaderConfig rc;
     rc.root = h.s.root;
-    rc.io = h.s.fs.get();
+    rc.io = h.io;
     rc.cls = LaneClass::Bulk;
     rc.lanes = 1;
     rc.ringBytes = 16u << 10;
@@ -299,10 +320,10 @@ void runExportUnderCompaction(uint64_t seconds) {
     REQUIRE(h.s.open() == 0);
     h.fill(3000);
     REQUIRE(waitLabeledEngine(h.s.e.get(), h.pids, 60000000000ull));
-    REQUIRE(waitTypeVisible(h.s.fs.get(), h.s.root, ommType().fid, h.pids, 60000000000ull));
+    REQUIRE(waitTypeVisible(h.io, h.s.root, ommType().fid, h.pids, 60000000000ull));
     ReaderConfig rc;
     rc.root = h.s.root;
-    rc.io = h.s.fs.get();
+    rc.io = h.io;
     rc.cls = LaneClass::Bulk;
     rc.lanes = 2;
     rc.ringBytes = 64u << 10;
@@ -324,7 +345,14 @@ void runExportUnderCompaction(uint64_t seconds) {
     std::deque<Retired> retired;
     const uint64_t until = monoNs() + seconds * 1000000000ull;
     int k = 0;
+    // The in-memory host keeps every file it ever held (unlinked ones too):
+    // bound the SWAPs there; on a real file system (--dir) they run freely.
+    const int maxSwaps = int(argInt("max_swaps", h.dir.empty() ? 300 : 1 << 30));
     while (monoNs() < until) {
+        if (swaps >= maxSwaps) {
+            sleepNs(1000000);
+            continue;
+        }
         const uint32_t pid = h.pids[size_t(k++) % h.pids.size()];
         SwapResult res;
         REQUIRE(h.s.e->swapSegment(pid, &res) == 0);
