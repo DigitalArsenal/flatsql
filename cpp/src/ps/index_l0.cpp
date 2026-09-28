@@ -25,6 +25,7 @@ bool isLookupKind(uint16_t kind) {
         case kIxTypeCid:
         case kIxTypeLabel:
         case kIxTypeRehome:
+        case kIxTypeGone:
             return true;
         default:
             return false;
@@ -37,6 +38,7 @@ uint8_t valueLenOf(uint16_t kind) {
         case kIxTypeLabel: return 17;   // tcs u64 BE, gseq u64 BE, label u8
         case kIxTypeRehome: return 20;  // tcs u64 BE, pid u32 BE, pseq u64 BE
         case kIxTypeRepeat: return 8;   // tcs u64 BE
+        case kIxTypeGone: return 8;     // tcs u64 BE
         default: return 8;              // partition kinds: pseq u64 BE
     }
 }
@@ -50,7 +52,8 @@ uint8_t keyTypeOf(uint16_t kind) {
         case kIxDead:
         case kIxTagDead:
         case kIxSpatial:
-        case kIxTypeRehome: return kKeyU64;
+        case kIxTypeRehome:
+        case kIxTypeGone: return kKeyU64;
         case kIxSourceEpoch:
         case kIxProviderEpoch:
         case kIxObjectEpoch: return kKeyStrI64;

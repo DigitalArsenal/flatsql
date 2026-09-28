@@ -113,10 +113,13 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
         if (gseq < gseqFloor) return 0;
         out->gseq = gseq;
     }
-    bool dead = false;
-    int32_t rc = store->isDead(*snap, pseq, bound, &dead);
-    if (rc < 0) return rc;
-    if (dead) return 0;
+    int32_t rc;
+    if (!knownLive) {
+        bool dead = false;
+        rc = store->isDead(*snap, pseq, bound, &dead);
+        if (rc < 0) return rc;
+        if (dead) return 0;
+    }
     rc = store->readRow(*snap, pseq, &out->row);
     if (rc < 0) return rc;
     if (out->row.kind != kRowPut) return 0;
@@ -707,7 +710,15 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
             p.bounded = closed;
         }
     }
-    (void)offsetC;
+    // OFFSET pushdown (T2 #7): arrivals order skips live entries by fence
+    // counts. Only where every row the scan finds is emitted (no post
+    // filters), so the vtab can own the OFFSET (SQLite then skips none).
+    if (offsetC >= 0 && typeLevel && !alias && !current && p.orderConsumed &&
+        (p.access == kAccGseq || p.access == kAccFull) && producerEq < 0 && sourceEq < 0 && sourceNameEq < 0 &&
+        cidEq < 0 && colEq < 0) {
+        use(offsetC, &p.aOffset);
+        info->aConstraintUsage[offsetC].omit = 1;
+    }
     info->orderByConsumed = p.orderConsumed && info->nOrderBy > 0 ? 1 : 0;
     info->estimatedCost = cost;
     info->estimatedRows = sqlite3_int64(rows);

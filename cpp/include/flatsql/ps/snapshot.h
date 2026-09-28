@@ -302,6 +302,42 @@ private:
     class LaneStore* store_ = nullptr;
 };
 
+// ---- L1 runs, read lazily ------------------------------------------------------------------
+// A reader's view of one L1 run (x-*.fsx): the footer and TOC at open, the
+// whole metadata region CRC-checked once per lane, then each kind's fences
+// on first use and its bloom only while it fits the lane's budget (a lookup
+// without a resident bloom searches the fences and reads one block).
+class LaneStore;
+class LazyRun {
+public:
+    int32_t open(LaneStore* st, const FileKey& key, uint64_t fileLen, bool verified);
+    bool hasKind(uint16_t kind) const { return find(kind) != nullptr; }
+    uint8_t kindVlen(uint16_t kind) const;
+    uint64_t kindEntries(uint16_t kind) const;
+    // Fences of a kind (loaded on first use); nullptr when the kind is absent.
+    const std::vector<L1Fence>* fences(LaneStore* st, uint16_t kind, int32_t* rc);
+    // Every entry whose key == key: visit(val) -> continue? Sets *stop when
+    // the visitor stopped.
+    int32_t lookup(LaneStore* st, uint16_t kind, const uint8_t* key, size_t klen, uint64_t hash,
+                   const std::function<bool(const uint8_t*)>& visit, bool* stop);
+    uint64_t bytes() const { return bytes_; }
+    const FileKey& key() const { return key_; }
+
+private:
+    struct Kind {
+        L1TocEntry toc{};
+        bool fencesLoaded = false;
+        std::vector<L1Fence> fences;
+        uint8_t bloomState = 0;  // 0 not tried, 1 resident, 2 not resident (budget)
+        std::vector<uint8_t> bloom;
+    };
+    Kind* find(uint16_t kind);
+    const Kind* find(uint16_t kind) const;
+    FileKey key_;
+    std::vector<Kind> kinds_;
+    uint64_t bytes_ = 0;
+};
+
 // ---- the lane's store view -------------------------------------------------------------
 struct LaneStoreConfig {
     std::string root;
@@ -361,6 +397,17 @@ public:
     int32_t arrivalAt(const TypeSnap& t, uint64_t pos, ArrivalEntry* out);
     int32_t arrivalsRead(const TypeSnap& t, uint64_t pos, uint32_t n, ArrivalEntry* out);
     int32_t arrivalsUpperBound(const TypeSnap& t, uint64_t gseq, uint64_t* pos);
+    // Dead arrivals (GONE postings: a gseq whose last live copy died).
+    int32_t isGone(const TypeSnap& t, uint64_t gseq, bool* gone);
+    // GONE gseqs in [lo, hi) counted from L1 fences (whole blocks by their
+    // counts, the two edge blocks read) and the unmerged L0 blocks.
+    int32_t goneCount(const TypeSnap& t, uint64_t lo, uint64_t hi, uint64_t* count);
+    // Live arrivals in positions [a, b) (b <= arrivalsTotal).
+    int32_t liveBetween(const TypeSnap& t, uint64_t a, uint64_t b, uint64_t* live);
+    // Offset paging over arrivals: the smallest position p >= begin with
+    // liveBetween(begin, p) >= offset (asc), or the largest p <= end with
+    // liveBetween(p, end) >= offset (desc). O(log n) probes.
+    int32_t seekLive(const TypeSnap& t, uint64_t begin, uint64_t end, uint64_t offset, bool desc, uint64_t* pos);
 
     // Lane tuples of a partition (l.fsl), by lane id.
     struct LaneTuple {
@@ -390,10 +437,12 @@ public:
     std::shared_ptr<const L0Parsed> typeL0Block(const uint8_t fid[4], const TypeL0DirEntry& e, int32_t* rc);
     // Sources keep file KEYS, never handles: a handle may be evicted and its
     // number reused between two reads; a key is reopened by name.
-    std::shared_ptr<const L1Run> run(uint32_t pid, uint32_t seg, uint32_t gen, uint64_t fileLen, FileKey* key,
-                                     int32_t* rc);
-    std::shared_ptr<const L1Run> typeRun(const uint8_t fid[4], uint32_t gen, uint64_t fileLen, FileKey* key,
-                                         int32_t* rc);
+    std::shared_ptr<LazyRun> run(uint32_t pid, uint32_t seg, uint32_t gen, uint64_t fileLen, FileKey* key,
+                                 int32_t* rc);
+    std::shared_ptr<LazyRun> typeRun(const uint8_t fid[4], uint32_t gen, uint64_t fileLen, FileKey* key, int32_t* rc);
+    // Run accelerator budget (fences and blooms of resident runs).
+    bool reserveRunBytes(uint64_t bytes);  // may evict other runs; false: over budget
+    void addRunBytes(int64_t delta) { runUsed_ = uint64_t(int64_t(runUsed_) + delta); }
     int32_t readBlock(const FileKey& key, uint64_t off, uint8_t* dst);  // one 4 KiB L1 block
 
 private:
@@ -424,6 +473,16 @@ private:
     std::unordered_map<FileKey, CacheEntry, FileKeyHash> cache_;
     std::list<FileKey> cacheLru_;
     uint64_t cacheUsed_ = 0;
+    // Resident runs (LRU by accelerator bytes) and the runs verified once.
+    std::shared_ptr<LazyRun> runGet(const FileKey& key, uint64_t fileLen, int32_t* rc);
+    struct RunEntry {
+        std::shared_ptr<LazyRun> run;
+        std::list<FileKey>::iterator lru;
+    };
+    std::unordered_map<FileKey, RunEntry, FileKeyHash> runs_;
+    std::list<FileKey> runLru_;
+    uint64_t runUsed_ = 0;
+    std::unordered_map<FileKey, bool, FileKeyHash> verifiedRuns_;
     // Type configs by (fid, fp).
     std::map<std::pair<uint32_t, uint64_t>, std::shared_ptr<TypeInfo>> typeInfos_;
     // Label maps of types with > 128 partitions: (fid) -> (commitSeq, labels).

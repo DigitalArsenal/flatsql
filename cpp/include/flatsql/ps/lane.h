@@ -121,6 +121,7 @@ struct alignas(64) SlotHeader {
     uint64_t rowsExamined;
     uint64_t bytesRead;
     uint64_t indexEntries;
+    uint64_t fenceReads;
     uint64_t submitNs, startNs, endNs;
     char err[256];
 };
@@ -330,6 +331,7 @@ struct Outcome {
     uint64_t rowsExamined = 0;
     uint64_t bytesRead = 0;
     uint64_t indexEntries = 0;
+    uint64_t fenceReads = 0;
     uint64_t queueNs = 0;   // submit -> start
     uint64_t runNs = 0;     // start -> done
 };

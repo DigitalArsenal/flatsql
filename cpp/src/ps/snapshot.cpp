@@ -377,7 +377,7 @@ struct L0Source : PostingScan::Source {
 
 // One kind of an L1 run: blocks read on demand (4 KiB each).
 struct L1Source : PostingScan::Source {
-    std::shared_ptr<const L1Run> run;
+    std::shared_ptr<LazyRun> run;
     FileKey file;
     const std::vector<L1Fence>* fences = nullptr;
     int64_t block = -1;
@@ -419,11 +419,16 @@ struct L1Source : PostingScan::Source {
         done = desc ? beforeLo : pastHi;
         return true;
     }
-    bool init(LaneStore* st, std::shared_ptr<const L1Run> r, const FileKey& f, uint16_t kind, const std::string& l,
+    bool init(LaneStore* st, std::shared_ptr<LazyRun> r, const FileKey& f, uint16_t kind, const std::string& l,
               bool hl, const std::string& h, bool hh, bool d) {
         run = std::move(r);
         file = f;
-        fences = run->fences(kind);
+        int32_t frc = 0;
+        fences = run->fences(st, kind, &frc);
+        if (frc < 0) {
+            err = frc;
+            return false;
+        }
         if (!fences || fences->empty()) return false;
         v = run->kindVlen(kind);
         lo = l;
@@ -1217,62 +1222,193 @@ std::shared_ptr<const L0Parsed> LaneStore::typeL0Block(const uint8_t fid[4], con
     return b;
 }
 
-std::shared_ptr<const L1Run> LaneStore::run(uint32_t pid, uint32_t seg, uint32_t gen, uint64_t fileLen, FileKey* keyOut,
-                                            int32_t* rc) {
-    const FileKey key = pk('x', pid, seg, gen);
-    *keyOut = key;
-    FileKey ck = key;
-    ck.letter = 'X';
+std::shared_ptr<LazyRun> LaneStore::runGet(const FileKey& key, uint64_t fileLen, int32_t* rc) {
     *rc = 0;
-    if (auto c = cacheGet(ck)) return std::static_pointer_cast<const L1Run>(c);
-    FileRef file;
-    *rc = io_.get(key, &file);
-    if (*rc < 0) {
-        if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
-        return nullptr;
+    auto it = runs_.find(key);
+    if (it != runs_.end()) {
+        runLru_.splice(runLru_.begin(), runLru_, it->second.lru);
+        return it->second.run;
     }
-    auto r = std::make_shared<L1Run>();
-    const uint64_t before = io_.ioStats().totalReadBytes();
-    if (r->load(&io_.ctx(), file, fileLen) < 0) {
-        *rc = kRsCorrupt;
-        return nullptr;
-    }
-    if (stats_) {
-        stats_->bytesRead += io_.ioStats().totalReadBytes() - before;
-        stats_->fenceReads++;
-    }
-    cachePut(ck, r, r->memoryBytes() + 256);
-    *rc = 0;
+    auto r = std::make_shared<LazyRun>();
+    const bool verified = verifiedRuns_.count(key) != 0;
+    *rc = r->open(this, key, fileLen, verified);
+    if (*rc < 0) return nullptr;
+    verifiedRuns_[key] = true;
+    reserveRunBytes(r->bytes());
+    runLru_.push_front(key);
+    runs_.emplace(key, RunEntry{r, runLru_.begin()});
+    runUsed_ += r->bytes();
     return r;
 }
 
-std::shared_ptr<const L1Run> LaneStore::typeRun(const uint8_t fid[4], uint32_t gen, uint64_t fileLen, FileKey* keyOut,
-                                                int32_t* rc) {
+bool LaneStore::reserveRunBytes(uint64_t bytes) {
+    const uint64_t budget = cfg_.cacheBytes;
+    // Evict least recently used runs (never the most recent: it is in use).
+    while (runUsed_ + bytes > budget && runLru_.size() > 1) {
+        auto vit = runs_.find(runLru_.back());
+        const uint64_t b = vit->second.run->bytes();
+        runUsed_ = runUsed_ >= b ? runUsed_ - b : 0;
+        runs_.erase(vit);
+        runLru_.pop_back();
+    }
+    return runUsed_ + bytes <= budget;
+}
+
+std::shared_ptr<LazyRun> LaneStore::run(uint32_t pid, uint32_t seg, uint32_t gen, uint64_t fileLen, FileKey* keyOut,
+                                        int32_t* rc) {
+    const FileKey key = pk('x', pid, seg, gen);
+    *keyOut = key;
+    return runGet(key, fileLen, rc);
+}
+
+std::shared_ptr<LazyRun> LaneStore::typeRun(const uint8_t fid[4], uint32_t gen, uint64_t fileLen, FileKey* keyOut,
+                                            int32_t* rc) {
     const FileKey key = tk('x', fid, 0, gen);
     *keyOut = key;
-    FileKey ck = key;
-    ck.letter = 'X';
+    return runGet(key, fileLen, rc);
+}
+
+// ---------------------------------------------------------------------------
+// LazyRun
+// ---------------------------------------------------------------------------
+LazyRun::Kind* LazyRun::find(uint16_t kind) {
+    for (auto& k : kinds_)
+        if (k.toc.kind == kind) return &k;
+    return nullptr;
+}
+const LazyRun::Kind* LazyRun::find(uint16_t kind) const {
+    for (const auto& k : kinds_)
+        if (k.toc.kind == kind) return &k;
+    return nullptr;
+}
+uint8_t LazyRun::kindVlen(uint16_t kind) const {
+    const Kind* k = find(kind);
+    return k ? k->toc.vlen : valueLenOf(kind);
+}
+uint64_t LazyRun::kindEntries(uint16_t kind) const {
+    const Kind* k = find(kind);
+    return k ? k->toc.nEntries : 0;
+}
+
+int32_t LazyRun::open(LaneStore* st, const FileKey& key, uint64_t fileLen, bool verified) {
+    key_ = key;
+    if (fileLen < sizeof(L1Header) + sizeof(L1Footer)) return kRsCorrupt;
+    FileRef f;
+    int32_t rc = st->io().get(key, &f);
+    if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
+    L1Footer ft;
+    if (st->io().read(f, &ft, sizeof(ft), fileLen - sizeof(ft)) != int64_t(sizeof(ft))) return FLATSQL_IO_ERR_IO;
+    if (ft.magic != kMagicL1Footer || ft.crc != crc32c(&ft, 28)) return kRsCorrupt;
+    if (ft.metaOff > ft.tocOff || ft.tocOff + ft.tocLen + sizeof(ft) != fileLen) return kRsCorrupt;
+    if (!verified) {
+        // The footer's CRC covers fences, blooms and TOC together: check the
+        // region once per lane, streaming (nothing retained).
+        uint32_t crc = 0;
+        std::vector<uint8_t> buf(1u << 20);
+        uint64_t off = ft.metaOff;
+        const uint64_t end = ft.tocOff + ft.tocLen;
+        while (off < end) {
+            const size_t n = size_t(std::min<uint64_t>(buf.size(), end - off));
+            if (st->io().read(f, buf.data(), n, off) != int64_t(n)) return FLATSQL_IO_ERR_IO;
+            crc = crc32c(crc, buf.data(), n);
+            off += n;
+        }
+        if (crc != ft.tocCrc) return kRsCorrupt;
+        if (st->stats()) st->stats()->fenceReads++;
+    }
+    const size_t nk = ft.tocLen / sizeof(L1TocEntry);
+    std::vector<uint8_t> toc(ft.tocLen);
+    if (ft.tocLen && st->io().read(f, toc.data(), toc.size(), ft.tocOff) != int64_t(toc.size())) return FLATSQL_IO_ERR_IO;
+    kinds_.resize(nk);
+    for (size_t i = 0; i < nk; i++) std::memcpy(&kinds_[i].toc, toc.data() + i * sizeof(L1TocEntry), sizeof(L1TocEntry));
+    bytes_ = 256 + nk * sizeof(Kind);
+    return 0;
+}
+
+const std::vector<L1Fence>* LazyRun::fences(LaneStore* st, uint16_t kind, int32_t* rc) {
     *rc = 0;
-    if (auto c = cacheGet(ck)) return std::static_pointer_cast<const L1Run>(c);
-    FileRef file;
-    *rc = io_.get(key, &file);
-    if (*rc < 0) {
-        if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
-        return nullptr;
+    Kind* k = find(kind);
+    if (!k) return nullptr;
+    if (!k->fencesLoaded) {
+        FileRef f;
+        *rc = st->io().get(key_, &f);
+        if (*rc < 0) {
+            if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
+            return nullptr;
+        }
+        k->fences.resize(k->toc.nBlocks);
+        const size_t bytes = size_t(k->toc.nBlocks) * sizeof(L1Fence);
+        if (bytes && st->io().read(f, k->fences.data(), bytes, k->toc.fenceOff) != int64_t(bytes)) {
+            k->fences.clear();
+            *rc = FLATSQL_IO_ERR_IO;
+            return nullptr;
+        }
+        k->fencesLoaded = true;
+        bytes_ += bytes;
+        st->addRunBytes(int64_t(bytes));
+        if (st->stats()) st->stats()->fenceReads++;
     }
-    auto r = std::make_shared<L1Run>();
-    const uint64_t before = io_.ioStats().totalReadBytes();
-    if (r->load(&io_.ctx(), file, fileLen) < 0) {
-        *rc = kRsCorrupt;
-        return nullptr;
+    return &k->fences;
+}
+
+int32_t LazyRun::lookup(LaneStore* st, uint16_t kind, const uint8_t* key, size_t klen, uint64_t hash,
+                        const std::function<bool(const uint8_t*)>& visit, bool* stop) {
+    *stop = false;
+    Kind* k = find(kind);
+    if (!k || k->toc.nBlocks == 0) return 0;
+    // Bloom: resident while it fits the lane budget (an eighth of it at most).
+    if (k->bloomState == 0 && k->toc.bloomBytes) {
+        k->bloomState = 2;
+        if (k->toc.bloomBytes <= st->config().cacheBytes / 8 && st->reserveRunBytes(k->toc.bloomBytes)) {
+            FileRef f;
+            int32_t rc = st->io().get(key_, &f);
+            if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
+            k->bloom.resize(k->toc.bloomBytes);
+            if (st->io().read(f, k->bloom.data(), k->bloom.size(), k->toc.bloomOff) != int64_t(k->bloom.size())) {
+                k->bloom.clear();
+                return FLATSQL_IO_ERR_IO;
+            }
+            k->bloomState = 1;
+            bytes_ += k->bloom.size();
+            st->addRunBytes(int64_t(k->bloom.size()));
+        }
     }
-    if (stats_) {
-        stats_->bytesRead += io_.ioStats().totalReadBytes() - before;
-        stats_->fenceReads++;
+    if (k->bloomState == 1 && !bloomTestHash(k->bloom.data(), k->bloom.size(), hash)) return 0;
+    int32_t rc = 0;
+    const std::vector<L1Fence>* f = fences(st, kind, &rc);
+    if (rc < 0) return rc;
+    if (!f || f->empty()) return 0;
+    // Last block whose first-key prefix is strictly below the key's.
+    size_t a = 0, b = f->size();
+    while (a < b) {
+        const size_t mid = (a + b) / 2;
+        if (prefixCmp(key, klen, (*f)[mid]) > 0) a = mid + 1;
+        else b = mid;
     }
-    cachePut(ck, r, r->memoryBytes() + 256);
-    *rc = 0;
-    return r;
+    uint8_t buf[kL1BlockBytes];
+    for (size_t blk = a == 0 ? 0 : a - 1; blk < f->size(); blk++) {
+        if (blk > 0 && prefixCmp(key, klen, (*f)[blk]) < 0) break;
+        rc = st->readBlock(key_, (*f)[blk].blockOff, buf);
+        if (rc < 0) return rc;
+        EntryIter it = l1BlockIter(buf, k->toc.vlen);
+        const uint8_t *ek, *ev;
+        uint16_t el;
+        bool past = false;
+        while (it.next(&ek, &el, &ev)) {
+            const int c = keyCmp(ek, el, key, klen);
+            if (c < 0) continue;
+            if (c > 0) {
+                past = true;
+                break;
+            }
+            if (!visit(ev)) {
+                *stop = true;
+                return 0;
+            }
+        }
+        if (past) break;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,25 +1544,15 @@ int32_t LaneStore::lookup(const PartSnap& s, uint16_t kind, const uint8_t* key, 
         if (!l0Lookup(*blk, kind, key, klen, h, visit)) return 0;
     }
     if (!s.manifest) return 0;
-    uint8_t scratch[kL1BlockBytes];
     for (const ManifestSegRef& m : s.manifest->segs) {
         for (const SegRunRef& rr : m.runs) {
             FileKey fk;
             int32_t rc = 0;
             auto run = this->run(s.pid, m.seg, rr.gen, rr.fileLen, &fk, &rc);
             if (!run) return rc;
-            if (!run->mayContainHash(kind, h)) continue;
-            FileRef f;
-            rc = io_.get(fk, &f);
-            if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
-            const uint64_t before = io_.ioStats().totalReadBytes();
             bool stop = false;
-            const int64_t n = run->lookup(&io_.ctx(), f, kind, key, klen, scratch,
-                                          [&](const uint8_t*, uint16_t, const uint8_t* v) {
-                                              if (!stop && !visit(v)) stop = true;
-                                          });
-            if (stats_) stats_->bytesRead += io_.ioStats().totalReadBytes() - before;
-            if (n < 0) return kRsCorrupt;
+            rc = run->lookup(this, kind, key, klen, h, visit, &stop);
+            if (rc < 0) return rc;
             if (stop) return 0;
         }
     }
@@ -1443,24 +1569,14 @@ int32_t LaneStore::lookupType(const TypeSnap& t, uint16_t kind, const uint8_t* k
         if (!blk) return rc;
         if (!l0Lookup(*blk, kind, key, klen, h, visit)) return 0;
     }
-    uint8_t scratch[kL1BlockBytes];
     for (const SegRunRef& rr : t.runs) {
         FileKey fk;
         int32_t rc = 0;
         auto run = typeRun(t.fid, rr.gen, rr.fileLen, &fk, &rc);
         if (!run) return rc;
-        if (!run->mayContainHash(kind, h)) continue;
-        FileRef f;
-        rc = io_.get(fk, &f);
-        if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
-        const uint64_t before = io_.ioStats().totalReadBytes();
         bool stop = false;
-        const int64_t n = run->lookup(&io_.ctx(), f, kind, key, klen, scratch,
-                                      [&](const uint8_t*, uint16_t, const uint8_t* v) {
-                                          if (!stop && !visit(v)) stop = true;
-                                      });
-        if (stats_) stats_->bytesRead += io_.ioStats().totalReadBytes() - before;
-        if (n < 0) return kRsCorrupt;
+        rc = run->lookup(this, kind, key, klen, h, visit, &stop);
+        if (rc < 0) return rc;
         if (stop) return 0;
     }
     return 0;
@@ -1646,6 +1762,145 @@ std::string cidToText(const uint8_t cid[kCidLen]) {
     char buf[2 + kCidLen * 8 / 5 + 2];
     const size_t n = cidText(cid, kCidLen, buf);
     return std::string(buf, n);
+}
+
+}  // namespace ps
+}  // namespace flatsql
+
+namespace flatsql {
+namespace ps {
+
+// ---------------------------------------------------------------------------
+// GONE counting (offset paging, dead-history skipping)
+// ---------------------------------------------------------------------------
+int32_t LaneStore::isGone(const TypeSnap& t, uint64_t gseq, bool* gone) {
+    *gone = false;
+    uint8_t k[8];
+    putBE64(k, gseq);
+    return lookupType(t, kIxTypeGone, k, 8, [&](const uint8_t*) {
+        *gone = true;
+        return false;
+    });
+}
+
+int32_t LaneStore::goneCount(const TypeSnap& t, uint64_t lo, uint64_t hi, uint64_t* count) {
+    *count = 0;
+    if (t.empty || lo >= hi) return 0;
+    uint8_t klo[8], khi[8];
+    putBE64(klo, lo);
+    putBE64(khi, hi);
+    // Unmerged type L0 blocks: scan their (small) GONE sections.
+    for (const TypeL0DirEntry& e : t.l0) {
+        int32_t rc = 0;
+        auto blk = typeL0Block(t.fid, e, &rc);
+        if (!blk) return rc;
+        const L0KindInfo* ki = blk->find(kIxTypeGone);
+        if (!ki || !ki->n) continue;
+        EntryIter it;
+        it.p = blk->bytes.data() + ki->entriesOff;
+        it.end = it.p + ki->entriesBytes;
+        it.vlen = ki->vlen;
+        const uint8_t *k, *v;
+        uint16_t kl;
+        while (it.next(&k, &kl, &v))
+            if (keyCmp(k, kl, klo, 8) >= 0 && keyCmp(k, kl, khi, 8) < 0) (*count)++;
+    }
+    // L1 runs: fences give whole-block counts; the two edge blocks are read.
+    uint8_t buf[kL1BlockBytes];
+    for (const SegRunRef& rr : t.runs) {
+        FileKey fk;
+        int32_t rc = 0;
+        auto run = typeRun(t.fid, rr.gen, rr.fileLen, &fk, &rc);
+        if (!run) return rc;
+        const std::vector<L1Fence>* f = run->fences(this, kIxTypeGone, &rc);
+        if (rc < 0) return rc;
+        if (!f || f->empty()) continue;
+        const size_t nb = f->size();
+        // Block b holds keys in [prefix(b), prefix(b+1)); GONE keys are 8
+        // bytes, so a fence prefix is the block's exact first key.
+        auto blockFor = [&](const uint8_t* key) -> size_t {  // last block with first key <= key
+            size_t a = 0, b = nb;
+            while (a < b) {
+                const size_t mid = (a + b) / 2;
+                if (prefixCmp(key, 8, (*f)[mid]) >= 0) a = mid + 1;
+                else b = mid;
+            }
+            return a == 0 ? 0 : a - 1;
+        };
+        const size_t ba = blockFor(klo);
+        const size_t bb = blockFor(khi);
+        auto countBlock = [&](size_t b) -> int32_t {
+            const int32_t r2 = readBlock(fk, (*f)[b].blockOff, buf);
+            if (r2 < 0) return r2;
+            if (stats_) stats_->fenceReads++;
+            EntryIter it = l1BlockIter(buf, 8);
+            const uint8_t *k, *v;
+            uint16_t kl;
+            while (it.next(&k, &kl, &v))
+                if (keyCmp(k, kl, klo, 8) >= 0 && keyCmp(k, kl, khi, 8) < 0) (*count)++;
+            return 0;
+        };
+        rc = countBlock(ba);
+        if (rc < 0) return rc;
+        if (bb != ba) {
+            for (size_t b = ba + 1; b < bb; b++) *count += (*f)[b].n;
+            rc = countBlock(bb);
+            if (rc < 0) return rc;
+        }
+    }
+    return 0;
+}
+
+int32_t LaneStore::liveBetween(const TypeSnap& t, uint64_t a, uint64_t b, uint64_t* live) {
+    *live = 0;
+    if (b <= a) return 0;
+    ArrivalEntry ea, eb;
+    int32_t rc = arrivalAt(t, a, &ea);
+    if (rc < 0) return rc;
+    uint64_t hiG = UINT64_MAX;
+    if (b < t.arrivalsTotal()) {
+        rc = arrivalAt(t, b, &eb);
+        if (rc < 0) return rc;
+        hiG = eb.gseq;
+    }
+    uint64_t gone = 0;
+    rc = goneCount(t, ea.gseq, hiG, &gone);
+    if (rc < 0) return rc;
+    *live = (b - a) >= gone ? (b - a) - gone : 0;
+    return 0;
+}
+
+int32_t LaneStore::seekLive(const TypeSnap& t, uint64_t begin, uint64_t end, uint64_t offset, bool desc,
+                            uint64_t* pos) {
+    if (offset == 0) {
+        *pos = desc ? end : begin;
+        return 0;
+    }
+    uint64_t lo = begin, hi = end;
+    if (!desc) {
+        // Smallest p in [begin, end] with liveBetween(begin, p) >= offset.
+        while (lo < hi) {
+            const uint64_t mid = lo + (hi - lo) / 2;
+            uint64_t live = 0;
+            const int32_t rc = liveBetween(t, begin, mid, &live);
+            if (rc < 0) return rc;
+            if (live >= offset) hi = mid;
+            else lo = mid + 1;
+        }
+        *pos = lo;
+    } else {
+        // Largest p in [begin, end] with liveBetween(p, end) >= offset.
+        while (lo < hi) {
+            const uint64_t mid = lo + (hi - lo + 1) / 2;
+            uint64_t live = 0;
+            const int32_t rc = liveBetween(t, mid, end, &live);
+            if (rc < 0) return rc;
+            if (live >= offset) lo = mid;
+            else hi = mid - 1;
+        }
+        *pos = lo;
+    }
+    return 0;
 }
 
 }  // namespace ps

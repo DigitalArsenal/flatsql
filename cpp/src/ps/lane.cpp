@@ -484,6 +484,7 @@ void ReaderLane::runStatement(Active* a) {
         h->rowsExamined = a->ctx.stats.rowsExamined;
         h->bytesRead = a->ctx.stats.bytesRead;
         h->indexEntries = a->ctx.stats.indexEntries;
+        h->fenceReads = a->ctx.stats.fenceReads;
         h->endNs = monoNs();
         h->state.store(kSlotDone, std::memory_order_release);
         h->outSeq.fetch_add(1, std::memory_order_release);
@@ -957,7 +958,7 @@ int32_t ReaderClient::submit(const Request& req, uint32_t* slotOut, uint64_t wai
             h->status = 0;
             h->errLen = 0;
             h->err[0] = 0;
-            h->rowsOut = h->rowsExamined = h->bytesRead = h->indexEntries = 0;
+            h->rowsOut = h->rowsExamined = h->bytesRead = h->indexEntries = h->fenceReads = 0;
             h->submitNs = monoNs();
             h->startNs = h->endNs = 0;
             h->state.store(kSlotQueued, std::memory_order_release);
@@ -1017,6 +1018,7 @@ Outcome ReaderClient::finish(uint32_t slot) {
     o.rowsExamined = h->rowsExamined;
     o.bytesRead = h->bytesRead;
     o.indexEntries = h->indexEntries;
+    o.fenceReads = h->fenceReads;
     o.queueNs = h->startNs > h->submitNs ? h->startNs - h->submitNs : 0;
     o.runNs = h->endNs > h->startNs ? h->endNs - h->startNs : 0;
     h->state.store(kSlotFree, std::memory_order_release);

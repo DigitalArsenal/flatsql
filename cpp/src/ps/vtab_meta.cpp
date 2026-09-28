@@ -27,7 +27,7 @@ namespace ps {
 
 namespace {
 
-enum MetaKind : int { kMkPartitions = 1, kMkLanes = 2, kMkLicences = 3, kMkArrivals = 4 };
+enum MetaKind : int { kMkPartitions = 1, kMkLanes = 2, kMkLicences = 3, kMkArrivals = 4, kMkTypes = 5 };
 
 struct MetaVtab : sqlite3_vtab {
     ReaderLane* lane = nullptr;
@@ -91,6 +91,11 @@ const char* ddlFor(int kind) {
         case kMkArrivals:
             return "CREATE TABLE x(gseq INTEGER, pid INTEGER, pseq INTEGER, live INTEGER, cid TEXT, "
                    "type TEXT HIDDEN)";
+        case kMkTypes:
+            // Datasync v1 (A15, A16): MaxRowID = gseq_hi; TotalCount =
+            // first_live_count; SnapshotID inputs.
+            return "CREATE TABLE x(type TEXT, schema TEXT, commit_seq INTEGER, gseq_hi INTEGER, arrivals INTEGER, "
+                   "first_live_count INTEGER, first_live_bytes INTEGER, partitions INTEGER)";
     }
     return nullptr;
 }
@@ -104,6 +109,7 @@ int metaConnect(sqlite3* db, void* aux, int argc, const char* const* argv, sqlit
     if (a.size() >= 2 && a[0] == '\'') a = a.substr(1, a.size() - 2);
     int kind = a == "partitions" ? kMkPartitions : a == "lanes" ? kMkLanes : a == "licences" ? kMkLicences
              : a == "arrivals"   ? kMkArrivals
+             : a == "types"      ? kMkTypes
                                  : 0;
     if (!kind) {
         *err = sqlite3_mprintf("flatsql_ps_meta: unknown table %s", a.c_str());
@@ -329,6 +335,27 @@ int32_t fillLicences(MetaCursor* c) {
     return 0;
 }
 
+int32_t fillTypes(MetaCursor* c) {
+    const RegistryView& reg = *c->stmt->reg;
+    for (const auto& t : reg.types) {
+        TypeSnap* ts = nullptr;
+        const int32_t rc = c->vt->lane->type(c->stmt, t->fid, &ts);
+        if (rc < 0) return rc;
+        std::vector<Cell> r;
+        r.push_back(ct(t->typeName));
+        r.push_back(ct(t->schemaName));
+        const bool e = ts->empty;
+        r.push_back(ci(e ? 0 : int64_t(ts->head.commitSeq)));
+        r.push_back(ci(e ? 0 : int64_t(ts->head.gseqHi)));
+        r.push_back(ci(e ? 0 : int64_t(ts->head.arrivalsCount)));
+        r.push_back(ci(e ? 0 : int64_t(ts->head.firstLiveCount)));
+        r.push_back(ci(e ? 0 : int64_t(ts->head.firstLiveBytes)));
+        r.push_back(ci(int64_t(t->pids.size())));
+        c->rows.push_back(std::move(r));
+    }
+    return 0;
+}
+
 int metaFilter(sqlite3_vtab_cursor* cur, int, const char* idxStr, int argc, sqlite3_value** argv) {
     MetaCursor* c = static_cast<MetaCursor*>(cur);
     c->rows.clear();
@@ -340,6 +367,7 @@ int metaFilter(sqlite3_vtab_cursor* cur, int, const char* idxStr, int argc, sqli
         case kMkPartitions: rc = fillPartitions(c); break;
         case kMkLanes: rc = fillLanes(c); break;
         case kMkLicences: rc = fillLicences(c); break;
+        case kMkTypes: rc = fillTypes(c); break;
         case kMkArrivals: {
             int one, aLo, aHi, loOp, hiOp, d;
             if (!idxStr || sscanf(idxStr + 1, ":%d:%d:%d:%d:%d:%d", &one, &aLo, &aHi, &loOp, &hiOp, &d) != 6 ||
@@ -451,6 +479,7 @@ int metaEnsure(ReaderLane* lane, const std::string& name, std::string* err) {
     const char* arg = lower == "flatsql_partitions" ? "partitions" : lower == "flatsql_lanes" ? "lanes"
                     : lower == "flatsql_licences"   ? "licences"
                     : lower == "flatsql_arrivals"   ? "arrivals"
+                    : lower == "flatsql_types"      ? "types"
                                                     : nullptr;
     if (!arg) return 0;
     const std::string sql = "CREATE VIRTUAL TABLE temp." + lower + " USING flatsql_ps_meta('" + arg + "')";

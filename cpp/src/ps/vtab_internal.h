@@ -121,6 +121,7 @@ struct RowFilter {
     uint64_t gseqFloor = 0;       // sandbox window (A18): skip gseq < floor
     std::string source;           // post-filter: a live tag instance with this source
     bool hasSource = false;
+    bool knownLive = false;       // liveness already established (arrivals joins)
     // Applies visibility, liveness, labels, source; reads the PUT row.
     // Returns 1 (keep, *row filled), 0 (skip), < 0 error.
     int32_t accept(uint64_t pseq, CurRow* out);

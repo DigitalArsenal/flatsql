@@ -314,6 +314,11 @@ bool labelRow(TCtx& c, Partition* p, const RecRow& r) {
         } else {
             c.st->firstLiveCount--;
             c.st->firstLiveBytes -= len - 4;
+            // The gseq is gone for good (a returning copy gets a new one).
+            uint8_t gk[8], gv[8];
+            putBE64(gk, gseq);
+            putBE64(gv, tcs);
+            if (!addPosting(c, kIxTypeGone, gk, 8, gv, 8)) return false;
         }
         return true;
     }

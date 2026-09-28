@@ -99,6 +99,8 @@ enum IndexKind : uint16_t {
     kIxTypeLabel = 0x201,  // (pid, pseq) -> {tcs, gseq, label} (A16)
     kIxTypeRehome = 0x202, // gseq -> {pid, pseq, tcs} (A14)
     kIxTypeRepeat = 0x203, // (pid, pseq) -> {} REPEAT run
+    kIxTypeGone = 0x204,   // gseq -> tcs: the gseq's last live copy died (T2: offset
+                           // paging and dead-history syncs count dead arrivals by fences)
 };
 
 enum KeyType : uint8_t {

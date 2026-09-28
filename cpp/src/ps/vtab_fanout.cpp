@@ -133,9 +133,9 @@ private:
 class ArrivalRows : public RowSource {
 public:
     ArrivalRows(ReaderLane* lane, StmtCtx* stmt, TypeSnap* ts, uint64_t lo, uint64_t hi, bool desc, const std::string& src,
-                bool hasSrc, std::vector<uint32_t> allowed)
+                bool hasSrc, std::vector<uint32_t> allowed, uint64_t offset = 0)
         : lane_(lane), stmt_(stmt), ts_(ts), lo_(lo), hi_(hi), desc_(desc), src_(src), hasSrc_(hasSrc),
-          allowed_(std::move(allowed)) {}
+          allowed_(std::move(allowed)), offset_(offset) {}
 
     int32_t next(CurRow* out) override {
         LaneStore& st = lane_->store();
@@ -149,11 +149,18 @@ public:
             if (rc < 0) return rc;
             begin_ = a;
             end_ = b;
-            pos_ = desc_ ? end_ : begin_;
+            // Offset paging: skip `offset` live entries by fence counts, not
+            // by reading them (T2 #7).
+            uint64_t start = desc_ ? end_ : begin_;
+            if (offset_ && begin_ < end_) {
+                rc = st.seekLive(*ts_, begin_, end_, offset_, desc_, &start);
+                if (rc < 0) return rc;
+            }
+            pos_ = start;
         }
         for (;;) {
             if (bufAt_ >= buf_.size()) {
-                // Refill: 256 entries per pread.
+                // Refill: up to 256 entries per pread.
                 buf_.clear();
                 bufAt_ = 0;
                 if (desc_) {
@@ -164,31 +171,154 @@ public:
                     if (rc < 0) return rc;
                     std::reverse(buf_.begin(), buf_.end());
                     pos_ -= n;
+                    bufPos_ = pos_ + n - 1;  // position of buf_[0]
                 } else {
                     if (pos_ >= end_) return 0;
                     const uint64_t n = std::min<uint64_t>(256, end_ - pos_);
                     buf_.resize(size_t(n));
                     const int32_t rc = st.arrivalsRead(*ts_, pos_, uint32_t(n), buf_.data());
                     if (rc < 0) return rc;
+                    bufPos_ = pos_;
                     pos_ += n;
                 }
-                if (st.stats()) st.stats()->indexEntries += buf_.size();
             }
-            const ArrivalEntry e = buf_[bufAt_++];
+            const size_t i = bufAt_++;
+            const ArrivalEntry e = buf_[i];
+            if (st.stats()) st.stats()->indexEntries++;
             const int32_t prc = pollEvery(&st, &poll_);
             if (prc < 0) return prc;
             if (e.gseq < lo_ || e.gseq > hi_) continue;
+            // GONE and REHOME are merge-joined with the arrivals by gseq (no
+            // per-entry lookups, §8 "merge-joined").
+            bool gone = false;
+            int32_t jrc = joinGone(e.gseq, &gone);
+            if (jrc < 0) return jrc;
+            // Dead runs (A15/T2 #8): a GONE entry starts a gallop over fence
+            // counts (O(log run) probes, no entry read) to the next position
+            // that is not GONE. Short runs back off to per-entry checks.
+            if (gone && !desc_ && skipAfter_ <= bufPos_ + i) {
+                int32_t rc = 0;
+                {
+                    const uint64_t here = bufPos_ + i;
+                    uint64_t run = 1;  // [here, here + run) all GONE
+                    auto allGone = [&](uint64_t k, bool* yes) -> int32_t {
+                        uint64_t live = 1;
+                        const int32_t r2 = st.liveBetween(*ts_, here, here + k, &live);
+                        *yes = live == 0;
+                        return r2;
+                    };
+                    uint64_t hiK = 0;  // smallest known not-all-GONE length (0: none)
+                    for (uint64_t k = 2; here + k <= end_; k *= 2) {
+                        bool yes = false;
+                        rc = allGone(k, &yes);
+                        if (rc < 0) return rc;
+                        if (!yes) {
+                            hiK = k;
+                            break;
+                        }
+                        run = k;
+                    }
+                    if (!hiK) hiK = end_ - here + 1;
+                    while (hiK - run > 1) {
+                        const uint64_t mid = run + (hiK - run) / 2;
+                        bool yes = false;
+                        if (here + mid > end_) {
+                            hiK = mid;
+                            continue;
+                        }
+                        rc = allGone(mid, &yes);
+                        if (rc < 0) return rc;
+                        if (yes) run = mid;
+                        else hiK = mid;
+                    }
+                    if (run >= 4) {
+                        skipped_ += run - 1;
+                        buf_.clear();
+                        bufAt_ = 0;
+                        pos_ = here + run;
+                        reseek_ = true;  // the joins restart at the new position
+                    } else {
+                        skipAfter_ = here + 32;  // short runs: check entries one by one for a while
+                    }
+                    continue;
+                }
+            }
+            if (gone) continue;
             const int32_t rc = resolve(e, out);
             if (rc < 0) return rc;
             if (rc == 1) return 1;
         }
     }
+    uint64_t skipped() const { return skipped_; }
 
     // Arrival entry -> its live FIRST copy (REHOME after promotion, A14).
+    // Advances a gseq-ordered posting join to `g` (asc or desc) and reports
+    // whether it holds g. Rebuilt after a skip.
+    int32_t seekJoin(PostingScan* sc, bool* have, uint16_t kind, uint64_t g) {
+        LaneStore& st = lane_->store();
+        if (!*have || reseekPending(kind)) {
+            uint8_t b[8];
+            if (!desc_) {
+                putBE64(b, g);
+                *sc = st.scanType(*ts_, kind, b, 8, nullptr, 0, false);
+            } else {
+                putBE64(b, g == UINT64_MAX ? g : g + 1);
+                *sc = st.scanType(*ts_, kind, nullptr, 0, b, 8, true);
+            }
+            if (sc->err()) return sc->err();
+            *have = true;
+        }
+        while (sc->valid()) {
+            const uint64_t k = getBE64(sc->key());
+            if (desc_ ? k <= g : k >= g) break;
+            sc->next();
+        }
+        return sc->err();
+    }
+    bool reseekPending(uint16_t kind) {
+        if (!reseek_) return false;
+        if (kind == kIxTypeGone) reseekGone_ = true;
+        else reseekRehome_ = true;
+        if (reseekGone_ && reseekRehome_) reseek_ = reseekGone_ = reseekRehome_ = false;
+        return true;
+    }
+    int32_t joinGone(uint64_t g, bool* gone) {
+        *gone = false;
+        const int32_t rc = seekJoin(&goneScan_, &haveGone_, kIxTypeGone, g);
+        if (rc < 0) return rc;
+        *gone = goneScan_.valid() && getBE64(goneScan_.key()) == g;
+        return 0;
+    }
+    int32_t joinRehome(uint64_t g) {
+        cands_.clear();
+        const int32_t rc = seekJoin(&rehomeScan_, &haveRehome_, kIxTypeRehome, g);
+        if (rc < 0) return rc;
+        // Every REHOME of g at its latest tcs (the scan is in (gseq, tcs)
+        // value order within the key).
+        uint64_t best = 0;
+        PostingScan& sc = rehomeScan_;
+        while (sc.valid() && getBE64(sc.key()) == g) {
+            const uint8_t* v = sc.val();
+            const uint64_t tcs = getBE64(v);
+            if (cands_.empty() || tcs > best) {
+                best = tcs;
+                cands_.clear();
+            }
+            if (tcs == best) cands_.push_back({getBE32(v + 8), getBE64(v + 12)});
+            sc.next();
+        }
+        return sc.err();
+    }
+
     int32_t resolve(const ArrivalEntry& e, CurRow* out) {
         LaneStore& st = lane_->store();
-        int32_t rc = st.rehomeOf(*ts_, e.gseq, &cands_);
+        int32_t rc = joinRehome(e.gseq);
         if (rc < 0) return rc;
+        // Not GONE: a live copy carries this gseq. Without a REHOME it is the
+        // arrivals copy; one REHOME at the latest tcs is the promoted copy;
+        // several (promote, kill, promote in one type commit) are told apart
+        // by liveness.
+        const bool knownLive = cands_.size() <= 1;
         if (cands_.empty()) cands_.push_back({e.pid, e.pseq});
         for (const auto& c : cands_) {
             if (!allowed_.empty() && !std::binary_search(allowed_.begin(), allowed_.end(), c.first)) continue;
@@ -202,6 +332,7 @@ public:
             f.bound = std::min(snap->pseqHi(), ts_->labeledThrough(c.first));
             f.source = src_;
             f.hasSource = hasSrc_;
+            f.knownLive = knownLive;
             rc = f.accept(c.second, out);
             if (rc < 0) return rc;
             if (rc == 0) continue;
@@ -213,6 +344,9 @@ public:
     }
 
 private:
+    PostingScan goneScan_, rehomeScan_;
+    bool haveGone_ = false, haveRehome_ = false;
+    bool reseek_ = false, reseekGone_ = false, reseekRehome_ = false;
     ReaderLane* lane_;
     StmtCtx* stmt_;
     TypeSnap* ts_;
@@ -221,9 +355,11 @@ private:
     std::string src_;
     bool hasSrc_;
     std::vector<uint32_t> allowed_;  // sorted; empty = every partition
+    uint64_t offset_ = 0;
     std::vector<std::pair<uint32_t, uint64_t>> cands_;
     bool started_ = false;
-    uint64_t begin_ = 0, end_ = 0, pos_ = 0;
+    uint64_t begin_ = 0, end_ = 0, pos_ = 0, bufPos_ = 0;
+    uint64_t skipAfter_ = 0, skipped_ = 0;
     std::vector<ArrivalEntry> buf_;
     size_t bufAt_ = 0;
     uint32_t poll_ = 0;
@@ -512,7 +648,12 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
                 out->reset(new Concat({}));
                 return 0;
             }
-            out->reset(new ArrivalRows(lane, stmt, ts, eff, uhi, p.desc, source, hasSource, allowed));
+            uint64_t offset = 0;
+            if (p.aOffset >= 0) {
+                int64_t v;
+                if (argInt(arg(p.aOffset), &v) && v > 0) offset = uint64_t(v);
+            }
+            out->reset(new ArrivalRows(lane, stmt, ts, eff, uhi, p.desc, source, hasSource, allowed, offset));
             return 0;
         }
         case kAccEpoch: {
