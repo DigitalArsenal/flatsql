@@ -109,6 +109,12 @@ struct Harness {
         s.cfg.commitJournal = (seed & 16) != 0;
         s.cfg.journalCkptBytes = (seed & 32) ? (16u << 10) : (256u << 10);
         s.cfg.journalCkptMs = 20;
+        // This oracle checks that every acked record's bytes stay on disk,
+        // dead or alive: compaction (T3) removes dead ones, so it stays off
+        // here (orphan_test.cpp crashes compactions against a liveness
+        // oracle). Merge retirements, A9 meta retirement and reclamation run.
+        s.cfg.autoCompact = false;
+        s.cfg.reclaimGraceMs = 5;
     }
 
     TestType& type(int k) { return crashTypes(nTypes)[size_t(k)]; }
@@ -365,6 +371,17 @@ struct Harness {
                 std::fprintf(stderr, "  [%s] pid %u: %s\n", phase, p.pid, v.err.c_str());
                 gFailures++;
                 continue;
+            }
+            // T3 (A11, A12, A9): exactly the named files exist after open, and
+            // disk_bytes equals their total.
+            {
+                const DirCheck dc = checkPartitionDir(s.fs.get(), s.fs.get(), s.root, p.pid);
+                if (!dc.ok || dc.bytes != s.e->partitionDiskBytes(p.pid)) {
+                    std::fprintf(stderr, "  [%s] pid %u files: %s (dir %llu bytes, disk_bytes %llu)\n", phase, p.pid,
+                                 dc.ok ? "sizes differ" : dc.err.c_str(), (unsigned long long)dc.bytes,
+                                 (unsigned long long)s.e->partitionDiskBytes(p.pid));
+                    gFailures++;
+                }
             }
             const Recount rc = recount(v);
             if (v.head.counters.totalCount != rc.total || v.head.counters.liveCount != rc.live ||

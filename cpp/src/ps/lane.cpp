@@ -176,6 +176,10 @@ int32_t ReaderLane::partForType(StmtCtx* s, uint32_t pid, const uint8_t fid[4], 
         if (attempt >= 200) return kRsRetryable;
         sleepNs(20000);
     }
+    // T3: rows a compaction removed behind kills this type snapshot does not
+    // see yet are read from the file set before that SWAP.
+    rc = store_->resolveForBound(snap.get(), std::min(snap->pseqHi(), labeled));
+    if (rc < 0) return rc;
     StmtCtx::PartEntry e;
     e.seq = ++s->snapSeq;
     e.snap = snap;
@@ -700,8 +704,10 @@ void ReaderLane::threadMain() {
                 a->h->ringTail.load(std::memory_order_relaxed) - a->h->ringHead.load(std::memory_order_acquire);
             if (used < a->h->ringCap || a->h->cancel.load(std::memory_order_acquire)) ready = true;
         }
-        if (!ready && !inst_->stopWord().load(std::memory_order_acquire))
+        if (!ready && !inst_->stopWord().load(std::memory_order_acquire)) {
+            if (active_.empty()) store_->io().closeIdle(monoNs(), 5000000000ull, true);  // T3 (A12)
             waitU32(&sh.doorbell, seq, 20ull * 1000 * 1000);
+        }
         sh.state.store(1, std::memory_order_seq_cst);
     }
     // Stop: every running or parked statement ends with STOPPED.

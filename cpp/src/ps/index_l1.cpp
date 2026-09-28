@@ -293,7 +293,7 @@ struct Cursor {
 
 int64_t mergeToL1(IoCtx* io, FileRef out, uint32_t seg, uint32_t gen, uint16_t level, uint64_t first,
                   uint64_t last, const std::vector<MergeL0Input>& l0s, const std::vector<MergeRunInput>& runs,
-                  uint64_t* entries) {
+                  uint64_t* entries, PostingFilter filter, void* filterCtx) {
     std::vector<std::vector<L0KindInfo>> infos(l0s.size());
     std::vector<uint16_t> kinds;
     for (size_t i = 0; i < l0s.size(); i++) {
@@ -356,8 +356,10 @@ int64_t mergeToL1(IoCtx* io, FileRef out, uint32_t seg, uint32_t gen, uint16_t l
                 if (k < 0 || (k == 0 && std::memcmp(c.val, best->val, vlen) < 0)) best = &c;
             }
             if (!best) break;
-            rc = w.add(best->key, best->klen, best->val);
-            if (rc < 0) return rc;
+            if (!filter || filter(filterCtx, kind, best->key, best->klen, best->val, vlen)) {
+                rc = w.add(best->key, best->klen, best->val);
+                if (rc < 0) return rc;
+            }
             best->advance(io);
             if (best->err) return best->err;
         }

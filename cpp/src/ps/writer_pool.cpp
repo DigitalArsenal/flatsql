@@ -297,7 +297,13 @@ void Writer::runJobs() {
     syncRounds_.fetch_add(1, std::memory_order_relaxed);
     // A failed sync is never retried (fsyncgate): the owner is quarantined.
     for (size_t i = 0; i < jobs_.size(); i++) {
-        if (jobResults_[i] >= 0) continue;
+        if (jobResults_[i] >= 0) {
+            if (jobOwners_[i].kind == 3) {  // a DURABLE_CKPT head is on disk (A9)
+                Partition* p = static_cast<Partition*>(jobOwners_[i].owner);
+                p->lastDurableHeadNs = p->pendingDurableHeadNs;
+            }
+            continue;
+        }
         if (jobOwners_[i].kind == 1) {
             Partition* p = static_cast<Partition*>(jobOwners_[i].owner);
             if (p->st) p->st->err = jobResults_[i];
@@ -352,6 +358,9 @@ void Writer::commitRound() {
             }
             if (!journal) queueSync(p->l, p, 1);
         }
+        // T3: the manifest a SWAP commits is durable before the batch is.
+        if (st->swapCommit)
+            if (const FileRef* mf = partitionCompactManifestFile(p)) queueSync(*mf, p, 1);
     }
     for (TypeOwner* t : dirtyTypes_) {
         StagedType* st = t->st;
@@ -531,8 +540,8 @@ bool Writer::iterate(bool mayWait) {
         if (backlog || r->wantPage.load(std::memory_order_acquire))
             ringMapAhead(r, eng_->pool(), reserve, backlog ? p->mapAheadPages : 1);
         if (!backlog && !p->rec.active && p->kills.empty() && p->ranges.empty() && !p->sealPending &&
-            !p->nPendingCtl &&
-            p->mergePhase != kMergeOutputsWritten)
+            !p->nPendingCtl && p->mergePhase != kMergeOutputsWritten && !p->retireDirty && p->retiring.empty() &&
+            p->unlinked.empty() && !p->forceLaneCkpt)
             continue;
         if (!p->warm && partitionWarm(this, p) < 0) {
             p->quarantined = true;
@@ -611,6 +620,9 @@ void Writer::processMailbox() {
             case kCmdRebalance: {
                 Partition* p = eng_->partition(uint32_t(c.a));
                 if (!p || p->ownerWriter.load() != id_ || uint8_t(c.b) == id_) break;
+                // Only while this writer still owns it: a partition released
+                // here (HANDOFF) and not yet adopted also reads as ours.
+                if (std::find(owned_.begin(), owned_.end(), p) == owned_.end()) break;
                 if (uint32_t(c.b) >= eng_->writerCount()) break;
                 releaseOwnership(p, uint8_t(c.b));
                 break;
@@ -707,6 +719,7 @@ void Writer::releaseOwnership(Partition* p, uint8_t target) {
     // At an iteration boundary: the partition has no staged batch (A26).
     // HANDOFF aborts in-flight maintenance; its INTENT is discarded as at open.
     partitionMergeAbort(this, p);
+    partitionCompactAbort(this, p);
     flushHeadSyncs();
     RingDesc* r = p->ring;
     const uint64_t w = r->ownerWordV.load(std::memory_order_acquire);
@@ -740,7 +753,15 @@ void Writer::maintenance() {
     for (size_t k = 0; k < n && outputs < 4; k++) {
         Partition* p = owned_[(maintRr_ + k) % n];
         int32_t rc = partitionMergeStep(this, p);
-        if (rc >= 0 && !p->swaps.empty()) rc = partitionSwapStep(this, p);
+        if (rc >= 0) {
+            const int32_t crc = partitionCompactStep(this, p);
+            rc = crc < 0 ? crc : rc + crc;
+        }
+        if (rc >= 0) {
+            const int32_t rrc = partitionReclaimStep(this, p);
+            if (rrc < 0) rc = rrc;
+        }
+        if (rc >= 0) partitionRetireMetaStep(this, p);
         if (rc < 0) {
             p->quarantined = true;
             p->ring->state.store(kRingQuarantined, std::memory_order_release);
@@ -755,7 +776,7 @@ void Writer::maintenance() {
     for (Partition* p : owned_) {
         if (p->quarantined) continue;
         // Seal by age (§4.2) and next-segment pre-creation at 50%.
-        if (!p->sealPending && p->dLen > 0 && cfg.sealAgeMs > 0 && p->segOpenedMs &&
+        if (!p->sealPending && (p->dLen > 0 || p->segRecords > 0) && cfg.sealAgeMs > 0 && p->segOpenedMs &&
             nowMsV - p->segOpenedMs >= cfg.sealAgeMs)
             p->sealPending = true;
         if (!p->precreated && p->warm && p->dLen >= cfg.sealBytes / 2) partitionPrecreate(this, p);
@@ -772,7 +793,8 @@ void Writer::maintenance() {
         const uint64_t idle = nowNsV - p->lastActivityNs;
         if (idle >= uint64_t(cfg.idleReclaimMs) * 1000000ull) ringReclaimIdle(p->ring, eng_->pool());
         if (p->warm && !p->rec.active && p->mergePhase == kMergeIdle && !p->nPendingCtl &&
-            idle >= uint64_t(cfg.idleCloseMs) * 1000000ull && p->ring->tail.load() == p->ring->head.load())
+            !partitionCompactBusy(p) && idle >= uint64_t(cfg.idleCloseMs) * 1000000ull &&
+            p->ring->tail.load() == p->ring->head.load())
             partitionCool(this, p);
     }
     for (TypeOwner* t : types_) {
@@ -857,6 +879,56 @@ void Engine::stopUrgentThread() {
     urgentThread_.join();  // drains the queue first
 }
 
+void Engine::submitCompaction(std::function<void(IoCtx*)> job) {
+    {
+        std::lock_guard<std::mutex> g(compactMu_);
+        compactJobs_.push_back(std::move(job));
+    }
+    compactCv_.notify_one();
+}
+
+void Engine::stopCompactThreads() {
+    // Plans in flight stop at their next slice.
+    for (auto& w : writers_)
+        for (Partition* p : w->owned_)
+            partitionCompactSignalAbort(p);
+    {
+        std::lock_guard<std::mutex> g(compactMu_);
+        compactStop_ = true;
+    }
+    compactCv_.notify_all();
+    for (auto& t : compactThreads_)
+        if (t.joinable()) t.join();  // drains the queue first
+    compactThreads_.clear();
+}
+
+void Engine::setReaderGate(uint64_t (*fn)(void*), void* ctx) {
+    readerGateCtx_.store(ctx, std::memory_order_release);
+    readerGate_.store(fn, std::memory_order_release);
+}
+
+uint64_t Engine::readerGateNs() const {
+    uint64_t (*fn)(void*) = readerGate_.load(std::memory_order_acquire);
+    if (!fn) return UINT64_MAX;
+    const uint64_t v = fn(readerGateCtx_.load(std::memory_order_acquire));
+    // Nothing running: every retirement so far is past the gate.
+    return v == UINT64_MAX ? monoNs() : v;
+}
+
+uint64_t Engine::partitionDiskBytes(uint32_t pid) const {
+    const Partition* p = partition(pid);
+    return p ? p->diskBytesPub.load(std::memory_order_relaxed) : 0;
+}
+
+uint64_t Engine::journalSafeNs() const {
+    uint64_t safe = UINT64_MAX;
+    for (const auto& w : writers_) {
+        const uint64_t s = w->jSafeNs_.load(std::memory_order_acquire);
+        if (s < safe) safe = s;
+    }
+    return safe == UINT64_MAX ? monoNs() : safe;
+}
+
 bool Engine::submitCheckpoint(std::function<void(IoCtx*)> job) {
     if (!ckptActive_.load(std::memory_order_acquire)) return false;
     {
@@ -915,6 +987,24 @@ int32_t Engine::start() {
             }
         });
     }
+    compactStop_ = false;
+    for (uint32_t i = 0; i < cfg_.compactThreads; i++) {
+        compactIo_.emplace_back(new IoCtx(cfg_.io ? cfg_.io : importIo(), &compactIoStats_));
+        IoCtx* cio = compactIo_.back().get();
+        compactThreads_.emplace_back([this, cio] {
+            for (;;) {
+                std::function<void(IoCtx*)> job;
+                {
+                    std::unique_lock<std::mutex> lk(compactMu_);
+                    compactCv_.wait(lk, [this] { return compactStop_ || !compactJobs_.empty(); });
+                    if (compactJobs_.empty()) return;  // stopping, queue drained
+                    job = std::move(compactJobs_.front());
+                    compactJobs_.pop_front();
+                }
+                job(cio);
+            }
+        });
+    }
     for (uint32_t i = 0; i < cfg_.mergeHelpers; i++) {
         helpers_.emplace_back([this] {
             for (;;) {
@@ -957,13 +1047,18 @@ int32_t Engine::stop(uint64_t deadlineMs) {
     for (auto& h : helpers_)
         if (h.joinable()) h.join();
     helpers_.clear();
+    stopCompactThreads();
     stopUrgentThread();
     stopCheckpointThread();
     syncPool_.stop();
     started_ = false;
-    // Merges still in flight are abandoned: their INTENT is discarded at open.
+    // Merges and compactions still in flight are abandoned: their outputs go
+    // now, and open discards any INTENT without MERGE_DONE or SWAP.
     for (auto& w : writers_)
-        for (Partition* p : w->owned_) partitionMergeAbort(w.get(), p);
+        for (Partition* p : w->owned_) {
+            partitionMergeAbort(w.get(), p);
+            partitionCompactAbort(w.get(), p);
+        }
     // Clean shutdown: durable heads, so the next open reads no tail.
     for (auto& w : writers_) w->flushHeadSyncs();
     for (auto& w : writers_) {
@@ -1023,6 +1118,7 @@ void Engine::abandon() {
     for (auto& h : helpers_)
         if (h.joinable()) h.join();
     helpers_.clear();
+    stopCompactThreads();
     stopUrgentThread();
     stopCheckpointThread();
     syncPool_.stop();
@@ -1200,6 +1296,19 @@ EngineStats Engine::stats() const {
     }
     s.descriptorBytes = desc;
     s.acceleratorBytes = acc;
+    for (uint32_t pid = 1; pid <= maxPid && pid < partsCap_; pid++) {
+        const Partition* p = parts_[pid].load(std::memory_order_acquire);
+        if (p) s.diskBytes += p->diskBytesPub.load(std::memory_order_relaxed);
+    }
+    s.compactions = cCompactions.load();
+    s.compactAborts = cCompactAborts.load();
+    s.compactBytesIn = cCompactBytesIn.load();
+    s.compactBytesOut = cCompactBytesOut.load();
+    s.retiredFiles = cRetired.load();
+    s.unlinkedFiles = cUnlinked.load();
+    s.unlinkBusy = cUnlinkBusy.load();
+    s.metaSegsRetired = cMetaRetired.load();
+    s.compactInFlight = cCompactInFlight.load();
     // Engine-accounted committed memory of the writer instance: touched pool
     // slabs, arenas and scratch, descriptors and L1 accelerators.
     uint64_t scratch = 0;

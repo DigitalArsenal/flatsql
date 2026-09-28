@@ -93,6 +93,8 @@ int32_t Writer::journalOpen() {
 
 void Writer::journalAppendRound() {
     jRoundFailed_ = false;
+    // T3 (A12): records written from now on are not checkpointed yet.
+    if (jSafeNs_.load(std::memory_order_relaxed) == UINT64_MAX) jSafeNs_.store(monoNs(), std::memory_order_release);
     if (jFailed_ || journalOpen() < 0) {
         jFailed_ = true;
         jRoundFailed_ = true;
@@ -299,6 +301,8 @@ void Writer::journalMaintenance(bool final) {
         jEnd_[jCkptRetire_] = 0;
         jExtent_[jCkptRetire_] = 0;
         jCheckpoints_.fetch_add(1, std::memory_order_relaxed);
+        // Every record written before the checkpoint began is in its files.
+        jSafeNs_.store(jEnd_[jcur_] > 0 ? jLastCkptNs_ : UINT64_MAX, std::memory_order_release);
     };
     settle(final);
     if (jCkptInFlight_ || jFailed_) return;

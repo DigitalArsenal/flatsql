@@ -26,6 +26,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "flatsql/ps/compaction.h"
 #include "flatsql/ps/extract.h"
 #include "flatsql/ps/format.h"
 #include "flatsql/ps/index.h"
@@ -42,6 +43,7 @@ struct TypeOwner;
 struct Staged;
 struct StagedType;
 struct StageScratch;
+struct CompactPlan;
 
 // ---- configuration -----------------------------------------------------------
 struct EngineConfig {
@@ -92,6 +94,18 @@ struct EngineConfig {
     // standing in for a SIGSTOPped helper.
     uint64_t testHelperStallNs = 0;
     uint32_t testHelperStallEvery = 0;
+    // T3 compaction (§11), reclamation (A12), meta-segment retirement (A9).
+    bool autoCompact = true;               // maintenance picks candidates itself
+    double compactDeadRatio = 0.25;        // a sealed segment with this share of dead frame bytes
+    uint64_t compactSmallBytes = 8ull << 20;   // adjacent sealed segments under this coalesce
+    uint32_t compactMaxInputs = 16;        // segments per coalesced output
+    uint64_t compactMaxOutputBytes = 64ull << 20;
+    uint32_t compactThreads = 1;           // builders (off the writer threads and merge helpers)
+    uint64_t compactSliceBytes = 4ull << 20;   // copied between pacing checks
+    uint32_t compactPacePct = 0;           // builder idles this % of its busy time (0: unpaced)
+    uint64_t reclaimGraceMs = 60000;       // A12: two reader-gate checks this far apart
+    uint32_t reclaimBatch = 64;            // unlinks per maintenance step
+    bool retireMeta = true;                // A9: retire merged sealed m-<seg>
     Io* io = nullptr;               // default: the seven imports
     int64_t (*clockMs)(void*) = nullptr;  // injectable wall clock
     void* clockCtx = nullptr;
@@ -207,7 +221,16 @@ struct SegRun {
 struct SegmentInfo {
     uint32_t seg = 0;
     bool sealed = false;
-    uint32_t cgen = 0;        // T3 seam: rows/attrs/data live in c-<seg>-<cgen>.* (0: d/r/a-<seg>)
+    uint32_t cgen = 0;        // compacted: rows/attrs/data live in c-<seg>-<cgen>.* (0: d/r/a-<seg>)
+    uint32_t lastSeg = 0;     // coalesced output: last original segment covered (0: seg)
+    bool empty = false;       // compacted with no surviving row (no c-* files, no run)
+    uint64_t killThrough = 0; // compaction kill bound (readers below it read prevGen's files)
+    uint32_t prevGen = 0;
+    int64_t minArrival = INT64_MAX;
+    int64_t maxArrival = INT64_MIN;
+    uint64_t deadBytes = 0;   // frame bytes of rows killed since warm (compaction trigger)
+    uint64_t deadRows = 0;
+    std::shared_ptr<const CompactDir> cdir;  // c-<seg>-<cgen>.fsr presence directory (lazy)
     uint64_t firstPseq = 0;
     uint64_t endPseq = 0;     // exclusive; merged rows cover [firstPseq, mergedEnd)
     uint64_t mergedEnd = 0;
@@ -280,22 +303,6 @@ enum MergePhase : uint8_t {
     kMergeOutputsWritten,  // outputs written (unsynced); DONE rides the next batch
 };
 
-// Snapshot of one segment for the manifest a merge writes (taken on the
-// owner at plan time; the helper never reads live partition state).
-struct SegSnap {
-    uint32_t seg = 0;
-    bool sealed = false;
-    uint32_t cgen = 0;
-    uint64_t firstPseq = 0, endPseq = 0, mergedEnd = 0, dLen = 0, rLen = 0, aLen = 0;
-    int64_t minEpoch = INT64_MAX, maxEpoch = INT64_MIN;
-    struct Run {
-        uint32_t gen;
-        uint64_t nEntries;
-        uint64_t fileLen;
-    };
-    std::vector<Run> runs;
-};
-
 struct MergePlan {
     uint32_t seg = 0;
     uint32_t gen = 0;
@@ -308,6 +315,10 @@ struct MergePlan {
     uint64_t aLen = 0;
     int64_t minEpoch = INT64_MAX;
     int64_t maxEpoch = INT64_MIN;
+    int64_t minArrival = INT64_MAX;
+    int64_t maxArrival = INT64_MIN;
+    uint32_t prevManifestGen = 0;
+    uint64_t mfLen = 0;         // the new manifest's size (disk accounting)
     uint32_t fold = 0;          // newest runs of the segment folded into the new one
     uint64_t segFirstPseq = 0;
     uint32_t ownerEpoch = 0;    // A26: the helper's result is applied only under it
@@ -316,7 +327,8 @@ struct MergePlan {
     const std::atomic<uint64_t>* ownerWord = nullptr;
     std::vector<L0DirEntry> batches;      // the merged batches (copy)
     std::vector<MergeRunInput> foldRuns;  // folded runs (immutable while in flight)
-    std::vector<SegSnap> snap;            // manifest input
+    std::vector<ManifestSegDesc> snap;    // manifest input
+    std::vector<RetireItem> retire;       // T3: what MERGE_DONE retires (folded runs, old manifest)
     FileRef r, a, mf;
     SegRun run;                 // the new L1 run, accelerators preloaded
     std::atomic<int32_t> result{0};   // helper: 0 running, 1 done, < 0 error
@@ -350,6 +362,25 @@ struct SwapResult {
     uint32_t seg = 0;
     uint32_t oldCgen = 0;               // the retired files: c-<seg>-<oldCgen>.*, or d/r/a-<seg> when 0
     uint32_t gen = 0;                   // the new manifest generation (and cgen)
+    // T3: what the compaction did.
+    uint32_t segEnd = 0;                // last input segment (coalesced inputs)
+    uint32_t requestSeg = UINT32_MAX;   // input: first segment to compact (UINT32_MAX: the engine picks)
+    uint32_t requestSegEnd = 0;         // input: last segment (0: requestSeg alone)
+    uint64_t rowsIn = 0, rowsKept = 0;
+    uint64_t putsDropped = 0, tombsDropped = 0;
+    uint64_t bytesIn = 0, bytesOut = 0; // input / output file bytes (d r a x)
+    uint64_t killThrough = 0;
+    uint64_t buildNs = 0;
+};
+
+// The partition's named files and their sizes (T3 disk accounting, §13):
+// every file except the ones still growing (h, l, the active d and m, whose
+// extents the partition tracks). Retired files stay until unlinked (A12:
+// disk_bytes drops at UNLINKED).
+struct RetiredFile {
+    RetireItem it{};
+    uint64_t retireNs = 0;    // when the batch naming it became durable
+    uint64_t firstOkNs = 0;   // first passing reader-gate check (A12: a second one a grace later)
 };
 
 struct PendingKill {
@@ -411,9 +442,31 @@ struct Partition {
     ReconcileState rec;
     std::vector<PendingKill> kills;  // type-level kills from the mailbox
     std::vector<TombRange> ranges;   // TOMB_RANGE commands, front first
-    std::vector<SwapResult*> swaps;  // SWAP requests (T3 seam), front first
+    std::vector<SwapResult*> swaps;  // compaction requests, front first
     SwapResult* swapInFlight = nullptr;  // SWAP ctl queued; applies at publish
     uint32_t swapSeg = 0, swapGen = 0;
+    // T3 compaction (compaction.cpp).
+    uint8_t compactPhase = 0;            // CompactPhase
+    std::shared_ptr<CompactPlan> cplan;
+    uint32_t cIntentSeg = 0, cIntentGen = 0;  // durable intent (head)
+    // T3 disk accounting and reclamation (reclaim.cpp).
+    std::vector<RetireItem> ledger;      // stable named files (retired ones until unlinked)
+    uint64_t ledgerBytes = 0;
+    uint64_t hExtent = 0;                // h.fsh size
+    uint64_t lDisk = 0;                  // l.fsl size (>= lExtent: a torn tail is overwritten)
+    std::atomic<uint64_t> diskBytesPub{0};
+    std::vector<RetiredFile> retired;    // the durable RETIRE set
+    std::vector<RetireItem> retiring;    // named by the batch in flight (retired at publish)
+    std::vector<RetireItem> unlinked;    // unlinked; UNLINKED not yet committed
+    bool retireDirty = false;            // the next batch carries RETIRE (+ UNLINKED)
+    uint32_t retireSeg = 0, retireN = 0;
+    uint64_t retireOff = 0;
+    uint32_t firstLiveMSeg = 0;          // A9: m-<seg> below this are retired
+    std::atomic<uint32_t> firstLiveMSegPub{0};
+    uint64_t lastDurableHeadNs = 0;      // write time of the last DURABLE_CKPT head synced (A9)
+    uint64_t pendingDurableHeadNs = 0;   // write time of the last DURABLE_CKPT head written
+    bool forceLaneCkpt = false;          // A9: re-emit the lane table before retiring its m
+    uint64_t lastCompactCheckNs = 0;
     // Memory accounting published for stats() (owner writes, anyone reads).
     std::atomic<uint64_t> accelBytes{0};
     std::atomic<uint32_t> laneCount{0};
@@ -421,7 +474,7 @@ struct Partition {
     uint32_t jCkptIdx = 0;           // its entry in that writer's list
     uint8_t mergePhase = kMergeIdle;
     MergePlan mplan;
-    uint8_t pendingCtl[256];         // ctl records for the next batch
+    uint8_t pendingCtl[1024];        // ctl records for the next batch
     uint32_t pendingCtlBytes = 0;
     uint32_t nPendingCtl = 0;
     uint32_t mapAheadPages = 2;      // adaptive ring page supply
@@ -503,6 +556,7 @@ struct TypeOwner {
     uint64_t fenceLen = 0;           // durable fence entries (bytes)
     uint64_t gSegLastGseq = 0;       // last arrival gseq in the current segment
     std::unordered_map<uint64_t, FileRef> partM;  // read handles keyed (pid << 32 | mSeg)
+    uint64_t partMSweepNs = 0;       // T3: last close of handles on retired meta segments
     uint32_t manifestGenLoaded = 0;  // catalog manifest (live runs)
     uint64_t labelCkptOff = 0;       // A10 full-label checkpoint batch (> 128 pids)
     uint32_t labelCkptSeg = 0;
@@ -537,7 +591,7 @@ enum CmdKind : uint32_t {
     kCmdTypeDelete = 5,       // ptr = TypeOwner*, cid in data, remaining ticket
     kCmdStop = 6,
     kCmdTombRange = 7,        // a = pid, b = seg, data[0..8) = epoch bound (ms), ticket
-    kCmdSwap = 8,             // a = pid, ptr = SwapResult*
+    kCmdSwap = 8,             // a = pid, ptr = SwapResult* (a compaction request)
 };
 
 struct Cmd {
@@ -712,6 +766,7 @@ private:
     uint64_t jLastCkptNs_ = 0;
     std::shared_ptr<std::atomic<int32_t>> jCkptResult_;
     std::vector<uint8_t> jStage_;       // small parts coalesced (reserved)
+    std::atomic<uint64_t> jSafeNs_{UINT64_MAX};  // T3: records before this are checkpointed (MAX: none pending)
     std::atomic<uint64_t> jRecords_{0};
     std::atomic<uint64_t> jBytes_{0};
     std::atomic<uint64_t> jCheckpoints_{0};
@@ -759,6 +814,17 @@ struct EngineStats {
     uint64_t descriptorBytes = 0;
     uint64_t acceleratorBytes = 0;
     uint64_t committedBytes = 0;   // engine-accounted writer memory
+    // T3
+    uint64_t compactions = 0;
+    uint64_t compactAborts = 0;
+    uint64_t compactBytesIn = 0;
+    uint64_t compactBytesOut = 0;
+    uint64_t retiredFiles = 0;
+    uint64_t unlinkedFiles = 0;
+    uint64_t unlinkBusy = 0;
+    uint64_t metaSegsRetired = 0;
+    uint64_t compactInFlight = 0;  // planned, not yet applied or aborted
+    uint64_t diskBytes = 0;        // sum over partitions (published values)
 };
 
 class Engine {
@@ -793,9 +859,23 @@ public:
     // Quota planner command (T3 issues it): TOMB_RANGE{seg, epoch < beforeMs}
     // on one partition. `remaining` (set to 1) reaches 0 when it is done.
     int32_t tombRange(uint32_t pid, uint32_t seg, int64_t beforeMs, std::atomic<int32_t>* remaining);
-    // SWAP seam (see SwapResult): compacts the partition's oldest-generation
-    // fully merged sealed segment. `r->remaining` reaches 0 when done.
+    // Compaction (T3, §11): compacts r->requestSeg..requestSegEnd, or the
+    // engine's choice (the best candidate, else the oldest-generation fully
+    // merged sealed segment). `r->remaining` reaches 0 once the SWAP is
+    // durable (status < 0: no candidate or an error).
     int32_t swapSegment(uint32_t pid, SwapResult* r);
+    // A12 reader gate: the oldest start (monoNs) of any running reader
+    // statement, UINT64_MAX when none. Files a SWAP or MERGE_DONE retired at t
+    // are unlinked only once it is past t, checked twice a grace apart. Not
+    // set: no reader shares the store (unit tests).
+    void setReaderGate(uint64_t (*fn)(void*), void* ctx);
+    uint64_t readerGateNs() const;
+    // Disk bytes of a partition as its owner last published them (§13).
+    uint64_t partitionDiskBytes(uint32_t pid) const;
+    // A8: every journal record written before this time is checkpointed.
+    uint64_t journalSafeNs() const;
+    // Compaction builds run on their own threads.
+    void submitCompaction(std::function<void(IoCtx*)> job);
 
     // Doorbell for a partition's owner (and HANDOFF target, A24).
     void ringOwner(uint32_t pid);
@@ -829,6 +909,8 @@ public:
     std::atomic<uint64_t> cRows{0}, cDedupe{0}, cRetags{0}, cTombs{0}, cRejects{0}, cMerges{0},
         cSeals{0}, cTypeCommits{0}, cFirst{0}, cRepeat{0}, cPromotions{0}, cMergeNotOwner{0},
         cHelperStalls{0}, cHelperJobs{0}, cHandoffHelperWaits{0};
+    std::atomic<uint64_t> cCompactions{0}, cCompactAborts{0}, cCompactBytesIn{0}, cCompactBytesOut{0},
+        cRetired{0}, cUnlinked{0}, cUnlinkBusy{0}, cMetaRetired{0}, cCompactInFlight{0};
     uint64_t framesParsedAtOpen = 0;
     uint64_t adoptedBatches = 0;
     uint64_t journalReplayRecords = 0;
@@ -914,6 +996,17 @@ private:
     bool ckptStop_ = false;
     std::atomic<bool> ckptActive_{false};
     void stopCheckpointThread();
+    // T3 compaction builders.
+    std::mutex compactMu_;
+    std::condition_variable compactCv_;
+    std::deque<std::function<void(IoCtx*)>> compactJobs_;
+    std::vector<std::thread> compactThreads_;
+    std::vector<std::unique_ptr<IoCtx>> compactIo_;
+    IoStats compactIoStats_;
+    bool compactStop_ = false;
+    void stopCompactThreads();
+    std::atomic<uint64_t (*)(void*)> readerGate_{nullptr};
+    std::atomic<void*> readerGateCtx_{nullptr};
     std::mutex helperMu_;               // maintenance queue (never on a record path)
     std::condition_variable helperCv_;
     std::deque<std::function<void(IoCtx*)>> helperJobs_;

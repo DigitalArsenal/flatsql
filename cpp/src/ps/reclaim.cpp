@@ -1,0 +1,391 @@
+// FlatSQL partition store: reclamation and disk accounting (design §11
+// step 4, §13, A9, A12; T3).
+//
+// Disk bytes (§13): a partition's disk_bytes is the exact size of the files
+// it names: a ledger of the stable ones (sealed segments' d and m, r/a, c-*,
+// L1 runs, manifests, and retired files until they are unlinked) plus the
+// extents of the files still growing (h, l, the active d and m, zero-fill
+// included). Open rebuilds the ledger from the head, the manifest and file
+// sizes; the owner maintains it on every append, merge, seal, SWAP and unlink.
+//
+// Reclamation (A12): a MERGE_DONE or SWAP names the files it replaces in a
+// RETIRE set that rides the same batch (the whole outstanding set, so the
+// head can point at one record). A retired file is unlinked with
+// UNLINK_IF_UNUSED only when the reader gate (the oldest running reader
+// statement's start) is past the time its retirement became durable, checked
+// twice a grace apart; BUSY means a handle is still open, retry later. The
+// next batch carries UNLINKED and the shrunken set; disk_bytes drops then.
+// Open unlinks every file of the persisted set (no reader of the previous
+// incarnation can be served from the writer's state anyway).
+//
+// Meta-segment retirement (A9): a sealed m-<seg> whose batches are all merged
+// is retired once its lane table and RETIRE set have been re-emitted into
+// the active segment (both ride the retiring batch), and unlinked only after
+// a DURABLE_CKPT head names a later first_live_m_seg.
+#include <algorithm>
+
+#include "internal.h"
+
+namespace flatsql {
+namespace ps {
+
+// ---------------------------------------------------------------------------
+// Ledger
+// ---------------------------------------------------------------------------
+namespace {
+bool ledgerMatch(const RetireItem& a, char letter, uint32_t seg, uint32_t gen) {
+    if (a.letter != uint8_t(letter)) return false;
+    if (letter == 'f') return a.gen == gen;
+    if (letter == 'd' || letter == 'r' || letter == 'a' || letter == 'm') return a.seg == seg;
+    return a.seg == seg && a.gen == gen;
+}
+}  // namespace
+
+void ledgerSet(Partition* p, const RetireItem& it) {
+    for (auto& e : p->ledger) {
+        if (ledgerMatch(e, char(it.letter), it.seg, it.gen)) {
+            p->ledgerBytes += uint64_t(it.size) - uint64_t(e.size);
+            e.size = it.size;
+            return;
+        }
+    }
+    const int saved = tHotPathDepth;
+    tHotPathDepth = 0;  // a maintenance event (merge, seal, SWAP), never per record
+    p->ledger.push_back(it);
+    tHotPathDepth = saved;
+    p->ledgerBytes += it.size;
+}
+
+void ledgerDrop(Partition* p, char letter, uint32_t seg, uint32_t gen) {
+    for (size_t i = 0; i < p->ledger.size(); i++) {
+        if (!ledgerMatch(p->ledger[i], letter, seg, gen)) continue;
+        p->ledgerBytes -= p->ledger[i].size;
+        p->ledger[i] = p->ledger.back();
+        p->ledger.pop_back();
+        return;
+    }
+}
+
+uint64_t ledgerSize(const Partition* p, char letter, uint32_t seg, uint32_t gen) {
+    for (const auto& e : p->ledger)
+        if (ledgerMatch(e, letter, seg, gen)) return e.size;
+    return 0;
+}
+
+uint64_t partitionDiskBytes(const Partition* p) {
+    return p->ledgerBytes + p->hExtent + p->lDisk + p->dExtent + p->mExtent;
+}
+
+void partitionPublishDisk(Partition* p) {
+    const uint64_t b = partitionDiskBytes(p);
+    p->counters.diskBytes = b;
+    p->diskBytesPub.store(b, std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// The RETIRE set record
+// ---------------------------------------------------------------------------
+namespace {
+// Consecutive manifest generations collapse into one 'F' item {gen = first,
+// seg = count}: a busy partition retires one manifest per merge.
+void appendItems(std::vector<RetireItem>* out, const RetireItem* it, size_t n) {
+    for (size_t i = 0; i < n; i++) out->push_back(it[i]);
+}
+}  // namespace
+
+size_t retireSetEncode(const Partition* p, const std::vector<const std::vector<RetireItem>*>& extra,
+                       const RetireSetHeader& hdr, uint8_t* out, size_t cap) {
+    // Gather (no allocation beyond this maintenance-time vector).
+    std::vector<RetireItem> all;
+    all.reserve(p->retired.size() + 16);
+    for (const auto& r : p->retired) all.push_back(r.it);
+    for (const auto* v : extra)
+        if (v) appendItems(&all, v->data(), v->size());
+    std::vector<uint32_t> mfs;
+    std::vector<RetireItem> rest;
+    for (const auto& it : all) {
+        if (it.letter == 'f') mfs.push_back(it.gen);
+        else rest.push_back(it);
+    }
+    std::sort(mfs.begin(), mfs.end());
+    mfs.erase(std::unique(mfs.begin(), mfs.end()), mfs.end());
+    for (size_t i = 0; i < mfs.size();) {
+        size_t j = i + 1;
+        while (j < mfs.size() && mfs[j] == mfs[j - 1] + 1) j++;
+        RetireItem f{};
+        f.letter = 'F';
+        f.gen = mfs[i];
+        f.seg = uint32_t(j - i);
+        rest.push_back(f);
+        i = j;
+    }
+    const size_t bytes = sizeof(RetireSetHeader) + rest.size() * sizeof(RetireItem);
+    if (bytes > cap) return 0;
+    RetireSetHeader h = hdr;
+    h.n = uint32_t(rest.size());
+    std::memcpy(out, &h, sizeof(h));
+    if (!rest.empty()) std::memcpy(out + sizeof(h), rest.data(), rest.size() * sizeof(RetireItem));
+    return bytes;
+}
+
+bool retireSetDecode(const uint8_t* body, size_t len, RetireSetHeader* h, std::vector<RetireItem>* items) {
+    items->clear();
+    if (len < sizeof(RetireSetHeader)) return false;
+    std::memcpy(h, body, sizeof(*h));
+    if (sizeof(RetireSetHeader) + size_t(h->n) * sizeof(RetireItem) > len) return false;
+    for (uint32_t i = 0; i < h->n; i++) {
+        RetireItem it;
+        std::memcpy(&it, body + sizeof(RetireSetHeader) + size_t(i) * sizeof(it), sizeof(it));
+        if (it.letter == 'F') {
+            if (it.seg > (1u << 24)) return false;
+            for (uint32_t g = 0; g < it.seg; g++) {
+                RetireItem f{};
+                f.letter = 'f';
+                f.gen = it.gen + g;
+                items->push_back(f);
+            }
+        } else {
+            items->push_back(it);
+        }
+    }
+    return true;
+}
+
+void partitionRetireCommitted(Partition* p, const std::vector<RetireItem>& items, uint64_t nowNs) {
+    for (const auto& it : items) {
+        RetiredFile r;
+        r.it = it;
+        r.retireNs = nowNs;
+        p->retired.push_back(r);
+    }
+}
+
+void partitionUnlinkedCommitted(Partition* p, uint32_t n) {
+    n = std::min<uint32_t>(n, uint32_t(p->unlinked.size()));
+    for (uint32_t i = 0; i < n; i++) {
+        const RetireItem& it = p->unlinked[i];
+        ledgerDrop(p, char(it.letter), it.seg, it.gen);
+    }
+    p->unlinked.erase(p->unlinked.begin(), p->unlinked.begin() + n);
+}
+
+// ---------------------------------------------------------------------------
+// Unlinking (maintenance)
+// ---------------------------------------------------------------------------
+int32_t partitionReclaimStep(Writer* w, Partition* p) {
+    if (p->retired.empty() || p->quarantined) return 0;
+    Engine* e = w->engine();
+    const EngineConfig& cfg = e->config();
+    const uint64_t now = monoNs();
+    const uint64_t gate = e->readerGateNs();
+    const uint64_t jsafe = cfg.commitJournal ? e->journalSafeNs() : UINT64_MAX;
+    const uint64_t grace = cfg.reclaimGraceMs * 1000000ull;
+    // A set grown past what one batch can carry (a reader statement older
+    // than hours of retirements): the oldest go regardless of the gate; such
+    // a statement gets the retryable SNAPSHOT_GONE instead of the writer
+    // ever waiting on it.
+    const bool valve = p->retired.size() > 2048;
+    const int saved = tHotPathDepth;
+    tHotPathDepth = 0;
+    uint32_t done = 0;
+    size_t i = 0;
+    int32_t out = 0;
+    while (i < p->retired.size() && done < cfg.reclaimBatch) {
+        RetiredFile& r = p->retired[i];
+        const bool forced = valve && p->retired.size() - i > 2048 && now - r.retireNs >= grace;
+        if (!forced) {
+            if (gate <= r.retireNs) break;  // FIFO: later items retired later
+            if (!r.firstOkNs) r.firstOkNs = now;
+            if (now - r.firstOkNs < grace) break;
+        }
+        if (r.it.letter == 'm' && p->lastDurableHeadNs <= r.retireNs) break;
+        if (jsafe <= r.retireNs) break;
+        // The owner's own read handles go first (UNLINK_IF_UNUSED).
+        if (r.it.letter == 'm') {
+            for (auto& s : p->segs)
+                if (s.seg == r.it.seg) w->io().close(&s.m);
+        }
+        PathBuf path;
+        retirePath(&path, w->eng_root(), p->pid, r.it);
+        const int32_t rc = path.len ? w->io().unlink(path.c_str(), path.len, true) : 0;
+        if (rc == FLATSQL_IO_ERR_BUSY) {
+            // A handle is open somewhere (an idle reader closes its own within
+            // seconds): later items go ahead of it.
+            e->cUnlinkBusy.fetch_add(1, std::memory_order_relaxed);
+            i++;
+            continue;
+        }
+        if (rc < 0 && rc != FLATSQL_IO_ERR_NOENT) {
+            out = rc;
+            break;
+        }
+        p->unlinked.push_back(r.it);
+        p->retired.erase(p->retired.begin() + long(i));
+        e->cUnlinked.fetch_add(1, std::memory_order_relaxed);
+        done++;
+    }
+    tHotPathDepth = saved;
+    if (done) {
+        p->retireDirty = true;
+        w->ring();
+    }
+    return out < 0 ? out : int32_t(done);
+}
+
+// ---------------------------------------------------------------------------
+// A9: retire merged sealed meta segments
+// ---------------------------------------------------------------------------
+int32_t partitionRetireMetaStep(Writer* w, Partition* p) {
+    Engine* e = w->engine();
+    if (!e->config().retireMeta || p->quarantined) return 0;
+    if (p->firstLiveMSeg >= p->mSeg) return 0;
+    if (p->retireDirty || !p->retiring.empty() || p->nPendingCtl) return 0;  // one change per batch
+    // firstLiveMSeg moves when the batch carrying the retirement commits
+    // (heads written before it must still name the segment).
+    const uint32_t s = p->firstLiveMSeg;
+    for (uint32_t i = 0; i < p->nL0; i++)
+        if (p->l0[i].mSeg <= s) return 0;  // unmerged batches still live in it
+    if (p->mergePhase != kMergeIdle && p->mplan.seg <= s) return 0;
+    const int saved = tHotPathDepth;
+    tHotPathDepth = 0;
+    for (auto& si : p->segs)
+        if (si.seg == s) w->io().close(&si.m);
+    const uint64_t size = ledgerSize(p, 'm', s, 0);
+    p->retiring.push_back(retireItem('m', s, 0, size));
+    p->forceLaneCkpt = true;  // the lane table moves to a live segment with it
+    p->retireDirty = true;
+    tHotPathDepth = saved;
+    e->cMetaRetired.fetch_add(1, std::memory_order_relaxed);
+    w->ring();
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Open: the persisted set is unlinked; the ledger is rebuilt from the head,
+// the manifest and file sizes (no data byte is read).
+// ---------------------------------------------------------------------------
+namespace {
+int64_t statFile(IoCtx* io, const PathBuf& path, FileClass cls) {
+    FileRef f;
+    if (io->open(path.c_str(), path.len, FLATSQL_IO_READ, cls, &f) < 0) return -1;
+    const int64_t n = io->size(f);
+    io->close(&f);
+    return n;
+}
+}  // namespace
+
+int32_t partitionOpenReclaim(IoCtx* io, const char* root, Partition* p, const std::vector<RetireItem>& items,
+                             uint32_t* unlinked) {
+    *unlinked = 0;
+    p->retired.clear();
+    for (const auto& it : items) {
+        PathBuf path;
+        retirePath(&path, root, p->pid, it);
+        if (!path.len) continue;
+        const int32_t rc = io->unlink(path.c_str(), path.len, true);
+        if (rc == 0) {
+            (*unlinked)++;
+        } else if (rc == FLATSQL_IO_ERR_BUSY) {
+            // A reader instance that outlived the writer still holds it: it
+            // stays retired, behind the reader gate like any other.
+            RetiredFile r;
+            r.it = it;
+            FileRef f;
+            if (io->open(path.c_str(), path.len, FLATSQL_IO_READ, FileClass::Store, &f) == 0) {
+                const int64_t n = io->size(f);
+                io->close(&f);
+                r.it.size = n > 0 ? uint32_t(std::min<int64_t>(n, 0xffffffffll)) : 0;
+            }
+            r.retireNs = monoNs();
+            p->retired.push_back(r);
+        } else if (rc != FLATSQL_IO_ERR_NOENT) {
+            return rc;
+        }
+    }
+    if (!p->retired.empty()) p->retireDirty = true;
+    return 0;
+}
+
+int32_t partitionOpenLedger(IoCtx* io, const char* root, Partition* p) {
+    p->ledger.clear();
+    p->ledgerBytes = 0;
+    PathBuf path;
+    pathPartition(&path, root, p->pid, "h.fsh");
+    int64_t n = statFile(io, path, FileClass::Head);
+    p->hExtent = n > 0 ? uint64_t(n) : 0;
+    pathPartition(&path, root, p->pid, "l.fsl");
+    n = statFile(io, path, FileClass::Lanes);
+    p->lDisk = n > 0 ? uint64_t(n) : 0;
+    pathPartitionSeg(&path, root, p->pid, 'd', p->dSeg, "fsd");
+    n = statFile(io, path, FileClass::Data);
+    p->dExtent = n > 0 ? uint64_t(n) : 0;
+    pathPartitionSeg(&path, root, p->pid, 'm', p->mSeg, "fsl");
+    n = statFile(io, path, FileClass::Meta);
+    p->mExtent = n > 0 ? uint64_t(n) : 0;
+    for (uint32_t s = p->firstLiveMSeg; s < p->mSeg; s++) {
+        pathPartitionSeg(&path, root, p->pid, 'm', s, "fsl");
+        n = statFile(io, path, FileClass::Meta);
+        if (n >= 0) ledgerSet(p, retireItem('m', s, 0, uint64_t(n)));
+    }
+    // The next segment's pre-created files (named by next_seg).
+    pathPartitionSeg(&path, root, p->pid, 'd', p->nextSeg, "fsd");
+    n = statFile(io, path, FileClass::Data);
+    if (n >= 0) ledgerSet(p, retireItem('d', p->nextSeg, 0, uint64_t(n)));
+    pathPartitionSeg(&path, root, p->pid, 'm', p->nextSeg, "fsl");
+    n = statFile(io, path, FileClass::Meta);
+    if (n >= 0) ledgerSet(p, retireItem('m', p->nextSeg, 0, uint64_t(n)));
+    // The manifest and the files it names.
+    if (p->manifestGen) {
+        pathPartitionManifest(&path, root, p->pid, p->manifestGen);
+        FileRef f;
+        int32_t rc = io->open(path.c_str(), path.len, FLATSQL_IO_READ, FileClass::Manifest, &f);
+        if (rc < 0) return rc;
+        const int64_t size = io->size(f);
+        std::vector<uint8_t> buf(size > 0 ? size_t(size) : 0);
+        ManifestDesc md;
+        const bool ok = size > 0 && io->read(f, buf.data(), buf.size(), 0) == size &&
+                        decodeManifest(buf.data(), buf.size(), &md);
+        io->close(&f);
+        if (!ok) return FLATSQL_IO_ERR_IO;
+        ledgerSet(p, retireItem('f', 0, p->manifestGen, uint64_t(size)));
+        p->segs.clear();
+        for (const auto& d : md.segs) {
+            SegmentInfo si;
+            segFromDesc(d, &si);
+            if (d.cgen && !d.empty) {
+                ledgerSet(p, retireItem('D', d.seg, d.cgen, d.dLen));
+                ledgerSet(p, retireItem('R', d.seg, d.cgen, d.rLen));
+                ledgerSet(p, retireItem('A', d.seg, d.cgen, d.aLen));
+            } else if (!d.cgen) {
+                if (d.rLen) ledgerSet(p, retireItem('r', d.seg, 0, d.rLen));
+                if (d.aLen) ledgerSet(p, retireItem('a', d.seg, 0, d.aLen));
+                if (d.seg != p->dSeg) {  // sealed since, even if the manifest predates the SEAL
+                    pathPartitionSeg(&path, root, p->pid, 'd', d.seg, "fsd");
+                    n = statFile(io, path, FileClass::Data);
+                    if (n >= 0) ledgerSet(p, retireItem('d', d.seg, 0, uint64_t(n)));
+                }
+            }
+            for (const auto& r : d.runs) ledgerSet(p, retireItem('x', d.seg, r.gen, r.fileLen));
+            p->segs.push_back(std::move(si));
+        }
+    }
+    // Sealed segments not merged yet (no manifest entry): their d files.
+    for (uint32_t s = p->firstLiveMSeg; s < p->dSeg; s++) {
+        bool known = false;
+        for (const auto& si : p->segs) {
+            const uint32_t last = si.lastSeg ? si.lastSeg : si.seg;
+            if (s >= si.seg && s <= last) known = true;
+        }
+        if (known) continue;
+        pathPartitionSeg(&path, root, p->pid, 'd', s, "fsd");
+        n = statFile(io, path, FileClass::Data);
+        if (n >= 0) ledgerSet(p, retireItem('d', s, 0, uint64_t(n)));
+    }
+    // Retired files a reader still held at open stay counted until unlinked.
+    for (const auto& r : p->retired) ledgerSet(p, r.it);
+    partitionPublishDisk(p);
+    return 0;
+}
+
+}  // namespace ps
+}  // namespace flatsql

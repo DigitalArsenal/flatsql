@@ -196,6 +196,8 @@ void StageScratch::resetPartition() {
     nCtl = 0;
     laneFrameBytes = 0;
     firstNewLaneIndex = 0;
+    retireAt = UINT32_MAX;
+    forceLaneCkpt = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +484,7 @@ StageScratch::Cid* cidState(Ctx& c, const uint8_t key[kCidKeyLen]) {
             c.err = rr;
             return nullptr;
         }
+        if (r.kind != kRowPut) continue;  // VOID: compacted away (dead)
         best = cands[i];
         putLen = r.len;
         break;
@@ -513,7 +516,7 @@ bool instanceLive(Ctx& c, uint64_t put, uint64_t h, const TagView& tag) {
         if (sc.instPut[i] != put || sc.instHash[i] != h) continue;
         if (stagedDeadGet(sc, sc.instPseq[i] | kTagDeadBit, nullptr)) continue;
         RecRow r;
-        if (readRow(c, sc.instPseq[i], &r) < 0) continue;
+        if (readRow(c, sc.instPseq[i], &r) < 0 || r.kind == kRowVoid) continue;
         if (readAttrOf(c, r, buf, sizeof(buf), &alen) < 0) continue;
         AttrView av;
         if (parseAttr(buf, alen, &av) && tagTupleEqual(av.tag, tag)) return true;
@@ -534,7 +537,7 @@ bool instanceLive(Ctx& c, uint64_t put, uint64_t h, const TagView& tag) {
     for (uint32_t i = 0; i < nc; i++) {
         if (isTagDead(c, cands[i])) continue;
         RecRow r;
-        if (readRow(c, cands[i], &r) < 0) continue;
+        if (readRow(c, cands[i], &r) < 0 || r.kind == kRowVoid) continue;
         if (readAttrOf(c, r, buf, sizeof(buf), &alen) < 0) continue;
         AttrView av;
         if (parseAttr(buf, alen, &av) && tagTupleEqual(av.tag, tag)) return true;
@@ -562,6 +565,11 @@ int32_t forEachLiveInstance(Ctx& c, uint64_t put, F&& visit) {
     for (uint32_t i = 0; i < nf; i++) {
         if (isTagDead(c, found[i])) continue;
         if (c.err) return c.err;
+        if (found[i] != put) {
+            // An instance compacted away is gone (its TAG_TOMB may be too).
+            RecRow ir;
+            if (readRow(c, found[i], &ir) >= 0 && ir.kind == kRowVoid) continue;
+        }
         if (!visit(found[i])) break;
     }
     return 0;
@@ -687,7 +695,22 @@ bool stageKill(Ctx& c, uint64_t target, uint8_t tombKind = kRowTomb) {
         c.err = rr;
         return false;
     }
+    if (tr.kind == kRowVoid) return true;  // compacted away: already dead
     const int64_t now = c.e->nowMs();
+    // Compaction trigger (§11): dead frame bytes per sealed segment.
+    if (tr.len && (tr.kind == kRowPut || tr.kind == kRowLicence || tr.kind == kRowCtl)) {
+        Staged& st = *c.st;
+        uint32_t k = 0;
+        while (k < st.nDeadSeg && st.deadSeg[k] != tr.seg) k++;
+        if (k < 16) {
+            if (k == st.nDeadSeg) {
+                st.deadSeg[k] = tr.seg;
+                st.deadSegBytes[k] = 0;
+                st.nDeadSeg++;
+            }
+            st.deadSegBytes[k] += tr.len;
+        }
+    }
     if (tr.kind == kRowPut) {
         // Every live tag instance dies with the record (lane counters).
         const int32_t rc = forEachLiveInstance(c, target, [&](uint64_t inst) {
@@ -847,10 +870,30 @@ int32_t partitionReadRow(Writer* w, Partition* p, uint64_t pseq, RecRow* out) {
     }
     for (auto& si : p->segs) {
         if (pseq >= si.firstPseq && pseq < si.mergedEnd) {
+            uint64_t off = (pseq - si.firstPseq) * sizeof(RecRow);
+            if (si.cgen) {
+                // Compacted (T3): a pseq the directory lacks was removed.
+                if (si.empty) {
+                    voidRow(out, pseq, si.seg);
+                    return 0;
+                }
+                const int saved = tHotPathDepth;
+                tHotPathDepth = 0;
+                const int32_t rc = partitionLoadCompactDir(&w->io(), w->eng_root(), p->pid, &si);
+                tHotPathDepth = saved;
+                if (rc < 0) return rc;
+                const int64_t idx = si.cdir->indexOf(pseq);
+                if (idx < 0) {
+                    voidRow(out, pseq, si.seg);
+                    return 0;
+                }
+                off = CompactDir::rowOffset(uint64_t(idx));
+            }
             FileRef* f = openSegFile(w, p, &si, 'r');
             if (!f) return FLATSQL_IO_ERR_IO;
-            const int64_t n = w->io().read(*f, out, sizeof(RecRow), (pseq - si.firstPseq) * sizeof(RecRow));
-            return n == int64_t(sizeof(RecRow)) ? 0 : (n < 0 ? int32_t(n) : FLATSQL_IO_ERR_IO);
+            const int64_t n = w->io().read(*f, out, sizeof(RecRow), off);
+            if (n != int64_t(sizeof(RecRow))) return n < 0 ? int32_t(n) : FLATSQL_IO_ERR_IO;
+            return out->pseq == pseq ? 0 : FLATSQL_IO_ERR_IO;
         }
     }
     return FLATSQL_IO_ERR_NOENT;
@@ -1383,7 +1426,7 @@ bool reconcileStep(Ctx& c) {
         if (c.sc->nRows + 4 > c.sc->capRows || c.sc->nEntries + 8 > c.sc->capEntries) return false;
         const uint64_t inst = rs.instances[rs.next];
         RecRow ir;
-        if (readRow(c, inst, &ir) < 0) {
+        if (readRow(c, inst, &ir) < 0 || ir.kind == kRowVoid) {
             rs.next++;
             continue;
         }
@@ -1529,7 +1572,7 @@ static bool finalizeBatch(Ctx& c, Arena* batches) {
     // More than 32 live lanes: the batch carries the full lane table so a
     // head can point at it (the head holds 32 inline).
     uint32_t laneCkptAt = UINT32_MAX;
-    if (sc.nDeltas) {
+    if (sc.nDeltas || sc.forceLaneCkpt) {
         uint32_t live = 0;
         for (const auto& l : p->lanes) {
             int64_t cnt = l.c.count;
@@ -1537,7 +1580,8 @@ static bool finalizeBatch(Ctx& c, Arena* batches) {
                 if (sc.deltas[i].laneId == l.id) cnt += sc.deltas[i].dCount;
             if (cnt != 0) live++;
         }
-        if (live > kMaxInlineLanes) {
+        // A9: a retiring meta segment's batch re-emits the whole table.
+        if (live > kMaxInlineLanes || sc.forceLaneCkpt) {
             const size_t need = 4 + size_t(live) * sizeof(LaneCounter);
             if (sc.ctlBytes + 4 + need <= sizeof(sc.ctl) && need <= 65535) {
                 laneCkptAt = sc.ctlBytes + 4;
@@ -1619,6 +1663,7 @@ static bool finalizeBatch(Ctx& c, Arena* batches) {
     off += deltasLen;
     putU32(b + off, sc.nCtl);
     if (laneCkptAt != UINT32_MAX) st.laneCkptOff = mOff + off + 4 + laneCkptAt;
+    if (sc.retireAt != UINT32_MAX) st.retireOff = mOff + off + 4 + sc.retireAt;
     std::memcpy(b + off + 4, sc.ctl, sc.ctlBytes);
     std::memset(b + off + 4 + sc.ctlBytes, 0, ctlLen - 4 - sc.ctlBytes);
     off += ctlLen;
@@ -1736,14 +1781,78 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
         sc->ctlBytes += p->pendingCtlBytes;
         sc->nCtl += p->nPendingCtl;
         st->consumedPendingCtl = true;
-        // A SWAP completes when its batch is durable and its head written.
-        if (p->swapInFlight) st->tickets[st->nTickets++] = &p->swapInFlight->remaining;
+        if (p->compactPhase == kCompactSwapQueued) {
+            // The compaction SWAP: counters lose the removed rows; it completes
+            // when its batch is durable and its head written.
+            st->swapCommit = true;
+            partitionCompactStage(p, &st->counters);
+            if (p->swapInFlight) st->tickets[st->nTickets++] = &p->swapInFlight->remaining;
+        }
     }
     if (p->mergePhase == kMergeOutputsWritten) {
         uint8_t body[40];
         mergeDoneBody(p, body);
         addCtl(c, kCtlMergeDone, body, sizeof(body));
         st->mergeDone = true;
+    }
+    // A12: UNLINKED and the outstanding RETIRE set (whole, so the head points
+    // at one record) ride the batch that changes it.
+    {
+        const std::vector<RetireItem>* swapRetire = st->swapCommit ? partitionCompactRetiring(p) : nullptr;
+        const std::vector<RetireItem>* mergeRetire = st->mergeDone ? &p->mplan.retire : nullptr;
+        if (!p->unlinked.empty()) {
+            const uint32_t n = uint32_t(std::min<size_t>(p->unlinked.size(), 1024));
+            const size_t len = sizeof(RetireSetHeader) + size_t(n) * sizeof(RetireItem);
+            if (sc->ctlBytes + 4 + len <= sizeof(sc->ctl) / 2) {
+                uint8_t* q = sc->ctl + sc->ctlBytes;
+                putU16(q, kCtlUnlinked);
+                putU16(q + 2, uint16_t(len));
+                RetireSetHeader h{};
+                h.n = n;
+                h.manifestGen = p->manifestGen;
+                h.mergedThrough = p->mergedThrough;
+                h.firstLiveMSeg = p->firstLiveMSeg;
+                h.nextGen = p->nextGen;
+                std::memcpy(q + 4, &h, sizeof(h));
+                std::memcpy(q + 4 + sizeof(h), p->unlinked.data(), size_t(n) * sizeof(RetireItem));
+                sc->ctlBytes += uint32_t(4 + len);
+                sc->nCtl++;
+                st->nUnlinked = n;
+            }
+        }
+        if (p->retireDirty || !p->retiring.empty() || (swapRetire && !swapRetire->empty()) ||
+            (mergeRetire && !mergeRetire->empty()) || st->nUnlinked) {
+            RetireSetHeader h{};
+            h.manifestGen = st->mergeDone ? p->mplan.gen : st->swapCommit ? p->swapGen : p->manifestGen;
+            h.mergedThrough = st->mergeDone ? p->mplan.through : p->mergedThrough;
+            h.firstLiveMSeg = p->firstLiveMSeg;
+            for (const auto& it : p->retiring)
+                if (it.letter == 'm' && it.seg + 1 > h.firstLiveMSeg) h.firstLiveMSeg = it.seg + 1;
+            h.nextGen = p->nextGen;
+            // Room for the lane table finalize may add (A9 forces one).
+            const size_t laneRoom = 64 + (p->lanes.size() + 1) * sizeof(LaneCounter);
+            const size_t used = sc->ctlBytes + 4 + laneRoom;
+            const size_t cap = used < sizeof(sc->ctl) ? std::min<size_t>(sizeof(sc->ctl) - used, 65535) : 0;
+            const int saved = tHotPathDepth;
+            tHotPathDepth = 0;  // a maintenance record, never per entry
+            const size_t len = cap ? retireSetEncode(p, {&p->retiring, swapRetire, mergeRetire}, h,
+                                                     sc->ctl + sc->ctlBytes + 4, cap)
+                                   : 0;
+            tHotPathDepth = saved;
+            if (!len) {
+                c.err = FLATSQL_IO_ERR_GENERIC;  // the set outgrew a batch: reclaim shrinks it first
+            } else {
+                putU16(sc->ctl + sc->ctlBytes, kCtlRetire);
+                putU16(sc->ctl + sc->ctlBytes + 2, uint16_t(len));
+                sc->retireAt = sc->ctlBytes + 4;
+                st->retireN = getU32(sc->ctl + sc->ctlBytes + 4);
+                sc->ctlBytes += uint32_t(4 + len);
+                sc->nCtl++;
+                st->retireSet = true;
+                st->nRetiring = uint32_t(p->retiring.size());
+            }
+        }
+        if (p->forceLaneCkpt) sc->forceLaneCkpt = true;
     }
     // Type-level kills from the mailbox (A14). They leave the queue when the
     // batch publishes; a discarded batch retries them.
@@ -1771,7 +1880,9 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
     const uint64_t rejHead = p->ring->rejectHead.load(std::memory_order_relaxed);
     const uint64_t rejTail = p->ring->rejectTail.load(std::memory_order_acquire);
     const uint32_t rejRoom = uint32_t(kRejectSlots - (rejHead - rejTail));
-    if (p->sealPending && p->dLen > 0) st->sealAfter = true;
+    // T3: a segment of rows without frames (tombstones) seals too, so it can
+    // be compacted once its targets are gone.
+    if (p->sealPending && (p->dLen > 0 || p->segRecords > 0)) st->sealAfter = true;
     while (!st->sealAfter && !c.err && pos + sizeof(EntryHeader) <= tail) {
         if (st->dBytes >= cfg.commitBytes || frames0 >= cfg.commitFrames) break;
         if (p->nL0 >= kMaxL0Dir - 1) break;  // wait for a merge (type labeling lags)
@@ -1969,11 +2080,17 @@ void encodePartitionHead(const Partition* p, uint8_t* slot, uint32_t* used, bool
     h.mergedThrough = p->mergedThrough;
     h.manifestGen = p->manifestGen;
     h.nL0 = uint16_t(p->nL0);
-    h.firstLiveMSeg = 0;
+    h.firstLiveMSeg = p->firstLiveMSeg;
+    h.cIntentSeg = p->cIntentSeg;
+    h.cIntentGen = p->cIntentGen;
+    h.retireSeg = p->retireSeg;
+    h.retireN = p->retireN;
+    h.retireOff = p->retireOff;
     h.nextGen = p->nextGen;
     h.schemaFp = p->type && p->type->cfg ? p->type->cfg->fingerprint() : 0;
     h.producerHash = hash64(p->token.data(), p->token.size());
     h.counters = p->counters;
+    h.counters.diskBytes = partitionDiskBytes(p);
     h.nextLaneId = p->nextLaneId;
     h.segFirstPseq = p->segFirstPseq;
     h.intentSeg = p->intentSeg;
@@ -2011,8 +2128,17 @@ int32_t partitionWriteHead(Writer* w, Partition* p, bool durable) {
     p->headGen++;
     uint32_t used;
     encodePartitionHead(p, slot, &used, durable);
-    int32_t rc = w->io().write(p->h, slot, used, (p->headGen % 2) * kHeadSlotBytes);
+    const uint64_t at = (p->headGen % 2) * kHeadSlotBytes;
+    if (at + used > p->hExtent) {
+        // The head file grows with this write: disk_bytes includes it (§13).
+        p->hExtent = at + used;
+        partitionPublishDisk(p);
+        encodePartitionHead(p, slot, &used, durable);
+        if (at + used > p->hExtent) p->hExtent = at + used;
+    }
+    int32_t rc = w->io().write(p->h, slot, used, at);
     if (rc < 0) return rc;
+    if (durable) p->pendingDurableHeadNs = monoNs();
     return 0;
 }
 
@@ -2053,10 +2179,38 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
     const uint64_t firstPseq = st->firstPseq;
     const uint32_t nRows = uint32_t(st->nextPseq - st->firstPseq);
     if (st->batch) {
+        // A12: the RETIRE set this batch carried is now the durable set.
+        if (st->retireSet) {
+            const int saved = tHotPathDepth;
+            tHotPathDepth = 0;
+            const uint64_t now = monoNs();
+            const size_t before = p->retired.size();
+            if (st->nRetiring) {
+                std::vector<RetireItem> meta(p->retiring.begin(), p->retiring.begin() + st->nRetiring);
+                // A9: the retired meta segments stop being named with this commit.
+                for (const auto& it : meta)
+                    if (it.letter == 'm' && it.seg + 1 > p->firstLiveMSeg) p->firstLiveMSeg = it.seg + 1;
+                p->firstLiveMSegPub.store(p->firstLiveMSeg, std::memory_order_release);
+                partitionRetireCommitted(p, meta, now);
+                p->retiring.erase(p->retiring.begin(), p->retiring.begin() + st->nRetiring);
+            }
+            if (st->swapCommit)
+                if (const std::vector<RetireItem>* sr = partitionCompactRetiring(p)) partitionRetireCommitted(p, *sr, now);
+            if (st->mergeDone) partitionRetireCommitted(p, p->mplan.retire, now);
+            e->cRetired.fetch_add(p->retired.size() - before, std::memory_order_relaxed);
+            p->retireSeg = st->mSeg;
+            p->retireOff = st->retireOff;
+            p->retireN = st->retireN;
+            p->retireDirty = false;
+            tHotPathDepth = saved;
+        }
+        if (st->nUnlinked) partitionUnlinkedCommitted(p, st->nUnlinked);
+        if (st->laneCkptOff && p->forceLaneCkpt) p->forceLaneCkpt = false;
         if (st->consumedPendingCtl) {
             p->nPendingCtl = 0;
             p->pendingCtlBytes = 0;
-            if (p->swapInFlight) partitionSwapApply(w, p);
+            if (st->swapCommit) partitionCompactApply(w, p);
+            if (p->compactPhase == kCompactIntentQueued) partitionCompactIntentDurable(p);
             if (p->mergePhase == kMergeIntentQueued) {
                 p->intentSeg = p->mplan.seg;
                 p->intentGen = p->mplan.gen;
@@ -2071,10 +2225,39 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         p->pseqHi = st->nextPseq - 1;
         p->mEnd = st->mOff + st->batchLen;
         p->dLen = st->dOff + st->dBytes;
+        // Without zero-fill ahead the files grow by the writes themselves.
+        if (p->dLen > p->dExtent) p->dExtent = p->dLen;
+        if (p->mEnd > p->mExtent) p->mExtent = p->mEnd;
         p->counters = st->counters;
         p->incarnation = e->incarnation();
         p->metaSinceCkpt += st->batchLen;
-        if (st->laneFrameBytes) p->lExtent = st->lOff + st->laneFrameBytes;
+        if (st->laneFrameBytes) {
+            p->lExtent = st->lOff + st->laneFrameBytes;
+            if (p->lExtent > p->lDisk) p->lDisk = p->lExtent;
+        }
+        // Compaction trigger (§11): dead frame bytes per segment.
+        for (uint32_t i = 0; i < st->nDeadSeg; i++) {
+            SegmentInfo* dsi = nullptr;
+            for (auto& s2 : p->segs) {
+                const uint32_t last = s2.lastSeg ? s2.lastSeg : s2.seg;
+                if (st->deadSeg[i] >= s2.seg && st->deadSeg[i] <= last) dsi = &s2;
+            }
+            if (!dsi) {
+                const int saved = tHotPathDepth;
+                tHotPathDepth = 0;
+                p->segs.emplace_back();
+                p->segs.back().seg = st->deadSeg[i];
+                std::sort(p->segs.begin(), p->segs.end(),
+                          [](const SegmentInfo& a, const SegmentInfo& b) { return a.seg < b.seg; });
+                tHotPathDepth = saved;
+                for (auto& s2 : p->segs)
+                    if (s2.seg == st->deadSeg[i]) dsi = &s2;
+            }
+            if (dsi) {
+                dsi->deadBytes += st->deadSegBytes[i];
+                dsi->deadRows++;
+            }
+        }
         if (st->laneCkptOff) {
             p->lanesOverflowSeg = st->mSeg;
             p->lanesOverflowOff = st->laneCkptOff;
@@ -2135,6 +2318,16 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
             si->sealed = true;
             si->endPseq = p->pseqHi + 1;
             si->dLen = p->dLen;
+            if (!si->firstPseq) {
+                si->firstPseq = p->segFirstPseq;
+                if (!si->mergedEnd) si->mergedEnd = p->segFirstPseq;
+            }
+            // Disk accounting: the sealed files join the ledger at their
+            // extents; the next segment's files take over the extents.
+            ledgerSet(p, retireItem('d', p->dSeg, 0, p->dExtent));
+            ledgerSet(p, retireItem('m', p->mSeg, 0, p->mExtent));
+            ledgerDrop(p, 'd', p->nextSeg, 0);
+            ledgerDrop(p, 'm', p->nextSeg, 0);
             // The old active handles become the segment's read handles.
             if (!si->m.valid()) si->m = p->m;
             else w->io().close(&p->m);
@@ -2167,6 +2360,7 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         p->durablePseqHi.store(p->pseqHi, std::memory_order_release);
         p->durableCommitSeq.store(p->commitSeq, std::memory_order_release);
         p->durableMEnd.store(p->mEnd, std::memory_order_release);
+        partitionPublishDisk(p);
     }
     // Acks (§7): every entry consumed by this commit.
     if (st->consumed) {

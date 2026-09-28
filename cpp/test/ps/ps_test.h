@@ -123,6 +123,7 @@ struct PartView {
     std::vector<RecRow> rows;           // pseq 1..pseqHi, index = pseq - 1
     std::vector<LaneCounter> lanes;
     std::map<uint32_t, uint64_t> segFirst;
+    std::map<uint32_t, uint32_t> segCgen;   // T3: compacted segments' generation
     std::string err;
 };
 class Inspector {
@@ -131,6 +132,7 @@ public:
     PartView partition(uint32_t pid);
     std::vector<uint8_t> frame(uint32_t pid, const RecRow& r);
     std::vector<uint8_t> attr(uint32_t pid, const RecRow& r);
+    uint32_t cgenOf(uint32_t pid, uint32_t seg);  // T3: c-* generation of a segment (0: d/r/a)
     struct TypeView {
         bool ok = false;
         TypeHeadFixed head{};
@@ -148,6 +150,19 @@ private:
     IoStats stats_;
     IoCtx ctx_;
 };
+
+// T3 (§11, A12, A9): the files a partition's durable head and manifest name,
+// against a walk of its directory. `orphans`: present but named by nothing;
+// `missing`: named but absent; `bytes`: the directory's total size (the
+// partition's disk_bytes must equal it once nothing is in flight).
+struct DirCheck {
+    bool ok = false;
+    std::string err;
+    std::vector<std::string> orphans, missing;
+    uint64_t bytes = 0;
+    uint64_t files = 0;
+};
+DirCheck checkPartitionDir(Io* io, FaultFs* fs, const std::string& root, uint32_t pid);
 
 // Recount of partition counters from rows (head counters must equal it).
 struct Recount {

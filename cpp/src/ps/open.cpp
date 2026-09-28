@@ -63,6 +63,11 @@ struct TailReplay {
     uint32_t maxIncarnation = 0;
     bool touchedSegs[2] = {false, false};
     std::vector<uint32_t> dSegs;  // data segments whose d must be fsynced
+    // A9 torn-head rebuild from the first live meta segment: its first batch
+    // anchors the commit chain.
+    bool anchor = false;
+    // T3 (A12): the outstanding RETIRE set as replayed.
+    std::vector<RetireItem> retired;
 };
 
 // Applies one validated batch to the in-memory partition state.
@@ -129,6 +134,12 @@ static void applyBatch(Partition* p, const uint8_t* b, uint64_t mOff, TailReplay
         const uint16_t kind = getU16(b + q);
         const uint16_t len = getU16(b + q + 2);
         ctls->push_back({kind, std::vector<uint8_t>(b + q + 4, b + q + 4 + len)});
+        if (kind == kCtlRetire) {
+            // T3: the head written after this open points at the latest set.
+            p->retireSeg = p->mSeg;
+            p->retireOff = mOff + q + 4;
+            p->retireN = len >= 4 ? getU32(b + q + 4) : 0;
+        }
         if (kind == kCtlLaneCkpt) {
             // Full table of non-zero lanes after this batch; the head written
             // after this open points at it (as publish does).
@@ -157,7 +168,7 @@ static void applyBatch(Partition* p, const uint8_t* b, uint64_t mOff, TailReplay
 
 // Applies ctl records that move state across files (seal, merges).
 static void applyCtls(Partition* p, const std::vector<std::pair<uint16_t, std::vector<uint8_t>>>& ctls,
-                      bool* sealed) {
+                      bool* sealed, TailReplay* tr) {
     for (const auto& c : ctls) {
         const uint8_t* b = c.second.data();
         switch (c.first) {
@@ -172,11 +183,39 @@ static void applyCtls(Partition* p, const std::vector<std::pair<uint16_t, std::v
                 p->intentThrough = getU64(b + 24);
                 if (p->intentGen + 1 > p->nextGen) p->nextGen = p->intentGen + 1;
                 break;
+            case kCtlIntentCompact: {
+                // T3: compaction outputs are named before they exist (A11).
+                if (c.second.size() < kIntentCompactBytes) break;
+                p->cIntentSeg = getU32(b);
+                p->cIntentGen = getU32(b + 8);
+                if (p->cIntentGen + 1 > p->nextGen) p->nextGen = p->cIntentGen + 1;
+                break;
+            }
             case kCtlSwap: {
-                // T3 seam: the manifest the SWAP committed (it names c-* files).
+                // The manifest the SWAP committed (it names c-* files).
                 const uint32_t gen = getU32(b + 4);
                 p->manifestGen = gen;
                 if (gen + 1 > p->nextGen) p->nextGen = gen + 1;
+                if (p->cIntentGen == gen) {
+                    p->cIntentGen = 0;
+                    p->cIntentSeg = 0;
+                }
+                break;
+            }
+            case kCtlRetire: {
+                // A12: the whole outstanding set, and (A9) the state a rebuild
+                // from a later meta segment needs.
+                RetireSetHeader h;
+                if (retireSetDecode(b, c.second.size(), &h, &tr->retired)) {
+                    if (h.manifestGen) p->manifestGen = h.manifestGen;
+                    if (h.mergedThrough > p->mergedThrough) p->mergedThrough = h.mergedThrough;
+                    if (h.firstLiveMSeg > p->firstLiveMSeg) p->firstLiveMSeg = h.firstLiveMSeg;
+                    if (h.nextGen > p->nextGen) p->nextGen = h.nextGen;
+                    uint32_t k = 0;
+                    while (k < p->nL0 && p->l0[k].firstPseq + p->l0[k].nRows - 1 <= p->mergedThrough) k++;
+                    for (uint32_t i = 0; i + k < p->nL0; i++) p->l0[i] = p->l0[i + k];
+                    p->nL0 -= k;
+                }
                 break;
             }
             case kCtlMergeDone: {
@@ -216,6 +255,12 @@ static int32_t replayPartitionTail(Engine* e, IoCtx* io, Partition* p, uint32_t 
         while (off + sizeof(BatchHeader) <= uint64_t(size)) {
             BatchHeader h;
             if (io->read(mf, &h, sizeof(h), off) != int64_t(sizeof(h))) break;
+            if (tr->anchor && tr->adopted == 0 && validBatchHeader(h, off, size) && h.commitSeq) {
+                // A9 rebuild: the first batch of the first live meta segment.
+                p->commitSeq = h.commitSeq - 1;
+                p->pseqHi = h.firstPseq - 1;
+                p->segFirstPseq = h.firstPseq;
+            }
             if (!validBatchHeader(h, off, size) || h.commitSeq != p->commitSeq + 1 ||
                 h.firstPseq != p->pseqHi + 1 || h.dSeg != p->mSeg)
                 break;
@@ -235,7 +280,7 @@ static int32_t replayPartitionTail(Engine* e, IoCtx* io, Partition* p, uint32_t 
             lastInc = t.incarnation;
             std::vector<std::pair<uint16_t, std::vector<uint8_t>>> ctls;
             applyBatch(p, batch.data(), off, tr, &ctls);
-            applyCtls(p, ctls, &sealed);
+            applyCtls(p, ctls, &sealed, tr);
             tr->adopted++;
             off += h.batchLen;
             if (sealed) break;
@@ -846,6 +891,12 @@ int32_t Engine::openPartitions(std::string* err) {
             p->intentROff = h.intentROff;
             p->intentAOff = h.intentAOff;
             p->intentThrough = h.intentThrough;
+            p->firstLiveMSeg = h.firstLiveMSeg;
+            p->cIntentSeg = h.cIntentSeg;
+            p->cIntentGen = h.cIntentGen;
+            p->retireSeg = h.retireSeg;
+            p->retireN = h.retireN;
+            p->retireOff = h.retireOff;
             p->nL0 = h.nL0 <= kMaxL0Dir ? h.nL0 : 0;
             size_t off = sizeof(h);
             std::memcpy(p->l0, head.data() + off, sizeof(L0DirEntry) * p->nL0);
@@ -884,15 +935,56 @@ int32_t Engine::openPartitions(std::string* err) {
                     io->close(&mf);
                 }
             }
-        } else {
+        }
+        TailReplay tr;
+        bool adoptedHead = false;
+        if (head.empty()) {
             // No valid head: an empty partition, or both slots torn (-3):
-            // rebuild from the meta log alone (still no payload byte).
+            // rebuild from the meta log alone (still no payload byte). A9:
+            // older meta segments may be retired; the rebuild starts at the
+            // first one that exists (names are deterministic: probe).
             p->mSeg = 0;
             p->dSeg = 0;
             p->nextSeg = 1;
             p->segFirstPseq = 1;
+            PathBuf m0;
+            pathPartitionSeg(&m0, cfg_.root.c_str(), p->pid, 'm', 0, "fsl");
+            FileRef hf2;
+            int64_t hsize = 0;
+            if (io->open(hp.c_str(), hp.len, FLATSQL_IO_READ, FileClass::Head, &hf2) == 0) {
+                hsize = io->size(hf2);
+                io->close(&hf2);
+            }
+            if (hsize > 0 && io->probe(m0.c_str(), m0.len) != 0) {
+                for (uint32_t s = 1; s < (1u << 20); s++) {
+                    PathBuf ms;
+                    pathPartitionSeg(&ms, cfg_.root.c_str(), p->pid, 'm', s, "fsl");
+                    if (io->probe(ms.c_str(), ms.len) != 0) continue;
+                    p->mSeg = p->dSeg = s;
+                    p->nextSeg = s + 1;
+                    p->firstLiveMSeg = s;
+                    tr.anchor = true;
+                    break;
+                }
+            }
         }
-        TailReplay tr;
+        // T3 (A12): the RETIRE set the head points at (the tail may replace it).
+        if (p->retireN && !head.empty()) {
+            PathBuf mp;
+            pathPartitionSeg(&mp, cfg_.root.c_str(), p->pid, 'm', p->retireSeg, "fsl");
+            FileRef mf;
+            if (io->open(mp.c_str(), mp.len, FLATSQL_IO_READ, FileClass::Meta, &mf) == 0) {
+                RetireSetHeader h;
+                if (io->read(mf, &h, sizeof(h), p->retireOff) == int64_t(sizeof(h)) && h.n < (1u << 20)) {
+                    std::vector<uint8_t> body(sizeof(h) + size_t(h.n) * sizeof(RetireItem));
+                    if (io->read(mf, body.data(), body.size(), p->retireOff) == int64_t(body.size())) {
+                        RetireSetHeader h2;
+                        retireSetDecode(body.data(), body.size(), &h2, &tr.retired);
+                    }
+                }
+                io->close(&mf);
+            }
+        }
         rc = replayPartitionTail(this, io, p, incFloor, &tr);
         if (rc < 0) {
             if (err) *err = "partition tail scan failed";
@@ -927,22 +1019,7 @@ int32_t Engine::openPartitions(std::string* err) {
                 p->ring->state.store(kRingQuarantined);
             } else {
                 adoptedBatches += tr.adopted;
-                FileRef h;
-                rc = io->open(hp.c_str(), hp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS,
-                              FileClass::Head, &h);
-                if (rc >= 0) {
-                    uint8_t slot[kHeadSlotBytes];
-                    p->headGen++;
-                    uint32_t used;
-                    encodePartitionHead(p, slot, &used, true);
-                    rc = io->write(h, slot, used, (p->headGen % 2) * kHeadSlotBytes);
-                    if (rc >= 0) rc = io->sync(h);
-                    io->close(&h);
-                }
-                if (rc < 0) {
-                    if (err) *err = "partition checkpoint head write failed";
-                    return rc;
-                }
+                adoptedHead = true;  // the DURABLE_CKPT head is written below
             }
         }
         // A11: outputs of a merge INTENT without MERGE_DONE are discarded, and
@@ -956,17 +1033,75 @@ int32_t Engine::openPartitions(std::string* err) {
             pathPartitionSeg(&rp, cfg_.root.c_str(), p->pid, 'r', p->intentSeg, "fsr");
             pathPartitionSeg(&ap, cfg_.root.c_str(), p->pid, 'a', p->intentSeg, "fsa");
             FileRef rf, af;
-            if (io->open(rp.c_str(), rp.len, kOpenRW, FileClass::Rows, &rf) == 0) {
+            // T3: a first merge of the segment (offset 0) created r/a; they
+            // name nothing, so they go (the orphan check walks the directory).
+            if (p->intentROff == 0) {
+                io->unlink(rp.c_str(), rp.len, true);
+            } else if (io->open(rp.c_str(), rp.len, kOpenRW, FileClass::Rows, &rf) == 0) {
                 if (io->size(rf) > int64_t(p->intentROff) && io->truncate(rf, p->intentROff) >= 0) io->sync(rf);
                 io->close(&rf);
             }
-            if (io->open(ap.c_str(), ap.len, kOpenRW, FileClass::Attrs, &af) == 0) {
+            if (p->intentROff == 0 && p->intentAOff == 0) {
+                io->unlink(ap.c_str(), ap.len, true);
+            } else if (io->open(ap.c_str(), ap.len, kOpenRW, FileClass::Attrs, &af) == 0) {
                 if (io->size(af) > int64_t(p->intentAOff) && io->truncate(af, p->intentAOff) >= 0) io->sync(af);
                 io->close(&af);
             }
             p->intentGen = 0;
             p->intentSeg = 0;
         }
+        // T3: compaction outputs of an INTENT_COMPACT without SWAP (A11), and
+        // every file of the persisted RETIRE set (A12), are unlinked; a
+        // durable head then stops naming either.
+        bool rewriteHead = adoptedHead;
+        if (p->cIntentGen) {
+            unlinkCompactOutputs(io, cfg_.root.c_str(), p->pid, p->cIntentSeg, p->cIntentGen);
+            p->cIntentGen = 0;
+            p->cIntentSeg = 0;
+            rewriteHead = true;
+        }
+        if (!tr.retired.empty() || p->retireN) {
+            uint32_t n = 0;
+            rc = partitionOpenReclaim(io, cfg_.root.c_str(), p, tr.retired, &n);
+            if (rc < 0) {
+                if (err) *err = "retired file unlink failed";
+                return rc;
+            }
+            if (p->retired.empty()) {
+                p->retireN = 0;
+                p->retireSeg = 0;
+                p->retireOff = 0;
+            }
+            rewriteHead = true;
+        }
+        rc = partitionOpenLedger(io, cfg_.root.c_str(), p);
+        if (rc < 0) {
+            if (err) *err = "partition manifest unreadable";
+            return rc;
+        }
+        if (rewriteHead && !p->quarantined) {
+            FileRef h;
+            rc = io->open(hp.c_str(), hp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS, FileClass::Head,
+                          &h);
+            if (rc >= 0) {
+                uint8_t slot[kHeadSlotBytes];
+                p->headGen++;
+                uint32_t used;
+                encodePartitionHead(p, slot, &used, true);
+                const uint64_t at = (p->headGen % 2) * kHeadSlotBytes;
+                rc = io->write(h, slot, used, at);
+                if (rc >= 0) rc = io->sync(h);
+                io->close(&h);
+                if (at + used > p->hExtent) p->hExtent = at + used;
+                partitionPublishDisk(p);
+            }
+            if (rc < 0) {
+                if (err) *err = "partition checkpoint head write failed";
+                return rc;
+            }
+        }
+        p->firstLiveMSegPub.store(p->firstLiveMSeg);
+        p->lastDurableHeadNs = monoNs();
         p->pub.commitSeq = p->commitSeq;
         p->pub.pseqHi = p->pseqHi;
         p->pub.nL0 = p->nL0;

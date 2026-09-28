@@ -1,9 +1,10 @@
 // Snapshots (T2 acceptance #5, A12):
 //   - 1,000 compaction SWAPs under load: statements that started before a
 //     SWAP complete with their pre-SWAP rows, 0 errors. The compactor is the
-//     writer's SWAP seam (Engine::swapSegment, a verbatim copier standing in
-//     for T3); the reclaimer is the test, unlinking retired files only once
-//     every reader announcement is newer than the SWAP (checked twice, A12).
+//     writer's compaction (Engine::swapSegment; T3), and the reclaimer is the
+//     writer's too (T3): it unlinks retired files only once every reader
+//     announcement is newer than the SWAP, checked twice a grace apart (A12),
+//     through the reader gate the test wires to its reader instance.
 //   - the negative control: unlinking at once breaks a statement that still
 //     had to open a retired file (FLATSQL_SNAPSHOT_GONE, retryable) — the
 //     announcement protocol is what prevents it;
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -44,6 +46,8 @@ struct Harness {
     explicit Harness(int parts) : sent(size_t(parts)) {
         s.cfg.sealBytes = 256u << 10;  // many sealed segments
         s.cfg.mergeL0Blocks = 4;
+        s.cfg.autoCompact = false;     // only the SWAPs the test asks for
+        s.cfg.reclaimGraceMs = 2;      // A12's second check (60 s in production)
         io = s.fs.get();
         dir = argStr("dir", "");
         if (!dir.empty()) {
@@ -130,6 +134,8 @@ void runSwapsUnderLoad(int targetSwaps, uint64_t maxSeconds) {
     rc.ringBytes = 64u << 10;
     Reader reader(rc);
     REQUIRE(reader.inst);
+    h.s.e->setReaderGate([](void* ctx) { return static_cast<ReaderInstance*>(ctx)->oldestActiveStart(); },
+                         reader.inst.get());
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> statements{0}, errors{0}, gone{0}, mismatches{0};
     std::string firstErr;
@@ -174,32 +180,9 @@ void runSwapsUnderLoad(int targetSwaps, uint64_t maxSeconds) {
             sleepNs(2000000);
         }
     });
-    // Compactor + reclaimer.
-    int swaps = 0, noCandidate = 0, unlinked = 0;
-    std::deque<Retired> retired;
+    // Compactor (the writer reclaims).
+    int swaps = 0, noCandidate = 0;
     const uint64_t until = monoNs() + maxSeconds * 1000000000ull;
-    auto reclaim = [&](bool drain) {
-        while (!retired.empty()) {
-            Retired& r = retired.front();
-            const uint64_t oldest = reader.inst->oldestActiveStart();
-            if (oldest <= r.publishedNs) {
-                if (!drain) return;
-                sleepNs(1000000);
-                continue;
-            }
-            const uint64_t now = monoNs();
-            if (!r.firstCheckNs) r.firstCheckNs = now;
-            // A12: two checks, a grace apart (60 s in production).
-            if (now - r.firstCheckNs < 2000000ull) {
-                if (!drain) return;
-                sleepNs(500000);
-                continue;
-            }
-            unlinkRetired(h, r);
-            unlinked++;
-            retired.pop_front();
-        }
-    };
     int k = 0;
     while (swaps < targetSwaps && monoNs() < until) {
         const uint32_t pid = h.pids[size_t(k++) % h.pids.size()];
@@ -212,21 +195,27 @@ void runSwapsUnderLoad(int targetSwaps, uint64_t maxSeconds) {
             noCandidate++;
             continue;
         }
-        retired.push_back({pid, res.seg, res.oldCgen, monoNs()});
         {
             std::lock_guard<std::mutex> g(spanMu);
-            swapTimes.push_back(retired.back().publishedNs);
+            swapTimes.push_back(monoNs());
         }
         swaps++;
-        reclaim(false);
     }
     stop = true;
     writer.join();
     for (auto& t : readers) t.join();
-    reclaim(true);
+    // Every retired file set goes once no statement predates it.
+    uint64_t retired = 0, unlinked = 0;
+    for (const uint64_t t0 = monoNs(); monoNs() - t0 < 30000000000ull; sleepNs(2000000)) {
+        const EngineStats st = h.s.e->stats();
+        retired = st.retiredFiles;
+        unlinked = st.unlinkedFiles;
+        if (unlinked == retired) break;
+    }
     report("swaps", double(swaps), "swaps");
     report("swap_requests_without_candidate", double(noCandidate), "requests");
-    report("retired_file_sets_unlinked", double(unlinked), "sets");
+    report("retired_files", double(retired), "files");
+    report("retired_files_unlinked", double(unlinked), "files");
     report("reader_statements", double(statements.load()), "statements");
     uint64_t spanning = 0, maxSwapsInOne = 0;
     for (const auto& sp : spans) {
@@ -244,7 +233,8 @@ void runSwapsUnderLoad(int targetSwaps, uint64_t maxSeconds) {
     CHECK_EQ(errors.load(), uint64_t(0));
     CHECK_EQ(gone.load(), uint64_t(0));
     CHECK_EQ(mismatches.load(), uint64_t(0));
-    CHECK_EQ(unlinked, swaps);
+    CHECK(retired >= uint64_t(swaps) * 4);  // each SWAP retires d, r, a, a run and the manifest
+    CHECK_EQ(unlinked, retired);
     // After everything, a fresh statement reads the compacted files only.
     for (size_t p = 0; p < h.pids.size(); p++) {
         Rows r = reader.q("SELECT _pseq, _data FROM sds_p_" + h.tokens[p] + "__OMM");
@@ -341,8 +331,9 @@ void runExportUnderCompaction(uint64_t seconds) {
             else if (o.status != 0) errors++;
         }
     });
-    int swaps = 0, unlinked = 0;
-    std::deque<Retired> retired;
+    h.s.e->setReaderGate([](void* ctx) { return static_cast<ReaderInstance*>(ctx)->oldestActiveStart(); },
+                         reader.inst.get());
+    int swaps = 0;
     const uint64_t until = monoNs() + seconds * 1000000000ull;
     int k = 0;
     // The in-memory host keeps every file it ever held (unlinked ones too):
@@ -357,29 +348,17 @@ void runExportUnderCompaction(uint64_t seconds) {
         SwapResult res;
         REQUIRE(h.s.e->swapSegment(pid, &res) == 0);
         while (res.remaining.load() != 0) sleepNs(100000);
-        if (res.status >= 0) {
-            retired.push_back({pid, res.seg, res.oldCgen, monoNs()});
-            swaps++;
-        }
-        while (!retired.empty()) {
-            Retired& r = retired.front();
-            if (reader.inst->oldestActiveStart() <= r.publishedNs) break;
-            const uint64_t now = monoNs();
-            if (!r.firstCheckNs) r.firstCheckNs = now;
-            if (now - r.firstCheckNs < 2000000ull) break;
-            unlinkRetired(h, r);
-            unlinked++;
-            retired.pop_front();
-        }
+        if (res.status >= 0) swaps++;
         if (k % 8 == 0) h.ingest(k % int(h.pids.size()), 100);
     }
+    const uint64_t unlinked = h.s.e->stats().unlinkedFiles;
     stop = true;
     exporter.join();
     report("export_seconds", double(seconds), "s");
     report("exports", double(exports.load()), "exports");
     report("exported_frames", double(frames.load()), "frames");
     report("swaps_during_export", double(swaps), "swaps");
-    report("retired_sets_unlinked", double(unlinked), "sets");
+    report("retired_files_unlinked", double(unlinked), "files");
     report("snapshot_gone", double(gone.load()), "statements");
     CHECK(exports.load() > 0);
     CHECK(swaps > 0);

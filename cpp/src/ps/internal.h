@@ -137,6 +137,8 @@ struct StageScratch {
     uint8_t laneFrames[32768];
     uint32_t laneFrameBytes = 0;
     uint32_t firstNewLaneIndex = 0;
+    uint32_t retireAt = UINT32_MAX;   // offset of the RETIRE body in ctl (T3)
+    bool forceLaneCkpt = false;       // A9: a full lane table rides this batch
 
     bool init(const EngineConfig& cfg);
     void freeAll();
@@ -185,6 +187,17 @@ struct Staged {
     bool rangeStep = false;       // a TOMB_RANGE step staged TOMBs
     bool rangeDone = false;
     uint64_t rangeNext = 0;
+    // T3
+    bool swapCommit = false;      // a compaction SWAP rides this batch
+    bool retireSet = false;       // a RETIRE set rides this batch (at retireOff)
+    uint64_t retireOff = 0;
+    uint32_t retireN = 0;
+    uint32_t nUnlinked = 0;       // UNLINKED items carried (the first of p->unlinked)
+    uint32_t nRetiring = 0;       // p->retiring items carried
+    // Dead frame bytes per segment staged by this batch (compaction trigger).
+    uint32_t deadSeg[16];
+    uint64_t deadSegBytes[16];
+    uint32_t nDeadSeg = 0;
 };
 
 // Staged type batch (A10).
@@ -238,16 +251,54 @@ void partitionRollback(Writer* w, Partition* p, Staged* st);
 int32_t partitionMergeStep(Writer* w, Partition* p);   // maintenance
 void partitionMergeApply(Writer* w, Partition* p);     // publish of MERGE_DONE
 void partitionMergeAbort(Writer* w, Partition* p);     // handoff / failure
-int32_t partitionSwapStep(Writer* w, Partition* p);    // maintenance: SWAP outputs + ctl (T3 seam)
-void partitionSwapApply(Writer* w, Partition* p);      // publish of the SWAP batch
 void mergeDoneBody(const Partition* p, uint8_t body[40]);
 bool partitionWantsMerge(const Engine* e, const Partition* p);
+void removePendingCtl(Partition* p, uint16_t kind);
 int32_t partitionPrecreate(Writer* w, Partition* p);
 int32_t ensureExtent(IoCtx* io, const FileRef& f, uint64_t* extent, uint64_t end, uint64_t step);
 void encodePartitionHead(const Partition* p, uint8_t* slot, uint32_t* used, bool durable);
 int32_t loadAccelFromBlock(Partition* p, SlabPool& pool, uint32_t idx, const uint8_t* block,
                            uint32_t len);
 int32_t partitionLoadLanes(Writer* w, Partition* p);
+
+// ---- compaction (compaction.cpp) and reclamation (reclaim.cpp), T3 ------------------
+enum CompactPhase : uint8_t {
+    kCompactIdle = 0,
+    kCompactIntentQueued,   // INTENT_COMPACT queued for the next batch
+    kCompactIntentDurable,  // outputs may be written
+    kCompactBuilding,       // a compaction thread writes them
+    kCompactBuilt,          // outputs durable; SWAP waits for no merge in flight
+    kCompactSwapQueued,     // manifest written; SWAP + RETIRE ride the next batch
+};
+int32_t partitionCompactStep(Writer* w, Partition* p);         // maintenance
+bool partitionCompactBusy(const Partition* p);
+void partitionCompactIntentDurable(Partition* p);              // publish of the INTENT batch
+void partitionCompactStage(const Partition* p, Counters* ct);  // counters of a consumed SWAP
+const std::vector<RetireItem>* partitionCompactRetiring(const Partition* p);
+const FileRef* partitionCompactManifestFile(const Partition* p);
+void partitionCompactApply(Writer* w, Partition* p);           // publish of the SWAP batch
+void partitionCompactAbort(Writer* w, Partition* p);           // handoff / failure / stop
+void partitionCompactSignalAbort(Partition* p);                // stop: builders end at their next slice
+void unlinkCompactOutputs(IoCtx* io, const char* root, uint32_t pid, uint32_t seg, uint32_t gen);
+ManifestSegDesc segDesc(const SegmentInfo& s);
+void segFromDesc(const ManifestSegDesc& d, SegmentInfo* si);
+int32_t partitionLoadCompactDir(IoCtx* io, const char* root, uint32_t pid, SegmentInfo* si);
+
+void ledgerSet(Partition* p, const RetireItem& it);
+void ledgerDrop(Partition* p, char letter, uint32_t seg, uint32_t gen);
+uint64_t ledgerSize(const Partition* p, char letter, uint32_t seg, uint32_t gen);
+uint64_t partitionDiskBytes(const Partition* p);
+void partitionPublishDisk(Partition* p);
+size_t retireSetEncode(const Partition* p, const std::vector<const std::vector<RetireItem>*>& extra,
+                       const RetireSetHeader& hdr, uint8_t* out, size_t cap);
+bool retireSetDecode(const uint8_t* body, size_t len, RetireSetHeader* h, std::vector<RetireItem>* items);
+void partitionRetireCommitted(Partition* p, const std::vector<RetireItem>& items, uint64_t nowNs);
+void partitionUnlinkedCommitted(Partition* p, uint32_t n);
+int32_t partitionReclaimStep(Writer* w, Partition* p);       // maintenance
+int32_t partitionRetireMetaStep(Writer* w, Partition* p);    // maintenance (A9)
+int32_t partitionOpenReclaim(IoCtx* io, const char* root, Partition* p, const std::vector<RetireItem>& items,
+                             uint32_t* unlinked);
+int32_t partitionOpenLedger(IoCtx* io, const char* root, Partition* p);
 
 // ---- type owner (type_owner.cpp) ---------------------------------------------
 bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* batches);

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 
 #include "flatsql/ps/platform.h"
 #include "ps/ps_test.h"
@@ -388,25 +389,65 @@ PartView Inspector::partition(uint32_t pid) {
     const PartitionHeadFixed& hd = v.head;
     v.rows.assign(hd.pseqHi, RecRow{});
     std::vector<bool> have(hd.pseqHi, false);
-    // Merged rows (manifest).
+    // Merged rows (manifest; T3: compacted segments hold the surviving rows
+    // and a presence directory, every other pseq reads VOID).
     if (hd.manifestGen) {
         PathBuf mp;
         pathPartitionManifest(&mp, root_.c_str(), pid, hd.manifestGen);
         std::vector<uint8_t> man;
-        if (!readFile(ctx_, mp, FileClass::Manifest, &man) || man.size() < 32) {
+        ManifestDesc md;
+        if (!readFile(ctx_, mp, FileClass::Manifest, &man) || !decodeManifest(man.data(), man.size(), &md)) {
             v.err = "manifest unreadable";
             return v;
         }
-        const uint16_t nSegs = getU16(man.data() + 6);
-        size_t off = 24;
-        for (uint16_t i = 0; i < nSegs; i++) {
-            const uint32_t seg = getU32(man.data() + off);
-            const uint64_t first = getU64(man.data() + off + 8);
-            const uint64_t mergedEnd = getU64(man.data() + off + 24);
-            const uint32_t nRuns = getU32(man.data() + off + 72);
-            off += 80 + size_t(nRuns) * 24;
+        for (const auto& sd : md.segs) {
+            const uint32_t seg = sd.seg;
+            const uint64_t first = sd.firstPseq;
+            const uint64_t mergedEnd = sd.mergedEnd;
             v.segFirst[seg] = first;
+            v.segCgen[seg] = sd.cgen;
             if (mergedEnd <= first) continue;
+            if (mergedEnd - 1 > hd.pseqHi) {
+                v.err = "manifest beyond pseq_hi";
+                return v;
+            }
+            if (sd.cgen) {
+                if (sd.empty) {
+                    for (uint64_t ps = first; ps < mergedEnd; ps++) {
+                        voidRow(&v.rows[ps - 1], ps, seg);
+                        have[ps - 1] = true;
+                    }
+                    continue;
+                }
+                PathBuf rp;
+                pathPartitionCompact(&rp, root_.c_str(), pid, seg, sd.cgen, "fsr");
+                std::vector<uint8_t> r;
+                CompactRowsHeader ch;
+                CompactDir dir;
+                if (!readFile(ctx_, rp, FileClass::Rows, &r) || !parseCompactHeader(r.data(), r.size(), &ch) ||
+                    ch.dirOff + uint64_t(ch.nBlocks) * sizeof(CompactDirBlock) != r.size() ||
+                    !parseCompactDir(ch, r.data() + ch.dirOff, size_t(ch.nBlocks) * sizeof(CompactDirBlock), &dir) ||
+                    ch.firstPseq != first || ch.endPseq != mergedEnd) {
+                    v.err = "compacted rows unreadable";
+                    return v;
+                }
+                for (uint64_t ps = first; ps < mergedEnd; ps++) {
+                    const int64_t idx = dir.indexOf(ps);
+                    RecRow row;
+                    if (idx < 0) {
+                        voidRow(&row, ps, seg);
+                    } else {
+                        std::memcpy(&row, r.data() + CompactDir::rowOffset(uint64_t(idx)), sizeof(row));
+                        if (row.pseq != ps) {
+                            v.err = "compacted row pseq mismatch";
+                            return v;
+                        }
+                    }
+                    v.rows[ps - 1] = row;
+                    have[ps - 1] = true;
+                }
+                continue;
+            }
             PathBuf rp;
             pathPartitionSeg(&rp, root_.c_str(), pid, 'r', seg, "fsr");
             std::vector<uint8_t> r;
@@ -513,7 +554,9 @@ PartView Inspector::partition(uint32_t pid) {
 
 std::vector<uint8_t> Inspector::frame(uint32_t pid, const RecRow& r) {
     PathBuf dp;
-    pathPartitionSeg(&dp, root_.c_str(), pid, 'd', r.seg, "fsd");
+    const uint32_t cgen = cgenOf(pid, r.seg);
+    if (cgen) pathPartitionCompact(&dp, root_.c_str(), pid, r.seg, cgen, "fsd");
+    else pathPartitionSeg(&dp, root_.c_str(), pid, 'd', r.seg, "fsd");
     FileRef f;
     std::vector<uint8_t> out;
     if (ctx_.open(dp.c_str(), dp.len, FLATSQL_IO_READ, FileClass::Data, &f) < 0) return out;
@@ -527,7 +570,9 @@ std::vector<uint8_t> Inspector::attr(uint32_t pid, const RecRow& r) {
     std::vector<uint8_t> out;
     if (!(r.flags & kRowHasAttr)) return out;
     PathBuf p;
+    const uint32_t cgen = (r.flags & kRowAttrInM) ? 0 : cgenOf(pid, r.seg);
     if (r.flags & kRowAttrInM) pathPartitionSeg(&p, root_.c_str(), pid, 'm', r.seg, "fsl");
+    else if (cgen) pathPartitionCompact(&p, root_.c_str(), pid, r.seg, cgen, "fsa");
     else pathPartitionSeg(&p, root_.c_str(), pid, 'a', r.seg, "fsa");
     FileRef f;
     if (ctx_.open(p.c_str(), p.len, FLATSQL_IO_READ, FileClass::Attrs, &f) < 0) return out;
@@ -535,6 +580,40 @@ std::vector<uint8_t> Inspector::attr(uint32_t pid, const RecRow& r) {
     if (ctx_.read(f, out.data(), r.attrLen, r.attrOff) != int64_t(r.attrLen)) out.clear();
     ctx_.close(&f);
     return out;
+}
+
+uint32_t Inspector::cgenOf(uint32_t pid, uint32_t seg) {
+    // The segment's file set per the partition's current manifest.
+    PathBuf hp;
+    pathPartition(&hp, root_.c_str(), pid, "h.fsh");
+    std::vector<uint8_t> h;
+    if (!readFile(ctx_, hp, FileClass::Head, &h)) return 0;
+    int best = -1;
+    uint64_t bestGen = 0;
+    for (int sl = 0; sl < 2; sl++) {
+        if (h.size() < size_t(sl) * kHeadSlotBytes + 64) continue;
+        const uint8_t* slot = h.data() + size_t(sl) * kHeadSlotBytes;
+        const size_t avail = std::min<size_t>(kHeadSlotBytes, h.size() - size_t(sl) * kHeadSlotBytes);
+        if (!validHeadSlot(slot, avail, kHeadPartition)) continue;
+        HeadPrefix pr;
+        std::memcpy(&pr, slot, sizeof(pr));
+        if (best < 0 || pr.gen > bestGen) {
+            best = sl;
+            bestGen = pr.gen;
+        }
+    }
+    if (best < 0) return 0;
+    PartitionHeadFixed hd;
+    std::memcpy(&hd, h.data() + size_t(best) * kHeadSlotBytes, sizeof(hd));
+    if (!hd.manifestGen) return 0;
+    PathBuf mp;
+    pathPartitionManifest(&mp, root_.c_str(), pid, hd.manifestGen);
+    std::vector<uint8_t> man;
+    ManifestDesc md;
+    if (!readFile(ctx_, mp, FileClass::Manifest, &man) || !decodeManifest(man.data(), man.size(), &md)) return 0;
+    for (const auto& sd : md.segs)
+        if (sd.seg == seg) return sd.cgen;
+    return 0;
 }
 
 Inspector::TypeView Inspector::type(const uint8_t fid[4]) {
@@ -612,6 +691,117 @@ Inspector::TypeView Inspector::type(const uint8_t fid[4]) {
         if (v.arrivals[i].gseq <= v.arrivals[i - 1].gseq) v.fenceErr = "arrivals gseq not increasing";
     v.ok = true;
     return v;
+}
+
+DirCheck checkPartitionDir(Io* io, FaultFs* fs, const std::string& root, uint32_t pid) {
+    DirCheck dc;
+    Inspector ins(io, root);
+    PartView v = ins.partition(pid);
+    if (!v.ok) {
+        dc.err = "partition view: " + v.err;
+        return dc;
+    }
+    PathBuf dirp;
+    pathPartitionDir(&dirp, root.c_str(), pid);
+    const std::string dir(dirp.c_str(), dirp.len);
+    // What is on disk.
+    std::map<std::string, uint64_t> present;
+    if (fs) {
+        for (const std::string& path : fs->list(dir + "/")) {
+            IoStats st;
+            IoCtx ctx(io, &st);
+            FileRef f;
+            if (ctx.open(path.c_str(), path.size(), FLATSQL_IO_READ, FileClass::Store, &f) < 0) continue;
+            present[path] = uint64_t(ctx.size(f));
+            ctx.close(&f);
+        }
+    } else {
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec))
+            if (e.is_regular_file()) present[e.path().string()] = uint64_t(e.file_size());
+    }
+    for (const auto& kv : present) {
+        dc.bytes += kv.second;
+        dc.files++;
+    }
+    const PartitionHeadFixed& hd = v.head;
+    std::set<std::string> required, optional;
+    auto name = [&](void (*fn)(PathBuf*, const char*, uint32_t, char, uint32_t, const char*), char letter,
+                    uint32_t seg, const char* ext) {
+        PathBuf pb;
+        fn(&pb, root.c_str(), pid, letter, seg, ext);
+        return std::string(pb.c_str(), pb.len);
+    };
+    PathBuf pb;
+    pathPartition(&pb, root.c_str(), pid, "h.fsh");
+    required.insert(std::string(pb.c_str(), pb.len));
+    pathPartition(&pb, root.c_str(), pid, "l.fsl");
+    optional.insert(std::string(pb.c_str(), pb.len));
+    if (hd.p.magic == kMagicHead) {
+        for (uint32_t sg = hd.firstLiveMSeg; sg <= hd.mSeg; sg++)
+            (sg == hd.mSeg ? optional : required).insert(name(pathPartitionSeg, 'm', sg, "fsl"));
+        optional.insert(name(pathPartitionSeg, 'd', hd.dSeg, "fsd"));
+        optional.insert(name(pathPartitionSeg, 'd', hd.nextSeg, "fsd"));
+        optional.insert(name(pathPartitionSeg, 'm', hd.nextSeg, "fsl"));
+        std::set<uint32_t> merged;
+        if (hd.manifestGen) {
+            pathPartitionManifest(&pb, root.c_str(), pid, hd.manifestGen);
+            required.insert(std::string(pb.c_str(), pb.len));
+            std::vector<uint8_t> man;
+            IoStats st;
+            IoCtx ctx(io, &st);
+            FileRef f;
+            ManifestDesc md;
+            bool ok = ctx.open(pb.c_str(), pb.len, FLATSQL_IO_READ, FileClass::Manifest, &f) >= 0;
+            if (ok) {
+                man.resize(size_t(ctx.size(f)));
+                ok = ctx.read(f, man.data(), man.size(), 0) == int64_t(man.size()) &&
+                     decodeManifest(man.data(), man.size(), &md);
+                ctx.close(&f);
+            }
+            if (!ok) {
+                dc.err = "manifest unreadable";
+                return dc;
+            }
+            for (const auto& sd : md.segs) {
+                for (uint32_t sg = sd.seg; sg <= (sd.lastSeg ? sd.lastSeg : sd.seg); sg++) merged.insert(sg);
+                if (sd.cgen) {
+                    if (!sd.empty)
+                        for (const char* ext : {"fsd", "fsr", "fsa"}) {
+                            pathPartitionCompact(&pb, root.c_str(), pid, sd.seg, sd.cgen, ext);
+                            required.insert(std::string(pb.c_str(), pb.len));
+                        }
+                } else {
+                    (sd.seg == hd.dSeg ? optional : required).insert(name(pathPartitionSeg, 'd', sd.seg, "fsd"));
+                    // A merge creates r and a; a segment without attributes (or
+                    // rows) leaves one empty.
+                    (sd.rLen ? required : optional).insert(name(pathPartitionSeg, 'r', sd.seg, "fsr"));
+                    (sd.aLen ? required : optional).insert(name(pathPartitionSeg, 'a', sd.seg, "fsa"));
+                }
+                for (const auto& r : sd.runs) {
+                    pathPartitionRun(&pb, root.c_str(), pid, sd.seg, r.gen);
+                    required.insert(std::string(pb.c_str(), pb.len));
+                }
+            }
+        }
+        for (uint32_t sg = hd.firstLiveMSeg; sg < hd.dSeg; sg++)
+            if (!merged.count(sg)) required.insert(name(pathPartitionSeg, 'd', sg, "fsd"));
+    } else {
+        // Registered, nothing durable yet: segment 0 is the active one.
+        optional.insert(name(pathPartitionSeg, 'd', 0, "fsd"));
+        optional.insert(name(pathPartitionSeg, 'm', 0, "fsl"));
+    }
+    for (const auto& kv : present)
+        if (!required.count(kv.first) && !optional.count(kv.first)) dc.orphans.push_back(kv.first);
+    for (const auto& r : required)
+        if (!present.count(r)) dc.missing.push_back(r);
+    dc.ok = dc.orphans.empty() && dc.missing.empty();
+    if (!dc.ok) {
+        dc.err = std::to_string(dc.orphans.size()) + " orphan(s), " + std::to_string(dc.missing.size()) + " missing";
+        for (size_t i = 0; i < dc.orphans.size() && i < 4; i++) dc.err += "; orphan " + dc.orphans[i];
+        if (!dc.missing.empty()) dc.err += "; first missing " + dc.missing.front();
+    }
+    return dc;
 }
 
 Recount recount(const PartView& v) {

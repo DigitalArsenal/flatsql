@@ -171,10 +171,26 @@ void LaneIo::forget(const FileKey& key) {
     map_.erase(it);
 }
 
+void LaneIo::closeIdle(uint64_t nowNs, uint64_t idleNs, bool idle) {
+    if (nowNs - lastSweepNs_ < 1000000000ull) return;  // at most once a second
+    lastSweepNs_ = nowNs;
+    for (auto it = map_.begin(); it != map_.end();) {
+        // Handles of the running statement stay (between statements none runs).
+        if ((idle || it->second.lastSeq != stmtSeq_) && it->second.lastNs + idleNs < nowNs) {
+            ctx_.close(&it->second.ref);
+            lru_.erase(it->second.lru);
+            it = map_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 int32_t LaneIo::get(const FileKey& key, FileRef* out) {
     auto it = map_.find(key);
     if (it != map_.end()) {
         it->second.lastSeq = stmtSeq_;
+        it->second.lastNs = monoNs();
         lru_.splice(lru_.begin(), lru_, it->second.lru);
         *out = it->second.ref;
         return 0;
@@ -196,6 +212,7 @@ int32_t LaneIo::get(const FileKey& key, FileRef* out) {
     Entry e;
     e.ref = f;
     e.lastSeq = stmtSeq_;
+    e.lastNs = monoNs();
     e.lru = lru_.begin();
     map_.emplace(key, e);
     *out = f;
@@ -628,6 +645,7 @@ void LaneStore::beginStatement(ReadStats* stats, const WorkGuard* guard) {
     stats_ = stats ? stats : &scratchStats_;
     io_.setStats(stats_);
     io_.beginStatement();
+    io_.closeIdle(monoNs(), 5000000000ull);
     guard_ = guard;
 }
 
@@ -862,45 +880,42 @@ int32_t LaneStore::loadManifest(uint32_t pid, uint32_t gen, std::shared_ptr<cons
     if (size < 32) return kRsCorrupt;
     std::vector<uint8_t> buf(static_cast<size_t>(size));
     if (io_.read(f, buf.data(), buf.size(), 0) != size) return FLATSQL_IO_ERR_IO;
-    const size_t body = buf.size() - 8;
-    if (getU32(buf.data()) != kMagicManifest || crc32c(buf.data(), body) != getU32(buf.data() + body))
-        return kRsCorrupt;
+    // Manifests are cached whole: the handle is not kept (a retired manifest
+    // is unlinked with UNLINK_IF_UNUSED, A12).
+    io_.forget(key);
+    ManifestDesc md;
+    if (!decodeManifest(buf.data(), buf.size(), &md)) return kRsCorrupt;
     auto m = std::make_shared<Manifest>();
-    m->gen = getU32(buf.data() + 8);
-    const uint16_t nSegs = getU16(buf.data() + 6);
-    size_t off = 24;
-    for (uint16_t i = 0; i < nSegs; i++) {
-        if (off + 80 > body) return kRsCorrupt;
-        const uint8_t* s = buf.data() + off;
+    m->gen = md.gen;
+    m->prevGen = md.prevGen;
+    for (const auto& d : md.segs) {
         ManifestSegRef r;
-        r.seg = getU32(s);
-        const uint32_t flags = getU32(s + 4);
-        r.sealed = flags & 1;
-        r.firstPseq = getU64(s + 8);
-        r.endPseq = getU64(s + 16);
-        r.mergedEnd = getU64(s + 24);
-        r.dLen = getU64(s + 32);
-        r.rLen = getU64(s + 40);
-        r.aLen = getU64(s + 48);
-        r.minEpoch = int64_t(getU64(s + 56));
-        r.maxEpoch = int64_t(getU64(s + 64));
-        const uint32_t nRuns = getU32(s + 72);
-        r.cgen = getU32(s + 76);  // T3 SWAP seam (0: original d/r/a files)
-        off += 80;
-        for (uint32_t k = 0; k < nRuns; k++) {
-            if (off + 24 > body) return kRsCorrupt;
-            SegRunRef run;
-            run.gen = getU32(buf.data() + off);
-            run.nEntries = getU64(buf.data() + off + 8);
-            run.fileLen = getU64(buf.data() + off + 16);
-            r.runs.push_back(run);
-            off += 24;
+        r.seg = d.seg;
+        r.lastSeg = d.lastSeg;
+        r.sealed = d.sealed;
+        r.empty = d.empty;
+        r.cgen = d.cgen;
+        r.firstPseq = d.firstPseq;
+        r.endPseq = d.endPseq;
+        r.mergedEnd = d.mergedEnd;
+        r.dLen = d.dLen;
+        r.rLen = d.rLen;
+        r.aLen = d.aLen;
+        r.minEpoch = d.minEpoch;
+        r.maxEpoch = d.maxEpoch;
+        r.minArrival = d.minArrival;
+        r.maxArrival = d.maxArrival;
+        r.killThrough = d.killThrough;
+        r.prevGen = d.prevGen;
+        for (const auto& run : d.runs) {
+            SegRunRef rr;
+            rr.gen = run.gen;
+            rr.nEntries = run.nEntries;
+            rr.fileLen = run.fileLen;
+            r.runs.push_back(rr);
         }
         m->segs.push_back(std::move(r));
     }
-    std::sort(m->segs.begin(), m->segs.end(), [](const ManifestSegRef& a, const ManifestSegRef& b) {
-        return a.seg < b.seg;
-    });
     cachePut(key, m, buf.size() + 256);
     *out = m;
     return 0;
@@ -1160,6 +1175,45 @@ int32_t LaneStore::readRows(const PartSnap& s, uint64_t first, uint32_t n, RecRo
         if (pseq <= s.head.mergedThrough) {
             const ManifestSegRef* m = s.manifest ? s.manifest->segForPseq(pseq) : nullptr;
             if (!m) return kRsCorrupt;
+            if (m->cgen) {
+                // Compacted (T3): surviving rows are dense by rank; a pseq the
+                // directory lacks was removed and reads as VOID (dead).
+                const uint64_t end = std::min<uint64_t>(m->mergedEnd, pseq + (n - done));
+                if (m->empty) {
+                    for (uint64_t ps = pseq; ps < end; ps++) voidRow(&out[done + (ps - pseq)], ps, m->seg);
+                    done += uint32_t(end - pseq);
+                    pseq = end;
+                    continue;
+                }
+                std::shared_ptr<const CompactDir> dir;
+                rc = compactDir(s, *m, &dir);
+                if (rc < 0) return rc;
+                const uint64_t cnt = dir->countIn(pseq, end);
+                std::vector<RecRow> present(static_cast<size_t>(cnt));
+                if (cnt) {
+                    FileRef rf;
+                    rc = io_.get(pk('r', s.pid, m->seg, m->cgen), &rf);
+                    if (rc == FLATSQL_IO_ERR_NOENT) return kRsSnapshotGone;
+                    if (rc < 0) return rc;
+                    const uint64_t idx0 = dir->countIn(dir->firstPseq, pseq);
+                    const size_t bytes = size_t(cnt) * sizeof(RecRow);
+                    const int64_t got = io_.read(rf, present.data(), bytes, CompactDir::rowOffset(idx0));
+                    if (got != int64_t(bytes)) return got < 0 ? int32_t(got) : kRsCorrupt;
+                }
+                size_t k = 0;
+                for (uint64_t ps = pseq; ps < end; ps++) {
+                    RecRow& r = out[done + (ps - pseq)];
+                    if (dir->contains(ps)) {
+                        if (k >= present.size() || present[k].pseq != ps) return kRsCorrupt;
+                        r = present[k++];
+                    } else {
+                        voidRow(&r, ps, m->seg);
+                    }
+                }
+                done += uint32_t(end - pseq);
+                pseq = end;
+                continue;
+            }
             FileKey k = pk('r', s.pid, m->seg, m->cgen);
             rc = io_.get(k, &f);
             off = (pseq - m->firstPseq) * sizeof(RecRow);
@@ -1193,6 +1247,70 @@ int32_t LaneStore::readRows(const PartSnap& s, uint64_t first, uint32_t n, RecRo
 }
 
 int32_t LaneStore::readRow(const PartSnap& s, uint64_t pseq, RecRow* out) { return readRows(s, pseq, 1, out); }
+
+int32_t LaneStore::compactDir(const PartSnap& s, const ManifestSegRef& m, std::shared_ptr<const CompactDir>* out) {
+    FileKey ck = pk('C', s.pid, m.seg, m.cgen);  // cache key only (no file)
+    if (auto c = cacheGet(ck)) {
+        *out = std::static_pointer_cast<const CompactDir>(c);
+        return 0;
+    }
+    const FileKey key = pk('r', s.pid, m.seg, m.cgen);
+    FileRef f;
+    int32_t rc = io_.get(key, &f);
+    if (rc == FLATSQL_IO_ERR_NOENT) return kRsSnapshotGone;
+    if (rc < 0) return rc;
+    uint8_t hb[sizeof(CompactRowsHeader)];
+    CompactRowsHeader h;
+    if (io_.read(f, hb, sizeof(hb), 0) != int64_t(sizeof(hb)) || !parseCompactHeader(hb, sizeof(hb), &h) ||
+        h.firstPseq != m.firstPseq || h.endPseq != m.endPseq)
+        return kRsCorrupt;
+    std::vector<uint8_t> db(size_t(h.nBlocks) * sizeof(CompactDirBlock));
+    if (!db.empty() && io_.read(f, db.data(), db.size(), h.dirOff) != int64_t(db.size())) return FLATSQL_IO_ERR_IO;
+    auto dir = std::make_shared<CompactDir>();
+    if (!parseCompactDir(h, db.data(), db.size(), dir.get())) return kRsCorrupt;
+    cachePut(ck, dir, dir->memoryBytes());
+    *out = dir;
+    return 0;
+}
+
+int32_t LaneStore::resolveForBound(PartSnap* s, uint64_t bound) {
+    if (!s->manifest) return 0;
+    bool need = false;
+    for (const auto& m : s->manifest->segs)
+        if (m.killThrough > bound) need = true;
+    if (!need) return 0;
+    // Replace each such segment by its description in the manifest before
+    // the SWAP that set the bound, repeatedly (a segment compacted twice).
+    auto merged = std::make_shared<Manifest>(*s->manifest);
+    for (int round = 0; round < 64; round++) {
+        bool changed = false;
+        std::vector<ManifestSegRef> next;
+        for (const auto& m : merged->segs) {
+            if (m.killThrough <= bound || !m.prevGen) {
+                next.push_back(m);
+                continue;
+            }
+            std::shared_ptr<const Manifest> prev;
+            const int32_t rc = loadManifest(s->pid, m.prevGen, &prev);
+            if (rc < 0) return rc;
+            const uint32_t last = m.lastSeg ? m.lastSeg : m.seg;
+            size_t added = 0;
+            for (const auto& pm : prev->segs) {
+                if (pm.seg < m.seg || pm.seg > last) continue;
+                next.push_back(pm);
+                added++;
+            }
+            if (!added) return kRsCorrupt;
+            changed = true;
+        }
+        std::sort(next.begin(), next.end(),
+                  [](const ManifestSegRef& a, const ManifestSegRef& b) { return a.seg < b.seg; });
+        merged->segs.swap(next);
+        if (!changed) break;
+    }
+    s->manifest = merged;
+    return 0;
+}
 
 int32_t LaneStore::readFramePart(const PartSnap& s, const RecRow& r, uint64_t off, uint32_t n, uint8_t* dst) {
     FileRef f;

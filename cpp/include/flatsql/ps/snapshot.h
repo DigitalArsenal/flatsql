@@ -35,6 +35,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "flatsql/ps/compaction.h"
 #include "flatsql/ps/extract.h"
 #include "flatsql/ps/format.h"
 #include "flatsql/ps/index.h"
@@ -136,6 +137,10 @@ public:
     void closeAll();
     // Drops a cached handle (the file was replaced, e.g. a torn-read retry).
     void forget(const FileKey& key);
+    // Closes handles unused for idleNs (T3: a retired file is unlinked with
+    // UNLINK_IF_UNUSED, so idle cached handles must not pin it forever).
+    // idle: no statement is running on the lane.
+    void closeIdle(uint64_t nowNs, uint64_t idleNs, bool idle = false);
     IoStats& ioStats() { return ioStats_; }
     IoCtx& ctx() { return ctx_; }
     uint32_t openHandles() const { return uint32_t(map_.size()); }
@@ -144,6 +149,7 @@ private:
     struct Entry {
         FileRef ref;
         uint64_t lastSeq = 0;
+        uint64_t lastNs = 0;
         std::list<FileKey>::iterator lru;
     };
     std::string root_;
@@ -151,6 +157,7 @@ private:
     IoCtx ctx_;
     uint32_t max_;
     uint64_t stmtSeq_ = 1;
+    uint64_t lastSweepNs_ = 0;
     ReadStats* stats_ = nullptr;
     std::unordered_map<FileKey, Entry, FileKeyHash> map_;
     std::list<FileKey> lru_;  // front = most recent
@@ -208,15 +215,21 @@ struct SegRunRef {
 };
 struct ManifestSegRef {
     uint32_t seg = 0;
+    uint32_t lastSeg = 0;       // coalesced compaction output: last original segment
     bool sealed = false;
-    uint32_t cgen = 0;          // T3 SWAP seam: rows/data/attrs in c-<seg>-<cgen>.*
+    bool empty = false;         // compacted with no surviving row: every pseq reads VOID
+    uint32_t cgen = 0;          // compacted: rows/data/attrs in c-<seg>-<cgen>.*
     uint64_t firstPseq = 0, endPseq = 0, mergedEnd = 0;
     uint64_t dLen = 0, rLen = 0, aLen = 0;
     int64_t minEpoch = INT64_MAX, maxEpoch = INT64_MIN;
+    int64_t minArrival = INT64_MAX, maxArrival = INT64_MIN;
+    uint64_t killThrough = 0;   // a reader bound below this reads prevGen's file set
+    uint32_t prevGen = 0;
     std::vector<SegRunRef> runs;
 };
 struct Manifest {
     uint32_t gen = 0;
+    uint32_t prevGen = 0;
     std::vector<ManifestSegRef> segs;   // ascending seg
     const ManifestSegRef* segFor(uint32_t seg) const;
     const ManifestSegRef* segForPseq(uint64_t pseq) const;  // merged range
@@ -420,6 +433,10 @@ public:
 
     // §8 step 3: head (valid slot, highest gen) + manifest.
     int32_t loadPart(uint32_t pid, PartSnap* out, bool withManifest = true);
+    // T3: a type-level snapshot whose bound is below a compacted segment's
+    // kill bound reads that segment through the manifest before its SWAP
+    // (prevGen; the reader gate keeps those files for such a statement).
+    int32_t resolveForBound(PartSnap* s, uint64_t bound);
     // §8 step 4 (taken before the partitions it bounds).
     int32_t loadType(const uint8_t fid[4], TypeSnap* out);
 
@@ -516,6 +533,8 @@ public:
 private:
     int32_t readHead(const FileKey& key, uint16_t kind, std::vector<uint8_t>* slot, bool* missing);
     int32_t loadManifest(uint32_t pid, uint32_t gen, std::shared_ptr<const Manifest>* out);
+    // The presence directory of a compacted rows file (cached, immutable).
+    int32_t compactDir(const PartSnap& s, const ManifestSegRef& m, std::shared_ptr<const CompactDir>* out);
     int32_t loadTypeConfig(TypeInfo* t);
     int32_t loadTypeLabels(const uint8_t fid[4], TypeSnap* t);
     // The file holding a merged segment's rows/attrs/data ('r', 'a', 'd'),

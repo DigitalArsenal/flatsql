@@ -1018,6 +1018,23 @@ int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t) {
 // batch. Outputs are named by the generation counter.
 int32_t typeMergeStep(Writer* w, TypeOwner* t) {
     Engine* e = w->engine();
+    // T3 (A9): handles on partition meta segments a partition retired are
+    // closed, so its UNLINK_IF_UNUSED is not BUSY forever.
+    if (!t->partM.empty()) {
+        const uint64_t now = monoNs();
+        if (now - t->partMSweepNs >= 100000000ull) {
+            t->partMSweepNs = now;
+            for (auto it = t->partM.begin(); it != t->partM.end();) {
+                const Partition* p = e->partition(uint32_t(it->first >> 32));
+                if (!p || uint32_t(it->first) < p->firstLiveMSegPub.load(std::memory_order_acquire)) {
+                    w->io().close(&it->second);
+                    it = t->partM.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
     if (t->mergePhase == 2) {
         const int32_t res = t->mergeResult.load(std::memory_order_acquire);
         if (res == 0) return 0;

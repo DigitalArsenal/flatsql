@@ -254,10 +254,13 @@ struct MergeRunInput {
     const L1Run* run;
     FileRef file;
 };
+// Keeps an entry in the output (compaction drops the postings of removed rows).
+using PostingFilter = bool (*)(void* ctx, uint16_t kind, const uint8_t* key, uint16_t klen, const uint8_t* val,
+                               uint8_t vlen);
 // Returns the new file length (< 0 on error); *entries receives the count.
 int64_t mergeToL1(IoCtx* io, FileRef out, uint32_t seg, uint32_t gen, uint16_t level, uint64_t first,
                   uint64_t last, const std::vector<MergeL0Input>& l0s, const std::vector<MergeRunInput>& runs,
-                  uint64_t* entries);
+                  uint64_t* entries, PostingFilter filter = nullptr, void* filterCtx = nullptr);
 
 // Validates a 4 KiB L1 block and iterates its entries.
 bool l1BlockValid(const uint8_t* block);

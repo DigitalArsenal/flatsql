@@ -35,39 +35,7 @@ SegmentInfo* segInfo(Partition* p, uint32_t seg, bool create) {
     return nullptr;
 }
 
-#pragma pack(push, 1)
-struct ManifestHeader {
-    uint32_t magic;
-    uint16_t ver;
-    uint16_t nSegs;
-    uint32_t gen;
-    uint32_t pid;
-    uint64_t pad;
-};
-struct ManifestSeg {
-    uint32_t seg;
-    uint32_t flags;  // 1 = sealed
-    uint64_t firstPseq;
-    uint64_t endPseq;
-    uint64_t mergedEnd;
-    uint64_t dLen;
-    uint64_t rLen;
-    uint64_t aLen;
-    int64_t minEpoch;
-    int64_t maxEpoch;
-    uint32_t nRuns;
-    uint32_t cgen;   // T3 seam: 0 = d/r/a-<seg>; else c-<seg>-<cgen>.{fsd,fsr,fsa}
-};
-struct ManifestRun {
-    uint32_t gen;
-    uint32_t pad;
-    uint64_t nEntries;
-    uint64_t fileLen;
-};
-#pragma pack(pop)
-static_assert(sizeof(ManifestHeader) == 24, "ManifestHeader");
-static_assert(sizeof(ManifestSeg) == 80, "ManifestSeg");
-static_assert(sizeof(ManifestRun) == 24, "ManifestRun");
+
 
 
 }  // namespace
@@ -189,48 +157,14 @@ int32_t partitionWarm(Writer* w, Partition* p) {
         if (rc >= 0) {
             const int64_t size = w->io().size(f);
             std::vector<uint8_t> buf(size > 0 ? size_t(size) : 0);
-            if (size < int64_t(sizeof(ManifestHeader) + 8) ||
-                w->io().read(f, buf.data(), buf.size(), 0) != size) {
+            ManifestDesc md;
+            if (size <= 0 || w->io().read(f, buf.data(), buf.size(), 0) != size ||
+                !decodeManifest(buf.data(), buf.size(), &md)) {
                 rc = FLATSQL_IO_ERR_IO;
             } else {
-                const size_t body = buf.size() - 8;
-                if (crc32c(buf.data(), body) != getU32(buf.data() + body)) rc = FLATSQL_IO_ERR_IO;
-                ManifestHeader h;
-                std::memcpy(&h, buf.data(), sizeof(h));
-                size_t off = sizeof(h);
-                for (uint16_t i = 0; rc >= 0 && i < h.nSegs; i++) {
-                    if (off + sizeof(ManifestSeg) > body) {
-                        rc = FLATSQL_IO_ERR_IO;
-                        break;
-                    }
-                    ManifestSeg ms;
-                    std::memcpy(&ms, buf.data() + off, sizeof(ms));
-                    off += sizeof(ms);
+                for (const auto& d : md.segs) {
                     SegmentInfo si;
-                    si.seg = ms.seg;
-                    si.sealed = ms.flags & 1;
-                    si.firstPseq = ms.firstPseq;
-                    si.endPseq = ms.endPseq;
-                    si.mergedEnd = ms.mergedEnd;
-                    si.dLen = ms.dLen;
-                    si.rLen = ms.rLen;
-                    si.aLen = ms.aLen;
-                    si.minEpoch = ms.minEpoch;
-                    si.maxEpoch = ms.maxEpoch;
-                    si.cgen = ms.cgen;
-                    for (uint32_t r = 0; r < ms.nRuns; r++) {
-                        if (off + sizeof(ManifestRun) > body) {
-                            rc = FLATSQL_IO_ERR_IO;
-                            break;
-                        }
-                        ManifestRun mr;
-                        std::memcpy(&mr, buf.data() + off, sizeof(mr));
-                        off += sizeof(mr);
-                        SegRun run;
-                        run.gen = mr.gen;
-                        run.fileLen = mr.fileLen;
-                        si.runs.push_back(std::move(run));
-                    }
+                    segFromDesc(d, &si);
                     p->segs.push_back(std::move(si));
                 }
             }
@@ -336,8 +270,31 @@ void partitionCool(Writer* w, Partition* p) {
     partitionAccount(p);
 }
 
+void removePendingCtl(Partition* p, uint16_t kind) {
+    // Keeps every queued ctl record except those of `kind` (a merge and a
+    // compaction may both have one queued).
+    uint8_t keep[sizeof(p->pendingCtl)];
+    uint32_t n = 0, bytes = 0;
+    for (uint32_t off = 0; off + 4 <= p->pendingCtlBytes;) {
+        const uint16_t k = getU16(p->pendingCtl + off);
+        const uint16_t len = getU16(p->pendingCtl + off + 2);
+        if (k != kind) {
+            std::memcpy(keep + bytes, p->pendingCtl + off, 4u + len);
+            bytes += 4u + len;
+            n++;
+        }
+        off += 4u + len;
+    }
+    std::memcpy(p->pendingCtl, keep, bytes);
+    p->pendingCtlBytes = bytes;
+    p->nPendingCtl = n;
+}
+
 bool partitionWantsMerge(const Engine* e, const Partition* p) {
     if (p->nL0 == 0 || p->quarantined) return false;
+    // T3: a built compaction waits for no merge in flight to SWAP; new merges
+    // wait for it (one commit round).
+    if (p->compactPhase == kCompactBuilt || p->compactPhase == kCompactSwapQueued) return false;
     const L0DirEntry& first = p->l0[0];
     const uint64_t firstLast = first.firstPseq + first.nRows - 1;
     if (firstLast > p->labeledThrough.load(std::memory_order_acquire)) return false;
@@ -375,6 +332,11 @@ void resetPlan(MergePlan& m) {
     m.batches.clear();
     m.foldRuns.clear();
     m.snap.clear();
+    m.retire.clear();
+    m.minArrival = INT64_MAX;
+    m.maxArrival = INT64_MIN;
+    m.prevManifestGen = 0;
+    m.mfLen = 0;
     m.r = m.a = m.mf = FileRef();
     m.run = SegRun();
     m.result.store(0, std::memory_order_relaxed);
@@ -394,6 +356,12 @@ int32_t openSegAt(IoCtx* io, const char* root, uint32_t pid, char letter, uint32
 // into the plan, so the build can run on a helper thread (A26).
 int32_t planMerge(Writer* w, Partition* p) {
     Engine* e = w->engine();
+    const int savedDepth = tHotPathDepth;
+    tHotPathDepth = 0;  // maintenance
+    struct Restore {
+        int d;
+        ~Restore() { tHotPathDepth = d; }
+    } restore{savedDepth};
     const uint64_t labeled = p->labeledThrough.load(std::memory_order_acquire);
     const uint32_t seg = p->l0[0].mSeg;
     uint32_t k = 0;
@@ -416,6 +384,9 @@ int32_t planMerge(Writer* w, Partition* p) {
     m.aOff = si->aLen;
     m.minEpoch = si->minEpoch;
     m.maxEpoch = si->maxEpoch;
+    m.minArrival = si->minArrival;
+    m.maxArrival = si->maxArrival;
+    m.prevManifestGen = p->manifestGen;
     m.ownerEpoch = p->ownerEpoch;
     m.ownerWord = &p->ring->ownerWordV;
     m.batches.assign(p->l0, p->l0 + k);
@@ -442,23 +413,15 @@ int32_t planMerge(Writer* w, Partition* p) {
         m.foldRuns.push_back({si->runs[i].run.get(), si->runs[i].file});
     // Manifest snapshot (as MERGE_DONE will leave the partition).
     for (const auto& s2 : p->segs) {
-        SegSnap sn;
-        sn.seg = s2.seg;
-        sn.sealed = s2.sealed;
-        sn.cgen = s2.cgen;
-        sn.firstPseq = s2.firstPseq;
-        sn.endPseq = s2.endPseq;
-        sn.mergedEnd = s2.mergedEnd;
-        sn.dLen = s2.dLen;
-        sn.rLen = s2.rLen;
-        sn.aLen = s2.aLen;
-        sn.minEpoch = s2.minEpoch;
-        sn.maxEpoch = s2.maxEpoch;
-        const size_t keep = s2.seg == seg ? s2.runs.size() - m.fold : s2.runs.size();
-        for (size_t i = 0; i < keep; i++)
-            sn.runs.push_back({s2.runs[i].gen, s2.runs[i].run ? s2.runs[i].run->entries() : 0, s2.runs[i].fileLen});
+        if (!s2.firstPseq && s2.runs.empty() && s2.seg != seg) continue;  // m-only placeholder
+        ManifestSegDesc sn = segDesc(s2);
+        if (s2.seg == seg) sn.runs.resize(s2.runs.size() - m.fold);
         m.snap.push_back(std::move(sn));
     }
+    // What MERGE_DONE retires (A12): the folded runs and the manifest it replaces.
+    for (size_t i = si->runs.size() - m.fold; i < si->runs.size(); i++)
+        m.retire.push_back(retireItem('x', seg, si->runs[i].gen, si->runs[i].fileLen));
+    if (p->manifestGen) m.retire.push_back(retireItem('f', 0, p->manifestGen, ledgerSize(p, 'f', 0, p->manifestGen)));
     si->runs.reserve(si->runs.size() + 1);  // MERGE_DONE applies without allocating
     uint8_t intent[40];
     putU32(intent, seg);
@@ -473,45 +436,14 @@ int32_t planMerge(Writer* w, Partition* p) {
     return 0;
 }
 
-std::vector<uint8_t> encodeSnapManifest(uint32_t pid, uint32_t gen, const std::vector<SegSnap>& snap) {
-    std::vector<uint8_t> out(sizeof(ManifestHeader));
-    ManifestHeader h{};
-    h.magic = kMagicManifest;
-    h.ver = 1;
-    h.nSegs = uint16_t(snap.size());
-    h.gen = gen;
-    h.pid = pid;
-    std::memcpy(out.data(), &h, sizeof(h));
-    for (const auto& s : snap) {
-        ManifestSeg ms{};
-        ms.seg = s.seg;
-        ms.flags = s.sealed ? 1 : 0;
-        ms.firstPseq = s.firstPseq;
-        ms.endPseq = s.endPseq;
-        ms.mergedEnd = s.mergedEnd;
-        ms.dLen = s.dLen;
-        ms.rLen = s.rLen;
-        ms.aLen = s.aLen;
-        ms.minEpoch = s.minEpoch;
-        ms.maxEpoch = s.maxEpoch;
-        ms.nRuns = uint32_t(s.runs.size());
-        ms.cgen = s.cgen;
-        const uint8_t* b = reinterpret_cast<const uint8_t*>(&ms);
-        out.insert(out.end(), b, b + sizeof(ms));
-        for (const auto& r : s.runs) {
-            ManifestRun mr{};
-            mr.gen = r.gen;
-            mr.nEntries = r.nEntries;
-            mr.fileLen = r.fileLen;
-            const uint8_t* rb = reinterpret_cast<const uint8_t*>(&mr);
-            out.insert(out.end(), rb, rb + sizeof(mr));
-        }
-    }
-    const uint32_t crc = crc32c(out.data(), out.size());
-    const size_t at = out.size();
-    out.resize(at + 8, 0);
-    putU32(out.data() + at, crc);
-    return out;
+std::vector<uint8_t> encodeSnapManifest(uint32_t pid, uint32_t gen, uint32_t prevGen,
+                                        const std::vector<ManifestSegDesc>& snap) {
+    ManifestDesc md;
+    md.gen = gen;
+    md.pid = pid;
+    md.prevGen = prevGen;
+    md.segs = snap;
+    return encodeManifest(md);
 }
 
 // Builds a planned merge's outputs (rows, attributes, the L1 run, the
@@ -555,6 +487,8 @@ int32_t writeMergeOutputs(IoCtx* io, const char* root, uint32_t pid, MergePlan& 
             if (row.kind == kRowPut) {
                 if (row.epochMs < m.minEpoch) m.minEpoch = row.epochMs;
                 if (row.epochMs > m.maxEpoch) m.maxEpoch = row.epochMs;
+                if (row.arrivalMs < m.minArrival) m.minArrival = row.arrivalMs;
+                if (row.arrivalMs > m.maxArrival) m.maxArrival = row.arrivalMs;
             }
             const uint8_t* rb = reinterpret_cast<const uint8_t*>(&row);
             rbuf.insert(rbuf.end(), rb, rb + sizeof(row));
@@ -605,9 +539,16 @@ int32_t writeMergeOutputs(IoCtx* io, const char* root, uint32_t pid, MergePlan& 
             sn.aLen = m.aLen;
             sn.minEpoch = m.minEpoch;
             sn.maxEpoch = m.maxEpoch;
-            sn.runs.push_back({m.gen, nEntries, m.run.fileLen});
+            sn.minArrival = m.minArrival;
+            sn.maxArrival = m.maxArrival;
+            ManifestRun mr{};
+            mr.gen = m.gen;
+            mr.nEntries = nEntries;
+            mr.fileLen = m.run.fileLen;
+            sn.runs.push_back(mr);
         }
-        const std::vector<uint8_t> man = encodeSnapManifest(pid, m.gen, m.snap);
+        const std::vector<uint8_t> man = encodeSnapManifest(pid, m.gen, m.prevManifestGen, m.snap);
+        m.mfLen = man.size();
         PathBuf mp;
         pathPartitionManifest(&mp, root, pid, m.gen);
         if (!planStillOwns(m)) rc = kMergeNotOwner;
@@ -663,17 +604,33 @@ void partitionMergeAbort(Writer* w, Partition* p) {
         w->io().unlink(xp.c_str(), xp.len, true);
         w->io().unlink(mfp.c_str(), mfp.len, true);
         FileRef rf, af;
-        if (openSeg(w, p, 'r', m.seg, kOpenRW, &rf) == 0) {
-            if (w->io().size(rf) > int64_t(m.rOff)) w->io().truncate(rf, m.rOff);
-            w->io().close(&rf);
-        }
-        if (openSeg(w, p, 'a', m.seg, kOpenRW, &af) == 0) {
-            if (w->io().size(af) > int64_t(m.aOff)) w->io().truncate(af, m.aOff);
-            w->io().close(&af);
+        // T3: r/a a first merge created name nothing: they go.
+        const bool first = m.rOff == 0 && m.aOff == 0;
+        if (first) {
+            PathBuf rp, ap;
+            pathPartitionSeg(&rp, w->eng_root(), p->pid, 'r', m.seg, "fsr");
+            pathPartitionSeg(&ap, w->eng_root(), p->pid, 'a', m.seg, "fsa");
+            for (auto& s2 : p->segs)
+                if (s2.seg == m.seg) {
+                    w->io().close(&s2.r);
+                    w->io().close(&s2.a);
+                }
+            w->io().close(&p->rA);
+            w->io().close(&p->aA);
+            w->io().unlink(rp.c_str(), rp.len, true);
+            w->io().unlink(ap.c_str(), ap.len, true);
+        } else {
+            if (openSeg(w, p, 'r', m.seg, kOpenRW, &rf) == 0) {
+                if (w->io().size(rf) > int64_t(m.rOff)) w->io().truncate(rf, m.rOff);
+                w->io().close(&rf);
+            }
+            if (openSeg(w, p, 'a', m.seg, kOpenRW, &af) == 0) {
+                if (w->io().size(af) > int64_t(m.aOff)) w->io().truncate(af, m.aOff);
+                w->io().close(&af);
+            }
         }
     }
-    p->nPendingCtl = 0;
-    p->pendingCtlBytes = 0;
+    removePendingCtl(p, kCtlIntentMerge);
     p->intentGen = 0;
     p->intentSeg = 0;
     p->mergePhase = kMergeIdle;
@@ -682,7 +639,8 @@ void partitionMergeAbort(Writer* w, Partition* p) {
 int32_t partitionMergeStep(Writer* w, Partition* p) {
     Engine* e = w->engine();
     if (p->quarantined) return 0;
-    if (p->swapInFlight && p->mergePhase == kMergeIdle) return 0;  // a SWAP owns the manifest now
+    // A queued SWAP owns the manifest until it publishes.
+    if (p->compactPhase == kCompactSwapQueued && p->mergePhase == kMergeIdle) return 0;
     if (p->mergePhase == kMergeIdle) {
         if (!partitionWantsMerge(e, p)) return 0;
         const int32_t rc = partitionWarm(w, p);
@@ -740,6 +698,14 @@ void partitionMergeApply(Writer* w, Partition* p) {
     si->aLen = m.aLen;
     si->minEpoch = m.minEpoch;
     si->maxEpoch = m.maxEpoch;
+    si->minArrival = m.minArrival;
+    si->maxArrival = m.maxArrival;
+    // Disk accounting: r/a grew, a run and a manifest were added (the folded
+    // runs and the old manifest stay in the ledger until unlinked, A12).
+    ledgerSet(p, retireItem('r', m.seg, 0, m.rLen));
+    ledgerSet(p, retireItem('a', m.seg, 0, m.aLen));
+    ledgerSet(p, retireItem('x', m.seg, m.gen, m.run.fileLen));
+    ledgerSet(p, retireItem('f', 0, m.gen, m.mfLen));
     for (uint32_t i = 0; i < m.fold && !si->runs.empty(); i++) {
         w->io().close(&si->runs.back().file);
         si->runs.pop_back();
@@ -798,142 +764,11 @@ int32_t partitionPrecreate(Writer* w, Partition* p) {
     w->io().close(&m);
     if (rc < 0) return rc;
     p->precreated = true;
+    ledgerSet(p, retireItem('d', p->nextSeg, 0, 0));
+    ledgerSet(p, retireItem('m', p->nextSeg, 0, 0));
     return 0;
 }
 
-
-// ---------------------------------------------------------------------------
-// SWAP (the T3 seam; see SwapResult in writer.h)
-// ---------------------------------------------------------------------------
-namespace {
-void swapDone(SwapResult* r, int32_t status) {
-    r->status = status;
-    if (r->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        wakeU32(reinterpret_cast<std::atomic<uint32_t>*>(&r->remaining), -1);
-}
-
-int32_t copyFile(IoCtx* io, const PathBuf& from, FileClass cls, const PathBuf& to, uint64_t len) {
-    FileRef src, dst;
-    int32_t rc = io->open(from.c_str(), from.len, FLATSQL_IO_READ, cls, &src);
-    if (rc < 0) return rc;
-    rc = io->open(to.c_str(), to.len,
-                  kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS, cls, &dst);
-    std::vector<uint8_t> buf(1u << 20);
-    uint64_t off = 0;
-    while (rc >= 0 && off < len) {
-        const size_t n = size_t(std::min<uint64_t>(buf.size(), len - off));
-        if (io->read(src, buf.data(), n, off) != int64_t(n)) rc = FLATSQL_IO_ERR_IO;
-        else rc = io->write(dst, buf.data(), n, off);
-        off += n;
-    }
-    if (rc >= 0) rc = io->sync(dst);
-    io->close(&src);
-    io->close(&dst);
-    return rc;
-}
-}  // namespace
-
-int32_t partitionSwapStep(Writer* w, Partition* p) {
-    if (p->swaps.empty() || p->swapInFlight || p->mergePhase != kMergeIdle || p->nPendingCtl || p->quarantined)
-        return 0;
-    SwapResult* req = p->swaps.front();
-    p->swaps.erase(p->swaps.begin());
-    const int saved = tHotPathDepth;
-    tHotPathDepth = 0;  // maintenance, never the record path
-    int32_t rc = partitionWarm(w, p);
-    SegmentInfo* cand = nullptr;
-    for (auto& si : p->segs) {
-        if (!si.sealed || si.endPseq <= si.firstPseq || si.mergedEnd != si.endPseq || si.runs.empty()) continue;
-        bool pendingL0 = false;
-        for (uint32_t i = 0; i < p->nL0; i++)
-            if (p->l0[i].mSeg == si.seg) pendingL0 = true;
-        if (pendingL0) continue;
-        if (!cand || si.cgen < cand->cgen || (si.cgen == cand->cgen && si.seg < cand->seg)) cand = &si;
-    }
-    if (rc < 0 || !cand) {
-        tHotPathDepth = saved;
-        swapDone(req, rc < 0 ? rc : FLATSQL_IO_ERR_NOENT);
-        return 0;
-    }
-    const uint32_t gen = p->nextGen++;
-    const char* root = w->eng_root();
-    struct Part {
-        char letter;
-        const char* ext;
-        FileClass cls;
-        uint64_t len;
-    } parts[3] = {{'d', "fsd", FileClass::Data, cand->dLen},
-                  {'r', "fsr", FileClass::Rows, cand->rLen},
-                  {'a', "fsa", FileClass::Attrs, cand->aLen}};
-    for (const Part& pt : parts) {
-        if (rc < 0) break;
-        PathBuf from, to;
-        if (cand->cgen) pathPartitionCompact(&from, root, p->pid, cand->seg, cand->cgen, pt.ext);
-        else pathPartitionSeg(&from, root, p->pid, pt.letter, cand->seg, pt.ext);
-        pathPartitionCompact(&to, root, p->pid, cand->seg, gen, pt.ext);
-        rc = copyFile(&w->io(), from, pt.cls, to, pt.len);
-    }
-    // The new manifest: the partition as the SWAP will leave it.
-    std::vector<SegSnap> snap;
-    for (const auto& s2 : p->segs) {
-        SegSnap sn;
-        sn.seg = s2.seg;
-        sn.sealed = s2.sealed;
-        sn.cgen = s2.seg == cand->seg ? gen : s2.cgen;
-        sn.firstPseq = s2.firstPseq;
-        sn.endPseq = s2.endPseq;
-        sn.mergedEnd = s2.mergedEnd;
-        sn.dLen = s2.dLen;
-        sn.rLen = s2.rLen;
-        sn.aLen = s2.aLen;
-        sn.minEpoch = s2.minEpoch;
-        sn.maxEpoch = s2.maxEpoch;
-        for (const auto& r : s2.runs) sn.runs.push_back({r.gen, r.run ? r.run->entries() : 0, r.fileLen});
-        snap.push_back(std::move(sn));
-    }
-    if (rc >= 0) {
-        const std::vector<uint8_t> man = encodeSnapManifest(p->pid, gen, snap);
-        PathBuf mp;
-        pathPartitionManifest(&mp, root, p->pid, gen);
-        FileRef mf;
-        rc = w->io().open(mp.c_str(), mp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
-                          FileClass::Manifest, &mf);
-        if (rc >= 0) rc = w->io().write(mf, man.data(), man.size(), 0);
-        if (rc >= 0) rc = w->io().sync(mf);
-        w->io().close(&mf);
-    }
-    tHotPathDepth = saved;
-    if (rc < 0) {
-        swapDone(req, rc);
-        return 0;
-    }
-    uint8_t body[12];
-    putU32(body, cand->seg);
-    putU32(body + 4, gen);
-    putU32(body + 8, cand->cgen);
-    queueCtl(p, kCtlSwap, body, sizeof(body));
-    req->seg = cand->seg;
-    req->oldCgen = cand->cgen;
-    req->gen = gen;
-    p->swapInFlight = req;
-    p->swapSeg = cand->seg;
-    p->swapGen = gen;
-    w->ring();  // the SWAP batch commits in the next iteration
-    return 1;
-}
-
-void partitionSwapApply(Writer* w, Partition* p) {
-    for (auto& si : p->segs) {
-        if (si.seg != p->swapSeg) continue;
-        si.cgen = p->swapGen;
-        // The retired files are never read again by the owner.
-        w->io().close(&si.r);
-        w->io().close(&si.a);
-        w->io().close(&si.d);
-    }
-    p->manifestGen = p->swapGen;
-    p->swapInFlight = nullptr;
-}
 
 }  // namespace ps
 }  // namespace flatsql

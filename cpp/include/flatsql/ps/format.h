@@ -57,6 +57,7 @@ enum RowKind : uint8_t {
     kRowCtlTomb = 5,
     kRowRetag = 6,    // A2: another tag instance of a live PUT (target_pseq)
     kRowTagTomb = 7,  // A2: retires one tag instance (target_pseq = instance)
+    kRowVoid = 8,     // T3: never stored; a pseq compaction removed reads as this row (dead)
 };
 
 enum RowFlag : uint8_t {
@@ -142,6 +143,7 @@ enum CtlKind : uint16_t {
     kCtlUnlinked = 10,     // A12
     kCtlLaneCkpt = 11,     // full lane counter table (overflow past 32 inline)
     kCtlQuarantine = 12,
+    // Bodies of kCtlIntentCompact, kCtlSwap, kCtlRetire and kCtlUnlinked: ps/compaction.h.
 };
 
 // ---- registry frame kinds (A10, §4.7) --------------------------------------
@@ -320,8 +322,17 @@ struct PartitionHeadFixed {
     uint64_t lanesOverflowOff;  // LANE_CKPT offset in m-<lanesOverflowSeg> (0 = none)
     uint64_t rLen;         // committed r-<dSeg> length
     uint64_t aLen;         // committed a-<dSeg> length
+    // T3: outstanding compaction intent (A11 rule; cIntentGen 0 = none): its
+    // outputs are c-<cIntentSeg>-<gen>.*, x-<cIntentSeg>-<gen>.fsx, mf-<gen>.fsm.
+    uint32_t cIntentSeg;
+    uint32_t cIntentGen;
+    // T3 (A12): the latest RETIRE set record, in m-<retireSeg> at retireOff
+    // (retireN items; 0 = nothing retired and not yet unlinked).
+    uint32_t retireSeg;
+    uint32_t retireN;
+    uint64_t retireOff;
 };
-static_assert(sizeof(PartitionHeadFixed) == 264, "PartitionHeadFixed layout");
+static_assert(sizeof(PartitionHeadFixed) == 288, "PartitionHeadFixed layout");
 
 struct TypeHeadFixed {
     HeadPrefix p;
