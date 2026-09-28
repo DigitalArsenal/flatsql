@@ -184,7 +184,8 @@ void quotaStep(Writer* w) {
         int d;
         ~Restore() { tHotPathDepth = d; }
     } restore{saved};
-    // Usage: what the partitions hold, less files that go once readers let go.
+    // Usage (§13): what the partitions and the type logs hold, less files
+    // that go once readers let go.
     const uint32_t maxPid = e->maxPid();
     uint64_t usage = 0;
     for (uint32_t pid = 1; pid <= maxPid; pid++) {
@@ -193,6 +194,11 @@ void quotaStep(Writer* w) {
         const uint64_t d = p->diskBytesPub.load(std::memory_order_relaxed);
         const uint64_t r = p->retiredBytesPub.load(std::memory_order_relaxed);
         usage += d > r ? d - r : 0;
+    }
+    {
+        uint64_t tr = 0;
+        const uint64_t td = e->typeDiskBytes(&tr);
+        usage += td > tr ? td - tr : 0;
     }
     q.usage.store(usage);
     if (noSpace) {

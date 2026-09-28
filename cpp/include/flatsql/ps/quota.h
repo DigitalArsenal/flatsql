@@ -2,8 +2,8 @@
 // §13 as amended by A13 and owner decision §22.4-3; T3).
 //
 // Quota is on on-disk bytes. When the store's usage (every partition's
-// disk_bytes, less files already retired and waiting only for readers)
-// exceeds the cap, the planner, engine code on writer 0, evicts whole sealed
+// disk_bytes and every type log's, less files already retired and waiting
+// only for readers) exceeds the cap, the planner, engine code on writer 0, evicts whole sealed
 // segments in ARRIVAL order (oldest first, across partitions) down to the low
 // water mark (0.85 of the cap): a TOMB_RANGE on each segment's owner
 // tombstones its live PUTs except supersede-lane heads and control kinds,

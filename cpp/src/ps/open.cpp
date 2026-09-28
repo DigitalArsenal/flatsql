@@ -858,8 +858,11 @@ int32_t Engine::writeOpenTypeHeads(std::string* err) {
             t->headGen++;
             uint32_t used;
             encodeTypeHead(t, slot, &used, true);
-            rc = io->write(t->h, slot, used, (t->headGen % 2) * kHeadSlotBytes);
+            const uint64_t off = (t->headGen % 2) * kHeadSlotBytes;
+            rc = io->write(t->h, slot, used, off);
+            if (rc >= 0 && off + used > t->hExtent) t->hExtent = off + used;
             if (rc >= 0) rc = io->sync(t->h);
+            typePublishDisk(t);
         }
         io->close(&t->h);
         io->close(&t->m);

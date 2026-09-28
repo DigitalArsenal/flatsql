@@ -371,6 +371,8 @@ void Writer::commitRound() {
                 st->err = rc;
                 continue;
             }
+            uint64_t& ext = st->gSeal ? t->gNextExtent : t->gExtent;
+            ext = std::max<uint64_t>(ext, st->gOff + uint64_t(st->nArrivals) * kArrivalBytes);
             if (!journal) queueSync(g, t, 2);
         }
         if (st->gSeal) {
@@ -381,6 +383,7 @@ void Writer::commitRound() {
                 st->err = rc;
                 continue;
             }
+            t->fenceExtent = std::max<uint64_t>(t->fenceExtent, st->fenceOff + sizeof(st->fence));
             if (!journal) queueSync(t->gFence, t, 2);
         }
     }
@@ -408,6 +411,7 @@ void Writer::commitRound() {
             st->err = rc;
             continue;
         }
+        t->mExtent = std::max<uint64_t>(t->mExtent, st->mOff + st->batchLen);
         if (!journal) queueSync(t->m, t, 2);
     }
     if (journal) journalAppendRound();
@@ -940,6 +944,24 @@ uint64_t Engine::partitionDiskBytes(uint32_t pid) const {
     return p ? p->diskBytesPub.load(std::memory_order_relaxed) : 0;
 }
 
+uint64_t Engine::typeDiskBytes(uint64_t* retired) const {
+    // typeStore_ grows under the registration lock (maintenance, never a
+    // record path).
+    std::lock_guard<std::mutex> g(const_cast<std::mutex&>(regMutex_));
+    uint64_t b = 0, r = 0;
+    for (const auto& t : typeStore_) {
+        b += t->diskBytesPub.load(std::memory_order_relaxed);
+        r += t->retiredBytesPub.load(std::memory_order_relaxed);
+    }
+    if (retired) *retired = r;
+    return b;
+}
+
+uint64_t Engine::typeDiskBytesOf(const uint8_t fid[4]) const {
+    const TypeOwner* t = type(fid);
+    return t ? t->diskBytesPub.load(std::memory_order_relaxed) : 0;
+}
+
 uint64_t Engine::journalSafeNs() const {
     uint64_t safe = UINT64_MAX;
     for (const auto& w : writers_) {
@@ -1292,7 +1314,10 @@ EngineStats Engine::stats() const {
     {
         // typeStore_ grows under the registration lock.
         std::lock_guard<std::mutex> g(const_cast<std::mutex&>(regMutex_));
-        for (const auto& t : typeStore_) s.noticesDropped += t->noticesDropped.load();
+        for (const auto& t : typeStore_) {
+            s.noticesDropped += t->noticesDropped.load();
+            s.typeDiskBytes += t->diskBytesPub.load(std::memory_order_relaxed);
+        }
     }
     s.framesParsedAtOpen = framesParsedAtOpen;
     s.openReadBytes = openIoStats_.totalReadBytes();

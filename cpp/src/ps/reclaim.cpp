@@ -317,6 +317,7 @@ int32_t typeRotateMeta(Writer* w, TypeOwner* t) {
     t->mPrev = t->m;  // unmerged L0 blocks are read from it until merged
     t->mPrevSeg = t->mSeg;
     t->m = nm;
+    t->mSealedBytes += t->mEnd;  // cut at its last batch
     t->mExtent = 0;
     t->mSeg++;
     t->mEnd = 0;
@@ -364,11 +365,31 @@ int32_t typeRetireMeta(Writer* w, TypeOwner* t) {
     r.it = retireItem('m', s, 0, size > 0 ? uint64_t(size) : 0);
     r.retireNs = monoNs();
     t->retired.push_back(r);
+    t->mSealedBytes -= std::min<uint64_t>(t->mSealedBytes, r.it.size);
     e->cRetired.fetch_add(1, std::memory_order_relaxed);
     e->cMetaRetired.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
 }  // namespace
+
+uint64_t typeDiskBytesNow(const TypeOwner* t, uint64_t* retiredOut) {
+    uint64_t retired = 0;
+    for (const auto& r : t->retired) retired += r.it.size;
+    uint64_t b = t->hExtent + t->mSealedBytes + std::max(t->mExtent, t->mEnd) + t->gSealedBytes +
+                 std::max(t->gExtent, t->gLen) + t->fenceExtent + retired;
+    for (const auto& run : t->runs) b += run.fileLen;
+    if (t->manifestGenLoaded) b += t->manifestBytes;
+    if (t->mergePhase == 1) b += t->mergeRun.fileLen + t->mergeManifestBytes;  // built, MERGE_DONE pending
+    if (retiredOut) *retiredOut = retired;
+    return b;
+}
+
+void typePublishDisk(TypeOwner* t) {
+    uint64_t retired = 0;
+    const uint64_t b = typeDiskBytesNow(t, &retired);
+    t->diskBytesPub.store(b, std::memory_order_relaxed);
+    t->retiredBytesPub.store(retired, std::memory_order_relaxed);
+}
 
 int32_t typeReclaimStep(Writer* w, TypeOwner* t) {
     if (t->st) return 0;
@@ -379,6 +400,7 @@ int32_t typeReclaimStep(Writer* w, TypeOwner* t) {
     int32_t out = 0;
     if (cfg.typeMetaSegBytes && t->mEnd >= cfg.typeMetaSegBytes) out = typeRotateMeta(w, t);
     if (out >= 0 && cfg.retireMeta) out = typeRetireMeta(w, t);
+    typePublishDisk(t);
     if (t->retired.empty()) {
         tHotPathDepth = saved;
         return out;
@@ -421,6 +443,7 @@ int32_t typeReclaimStep(Writer* w, TypeOwner* t) {
         e->cUnlinked.fetch_add(1, std::memory_order_relaxed);
         done++;
     }
+    if (done) typePublishDisk(t);
     tHotPathDepth = saved;
     return out < 0 ? out : int32_t(done);
 }
@@ -459,6 +482,14 @@ int32_t typeOpenReclaim(IoCtx* io, const char* root, TypeOwner* t, const std::ve
     // Meta segments below first_live_m_seg (retired, maybe not unlinked).
     const uint32_t lo = t->firstLiveMSeg > 256 ? t->firstLiveMSeg - 256 : 0;
     for (uint32_t s = lo; rc >= 0 && s < t->firstLiveMSeg; s++) rc = drop(retireItem('m', s, 0, 0), true);
+    // A rotation the crash cut short: a next meta segment the chain does not
+    // continue into holds nothing (a later rotation would truncate it).
+    {
+        PathBuf np;
+        pathTypeSeg(&np, root, t->fid, 'm', t->mSeg + 1, "fsl");
+        const int32_t urc = io->unlink(np.c_str(), np.len, true);
+        if (urc < 0 && urc != FLATSQL_IO_ERR_NOENT) rc = urc;
+    }
     // A merge in flight at the crash: outputs no MERGE_DONE named. The
     // unlinks are durable: merges after this open name later generations,
     // and a file that came back would never be looked for again.
@@ -466,7 +497,35 @@ int32_t typeOpenReclaim(IoCtx* io, const char* root, TypeOwner* t, const std::ve
         rc = drop(retireItem('x', 0, g, 0), true);
         if (rc >= 0) rc = drop(retireItem('f', 0, g, 0), true);
     }
-    return rc;
+    if (rc < 0) return rc;
+    // The ledger: sizes of the files the type names (no data byte is read).
+    PathBuf path;
+    pathType(&path, root, t->fid, "h.fsh");
+    int64_t n = fileSize(io, path);
+    t->hExtent = n > 0 ? uint64_t(n) : 0;
+    t->mSealedBytes = 0;
+    for (uint32_t s = t->firstLiveMSeg; s < t->mSeg; s++) {
+        pathTypeSeg(&path, root, t->fid, 'm', s, "fsl");
+        n = fileSize(io, path);
+        if (n > 0) t->mSealedBytes += uint64_t(n);
+    }
+    pathTypeSeg(&path, root, t->fid, 'm', t->mSeg, "fsl");
+    n = fileSize(io, path);
+    t->mExtent = n > 0 ? uint64_t(n) : 0;
+    t->gSealedBytes = 0;
+    for (uint32_t s = 0; s < t->gSeg; s++) {
+        pathTypeSeg(&path, root, t->fid, 'g', s, "fsg");
+        n = fileSize(io, path);
+        if (n > 0) t->gSealedBytes += uint64_t(n);
+    }
+    pathTypeSeg(&path, root, t->fid, 'g', t->gSeg, "fsg");
+    n = fileSize(io, path);
+    t->gExtent = n > 0 ? uint64_t(n) : 0;
+    pathType(&path, root, t->fid, kArrivalFenceName);
+    n = fileSize(io, path);
+    t->fenceExtent = n > 0 ? uint64_t(n) : 0;
+    typePublishDisk(t);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------

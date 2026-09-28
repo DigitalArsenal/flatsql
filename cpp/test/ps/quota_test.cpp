@@ -52,22 +52,26 @@ std::string cidKey(const std::vector<uint8_t>& frame) {
     return std::string(reinterpret_cast<const char*>(cid), kCidLen);
 }
 
-uint64_t storeBytes(Store& s, const std::vector<uint32_t>& pids) {
+// The store's bytes (§13): the partitions and the type logs.
+uint64_t storeBytes(Store& s, const std::vector<uint32_t>& pids, const std::vector<const TestType*>& types) {
     uint64_t b = 0;
     for (uint32_t pid : pids) b += checkPartitionDir(s.fs.get(), s.fs.get(), s.root, pid).bytes;
+    for (const TestType* t : types) b += checkTypeDir(s.fs.get(), s.fs.get(), s.root, t->fid).bytes;
     return b;
 }
 
 // Waits until background work (merges, compactions, reclamation) has
 // stopped changing the store: no compaction in flight and the same bytes on
 // disk for a second, equal to the engine's disk_bytes.
-uint64_t settle(Store& s, const std::vector<uint32_t>& pids, uint64_t timeoutNs) {
+uint64_t settle(Store& s, const std::vector<uint32_t>& pids, const std::vector<const TestType*>& types,
+              uint64_t timeoutNs) {
     uint64_t last = 0;
     int same = 0;
     for (const uint64_t t0 = monoNs(); monoNs() - t0 < timeoutNs; sleepNs(50000000)) {
-        const uint64_t b = storeBytes(s, pids);
+        const uint64_t b = storeBytes(s, pids, types);
         uint64_t d = 0;
         for (uint32_t pid : pids) d += s.e->partitionDiskBytes(pid);
+        for (const TestType* t : types) d += s.e->typeDiskBytesOf(t->fid);
         if (b == last && b == d && s.e->stats().compactInFlight == 0) {
             if (++same >= 20) return b;
         } else {
@@ -135,7 +139,8 @@ PS_TEST(quota_arrival_order_heads_spared_T3_3) {
     REQUIRE(waitLabeledEngine(s.e.get(), pids, 60000000000ull));
     // Seals by age, merges and compactions first: the cap applies to a store
     // at rest.
-    const uint64_t usage0 = settle(s, pids, 60000000000ull);
+    const std::vector<const TestType*> types = {&ommType(), &catType()};
+    const uint64_t usage0 = settle(s, pids, types, 60000000000ull);
     const uint64_t cap = usage0 * 8 / 10;
     s.e->setQuota(cap);
     // Disk at or below the cap: planner passes until then.
@@ -143,14 +148,14 @@ PS_TEST(quota_arrival_order_heads_spared_T3_3) {
     bool underCap = false;
     for (const uint64_t t0 = monoNs(); monoNs() - t0 < 60000000000ull; sleepNs(5000000)) {
         const QuotaStats q = s.e->quotaStats();
-        if (storeBytes(s, pids) <= cap && q.passes) {
+        if (storeBytes(s, pids, types) <= cap && q.passes) {
             passesAtCap = q.passes;
             underCap = true;
             break;
         }
     }
     const QuotaStats qs = s.e->quotaStats();
-    const uint64_t usage1 = storeBytes(s, pids);
+    const uint64_t usage1 = storeBytes(s, pids, types);
     // Arrival order within each partition: the evicted records are exactly
     // its oldest ones (no survivor is older than an evicted record).
     uint64_t evicted = 0, olderSurvivorsGlobal = 0;
@@ -195,7 +200,8 @@ PS_TEST(quota_arrival_order_heads_spared_T3_3) {
     report("quota_cat_heads_evicted", double(headsLost), "heads");
     report("quota_eviction_steps", double(eh.count.load()), "steps");
     report("quota_eviction_step_max_ms", double(eh.maxNs.load()) / 1e6, "ms");
-    report("quota_eviction_step_p99_ms", double(eh.percentileNs(0.99)) / 1e6, "ms");
+    // (the histogram's p99 is its bucket's upper bound: never above the max)
+    report("quota_eviction_step_p99_ms", double(std::min(eh.percentileNs(0.99), eh.maxNs.load())) / 1e6, "ms");
     CHECK(underCap);
     CHECK(passesAtCap <= 3);
     CHECK(evicted > 0);
@@ -351,5 +357,9 @@ PS_TEST(quota_disk_full_resumes_without_operator_T3_6) {
         CHECK(dc.ok);
         CHECK_EQ(dc.bytes, s.e->partitionDiskBytes(pid));
     }
+    const DirCheck tc = checkTypeDir(s.fs.get(), s.fs.get(), s.root, ommType().fid);
+    if (!tc.ok) std::fprintf(stderr, "  type dir: %s\n", tc.err.c_str());
+    CHECK(tc.ok);
+    CHECK_EQ(tc.bytes, s.e->typeDiskBytesOf(ommType().fid));
     s.close();
 }

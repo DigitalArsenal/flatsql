@@ -828,6 +828,8 @@ DirCheck checkTypeDir(Io* io, FaultFs* fs, const std::string& root, const uint8_
             if (e.is_regular_file()) present[e.path().string()] = uint64_t(e.file_size());
     }
     for (const auto& kv : present) {
+        const std::string base = kv.first.substr(kv.first.rfind('/') + 1);
+        if (base.compare(0, 2, "s-") == 0) continue;  // type configs: registration, not type logs
         dc.bytes += kv.second;
         dc.files++;
     }

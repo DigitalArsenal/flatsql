@@ -165,7 +165,8 @@ struct DirCheck {
 DirCheck checkPartitionDir(Io* io, FaultFs* fs, const std::string& root, uint32_t pid);
 // T3 (type-log reclamation): the files a type's durable head and manifest
 // name (catalog runs, meta segments from first_live_m_seg, arrivals) against
-// its directory. `bytes`: the directory's total.
+// its directory. `bytes`: the directory's total without the type configs
+// (s-*.fsc, registration): the type's disk bytes must equal it at rest.
 DirCheck checkTypeDir(Io* io, FaultFs* fs, const std::string& root, const uint8_t fid[4]);
 
 // Recount of partition counters from rows (head counters must equal it).

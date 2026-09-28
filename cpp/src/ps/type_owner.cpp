@@ -436,7 +436,10 @@ int32_t typeWriteHead(Writer* w, TypeOwner* t, bool durable) {
     t->headGen++;
     uint32_t used;
     encodeTypeHead(t, slot, &used, durable);
-    return w->io().write(t->h, slot, used, (t->headGen % 2) * kHeadSlotBytes);
+    const uint64_t off = (t->headGen % 2) * kHeadSlotBytes;
+    const int32_t rc = w->io().write(t->h, slot, used, off);
+    if (rc >= 0 && off + used > t->hExtent) t->hExtent = off + used;
+    return rc;
 }
 
 int32_t typeEnsureFiles(IoCtx* io, Engine* e, TypeOwner* t) {
@@ -564,6 +567,7 @@ bool typeStageSeal(Writer* w, TypeOwner* t, StagedType* st) {
         ok = io->open(gp.c_str(), gp.len,
                       kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
                       FileClass::Arrivals, &t->gNext) == 0;
+        t->gNextExtent = 0;
     }
     tHotPathDepth = saved;
     if (!ok) return false;
@@ -823,7 +827,9 @@ void typePublish(Writer* w, TypeOwner* t, StagedType* st) {
         w->io().close(&t->g);
         t->g = t->gNext;
         t->gNext = FileRef();
-        t->gExtent = 0;
+        t->gSealedBytes += std::max(t->gExtent, t->gLen);
+        t->gExtent = t->gNextExtent;
+        t->gNextExtent = 0;
         t->gSeg = st->gSeg;
         t->fenceLen = st->fenceOff + sizeof(ArrivalFence);
     }

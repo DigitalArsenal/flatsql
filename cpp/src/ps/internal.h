@@ -302,6 +302,8 @@ int32_t partitionOpenReclaim(IoCtx* io, const char* root, Partition* p, const st
 int32_t partitionOpenLedger(IoCtx* io, const char* root, Partition* p);
 int32_t typeReclaimStep(Writer* w, TypeOwner* t);           // maintenance: rotate, retire, unlink
 int32_t typeOpenReclaim(IoCtx* io, const char* root, TypeOwner* t, const std::vector<RetireItem>& items);
+uint64_t typeDiskBytesNow(const TypeOwner* t, uint64_t* retired);  // owner: the ledger's total
+void typePublishDisk(TypeOwner* t);                                 // owner: for the quota planner
 
 // ---- quota (quota.cpp), T3 ------------------------------------------------------
 uint64_t segmentDiskBytes(const Partition* p, const SegmentInfo& s);

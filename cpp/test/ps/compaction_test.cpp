@@ -807,6 +807,10 @@ PS_TEST(type_logs_reclaimed_under_readers) {
         if (tc.ok) break;
     }
     if (!tc.ok) std::fprintf(stderr, "  type dir: %s\n", tc.err.c_str());
+    // The type's disk bytes are its directory's (maintenance publishes them).
+    bool bytesMatch = false;
+    for (const uint64_t t1 = monoNs(); !bytesMatch && monoNs() - t1 < 10000000000ull; sleepNs(20000000))
+        bytesMatch = checkTypeDir(cs.io, cs.fs(), s.root, ommType().fid).bytes == s.e->typeDiskBytesOf(ommType().fid);
     const Rows cnt = rd.q("SELECT first_live_count FROM flatsql_types WHERE type = 'OMM'");
     s.e->setReaderGate(nullptr, nullptr);
     const EngineStats st = s.e->stats();
@@ -840,6 +844,11 @@ PS_TEST(type_logs_reclaimed_under_readers) {
     report("typelogs_first_live_m_seg", double(tv.head.firstLiveMSeg), "segment");
     if (!firstErr.empty()) std::fprintf(stderr, "  first error: %s\n", firstErr.c_str());
     CHECK(tc.ok);
+    if (!bytesMatch)
+        std::fprintf(stderr, "  type dir %llu bytes, type disk bytes %llu\n",
+                     (unsigned long long)checkTypeDir(cs.io, cs.fs(), s.root, ommType().fid).bytes,
+                     (unsigned long long)s.e->typeDiskBytesOf(ommType().fid));
+    CHECK(bytesMatch);
     CHECK_EQ(errors.load(), uint64_t(0));
     CHECK_EQ(wrong.load(), uint64_t(0));
     CHECK(statements.load() > 0);
@@ -852,6 +861,7 @@ PS_TEST(type_logs_reclaimed_under_readers) {
     const DirCheck tc2 = checkTypeDir(cs.io, cs.fs(), s.root, ommType().fid);
     if (!tc2.ok) std::fprintf(stderr, "  type dir after reopen: %s\n", tc2.err.c_str());
     CHECK(tc2.ok);
+    CHECK_EQ(tc2.bytes, s.e->typeDiskBytesOf(ommType().fid));
     Reader rd2(ic);
     int wrong2 = 0;
     for (int i = 0; i < 64; i++) {

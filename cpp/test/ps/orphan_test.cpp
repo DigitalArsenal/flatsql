@@ -222,6 +222,11 @@ struct OrphanHarness {
         }
         // Type logs: the head's segments, the manifest's runs, nothing else.
         const DirCheck tc = checkTypeDir(s.fs.get(), s.fs.get(), s.root, ommType().fid);
+        if (tc.ok && tc.bytes != s.e->typeDiskBytesOf(ommType().fid)) {
+            std::fprintf(stderr, "  [%s] type dir %llu bytes, type disk bytes %llu\n", phase,
+                         (unsigned long long)tc.bytes, (unsigned long long)s.e->typeDiskBytesOf(ommType().fid));
+            gFailures++;
+        }
         if (!tc.ok) {
             std::fprintf(stderr, "  [%s] type files: %s\n", phase, tc.err.c_str());
             {

@@ -608,6 +608,16 @@ struct TypeOwner {
     uint32_t mPrevSeg = UINT32_MAX;
     bool haveLabelCkpt = false;           // a FULL_LABELS batch is durable (A10)
     bool forceFullLabels = false;         // the first batch of a new m segment checkpoints labels
+    // Disk accounting (§13: usage is partitions + type logs): the files the
+    // type names, by size, maintained on every write, seal, rotation, merge
+    // and unlink (configs s-*.fsc are registration, not counted).
+    uint64_t hExtent = 0;                 // h.fsh
+    uint64_t mSealedBytes = 0;            // m-<seg>, first_live_m_seg <= seg < m_seg
+    uint64_t gSealedBytes = 0;            // g-<seg>, seg < g_seg
+    uint64_t gNextExtent = 0;             // g-<g_seg + 1> while a seal is staged
+    uint64_t fenceExtent = 0;             // g.fsf
+    std::atomic<uint64_t> diskBytesPub{0};
+    std::atomic<uint64_t> retiredBytesPub{0};
 };
 
 // ---- writer mailbox --------------------------------------------------------------
@@ -853,6 +863,7 @@ struct EngineStats {
     uint64_t unlinkBusy = 0;
     uint64_t metaSegsRetired = 0;
     uint64_t catalogEntriesDropped = 0;  // T3 (A15): dead copies' CID/LABEL/REPEAT entries folded out
+    uint64_t typeDiskBytes = 0;          // T3 (§13): Σ type logs on disk
     uint64_t compactInFlight = 0;  // planned, not yet applied or aborted
     uint64_t diskBytes = 0;        // sum over partitions (published values)
 };
@@ -908,6 +919,10 @@ public:
     uint64_t readerGateNs() const;
     // Disk bytes of a partition as its owner last published them (§13).
     uint64_t partitionDiskBytes(uint32_t pid) const;
+    // T3 (§13): the type logs' bytes on disk (as last published by their
+    // owners), and the part of them retired and waiting only for readers.
+    uint64_t typeDiskBytes(uint64_t* retired = nullptr) const;
+    uint64_t typeDiskBytesOf(const uint8_t fid[4]) const;
     // A8: every journal record written before this time is checkpointed.
     uint64_t journalSafeNs() const;
     // Compaction builds run on their own threads.
