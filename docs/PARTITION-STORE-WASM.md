@@ -109,14 +109,15 @@ FLATSQL_PS_WASMEDGE=1 npm test -- test/ps-parity-vectors.test.ts   # + the C run
 
 Machine: the owner's Mac Studio (Darwin 25.3.0, arm64, 28 hardware threads,
 APFS), Node 25.4.0, shared with other lanes: 1-minute load average 18–25
-during these runs. Native builds RelWithDebInfo; wasm builds as §1.
+during these runs (37–41 for the release rerun, §4.2). Native builds
+RelWithDebInfo; wasm builds as §1.
 
 | # | Acceptance | Result |
 |---|---|---|
 | 1 | Imports exactly WASI p1 + `wasi.thread-spawn` + shared `env.memory` (≤ 32768 pages) + the 7 `env.flatsql_io_*`; exports `wasi_thread_start`; 0 emscripten imports; passes `assertPthreadArtifact` | **Pass.** §1 table; `scripts/check-wasm-imports.mjs`, `test/standalone-wasm-imports.test.ts` (the SDK guard runs in a child process). |
 | 2 | The T1 and T2 suites, including 1,000 fault crashes, pass under the Node host with distinct OS thread ids ≥ writers + lanes | **Pass.** `scripts/ps-wasm-suite.mjs`: all 53 default-suite tests, each in its own guest process, plus `crash_faults_T1_1 --crash-trials=1000` (1,000 trials over the five modes, 298,923 acked records verified, 41.8 s). `readers_under_saturating_writers_T2_1` (8 writers, 16 lanes) ran 54 guest threads at once on 54 distinct worker (OS) threads. `test/ps-node-threads.test.ts`: the shipped artifact as a writer instance (4 writers) and a reader instance (4 lanes), each running thread on its own worker. `writer_backpressure_flood_T1_5` runs with `--bp-samples=40` (deviation 3). `crash_faults_T1_1_full` (10,000 trials, 64 types, 256 partitions): §4.1. |
 | 3 | Parity: canonical dumps (by (pid, pseq)) and query results identical native vs Node; deterministic mode byte-identical across native, Node and the SDK WasmEdge C runner (patched 0.16.4) | **Pass.** Canonical dump, 4 writers, 11,313 lines (rows, counters, lane counters and six queries, partition and type level): sha256 `f3b419a2…` natively and under Node, three runs each. Deterministic mode, 122 files: in memory `e7ab8592…` natively, under Node and under the C runner (18.7 s, interpreted); on the host's files `c7e34c55…` natively and under Node. `test/ps-parity-vectors.test.ts`. |
-| 4 | A published npm version with provenance; the wasm sha256 in `integrity.json`; `npm ls sql.js` empty; the package root exports only the wasm bindings | See §6 and the release record in §4.2. |
+| 4 | A published npm version with provenance; the wasm sha256 in `integrity.json`; `npm ls sql.js` empty; the package root exports only the wasm bindings | **Pass.** `flatsql@3.0.0`, §4.2 and §6. |
 
 Host-level crashes (the overlay, §2): `test/ps-host-fault.test.ts` kills the
 guest mid-ingest at a random 0.4–2.0 s, crashes the store in the three modes
@@ -140,7 +141,27 @@ journal. A negative control (half a data segment cut off) fails the verifier.
 
 ### 4.2 Release
 
-Filled in when the release is published.
+- `flatsql@3.0.0`, published by `npm-publish.yml` from tag `v3.0.0` =
+  `79fd694` (run 36486543061) with a signed provenance statement
+  (`npm audit signatures`: verified attestation); `gitHead` 79fd694, dist-tag
+  `latest`, `dependencies` `{}`.
+- `wasm/flatsql-ps-threads.wasm`: 2,074,707 bytes, sha256
+  `572a4bc38345d07ff91c345fc8d81e28873d72efa0fb8864a2edc5242145f9f5`, the same
+  in `wasm/integrity.json`, from the Linux arm64 Docker build, the x86_64
+  publish runner and the installed tarball.
+- A fresh `npm install flatsql@3.0.0`: `npm ls sql.js` is empty; the root's
+  exports equal `flatsql/wasm`'s; `loadFlatSQLPsThreads()` checks the bytes
+  against `integrity.json`.
+- At the release sources (`dac8d89` engine), under the Node host: the 55
+  default-suite tests and `crash_faults_T1_1 --crash-trials=1000` pass (1,000
+  trials, 403,798 acked records verified, 47.3 s; load 37–41). Main CI green
+  on `79fd694` (run 36482613908).
+- Two engine defects the Node host found before the release, fixed in the
+  sources the artifact builds: the open path dropped the lane checkpoint
+  pointer of a head with more than 32 live lanes (`5c7e769`; the 1,000-trial
+  crash run, trial 317), and the type owner never merged its L0 directory
+  when `mergeL0Blocks` exceeded the directory cap, so labeling, partition
+  merges and acks stopped (`dac8d89`).
 
 ## 5. Design deviations
 
