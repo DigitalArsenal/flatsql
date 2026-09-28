@@ -575,13 +575,18 @@ int32_t readerSqliteInit(std::string* err) {
                                    memInit, memShutdown, nullptr};
         int rc = sqlite3_config(SQLITE_CONFIG_MALLOC, &mem);
         if (rc == SQLITE_OK) rc = sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0);
+        if (rc == SQLITE_OK) rc = sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
+        // The default mutex methods exist only once SQLite has initialized:
+        // initialize, read them, shut down, then install the wrappers.
+        if (rc == SQLITE_OK) rc = sqlite3_initialize();
+        if (rc == SQLITE_OK) rc = sqlite3_shutdown();
         if (rc == SQLITE_OK) rc = sqlite3_config(SQLITE_CONFIG_GETMUTEX, &gDefaultMutex);
+        if (rc == SQLITE_OK && !gDefaultMutex.xMutexAlloc) rc = SQLITE_ERROR;
         if (rc == SQLITE_OK) {
             sqlite3_mutex_methods wrapped = {mxInit, mxEnd, mxAlloc, mxFree, mxEnter,
                                              mxTry, mxLeave, mxHeld, mxNotHeld};
             rc = sqlite3_config(SQLITE_CONFIG_MUTEX, &wrapped);
         }
-        if (rc == SQLITE_OK) rc = sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
         if (rc == SQLITE_OK) rc = sqlite3_initialize();
         if (rc == SQLITE_OK) rc = sqlite3_vfs_register(&gNullVfs, 0);
         if (rc != SQLITE_OK) {
