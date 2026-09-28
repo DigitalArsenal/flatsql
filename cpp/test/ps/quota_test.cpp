@@ -214,6 +214,7 @@ PS_TEST(quota_disk_full_resumes_without_operator_T3_6) {
     s.cfg.reclaimGraceMs = 1;
     s.cfg.quotaIntervalMs = 20;
     s.cfg.zeroFillStep = 0;
+    s.cfg.typeMetaSegBytes = 256u << 10;  // the type meta log rotates (and retires) at this size
     s.cfg.ballastBytes = 1u << 20;
     REQUIRE(s.open() == 0);
     s.registerTypes({&ommType()});
@@ -283,6 +284,7 @@ PS_TEST(quota_disk_full_resumes_without_operator_T3_6) {
             const std::string base = rel.substr(rel.rfind('/') + 1);
             const std::string dir = rel.substr(0, 1);
             by[dir + ":" + base.substr(0, base.find_first_of("-."))] += uint64_t(ctx.size(f));
+            if (getenv("PS_QDEBUG_FILES") && dir == "t") std::fprintf(stderr, "    %s %llu\n", base.c_str(), (unsigned long long)ctx.size(f));
             ctx.close(&f);
         }
         std::fprintf(stderr, "  device used %llu emergency %d usage %llu cap %llu retired %llu unlinked %llu busy %llu:",

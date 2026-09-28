@@ -300,6 +300,8 @@ int32_t partitionRetireMetaStep(Writer* w, Partition* p);    // maintenance (A9)
 int32_t partitionOpenReclaim(IoCtx* io, const char* root, Partition* p, const std::vector<RetireItem>& items,
                              uint32_t* unlinked);
 int32_t partitionOpenLedger(IoCtx* io, const char* root, Partition* p);
+int32_t typeReclaimStep(Writer* w, TypeOwner* t);           // maintenance: rotate, retire, unlink
+int32_t typeOpenReclaim(IoCtx* io, const char* root, TypeOwner* t, const std::vector<RetireItem>& items);
 
 // ---- quota (quota.cpp), T3 ------------------------------------------------------
 uint64_t segmentDiskBytes(const Partition* p, const SegmentInfo& s);

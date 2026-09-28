@@ -805,6 +805,98 @@ DirCheck checkPartitionDir(Io* io, FaultFs* fs, const std::string& root, uint32_
     return dc;
 }
 
+DirCheck checkTypeDir(Io* io, FaultFs* fs, const std::string& root, const uint8_t fid[4]) {
+    DirCheck dc;
+    Inspector ins(io, root);
+    const Inspector::TypeView v = ins.type(fid);
+    PathBuf dirp;
+    pathTypeDir(&dirp, root.c_str(), fid);
+    const std::string dir(dirp.c_str(), dirp.len);
+    std::map<std::string, uint64_t> present;
+    if (fs) {
+        for (const std::string& path : fs->list(dir + "/")) {
+            IoStats st;
+            IoCtx ctx(io, &st);
+            FileRef f;
+            if (ctx.open(path.c_str(), path.size(), FLATSQL_IO_READ, FileClass::Store, &f) < 0) continue;
+            present[path] = uint64_t(ctx.size(f));
+            ctx.close(&f);
+        }
+    } else {
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec))
+            if (e.is_regular_file()) present[e.path().string()] = uint64_t(e.file_size());
+    }
+    for (const auto& kv : present) {
+        dc.bytes += kv.second;
+        dc.files++;
+    }
+    std::set<std::string> required, optional;
+    auto add = [&](std::set<std::string>& set, const PathBuf& pb) { set.insert(std::string(pb.c_str(), pb.len)); };
+    PathBuf pb;
+    if (!v.ok) {
+        // Nothing durable yet: only a first meta segment and arrivals may exist.
+        pathType(&pb, root.c_str(), fid, "h.fsh");
+        add(optional, pb);
+        pathTypeSeg(&pb, root.c_str(), fid, 'm', 0, "fsl");
+        add(optional, pb);
+        pathTypeSeg(&pb, root.c_str(), fid, 'g', 0, "fsg");
+        add(optional, pb);
+    } else {
+        const TypeHeadFixed& h = v.head;
+        pathType(&pb, root.c_str(), fid, "h.fsh");
+        add(required, pb);
+        // Meta segments: the sealed ones from first_live_m_seg, the active
+        // one (created on first use) and the next (a rotation cut short).
+        for (uint32_t sg = h.firstLiveMSeg; sg <= h.mSeg + 1; sg++) {
+            pathTypeSeg(&pb, root.c_str(), fid, 'm', sg, "fsl");
+            add(sg < h.mSeg ? required : optional, pb);
+        }
+        for (uint32_t sg = 0; sg <= h.gSeg + 1; sg++) {
+            pathTypeSeg(&pb, root.c_str(), fid, 'g', sg, "fsg");
+            add(sg < h.gSeg ? required : optional, pb);
+        }
+        pathType(&pb, root.c_str(), fid, kArrivalFenceName);
+        add(h.gSeg ? required : optional, pb);
+        if (h.manifestGen) {
+            pathTypeManifest(&pb, root.c_str(), fid, h.manifestGen);
+            add(required, pb);
+            IoStats st;
+            IoCtx ctx(io, &st);
+            std::vector<uint8_t> man;
+            if (!readFile(ctx, pb, FileClass::Manifest, &man) || man.size() < 24 ||
+                getU32(man.data()) != kMagicManifest) {
+                dc.err = "type manifest unreadable";
+                return dc;
+            }
+            const uint32_t n = getU32(man.data() + 4);
+            const size_t body = 16 + size_t(n) * 16;
+            if (body + 8 > man.size() || crc32c(man.data(), body) != getU32(man.data() + body)) {
+                dc.err = "type manifest invalid";
+                return dc;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                pathTypeRun(&pb, root.c_str(), fid, getU32(man.data() + 16 + size_t(i) * 16));
+                add(required, pb);
+            }
+        }
+    }
+    for (const auto& kv : present) {
+        const std::string base = kv.first.substr(kv.first.rfind('/') + 1);
+        if (base.compare(0, 2, "s-") == 0) continue;  // type configs (registration)
+        if (!required.count(kv.first) && !optional.count(kv.first)) dc.orphans.push_back(kv.first);
+    }
+    for (const auto& r : required)
+        if (!present.count(r)) dc.missing.push_back(r);
+    dc.ok = dc.orphans.empty() && dc.missing.empty();
+    if (!dc.ok) {
+        dc.err = std::to_string(dc.orphans.size()) + " orphan(s), " + std::to_string(dc.missing.size()) + " missing";
+        for (size_t i = 0; i < dc.orphans.size() && i < 4; i++) dc.err += "; orphan " + dc.orphans[i];
+        if (!dc.missing.empty()) dc.err += "; first missing " + dc.missing.front();
+    }
+    return dc;
+}
+
 Recount recount(const PartView& v) {
     Recount r;
     std::set<uint64_t> tagDead;

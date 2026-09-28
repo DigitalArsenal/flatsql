@@ -574,17 +574,20 @@ int32_t Engine::openTypes(std::string* err) {
                 labelCkptSeg = h.labelCkptSeg;
             }
             t->manifestGenLoaded = h.manifestGen;
+            t->firstLiveMSeg = h.firstLiveMSeg;
         }
         // Label checkpoint (A10, > 128 pids): the FULL_LABELS batch, then the
         // label deltas of every later batch up to the head (bounded by the
         // checkpoint interval).
-        if (!labelsInline) {
+        // T3: the checkpoint's segment may precede the head's (a rotation
+        // before the next checkpoint): later segments are read whole.
+        for (uint32_t sg = labelCkptSeg; !labelsInline && sg <= t->mSeg; sg++) {
             PathBuf mp;
-            pathTypeSeg(&mp, cfg_.root.c_str(), t->fid, 'm', labelCkptSeg, "fsl");
+            pathTypeSeg(&mp, cfg_.root.c_str(), t->fid, 'm', sg, "fsl");
             FileRef mf;
             if (io->open(mp.c_str(), mp.len, FLATSQL_IO_READ, FileClass::TypeMeta, &mf) == 0) {
-                uint64_t off = labelCkptOff;
-                const uint64_t end = labelCkptSeg == t->mSeg ? t->mEnd : uint64_t(io->size(mf));
+                uint64_t off = sg == labelCkptSeg ? labelCkptOff : 0;
+                const uint64_t end = sg == t->mSeg ? t->mEnd : uint64_t(io->size(mf));
                 while (off + sizeof(TypeBatchHeader) <= end) {
                     TypeBatchHeader bh;
                     if (io->read(mf, &bh, sizeof(bh), off) != int64_t(sizeof(bh)) || bh.magic != kMagicTypeBatch ||
@@ -603,8 +606,11 @@ int32_t Engine::openTypes(std::string* err) {
                 }
                 io->close(&mf);
             }
+        }
+        if (!labelsInline) {
             t->labelCkptOff = labelCkptOff;
             t->labelCkptSeg = labelCkptSeg;
+            t->haveLabelCkpt = true;
         }
         // Tail of the type log (A4, A10).
         PathBuf mp, gp;
@@ -615,102 +621,132 @@ int32_t Engine::openTypes(std::string* err) {
         if (io->open(mp.c_str(), mp.len, kOpenRW, FileClass::TypeMeta, &mf) == 0) {
             io->open(gp.c_str(), gp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS,
                      FileClass::Arrivals, &gf);
-            const int64_t size = io->size(mf);
+            int64_t size = io->size(mf);
             uint64_t off = t->mEnd;
             uint32_t lastInc = incFloor;
             std::vector<uint8_t> b;
             bool sealAdopted = false;
-            while (off + sizeof(TypeBatchHeader) <= uint64_t(size)) {
-                TypeBatchHeader h;
-                if (io->read(mf, &h, sizeof(h), off) != int64_t(sizeof(h))) break;
-                // A15: a batch may open the next arrivals segment.
-                const bool seal = h.gSeg == t->gSeg + 1 && h.gOff == 0 && h.nArrivals > 0;
-                if (h.magic != kMagicTypeBatch || h.ver != 1 || h.commitSeq != t->commitSeq + 1 ||
-                    h.batchLen < sizeof(h) + 8 || off + h.batchLen > uint64_t(size) ||
-                    h.incarnation < lastInc || (h.gSeg != t->gSeg && !seal))
-                    break;
-                b.resize(h.batchLen);
-                if (io->read(mf, b.data(), h.batchLen, off) != int64_t(h.batchLen)) break;
-                if (crc32c(b.data(), h.batchLen - 8) != getU32(b.data() + h.batchLen - 8)) break;
-                if (h.flags & kTypeBatchJournaled) {
-                    uint32_t fidv;
-                    std::memcpy(&fidv, t->fid, 4);
-                    if (!journalReplayed(kJrnTypeMeta, fidv, t->mSeg, off)) break;
-                }
-                // Arrivals must be durable too: validate them by their CRC.
-                if (h.nArrivals) {
-                    FileRef next;
-                    if (seal) {
-                        PathBuf np;
-                        pathTypeSeg(&np, cfg_.root.c_str(), t->fid, 'g', h.gSeg, "fsg");
-                        if (io->open(np.c_str(), np.len, kOpenRW, FileClass::Arrivals, &next) != 0) break;
-                    } else if (h.gOff != t->gLen) {
+            uint32_t adoptedHere = 0;
+            for (;;) {
+                while (off + sizeof(TypeBatchHeader) <= uint64_t(size)) {
+                    TypeBatchHeader h;
+                    if (io->read(mf, &h, sizeof(h), off) != int64_t(sizeof(h))) break;
+                    // A15: a batch may open the next arrivals segment.
+                    const bool seal = h.gSeg == t->gSeg + 1 && h.gOff == 0 && h.nArrivals > 0;
+                    if (h.magic != kMagicTypeBatch || h.ver != 1 || h.commitSeq != t->commitSeq + 1 ||
+                        h.batchLen < sizeof(h) + 8 || off + h.batchLen > uint64_t(size) ||
+                        h.incarnation < lastInc || (h.gSeg != t->gSeg && !seal))
                         break;
+                    b.resize(h.batchLen);
+                    if (io->read(mf, b.data(), h.batchLen, off) != int64_t(h.batchLen)) break;
+                    if (crc32c(b.data(), h.batchLen - 8) != getU32(b.data() + h.batchLen - 8)) break;
+                    if (h.flags & kTypeBatchJournaled) {
+                        uint32_t fidv;
+                        std::memcpy(&fidv, t->fid, 4);
+                        if (!journalReplayed(kJrnTypeMeta, fidv, t->mSeg, off)) break;
                     }
-                    FileRef& src = seal ? next : gf;
-                    std::vector<uint8_t> g(size_t(h.nArrivals) * kArrivalBytes);
-                    if (!src.valid() || io->read(src, g.data(), g.size(), h.gOff) != int64_t(g.size()) ||
-                        crc32c(g.data(), g.size()) != h.gCrc) {
-                        io->close(&next);
-                        break;
-                    }
-                    if (seal) {
-                        // The sealed segment's tail was adopted durable
-                        // already; switch to the new one.
-                        if (gf.valid() && adopted && io->sync(gf) < 0) {
-                            io->close(&next);
-                            if (err) *err = "arrivals fsync failed";
-                            return FLATSQL_IO_ERR_IO;
+                    // Arrivals must be durable too: validate them by their CRC.
+                    if (h.nArrivals) {
+                        FileRef next;
+                        if (seal) {
+                            PathBuf np;
+                            pathTypeSeg(&np, cfg_.root.c_str(), t->fid, 'g', h.gSeg, "fsg");
+                            if (io->open(np.c_str(), np.len, kOpenRW, FileClass::Arrivals, &next) != 0) break;
+                        } else if (h.gOff != t->gLen) {
+                            break;
                         }
-                        io->close(&gf);
-                        gf = next;
-                        t->gSeg = h.gSeg;
-                        t->gLen = 0;
-                        sealAdopted = true;
+                        FileRef& src = seal ? next : gf;
+                        std::vector<uint8_t> g(size_t(h.nArrivals) * kArrivalBytes);
+                        if (!src.valid() || io->read(src, g.data(), g.size(), h.gOff) != int64_t(g.size()) ||
+                            crc32c(g.data(), g.size()) != h.gCrc) {
+                            io->close(&next);
+                            break;
+                        }
+                        if (seal) {
+                            // The sealed segment's tail was adopted durable
+                            // already; switch to the new one.
+                            if (gf.valid() && adopted && io->sync(gf) < 0) {
+                                io->close(&next);
+                                if (err) *err = "arrivals fsync failed";
+                                return FLATSQL_IO_ERR_IO;
+                            }
+                            io->close(&gf);
+                            gf = next;
+                            t->gSeg = h.gSeg;
+                            t->gLen = 0;
+                            sealAdopted = true;
+                        }
+                        if (h.gOff == 0) t->gSegFirstGseq = h.firstGseq;
                     }
-                    if (h.gOff == 0) t->gSegFirstGseq = h.firstGseq;
+                    lastInc = h.incarnation;
+                    t->commitSeq = h.commitSeq;
+                    t->incarnation = h.incarnation;
+                    if (h.gseqHi > t->gseqHi) t->gseqHi = h.gseqHi;
+                    t->gLen = h.gOff + uint64_t(h.nArrivals) * kArrivalBytes;
+                    t->arrivalsCount = h.arrivalsCount;
+                    t->firstLiveCount = h.firstLiveCount;
+                    t->firstLiveBytes = h.firstLiveBytes;
+                    for (uint32_t i = 0; i < h.nLabel; i++) {
+                        LabelEntry le;
+                        std::memcpy(&le, b.data() + sizeof(h) + size_t(i) * sizeof(le), sizeof(le));
+                        t->labeled[le.pid] = le.labeledThrough;
+                    }
+                    if (h.flags & 1) {
+                        t->labelCkptOff = off;
+                        t->labelCkptSeg = t->mSeg;
+                        t->haveLabelCkpt = true;
+                    }
+                    if (h.flags & 4) {
+                        // MERGE_DONE: L0 blocks of commits <= mergedThroughCommit
+                        // live in the run named by mergeGen.
+                        uint32_t k = 0;
+                        while (k < t->nL0 && t->l0[k].commitSeq <= h.mergedThroughCommit) k++;
+                        for (uint32_t i = 0; i + k < t->nL0; i++) t->l0[i] = t->l0[i + k];
+                        t->nL0 -= k;
+                        t->manifestGenLoaded = h.mergeGen;
+                        if (h.mergeGen + 1 > t->nextGen) t->nextGen = h.mergeGen + 1;
+                    }
+                    const uint32_t l0Len = h.batchLen - 8 - h.l0Off;
+                    if (l0Len && t->nL0 < kMaxTypeL0Dir) {
+                        TypeL0DirEntry& de = t->l0[t->nL0++];
+                        de.mSeg = t->mSeg;
+                        de.l0Len = l0Len;
+                        de.mOff = off;
+                        de.commitSeq = h.commitSeq;
+                        de.batchLen = h.batchLen;
+                        de.l0Off = h.l0Off;
+                    }
+                    off += h.batchLen;
+                    t->mEnd = off;
+                    adopted++;
+                    adoptedHere++;
                 }
-                lastInc = h.incarnation;
-                t->commitSeq = h.commitSeq;
-                t->incarnation = h.incarnation;
-                if (h.gseqHi > t->gseqHi) t->gseqHi = h.gseqHi;
-                t->gLen = h.gOff + uint64_t(h.nArrivals) * kArrivalBytes;
-                t->arrivalsCount = h.arrivalsCount;
-                t->firstLiveCount = h.firstLiveCount;
-                t->firstLiveBytes = h.firstLiveBytes;
-                for (uint32_t i = 0; i < h.nLabel; i++) {
-                    LabelEntry le;
-                    std::memcpy(&le, b.data() + sizeof(h) + size_t(i) * sizeof(le), sizeof(le));
-                    t->labeled[le.pid] = le.labeledThrough;
+                // T3 (A9): the chain goes on at the start of the next segment
+                // (a rotation cut this one at its last batch).
+                PathBuf np;
+                pathTypeSeg(&np, cfg_.root.c_str(), t->fid, 'm', t->mSeg + 1, "fsl");
+                FileRef nf;
+                if (io->open(np.c_str(), np.len, kOpenRW, FileClass::TypeMeta, &nf) != 0) break;
+                TypeBatchHeader nh;
+                if (io->read(nf, &nh, sizeof(nh), 0) != int64_t(sizeof(nh)) || nh.magic != kMagicTypeBatch ||
+                    nh.commitSeq != t->commitSeq + 1) {
+                    io->close(&nf);
+                    break;
                 }
-                if (h.flags & 1) {
-                    t->labelCkptOff = off;
-                    t->labelCkptSeg = t->mSeg;
+                if (adoptedHere && io->sync(mf) < 0) {
+                    io->close(&nf);
+                    if (err) *err = "type tail fsync failed";
+                    return FLATSQL_IO_ERR_IO;
                 }
-                if (h.flags & 4) {
-                    // MERGE_DONE: L0 blocks of commits <= mergedThroughCommit
-                    // live in the run named by mergeGen.
-                    uint32_t k = 0;
-                    while (k < t->nL0 && t->l0[k].commitSeq <= h.mergedThroughCommit) k++;
-                    for (uint32_t i = 0; i + k < t->nL0; i++) t->l0[i] = t->l0[i + k];
-                    t->nL0 -= k;
-                    t->manifestGenLoaded = h.mergeGen;
-                    if (h.mergeGen + 1 > t->nextGen) t->nextGen = h.mergeGen + 1;
-                }
-                const uint32_t l0Len = h.batchLen - 8 - h.l0Off;
-                if (l0Len && t->nL0 < kMaxTypeL0Dir) {
-                    TypeL0DirEntry& de = t->l0[t->nL0++];
-                    de.mSeg = t->mSeg;
-                    de.l0Len = l0Len;
-                    de.mOff = off;
-                    de.commitSeq = h.commitSeq;
-                    de.batchLen = h.batchLen;
-                    de.l0Off = h.l0Off;
-                }
-                off += h.batchLen;
-                t->mEnd = off;
-                adopted++;
+                io->close(&mf);
+                mf = nf;
+                t->mSeg++;
+                t->mEnd = 0;
+                off = 0;
+                size = io->size(mf);
+                adoptedHere = 0;
             }
+            if (t->nextSeg <= t->mSeg) t->nextSeg = t->mSeg + 1;
             if (adopted) {
                 // A4: make the adopted tail durable before anything is published.
                 if ((gf.valid() && io->sync(gf) < 0) || io->sync(mf) < 0) {
@@ -760,11 +796,10 @@ int32_t Engine::openTypes(std::string* err) {
             if (io->probe(np.c_str(), np.len) == 0) io->unlink(np.c_str(), np.len, true);
         }
         // Type manifest: live catalog runs.
+        std::vector<RetireItem> typeRetired;
         if (t->manifestGenLoaded) {
             PathBuf mfp;
-            char name[32];
-            snprintf(name, sizeof(name), "mf-%06x.fsm", t->manifestGenLoaded);
-            pathType(&mfp, cfg_.root.c_str(), t->fid, name);
+            pathTypeManifest(&mfp, cfg_.root.c_str(), t->fid, t->manifestGenLoaded);
             FileRef f;
             if (io->open(mfp.c_str(), mfp.len, FLATSQL_IO_READ, FileClass::Manifest, &f) == 0) {
                 const int64_t size = io->size(f);
@@ -780,10 +815,19 @@ int32_t Engine::openTypes(std::string* err) {
                             r.fileLen = getU64(man.data() + 16 + size_t(i) * 16 + 8);
                             t->runs.push_back(std::move(r));
                         }
+                        parseTypeRetireSet(man.data(), man.size(), body + 8, &typeRetired);
                     }
+                    t->manifestBytes = uint64_t(size);
                 }
                 io->close(&f);
             }
+        }
+        // T3: runs and manifests the manifest retired, meta segments below
+        // first_live_m_seg, outputs of a merge the crash cut short.
+        rc = typeOpenReclaim(io, cfg_.root.c_str(), t, typeRetired);
+        if (rc < 0) {
+            if (err) *err = "type reclamation failed";
+            return rc;
         }
         const uint64_t floor = t->gseqHi + 1;
         if (floor > gseqNext_.load()) gseqNext_.store(floor);

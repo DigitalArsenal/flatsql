@@ -204,6 +204,19 @@ inline bool sameFile(const RetireItem& a, const RetireItem& b) {
     return a.letter == b.letter && a.seg == b.seg && a.gen == b.gen;
 }
 
+// ---- type logs (T3) ------------------------------------------------------------------
+// A type retires catalog runs 'x' (x-<gen>.fsx) and manifests 'f'
+// (mf-<gen>.fsm) at MERGE_DONE, and sealed meta segments 'm' (m-<seg>.fsl).
+// The manifest a MERGE_DONE names persists the outstanding runs and
+// manifests after its CRC trailer, in an appendix readers that predate it
+// ignore: [u32 magic][u32 n][n x RetireItem][u32 crc][u32 pad]. Open unlinks
+// them; a meta segment below the head's first_live_m_seg is unlinked too.
+constexpr uint32_t kMagicTypeRetire = fourcc('F', 'S', 'T', 'R');
+void typeRetirePath(PathBuf* out, const char* root, const uint8_t fid[4], const RetireItem& it);
+void appendTypeRetireSet(std::vector<uint8_t>* man, const std::vector<RetireItem>& items);
+// `at`: the first byte after the manifest's CRC trailer. False when absent or invalid.
+bool parseTypeRetireSet(const uint8_t* man, size_t len, size_t at, std::vector<RetireItem>* out);
+
 // ---- ctl bodies ---------------------------------------------------------------------
 // INTENT_COMPACT{seg u32, segEnd u32, gen u32, pad u32}: outputs c-<seg>-<gen>.*,
 // x-<seg>-<gen>.fsx and mf-<gen>.fsm; discarded at open unless a SWAP follows.

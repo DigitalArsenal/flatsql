@@ -782,7 +782,10 @@ void Writer::maintenance() {
         }
     }
     maintRr_++;
-    for (TypeOwner* t : types_) typeMergeStep(this, t);
+    for (TypeOwner* t : types_) {
+        typeMergeStep(this, t);
+        typeReclaimStep(this, t);
+    }
     if (id_ == 0) quotaStep(this);  // §13: the planner runs on writer 0
     // Checkpoint heads waiting for a round that is not coming: sync now.
     if (!headSyncs_.empty() && nowNsV - lastCommitNs_ > 2000000ull) flushHeadSyncs();
@@ -1326,6 +1329,7 @@ EngineStats Engine::stats() const {
     s.unlinkedFiles = cUnlinked.load();
     s.unlinkBusy = cUnlinkBusy.load();
     s.metaSegsRetired = cMetaRetired.load();
+    s.catalogEntriesDropped = cCatalogDropped.load();
     s.compactInFlight = cCompactInFlight.load();
     // Engine-accounted committed memory of the writer instance: touched pool
     // slabs, arenas and scratch, descriptors and L1 accelerators.

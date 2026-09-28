@@ -1026,35 +1026,54 @@ int32_t LaneStore::laneTuples(const PartSnap& s, std::vector<LaneTuple>* out) {
 int32_t LaneStore::loadTypeLabels(const uint8_t fid[4], TypeSnap* t) {
     const TypeHeadFixed& h = t->head;
     LabelCache& lc = labelCache_[fidU32(fid)];
-    FileRef f;
-    int32_t rc = io_.get(tk('m', fid, h.labelCkptSeg), &f);
-    if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
+    uint32_t seg;
     uint64_t off;
-    if (lc.ckptOff == h.labelCkptOff && lc.scannedTo && lc.scannedTo <= h.mEnd && lc.commitSeq <= h.commitSeq) {
-        off = lc.scannedTo;  // incremental: only batches after the last scan
+    if (lc.ckptOff == h.labelCkptOff && lc.ckptSeg == h.labelCkptSeg && lc.scannedTo &&
+        lc.scannedSeg <= h.mSeg && (lc.scannedSeg < h.mSeg || lc.scannedTo <= h.mEnd) &&
+        lc.commitSeq <= h.commitSeq) {
+        seg = lc.scannedSeg;  // incremental: only batches after the last scan
+        off = lc.scannedTo;
     } else {
         lc = LabelCache();
         lc.ckptOff = h.labelCkptOff;
+        lc.ckptSeg = h.labelCkptSeg;
+        seg = h.labelCkptSeg;
         off = h.labelCkptOff;
     }
-    const uint64_t end = h.mEnd;
+    if (seg > h.mSeg) return kRsCorrupt;
     std::vector<uint8_t> labels;
     std::unordered_map<uint32_t, uint64_t> map = lc.labels;
-    while (off + sizeof(TypeBatchHeader) <= end) {
-        TypeBatchHeader bh;
-        if (io_.read(f, &bh, sizeof(bh), off) != int64_t(sizeof(bh))) return FLATSQL_IO_ERR_IO;
-        if (bh.magic != kMagicTypeBatch || bh.batchLen < sizeof(bh) + 8 || off + bh.batchLen > end) return kRsCorrupt;
-        labels.resize(size_t(bh.nLabel) * sizeof(LabelEntry));
-        if (bh.nLabel && io_.read(f, labels.data(), labels.size(), off + sizeof(bh)) != int64_t(labels.size()))
-            return FLATSQL_IO_ERR_IO;
-        for (uint32_t i = 0; i < bh.nLabel; i++) {
-            LabelEntry le;
-            std::memcpy(&le, labels.data() + size_t(i) * sizeof(le), sizeof(le));
-            map[le.pid] = le.labeledThrough;
+    // The checkpoint's segment may precede the head's (T3, A9: a rotation
+    // before the next checkpoint); a sealed segment ends at its last batch.
+    for (;; seg++, off = 0) {
+        FileRef f;
+        int32_t rc = io_.get(tk('m', fid, seg), &f);
+        if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
+        uint64_t end = h.mEnd;
+        if (seg < h.mSeg) {
+            const int64_t sz = io_.size(f);
+            if (sz < 0) return int32_t(sz);
+            end = uint64_t(sz);
         }
-        off += bh.batchLen;
+        while (off + sizeof(TypeBatchHeader) <= end) {
+            TypeBatchHeader bh;
+            if (io_.read(f, &bh, sizeof(bh), off) != int64_t(sizeof(bh))) return FLATSQL_IO_ERR_IO;
+            if (bh.magic != kMagicTypeBatch || bh.batchLen < sizeof(bh) + 8 || off + bh.batchLen > end)
+                return kRsCorrupt;
+            labels.resize(size_t(bh.nLabel) * sizeof(LabelEntry));
+            if (bh.nLabel && io_.read(f, labels.data(), labels.size(), off + sizeof(bh)) != int64_t(labels.size()))
+                return FLATSQL_IO_ERR_IO;
+            for (uint32_t i = 0; i < bh.nLabel; i++) {
+                LabelEntry le;
+                std::memcpy(&le, labels.data() + size_t(i) * sizeof(le), sizeof(le));
+                map[le.pid] = le.labeledThrough;
+            }
+            off += bh.batchLen;
+        }
+        if (seg >= h.mSeg) break;
     }
     lc.labels = map;
+    lc.scannedSeg = seg;
     lc.scannedTo = off;
     lc.commitSeq = h.commitSeq;
     t->labeled = std::make_shared<const std::unordered_map<uint32_t, uint64_t>>(std::move(map));
@@ -1110,6 +1129,7 @@ int32_t LaneStore::loadType(const uint8_t fid[4], TypeSnap* out) {
             if (size < 24) return kRsCorrupt;
             std::vector<uint8_t> man(static_cast<size_t>(size));
             if (io_.read(f, man.data(), man.size(), 0) != size) return FLATSQL_IO_ERR_IO;
+            io_.forget(mk);  // cached whole; a retired manifest goes with UNLINK_IF_UNUSED (A12)
             if (getU32(man.data()) != kMagicManifest) return kRsCorrupt;
             const uint32_t n = getU32(man.data() + 4);
             const size_t body = 16 + size_t(n) * 16;

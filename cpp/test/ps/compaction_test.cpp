@@ -683,3 +683,183 @@ PS_TEST(compaction_cat_supersede_plateau_T3_2) {
 PS_SLOW_TEST(compaction_cat_supersede_plateau_T3_2_full) {
     runCatPlateau(int(argInt("objects", 20000)), int(argInt("cycles", 100)));
 }
+
+// ---------------------------------------------------------------------------
+// Type logs (A9, A12, A15): under ingest and kills, with readers running
+// type-level statements the whole time, the catalog runs a merge replaces,
+// the manifests they were named in and the sealed type meta segments are
+// unlinked behind the reader gate, copies killed within a fold leave the
+// catalog, no statement fails or sees a wrong result, and the type directory
+// holds exactly what the head and manifest name (also after a reopen).
+PS_TEST(type_logs_reclaimed_under_readers) {
+    CStore cs("typelogs");
+    Store& s = cs.s;
+    s.cfg.typeMetaSegBytes = 16u << 10;
+    s.cfg.sealBytes = 64u << 10;
+    s.cfg.sealAgeMs = 50;
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const int parts = 3;
+    std::vector<uint32_t> pids;
+    std::vector<std::string> tokens;
+    for (int p = 0; p < parts; p++) {
+        tokens.push_back("tl" + std::to_string(p));
+        pids.push_back(s.partition(tokens.back(), ommType()));
+    }
+    std::vector<std::unique_ptr<Producer>> prods;
+    for (uint32_t pid : pids) prods.emplace_back(new Producer(s.e.get(), pid));
+    const auto attr = buildRecordAttr("tl", "prov", "src", "b1");
+    std::vector<std::vector<std::vector<uint8_t>>> live(parts);  // frames of live records
+    uint64_t live0 = 0;
+    std::mt19937_64 rng(11);
+    int next = 0;
+    // One round: `n` new records per partition, then kills of `killPct`% of
+    // the live ones (by cid), all acked.
+    auto round = [&](int n, int killPct, std::vector<std::vector<uint8_t>>* killed) {
+        for (int p = 0; p < parts; p++) {
+            uint64_t last = 0;
+            for (int i = 0; i < n; i++) {
+                auto f = ommFrame(p, next++, 120);
+                last = send(s.e.get(), *prods[size_t(p)], f, attr, 1780000000000ll + next, false);
+                if (last) live[size_t(p)].push_back(std::move(f));
+            }
+            std::vector<std::vector<uint8_t>> keep;
+            for (auto& f : live[size_t(p)]) {
+                if (int(rng() % 100) >= killPct) {
+                    keep.push_back(std::move(f));
+                    continue;
+                }
+                uint8_t cid[kCidLen];
+                frameCid(f, cid);
+                uint64_t rs = 0;
+                if (prods[size_t(p)]->enqueue(kEntTombCid, 0, 0, cid, nullptr, 0, nullptr, 0, &rs, false) == 0) {
+                    last = rs;
+                    if (killed) killed->push_back(std::move(f));
+                } else {
+                    keep.push_back(std::move(f));
+                }
+            }
+            live[size_t(p)].swap(keep);
+            if (last) REQUIRE(prods[size_t(p)]->waitAcked(last, 60000000000ull) == 0);
+        }
+    };
+    // Keepers (never killed) and victims (killed before any reader starts).
+    std::vector<std::vector<uint8_t>> victims;
+    round(300, 50, &victims);
+    std::vector<std::vector<uint8_t>> keepers;
+    for (auto& v : live) {
+        for (auto& f : v) keepers.push_back(f);
+        v.clear();  // keepers are never killed: out of the churn
+    }
+    live0 = keepers.size();
+    REQUIRE(waitLabeledEngine(s.e.get(), pids, 60000000000ull));
+    REQUIRE(waitTypeVisible(cs.io, s.root, ommType().fid, pids, 60000000000ull));
+    ReaderConfig ic;
+    ic.root = s.root;
+    ic.io = cs.io;
+    ic.cls = LaneClass::Interactive;
+    ic.lanes = 2;
+    Reader rd(ic);
+    REQUIRE(rd.inst);
+    s.e->setReaderGate([](void* ctx) -> uint64_t { return static_cast<ReaderInstance*>(ctx)->oldestActiveStart(); },
+                       rd.inst.get());
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> statements{0}, errors{0}, wrong{0};
+    std::mutex errMu;
+    std::string firstErr;
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 2; t++)
+        readers.emplace_back([&, t] {
+            std::mt19937_64 r2(uint64_t(t) + 5);
+            while (!stop.load()) {
+                const bool wantLive = (r2() & 1) != 0;
+                const auto& pool = wantLive ? keepers : victims;
+                const auto& f = pool[r2() % pool.size()];
+                const Rows c = rd.q("SELECT count(*) FROM OMM WHERE _cid = ?", {Param::text(cidTextOf(f))});
+                statements++;
+                if (c.status != 0 || c.rows.size() != 1) {
+                    errors++;
+                    std::lock_guard<std::mutex> g(errMu);
+                    if (firstErr.empty()) firstErr = c.error + " (" + std::to_string(c.status) + ")";
+                    continue;
+                }
+                if (c.i(0, 0) != (wantLive ? 1 : 0)) wrong++;
+            }
+        });
+    // Churn: merges fold catalog runs, kills leave dead copies to fold out,
+    // the type meta log rotates.
+    const uint64_t t0 = monoNs();
+    int rounds = 0;
+    while (monoNs() - t0 < uint64_t(argInt("seconds", 3)) * 1000000000ull) {
+        round(200, 60, nullptr);
+        rounds++;
+    }
+    REQUIRE(waitLabeledEngine(s.e.get(), pids, 60000000000ull));
+    REQUIRE(waitTypeVisible(cs.io, s.root, ommType().fid, pids, 60000000000ull));
+    uint64_t liveNow = live0;
+    for (const auto& v : live) liveNow += v.size();
+    // Every retired type file goes once the readers stop holding it.
+    stop = true;
+    for (auto& t : readers) t.join();
+    DirCheck tc;
+    for (const uint64_t t1 = monoNs(); monoNs() - t1 < 30000000000ull; sleepNs(20000000)) {
+        tc = checkTypeDir(cs.io, cs.fs(), s.root, ommType().fid);
+        if (tc.ok) break;
+    }
+    if (!tc.ok) std::fprintf(stderr, "  type dir: %s\n", tc.err.c_str());
+    const Rows cnt = rd.q("SELECT first_live_count FROM flatsql_types WHERE type = 'OMM'");
+    s.e->setReaderGate(nullptr, nullptr);
+    const EngineStats st = s.e->stats();
+    Inspector ins(cs.io, s.root);
+    const auto tv = ins.type(ommType().fid);
+    uint64_t runBytes = 0;
+    {
+        PathBuf mp;
+        if (tv.head.manifestGen) {
+            pathTypeManifest(&mp, s.root.c_str(), ommType().fid, tv.head.manifestGen);
+            IoStats ios;
+            IoCtx ctx(cs.io, &ios);
+            FileRef f;
+            if (ctx.open(mp.c_str(), mp.len, FLATSQL_IO_READ, FileClass::Manifest, &f) >= 0) {
+                std::vector<uint8_t> man(size_t(ctx.size(f)));
+                if (ctx.read(f, man.data(), man.size(), 0) == int64_t(man.size()) && man.size() >= 24)
+                    for (uint32_t i = 0; i < getU32(man.data() + 4); i++) runBytes += getU64(man.data() + 24 + i * 16);
+                ctx.close(&f);
+            }
+        }
+    }
+    report("typelogs_rounds", double(rounds), "rounds");
+    report("typelogs_records_sent", double(next), "records");
+    report("typelogs_records_live", double(liveNow), "records");
+    report("typelogs_statements", double(statements.load()), "statements");
+    report("typelogs_catalog_entries_dropped", double(st.catalogEntriesDropped), "entries");
+    report("typelogs_catalog_run_bytes", double(runBytes), "bytes");
+    report("typelogs_catalog_run_bytes_per_live_record", double(runBytes) / double(std::max<uint64_t>(liveNow, 1)),
+           "bytes");
+    report("typelogs_type_dir_bytes", double(tc.bytes), "bytes");
+    report("typelogs_first_live_m_seg", double(tv.head.firstLiveMSeg), "segment");
+    if (!firstErr.empty()) std::fprintf(stderr, "  first error: %s\n", firstErr.c_str());
+    CHECK(tc.ok);
+    CHECK_EQ(errors.load(), uint64_t(0));
+    CHECK_EQ(wrong.load(), uint64_t(0));
+    CHECK(statements.load() > 0);
+    CHECK(cnt.status == 0 && cnt.rows.size() == 1 && uint64_t(cnt.i(0, 0)) == liveNow);
+    CHECK(st.catalogEntriesDropped > 0);
+    CHECK(tv.head.firstLiveMSeg > 0);  // sealed type meta segments were retired
+    // A reopen finds the same files, and the catalog still answers.
+    s.close();
+    REQUIRE(s.open() == 0);
+    const DirCheck tc2 = checkTypeDir(cs.io, cs.fs(), s.root, ommType().fid);
+    if (!tc2.ok) std::fprintf(stderr, "  type dir after reopen: %s\n", tc2.err.c_str());
+    CHECK(tc2.ok);
+    Reader rd2(ic);
+    int wrong2 = 0;
+    for (int i = 0; i < 64; i++) {
+        const bool wantLive = (i & 1) != 0;
+        const auto& pool = wantLive ? keepers : victims;
+        const Rows c = rd2.q("SELECT count(*) FROM OMM WHERE _cid = ?",
+                             {Param::text(cidTextOf(pool[rng() % pool.size()]))});
+        if (c.status != 0 || c.rows.size() != 1 || c.i(0, 0) != (wantLive ? 1 : 0)) wrong2++;
+    }
+    CHECK_EQ(wrong2, 0);
+}

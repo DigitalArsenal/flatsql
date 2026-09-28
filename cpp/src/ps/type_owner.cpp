@@ -64,6 +64,7 @@ bool addPosting(TCtx& c, uint16_t kind, const uint8_t* key, size_t klen, const u
 
 FileRef* typeMHandle(TCtx& c, uint32_t mSeg, FileRef* tmp) {
     if (mSeg == c.t->mSeg && c.t->m.valid()) return &c.t->m;
+    if (mSeg == c.t->mPrevSeg && c.t->mPrev.valid()) return &c.t->mPrev;
     PathBuf path;
     pathTypeSeg(&path, c.w->eng_root(), c.t->fid, 'm', mSeg, "fsl");
     if (c.io->open(path.c_str(), path.len, FLATSQL_IO_READ, FileClass::TypeMeta, tmp) < 0) return nullptr;
@@ -404,6 +405,7 @@ void encodeTypeHead(const TypeOwner* t, uint8_t* slot, uint32_t* used, bool dura
     h.nextGen = t->nextGen;
     h.gSegFirstGseq = t->gSegFirstGseq;
     h.tcsHi = t->commitSeq;
+    h.firstLiveMSeg = t->firstLiveMSeg;
     size_t off = sizeof(h);
     std::memcpy(slot + off, t->l0, sizeof(TypeL0DirEntry) * t->nL0);
     off += sizeof(TypeL0DirEntry) * t->nL0;
@@ -749,8 +751,8 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
     for (uint32_t i = 0; i < sc->nEntries; i++) sc->order[i] = &sc->entries[i];
     sortStaged(sc->order, sc->nEntries);
     const size_t l0Len = sc->nEntries ? l0BlockSize(sc->order, sc->nEntries) : 0;
-    const bool full = nParts > kMaxInlineLabels &&
-                      (t->labelCkptOff == 0 || t->metaSinceCkpt >= e->config().ckptMetaBytes);
+    const bool full = nParts > kMaxInlineLabels && (!t->haveLabelCkpt || t->forceFullLabels ||
+                                                    t->metaSinceCkpt >= e->config().ckptMetaBytes);
     const uint32_t nLabelEntries = full ? nParts : st->nLabels;
     const size_t labelsLen = size_t(nLabelEntries) * sizeof(LabelEntry);
     const size_t batchLen = sizeof(TypeBatchHeader) + labelsLen + l0Len + 8;
@@ -842,20 +844,37 @@ void typePublish(Writer* w, TypeOwner* t, StagedType* st) {
         t->labelCkptOff = st->mOff;
         t->labelCkptSeg = st->mSeg;
         t->metaSinceCkpt = 0;
+        t->haveLabelCkpt = true;
+        t->forceFullLabels = false;
     }
     for (uint32_t i = 0; i < st->nLabels; i++)
         st->labels[i].p->labeledThrough.store(st->labels[i].through, std::memory_order_release);
     if (st->mergeDone) {
         // MERGE_DONE durable: the run replaces the merged L0 blocks and the
-        // folded runs.
+        // folded runs; they and the previous manifest are retired (A12).
+        const int saved = tHotPathDepth;
+        tHotPathDepth = 0;  // once per merge
+        const uint64_t nowNs = monoNs();
+        auto retire = [&](char letter, uint32_t gen, uint64_t size) {
+            RetiredFile r;
+            r.it = retireItem(letter, 0, gen, size);
+            r.retireNs = nowNs;
+            t->retired.push_back(r);
+            e->cRetired.fetch_add(1, std::memory_order_relaxed);
+        };
+        if (t->manifestGenLoaded) retire('f', t->manifestGenLoaded, t->manifestBytes);
         for (uint32_t i = 0; i < t->mergeFold && !t->runs.empty(); i++) {
+            retire('x', t->runs.back().gen, t->runs.back().fileLen);
             w->io().close(&t->runs.back().file);
             t->runs.pop_back();
         }
+        tHotPathDepth = saved;
         t->runs.push_back(std::move(t->mergeRun));
         t->mergeRun = SegRun();
         w->io().close(&t->mergeMf);
         t->manifestGenLoaded = t->mergeGen;
+        t->manifestBytes = t->mergeManifestBytes;
+        e->cCatalogDropped.fetch_add(t->mergeDropped.load(std::memory_order_relaxed), std::memory_order_relaxed);
         const uint32_t k = t->mergeK;
         const uint32_t remaining = t->nL0 - k;
         for (uint32_t i = 0; i < remaining; i++) {
@@ -939,6 +958,62 @@ void typeRollback(Writer* w, TypeOwner* t, StagedType* st) {
 // first phase and MERGE_DONE rides that round's type batch. Outputs are named
 // by the generation counter (never reused once a head records it).
 namespace {
+// T3 (A15): copies killed within a merge's inputs leave the catalog. A copy
+// never leaves DEAD, and its first posting (FIRST or REPEAT) precedes all
+// its others: with that posting among the inputs no older run holds any of
+// them, so its CID, LABEL and REPEAT entries all go. GONE and REHOME are
+// keyed by gseq for arrivals order and stay.
+struct DeadCopies {
+    std::vector<std::pair<uint32_t, uint64_t>> dead;  // (pid, pseq), sorted
+    std::vector<uint8_t> labeled;                     // a FIRST/REPEAT posting is among the inputs
+    uint64_t dropped = 0;
+    size_t find(uint32_t pid, uint64_t pseq) const {
+        const auto key = std::make_pair(pid, pseq);
+        const auto it = std::lower_bound(dead.begin(), dead.end(), key);
+        return it != dead.end() && *it == key ? size_t(it - dead.begin()) : SIZE_MAX;
+    }
+};
+
+bool collectDead(void* ctx, uint16_t, const uint8_t*, uint16_t, const uint8_t* v, uint8_t) {
+    if (v[20] == kLabelDead) static_cast<DeadCopies*>(ctx)->dead.emplace_back(getBE32(v), getBE64(v + 4));
+    return true;
+}
+
+bool markLabeled(void* ctx, uint16_t, const uint8_t*, uint16_t, const uint8_t* v, uint8_t) {
+    auto* d = static_cast<DeadCopies*>(ctx);
+    if (v[20] != kLabelFirst && v[20] != kLabelRepeat) return true;
+    const size_t i = d->find(getBE32(v), getBE64(v + 4));
+    if (i != SIZE_MAX) d->labeled[i] = 1;
+    return true;
+}
+
+bool keepLiveCopies(void* ctx, uint16_t kind, const uint8_t* k, uint16_t klen, const uint8_t* v, uint8_t) {
+    auto* d = static_cast<DeadCopies*>(ctx);
+    size_t i = SIZE_MAX;
+    if (kind == kIxTypeCid) i = d->find(getBE32(v), getBE64(v + 4));
+    else if ((kind == kIxTypeLabel || kind == kIxTypeRepeat) && klen == 12) i = d->find(getBE32(k), getBE64(k + 4));
+    if (i == SIZE_MAX) return true;
+    d->dropped++;
+    return false;
+}
+
+int32_t deadCopies(IoCtx* io, const std::vector<MergeL0Input>& l0s, const std::vector<MergeRunInput>& runs,
+                   bool full, DeadCopies* d) {
+    int32_t rc = scanKind(io, kIxTypeCid, l0s, runs, collectDead, d);
+    if (rc < 0 || d->dead.empty()) return rc;
+    std::sort(d->dead.begin(), d->dead.end());
+    d->dead.erase(std::unique(d->dead.begin(), d->dead.end()), d->dead.end());
+    if (full) return 0;  // every posting is among the inputs
+    d->labeled.assign(d->dead.size(), 0);
+    rc = scanKind(io, kIxTypeCid, l0s, runs, markLabeled, d);
+    if (rc < 0) return rc;
+    size_t n = 0;
+    for (size_t i = 0; i < d->dead.size(); i++)
+        if (d->labeled[i]) d->dead[n++] = d->dead[i];
+    d->dead.resize(n);
+    return 0;
+}
+
 // Builds a planned catalog merge's run and manifest (no sync). Reads only the
 // plan and immutable files: may run on a helper thread.
 int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t) {
@@ -973,9 +1048,14 @@ int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t) {
     if (rc < 0) return rc;
     std::vector<MergeL0Input> l0s;
     for (uint32_t i = 0; i < k; i++) l0s.push_back({blocks[i].data(), blocks[i].size()});
+    DeadCopies dead;
+    rc = deadCopies(io, l0s, t->mergeFoldRuns, t->mergeKeepRuns.empty(), &dead);
+    if (rc < 0) return rc;
     uint64_t nEntries = 0;
     const int64_t xLen = mergeToL1(io, run.file, 0, gen, uint16_t(t->mergeFold ? 1 : 0), t->mergeBatches[0].commitSeq,
-                                   t->mergeBatches[k - 1].commitSeq, l0s, t->mergeFoldRuns, &nEntries);
+                                   t->mergeBatches[k - 1].commitSeq, l0s, t->mergeFoldRuns, &nEntries,
+                                   dead.dead.empty() ? nullptr : keepLiveCopies, &dead);
+    t->mergeDropped.store(dead.dropped, std::memory_order_relaxed);
     if (xLen < 0) return int32_t(xLen);
     run.fileLen = uint64_t(xLen);
     std::vector<uint8_t> man(16);
@@ -995,10 +1075,12 @@ int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t) {
     const size_t at = man.size();
     man.resize(at + 8, 0);
     putU32(man.data() + at, crc32c(man.data(), at));
+    // T3: the runs and manifests this one replaces, and those still waiting
+    // for readers (open unlinks them after a crash).
+    appendTypeRetireSet(&man, t->mergeRetire);
+    t->mergeManifestBytes = man.size();
     PathBuf mp;
-    char name[32];
-    snprintf(name, sizeof(name), "mf-%06x.fsm", gen);
-    pathType(&mp, root, t->fid, name);
+    pathTypeManifest(&mp, root, t->fid, gen);
     rc = io->open(mp.c_str(), mp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
                   FileClass::Manifest, &t->mergeMf);
     if (rc >= 0) rc = io->write(t->mergeMf, man.data(), man.size(), 0);
@@ -1043,6 +1125,21 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
             w->io().close(&t->mergeMf);
             t->mergeRun = SegRun();
             t->mergePhase = 0;
+            // T3: outputs nothing ever named go now (NOSPACE retries leave
+            // no debris behind). One that cannot go yet is retired: the next
+            // manifest persists it until it does.
+            for (const char letter : {'x', 'f'}) {
+                const RetireItem it = retireItem(letter, 0, t->mergeGen, 0);
+                PathBuf op;
+                typeRetirePath(&op, w->eng_root(), t->fid, it);
+                const int32_t urc = w->io().unlink(op.c_str(), op.len, true);
+                if (urc < 0 && urc != FLATSQL_IO_ERR_NOENT) {
+                    RetiredFile r;
+                    r.it = it;
+                    r.retireNs = monoNs();
+                    t->retired.push_back(r);
+                }
+            }
             return res;
         }
         t->mergePhase = 1;
@@ -1087,6 +1184,14 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
         if (i + t->mergeFold >= t->runs.size()) t->mergeFoldRuns.push_back({t->runs[i].run.get(), t->runs[i].file});
         else t->mergeKeepRuns.push_back({t->runs[i].gen, t->runs[i].fileLen});
     }
+    // T3: the set the new manifest persists: what still waits for readers,
+    // the manifest it replaces and the runs it folds.
+    t->mergeRetire.clear();
+    for (const auto& r : t->retired)
+        if (r.it.letter == 'x' || r.it.letter == 'f') t->mergeRetire.push_back(r.it);
+    if (t->manifestGenLoaded) t->mergeRetire.push_back(retireItem('f', 0, t->manifestGenLoaded, t->manifestBytes));
+    for (size_t i = t->runs.size() - t->mergeFold; i < t->runs.size(); i++)
+        t->mergeRetire.push_back(retireItem('x', 0, t->runs[i].gen, t->runs[i].fileLen));
     t->runs.reserve(t->runs.size() + 1);
     t->mergeRun = SegRun();
     t->mergeResult.store(0, std::memory_order_release);

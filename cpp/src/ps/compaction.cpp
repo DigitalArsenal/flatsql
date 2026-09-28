@@ -259,6 +259,37 @@ void retirePath(PathBuf* out, const char* root, uint32_t pid, const RetireItem& 
     }
 }
 
+void typeRetirePath(PathBuf* out, const char* root, const uint8_t fid[4], const RetireItem& it) {
+    switch (it.letter) {
+        case 'm': pathTypeSeg(out, root, fid, 'm', it.seg, "fsl"); break;
+        case 'x': pathTypeRun(out, root, fid, it.gen); break;
+        case 'f': pathTypeManifest(out, root, fid, it.gen); break;
+        default: out->buf[0] = 0; out->len = 0; break;
+    }
+}
+
+void appendTypeRetireSet(std::vector<uint8_t>* man, const std::vector<RetireItem>& items) {
+    const size_t at = man->size();
+    const size_t body = 8 + items.size() * sizeof(RetireItem);
+    man->resize(at + body + 8, 0);
+    uint8_t* b = man->data() + at;
+    putU32(b, kMagicTypeRetire);
+    putU32(b + 4, uint32_t(items.size()));
+    if (!items.empty()) std::memcpy(b + 8, items.data(), items.size() * sizeof(RetireItem));
+    putU32(b + body, crc32c(b, body));
+}
+
+bool parseTypeRetireSet(const uint8_t* man, size_t len, size_t at, std::vector<RetireItem>* out) {
+    out->clear();
+    if (at + 16 > len || getU32(man + at) != kMagicTypeRetire) return false;
+    const uint32_t n = getU32(man + at + 4);
+    const size_t body = 8 + size_t(n) * sizeof(RetireItem);
+    if (n > (1u << 20) || at + body + 8 > len || crc32c(man + at, body) != getU32(man + at + body)) return false;
+    out->resize(n);
+    if (n) std::memcpy(out->data(), man + at + 8, size_t(n) * sizeof(RetireItem));
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Partition state <-> manifest
 // ---------------------------------------------------------------------------
@@ -399,7 +430,6 @@ namespace {
 
 constexpr int32_t kOpenRW = FLATSQL_IO_READ | FLATSQL_IO_WRITE;
 constexpr int32_t kCompactNotOwner = -1001;
-constexpr int32_t kCompactAborted = -1002;
 constexpr int32_t kCompactNotWorth = -1003;
 
 bool planOwns(const CompactPlan& c) {

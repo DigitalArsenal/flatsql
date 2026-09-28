@@ -356,7 +356,8 @@ struct TypeHeadFixed {
     uint64_t mergedThroughCommit;
     uint64_t gSegFirstGseq;
     uint64_t tcsHi;        // highest type commit sequence (== commitSeq)
-    uint64_t reserved;
+    uint32_t firstLiveMSeg; // T3 (A9): type meta segments below this are retired
+    uint32_t reserved;
 };
 static_assert(sizeof(TypeHeadFixed) == 160, "TypeHeadFixed layout");
 
@@ -581,6 +582,7 @@ void pathType(PathBuf* out, const char* root, const uint8_t fid[4], const char* 
 void pathTypeSeg(PathBuf* out, const char* root, const uint8_t fid[4], char letter,
                  uint32_t seg, const char* ext);
 void pathTypeRun(PathBuf* out, const char* root, const uint8_t fid[4], uint32_t gen);
+void pathTypeManifest(PathBuf* out, const char* root, const uint8_t fid[4], uint32_t gen);
 void pathTypeConfig(PathBuf* out, const char* root, const uint8_t fid[4], uint64_t fp);
 // A8 commit journal of writer w, file 0 (a) or 1 (b).
 void pathJournal(PathBuf* out, const char* root, uint32_t writer, int file);

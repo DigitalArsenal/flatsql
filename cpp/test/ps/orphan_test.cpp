@@ -68,6 +68,9 @@ struct OrphanHarness {
         s.cfg.poolBytes = 48ull << 20;
         s.cfg.commitJournal = (seed & 8) != 0;
         s.cfg.journalCkptMs = 10;
+        // The type meta log rotates often: its segments retire and unlink
+        // with the catalog runs and manifests merges replace.
+        s.cfg.typeMetaSegBytes = (seed & 16) ? (8u << 10) : (32u << 10);
     }
 
     bool setup() {
@@ -217,6 +220,70 @@ struct OrphanHarness {
             p.recs.swap(keep);
             p.ackedTo = 0;
         }
+        // Type logs: the head's segments, the manifest's runs, nothing else.
+        const DirCheck tc = checkTypeDir(s.fs.get(), s.fs.get(), s.root, ommType().fid);
+        if (!tc.ok) {
+            std::fprintf(stderr, "  [%s] type files: %s\n", phase, tc.err.c_str());
+            {
+                Inspector ti(s.fs.get(), s.root);
+                const auto tv = ti.type(ommType().fid);
+                std::fprintf(stderr, "    head manifestGen %x nextGen %x mSeg %u firstLiveMSeg %u commitSeq %llu\n",
+                             tv.head.manifestGen, tv.head.nextGen, tv.head.mSeg, tv.head.firstLiveMSeg,
+                             (unsigned long long)tv.head.commitSeq);
+                for (const std::string& path : s.fs->list(s.root + "/fsql2/t/"))
+                    std::fprintf(stderr, "    %s\n", path.c_str());
+            }
+            gFailures++;
+        }
+        return gFailures == before;
+    }
+
+    // Type level, once labels caught up: the catalog agrees with the files
+    // (every cid is unique, so first_live_count is the number of live
+    // records), and a sample of cids looked up through the catalog is found
+    // exactly when live.
+    bool typeVerify(const char* phase) {
+        const int before = gFailures;
+        std::vector<uint32_t> pids;
+        uint64_t live = 0;
+        std::vector<const Rec*> liveRecs, deadRecs;
+        for (auto& p : parts) {
+            pids.push_back(p.pid);
+            for (const Rec& r : p.recs) {
+                if (r.known && r.live) {
+                    live++;
+                    liveRecs.push_back(&r);
+                } else if (r.known) {
+                    deadRecs.push_back(&r);
+                }
+            }
+        }
+        if (!waitLabeledEngine(s.e.get(), pids, 60000000000ull) ||
+            !waitTypeVisible(s.fs.get(), s.root, ommType().fid, pids, 60000000000ull)) {
+            std::fprintf(stderr, "  [%s] labels did not catch up\n", phase);
+            gFailures++;
+            return false;
+        }
+        Reader rd(s, LaneClass::Interactive, 1);
+        const Rows t = rd.q("SELECT first_live_count FROM flatsql_types WHERE type = 'OMM'");
+        if (t.status != 0 || t.rows.size() != 1 || uint64_t(t.i(0, 0)) != live) {
+            std::fprintf(stderr, "  [%s] first_live_count %lld, %llu live records\n", phase,
+                         t.rows.empty() ? -1ll : (long long)t.i(0, 0), (unsigned long long)live);
+            gFailures++;
+        }
+        int wrong = 0;
+        for (int i = 0; i < 16; i++) {
+            const bool wantLive = (i & 1) == 0;
+            const auto& pool = wantLive ? liveRecs : deadRecs;
+            if (pool.empty()) continue;
+            const Rec* r = pool[rng() % pool.size()];
+            const Rows c = rd.q("SELECT count(*) FROM OMM WHERE _cid = ?", {Param::text(cidTextOf(r->frame))});
+            if (c.status != 0 || c.rows.size() != 1 || c.i(0, 0) != (wantLive ? 1 : 0)) wrong++;
+        }
+        if (wrong) {
+            std::fprintf(stderr, "  [%s] %d catalog lookups wrong\n", phase, wrong);
+            gFailures++;
+        }
         return gFailures == before;
     }
 };
@@ -224,7 +291,7 @@ struct OrphanHarness {
 void runOrphanTrials(int wantDuring, int maxTrials, uint64_t seed0) {
     int trials = 0, during = 0, inGrace = 0;
     std::map<int, int> modes;
-    uint64_t compactions = 0, unlinked = 0, metaRetired = 0;
+    uint64_t compactions = 0, unlinked = 0, metaRetired = 0, catalogDropped = 0;
     uint64_t seed = seed0;
     while ((during < wantDuring) && trials < maxTrials) {
         OrphanHarness h(seed++);
@@ -242,6 +309,7 @@ void runOrphanTrials(int wantDuring, int maxTrials, uint64_t seed0) {
             compactions += st.compactions;
             unlinked += st.unlinkedFiles;
             metaRetired += st.metaSegsRetired;
+            catalogDropped += st.catalogEntriesDropped;
             const auto mode = FaultFs::CrashMode(h.rng() % FaultFs::kModeCount);
             modes[mode]++;
             h.crash(mode);
@@ -254,6 +322,11 @@ void runOrphanTrials(int wantDuring, int maxTrials, uint64_t seed0) {
                 return;
             }
             h.s.e->start();
+            if (!h.typeVerify("crash")) {
+                std::fprintf(stderr, "  trial %d (seed %llu) failed at type level\n", trials,
+                             (unsigned long long)(seed - 1));
+                return;
+            }
         }
         h.s.close();
     }
@@ -263,6 +336,7 @@ void runOrphanTrials(int wantDuring, int maxTrials, uint64_t seed0) {
     report("orphan_compactions_applied", double(compactions), "compactions");
     report("orphan_files_unlinked", double(unlinked), "files");
     report("orphan_meta_segments_retired", double(metaRetired), "segments");
+    report("orphan_catalog_entries_dropped", double(catalogDropped), "entries");
     const char* names[] = {"drop_all", "drop_subset", "tear_last_512", "reorder", "kill9_keep_all"};
     for (const auto& kv : modes) {
         char key[64];

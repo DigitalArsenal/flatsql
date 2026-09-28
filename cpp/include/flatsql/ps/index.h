@@ -257,6 +257,10 @@ struct MergeRunInput {
 // Keeps an entry in the output (compaction drops the postings of removed rows).
 using PostingFilter = bool (*)(void* ctx, uint16_t kind, const uint8_t* key, uint16_t klen, const uint8_t* val,
                                uint8_t vlen);
+// Visits every entry of one kind in the inputs, input by input (T3: the
+// type merge's dead-copy pass; the visitor's result is ignored).
+int32_t scanKind(IoCtx* io, uint16_t kind, const std::vector<MergeL0Input>& l0s,
+                 const std::vector<MergeRunInput>& runs, PostingFilter visit, void* ctx);
 // Returns the new file length (< 0 on error); *entries receives the count.
 int64_t mergeToL1(IoCtx* io, FileRef out, uint32_t seg, uint32_t gen, uint16_t level, uint64_t first,
                   uint64_t last, const std::vector<MergeL0Input>& l0s, const std::vector<MergeRunInput>& runs,

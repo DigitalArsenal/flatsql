@@ -108,6 +108,7 @@ struct EngineConfig {
     uint64_t reclaimGraceMs = 60000;       // A12: two reader-gate checks this far apart
     uint32_t reclaimBatch = 64;            // unlinks per maintenance step
     bool retireMeta = true;                // A9: retire merged sealed m-<seg>
+    uint64_t typeMetaSegBytes = 64ull << 20;   // a type's meta log starts a new segment past this
     uint64_t quotaBytes = 0;               // §13: cap on the store's on-disk bytes (0: none)
     double quotaLowWater = 0.85;           // §22.4-3: evict down to this share of the cap
     uint32_t quotaIntervalMs = 100;        // planner cadence
@@ -389,6 +390,7 @@ struct RetiredFile {
     RetireItem it{};
     uint64_t retireNs = 0;    // when the batch naming it became durable
     uint64_t firstOkNs = 0;   // first passing reader-gate check (A12: a second one a grace later)
+    uint64_t retryNs = 0;     // BUSY: not tried again before this
 };
 
 struct PendingKill {
@@ -557,6 +559,8 @@ struct TypeOwner {
     uint64_t mergeThroughCommit = 0;
     SegRun mergeRun;
     FileRef mergeMf;
+    uint64_t mergeManifestBytes = 0;
+    std::atomic<uint64_t> mergeDropped{0};  // catalog entries the built run left out
     std::unordered_map<uint32_t, uint64_t> labeled;  // pid -> labeled_through
     bool warm = false;
     FileRef h, m, g;
@@ -591,6 +595,19 @@ struct TypeOwner {
     std::vector<Delete> deletes;
 
     StagedType* st = nullptr;
+
+    // T3 reclamation of the type logs (A12, A9): catalog runs and manifests a
+    // MERGE_DONE replaced and sealed meta segments nothing reads any more,
+    // unlinked behind the reader gate. The runs and manifests are persisted
+    // in the appendix of the manifest that replaced them.
+    std::vector<RetiredFile> retired;
+    std::vector<RetireItem> mergeRetire;  // plan: the set the new manifest persists
+    uint64_t manifestBytes = 0;           // mf-<manifestGenLoaded>.fsm on disk
+    uint32_t firstLiveMSeg = 0;           // m-<seg> below are retired (head field)
+    FileRef mPrev;                        // read handle on the previous m segment
+    uint32_t mPrevSeg = UINT32_MAX;
+    bool haveLabelCkpt = false;           // a FULL_LABELS batch is durable (A10)
+    bool forceFullLabels = false;         // the first batch of a new m segment checkpoints labels
 };
 
 // ---- writer mailbox --------------------------------------------------------------
@@ -835,6 +852,7 @@ struct EngineStats {
     uint64_t unlinkedFiles = 0;
     uint64_t unlinkBusy = 0;
     uint64_t metaSegsRetired = 0;
+    uint64_t catalogEntriesDropped = 0;  // T3 (A15): dead copies' CID/LABEL/REPEAT entries folded out
     uint64_t compactInFlight = 0;  // planned, not yet applied or aborted
     uint64_t diskBytes = 0;        // sum over partitions (published values)
 };
@@ -939,7 +957,7 @@ public:
         cSeals{0}, cTypeCommits{0}, cFirst{0}, cRepeat{0}, cPromotions{0}, cMergeNotOwner{0},
         cHelperStalls{0}, cHelperJobs{0}, cHandoffHelperWaits{0};
     std::atomic<uint64_t> cCompactions{0}, cCompactAborts{0}, cCompactBytesIn{0}, cCompactBytesOut{0},
-        cRetired{0}, cUnlinked{0}, cUnlinkBusy{0}, cMetaRetired{0}, cCompactInFlight{0};
+        cRetired{0}, cUnlinked{0}, cUnlinkBusy{0}, cMetaRetired{0}, cCompactInFlight{0}, cCatalogDropped{0};
     uint64_t framesParsedAtOpen = 0;
     uint64_t adoptedBatches = 0;
     uint64_t journalReplayRecords = 0;

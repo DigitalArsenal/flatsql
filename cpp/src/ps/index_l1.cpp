@@ -291,6 +291,36 @@ struct Cursor {
 };
 }  // namespace
 
+int32_t scanKind(IoCtx* io, uint16_t kind, const std::vector<MergeL0Input>& l0s,
+                 const std::vector<MergeRunInput>& runs, PostingFilter visit, void* ctx) {
+    for (const auto& in : l0s) {
+        L0KindInfo ki[64];
+        size_t nk = 0;
+        if (!parseL0Block(in.block, in.len, ki, 64, &nk)) return FLATSQL_IO_ERR_IO;
+        for (size_t j = 0; j < nk; j++) {
+            if (ki[j].kind != kind) continue;
+            Cursor c;
+            c.it.p = in.block + ki[j].entriesOff;
+            c.it.end = c.it.p + ki[j].entriesBytes;
+            c.it.vlen = ki[j].vlen;
+            c.vlen = ki[j].vlen;
+            while (c.advance(io)) visit(ctx, kind, c.key, c.klen, c.val, c.vlen);
+        }
+    }
+    for (const auto& r : runs) {
+        if (!r.run->hasKind(kind)) continue;
+        Cursor c;
+        c.run = r.run;
+        c.file = r.file;
+        c.fences = r.run->fences(kind);
+        c.vlen = r.run->kindVlen(kind);
+        c.it.p = c.it.end = nullptr;
+        while (c.advance(io)) visit(ctx, kind, c.key, c.klen, c.val, c.vlen);
+        if (c.err) return c.err;
+    }
+    return 0;
+}
+
 int64_t mergeToL1(IoCtx* io, FileRef out, uint32_t seg, uint32_t gen, uint16_t level, uint64_t first,
                   uint64_t last, const std::vector<MergeL0Input>& l0s, const std::vector<MergeRunInput>& runs,
                   uint64_t* entries, PostingFilter filter, void* filterCtx) {

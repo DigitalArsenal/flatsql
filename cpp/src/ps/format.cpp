@@ -195,6 +195,11 @@ void pathTypeRun(PathBuf* out, const char* root, const uint8_t fid[4], uint32_t 
     fidHex(fid, hex);
     finish(out, snprintf(out->buf, sizeof(out->buf), "%s/fsql2/t/%s/x-%06x.fsx", root, hex, gen));
 }
+void pathTypeManifest(PathBuf* out, const char* root, const uint8_t fid[4], uint32_t gen) {
+    char hex[9];
+    fidHex(fid, hex);
+    finish(out, snprintf(out->buf, sizeof(out->buf), "%s/fsql2/t/%s/mf-%06x.fsm", root, hex, gen));
+}
 void pathTypeConfig(PathBuf* out, const char* root, const uint8_t fid[4], uint64_t fp) {
     char hex[9];
     fidHex(fid, hex);

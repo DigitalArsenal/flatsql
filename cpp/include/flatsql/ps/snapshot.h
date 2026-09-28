@@ -583,6 +583,8 @@ private:
     // Label maps of types with > 128 partitions: (fid) -> (commitSeq, labels).
     struct LabelCache {
         uint64_t ckptOff = 0;
+        uint32_t ckptSeg = 0;
+        uint32_t scannedSeg = 0;  // T3: the type meta log is segmented (A9)
         uint64_t scannedTo = 0;
         uint64_t commitSeq = 0;
         std::unordered_map<uint32_t, uint64_t> labels;

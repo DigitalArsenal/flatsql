@@ -33,6 +33,8 @@ namespace ps {
 // Ledger
 // ---------------------------------------------------------------------------
 namespace {
+constexpr uint64_t kBusyRetryNs = 50000000ull;  // 50 ms
+
 bool ledgerMatch(const RetireItem& a, char letter, uint32_t seg, uint32_t gen) {
     if (a.letter != uint8_t(letter)) return false;
     if (letter == 'f') return a.gen == gen;
@@ -193,6 +195,10 @@ int32_t partitionReclaimStep(Writer* w, Partition* p) {
     int32_t out = 0;
     while (i < p->retired.size() && done < cfg.reclaimBatch) {
         RetiredFile& r = p->retired[i];
+        if (now < r.retryNs) {
+            i++;
+            continue;
+        }
         const bool forced = valve && p->retired.size() - i > 2048 && now - r.retireNs >= grace;
         if (!forced) {
             if (gate <= r.retireNs) break;  // FIFO: later items retired later
@@ -212,8 +218,10 @@ int32_t partitionReclaimStep(Writer* w, Partition* p) {
         const int32_t rc = path.len ? w->io().unlink(path.c_str(), path.len, true) : 0;
         if (rc == FLATSQL_IO_ERR_BUSY) {
             // A handle is open somewhere (an idle reader closes its own within
-            // seconds): later items go ahead of it.
+            // seconds, the type owner its partition meta handles within 100
+            // ms): later items go ahead of it, and it waits a little.
             e->cUnlinkBusy.fetch_add(1, std::memory_order_relaxed);
+            r.retryNs = now + kBusyRetryNs;
             i++;
             continue;
         }
@@ -260,6 +268,205 @@ int32_t partitionRetireMetaStep(Writer* w, Partition* p) {
     e->cMetaRetired.fetch_add(1, std::memory_order_relaxed);
     w->ring();
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Type logs (T3): meta segments (A9), catalog runs and manifests (A12)
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int32_t kTypeOpenRW = FLATSQL_IO_READ | FLATSQL_IO_WRITE;
+
+int64_t fileSize(IoCtx* io, const PathBuf& path) {
+    FileRef f;
+    if (io->open(path.c_str(), path.len, FLATSQL_IO_READ, FileClass::TypeMeta, &f) < 0) return -1;
+    const int64_t n = io->size(f);
+    io->close(&f);
+    return n;
+}
+
+// Both head slots are rewritten and synced: no head open could pick names
+// what is being retired.
+int32_t typeTwoDurableHeads(Writer* w, TypeOwner* t) {
+    for (int i = 0; i < 2; i++) {
+        int32_t rc = typeWriteHead(w, t, true);
+        if (rc >= 0) rc = w->io().sync(t->h);
+        if (rc < 0) return rc;
+    }
+    t->lastCkptNs = monoNs();
+    return 0;
+}
+
+// The type meta log starts a new segment past typeMetaSegBytes. The sealed
+// one is cut at the end of its last batch first: open follows the chain from
+// a segment's end into the next one, and a rolled-back batch left past the
+// end must never pass for the chain's continuation.
+int32_t typeRotateMeta(Writer* w, TypeOwner* t) {
+    int32_t rc = typeWarm(w, t);
+    if (rc < 0) return rc;
+    rc = w->io().truncate(t->m, t->mEnd);
+    if (rc >= 0) rc = w->io().sync(t->m);
+    if (rc < 0) return rc;
+    PathBuf np;
+    pathTypeSeg(&np, w->eng_root(), t->fid, 'm', t->mSeg + 1, "fsl");
+    FileRef nm;
+    rc = w->io().open(np.c_str(), np.len,
+                      kTypeOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
+                      FileClass::TypeMeta, &nm);
+    if (rc < 0) return rc;
+    w->io().close(&t->mPrev);
+    t->mPrev = t->m;  // unmerged L0 blocks are read from it until merged
+    t->mPrevSeg = t->mSeg;
+    t->m = nm;
+    t->mExtent = 0;
+    t->mSeg++;
+    t->mEnd = 0;
+    if (t->nextSeg <= t->mSeg) t->nextSeg = t->mSeg + 1;
+    // A10: the new segment's first batch checkpoints the labels (with more
+    // than 128 partitions), so the old one stops being read for them.
+    t->forceFullLabels = true;
+    // A durable head names the new segment (open finds it by the chain
+    // anyway; the head is what lets the old segment go).
+    rc = typeWriteHead(w, t, true);
+    if (rc >= 0) rc = w->io().sync(t->h);
+    if (rc >= 0) t->lastCkptNs = monoNs();
+    return rc < 0 ? rc : 1;
+}
+
+// A9 for types: the oldest sealed meta segment goes once no unmerged L0
+// block and no label checkpoint lives in it.
+int32_t typeRetireMeta(Writer* w, TypeOwner* t) {
+    Engine* e = w->engine();
+    if (t->firstLiveMSeg >= t->mSeg) return 0;
+    const uint32_t s = t->firstLiveMSeg;
+    for (uint32_t i = 0; i < t->nL0; i++)
+        if (t->l0[i].mSeg <= s) return 0;
+    if (t->mergePhase != 0)
+        for (const auto& de : t->mergeBatches)
+            if (de.mSeg <= s) return 0;
+    if (t->haveLabelCkpt && t->labelCkptSeg <= s) return 0;
+    t->firstLiveMSeg = s + 1;
+    const int32_t rc = typeTwoDurableHeads(w, t);
+    if (rc < 0) {
+        t->firstLiveMSeg = s;
+        return rc;
+    }
+    int64_t size = -1;
+    if (t->mPrevSeg == s) {
+        size = w->io().size(t->mPrev);
+        w->io().close(&t->mPrev);
+        t->mPrevSeg = UINT32_MAX;
+    } else {
+        PathBuf mp;
+        pathTypeSeg(&mp, w->eng_root(), t->fid, 'm', s, "fsl");
+        size = fileSize(&w->io(), mp);
+    }
+    RetiredFile r;
+    r.it = retireItem('m', s, 0, size > 0 ? uint64_t(size) : 0);
+    r.retireNs = monoNs();
+    t->retired.push_back(r);
+    e->cRetired.fetch_add(1, std::memory_order_relaxed);
+    e->cMetaRetired.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+}  // namespace
+
+int32_t typeReclaimStep(Writer* w, TypeOwner* t) {
+    if (t->st) return 0;
+    Engine* e = w->engine();
+    const EngineConfig& cfg = e->config();
+    const int saved = tHotPathDepth;
+    tHotPathDepth = 0;
+    int32_t out = 0;
+    if (cfg.typeMetaSegBytes && t->mEnd >= cfg.typeMetaSegBytes) out = typeRotateMeta(w, t);
+    if (out >= 0 && cfg.retireMeta) out = typeRetireMeta(w, t);
+    if (t->retired.empty()) {
+        tHotPathDepth = saved;
+        return out;
+    }
+    // Unlinking: as for partitions (partitionReclaimStep).
+    const uint64_t now = monoNs();
+    const uint64_t gate = e->readerGateNs();
+    const uint64_t jsafe = cfg.commitJournal ? e->journalSafeNs() : UINT64_MAX;
+    const uint64_t grace = cfg.reclaimGraceMs * 1000000ull;
+    const bool valve = t->retired.size() > 2048;
+    uint32_t done = 0;
+    size_t i = 0;
+    while (i < t->retired.size() && done < cfg.reclaimBatch) {
+        RetiredFile& r = t->retired[i];
+        if (now < r.retryNs) {
+            i++;
+            continue;
+        }
+        const bool forced = valve && t->retired.size() - i > 2048 && now - r.retireNs >= grace;
+        if (!forced) {
+            if (gate <= r.retireNs) break;
+            if (!r.firstOkNs) r.firstOkNs = now;
+            if (now - r.firstOkNs < grace) break;
+        }
+        if (jsafe <= r.retireNs) break;
+        PathBuf path;
+        typeRetirePath(&path, w->eng_root(), t->fid, r.it);
+        const int32_t rc = path.len ? w->io().unlink(path.c_str(), path.len, true) : 0;
+        if (rc == FLATSQL_IO_ERR_BUSY) {
+            e->cUnlinkBusy.fetch_add(1, std::memory_order_relaxed);
+            r.retryNs = now + kBusyRetryNs;
+            i++;
+            continue;
+        }
+        if (rc < 0 && rc != FLATSQL_IO_ERR_NOENT) {
+            out = rc;
+            break;
+        }
+        t->retired.erase(t->retired.begin() + long(i));
+        e->cUnlinked.fetch_add(1, std::memory_order_relaxed);
+        done++;
+    }
+    tHotPathDepth = saved;
+    return out < 0 ? out : int32_t(done);
+}
+
+int32_t typeOpenReclaim(IoCtx* io, const char* root, TypeOwner* t, const std::vector<RetireItem>& items) {
+    t->retired.clear();
+    auto drop = [&](const RetireItem& it, bool ifUnused) -> int32_t {
+        PathBuf path;
+        typeRetirePath(&path, root, t->fid, it);
+        if (!path.len) return 0;
+        const int32_t rc = io->unlink(path.c_str(), path.len, ifUnused);
+        if (rc == 0 || rc == FLATSQL_IO_ERR_NOENT) return 0;
+        if (rc != FLATSQL_IO_ERR_BUSY) return rc;
+        // A reader that outlived the writer still holds it: it stays
+        // retired, behind the reader gate.
+        RetiredFile r;
+        r.it = it;
+        const int64_t n = fileSize(io, path);
+        r.it.size = n > 0 ? uint32_t(std::min<int64_t>(n, 0xffffffffll)) : 0;
+        r.retireNs = monoNs();
+        t->retired.push_back(r);
+        return 0;
+    };
+    auto live = [&](const RetireItem& it) {
+        if (it.letter == 'f') return it.gen == t->manifestGenLoaded;
+        if (it.letter == 'x')
+            for (const auto& r : t->runs)
+                if (r.gen == it.gen) return true;
+        if (it.letter == 'm') return it.seg >= t->firstLiveMSeg;
+        return false;
+    };
+    int32_t rc = 0;
+    // The set the manifest persists.
+    for (const auto& it : items)
+        if (rc >= 0 && !live(it)) rc = drop(it, true);
+    // Meta segments below first_live_m_seg (retired, maybe not unlinked).
+    const uint32_t lo = t->firstLiveMSeg > 256 ? t->firstLiveMSeg - 256 : 0;
+    for (uint32_t s = lo; rc >= 0 && s < t->firstLiveMSeg; s++) rc = drop(retireItem('m', s, 0, 0), true);
+    // A merge in flight at the crash: outputs no MERGE_DONE named. The
+    // unlinks are durable: merges after this open name later generations,
+    // and a file that came back would never be looked for again.
+    for (uint32_t g = t->manifestGenLoaded + 1; rc >= 0 && g <= t->nextGen + 4; g++) {
+        rc = drop(retireItem('x', 0, g, 0), true);
+        if (rc >= 0) rc = drop(retireItem('f', 0, g, 0), true);
+    }
+    return rc;
 }
 
 // ---------------------------------------------------------------------------
