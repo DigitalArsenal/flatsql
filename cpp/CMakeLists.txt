@@ -5,8 +5,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# FlatBuffers location
-set(FLATBUFFERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../flatbuffers" CACHE PATH "FlatBuffers source checkout")
+# FlatBuffers location: -DFLATBUFFERS_DIR, else $FLATBUFFERS_DIR (worktrees
+# outside the stack layout), else the sibling checkout.
+set(FLATSQL_FLATBUFFERS_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../../flatbuffers")
+if(DEFINED ENV{FLATBUFFERS_DIR})
+    set(FLATSQL_FLATBUFFERS_DEFAULT "$ENV{FLATBUFFERS_DIR}")
+endif()
+set(FLATBUFFERS_DIR "${FLATSQL_FLATBUFFERS_DEFAULT}" CACHE PATH "FlatBuffers source checkout")
 set(FLATBUFFERS_INCLUDE_DIR "${FLATBUFFERS_DIR}/include")
 set(FLATBUFFERS_SRC_DIR "${FLATBUFFERS_DIR}/src")
 
