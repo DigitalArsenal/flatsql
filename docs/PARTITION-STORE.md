@@ -4,13 +4,14 @@ The engine of the partition store program. Part I (§1–§11) is T1: append-onl
 partition logs, one writer per partition on a pinned pool, durable acks,
 per-commit indexes, type owners, and durable-tail open. Part II (§12–§21) is
 T2: reader instances and lanes, the snapshot protocol, the SQL surface, the
-fan-out merge, admission and results. The design is the stack's
-`docs/architecture/flatsql-partition-store.md` (§22 overrides §0–§21; §22.4
-holds the owner rulings). This file records what was built, how to run it, the
-measured acceptance, and every place the build departs from the design.
+fan-out merge, admission and results. Part III (§23–§30) is T3: compaction,
+reclamation, meta-segment retirement, disk accounting and quota. The design is
+the stack's `docs/architecture/flatsql-partition-store.md` (§22 overrides
+§0–§21; §22.4 holds the owner rulings). This file records what was built, how
+to run it, the measured acceptance, and every place the build departs from the
+design.
 
-Compaction, splits and quota are T3; the wasm artifact is T4; SDN and browser
-integration are T6/T10.
+The wasm artifact is T4; SDN and browser integration are T6/T10.
 
 ## 1. Code map
 
@@ -633,3 +634,248 @@ engine. If the bound fails there, the next steps are the design's own levers:
 fewer writer threads than cores (design §5.1: `clamp(cores−2, 1, 16)`), interactive
 lanes at a higher priority than writers (design A28 gives nice −5 only on ≤ 2 vCPU),
 and idle-lane sub-cursors (§21 deviation 1).
+
+# Part III: compaction, reclamation and quota (T3)
+
+## 23. Code map
+
+| Path | Contents |
+|---|---|
+| `ps/compaction.h`, `src/ps/compaction.cpp` | Manifest version 2, the compacted rows format, retire items; the compaction pipeline (plan, build, SWAP, apply, abort). |
+| `src/ps/reclaim.cpp` | The per-partition file ledger (`disk_bytes`), the RETIRE and UNLINKED records, reader-gated unlinking, meta-segment retirement (A9), open-time cleanup. |
+| `ps/quota.h`, `src/ps/quota.cpp` | The quota planner, the space emergency, the ballast. |
+| `src/ps/sources-t3.cmake` | Registers the T3 sources and tests on the targets `cpp/CMakeLists.txt` defines. |
+| `cpp/test/ps/{compaction,orphan,quota}_test.cpp` | T3 tests. `checkPartitionDir` (fixtures) walks a partition directory against the files its head and manifest name. |
+
+## 24. Compaction (§11, A11, minor 1)
+
+A compaction rewrites a run of sealed, fully merged segments `[seg, segEnd]`
+into one new file set, `c-<seg>-<gen>.{fsd,fsr,fsa}` plus
+`x-<seg>-<gen>.fsx` and `mf-<gen>.fsm`:
+
+1. The owner plans. `INTENT_COMPACT{seg, segEnd, gen}` rides the next batch; no
+   output exists before it is durable. The head carries the intent.
+2. A compaction thread builds. It reads the DEAD and TAG_DEAD postings over the
+   inputs' pseq range from every run and L0 block at or after the inputs, keeps
+   a killer only when it is at or below the plan's kill bound (the type owner's
+   `labeled_through`), and decides per row:
+   - PUT, LICENCE and CTL rows with a killer go;
+   - RETAG rows go when their instance is TAG_DEAD, or their PUT is dead or gone;
+   - TOMB, CTL_TOMB and TAG_TOMB rows go only when an earlier SWAP removed their
+     target (minor 1): outside the inputs, or VOID within them.
+
+   It copies the surviving frames, attributes and rows in 4 MiB slices, filters
+   the inputs' L1 runs down to the surviving rows' postings (every partition
+   posting's value is the pseq of the row that emitted it), fsyncs everything,
+   and re-checks the owner word and an abort flag before every mutation (A26).
+3. The owner, once no merge is in flight, writes the manifest (its fsync joins
+   the next round's first sync phase) and queues `SWAP{seg, gen, oldCgen,
+   segEnd}`; the SWAP, the RETIRE set and the counters' adjustment ride one
+   batch. Publish attaches the new files.
+
+Rows keep their pseqs. `c-*.fsr` holds the surviving rows (dense by rank) and a
+presence directory (a bit per pseq, a rank per 512); a pseq the directory
+lacks reads as a `VOID` row (kind 8, never stored, never live). A segment with
+no survivor is `EMPTY` in the manifest and has no files.
+
+Candidates (maintenance, every 50 ms per warm partition): the sealed segment
+with the largest dead share at or over 25% (dead frame bytes counted as kills
+commit); adjacent sealed segments under 8 MiB, coalesced up to 16 at a time
+and 64 MiB of output into one segment named by the first (`lastSeg` in the
+manifest; rows' `seg` is rewritten); after a restart, when the partition's
+dead share is over 25% and the per-segment counts are unknown, the oldest
+segment not yet surveyed (a build that would save under 10% is abandoned and
+its count remembered). `Engine::swapSegment` requests one (targeted, or the
+oldest-generation compactable segment).
+
+Kill bound and readers. A type-level reader's visibility is `V_p =
+min(pseq_hi, labeled_through[p])`. A compacted segment records `killThrough`
+(the largest killer behind a removed row, the inputs' own, and the bound of
+the SWAP that removed a dropped tombstone's target) and `prevGen` (the manifest
+before its SWAP). A type-level snapshot whose `V_p` is below a segment's
+`killThrough` reads that segment through `prevGen`, repeatedly for a segment
+compacted more than once; the reader gate keeps those files for any statement
+older than the SWAP. Partition-level readers see `pseq_hi`, which is never
+below a SWAP's bound.
+
+Counters: `total_count`, `total_bytes` and `tomb_count` count the rows the
+files hold (a SWAP subtracts what it removed), so they equal a recount;
+`min_epoch`, `max_epoch` and `latest_arrival` stay bounds over everything ever
+appended.
+
+## 25. Reclamation (A12) and meta segments (A9)
+
+- **Retire.** A MERGE_DONE retires the folded runs and the manifest it
+  replaces; a SWAP retires the inputs' files, their runs and the manifest. The
+  whole outstanding set is a `RETIRE` ctl record in the same batch (the head
+  points at it: `retireSeg/retireOff/retireN`); consecutive manifests collapse
+  into one range item.
+- **Unlink.** Maintenance unlinks a retired file with `UNLINK_IF_UNUSED` once
+  the reader gate (the start of the oldest running reader statement) is past
+  the time its retirement became durable, checked twice a grace apart (60 s by
+  default); in journal mode once every journal record older than the
+  retirement is checkpointed; a meta segment once a DURABLE_CKPT head names a
+  later `first_live_m_seg`. BUSY (a handle is open) skips to later items; idle
+  reader lanes close cached handles after 5 s. The next batch carries
+  `UNLINKED` and the shrunken set; `disk_bytes` drops then. A set past 2,048
+  items unlinks its oldest regardless of the gate (a statement older than
+  hours of retirements gets the retryable SNAPSHOT_GONE instead of a writer
+  waiting on it).
+- **Open** unlinks every file of the persisted set (a file a surviving reader
+  instance still holds stays retired), the outputs of an INTENT_COMPACT
+  without SWAP, and r/a files a first merge created without MERGE_DONE, then
+  writes a durable head.
+- **Meta segments (A9).** A sealed `m-<seg>` whose batches are all merged is
+  retired by a batch that also re-emits the full lane table (LANE_CKPT) and the
+  RETIRE set, whose header carries the manifest generation, `merged_through`,
+  `first_live_m_seg` and `next_gen`; `first_live_m_seg` advances when that
+  batch commits. A rebuild of a head whose both slots are torn probes for the
+  first existing meta segment and replays from its first batch.
+- **Reader gate in production.** The writer is its own wasm instance: the host
+  reads every reader instance's lane announcements
+  (`FlatsqlPsReaderLayout.laneAnnounce`) and passes the minimum through
+  `flatsql_ps_reader_gate` (T6 wires it). Natively, `Engine::setReaderGate`.
+
+## 26. Disk bytes (§13)
+
+`disk_bytes` is the exact size of the files a partition names: a ledger of the
+stable files (sealed segments' d and m, r/a, c-*, runs, manifests, the next
+segment's pre-created files, retired files until UNLINKED) plus the extents of
+the files still growing (h, l, the active d and m, zero-fill included). Open
+rebuilds it from the head, the manifest and file sizes; the owner maintains it
+on every append, merge, seal, SWAP and unlink. After every reopen in the crash
+tests, a walk of each partition directory finds exactly the named files and a
+total equal to `disk_bytes`. Head files are written as whole slots until they
+hold both, so a head write never grows the file again.
+
+## 27. Quota and the full disk (§13, A13, §22.4-3)
+
+- **Planner** (writer 0's maintenance, every 100 ms): usage = Σ `disk_bytes`
+  less retired files waiting only for readers. Over the cap
+  (`EngineConfig::quotaBytes`, `Engine::setQuota`, `flatsql_ps_set_quota`), it
+  evicts whole sealed segments in arrival order across partitions (their
+  `minArrival` zone) down to 0.85 of the cap: a `TOMB_RANGE{seg, all}` on the
+  owner (bounded 512-row steps; supersede-lane heads and control kinds are
+  spared), then, once the tombstones are durable, a compaction of the segment.
+  One wave at a time.
+- **ENOSPC.** A commit that fails NOSPACE starts an emergency: record entries
+  stop being consumed (producers see zero credits; nothing is acked), the
+  ballast file (`fsql2/ballast`, `ballastBytes`) is released, and waves evict one
+  segment at a time down to 0.85 of the usage at the failure, and at least the
+  ballast's size, but never more than half the store in one episode. Once
+  usage is under that cap the ballast is recreated and ingest resumes. NOSPACE
+  in a merge, a compaction, a head write or a segment creation is transient.
+
+## 28. Acceptance (§18 T3 as amended)
+
+Machines: **Mac** = the owner's Mac Studio (Darwin 25.3.0, arm64, 28 hardware
+threads), shared with other lanes (1-minute load recorded per run). **Mac mem**
+runs use the in-memory fault host (no fsync). Numbers come from `MEASURED`
+lines of `flatsql_ps_test` on task-branch builds of 2026-09-28.
+
+| # | Acceptance | Result | Where |
+|---|---|---|---|
+| 1 | A partition with 50% dead bytes compacts to ≤ 55% of its prior disk bytes; owner commit p99 and interactive lane p99 ≤ 1.5× baseline during compaction; 1,000 pre-SWAP statements complete correctly | **Size and statements pass; the latency ratio is not met on the Mac (needs a quiet Linux-8 box).** Mac mem, load 30–31: 4 partitions × 20,000 OMM records, half killed: 106.5 MB → 52.2 MB (0.490×); 1,003 bulk statements that started before a SWAP returned exactly the live rows with their bytes, 0 errors (625 SWAPs). Latency over the whole SWAP period (the compaction plus the re-compactions that produced those statements; 14,053 samples): ack p99 0.128 → 10.3 ms, interactive lane p99 0.355 → 1.07 ms; the box ran 31 load on 28 threads. | `compaction_half_dead_T3_1_full` |
+| 2 | CAT supersede, 20% changed per cycle, 100 cycles: disk plateaus ≤ 1.3× live bytes; A9: `m` bytes ≤ one active plus one sealed segment | **Pass, with "live bytes" read as the live set's compacted footprint.** Mac mem, load 31–36: 20,000 CAT objects, 100 cycles (each updates a random 20%): disk peaked at 1.281× the footprint of the same live set fully compacted (19.5 MB); 292 compactions, 517 meta segments retired, 4,551 files unlinked; at most 1 meta segment on disk (A9). Against the records' own bytes (Σ len − 4 of live PUTs, 4.9 MB) the disk is 5.1×: a fully compacted CAT record costs about 4× its frame in rows, attributes and postings, which no compaction removes | `compaction_cat_supersede_plateau_T3_2_full` |
+| 3 | Quota at 80% of current bytes: oldest records evicted first; no supersede-lane head evicted; disk ≤ cap within 3 passes; each eviction step ≤ 10 ms | **Pass (arrival order, §22.4-3).** Mac mem: 12.6 MB store, cap 10.1 MB: under the cap after 1 pass (14 segments), 0 of 256 CAT heads evicted, in each partition the evicted records are exactly its oldest (0 holes); step max 5.2–7.4 ms over 12–14 steps at load 17–31. Across partitions eviction is by whole segment, so a survivor can be older than an evicted record of another partition (139 of 6,367 records here). | `quota_arrival_order_heads_spared_T3_3` |
+| 4 | 1,000 crash points during compaction: exactly one of the old or new set is live, 0 orphans, 0 acked records lost; A12: crash points inside the grace window, Σ on-disk sizes = Σ `disk_bytes` after each reopen | **Pass.** Mac mem: 3,472 trials, 1,000 with a compaction planned but not applied at the crash, 3,294 with retired files waiting; all five crash modes (705 drop-all, 711 drop-subset, 697 torn, 707 reordered, 652 kill -9); 40,798 compactions, 84,154 files unlinked, 17,847 meta segments retired; after every reopen each partition directory held exactly the named files, `disk_bytes` equal to their total, every acked live record live with its bytes, every acked kill dead, counters equal to a recount. 565 s. The T1 crash harness (merges, A9, reclamation; compaction off: its oracle keeps dead bytes) checks the same after every reopen. | `orphan_crash_points_during_compaction_T3_4_full`, `crash_faults_T1_1` |
+| 5 | Hot split at 4× single-writer capacity with 4 helpers | **Not built** (§30). | – |
+| 6 | Fill the disk to ENOSPC under ingest: ingest resumes with 0 acked losses and no operator action | **Pass.** Mac mem, a 16 MiB device, 1 MiB ballast, two OMM producers: 4 episodes, the ballast released 4 times and restored 3 times, 4,130 records acked after a recovery; in each partition the surviving acked records are exactly its newest (0 holes). The type logs, not yet reclaimed (§30), fill most of such a small device: the last episode evicted every record. | `quota_disk_full_resumes_without_operator_T3_6` |
+
+§22 amendments naming T3:
+
+| Amendment | Status |
+|---|---|
+| A9 meta-segment retirement | Built (§25). |
+| A11 intents | INTENT_COMPACT built; merge and compaction intents coexist in one batch. |
+| A12 reclamation lifecycle | Built (§25): RETIRE/UNLINKED, reader gate twice a grace apart, open replays the set. |
+| A13 ENOSPC, ballast, arrival order | Built with deviations 12–13. |
+| A15 arrivals compaction | **Not built** (§30). |
+| A26 stage-1 prep states | Not built (with #5). |
+
+## 29. Design deviations (T3)
+
+1. **Compaction builds on its own threads** (§11: the owner in 4 MiB / 10 ms
+   slices; helpers only for split partitions). As T1 deviation 1 did for
+   merges: a build on the writer stalls every partition it owns. The builder
+   re-checks the owner word and an abort flag before every mutation, and a
+   HANDOFF waits for it to stop (one slice).
+2. **The owner writes the manifest at SWAP time**, synced in the next round's
+   first phase, instead of the builder: merges of the active segment continue
+   while a build runs; only the SWAP waits for no merge in flight.
+3. **Kill bound and `prevGen` fallback** (not in the design): a row is removed
+   only when its killer is labeled, and a type-level snapshot below a
+   segment's bound reads the previous file set. Without it, a type-level
+   statement whose type snapshot predates a death could miss a live copy
+   (A14).
+4. **Counters are physical** (§24): recounts equal them after compaction.
+5. **Coalescing** adjacent small segments (§11 "adjacent sealed segments under
+   8 MiB each") into one output named by the first segment.
+6. **Minor 1 extended**: a tombstone whose target is VOID in the same inputs
+   (an earlier SWAP of that segment removed it) goes too. Without it the
+   supersede tombstones of a partition compacted in one piece never went
+   (measured: the CAT plateau grew by 77 KB a cycle).
+7. **Tombstone-only segments seal by age** (T1 sealed only segments with
+   frames), so a partition that stops ingesting can drop its tombstones.
+8. **Reader gate by statement start time**, not by announced manifest
+   generations (A12 text): T2 built announcements as start times
+   (`oldestActiveStart`); the host passes the minimum
+   (`flatsql_ps_reader_gate`).
+9. **RETIRE is the whole set** per changing batch, not incremental records, so
+   open reads one record (head pointer) plus the tail.
+10. **UNLINK_IF_UNUSED BUSY skips** to later items (A12: "retry later");
+    reader lanes close idle handles after 5 s.
+11. **Disk bytes include zero-fill and pre-created files** (the file sizes);
+    open stats the files it names.
+12. **ENOSPC evicts with tombstones, one segment per wave** (A13: "first unlink
+    whole eligible sealed segments, oldest first ... needs no new space").
+    Dropping a segment without per-record tombstones would leave the type
+    owner unaware of the deaths (A14: FIRST copies must be labeled DEAD and
+    REPEATs promoted), and those catalog updates need space too. The ballast
+    must hold one segment's tombstones: about 128 B of row plus postings per
+    record, twice until the tombstones' own segment is compacted.
+13. **Ballast is off in the engine default**; hosts set it (servers 256 MiB,
+    browsers one seal plus one commit), so tests and benchmarks are unaffected.
+14. **Quota counts partitions only**: type logs and the registry are not in
+    `usage` yet (§30).
+15. **A rebalance of a partition already handed off is ignored** (a T1 race
+    the compaction timing exposed: a second release before the target adopted
+    could leave two owners).
+16. **RecordAttr bytes**: `buildRecordAttr` created its strings inside one
+    argument list, whose evaluation order C++ leaves unspecified; GCC on x86_64
+    built different bytes from clang. Each string is now created in field order;
+    `format_record_attr_golden_bytes` checks `vectors/record_attr.hex`
+    (22.3a-6).
+17. **T3 #2 "live bytes" is the live set's compacted footprint**: the same
+    records fully compacted, rows, attributes and postings included. Every
+    record carries about four times its frame in index structure, so a ratio
+    to frame bytes alone would measure the index, not garbage; both ratios are
+    reported (§28).
+
+## 30. Not built yet; running the T3 tests
+
+Remaining T3 scope:
+
+- **#5 hot split** with stage-1 helpers and sealed-segment re-homing (§12), and
+  A26's ring prep states.
+- **A15 arrivals compaction** and **type-log reclamation**: folded catalog runs
+  and superseded type manifests are never unlinked, the type meta log never
+  rotates, and DEAD catalog entries are never dropped; the quota does not
+  count type logs. Measured in the ENOSPC run: the type directory held 6.9 MB
+  of an 8.5 MB device.
+- **#1 latency ratio** on a quiet Linux-8 box.
+
+```
+cpp/build/flatsql_ps_test --test=compaction_          # basic, T3 #1 and #2 (short forms)
+cpp/build/flatsql_ps_test --test=compaction_half_dead_T3_1_full [--dir=<dir>]
+cpp/build/flatsql_ps_test --test=compaction_cat_supersede_plateau_T3_2_full
+cpp/build/flatsql_ps_test --test=orphan_crash_points_during_compaction_T3_4_full   # 1,000 crash points
+cpp/build/flatsql_ps_test --test=quota_                # T3 #3, #6
+```
+
+**T3 #1 on a quiet Linux-8 box** (8 cores, ext4, nothing else running), from a
+checkout at the landed commit; the test enforces the 1.5× bounds on such a box:
+
+```
+cpp/build/flatsql_ps_test --test=compaction_half_dead_T3_1_full --dir=<ext4 dir>
+```
