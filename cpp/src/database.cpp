@@ -622,9 +622,17 @@ size_t FlatSQLDatabase::ingest(const uint8_t* data, size_t length, size_t* recor
     return consumed;
 }
 
+void FlatSQLDatabase::setArenaLimit(size_t bytes) {
+    std::unique_lock lock(*accessMutex_);
+    storage_->setArenaLimit(bytes);
+}
+
 uint64_t FlatSQLDatabase::ingestOne(const uint8_t* flatbuffer, size_t length) {
     std::unique_lock lock(*accessMutex_);
     requireReadyUnlocked();
+    if (!storage_->canAppend(SIZE_PREFIX_LENGTH + length)) {
+        return kIngestRefused;
+    }
     invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     return storage_->ingestFlatBuffer(flatbuffer, length,
@@ -1659,6 +1667,9 @@ uint64_t FlatSQLDatabase::ingestOneWithSource(const uint8_t* flatbuffer, size_t 
                                                const std::string& source) {
     std::unique_lock lock(*accessMutex_);
     requireReadyUnlocked();
+    if (!storage_->canAppend(SIZE_PREFIX_LENGTH + length)) {
+        return kIngestRefused;
+    }
     invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
     const uint64_t begin = storage_->getWriteOffset();

@@ -172,6 +172,12 @@ public:
     // File identifier is read from bytes 4-7
     uint64_t ingestOne(const uint8_t* flatbuffer, size_t length);
 
+    // Returned by ingestOne/ingestOneWithSource when the record does not fit
+    // the arena's cap (StreamingFlatBufferStore::canAppend). Nothing was
+    // appended; the C API answers -1 with "arena capacity exhausted".
+    static constexpr uint64_t kIngestRefused = ~uint64_t(0);
+    void setArenaLimit(size_t bytes);
+
     // Load existing stream data and rebuild indexes
     void loadAndRebuild(const uint8_t* data, size_t length);
 

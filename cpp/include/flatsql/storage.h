@@ -57,6 +57,18 @@ public:
     // Preallocate storage for known large ingest targets. writeOffset_ remains unchanged.
     void reserveCapacity(size_t capacity);
 
+    // The arena's hard cap in bytes. Growth never allocates past it, so an
+    // append that would need to returns false from canAppend() instead of
+    // trapping inside std::vector::resize (the no-EH build turns a failed
+    // allocation into `unreachable`, which poisons the host's instance).
+    static constexpr size_t kDefaultArenaLimit = size_t(1) << 30;  // 1 GiB
+    void setArenaLimit(size_t bytes) { arenaLimit_ = bytes; }
+    size_t arenaLimit() const { return arenaLimit_; }
+    // True when `needed` more bytes fit under the cap (growing if required).
+    bool canAppend(size_t needed) const noexcept {
+        return static_cast<uint64_t>(writeOffset_) + needed <= arenaLimit_;
+    }
+
     // Stream raw size-prefixed FlatBuffers
     // Calls callback for each complete FlatBuffer ingested
     // Returns number of bytes consumed (for buffer management)
@@ -176,6 +188,7 @@ private:
     void indexRecord(const std::string& fileId, uint64_t offset);
 
     std::vector<uint8_t> data_;
+    size_t arenaLimit_ = kDefaultArenaLimit;
     uint64_t writeOffset_ = 0;
     uint64_t recordCount_ = 0;
     uint64_t nextSequence_ = 1;

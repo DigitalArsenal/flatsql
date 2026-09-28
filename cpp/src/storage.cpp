@@ -64,6 +64,13 @@ void StreamingFlatBufferStore::ensureCapacity(size_t needed) {
     while (newSize < totalNeeded) {
         newSize *= 2;
     }
+    // Doubling past the cap is what trapped at ~1 GiB inside the 4 GiB wasm32
+    // memory: the resize needs the old and the new vector at once. Growth
+    // stops AT the cap; callers check canAppend() before they append, so a
+    // request past it never reaches the resize.
+    if (newSize > arenaLimit_) {
+        newSize = totalNeeded > arenaLimit_ ? totalNeeded : arenaLimit_;
+    }
     data_.resize(newSize);
 }
 
@@ -89,6 +96,11 @@ size_t StreamingFlatBufferStore::ingest(const uint8_t* data, size_t length, Inge
         // Check if we have the complete FlatBuffer
         if (offset + SIZE_PREFIX_LENGTH + fbSize > length) {
             break;  // Incomplete, wait for more data
+        }
+        // A record past the arena cap is not consumed (as if incomplete): the
+        // caller sees fewer bytes taken instead of a trap in the resize.
+        if (!canAppend(SIZE_PREFIX_LENGTH + fbSize)) {
+            break;
         }
 
         const uint8_t* fbData = data + offset + SIZE_PREFIX_LENGTH;

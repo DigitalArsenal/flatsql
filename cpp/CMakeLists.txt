@@ -193,6 +193,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_ingest\", \"_flatsql_ingest_one\", \
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
                 \"_flatsql_ingest_with_source\", \"_flatsql_ingest_one_with_source\", \
+                \"_flatsql_set_arena_limit\", \
                 \"_flatsql_get_sources_count\", \"_flatsql_get_source_name\", \
                 \"_flatsql_query\", \"_flatsql_query_params\", \"_flatsql_query_many\", \
                 \"_flatsql_build_query_cache_key\", \
@@ -297,6 +298,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_ingest\", \"_flatsql_ingest_one\", \
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
                 \"_flatsql_ingest_with_source\", \"_flatsql_ingest_one_with_source\", \
+                \"_flatsql_set_arena_limit\", \
                 \"_flatsql_get_sources_count\", \"_flatsql_get_source_name\", \
                 \"_flatsql_query\", \"_flatsql_query_params\", \"_flatsql_query_many\", \
                 \"_flatsql_build_query_cache_key\", \
@@ -595,7 +597,11 @@ else()
     # Native library. The VFS sources ride along so the native lane exercises
     # the SAME sqlite3_vfs the wasm lanes use (flatsql_io_native.cpp supplies
     # the seven functions that are imports on wasm).
-    add_library(flatsql_lib STATIC ${FLATSQL_LIB_SOURCES} ${FLATSQL_VFS_SOURCES})
+    # flatbuffers util.cpp defines ClassicLocale::instance_, which util.h's
+    # inline ClassicLocale::Get references (GNU ld on ubuntu fails without
+    # it); util.cpp in turn uses global_options from options.cpp.
+    add_library(flatsql_lib STATIC ${FLATSQL_LIB_SOURCES} ${FLATSQL_VFS_SOURCES}
+        ${FLATBUFFERS_SRC_DIR}/util.cpp ${FLATBUFFERS_SRC_DIR}/options.cpp)
     target_compile_definitions(flatsql_lib PUBLIC FLATSQL_ENABLE_IO_VFS=1)
 
     target_include_directories(flatsql_lib PUBLIC
@@ -820,6 +826,14 @@ else()
     add_executable(flatsql_full_text_reflection_test tests/full_text_reflection_test.cpp)
     target_link_libraries(flatsql_full_text_reflection_test PRIVATE flatsql_lib)
     add_test(NAME FlatSQLFullTextReflectionTest COMMAND flatsql_full_text_reflection_test)
+    # Query-path regressions: index use and rows examined, never wall-clock
+    add_executable(flatsql_query_regression_test test/query_regression_test.cpp)
+    target_link_libraries(flatsql_query_regression_test PRIVATE flatsql_lib)
+    add_test(NAME FlatSQLQueryRegressionTest COMMAND flatsql_query_regression_test)
+    # Arena capacity cap: refusals, never a trap in the arena's resize
+    add_executable(flatsql_arena_limit_test test/arena_limit_test.cpp)
+    target_link_libraries(flatsql_arena_limit_test PRIVATE flatsql_lib)
+    add_test(NAME FlatSQLArenaLimitTest COMMAND flatsql_arena_limit_test)
     add_test(NAME FlatSQLVfsTest COMMAND flatsql_vfs_test)
     add_test(NAME FlatSQLStatePersistenceTest COMMAND flatsql_state_persistence_test)
     add_test(NAME FlatSQLDiskPersistenceTest COMMAND flatsql_disk_persistence_test)

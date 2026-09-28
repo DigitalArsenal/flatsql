@@ -932,7 +932,12 @@ double flatsql_ingest(void* handle, const uint8_t* data, size_t length) {
 EMSCRIPTEN_KEEPALIVE
 double flatsql_ingest_one(void* handle, const uint8_t* data, size_t length) {
     if (!requireReadyHandle(handle)) return -1;
-    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->ingestOne(data, length));
+    const uint64_t seq = static_cast<FlatSQLDatabase*>(handle)->ingestOne(data, length);
+    if (seq == FlatSQLDatabase::kIngestRefused) {
+        g_lastError = "arena capacity exhausted";
+        return -1;
+    }
+    return static_cast<double>(seq);
 }
 
 // Source-aware ingestion
@@ -971,7 +976,20 @@ double flatsql_ingest_with_source(void* handle, const uint8_t* data, size_t leng
 EMSCRIPTEN_KEEPALIVE
 double flatsql_ingest_one_with_source(void* handle, const uint8_t* data, size_t length, const char* source) {
     if (!requireReadyHandle(handle)) return -1;
-    return static_cast<double>(static_cast<FlatSQLDatabase*>(handle)->ingestOneWithSource(data, length, source));
+    const uint64_t seq = static_cast<FlatSQLDatabase*>(handle)->ingestOneWithSource(data, length, source);
+    if (seq == FlatSQLDatabase::kIngestRefused) {
+        g_lastError = "arena capacity exhausted";
+        return -1;
+    }
+    return static_cast<double>(seq);
+}
+
+// The arena's hard cap in bytes (default 1 GiB). An ingest past it answers
+// -1 with "arena capacity exhausted" instead of trapping.
+EMSCRIPTEN_KEEPALIVE
+void flatsql_set_arena_limit(void* handle, double bytes) {
+    if (!requireReadyHandle(handle) || !(bytes > 0)) return;
+    static_cast<FlatSQLDatabase*>(handle)->setArenaLimit(static_cast<size_t>(bytes));
 }
 
 EMSCRIPTEN_KEEPALIVE
