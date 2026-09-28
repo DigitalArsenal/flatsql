@@ -1101,6 +1101,26 @@ int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t) {
 }
 }  // namespace
 
+// Engine stop: a merge in flight never commits in this instance. Its
+// handles close (a handle left open makes open's unlink of the outputs BUSY
+// for good). An unfinished build's outputs go: nothing can name them. A
+// finished one's stay: a MERGE_DONE batch already in the log may name them,
+// and open sweeps them otherwise.
+void typeMergeStop(Writer* w, TypeOwner* t) {
+    if (t->mergePhase == 0) return;
+    w->io().close(&t->mergeRun.file);
+    w->io().close(&t->mergeMf);
+    t->mergeRun = SegRun();
+    if (t->mergePhase == 2) {
+        for (const char letter : {'x', 'f'}) {
+            PathBuf op;
+            typeRetirePath(&op, w->eng_root(), t->fid, retireItem(letter, 0, t->mergeGen, 0));
+            w->io().unlink(op.c_str(), op.len, true);
+        }
+    }
+    t->mergePhase = 0;
+}
+
 // Type merge pipeline: planned on the owner, built on a helper (or inline),
 // synced in the next round's first phase; MERGE_DONE rides that round's type
 // batch. Outputs are named by the generation counter.

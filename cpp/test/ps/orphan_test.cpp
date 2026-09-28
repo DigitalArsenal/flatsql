@@ -359,3 +359,58 @@ PS_TEST(orphan_crash_points_during_compaction_T3_4) {
 PS_SLOW_TEST(orphan_crash_points_during_compaction_T3_4_full) {
     runOrphanTrials(int(argInt("during", 1000)), int(argInt("orphan-trials", 20000)), uint64_t(argInt("orphan-seed", 1000)));
 }
+
+// Outputs of a type merge a crash cut short sit at generations after the
+// manifest's; the head's next_gen can lag them (heads are not written every
+// commit). Open sweeps past next_gen and past every leftover it finds.
+PS_TEST(orphan_type_merge_outputs_past_next_gen_go_at_open) {
+    Store s(true, 1, true);
+    s.cfg.mergeL0Blocks = 2;
+    s.cfg.mergeMinL0Bytes = 0;
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const uint32_t pid = s.partition("sweep", ommType());
+    {
+        Producer p(s.e.get(), pid);
+        for (int i = 0; i < 200; i++) {
+            const uint64_t r = send(s.e.get(), p, ommRecord(uint32_t(80000 + i), "S", "2026-09-01T00:00:00Z", 15.0),
+                                    buildRecordAttr("peer", "prov", "src", "b"), i);
+            if (i % 10 == 9) REQUIRE(p.waitAcked(r, 60000000000ull) == 0);
+        }
+    }
+    REQUIRE(waitLabeledEngine(s.e.get(), {pid}, 60000000000ull));
+    s.close();
+    Inspector ins(s.fs.get(), s.root);
+    const auto tv = ins.type(ommType().fid);
+    REQUIRE(tv.ok && tv.head.manifestGen > 0);
+    // Leftovers of merges past next_gen: one just past it, one 40 further
+    // (found by the sweep's reach from the first), and a run without its
+    // manifest.
+    const uint32_t gens[3] = {tv.head.nextGen + 2, tv.head.nextGen + 42, tv.head.nextGen + 50};
+    IoStats st;
+    IoCtx ctx(s.fs.get(), &st);
+    for (int k = 0; k < 3; k++) {
+        for (const char letter : {'x', 'f'}) {
+            if (k == 2 && letter == 'f') continue;
+            PathBuf path;
+            typeRetirePath(&path, s.root.c_str(), ommType().fid, retireItem(letter, 0, gens[k], 0));
+            FileRef f;
+            REQUIRE(ctx.open(path.c_str(), path.len,
+                             FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS,
+                             FileClass::Index, &f) == 0);
+            const uint8_t junk[64] = {1, 2, 3};
+            REQUIRE(ctx.write(f, junk, sizeof(junk), 0) == 0);
+            REQUIRE(ctx.sync(f) == 0);
+            ctx.close(&f);
+        }
+    }
+    CHECK(!checkTypeDir(s.fs.get(), s.fs.get(), s.root, ommType().fid).ok);
+    std::string err;
+    REQUIRE(Engine::open(s.cfg, &s.e, &err) == 0);
+    const DirCheck dc = checkTypeDir(s.fs.get(), s.fs.get(), s.root, ommType().fid);
+    if (!dc.ok) std::fprintf(stderr, "  type dir: %s\n", dc.err.c_str());
+    CHECK(dc.ok);
+    CHECK_EQ(dc.bytes, s.e->typeDiskBytesOf(ommType().fid));
+    s.e->start();
+    s.close();
+}

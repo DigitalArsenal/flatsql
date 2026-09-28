@@ -1096,11 +1096,13 @@ int32_t Engine::stop(uint64_t deadlineMs) {
     started_ = false;
     // Merges and compactions still in flight are abandoned: their outputs go
     // now, and open discards any INTENT without MERGE_DONE or SWAP.
-    for (auto& w : writers_)
+    for (auto& w : writers_) {
         for (Partition* p : w->owned_) {
             partitionMergeAbort(w.get(), p);
             partitionCompactAbort(w.get(), p);
         }
+        for (TypeOwner* t : w->types_) typeMergeStop(w.get(), t);
+    }
     if (!writers_.empty()) quotaClose(this, &writers_[0]->io());
     // Clean shutdown: durable heads, so the next open reads no tail.
     for (auto& w : writers_) w->flushHeadSyncs();

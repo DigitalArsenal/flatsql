@@ -320,6 +320,7 @@ int32_t typeWriteHead(Writer* w, TypeOwner* t, bool durable);
 int32_t typeEnsureFiles(IoCtx* io, Engine* e, TypeOwner* t);
 int32_t typeWarm(Writer* w, TypeOwner* t);
 int32_t typeMergeStep(Writer* w, TypeOwner* t);
+void typeMergeStop(Writer* w, TypeOwner* t);  // engine stop: closes a merge in flight
 void typePostNotice(TypeOwner* t, uint32_t pid);
 void encodeTypeHead(const TypeOwner* t, uint8_t* slot, uint32_t* used, bool durable);
 

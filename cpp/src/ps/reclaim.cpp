@@ -506,12 +506,23 @@ int32_t typeOpenReclaim(IoCtx* io, const char* root, TypeOwner* t, const std::ve
         const int32_t urc = io->unlink(np.c_str(), np.len, true);
         if (urc < 0 && urc != FLATSQL_IO_ERR_NOENT) rc = urc;
     }
-    // A merge in flight at the crash: outputs no MERGE_DONE named. The
-    // unlinks are durable: merges after this open name later generations,
-    // and a file that came back would never be looked for again.
-    for (uint32_t g = t->manifestGenLoaded + 1; rc >= 0 && g <= t->nextGen + 4; g++) {
-        rc = drop(retireItem('x', 0, g, 0), true);
-        if (rc >= 0) rc = drop(retireItem('f', 0, g, 0), true);
+    // A merge in flight at the crash: outputs no MERGE_DONE named, at the
+    // generations after the manifest's. The head's next_gen may lag the
+    // generation a crash left (heads are not written every commit), so the
+    // sweep covers 64 past it and 16 past the last one it found. The unlinks
+    // are durable: merges after this open name later generations, and a file
+    // that came back would never be looked for again.
+    uint32_t hi = t->nextGen + 64;
+    for (uint32_t g = t->manifestGenLoaded + 1; rc >= 0 && g <= hi && g - t->manifestGenLoaded <= 4096; g++) {
+        for (const char letter : {'x', 'f'}) {
+            PathBuf path;
+            typeRetirePath(&path, root, t->fid, retireItem(letter, 0, g, 0));
+            if (io->probe(path.c_str(), path.len) != 0) continue;
+            hi = std::max(hi, g + 16);
+            if (g >= t->nextGen) t->nextGen = g + 1;  // never reused while it may linger
+            rc = drop(retireItem(letter, 0, g, 0), true);
+            if (rc < 0) break;
+        }
     }
     if (rc < 0) return rc;
     // The ledger: sizes of the files the type names (no data byte is read).
