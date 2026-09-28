@@ -667,3 +667,71 @@ platform quirk.
 6. `sdn-server/internal/flatsqldrv/standalone.go:33`'s `sql.Open("sqlite", ...)`
    for auth.db is still a genuine second engine and still contrary to "use
    FlatSQL only". It can move now that FlatSQL is disk-backed.
+
+## 7. Partition store (format 2): backpressure and ack contract
+
+Verbatim from the approved design (stack `docs/architecture/flatsql-partition-store.md`
+§7), then the §22 amendments that change it. The engine side is in
+[PARTITION-STORE.md](PARTITION-STORE.md).
+
+**Ack.**
+- A record is acknowledged **only** after steps 1–5 of §6.4 for the commit that contains it.
+- "Acknowledged" means:
+  - a stream-push ack;
+  - a datasync page counted as applied;
+  - a module flow `storage.ingest_with_source` return;
+  - a publish-API 2xx (207 with per-record status when some records are rejected);
+  - a Runner batch completion.
+- A dedupe hit is acked as durable: the record is already durable.
+
+**Credits per path** (ruling 5):
+
+| Path | On zero credits |
+|---|---|
+| Stream push (`handleDataPush`) | The router stops reading the stream. yamux/TCP flow control blocks the sender, whose in-flight data is bounded by ring cap + window. |
+| Datasync pull | The puller does not request the next page until credits free. |
+| Module flows (`modulert/caps/storage.go`) | The records arrive as a binary size-prefixed stream, not base64-in-JSON (`:634-640`). The hostcall blocks, within the flow's own seam budget. Records are never dropped. |
+| Publish API | The body is read in chunks as credits allow (TCP backpressure). No 503 and no client timeout. |
+| Ingest Runner (CelesTrak) | It enqueues without waiting per record and waits once per batch. A write never takes two store locks any more (`runner.go:760-778`). |
+| **Gossip (pubsub)** | **Dropped** when credits are zero, counted in `sdn_ingest_dropped_total{path="gossip",type,producer}`. The periodic datasync pull re-fetches by cursor. This is the documented contract, because gossipsub cannot be backpressured. |
+
+**Exactly what a crash can lose:**
+- **Process crash** (kill -9, OOM kill, abort): ring contents, and batches whose §6.4 step 4 had not completed. **None of these were acked.**
+- **Power loss or kernel crash:** the same, provided the device honours flushes (`F_FULLFSYNC`, `fdatasync` with barriers, OPFS `flush()`).
+  - Head slots may regress to the last checkpoint. Open then scans the meta log forward from there (≤ 64 KiB per active partition) and recovers every fsynced batch.
+- **Registry:** a registration that was not durable is lost, together with nothing acked, since records are acked only after registration.
+- **Type logs:** arrivals and cid entries that were not durable are rebuilt by catch-up from partition rows. They get fresh gseqs, which is safe because they were never published.
+- **Compaction in flight:** discarded by the INTENT rule and redone later.
+- **Gossip:** staged gossip that was not yet durable is lost and recovered by the sync pull.
+- **Lane results in flight:** the statement fails with a retryable error.
+- **Producers resend** everything unacked. Resends dedupe by cid within the partition, so the result is 0 duplicates.
+
+### 7.1 Amendments (design §22)
+
+- **A4, durable tails.** Open adopts a batch past a head only after it fsyncs
+  that batch's `m` and `d` (type logs: `g` and type `m`) and writes a
+  DURABLE_CKPT head; only then do threads start or gseqs publish. An fsync
+  failure quarantines the partition, which reopens from its last DURABLE_CKPT
+  head. A dedupe hit or RETAG is acked only once the matched row's commit is
+  durable.
+- **A8, commit journal (§22.4 ruling 5).** With `commitJournal`, step 4 is the
+  fsync of the writer's journal record, which carries every byte the commit
+  wrote to `d`, `l`, `m`, `g` and the type `m`. Open replays the journals into
+  those files before reading any head. A journaled batch whose record was not
+  replayed is not adopted, even when its `m` bytes survived: its `d` bytes may
+  not have.
+- **A20, read-your-writes.** Partition-level reads and GetRecord see a record
+  at ack. Type-level reads see it at the next type commit, except on paths that
+  wait for labeling (publish API and module flows wait until
+  `labeled_through[p] ≥` the record's pseq).
+- **§22.4 ruling 4 (A33), gossip.** Replaces the gossip row above: at zero
+  credits the validator ignores the message and stages (peer, schema, cid) in
+  a bounded per-type set; a per-(producer, type) cursor pull scheduler (T7)
+  fetches them. Staged gossip that was not durable is lost and pulled again.
+- **Minor 4, directories.** POSIX hosts fsync the parent directory of every
+  created file (`CREATE_PARENTS`) and after `UNLINK_IF_UNUSED`
+  (`F_FULLFSYNC` on darwin). **On OPFS, directory durability is best effort.**
+- **A13, browser quota.** `QuotaExceededError` maps to
+  `FLATSQL_IO_ERR_NOSPACE`. If the browser evicts the origin and `STORE` is
+  missing at boot, the node creates a fresh store and resyncs: everything the
+  evicted store held locally is lost.
