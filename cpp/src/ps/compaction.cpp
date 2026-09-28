@@ -486,8 +486,40 @@ bool pickCandidate(const Engine* e, const Partition* p, uint32_t* seg, uint32_t*
         }
     }
     if (best) {
-        *seg = best->seg;
-        *segEnd = best->lastSeg ? best->lastSeg : best->seg;
+        // Neighbors past the ratio too join the same output, within the
+        // coalescing limits: updates spread over a partition bring its
+        // segments to the ratio together, and one compaction per segment
+        // would leave the rest of the wave on disk meanwhile.
+        auto qualifies = [&](const SegmentInfo& s) {
+            if (!compactable(p, s) || s.empty) return false;
+            const uint64_t data = s.dLen ? s.dLen : 1;
+            return double(s.deadBytes) / double(data) >= cfg.compactDeadRatio;
+        };
+        size_t lo = size_t(best - p->segs.data()), hi = lo;
+        uint64_t bytes = inputDiskBytes(p, *best);
+        for (bool grown = true; grown;) {
+            grown = false;
+            if (hi - lo + 1 < cfg.compactMaxInputs && hi + 1 < p->segs.size()) {
+                const SegmentInfo& n = p->segs[hi + 1];
+                const uint64_t nb = inputDiskBytes(p, n);
+                if (n.firstPseq == p->segs[hi].endPseq && qualifies(n) && bytes + nb <= cfg.compactMaxOutputBytes) {
+                    hi++;
+                    bytes += nb;
+                    grown = true;
+                }
+            }
+            if (hi - lo + 1 < cfg.compactMaxInputs && lo > 0) {
+                const SegmentInfo& n = p->segs[lo - 1];
+                const uint64_t nb = inputDiskBytes(p, n);
+                if (p->segs[lo].firstPseq == n.endPseq && qualifies(n) && bytes + nb <= cfg.compactMaxOutputBytes) {
+                    lo--;
+                    bytes += nb;
+                    grown = true;
+                }
+            }
+        }
+        *seg = p->segs[lo].seg;
+        *segEnd = p->segs[hi].lastSeg ? p->segs[hi].lastSeg : p->segs[hi].seg;
         return true;
     }
     // 2. Adjacent small sealed segments coalesce (§11: "under 8 MiB each").
@@ -1501,6 +1533,7 @@ void partitionCompactApply(Writer* w, Partition* p) {
         r->status = 0;  // the batch's ticket releases it
     }
     p->cplan.reset();
+    p->lastCompactCheckNs = 0;  // the next candidate is looked for at once
     partitionAccount(p);
     tHotPathDepth = saved;
 }

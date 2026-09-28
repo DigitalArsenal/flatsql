@@ -96,21 +96,32 @@ bool waitMerged(Io* io, const std::string& root, const std::vector<uint32_t>& pi
     return false;
 }
 
-// Waits until nothing is in flight and each partition's disk_bytes equals its
-// directory; returns the checks.
+// Waits until the store is at rest: nothing in flight, each partition's
+// disk_bytes equal to its directory, and the bytes unchanged for 150 ms
+// (three of maintenance's 50 ms looks for a compaction candidate: a wave of
+// compactions has gaps between its members). Returns the checks.
 bool waitSettled(Store& s, const std::vector<uint32_t>& pids, uint64_t timeoutNs, std::vector<DirCheck>* out) {
     const uint64_t deadline = monoNs() + timeoutNs;
     Io* io = s.cfg.io ? s.cfg.io : importIo();
     FaultFs* fs = s.cfg.io ? s.fs.get() : nullptr;
+    uint64_t restSince = 0, restBytes = UINT64_MAX;
     for (;;) {
         out->clear();
         bool all = s.e->stats().compactInFlight == 0;
+        uint64_t bytes = 0;
         for (uint32_t pid : pids) {
             DirCheck dc = checkPartitionDir(io, fs, s.root, pid);
             if (!dc.ok || dc.bytes != s.e->partitionDiskBytes(pid)) all = false;
+            bytes += dc.bytes;
             out->push_back(std::move(dc));
         }
-        if (all) return true;
+        const uint64_t now = monoNs();
+        if (!all || bytes != restBytes) {
+            restSince = now;
+            restBytes = all ? bytes : UINT64_MAX;
+        } else if (now - restSince >= 150000000ull) {
+            return true;
+        }
         if (monoNs() >= deadline) {
             for (size_t i = 0; i < pids.size(); i++)
                 std::fprintf(stderr, "  unsettled pid %u: %s bytes %llu disk_bytes %llu in-flight %llu\n", pids[i],
@@ -565,6 +576,7 @@ void runCatPlateau(int objects, int cycles) {
     Store& s = cs.s;
     s.cfg.sealBytes = 256u << 10;
     s.cfg.autoCompact = true;
+    if (argInt("dead-pct", 0) > 0) s.cfg.compactDeadRatio = double(argInt("dead-pct", 0)) / 100.0;
     REQUIRE(s.open() == 0);
     s.registerTypes({&catType()});
     const uint32_t pid = s.partition("cat0", catType());

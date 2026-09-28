@@ -98,7 +98,7 @@ struct EngineConfig {
     uint32_t testHelperStallEvery = 0;
     // T3 compaction (§11), reclamation (A12), meta-segment retirement (A9).
     bool autoCompact = true;               // maintenance picks candidates itself
-    double compactDeadRatio = 0.25;        // a sealed segment with this share of dead frame bytes
+    double compactDeadRatio = 0.15;        // a sealed segment with this share of dead frame bytes (§11 says 25%: PARTITION-STORE.md §29)
     uint64_t compactSmallBytes = 8ull << 20;   // adjacent sealed segments under this coalesce
     uint32_t compactMaxInputs = 16;        // segments per coalesced output
     uint64_t compactMaxOutputBytes = 64ull << 20;
