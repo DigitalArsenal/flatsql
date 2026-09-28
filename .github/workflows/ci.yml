@@ -71,3 +71,75 @@ jobs:
       run: |
         ls -la cpp/build-wasm/flatsql.js cpp/build-wasm/flatsql.wasm cpp/build-wasm/flatsql-wasi.wasm
         echo "WASM build successful!"
+
+  # The partition store artifact (docs/PARTITION-STORE-WASM.md): build it with
+  # the pinned wasi-sdk and DigitalArsenal flatbuffers, check its import
+  # surface, and run the native suites, 1,000 fault crashes, host-level crashes
+  # and the parity vectors under the Node wasi-threads host.
+  ps-wasm:
+    runs-on: ubuntu-latest
+    env:
+      WASI_SDK_PATH: /opt/wasi-sdk
+      FLATSQL_BUILD_JOBS: '4'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
+    - name: Install wasi-sdk 30, ninja
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build cmake
+        curl -fsSL -o /tmp/wasi-sdk.tar.gz \
+          https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
+        sudo mkdir -p /opt/wasi-sdk
+        sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
+        cat /opt/wasi-sdk/VERSION
+
+    - name: Clone FlatBuffers (DigitalArsenal pin)
+      run: |
+        git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
+        git -C ../flatbuffers checkout c72a8bed83d2d1c6cf4c9d229c79fc795ec395ae
+
+    - name: Install dependencies
+      run: npm ci --ignore-scripts
+
+    - name: Build flatsql-ps-threads.wasm and the wasm test commands
+      run: bash scripts/build-wasm.sh --ps-tests
+
+    - name: The committed artifact is this source's build
+      run: |
+        if ! git diff --quiet -- wasm/flatsql-ps-threads.wasm; then
+          echo "::warning::wasm/flatsql-ps-threads.wasm differs from this commit's build; a release commit must carry the rebuilt artifact (npm-publish.yml refuses otherwise)"
+        fi
+        sha256sum wasm/flatsql-ps-threads.wasm
+
+    - name: Native partition store test binary (parity vectors)
+      working-directory: cpp
+      run: |
+        cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFLATBUFFERS_DIR=$GITHUB_WORKSPACE/../flatbuffers
+        cmake --build build --target flatsql_ps_test -j 4
+
+    - name: Partition store tests under the Node host
+      env:
+        FLATSQL_PS_WASM_SUITE: '1'
+      run: >
+        node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand
+        --runTestsByPath test/standalone-wasm-imports.test.ts test/package-exports.test.ts
+        test/ps-node-threads.test.ts test/ps-host-fault.test.ts test/ps-parity-vectors.test.ts
+
+    - name: Cache the patched WasmEdge runtime (space-data-module-sdk C runner)
+      uses: actions/cache@v4
+      with:
+        path: /tmp/sdm-wasmedge-runtimes
+        key: sdm-wasmedge-0.16.4-${{ runner.os }}-${{ hashFiles('node_modules/space-data-module-sdk/src/testing/native/wasmedge-0.16.4-atomic-wait.patch') }}
+
+    - name: Deterministic parity under the SDK WasmEdge C runner
+      env:
+        FLATSQL_PS_WASMEDGE: '1'
+      run: >
+        node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand
+        --runTestsByPath test/ps-parity-vectors.test.ts -t 'C runner'

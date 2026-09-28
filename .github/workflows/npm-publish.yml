@@ -45,9 +45,10 @@ jobs:
           version: "4.0.23"
           actions-cache-folder: "emsdk-cache"
 
-      - name: Clone FlatBuffers
+      - name: Clone FlatBuffers (DigitalArsenal pin)
         run: |
-          git clone --depth 1 https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
+          git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
+          git -C ../flatbuffers checkout c72a8bed83d2d1c6cf4c9d229c79fc795ec395ae
 
       - name: Build WASM
         working-directory: cpp
@@ -63,6 +64,29 @@ jobs:
           cp cpp/build-wasm/flatsql.wasm wasm/ || true
           cp cpp/build-wasm/flatsql-wasi.wasm wasm/ || true
           cp cpp/build-wasm/flatsql-spatial.wasm sdm/ || true
+
+      # The partition store artifact (A34): wasi-sdk 30, the same pinned
+      # flatbuffers. The published bytes must be the committed bytes, so a
+      # release commit carries the artifact its sources build.
+      - name: Install wasi-sdk 30
+        run: |
+          curl -fsSL -o /tmp/wasi-sdk.tar.gz \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
+          sudo mkdir -p /opt/wasi-sdk
+          sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
+          cat /opt/wasi-sdk/VERSION
+
+      - name: Build flatsql-ps-threads.wasm, check imports, write integrity.json
+        env:
+          WASI_SDK_PATH: /opt/wasi-sdk
+          FLATSQL_BUILD_JOBS: '4'
+        run: bash scripts/build-wasm.sh --ps
+
+      - name: The published artifact is the committed artifact
+        run: |
+          sha256sum wasm/flatsql-ps-threads.wasm
+          git diff --exit-code --stat -- wasm/flatsql-ps-threads.wasm
+          node -e "const j=require('./wasm/integrity.json');console.log(JSON.stringify(j.files['flatsql-ps-threads.wasm']))"
 
       - name: Verify build output
         run: |
@@ -112,6 +136,18 @@ jobs:
 
       - name: Run WASI tests
         run: npm run test:wasi
+
+      - name: Check import surfaces and integrity.json
+        run: |
+          npm run check:imports
+          npm run check:integrity
+
+      - name: No sql.js in the package's dependency tree
+        run: |
+          test "$(node -e "const p=require('./package.json');console.log(Object.keys(p.dependencies||{}).length)")" = "0"
+          npm ls sql.js --omit=dev --omit=peer --omit=optional --all > /tmp/npm-ls.txt || true
+          cat /tmp/npm-ls.txt
+          ! grep -q "sql.js@" /tmp/npm-ls.txt
 
       - name: Verify package
         run: npm pack --dry-run
