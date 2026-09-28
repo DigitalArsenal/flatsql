@@ -418,9 +418,9 @@ int32_t Engine::replayJournals(std::string* err) {
             }
         }
         if (rc < 0) break;
-        // A writer that never committed has no journal; the writer count may
-        // also have shrunk since the files were written: probe every id.
-        if (!any) continue;
+        // Journal-mode engines create every writer's files at open, so ids
+        // with journals are contiguous (a larger earlier writer count too).
+        if (!any) break;
         std::sort(recs.begin(), recs.end(), [](const Rec& a, const Rec& b) { return a.seq < b.seq; });
         for (const Rec& r : recs) {
             const uint8_t* b = data[r.file].data() + r.off;

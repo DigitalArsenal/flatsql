@@ -6,6 +6,7 @@
 //                    [--rate=R] (open loop; 0 = find the sustained maximum)
 //   flatsql_ps_bench --mode=dirty --rate=R [--dir=D]   (A8: ack p99 at 1/10/50
 //                    dirty partitions)
+//   Any mode: --journal=1 commits through the per-writer journal (A8 fallback).
 //   flatsql_ps_bench --mode=soak [--seconds=1800] [--dir=D]   (lock holds,
 //                    hot-path allocations)
 // Every number is printed as "MEASURED <key> = <value> <unit>" together with
@@ -119,6 +120,7 @@ struct Bench {
         cfg.poolBytes = uint64_t(argInt("pool-mb", 192)) << 20;
         cfg.arenaBytes = 24ull << 20;
         cfg.zeroFillStep = uint64_t(argInt("zero-fill-kb", 1024)) << 10;
+        cfg.commitJournal = argInt("journal", 0) != 0;  // A8 fallback mode
         cfg.lockStats = true;
         if (memIo) {
             mem.reset(new FaultFs(false));
@@ -338,6 +340,14 @@ void reportSyncs(Engine* e, const char* prefix) {
            "records");
     std::snprintf(key, sizeof(key), "%s_total_fsyncs", prefix);
     report(key, double(io.totalSyncs()), "fsyncs");
+    if (st.journalRecords) {
+        std::snprintf(key, sizeof(key), "%s_journal_fsyncs_per_committing_iteration", prefix);
+        report(key, st.iterationsWithCommit ? double(st.journalRecords) / double(st.iterationsWithCommit) : 0, "fsyncs");
+        std::snprintf(key, sizeof(key), "%s_journal_checkpoints", prefix);
+        report(key, double(st.journalCheckpoints), "checkpoints");
+        std::snprintf(key, sizeof(key), "%s_journal_bytes", prefix);
+        report(key, double(st.journalBytes), "bytes");
+    }
     std::snprintf(key, sizeof(key), "%s_maintenance_step_max_ms", prefix);
     report(key, double(e->maintHist().maxNs.load()) / 1e6, "ms");
     std::snprintf(key, sizeof(key), "%s_maintenance_step_p99_ms", prefix);
@@ -451,6 +461,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) gArgs.push_back(argv[i]);
     machine();
     const std::string mode = argStr("mode", "scaling");
+    report("commit_journal", double(argInt("journal", 0) != 0), "mode");
     if (mode == "scaling") return modeScaling();
     if (mode == "host02") return modeHost02();
     if (mode == "dirty") return modeDirty();

@@ -305,6 +305,16 @@ int32_t Engine::open(const EngineConfig& cfgIn, std::unique_ptr<Engine>* out, st
         e->writers_[w]->ownedCount_.fetch_add(1);
         e->writers_[w]->pinned_.fetch_add(1);
     }
+    // A8: every writer's journal files exist from the start, so writer ids
+    // with journals are contiguous and replay stops at the first gap.
+    if (cfg.commitJournal) {
+        for (auto& w : e->writers_) {
+            if (w->journalOpen() < 0) {
+                if (err) *err = "commit journal create failed";
+                return FLATSQL_IO_ERR_IO;
+            }
+        }
+    }
     *out = std::move(e);
     return 0;
 }
