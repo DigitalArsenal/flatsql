@@ -69,15 +69,35 @@ std::vector<Plan> plans() {
             {"par-mpe-0", &mpeType(), 1800}, {"par-mpe-1", &mpeType(), 900},  {"par-cat-0", &catType(), 600}};
 }
 
+// Frames are built from exact values only: a fixture expression such as
+// a + b * c may be contracted to a fused multiply-add natively (arm64) and not
+// in wasm, which would change the input bytes, not the engine's output.
+std::vector<uint8_t> parityOmm(uint32_t norad, const std::string& objectId, const std::string& epoch, uint32_t v) {
+    std::vector<Field> f = {Field::str("OBJECT_NAME", "SAT-" + std::to_string(norad)),
+                            Field::str("OBJECT_ID", objectId),
+                            Field::u64("NORAD_CAT_ID", norad),
+                            Field::str("EPOCH", epoch),
+                            Field::str("CREATION_DATE", "2026-09-27T00:00:00"),
+                            Field::f64("MEAN_MOTION", 14.0 + double(v % 64) / 64.0),
+                            Field::f64("ECCENTRICITY", double(v % 128) / 1024.0),
+                            Field::f64("INCLINATION", 51.5),
+                            Field::f64("RA_OF_ASC_NODE", 120.5),
+                            Field::f64("ARG_OF_PERICENTER", 90.25),
+                            Field::f64("MEAN_ANOMALY", 270.125),
+                            Field::f64("BSTAR", 0.0009765625),
+                            Field::str("COMMENT", std::string(40, 'x'))};
+    return buildRecord(ommType(), f);
+}
+
 std::vector<uint8_t> planFrame(size_t k, const Plan& p, uint32_t i) {
     const uint32_t id = uint32_t(k) * 100000 + i;
     if (p.type == &ommType()) {
         // Every 9th record repeats the previous one (a resend: dedupe).
         const uint32_t j = (i % 9 == 8) ? i - 1 : i;
         const uint32_t jid = uint32_t(k) * 100000 + j;
-        return ommRecord(jid + 1, "P" + std::to_string(jid), parityEpoch(j * 37), 14.0 + double(j % 100) * 0.01, 40);
+        return parityOmm(jid + 1, "P" + std::to_string(jid), parityEpoch(j * 37), j);
     }
-    if (p.type == &mpeType()) return mpeRecord("E" + std::to_string(id), 1.78e9 + double(i) * 60.0, double(i % 500));
+    if (p.type == &mpeType()) return mpeRecord("E" + std::to_string(id), double(1780000000u + i * 60u), double(i % 500));
     // CAT: 150 objects updated four times each (supersede by object).
     const uint32_t obj = i % 150;
     return catRecord(700000 + obj, "C" + std::to_string(obj), "", "",
@@ -143,6 +163,9 @@ void useHostDir(Store& s, const std::string& dir) {
 
 PS_SLOW_TEST(parity_canonical_dump) {
     Store s(false, 4, true);
+    // The engine's wall clock (TOMB arrival times) is injected; the threads
+    // run on the host's monotonic clock.
+    s.cfg.clockMs = [](void*) -> int64_t { return 1790000000000ll; };
     const std::string dir = argStr("dir", "");
     if (!dir.empty()) useHostDir(s, dir);
     REQUIRE(s.open() == 0);
@@ -185,7 +208,9 @@ PS_SLOW_TEST(parity_canonical_dump) {
                         " tombs=" + std::to_string(c.tombCount) + " totalBytes=" + std::to_string(c.totalBytes));
         for (const auto& r : v.rows) {
             std::ostringstream o;
-            o << "R " << pid << " " << r.pseq << " k" << int(r.kind) << " f" << int(r.flags) << " "
+            // ATTR_IN_M says where the attributes are stored (the meta batch
+            // until a merge moves them to a-<seg>): physical, like offsets.
+            o << "R " << pid << " " << r.pseq << " k" << int(r.kind) << " f" << int(r.flags & ~kRowAttrInM) << " "
               << hex(r.cid, r.cidLen) << " e" << r.epochMs << " a" << r.arrivalMs << " n" << r.len << " t"
               << r.targetPseq << " l" << r.laneId << " s" << r.supersedeHash << " g" << r.tagHash << " c"
               << r.dataCrc;
@@ -203,11 +228,12 @@ PS_SLOW_TEST(parity_canonical_dump) {
         "SELECT _cid, _epoch, _producer FROM OMM ORDER BY _epoch DESC, _cid LIMIT 400",
         "SELECT _cid, _epoch FROM MPE ORDER BY _epoch, _cid LIMIT 400 OFFSET 700",
         "SELECT _cid, _epoch, _source FROM CAT_current ORDER BY _cid",
-        "SELECT _pseq, _cid, _epoch FROM sds_p_par-omm-1__OMM WHERE _pseq BETWEEN 100 AND 400 ORDER BY _pseq",
+        "SELECT _pseq, _cid, _epoch FROM sds_p_par_omm_1__OMM WHERE _pseq BETWEEN 100 AND 400 ORDER BY _pseq",
         "SELECT producer, live_count, live_bytes, total_count FROM flatsql_partitions ORDER BY producer",
     };
     for (const auto& q : queries) {
         Rows x = r.q(q);
+        if (x.status != 0) std::fprintf(stderr, "  query failed (%d): %s: %s\n", x.status, q.c_str(), x.error.c_str());
         CHECK_EQ(x.status, 0);
         lines.push_back("Q " + q + " rows=" + std::to_string(x.rows.size()));
         for (const auto& row : x.rows) {
