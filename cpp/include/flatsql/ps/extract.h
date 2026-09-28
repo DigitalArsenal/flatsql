@@ -113,6 +113,10 @@ public:
     bool hasSupersede() const { return !supersede_.empty(); }
     bool verifies() const { return (flags_ & kVerifyBfbs) && schema_ != nullptr; }
     uint32_t nCols() const { return nCols_; }
+    // Readers (T2): the binary schema, for column projection.
+    const reflection::Schema* schema() const { return schema_; }
+    const std::vector<uint8_t>& bfbs() const { return bfbs_; }
+    const std::string& rules() const { return rules_; }
 
     enum Flag : uint32_t {
         kVerifyBfbs = 1,
