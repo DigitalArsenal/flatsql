@@ -92,6 +92,7 @@ int32_t Registry::open(IoCtx* io, const std::string& root, bool create, std::str
         frames_++;
     }
     fslEnd_ = off;
+    reserve_ = off;
     if (off < buf.size()) {
         truncated_ = buf.size() - off;
         rc = io->truncate(log_, off);
@@ -178,10 +179,25 @@ int32_t Registry::writeFrame(uint16_t kind, const std::vector<uint8_t>& payload)
     putU16(frame.data() + 8, kind);
     if (!payload.empty()) std::memcpy(frame.data() + 10, payload.data(), payload.size());
     putU32(frame.data() + 4, crc32c(frame.data() + 8, 2 + payload.size()));
-    const int32_t rc = io_->write(log_, frame.data(), frame.size(), fslEnd_);
-    if (rc < 0) return rc;
-    fslEnd_ += frame.size();
-    return 0;
+    uint64_t off;
+    {
+        std::lock_guard<std::mutex> g(wmu_);
+        if (broken_) return FLATSQL_IO_ERR_IO;
+        off = reserve_;
+        reserve_ += frame.size();
+    }
+    const int32_t rc = io_->write(log_, frame.data(), frame.size(), off);
+    std::unique_lock<std::mutex> lk(wmu_);
+    if (rc < 0) {
+        broken_ = true;
+    } else {
+        done_[off] = frame.size();
+        for (auto it = done_.begin(); it != done_.end() && it->first == fslEnd_; it = done_.erase(it))
+            fslEnd_ += it->second;
+    }
+    wcv_.notify_all();
+    wcv_.wait(lk, [&] { return broken_ || fslEnd_ >= off + frame.size(); });
+    return broken_ && fslEnd_ < off + frame.size() ? FLATSQL_IO_ERR_IO : 0;
 }
 
 int32_t Registry::syncLog() { return io_->sync(log_); }
@@ -233,25 +249,44 @@ int32_t Registry::appendQuarantine(uint32_t pid, bool on, const std::string& rea
     return appendFrame(on ? kRegQuarantine : kRegUnquarantine, p);
 }
 
-int32_t Registry::writeHead(bool sync) {
-    uint8_t slot[kHeadSlotBytes];
-    std::memset(slot, 0, sizeof(RegistryHeadFixed) + 4);
+void Registry::encodeHead(bool durable, HeadSlot* out) {
+    static_assert(sizeof(RegistryHeadFixed) + 4 <= sizeof(out->bytes), "registry head slot");
+    std::memset(out->bytes, 0, sizeof(RegistryHeadFixed) + 4);
     RegistryHeadFixed h{};
     h.p.magic = kMagicHead;
     h.p.format = kFormat;
     h.p.kind = kHeadRegistry;
     h.p.gen = ++headGen_;
-    h.p.flags = sync ? uint32_t(kHeadDurableCkpt) : 0u;
+    h.p.flags = durable ? uint32_t(kHeadDurableCkpt) : 0u;
     h.frameCount = frames_;
-    h.fslEnd = fslEnd_;
+    {
+        std::lock_guard<std::mutex> g(wmu_);
+        h.fslEnd = fslEnd_;
+    }
     h.maxPid = maxPid_;
     h.incarnation = incarnation_;
     h.nTypes = uint32_t(types_.size());
     h.nPartitions = uint32_t(parts_.size());
-    std::memcpy(slot, &h, sizeof(h));
-    const uint32_t used = uint32_t(sizeof(h) + 4);
-    sealHeadSlot(slot, used);
-    int32_t rc = io_->write(head_, slot, used, (headGen_ % 2) * kHeadSlotBytes);
+    std::memcpy(out->bytes, &h, sizeof(h));
+    out->used = uint32_t(sizeof(h) + 4);
+    out->gen = h.p.gen;
+    sealHeadSlot(out->bytes, out->used);
+}
+
+int32_t Registry::writeHeadSlot(const HeadSlot& head) {
+    return io_->write(head_, head.bytes, head.used, (head.gen % 2) * kHeadSlotBytes);
+}
+
+void Registry::applyFrameDeferHead(uint16_t kind, const std::vector<uint8_t>& payload, HeadSlot* head) {
+    frames_++;
+    apply(kind, payload.data(), payload.size());
+    encodeHead(false, head);
+}
+
+int32_t Registry::writeHead(bool sync) {
+    HeadSlot slot;
+    encodeHead(sync, &slot);
+    int32_t rc = writeHeadSlot(slot);
     if (rc < 0) return rc;
     if (sync) {
         rc = io_->sync(head_);

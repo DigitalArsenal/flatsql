@@ -1034,17 +1034,12 @@ int32_t Engine::registerType(const std::vector<uint8_t>& config, std::string* er
     te.schemaName = cfg->schemaName();
     te.configFp = cfg->fingerprint();
     const std::vector<uint8_t> payload = Registry::encodeType(te);
-    if (rc >= 0) {
-        lk.lock();
-        t0 = monoNs();
-        rc = registry_.writeFrame(kRegTypeAdd, payload);
-        hold();
-        lk.unlock();
-    }
+    if (rc >= 0) rc = registry_.writeFrame(kRegTypeAdd, payload);
     if (rc >= 0) rc = registry_.syncLog();
     lk.lock();
     t0 = monoNs();
-    if (rc >= 0) rc = registry_.applyFrame(kRegTypeAdd, payload);
+    Registry::HeadSlot regHead;
+    if (rc >= 0) registry_.applyFrameDeferHead(kRegTypeAdd, payload, &regHead);
     if (rc >= 0) {
         std::unique_ptr<TypeOwner> t(new TypeOwner());
         std::memcpy(t->fid, te.fid, 4);
@@ -1074,6 +1069,8 @@ int32_t Engine::registerType(const std::vector<uint8_t>& config, std::string* er
     pendingReg_.erase("t" + key);
     regCv_.notify_all();
     hold();
+    lk.unlock();
+    if (rc >= 0 && regHead.used) registry_.writeHeadSlot(regHead);  // hint head, outside the lock
     return rc;
 }
 
@@ -1127,18 +1124,15 @@ int32_t Engine::registerPartition(const uint8_t* peer, size_t peerLen, const uin
     e.ordinal = e.pid - 1;
     e.ctimeMs = nowMs();
     const std::vector<uint8_t> payload = Registry::encodePartition(e);
-    int32_t rc = registry_.writeFrame(kRegPartitionAdd, payload);
-    if (rc < 0) {
-        hold();
-        return rc;
-    }
     reservedPid_ = e.pid;
     auto pr = std::make_shared<PendingReg>();
     pendingReg_["p" + key] = pr;
     hold();
     lk.unlock();
-    // Intent rule (§4.7): the frame is durable before p/<pid>/ exists.
-    rc = registry_.syncLog();
+    // Intent rule (§4.7): the frame is durable before p/<pid>/ exists. No
+    // lock is held across the frame's pwrite or the fsync.
+    int32_t rc = registry_.writeFrame(kRegPartitionAdd, payload);
+    if (rc >= 0) rc = registry_.syncLog();
     if (rc >= 0) {
         PathBuf hp;
         pathPartition(&hp, cfg_.root.c_str(), e.pid, "h.fsh");
@@ -1151,7 +1145,8 @@ int32_t Engine::registerPartition(const uint8_t* peer, size_t peerLen, const uin
     }
     lk.lock();
     t0 = monoNs();
-    if (rc >= 0) rc = registry_.applyFrame(kRegPartitionAdd, payload);
+    Registry::HeadSlot regHead;
+    if (rc >= 0) registry_.applyFrameDeferHead(kRegPartitionAdd, payload, &regHead);
     if (rc >= 0) {
         const uint8_t w = leastLoadedWriter();
         Partition* p = makePartition(e, w);
@@ -1181,6 +1176,8 @@ int32_t Engine::registerPartition(const uint8_t* peer, size_t peerLen, const uin
     pendingReg_.erase("p" + key);
     regCv_.notify_all();
     hold();
+    lk.unlock();
+    if (rc >= 0 && regHead.used) registry_.writeHeadSlot(regHead);  // hint head, outside the lock
     return rc;
 }
 

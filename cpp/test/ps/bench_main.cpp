@@ -454,6 +454,8 @@ int modeSoak() {
     report("soak_seqlock_writer_p999_ms", double(sq.percentileNs(0.999)) / 1e6, "ms");
     report("soak_seqlock_writer_sections", double(sq.count.load()), "sections");
     report("soak_registration_lock_max_ms", double(rg.maxNs.load()) / 1e6, "ms");
+    report("soak_registration_lock_p999_ms", double(rg.percentileNs(0.999)) / 1e6, "ms");
+    report("soak_registration_lock_holds", double(rg.count.load()), "holds");
     report("soak_ack_p99_ms", pct(lat, 0.99), "ms");
     return 0;
 }
