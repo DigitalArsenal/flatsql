@@ -91,22 +91,28 @@ describe('partition store parity vectors', () => {
     }
   }, 600000);
 
-  runWasmEdge('deterministic mode writes the same bytes under the SDK WasmEdge C runner', async () => {
+  runWasmEdge('deterministic mode writes the same bytes under the SDK WasmEdge C runner', () => {
     // The SDK's isomorphic loader runs a threaded command on its wasi-threads
-    // C runner (it builds and caches the patched runtime on first use).
-    const sdkLoader = 'space-data-module-sdk/host/isomorphic';
-    const { loadModule } = await import(sdkLoader);
-    const harness = await loadModule({
-      wasmSource: MEMIO_WASM,
-      args: ['--test=parity_deterministic_bytes'],
-      runtimeKind: 'wasmedge',
+    // C runner (it builds and caches the patched runtime on first use). It
+    // runs in its own process: its module graph is plain ESM that this Jest
+    // environment does not load.
+    const code = `
+      import { loadModule } from 'space-data-module-sdk/host/isomorphic';
+      const harness = await loadModule({ wasmSource: process.argv[1], args: ['--test=parity_deterministic_bytes'], runtimeKind: 'wasmedge' });
+      try {
+        process.stdout.write(Buffer.from(await harness.invokeRaw(new Uint8Array())));
+      } finally {
+        await harness.destroy();
+      }`;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', code, MEMIO_WASM], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 3600000,
     });
-    try {
-      const stdout = Buffer.from(await harness.invokeRaw(new Uint8Array())).toString('utf8');
-      const nMem = parityLine(native(['--test=parity_deterministic_bytes']), 'deterministic_bytes');
-      expect(parityLine(stdout, 'deterministic_bytes')).toBe(nMem);
-    } finally {
-      await harness.destroy();
-    }
+    if (r.status !== 0) console.log(r.stderr);
+    expect(r.status).toBe(0);
+    const nMem = parityLine(native(['--test=parity_deterministic_bytes']), 'deterministic_bytes');
+    expect(parityLine(r.stdout, 'deterministic_bytes')).toBe(nMem);
   }, 3600000);
 });

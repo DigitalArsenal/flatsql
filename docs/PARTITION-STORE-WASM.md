@@ -166,7 +166,16 @@ Filled in when the release is published.
    the ack-p99 ratio is reported (1.066) and, as on any box with fewer than 8
    hardware threads, not enforced: WASI reports one CPU. The same holds for the
    T2 latency bounds (`latencyBoxQuiet` is false under wasm): they are native
-   Linux-8 acceptance numbers.
+   Linux-8 acceptance numbers. `lane_needs_bulk_under_1ms_zero_rows_T2_4`
+   enforced its 1 ms p99 on every machine; it now follows the same rule
+   (enforced on a quiet box, reported elsewhere) after a Debug build on the
+   loaded 3-vCPU macOS CI runner and the Node host on the Linux runner
+   measured past it. Its status, rows and examined counts are enforced
+   everywhere. `type_arrivals_segments_and_fence_A15` caps type commits at 40
+   rows: a slow type owner labeled more than 40 rows in one commit and filled
+   an empty arrivals segment past its 40-entry seal (a batch never splits
+   across segments), which failed on the macOS runner (main 8aea463) and
+   under the Node host.
 4. **The C runner lane runs the memio command.** The SDK's WasmEdge
    wasi-threads C runner provides WASI and thread-spawn only, so the byte
    vectors there use the in-memory host, which is also compared natively and
