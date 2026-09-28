@@ -199,6 +199,16 @@ struct BatchHeader {
     uint32_t l0Bytes;
 };
 static_assert(sizeof(BatchHeader) == 64, "BatchHeader is 64 bytes");
+// BatchHeader.flags
+enum BatchFlag : uint16_t {
+    kBatchHasData = 1,
+    // A8: written under the commit journal. Its d/l bytes were not synced
+    // before it, so open adopts it only when the journal replayed it.
+    kBatchJournaled = 2,
+};
+// TypeBatchHeader.flags bit for the same rule (the other bits live in
+// type_owner.cpp).
+constexpr uint16_t kTypeBatchJournaled = 8;
 
 struct BatchTrailer {
     uint32_t magic;
@@ -429,6 +439,48 @@ struct ArrivalFence {
 static_assert(sizeof(ArrivalFence) == 40, "ArrivalFence is 40 bytes");
 constexpr const char* kArrivalFenceName = "g.fsf";
 
+// ---- A8 per-writer commit journal (§22.4 ruling 5) --------------------------
+// One record per commit round of a writer: every byte the round wrote to
+// partition and type files (d, l, m, g, g.fsf, type m) as offset-addressed
+// parts. The round fsyncs only the journal; the files themselves are synced
+// by an asynchronous checkpoint, after which the journal file is truncated.
+// Open replays both journal files of every writer (records in seq order) into
+// the files, fsyncs them, then runs the normal durable-tail open.
+constexpr uint32_t kMagicJournal = fourcc('F', 'S', 'J', 'R');
+constexpr uint32_t kMagicJournalEnd = fourcc('F', 'S', 'J', 'T');
+struct JournalRecHeader {
+    uint32_t magic;
+    uint16_t ver;
+    uint16_t flags;
+    uint32_t len;          // whole record, trailer included (multiple of 8)
+    uint32_t nParts;
+    uint64_t seq;          // per writer, strictly increasing across both files
+    uint32_t incarnation;
+    uint32_t writer;
+};
+static_assert(sizeof(JournalRecHeader) == 32, "JournalRecHeader layout");
+enum JournalFile : uint8_t {
+    kJrnData = 1,        // p/<id>/d-<seg>.fsd
+    kJrnMeta = 2,        // p/<id>/m-<seg>.fsl
+    kJrnLanes = 3,       // p/<id>/l.fsl
+    kJrnArrivals = 4,    // t/<fid>/g-<seg>.fsg
+    kJrnFence = 5,       // t/<fid>/g.fsf
+    kJrnTypeMeta = 6,    // t/<fid>/m-<seg>.fsl
+};
+struct JournalPart {
+    uint8_t file;
+    uint8_t rsv[3];
+    uint32_t len;          // payload bytes (padded to 8 in the record)
+    uint32_t id;           // pid, or the fid bytes
+    uint32_t seg;
+    uint64_t off;
+};
+static_assert(sizeof(JournalPart) == 24, "JournalPart layout");
+struct JournalTrailer {
+    uint32_t crc;          // CRC32C of header + parts
+    uint32_t magic;        // kMagicJournalEnd
+};
+
 // ---- little-endian helpers -------------------------------------------------
 inline void putU16(uint8_t* p, uint16_t v) { std::memcpy(p, &v, 2); }
 inline void putU32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
@@ -499,6 +551,8 @@ void pathTypeSeg(PathBuf* out, const char* root, const uint8_t fid[4], char lett
                  uint32_t seg, const char* ext);
 void pathTypeRun(PathBuf* out, const char* root, const uint8_t fid[4], uint32_t gen);
 void pathTypeConfig(PathBuf* out, const char* root, const uint8_t fid[4], uint64_t fp);
+// A8 commit journal of writer w, file 0 (a) or 1 (b).
+void pathJournal(PathBuf* out, const char* root, uint32_t writer, int file);
 void pathPartitionDir(PathBuf* out, const char* root, uint32_t pid);
 void pathTypeDir(PathBuf* out, const char* root, const uint8_t fid[4]);
 

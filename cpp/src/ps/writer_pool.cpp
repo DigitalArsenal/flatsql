@@ -305,6 +305,10 @@ void Writer::runJobs() {
         } else if (jobOwners_[i].kind == 2) {
             TypeOwner* t = static_cast<TypeOwner*>(jobOwners_[i].owner);
             if (t->st) t->st->err = jobResults_[i];
+        } else if (jobOwners_[i].kind == 5) {
+            // A8 journal: the whole round failed (never retried).
+            jRoundFailed_ = true;
+            jFailed_ = true;
         }
     }
     jobs_.clear();
@@ -315,6 +319,9 @@ void Writer::commitRound() {
     const EngineConfig& cfg = eng_->config();
     const uint64_t t0 = monoNs();
     HotPathScope hot;
+    // A8 fallback: with the commit journal, the round's only fsync is the
+    // journal's; the files are synced by the journal checkpoint.
+    const bool journal = cfg.commitJournal;
     // Checkpoint heads written by the previous round are synced in this one.
     for (const auto& hs : headSyncs_) {
         if (hs.second == 3) queueSync(static_cast<Partition*>(hs.first)->h, hs.first, 3);
@@ -326,12 +333,6 @@ void Writer::commitRound() {
         Staged* st = p->st;
         st->commitStartNs = t0;
         if (!st->batch) continue;
-        if (st->mergeDone) {
-            queueSync(p->mplan.r, p, 1);
-            queueSync(p->mplan.a, p, 1);
-            queueSync(p->mplan.run.file, p, 1);
-            queueSync(p->mplan.mf, p, 1);
-        }
         if (st->dBytes) {
             framedCommits_.fetch_add(1, std::memory_order_relaxed);
             int32_t rc = ensureExtent(&io_, p->d, &p->dExtent, st->dOff + st->dBytes, cfg.zeroFillStep);
@@ -340,7 +341,7 @@ void Writer::commitRound() {
                 st->err = rc;
                 continue;
             }
-            queueSync(p->d, p, 1);
+            if (!journal) queueSync(p->d, p, 1);
         }
         if (st->laneFrameBytes) {
             const int32_t rc = io_.write(p->l, st->laneFrames, st->laneFrameBytes, st->lOff);
@@ -348,15 +349,11 @@ void Writer::commitRound() {
                 st->err = rc;
                 continue;
             }
-            queueSync(p->l, p, 1);
+            if (!journal) queueSync(p->l, p, 1);
         }
     }
     for (TypeOwner* t : dirtyTypes_) {
         StagedType* st = t->st;
-        if (st->mergeDone) {
-            queueSync(t->mergeRun.file, t, 2);
-            queueSync(t->mergeMf, t, 2);
-        }
         if (st->nArrivals) {
             FileRef& g = st->gSeal ? t->gNext : t->g;
             const int32_t rc = io_.write(g, st->arrivals, size_t(st->nArrivals) * kArrivalBytes, st->gOff);
@@ -364,7 +361,7 @@ void Writer::commitRound() {
                 st->err = rc;
                 continue;
             }
-            queueSync(g, t, 2);
+            if (!journal) queueSync(g, t, 2);
         }
         if (st->gSeal) {
             // A15: the sealed segment's fence entry, durable before the
@@ -374,7 +371,7 @@ void Writer::commitRound() {
                 st->err = rc;
                 continue;
             }
-            queueSync(t->gFence, t, 2);
+            if (!journal) queueSync(t->gFence, t, 2);
         }
     }
     commitSyncRounds_.fetch_add(jobs_.empty() ? 0 : 1, std::memory_order_relaxed);
@@ -389,7 +386,7 @@ void Writer::commitRound() {
             st->err = rc;
             continue;
         }
-        queueSync(p->m, p, 1);
+        if (!journal) queueSync(p->m, p, 1);
         batches_.fetch_add(1, std::memory_order_relaxed);
     }
     for (TypeOwner* t : dirtyTypes_) {
@@ -401,10 +398,26 @@ void Writer::commitRound() {
             st->err = rc;
             continue;
         }
-        queueSync(t->m, t, 2);
+        if (!journal) queueSync(t->m, t, 2);
     }
+    if (journal) journalAppendRound();
     commitSyncRounds_.fetch_add(jobs_.empty() ? 0 : 1, std::memory_order_relaxed);
-    runJobs();  // sync round 2
+    runJobs();  // sync round 2 (journal mode: the only one)
+    if (journal) {
+        if (jRoundFailed_) {
+            for (Partition* p : dirty_) {
+                Staged* st = p->st;
+                if (!st->batch) continue;
+                if (!st->err) st->err = FLATSQL_IO_ERR_IO;
+                p->quarantined = true;
+                p->ring->state.store(kRingQuarantined, std::memory_order_release);
+            }
+            for (TypeOwner* t : dirtyTypes_)
+                if (!t->st->err) t->st->err = FLATSQL_IO_ERR_IO;
+        } else {
+            journalTrack();
+        }
+    }
     // Publish: heads, then acks (§6.4 steps 5-6); checkpoint heads are synced.
     const uint64_t nowNsV = monoNs();
     for (Partition* p : dirty_) {
@@ -422,8 +435,9 @@ void Writer::commitRound() {
         const bool hadBatch = st->batch != nullptr;
         const uint64_t startNs = st->commitStartNs;
         if (hadBatch) {
-            const bool due = (nowNsV - p->lastCkptNs) >= uint64_t(cfg.ckptIntervalMs) * 1000000ull ||
-                             p->metaSinceCkpt + st->batchLen >= cfg.ckptMetaBytes;
+            // Journal mode: heads become durable at the journal checkpoint.
+            const bool due = !journal && ((nowNsV - p->lastCkptNs) >= uint64_t(cfg.ckptIntervalMs) * 1000000ull ||
+                                          p->metaSinceCkpt + st->batchLen >= cfg.ckptMetaBytes);
             // State first (includes a segment switch), then the head, then acks.
             Staged copy = *st;
             copy.consumed = false;
@@ -477,8 +491,8 @@ void Writer::commitRound() {
             typeRollback(this, t, st);
             continue;
         }
-        const bool due = (nowNsV - t->lastCkptNs) >= uint64_t(cfg.ckptIntervalMs) * 1000000ull ||
-                         t->metaSinceCkpt + st->batchLen >= cfg.ckptMetaBytes;
+        const bool due = !journal && ((nowNsV - t->lastCkptNs) >= uint64_t(cfg.ckptIntervalMs) * 1000000ull ||
+                                      t->metaSinceCkpt + st->batchLen >= cfg.ckptMetaBytes);
         typePublish(this, t, st);
         if (typeWriteHead(this, t, due) >= 0 && due) {
             headSyncs_.push_back({t, 4});
@@ -697,6 +711,7 @@ void Writer::releaseOwnership(Partition* p, uint8_t target) {
 
 void Writer::maintenance() {
     const EngineConfig& cfg = eng_->config();
+    if (cfg.commitJournal) journalMaintenance(false);
     const int64_t nowMsV = eng_->nowMs();
     const uint64_t nowNsV = monoNs();
     const size_t n = owned_.size();
@@ -868,6 +883,13 @@ int32_t Engine::stop(uint64_t deadlineMs) {
             }
         }
     }
+    // A8 journal: every journaled byte into durable files, journals emptied,
+    // so the next open replays nothing.
+    for (auto& w : writers_) w->journalMaintenance(true);
+    for (auto& w : writers_) {
+        w->io().close(&w->jf_[0]);
+        w->io().close(&w->jf_[1]);
+    }
     for (auto& w : writers_) {
         for (Partition* p : w->owned_) {
             partitionCool(w.get(), p);
@@ -906,6 +928,10 @@ void Engine::abandon() {
     helpers_.clear();
     syncPool_.stop();
     started_ = false;
+    for (auto& w : writers_) {
+        w->io().close(&w->jf_[0]);
+        w->io().close(&w->jf_[1]);
+    }
     for (auto& w : writers_) {
         for (Partition* p : w->owned_) {
             partitionCool(w.get(), p);
@@ -1025,6 +1051,13 @@ EngineStats Engine::stats() const {
     s.mergeNotOwner = cMergeNotOwner.load();
     s.helperStalls = cHelperStalls.load();
     s.handoffHelperWaits = cHandoffHelperWaits.load();
+    for (const auto& w : writers_) {
+        s.journalRecords += w->jRecords_.load();
+        s.journalBytes += w->jBytes_.load();
+        s.journalCheckpoints += w->jCheckpoints_.load();
+    }
+    s.journalReplayRecords = journalReplayRecords;
+    s.openJournalBytes = openIoStats_.readBytes(FileClass::Journal);
     for (const auto& t : typeStore_) s.noticesDropped += t->noticesDropped.load();
     s.framesParsedAtOpen = framesParsedAtOpen;
     s.openReadBytes = openIoStats_.totalReadBytes();

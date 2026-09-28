@@ -19,6 +19,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <tuple>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -66,6 +68,11 @@ struct EngineConfig {
     uint64_t zeroFillStep = 1ull << 20;    // A8 zero-fill ahead (0 = off)
     uint32_t noticeQueue = 1024;           // A25 (a full queue drops the notice)
     uint64_t arrivalsSegBytes = 64ull << 20;  // A15: arrivals segment seal size
+    // A8 fallback (§22.4 ruling 5): one fdatasync per writer iteration on a
+    // per-writer commit journal, files synced by an async checkpoint.
+    bool commitJournal = false;
+    uint64_t journalCkptBytes = 8ull << 20;
+    uint32_t journalCkptMs = 1000;
     uint32_t typeCommitRows = 8192;        // rows labeled per type commit
     uint32_t reconcileStep = 4096;         // instances per RECONCILE step
     uint32_t idleReclaimMs = 1000;         // ring slabs of idle partitions
@@ -384,6 +391,8 @@ struct Partition {
     ReconcileState rec;
     std::vector<PendingKill> kills;  // type-level kills from the mailbox
     std::vector<TombRange> ranges;   // TOMB_RANGE commands, front first
+    uint64_t jCkptTag = 0;           // A8: (writer << 32 | checkpoint epoch) that tracks it
+    uint32_t jCkptIdx = 0;           // its entry in that writer's list
     uint8_t mergePhase = kMergeIdle;
     MergePlan mplan;
     uint8_t pendingCtl[256];         // ctl records for the next batch
@@ -462,6 +471,9 @@ struct TypeOwner {
     FileRef h, m, g;
     FileRef gNext;                   // A15: the next arrivals segment while a seal is staged
     FileRef gFence;                  // A15: g.fsf
+    bool openHeadDue = false;        // open adopted a tail: durable head after attach
+    uint64_t jCkptTag = 0;           // A8 checkpoint tracking (see Partition)
+    uint32_t jCkptIdx = 0;
     uint64_t fenceLen = 0;           // durable fence entries (bytes)
     uint64_t gSegLastGseq = 0;       // last arrival gseq in the current segment
     std::unordered_map<uint64_t, FileRef> partM;  // read handles keyed (pid << 32 | mSeg)
@@ -603,6 +615,12 @@ private:
     void runJobs();
     void queueSync(const FileRef& f, void* owner, uint8_t ownerKind);
     void flushHeadSyncs();
+    // A8 commit journal (journal.cpp).
+    int32_t journalOpen();
+    void journalAppendRound();          // writes this round's record, queues its sync
+    void journalTrack();                // after a successful round
+    void journalMaintenance(bool final); // async checkpoint (final: synchronous, at stop)
+    void journalCheckpointPaths(std::vector<std::string>* paths);
 
     Engine* eng_;
     uint8_t id_;
@@ -642,6 +660,34 @@ private:
     std::atomic<uint64_t> batches_{0};
     std::thread thread_;
     uint32_t osTid_ = 0;
+    // A8 commit journal state (owner thread only, except ckptResult_).
+    FileRef jf_[2];
+    int jcur_ = 0;
+    uint64_t jEnd_[2] = {0, 0};
+    uint64_t jExtent_[2] = {0, 0};
+    uint64_t jSeq_ = 0;
+    bool jFailed_ = false;
+    bool jRoundFailed_ = false;
+    uint32_t jEpoch_ = 1;
+    // Files dirtied in this checkpoint epoch: one entry per partition/type
+    // with the segment range written (owner-side copies; a partition that
+    // moves away keeps its entry here).
+    struct JEntry {
+        uint32_t pid = 0;          // 0 for a type
+        uint8_t fid[4] = {0, 0, 0, 0};
+        uint32_t lo = 0, hi = 0;   // d/m segments (type: g segments)
+        uint32_t mLo = 0, mHi = 0; // type m segments
+    };
+    std::vector<JEntry> jParts_;        // reserved
+    std::vector<JEntry> jTypes_;
+    bool jCkptInFlight_ = false;
+    int jCkptRetire_ = 0;
+    uint64_t jLastCkptNs_ = 0;
+    std::shared_ptr<std::atomic<int32_t>> jCkptResult_;
+    std::vector<uint8_t> jStage_;       // small parts coalesced (reserved)
+    std::atomic<uint64_t> jRecords_{0};
+    std::atomic<uint64_t> jBytes_{0};
+    std::atomic<uint64_t> jCheckpoints_{0};
 };
 
 // ---- engine -------------------------------------------------------------------------
@@ -666,6 +712,11 @@ struct EngineStats {
     uint64_t mergeNotOwner = 0;          // helper found its epoch revoked (A26)
     uint64_t helperStalls = 0;           // injected helper stalls (tests)
     uint64_t handoffHelperWaits = 0;     // aborts that waited for an in-flight helper
+    uint64_t journalRecords = 0;         // A8 commit journal
+    uint64_t journalBytes = 0;
+    uint64_t journalCheckpoints = 0;
+    uint64_t journalReplayRecords = 0;   // replayed at open
+    uint64_t openJournalBytes = 0;
     uint64_t noticesDropped = 0;
     uint64_t framesParsedAtOpen = 0;
     uint64_t openReadBytes = 0;
@@ -748,6 +799,7 @@ public:
         cHelperStalls{0}, cHelperJobs{0}, cHandoffHelperWaits{0};
     uint64_t framesParsedAtOpen = 0;
     uint64_t adoptedBatches = 0;
+    uint64_t journalReplayRecords = 0;
 
     // Internals shared by the implementation files.
     SyncPool& syncPool() { return syncPool_; }
@@ -763,6 +815,14 @@ private:
     Engine() = default;
     static int64_t wallMsNow();
     int32_t openStore(std::string* err);
+    int32_t replayJournals(std::string* err);  // A8 (journal.cpp)
+    int32_t writeOpenTypeHeads(std::string* err);
+public:
+    // A8: was this meta batch (partition kJrnMeta / type kJrnTypeMeta part)
+    // replayed from a commit journal by this open?
+    bool journalReplayed(uint8_t file, uint32_t id, uint32_t seg, uint64_t off) const;
+private:
+    std::set<std::tuple<uint8_t, uint32_t, uint32_t, uint64_t>> journalMeta_;
     int32_t openPartitions(std::string* err);
     int32_t openTypes(std::string* err);
     int32_t loadTypeConfig(const TypeEntry& t, std::string* err);

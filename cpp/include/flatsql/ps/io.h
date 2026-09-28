@@ -48,6 +48,7 @@ enum class FileClass : uint8_t {
     Arrivals,   // g-<seg>.fsg
     Config,     // t/<fid>/s-<fp>.fsc
     Directory,
+    Journal,    // j/<writer>-<a|b>.fsj (A8 commit journal)
     Count
 };
 

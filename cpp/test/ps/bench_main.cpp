@@ -147,8 +147,7 @@ struct Bench {
         const uint32_t nTypes = uint32_t(argInt("types", 8));
         types.clear();
         for (uint32_t k = 0; k < nTypes; k++) {
-            char fid[5];
-            std::snprintf(fid, sizeof(fid), "B%03u", k);
+            char fid[5] = {'B', char('0' + (k / 100) % 10), char('0' + (k / 10) % 10), char('0' + k % 10), 0};
             types.push_back(makeTypeVariant(0, fid, std::string(fid) + ".fbs"));
             e->registerType(types.back().config, &err);
         }

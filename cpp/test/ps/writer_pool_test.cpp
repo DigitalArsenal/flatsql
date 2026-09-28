@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <random>
+#include <map>
 #include <set>
 #include <thread>
 
@@ -480,8 +481,9 @@ PS_TEST(writer_memory_2048_partitions_64_active_T1_9) {
     s.close();
 }
 
-PS_TEST(writer_hot_path_zero_malloc_T1_8) {
+static void hotPathRun(bool journal) {
     Store s(true, 1, true);
+    s.cfg.commitJournal = journal;
     REQUIRE(s.open() == 0);
     s.registerTypes({&ommType()});
     std::vector<uint32_t> pids;
@@ -504,11 +506,16 @@ PS_TEST(writer_hot_path_zero_malloc_T1_8) {
     for (size_t i = 0; i < prods.size(); i++) prods[i].waitAcked(last[i], 30000000000ull);
     const uint64_t hot = gHotAllocs.load() - before;
     const uint64_t rows = s.e->stats().rowsAppended - rows0;
-    report("hot_path_allocations", double(hot), "allocations");
-    report("hot_path_records", double(rows), "records");
+    report(journal ? "hot_path_allocations_journal" : "hot_path_allocations", double(hot), "allocations");
+    report(journal ? "hot_path_records_journal" : "hot_path_records", double(rows), "records");
     CHECK_EQ(rows, uint64_t(4000));
     CHECK_EQ(hot, uint64_t(0));
     s.close();
+}
+
+PS_TEST(writer_hot_path_zero_malloc_T1_8) {
+    hotPathRun(false);
+    hotPathRun(true);  // A8 commit journal
 }
 
 PS_TEST(writer_control_transactions_single_batch) {
@@ -650,5 +657,93 @@ PS_TEST(writer_tomb_range_spares_supersede_heads) {
     CHECK_EQ(ck.tombs, 2);  // ISS v1 by supersede, the identity-less record by TOMB_RANGE
     checkCounters(cv);
     CHECK_EQ(cv.head.counters.liveCount, uint64_t(1));
+    s.close();
+}
+
+PS_TEST(writer_commit_journal_one_sync_per_round_A8) {
+    // A8 fallback (§22.4 ruling 5): one journal fsync per committing round,
+    // files synced by asynchronous checkpoints; a crash dropping every
+    // unsynced write keeps every acked record; a clean stop empties the
+    // journals.
+    Store s(true, 2, true);
+    s.cfg.commitJournal = true;
+    s.cfg.journalCkptBytes = 32u << 10;
+    s.cfg.journalCkptMs = 20;
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType(), &mpeType()});
+    std::vector<uint32_t> pids;
+    for (int i = 0; i < 10; i++)
+        pids.push_back(s.partition("jp" + std::to_string(i), (i % 2) ? mpeType() : ommType()));
+    std::vector<std::unique_ptr<Producer>> prods;
+    for (uint32_t pid : pids) prods.emplace_back(new Producer(s.e.get(), pid));
+    const auto attr = buildRecordAttr("jp", "prov", "src", "b1");
+    std::vector<std::vector<std::pair<uint64_t, std::vector<uint8_t>>>> sent(pids.size());
+    auto wave = [&](int from, int n) {
+        std::vector<uint64_t> last(pids.size(), 0);
+        for (int i = from; i < from + n; i++) {
+            for (size_t k = 0; k < pids.size(); k++) {
+                auto f = (k % 2) ? mpeRecord("J" + std::to_string(i), 1.7e9 + i, double(k))
+                                 : ommRecord(uint32_t(60000 + i), "J", epochAt(i), 12.0 + double(k));
+                last[k] = send(s.e.get(), *prods[k], f, attr, i);
+                sent[k].push_back({last[k], f});
+            }
+        }
+        for (size_t k = 0; k < pids.size(); k++) CHECK_EQ(prods[k]->waitAcked(last[k], 10000000000ull), 0);
+    };
+    for (int w = 0; w < 20; w++) wave(w * 20, 20);
+    // A consistent snapshot: the counters move at different points of a
+    // round, so wait until a round is not in flight (no new work arrives).
+    EngineStats st = s.e->stats();
+    for (int i = 0; i < 1000; i++) {
+        sleepNs(2000000);
+        const EngineStats again = s.e->stats();
+        const bool same = again.iterationsWithCommit == st.iterationsWithCommit &&
+                          again.commitSyncRounds == st.commitSyncRounds && again.journalRecords == st.journalRecords;
+        st = again;
+        if (same) break;
+    }
+    report("journal_commit_rounds", double(st.iterationsWithCommit), "rounds");
+    report("journal_sync_rounds", double(st.commitSyncRounds), "rounds");
+    report("journal_records", double(st.journalRecords), "records");
+    report("journal_checkpoints", double(st.journalCheckpoints), "checkpoints");
+    CHECK(st.journalRecords > 0);
+    CHECK_EQ(st.journalRecords, st.commitSyncRounds);          // one fsync per round
+    CHECK(st.commitSyncRounds <= st.iterationsWithCommit);
+    CHECK(st.journalCheckpoints > 0);
+    // Acked just before a crash that drops every unsynced write.
+    wave(400, 5);
+    for (auto& p : prods) p.reset();
+    s.crash(FaultFs::kDropAll, 7);
+    REQUIRE(s.open() == 0);
+    st = s.e->stats();
+    report("journal_replayed_records", double(st.journalReplayRecords), "records");
+    CHECK_EQ(st.openDataBytes, uint64_t(0));
+    Inspector ins(s.fs.get(), s.root);
+    int missing = 0, bad = 0;
+    for (size_t k = 0; k < pids.size(); k++) {
+        PartView v = ins.partition(pids[k]);
+        REQUIRE(v.ok && v.err.empty());
+        checkCounters(v);
+        std::map<std::string, const RecRow*> puts;
+        for (const auto& row : v.rows)
+            if (row.kind == kRowPut) puts[std::string(reinterpret_cast<const char*>(row.cid), kCidLen)] = &row;
+        for (const auto& sr : sent[k]) {
+            uint8_t cid[kCidLen];
+            frameCid(sr.second, cid);
+            auto it = puts.find(std::string(reinterpret_cast<const char*>(cid), kCidLen));
+            if (it == puts.end()) {
+                missing++;
+                continue;
+            }
+            if (ins.frame(pids[k], *it->second) != sr.second) bad++;
+        }
+    }
+    CHECK_EQ(missing, 0);
+    CHECK_EQ(bad, 0);
+    s.close();
+    // A clean stop checkpoints everything: the next open replays nothing.
+    REQUIRE(s.open() == 0);
+    CHECK_EQ(s.e->stats().journalReplayRecords, uint64_t(0));
+    CHECK_EQ(s.e->stats().openJournalBytes, uint64_t(0));
     s.close();
 }

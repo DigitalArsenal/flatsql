@@ -753,6 +753,7 @@ else()
         src/ps/index_l1.cpp
         src/ps/ring.cpp
         src/ps/extract.cpp
+        src/ps/journal.cpp
         src/ps/registry.cpp
         src/ps/partition_log.cpp
         src/ps/merge.cpp

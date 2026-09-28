@@ -602,6 +602,13 @@ int32_t writeMergeOutputs(IoCtx* io, const char* root, uint32_t pid, MergePlan& 
         m.run.run.reset(new L1Run());
         rc = m.run.run->load(io, m.run.file, m.run.fileLen);
     }
+    // Outputs are durable before MERGE_DONE is staged: the builder syncs them,
+    // off the commit path (no sync round of the writer carries them).
+    if (rc >= 0 && !planStillOwns(m)) rc = kMergeNotOwner;
+    if (rc >= 0) rc = io->sync(m.r);
+    if (rc >= 0) rc = io->sync(m.a);
+    if (rc >= 0) rc = io->sync(m.run.file);
+    if (rc >= 0) rc = io->sync(m.mf);
     return rc;
 }
 

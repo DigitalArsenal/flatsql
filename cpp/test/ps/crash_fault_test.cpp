@@ -104,6 +104,11 @@ struct Harness {
         s.cfg.sealRecords = (seed & 2) ? 24 : 200;  // some stores seal often
         s.cfg.zeroFillStep = (seed & 1) ? (64u << 10) : 0;
         s.cfg.arrivalsSegBytes = (seed & 8) ? 24 * 16 : 24 * 256;  // A15 arrivals seals
+        // A8 fallback: half the stores commit through the per-writer journal,
+        // with frequent checkpoints (journal switch + truncate under crashes).
+        s.cfg.commitJournal = (seed & 16) != 0;
+        s.cfg.journalCkptBytes = (seed & 32) ? (16u << 10) : (256u << 10);
+        s.cfg.journalCkptMs = 20;
     }
 
     TestType& type(int k) { return crashTypes(nTypes)[size_t(k)]; }
@@ -295,6 +300,7 @@ struct Harness {
     uint64_t ackedTotal = 0, adoptedTotal = 0;
     std::map<int, size_t> arrivalSegsMax;  // sealed arrivals segments seen per type
     uint64_t rangeCmds = 0;                // TOMB_RANGE commands issued
+    uint64_t journalReplayed = 0;          // A8 journal records replayed at reopen
     void crash(FaultFs::CrashMode mode) {
         if (s.e) {
             const EngineStats st = s.e->stats();
@@ -333,6 +339,7 @@ struct Harness {
         }
         const EngineStats st = s.e->stats();
         adoptedTotal += st.adoptedBatches;
+        journalReplayed += st.journalReplayRecords;
         CHECK_EQ(st.openDataBytes, uint64_t(0));
         CHECK_EQ(st.framesParsedAtOpen, uint64_t(0));
         // A10: durable pids keep their identity.
@@ -393,7 +400,16 @@ struct Harness {
                     continue;
                 }
                 computeCid(f.data() + 4, f.size() - 4, c);
-                if (std::memcmp(c, a.cid, kCidLen) != 0) badBytes++;
+                if (std::memcmp(c, a.cid, kCidLen) != 0) {
+                    badBytes++;
+                    if (badBytes <= 3) {
+                        const RecRow& rr = *it->second;
+                        size_t nz = 0;
+                        for (uint8_t b : f) nz += b != 0;
+                        std::fprintf(stderr, "    pid %u pseq %llu seg %u off %u len %u flags %x frameSize %zu nonzero %zu\n", p.pid,
+                                     (unsigned long long)rr.pseq, rr.seg, rr.off, rr.len, rr.flags, f.size(), nz);
+                    }
+                }
             }
             if (missing || badBytes) {
                 std::fprintf(stderr, "  [%s] pid %u: %d acked records missing, %d with different bytes\n", phase,
@@ -488,8 +504,26 @@ struct Harness {
             p.lost.clear();
             p.inflight.swap(again);
         }
-        for (size_t k = 0; k < parts.size(); k++)
-            if (!parts[k].inflight.empty()) prods[k]->waitAcked(parts[k].inflight.back().rseq, 30000000000ull);
+        for (size_t k = 0; k < parts.size(); k++) {
+            if (parts[k].inflight.empty()) continue;
+            const uint64_t t0 = monoNs();
+            const int32_t wr = prods[k]->waitAcked(parts[k].inflight.back().rseq, 30000000000ull);
+            if (wr != 0 && wr != FLATSQL_IO_ERR_ACCESS) gFailures++;  // a stall (quarantine is an outcome)
+            if (monoNs() - t0 > 5000000000ull) {
+                Partition* pp = s.e->partition(parts[k].pid);
+                RingDesc* r = pp->ring;
+                std::fprintf(stderr,
+                             "  STALL pid %u rc %d waited %.1fs want %llu acked %llu head %llu tail %llu state %u "
+                             "quarantined %d nL0 %u merge %u owner %u labeled %llu durable %llu l0first %llu+%u l0seg %u mseg %u warm %d\n",
+                             parts[k].pid, wr, double(monoNs() - t0) / 1e9,
+                             (unsigned long long)parts[k].inflight.back().rseq,
+                             (unsigned long long)r->ackedRseq.load(), (unsigned long long)r->head.load(),
+                             (unsigned long long)r->tail.load(), unsigned(r->state.load()), int(pp->quarantined),
+                             pp->nL0, unsigned(pp->mergePhase), pp->ownerWriter.load(),
+                             (unsigned long long)pp->labeledThrough.load(), (unsigned long long)pp->durablePseqHi.load(),
+                             (unsigned long long)pp->l0[0].firstPseq, pp->l0[0].nRows, pp->l0[0].mSeg, pp->mSeg, int(pp->warm));
+            }
+        }
         pollAcks(prods, ctl);
     }
 };
@@ -497,7 +531,7 @@ struct Harness {
 void runTrials(int trials, int types, uint32_t partitions, uint64_t seed0) {
     int done = 0;
     EngineStats sum{};
-    uint64_t acked = 0, adopted = 0, arrivalSeals = 0, rangeTotal = 0;
+    uint64_t acked = 0, adopted = 0, arrivalSeals = 0, rangeTotal = 0, journalReplayed = 0;
     uint64_t seed = seed0;
     const int phasesPerStore = 6;
     std::map<int, int> modes;
@@ -538,6 +572,7 @@ void runTrials(int trials, int types, uint32_t partitions, uint64_t seed0) {
         adopted += h.adoptedTotal;
         for (const auto& kv : h.arrivalSegsMax) arrivalSeals += kv.second;
         rangeTotal += h.rangeCmds;
+        journalReplayed += h.journalReplayed;
         sum.rowsAppended += h.totals.rowsAppended;
         sum.merges += h.totals.merges;
         sum.seals += h.totals.seals;
@@ -561,6 +596,7 @@ void runTrials(int trials, int types, uint32_t partitions, uint64_t seed0) {
     report("crash_adopted_tail_batches", double(adopted), "batches");
     report("crash_arrivals_segments_sealed", double(arrivalSeals), "segments");
     report("crash_tomb_range_commands", double(rangeTotal), "commands");
+    report("crash_journal_records_replayed", double(journalReplayed), "records");
     for (const auto& kv : modes) {
         const char* names[] = {"drop_all", "drop_subset", "tear_last_512", "reorder", "kill9_keep_all"};
         char key[64];

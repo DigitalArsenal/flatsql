@@ -1581,7 +1581,7 @@ static bool finalizeBatch(Ctx& c, Arena* batches) {
     BatchHeader hdr{};
     hdr.magic = kMagicBatch;
     hdr.ver = 1;
-    hdr.flags = st.dBytes ? 1 : 0;
+    hdr.flags = uint16_t((st.dBytes ? kBatchHasData : 0) | (c.e->config().commitJournal ? kBatchJournaled : 0));
     hdr.commitSeq = p->commitSeq + 1;
     hdr.firstPseq = st.firstPseq;
     hdr.nRows = sc.nRows;
@@ -1950,7 +1950,7 @@ void encodePartitionHead(const Partition* p, uint8_t* slot, uint32_t* used, bool
     h.p.gen = p->headGen;
     h.p.ownerEpoch = p->ownerEpoch;
     h.p.id = p->pid;
-    h.p.flags = (durable ? kHeadDurableCkpt : 0) | (p->quarantined ? kHeadQuarantined : 0);
+    h.p.flags = (durable ? uint32_t(kHeadDurableCkpt) : 0u) | (p->quarantined ? uint32_t(kHeadQuarantined) : 0u);
     h.commitSeq = p->commitSeq;
     h.pseqHi = p->pseqHi;
     h.mSeg = p->mSeg;

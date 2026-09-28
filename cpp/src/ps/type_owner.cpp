@@ -336,7 +336,7 @@ void encodeTypeHead(const TypeOwner* t, uint8_t* slot, uint32_t* used, bool dura
     h.p.kind = kHeadType;
     h.p.gen = t->headGen;
     h.p.id = fidU32(t->fid);
-    h.p.flags = durable ? kHeadDurableCkpt : 0;
+    h.p.flags = durable ? uint32_t(kHeadDurableCkpt) : 0u;
     h.commitSeq = t->commitSeq;
     h.gseqHi = t->gseqHi;
     h.gSeg = t->gSeg;
@@ -538,6 +538,9 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
     t->dirty.store(0, std::memory_order_relaxed);
     t->noticeHead.store(t->noticeTail.load(std::memory_order_acquire), std::memory_order_release);
     if (!work) return false;
+    // Every type commit adds an L0 block to the directory the head lists; a
+    // full directory waits for the merge (its MERGE_DONE batch may pass).
+    if (t->nL0 >= kMaxTypeL0Dir - 1 && t->mergePhase != 1) return false;
     if (typeWarm(w, t) < 0) return false;
     StagedType* st = batches->make<StagedType>();
     if (!st) return false;
@@ -705,7 +708,8 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
     TypeBatchHeader h{};
     h.magic = kMagicTypeBatch;
     h.ver = 1;
-    h.flags = uint16_t((full ? kTypeFlagFullLabels : 0) | (st->mergeDone ? kTypeFlagMergeDone : 0));
+    h.flags = uint16_t((full ? kTypeFlagFullLabels : 0) | (st->mergeDone ? kTypeFlagMergeDone : 0) |
+                       (e->config().commitJournal ? kTypeBatchJournaled : 0));
     if (st->mergeDone) {
         h.mergeGen = t->mergeGen;
         h.mergedThroughCommit = t->mergeThroughCommit;
@@ -947,6 +951,9 @@ int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t) {
     rc = io->open(mp.c_str(), mp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
                   FileClass::Manifest, &t->mergeMf);
     if (rc >= 0) rc = io->write(t->mergeMf, man.data(), man.size(), 0);
+    // Outputs are durable before MERGE_DONE is staged (off the commit path).
+    if (rc >= 0) rc = io->sync(run.file);
+    if (rc >= 0) rc = io->sync(t->mergeMf);
     if (rc >= 0) {
         run.run.reset(new L1Run());
         rc = run.run->load(io, run.file, run.fileLen);

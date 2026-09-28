@@ -199,5 +199,9 @@ void pathTypeConfig(PathBuf* out, const char* root, const uint8_t fid[4], uint64
                          (unsigned long long)fp));
 }
 
+void pathJournal(PathBuf* out, const char* root, uint32_t writer, int file) {
+    finish(out, snprintf(out->buf, sizeof(out->buf), "%s/fsql2/j/%02x-%c.fsj", root, writer, file ? 'b' : 'a'));
+}
+
 }  // namespace ps
 }  // namespace flatsql

@@ -241,7 +241,7 @@ int32_t Registry::writeHead(bool sync) {
     h.p.format = kFormat;
     h.p.kind = kHeadRegistry;
     h.p.gen = ++headGen_;
-    h.p.flags = sync ? kHeadDurableCkpt : 0;
+    h.p.flags = sync ? uint32_t(kHeadDurableCkpt) : 0u;
     h.frameCount = frames_;
     h.fslEnd = fslEnd_;
     h.maxPid = maxPid_;

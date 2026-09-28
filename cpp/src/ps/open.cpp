@@ -219,6 +219,9 @@ static int32_t replayPartitionTail(Engine* e, IoCtx* io, Partition* p, uint32_t 
             // Stale batches of an older incarnation never chain (open never
             // zeroes: the incarnation does).
             if (t.incarnation < lastInc) break;
+            // A8: a journaled batch is durable only through its journal
+            // record; present in m but not replayed, its d/l bytes may be lost.
+            if ((h.flags & kBatchJournaled) && !e->journalReplayed(kJrnMeta, p->pid, p->mSeg, off)) break;
             lastInc = t.incarnation;
             std::vector<std::pair<uint16_t, std::vector<uint8_t>>> ctls;
             applyBatch(p, batch.data(), off, tr, &ctls);
@@ -264,9 +267,15 @@ int32_t Engine::open(const EngineConfig& cfgIn, std::unique_ptr<Engine>* out, st
     for (uint32_t i = 0; i < cfg.writers; i++) e->writers_.emplace_back(new Writer(e.get(), uint8_t(i)));
     int32_t rc = e->openStore(err);
     if (rc < 0) return rc;
+    // A8: journaled rounds reach their files before any head is read.
+    rc = e->replayJournals(err);
+    if (rc < 0) return rc;
     rc = e->openTypes(err);
     if (rc < 0) return rc;
     rc = e->openPartitions(err);
+    if (rc < 0) return rc;
+    e->journalMeta_.clear();
+    rc = e->writeOpenTypeHeads(err);
     if (rc < 0) return rc;
     // New incarnation: strictly above every incarnation any batch carries.
     uint32_t inc = e->registry_.incarnation();
@@ -555,6 +564,11 @@ int32_t Engine::openTypes(std::string* err) {
                 b.resize(h.batchLen);
                 if (io->read(mf, b.data(), h.batchLen, off) != int64_t(h.batchLen)) break;
                 if (crc32c(b.data(), h.batchLen - 8) != getU32(b.data() + h.batchLen - 8)) break;
+                if (h.flags & kTypeBatchJournaled) {
+                    uint32_t fidv;
+                    std::memcpy(&fidv, t->fid, 4);
+                    if (!journalReplayed(kJrnTypeMeta, fidv, t->mSeg, off)) break;
+                }
                 // Arrivals must be durable too: validate them by their CRC.
                 if (h.nArrivals) {
                     FileRef next;
@@ -707,25 +721,41 @@ int32_t Engine::openTypes(std::string* err) {
         if (floor > gseqNext_.load()) gseqNext_.store(floor);
         if (adopted) {
             adoptedBatches += adopted;
-            rc = typeEnsureFiles(io, this, t);
-            if (rc >= 0) {
-                uint8_t slot[kHeadSlotBytes];
-                t->headGen++;
-                uint32_t used;
-                encodeTypeHead(t, slot, &used, true);
-                rc = io->write(t->h, slot, used, (t->headGen % 2) * kHeadSlotBytes);
-                if (rc >= 0) rc = io->sync(t->h);
-            }
-            if (rc < 0) {
-                if (err) *err = "type head write failed";
-                return rc;
-            }
-            io->close(&t->h);
-            io->close(&t->m);
-            io->close(&t->g);
+            // A4: the DURABLE_CKPT head is written once the partitions are
+            // attached (its inline labels come from them), before any thread.
+            t->openHeadDue = true;
         }
         t->publishedGseqHi.store(t->gseqHi);
         t->publishedArrivals.store(t->arrivalsCount);
+    }
+    return 0;
+}
+
+// Type heads for adopted type tails (A4), written after openPartitions has
+// attached every partition and set its labeled_through: a head written earlier
+// would list no labels and, once durable, lose them.
+int32_t Engine::writeOpenTypeHeads(std::string* err) {
+    IoCtx* io = openIo_;
+    for (auto& tp : typeStore_) {
+        TypeOwner* t = tp.get();
+        if (!t->openHeadDue) continue;
+        t->openHeadDue = false;
+        int32_t rc = typeEnsureFiles(io, this, t);
+        if (rc >= 0) {
+            uint8_t slot[kHeadSlotBytes];
+            t->headGen++;
+            uint32_t used;
+            encodeTypeHead(t, slot, &used, true);
+            rc = io->write(t->h, slot, used, (t->headGen % 2) * kHeadSlotBytes);
+            if (rc >= 0) rc = io->sync(t->h);
+        }
+        io->close(&t->h);
+        io->close(&t->m);
+        io->close(&t->g);
+        if (rc < 0) {
+            if (err) *err = "type head write failed";
+            return rc;
+        }
     }
     return 0;
 }
