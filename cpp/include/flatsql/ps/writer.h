@@ -65,6 +65,7 @@ struct EngineConfig {
     uint32_t mergeHelpers = 1;             // 0 = merges build on the writer thread
     uint64_t zeroFillStep = 1ull << 20;    // A8 zero-fill ahead (0 = off)
     uint32_t noticeQueue = 1024;           // A25 (a full queue drops the notice)
+    uint64_t arrivalsSegBytes = 64ull << 20;  // A15: arrivals segment seal size
     uint32_t typeCommitRows = 8192;        // rows labeled per type commit
     uint32_t reconcileStep = 4096;         // instances per RECONCILE step
     uint32_t idleReclaimMs = 1000;         // ring slabs of idle partitions
@@ -310,6 +311,20 @@ struct MergePlan {
     std::atomic<int32_t> result{0};   // helper: 0 running, 1 done, < 0 error
 };
 
+// TOMB_RANGE{seg, epoch < t} (§13, A24): a control-mailbox command, never a
+// ring entry. Tombstones every live PUT of the segment whose epoch is below the
+// bound, except supersede-lane heads (the current state of an object) and
+// control kinds. Runs in bounded steps across commits; `remaining` drops to 0
+// once every TOMB it staged is durable.
+struct TombRange {
+    uint32_t seg = 0;
+    int64_t beforeMs = 0;
+    std::atomic<int32_t>* remaining = nullptr;
+    bool started = false;
+    uint64_t next = 0;   // pseq cursor
+    uint64_t end = 0;    // exclusive
+};
+
 struct PendingKill {
     uint8_t cid[kCidLen];
     std::atomic<int32_t>* remaining;  // type-level delete ticket (may be null)
@@ -368,6 +383,7 @@ struct Partition {
     uint64_t lastActivityNs = 0;
     ReconcileState rec;
     std::vector<PendingKill> kills;  // type-level kills from the mailbox
+    std::vector<TombRange> ranges;   // TOMB_RANGE commands, front first
     uint8_t mergePhase = kMergeIdle;
     MergePlan mplan;
     uint8_t pendingCtl[256];         // ctl records for the next batch
@@ -444,6 +460,10 @@ struct TypeOwner {
     std::unordered_map<uint32_t, uint64_t> labeled;  // pid -> labeled_through
     bool warm = false;
     FileRef h, m, g;
+    FileRef gNext;                   // A15: the next arrivals segment while a seal is staged
+    FileRef gFence;                  // A15: g.fsf
+    uint64_t fenceLen = 0;           // durable fence entries (bytes)
+    uint64_t gSegLastGseq = 0;       // last arrival gseq in the current segment
     std::unordered_map<uint64_t, FileRef> partM;  // read handles keyed (pid << 32 | mSeg)
     uint32_t manifestGenLoaded = 0;  // catalog manifest (live runs)
     uint64_t labelCkptOff = 0;       // A10 full-label checkpoint batch (> 128 pids)
@@ -478,6 +498,7 @@ enum CmdKind : uint32_t {
     kCmdKillCid = 4,          // a = pid, ptr = PendingKill*
     kCmdTypeDelete = 5,       // ptr = TypeOwner*, cid in data, remaining ticket
     kCmdStop = 6,
+    kCmdTombRange = 7,        // a = pid, b = seg, data[0..8) = epoch bound (ms), ticket
 };
 
 struct Cmd {
@@ -689,6 +710,9 @@ public:
     // every partition's TOMB is durable (or there were none).
     int32_t deleteCid(const uint8_t fid[4], const uint8_t cid[kCidLen],
                       std::atomic<int32_t>* remaining);
+    // Quota planner command (T3 issues it): TOMB_RANGE{seg, epoch < beforeMs}
+    // on one partition. `remaining` (set to 1) reaches 0 when it is done.
+    int32_t tombRange(uint32_t pid, uint32_t seg, int64_t beforeMs, std::atomic<int32_t>* remaining);
 
     // Doorbell for a partition's owner (and HANDOFF target, A24).
     void ringOwner(uint32_t pid);
@@ -753,6 +777,15 @@ private:
     Registry registry_;
     std::mutex regMutex_;
     std::unordered_map<std::string, uint32_t> pidByKey_;   // token + fid -> pid
+    // Registrations in flight (T1 #8): the registration lock is never held
+    // across an fsync; a second registrant of the same key waits here.
+    struct PendingReg {
+        bool ready = false;
+        int32_t rc = 0;
+    };
+    std::unordered_map<std::string, std::shared_ptr<PendingReg>> pendingReg_;
+    std::condition_variable regCv_;
+    uint32_t reservedPid_ = 0;
     std::unique_ptr<std::atomic<Partition*>[]> parts_;
     uint32_t partsCap_ = 0;
     std::atomic<uint32_t> nParts_{0};

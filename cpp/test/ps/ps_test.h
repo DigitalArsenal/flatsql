@@ -134,7 +134,9 @@ public:
     struct TypeView {
         bool ok = false;
         TypeHeadFixed head{};
-        std::vector<ArrivalEntry> arrivals;
+        std::vector<ArrivalEntry> arrivals;   // every segment, in order (A15)
+        std::vector<ArrivalFence> fence;      // one per sealed segment
+        std::string fenceErr;                 // fence/segment inconsistency
         std::map<uint32_t, uint64_t> labeled;
     };
     TypeView type(const uint8_t fid[4]);

@@ -412,6 +412,23 @@ static_assert(sizeof(ArrivalEntry) == 24, "ArrivalEntry is 24 bytes");
 
 enum ArrivalFlag : uint16_t { kArrivalFirst = 1, kArrivalPromoted = 2 };
 
+// A15: arrivals are segmented (g-<seg>.fsg). t/<fid>/g.fsf is the gseq fence
+// index: one entry per sealed segment, entry i describing segment i. Segment s
+// holds the gseqs in [first_s, first_{s+1}). An entry is written and fsynced
+// in the same round-1 sync as the first arrivals of segment s+1, before the
+// type batch that switches segments, so every committed switch has its entry.
+struct ArrivalFence {
+    uint32_t seg;
+    uint32_t rsv;
+    uint64_t firstGseq;
+    uint64_t lastGseq;
+    uint64_t count;        // entries in the sealed segment
+    uint32_t crc;          // CRC32C of the bytes before it
+    uint32_t pad;
+};
+static_assert(sizeof(ArrivalFence) == 40, "ArrivalFence is 40 bytes");
+constexpr const char* kArrivalFenceName = "g.fsf";
+
 // ---- little-endian helpers -------------------------------------------------
 inline void putU16(uint8_t* p, uint16_t v) { std::memcpy(p, &v, 2); }
 inline void putU32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }

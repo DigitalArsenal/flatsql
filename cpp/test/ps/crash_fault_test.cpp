@@ -103,6 +103,7 @@ struct Harness {
         s.cfg.sealBytes = 1u << 20;   // seals too
         s.cfg.sealRecords = (seed & 2) ? 24 : 200;  // some stores seal often
         s.cfg.zeroFillStep = (seed & 1) ? (64u << 10) : 0;
+        s.cfg.arrivalsSegBytes = (seed & 8) ? 24 * 16 : 24 * 256;  // A15 arrivals seals
     }
 
     TestType& type(int k) { return crashTypes(nTypes)[size_t(k)]; }
@@ -176,6 +177,12 @@ struct Harness {
                     sr.ctl = true;
                     p.inflight.push_back(sr);
                 }
+                continue;
+            }
+            if (r >= 20 && r < 22) {
+                // Quota-planner eviction of one segment (TOMB_RANGE, §13).
+                s.e->tombRange(p.pid, uint32_t(rng() % 3), INT64_MAX, nullptr);
+                rangeCmds++;
                 continue;
             }
             if (r < 20 && !p.acked.empty()) {
@@ -286,6 +293,8 @@ struct Harness {
 
     EngineStats totals{};
     uint64_t ackedTotal = 0, adoptedTotal = 0;
+    std::map<int, size_t> arrivalSegsMax;  // sealed arrivals segments seen per type
+    uint64_t rangeCmds = 0;                // TOMB_RANGE commands issued
     void crash(FaultFs::CrashMode mode) {
         if (s.e) {
             const EngineStats st = s.e->stats();
@@ -397,6 +406,11 @@ struct Harness {
             const auto tv = ins.type(type(k).fid);
             const auto& pub = published[std::string(reinterpret_cast<const char*>(type(k).fid), 4)];
             std::map<uint64_t, std::pair<uint32_t, uint64_t>> now;
+            if (!tv.fenceErr.empty()) {
+                std::fprintf(stderr, "  [%s] arrivals segments: %s\n", phase, tv.fenceErr.c_str());
+                gFailures++;
+            }
+            if (tv.fence.size() > arrivalSegsMax[k]) arrivalSegsMax[k] = tv.fence.size();
             for (const auto& a : tv.arrivals) {
                 if (a.gseq == 0 || a.pid == 0 || a.pseq == 0) {
                     std::fprintf(stderr, "  [%s] zero-filled arrival visible\n", phase);
@@ -483,7 +497,7 @@ struct Harness {
 void runTrials(int trials, int types, uint32_t partitions, uint64_t seed0) {
     int done = 0;
     EngineStats sum{};
-    uint64_t acked = 0, adopted = 0;
+    uint64_t acked = 0, adopted = 0, arrivalSeals = 0, rangeTotal = 0;
     uint64_t seed = seed0;
     const int phasesPerStore = 6;
     std::map<int, int> modes;
@@ -522,6 +536,8 @@ void runTrials(int trials, int types, uint32_t partitions, uint64_t seed0) {
         }
         for (const auto& p : h.parts) acked += p.acked.size();
         adopted += h.adoptedTotal;
+        for (const auto& kv : h.arrivalSegsMax) arrivalSeals += kv.second;
+        rangeTotal += h.rangeCmds;
         sum.rowsAppended += h.totals.rowsAppended;
         sum.merges += h.totals.merges;
         sum.seals += h.totals.seals;
@@ -543,6 +559,8 @@ void runTrials(int trials, int types, uint32_t partitions, uint64_t seed0) {
     report("crash_first_labels", double(sum.firstLabels), "labels");
     report("crash_promotions", double(sum.promotions), "promotions");
     report("crash_adopted_tail_batches", double(adopted), "batches");
+    report("crash_arrivals_segments_sealed", double(arrivalSeals), "segments");
+    report("crash_tomb_range_commands", double(rangeTotal), "commands");
     for (const auto& kv : modes) {
         const char* names[] = {"drop_all", "drop_subset", "tear_last_512", "reorder", "kill9_keep_all"};
         char key[64];

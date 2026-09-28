@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <random>
+#include <set>
 #include <thread>
 
 #include "flatsql/ps/platform.h"
@@ -580,5 +581,74 @@ PS_TEST(writer_enospc_pauses_then_recovers_without_loss) {
     CHECK(v.err.empty());
     CHECK_EQ(v.rows.size(), size_t(50));
     checkCounters(v);
+    s.close();
+}
+
+PS_TEST(writer_tomb_range_spares_supersede_heads) {
+    // TOMB_RANGE{seg, epoch < t} (§13, A24): only live PUTs below the bound in
+    // that segment die; supersede-lane heads and later segments stay.
+    Store s(true, 1, true);
+    s.cfg.sealRecords = 40;
+    s.cfg.reconcileStep = 7;  // several bounded steps
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType(), &catType()});
+    const uint32_t pid = s.partition("peer-q", ommType());
+    Producer prod(s.e.get(), pid);
+    const auto attr = buildRecordAttr("peer-q", "prov", "src", "b1");
+    uint64_t r = 0;
+    for (int i = 0; i < 100; i++) {
+        r = send(s.e.get(), prod, ommRecord(40000 + i, "Q" + std::to_string(i), epochAt(i), 13.0), attr, i);
+        if (i % 10 == 9) CHECK_EQ(prod.waitAcked(r, 10000000000ull), 0);
+    }
+    CHECK_EQ(prod.waitAcked(r, 10000000000ull), 0);
+    // Bound: the epoch of record 25; segment 0 holds records 0..39.
+    int64_t bound = 0;
+    {
+        Inspector ins(s.fs.get(), s.root);
+        PartView v = ins.partition(pid);
+        REQUIRE(v.ok && v.rows.size() >= 26);
+        bound = v.rows[25].epochMs;
+    }
+    std::atomic<int32_t> remaining{0};
+    CHECK_EQ(s.e->tombRange(pid, 0, bound, &remaining), 0);
+    const uint64_t deadline = monoNs() + 10000000000ull;
+    while (remaining.load() != 0 && monoNs() < deadline) sleepNs(1000000);
+    CHECK_EQ(remaining.load(), 0);
+    // CAT: supersede-lane heads are never evicted; a superseded copy is
+    // already dead; a record with no identity is.
+    const uint32_t cpid = s.partition("peer-c", catType());
+    Producer cprod(s.e.get(), cpid);
+    const auto cattr = buildRecordAttr("peer-c", "celestrak", "satcat", "b1");
+    r = send(s.e.get(), cprod, catRecord(25544, "1998-067A", "", "", "ISS"), cattr, 1);
+    r = send(s.e.get(), cprod, catRecord(25544, "1998-067A", "", "", "ISS (ZARYA)"), cattr, 2);
+    r = send(s.e.get(), cprod, catRecord(0, "", "", "", "NO IDENTITY"), cattr, 3);
+    CHECK_EQ(cprod.waitAcked(r, 10000000000ull), 0);
+    std::atomic<int32_t> remaining2{0};
+    CHECK_EQ(s.e->tombRange(cpid, 0, INT64_MAX, &remaining2), 0);
+    const uint64_t deadline2 = monoNs() + 10000000000ull;
+    while (remaining2.load() != 0 && monoNs() < deadline2) sleepNs(1000000);
+    CHECK_EQ(remaining2.load(), 0);
+    s.close();
+    REQUIRE(s.open() == 0);
+    Inspector ins(s.fs.get(), s.root);
+    PartView v = ins.partition(pid);
+    REQUIRE(v.ok && v.err.empty());
+    std::set<uint64_t> killed;
+    for (const auto& row : v.rows)
+        if (row.kind == kRowTomb) killed.insert(row.targetPseq);
+    std::set<uint64_t> expect;
+    for (const auto& row : v.rows)
+        if (row.kind == kRowPut && row.pseq <= 40 && row.epochMs < bound) expect.insert(row.pseq);
+    CHECK_EQ(expect.size(), size_t(25));
+    CHECK(killed == expect);
+    checkCounters(v);
+    CHECK_EQ(v.head.counters.liveCount, uint64_t(75));
+    PartView cv = ins.partition(cpid);
+    REQUIRE(cv.ok && cv.err.empty());
+    const KindCount ck = kinds(cv);
+    CHECK_EQ(ck.puts, 3);
+    CHECK_EQ(ck.tombs, 2);  // ISS v1 by supersede, the identity-less record by TOMB_RANGE
+    checkCounters(cv);
+    CHECK_EQ(cv.head.counters.liveCount, uint64_t(1));
     s.close();
 }

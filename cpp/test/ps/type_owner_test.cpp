@@ -233,3 +233,56 @@ PS_TEST(type_label_checkpoint_past_128_pids_A10) {
     CHECK_EQ(tv.head.nLabels, uint16_t(0xffff));
     s.close();
 }
+
+PS_TEST(type_arrivals_segments_and_fence_A15) {
+    // Arrivals seal every 40 entries; the fence index names each sealed
+    // segment's gseq range; reopen resumes the active segment.
+    Store s(true, 2, true);
+    s.cfg.arrivalsSegBytes = 40 * kArrivalBytes;
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const std::vector<uint32_t> pids = {s.partition("A", ommType()), s.partition("B", ommType())};
+    uint32_t norad = 50000;
+    auto ingest = [&](int n) {
+        for (int k = 0; k < 2; k++) {
+            Producer prod(s.e.get(), pids[size_t(k)]);
+            const auto attr = buildRecordAttr("P", "prov", "src", "b");
+            uint64_t last = 0;
+            for (int i = 0; i < n; i++) {
+                last = send(s.e.get(), prod, ommRecord(norad, "S", ep(int(norad % 1000)), 1.0 + norad), attr, i);
+                norad++;
+                if (i % 16 == 15) CHECK_EQ(prod.waitAcked(last, 10000000000ull), 0);  // many small commits
+            }
+            CHECK_EQ(prod.waitAcked(last, 10000000000ull), 0);
+        }
+        CHECK(waitLabeled(s.e.get(), pids, 5000000000ull));
+    };
+    auto verify = [&](size_t expect) -> uint32_t {
+        Inspector ins(s.fs.get(), s.root);
+        const auto tv = ins.type(ommType().fid);
+        CHECK(tv.ok);
+        if (!tv.ok) return 0;
+        if (!tv.fenceErr.empty()) std::fprintf(stderr, "  fence: %s\n", tv.fenceErr.c_str());
+        CHECK(tv.fenceErr.empty());
+        CHECK_EQ(tv.arrivals.size(), expect);
+        CHECK_EQ(tv.fence.size(), size_t(tv.head.gSeg));
+        uint64_t total = 0;
+        for (const auto& f : tv.fence) {
+            CHECK(f.count > 0 && f.count <= 40);
+            total += f.count;
+        }
+        CHECK_EQ(total + tv.head.gLen / kArrivalBytes, uint64_t(expect));
+        return tv.head.gSeg;
+    };
+    ingest(150);
+    s.close();
+    REQUIRE(s.open() == 0);
+    const uint32_t segs = verify(300);
+    CHECK(segs >= 7);
+    report("a15_sealed_segments", double(segs), "segments");
+    ingest(100);
+    s.close();
+    REQUIRE(s.open() == 0);
+    CHECK(verify(500) > segs);
+    s.close();
+}

@@ -172,24 +172,35 @@ void Registry::apply(uint16_t kind, const uint8_t* p, size_t n) {
     }
 }
 
-int32_t Registry::appendFrame(uint16_t kind, const std::vector<uint8_t>& payload) {
+int32_t Registry::writeFrame(uint16_t kind, const std::vector<uint8_t>& payload) {
     std::vector<uint8_t> frame(kFrameHdr + payload.size());
     putU32(frame.data(), uint32_t(2 + payload.size()));
     putU16(frame.data() + 8, kind);
     if (!payload.empty()) std::memcpy(frame.data() + 10, payload.data(), payload.size());
     putU32(frame.data() + 4, crc32c(frame.data() + 8, 2 + payload.size()));
-    int32_t rc = io_->write(log_, frame.data(), frame.size(), fslEnd_);
-    if (rc < 0) return rc;
-    rc = io_->sync(log_);
+    const int32_t rc = io_->write(log_, frame.data(), frame.size(), fslEnd_);
     if (rc < 0) return rc;
     fslEnd_ += frame.size();
+    return 0;
+}
+
+int32_t Registry::syncLog() { return io_->sync(log_); }
+
+int32_t Registry::applyFrame(uint16_t kind, const std::vector<uint8_t>& payload) {
     frames_++;
-    apply(kind, frame.data() + 10, payload.size());
+    apply(kind, payload.data(), payload.size());
     // The head is a hint (open scans past it); written without a sync.
     return writeHead(false);
 }
 
-int32_t Registry::appendPartition(const PartitionEntry& e) {
+int32_t Registry::appendFrame(uint16_t kind, const std::vector<uint8_t>& payload) {
+    int32_t rc = writeFrame(kind, payload);
+    if (rc >= 0) rc = syncLog();
+    if (rc < 0) return rc;
+    return applyFrame(kind, payload);
+}
+
+std::vector<uint8_t> Registry::encodePartition(const PartitionEntry& e) {
     std::vector<uint8_t> p;
     putU32v(p, e.pid);
     p.insert(p.end(), e.fid, e.fid + 4);
@@ -198,18 +209,22 @@ int32_t Registry::appendPartition(const PartitionEntry& e) {
     putU64v(p, e.schemaFp);
     putU32v(p, e.ordinal);
     putU64v(p, uint64_t(e.ctimeMs));
-    return appendFrame(kRegPartitionAdd, p);
+    return p;
 }
 
-int32_t Registry::appendType(const TypeEntry& t) {
+std::vector<uint8_t> Registry::encodeType(const TypeEntry& t) {
     std::vector<uint8_t> p;
     p.insert(p.end(), t.fid, t.fid + 4);
     putStr(p, t.schemaName);
     putU64v(p, t.configFp);
     putU64v(p, t.indexSpecHash);
     putU64v(p, t.supersedeRuleHash);
-    return appendFrame(kRegTypeAdd, p);
+    return p;
 }
+
+int32_t Registry::appendPartition(const PartitionEntry& e) { return appendFrame(kRegPartitionAdd, encodePartition(e)); }
+
+int32_t Registry::appendType(const TypeEntry& t) { return appendFrame(kRegTypeAdd, encodeType(t)); }
 
 int32_t Registry::appendQuarantine(uint32_t pid, bool on, const std::string& reason) {
     std::vector<uint8_t> p;

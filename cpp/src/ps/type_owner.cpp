@@ -489,6 +489,42 @@ int32_t typeWarm(Writer* w, TypeOwner* t) {
     return 0;
 }
 
+// A15: opens the next arrivals segment (fresh: a seal that never committed may
+// have left one behind) and the fence file, and builds the sealed segment's
+// fence entry. A failure only postpones the seal.
+bool typeStageSeal(Writer* w, TypeOwner* t, StagedType* st) {
+    Engine* e = w->engine();
+    IoCtx* io = &w->io();
+    const int saved = tHotPathDepth;
+    tHotPathDepth = 0;  // host opens (once per seal)
+    bool ok = true;
+    if (!t->gFence.valid()) {
+        PathBuf fp;
+        pathType(&fp, e->root().c_str(), t->fid, kArrivalFenceName);
+        ok = io->open(fp.c_str(), fp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS,
+                      FileClass::Arrivals, &t->gFence) == 0;
+    }
+    if (ok) {
+        io->close(&t->gNext);
+        PathBuf gp;
+        pathTypeSeg(&gp, e->root().c_str(), t->fid, 'g', t->gSeg + 1, "fsg");
+        ok = io->open(gp.c_str(), gp.len,
+                      kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
+                      FileClass::Arrivals, &t->gNext) == 0;
+    }
+    tHotPathDepth = saved;
+    if (!ok) return false;
+    ArrivalFence& f = st->fence;
+    f = ArrivalFence{};
+    f.seg = t->gSeg;
+    f.firstGseq = t->gSegFirstGseq;
+    f.lastGseq = t->gSegLastGseq;
+    f.count = t->gLen / kArrivalBytes;
+    f.crc = crc32c(&f, offsetof(ArrivalFence, crc));
+    st->fenceOff = t->fenceLen;
+    return true;
+}
+
 bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* batches) {
     Engine* e = w->engine();
     // Anything to label? (A25: compare with each partition's durable HWM.)
@@ -640,6 +676,21 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
     st->nArrivals = sc->nArrivals;
     st->gOff = t->gLen;
     st->gSeg = t->gSeg;
+    st->gSeal = false;
+    st->lastGseq = 0;
+    if (gBytes) {
+        ArrivalEntry lastEntry;
+        std::memcpy(&lastEntry, st->arrivals + gBytes - kArrivalBytes, sizeof(lastEntry));
+        st->lastGseq = lastEntry.gseq;
+    }
+    if (gBytes && t->gLen > 0 && t->gLen + gBytes > e->config().arrivalsSegBytes &&
+        typeStageSeal(w, t, st)) {
+        // A15: this batch's arrivals open segment gSeg + 1; the fence entry of
+        // the sealed segment is synced with them in round 1.
+        st->gSeal = true;
+        st->gSeg = t->gSeg + 1;
+        st->gOff = 0;
+    }
     // Type batch (A10).
     for (uint32_t i = 0; i < sc->nEntries; i++) sc->order[i] = &sc->entries[i];
     sortStaged(sc->order, sc->nEntries);
@@ -711,6 +762,18 @@ void typePublish(Writer* w, TypeOwner* t, StagedType* st) {
     Engine* e = w->engine();
     t->commitSeq = st->commitSeq;
     t->gseqHi = st->gseqHi;
+    if (st->gSeal) {
+        w->io().close(&t->g);
+        t->g = t->gNext;
+        t->gNext = FileRef();
+        t->gExtent = 0;
+        t->gSeg = st->gSeg;
+        t->fenceLen = st->fenceOff + sizeof(ArrivalFence);
+    }
+    if (st->nArrivals) {
+        if (st->gOff == 0) t->gSegFirstGseq = st->firstGseq;
+        t->gSegLastGseq = st->lastGseq;
+    }
     t->gLen = st->gOff + uint64_t(st->nArrivals) * kArrivalBytes;
     t->mEnd = st->mOff + st->batchLen;
     t->arrivalsCount = st->arrivalsCount;
@@ -809,8 +872,9 @@ void typePublish(Writer* w, TypeOwner* t, StagedType* st) {
 }
 
 void typeRollback(Writer* w, TypeOwner* t, StagedType* st) {
-    (void)w;
-    (void)st;
+    // A staged seal is retried by a later batch (the next segment is reopened
+    // fresh, the fence entry rewritten at the same offset).
+    if (st->gSeal) w->io().close(&t->gNext);
     // Allocated gseqs were never published; they are simply not used (A6).
     t->st = nullptr;
 }

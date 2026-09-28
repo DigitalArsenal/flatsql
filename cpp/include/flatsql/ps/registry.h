@@ -53,6 +53,18 @@ public:
     int32_t appendType(const TypeEntry& e);             // durable on return
     int32_t appendQuarantine(uint32_t pid, bool on, const std::string& reason);
 
+    // Split append for callers that must not hold their lock across an fsync
+    // (T1 #8): writeFrame pwrites at the end (serialized by the caller's
+    // lock), syncLog makes every written frame durable (no lock needed), and
+    // applyFrame records it in memory and in the hint head (caller's lock).
+    // A frame whose pwrite fails does not advance the end, so the next frame
+    // overwrites it; a later frame's sync covers every earlier written frame.
+    static std::vector<uint8_t> encodePartition(const PartitionEntry& e);
+    static std::vector<uint8_t> encodeType(const TypeEntry& t);
+    int32_t writeFrame(uint16_t kind, const std::vector<uint8_t>& payload);
+    int32_t syncLog();
+    int32_t applyFrame(uint16_t kind, const std::vector<uint8_t>& payload);
+
     const std::vector<PartitionEntry>& partitions() const { return parts_; }
     const std::vector<TypeEntry>& types() const { return types_; }
     uint32_t maxPid() const { return maxPid_; }

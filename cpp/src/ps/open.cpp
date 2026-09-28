@@ -542,23 +542,51 @@ int32_t Engine::openTypes(std::string* err) {
             uint64_t off = t->mEnd;
             uint32_t lastInc = incFloor;
             std::vector<uint8_t> b;
+            bool sealAdopted = false;
             while (off + sizeof(TypeBatchHeader) <= uint64_t(size)) {
                 TypeBatchHeader h;
                 if (io->read(mf, &h, sizeof(h), off) != int64_t(sizeof(h))) break;
+                // A15: a batch may open the next arrivals segment.
+                const bool seal = h.gSeg == t->gSeg + 1 && h.gOff == 0 && h.nArrivals > 0;
                 if (h.magic != kMagicTypeBatch || h.ver != 1 || h.commitSeq != t->commitSeq + 1 ||
                     h.batchLen < sizeof(h) + 8 || off + h.batchLen > uint64_t(size) ||
-                    h.incarnation < lastInc || h.gSeg != t->gSeg)
+                    h.incarnation < lastInc || (h.gSeg != t->gSeg && !seal))
                     break;
                 b.resize(h.batchLen);
                 if (io->read(mf, b.data(), h.batchLen, off) != int64_t(h.batchLen)) break;
                 if (crc32c(b.data(), h.batchLen - 8) != getU32(b.data() + h.batchLen - 8)) break;
                 // Arrivals must be durable too: validate them by their CRC.
                 if (h.nArrivals) {
-                    std::vector<uint8_t> g(size_t(h.nArrivals) * kArrivalBytes);
-                    if (!gf.valid() || io->read(gf, g.data(), g.size(), h.gOff) != int64_t(g.size()) ||
-                        crc32c(g.data(), g.size()) != h.gCrc)
+                    FileRef next;
+                    if (seal) {
+                        PathBuf np;
+                        pathTypeSeg(&np, cfg_.root.c_str(), t->fid, 'g', h.gSeg, "fsg");
+                        if (io->open(np.c_str(), np.len, kOpenRW, FileClass::Arrivals, &next) != 0) break;
+                    } else if (h.gOff != t->gLen) {
                         break;
-                    if (h.gOff != t->gLen) break;
+                    }
+                    FileRef& src = seal ? next : gf;
+                    std::vector<uint8_t> g(size_t(h.nArrivals) * kArrivalBytes);
+                    if (!src.valid() || io->read(src, g.data(), g.size(), h.gOff) != int64_t(g.size()) ||
+                        crc32c(g.data(), g.size()) != h.gCrc) {
+                        io->close(&next);
+                        break;
+                    }
+                    if (seal) {
+                        // The sealed segment's tail was adopted durable
+                        // already; switch to the new one.
+                        if (gf.valid() && adopted && io->sync(gf) < 0) {
+                            io->close(&next);
+                            if (err) *err = "arrivals fsync failed";
+                            return FLATSQL_IO_ERR_IO;
+                        }
+                        io->close(&gf);
+                        gf = next;
+                        t->gSeg = h.gSeg;
+                        t->gLen = 0;
+                        sealAdopted = true;
+                    }
+                    if (h.gOff == 0) t->gSegFirstGseq = h.firstGseq;
                 }
                 lastInc = h.incarnation;
                 t->commitSeq = h.commitSeq;
@@ -608,8 +636,46 @@ int32_t Engine::openTypes(std::string* err) {
                     return FLATSQL_IO_ERR_IO;
                 }
             }
+            (void)sealAdopted;
             io->close(&mf);
             if (gf.valid()) io->close(&gf);
+        }
+        // A15: the fence index covers exactly the sealed segments; entries of
+        // seals that never committed are cut, and a next segment they created
+        // is removed.
+        t->gSegLastGseq = t->gLen ? t->gseqHi : 0;
+        {
+            PathBuf fp;
+            pathType(&fp, cfg_.root.c_str(), t->fid, kArrivalFenceName);
+            FileRef ff;
+            const uint64_t want = uint64_t(t->gSeg) * sizeof(ArrivalFence);
+            if (io->open(fp.c_str(), fp.len, kOpenRW, FileClass::Arrivals, &ff) == 0) {
+                const int64_t fsz = io->size(ff);
+                std::vector<uint8_t> fb(size_t(std::min<uint64_t>(fsz > 0 ? uint64_t(fsz) : 0, want)));
+                bool okF = fb.empty() || io->read(ff, fb.data(), fb.size(), 0) == int64_t(fb.size());
+                for (uint32_t i = 0; okF && i < t->gSeg; i++) {
+                    ArrivalFence f;
+                    if ((uint64_t(i) + 1) * sizeof(f) > fb.size()) {
+                        okF = false;
+                        break;
+                    }
+                    std::memcpy(&f, fb.data() + size_t(i) * sizeof(f), sizeof(f));
+                    if (f.seg != i || f.crc != crc32c(&f, offsetof(ArrivalFence, crc))) okF = false;
+                }
+                if (okF && uint64_t(fsz) > want) okF = io->truncate(ff, want) >= 0 && io->sync(ff) >= 0;
+                io->close(&ff);
+                if (!okF) {
+                    if (err) *err = "arrivals fence index invalid";
+                    return FLATSQL_IO_ERR_IO;
+                }
+            } else if (t->gSeg != 0) {
+                if (err) *err = "arrivals fence index missing";
+                return FLATSQL_IO_ERR_IO;
+            }
+            t->fenceLen = want;
+            PathBuf np;
+            pathTypeSeg(&np, cfg_.root.c_str(), t->fid, 'g', t->gSeg + 1, "fsg");
+            if (io->probe(np.c_str(), np.len) == 0) io->unlink(np.c_str(), np.len, true);
         }
         // Type manifest: live catalog runs.
         if (t->manifestGenLoaded) {
@@ -874,14 +940,35 @@ int32_t Engine::registerType(const std::vector<uint8_t>& config, std::string* er
         if (err) *err = perr;
         return FLATSQL_IO_ERR_GENERIC;
     }
-    const uint64_t t0 = monoNs();
-    std::lock_guard<std::mutex> guard(regMutex_);
+    const std::string key(reinterpret_cast<const char*>(cfg->fid()), 4);
+    std::unique_lock<std::mutex> lk(regMutex_);
+    uint64_t t0 = monoNs();
+    auto hold = [&] {
+        if (cfg_.lockStats) lockHist_.record(monoNs() - t0);
+    };
+    for (;;) {
+        auto pit = pendingReg_.find("t" + key);
+        if (pit == pendingReg_.end()) break;
+        std::shared_ptr<PendingReg> pr = pit->second;
+        hold();
+        regCv_.wait(lk, [&] { return pr->ready; });
+        t0 = monoNs();
+    }
     TypeOwner* existing = type(cfg->fid());
-    if (existing && existing->cfg->fingerprint() == cfg->fingerprint()) return 0;
+    if (existing && existing->cfg->fingerprint() == cfg->fingerprint()) {
+        hold();
+        return 0;
+    }
     if (existing) {
         if (err) *err = "schema change of a registered type is a separate operation";
+        hold();
         return FLATSQL_IO_ERR_GENERIC;
     }
+    auto pr = std::make_shared<PendingReg>();
+    pendingReg_["t" + key] = pr;
+    hold();
+    lk.unlock();
+    // Durable config, then the registry frame; no lock across either fsync.
     IoCtx* io = openIo_;
     PathBuf cp;
     pathTypeConfig(&cp, cfg_.root.c_str(), cfg->fid(), cfg->fingerprint());
@@ -889,65 +976,105 @@ int32_t Engine::registerType(const std::vector<uint8_t>& config, std::string* er
     int32_t rc = io->open(cp.c_str(), cp.len,
                           kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
                           FileClass::Config, &f);
-    if (rc < 0) return rc;
-    std::vector<uint8_t> file(16 + config.size());
-    putU32(file.data(), kMagicTypeConfig);
-    putU32(file.data() + 4, 1);
-    putU32(file.data() + 8, uint32_t(config.size()));
-    putU32(file.data() + 12, crc32c(config.data(), config.size()));
-    std::memcpy(file.data() + 16, config.data(), config.size());
-    rc = io->write(f, file.data(), file.size(), 0);
-    if (rc >= 0) rc = io->sync(f);
-    io->close(&f);
-    if (rc < 0) return rc;
+    if (rc >= 0) {
+        std::vector<uint8_t> file(16 + config.size());
+        putU32(file.data(), kMagicTypeConfig);
+        putU32(file.data() + 4, 1);
+        putU32(file.data() + 8, uint32_t(config.size()));
+        putU32(file.data() + 12, crc32c(config.data(), config.size()));
+        std::memcpy(file.data() + 16, config.data(), config.size());
+        rc = io->write(f, file.data(), file.size(), 0);
+        if (rc >= 0) rc = io->sync(f);
+        io->close(&f);
+    }
     TypeEntry te;
     std::memcpy(te.fid, cfg->fid(), 4);
     te.schemaName = cfg->schemaName();
     te.configFp = cfg->fingerprint();
-    rc = registry_.appendType(te);
-    if (rc < 0) return rc;
-    std::unique_ptr<TypeOwner> t(new TypeOwner());
-    std::memcpy(t->fid, te.fid, 4);
-    t->cfg = cfg;
-    t->noticeCap = cfg_.noticeQueue;
-    t->notices.reset(new std::atomic<uint32_t>[t->noticeCap ? t->noticeCap : 1]);
-    t->mSeg = 0;
-    t->gSeg = 0;
-    TypeOwner* raw = t.get();
-    typeByFid_[fidU32(te.fid)] = raw;
-    typeStore_.push_back(std::move(t));
-    const uint8_t w = leastLoadedWriter();
-    writers_[w]->pinned_.fetch_add(1);
-    raw->ownerWriter.store(w);
-    if (!started_) {
-        writers_[w]->types_.push_back(raw);
-    } else {
-        Cmd c;
-        c.kind = kCmdAdoptType;
-        c.ptr = raw;
-        while (!writers_[w]->mailbox().push(c)) cpuRelax();
-        writers_[w]->ring();
+    const std::vector<uint8_t> payload = Registry::encodeType(te);
+    if (rc >= 0) {
+        lk.lock();
+        t0 = monoNs();
+        rc = registry_.writeFrame(kRegTypeAdd, payload);
+        hold();
+        lk.unlock();
     }
-    if (cfg_.lockStats) lockHist_.record(monoNs() - t0);
-    return 0;
+    if (rc >= 0) rc = registry_.syncLog();
+    lk.lock();
+    t0 = monoNs();
+    if (rc >= 0) rc = registry_.applyFrame(kRegTypeAdd, payload);
+    if (rc >= 0) {
+        std::unique_ptr<TypeOwner> t(new TypeOwner());
+        std::memcpy(t->fid, te.fid, 4);
+        t->cfg = cfg;
+        t->noticeCap = cfg_.noticeQueue;
+        t->notices.reset(new std::atomic<uint32_t>[t->noticeCap ? t->noticeCap : 1]);
+        t->mSeg = 0;
+        t->gSeg = 0;
+        TypeOwner* raw = t.get();
+        typeByFid_[fidU32(te.fid)] = raw;
+        typeStore_.push_back(std::move(t));
+        const uint8_t w = leastLoadedWriter();
+        writers_[w]->pinned_.fetch_add(1);
+        raw->ownerWriter.store(w);
+        if (!started_) {
+            writers_[w]->types_.push_back(raw);
+        } else {
+            Cmd c;
+            c.kind = kCmdAdoptType;
+            c.ptr = raw;
+            while (!writers_[w]->mailbox().push(c)) cpuRelax();
+            writers_[w]->ring();
+        }
+    }
+    pr->ready = true;
+    pr->rc = rc;
+    pendingReg_.erase("t" + key);
+    regCv_.notify_all();
+    hold();
+    return rc;
 }
 
 int32_t Engine::registerPartition(const uint8_t* peer, size_t peerLen, const uint8_t fid[4], uint32_t* pidOut) {
     const std::string token = producerToken(peer, peerLen);
     std::string key = token;
     key.append(reinterpret_cast<const char*>(fid), 4);
-    std::lock_guard<std::mutex> guard(regMutex_);
-    const uint64_t t0 = monoNs();
-    auto it = pidByKey_.find(key);
-    if (it != pidByKey_.end()) {
-        *pidOut = it->second;
-        return 0;
+    std::unique_lock<std::mutex> lk(regMutex_);
+    uint64_t t0 = monoNs();
+    auto hold = [&] {
+        if (cfg_.lockStats) lockHist_.record(monoNs() - t0);
+    };
+    for (;;) {
+        auto it = pidByKey_.find(key);
+        if (it != pidByKey_.end()) {
+            *pidOut = it->second;
+            hold();
+            return 0;
+        }
+        auto pit = pendingReg_.find("p" + key);
+        if (pit == pendingReg_.end()) break;
+        std::shared_ptr<PendingReg> pr = pit->second;
+        hold();
+        regCv_.wait(lk, [&] { return pr->ready; });
+        t0 = monoNs();
+        if (pr->rc < 0) {
+            hold();
+            return pr->rc;
+        }
     }
     TypeOwner* t = type(fid);
-    if (!t) return FLATSQL_IO_ERR_NOENT;
+    if (!t) {
+        hold();
+        return FLATSQL_IO_ERR_NOENT;
+    }
     PartitionEntry e;
-    e.pid = registry_.maxPid() + 1;
-    if (e.pid >= partsCap_) return FLATSQL_IO_ERR_NOSPACE;
+    // pid = 1 + the largest pid durable or in flight (A10: never reused, even
+    // when a registration fails after its frame was written).
+    e.pid = std::max(registry_.maxPid(), reservedPid_) + 1;
+    if (e.pid >= partsCap_) {
+        hold();
+        return FLATSQL_IO_ERR_NOSPACE;
+    }
     std::memcpy(e.fid, fid, 4);
     e.token = token;
     std::string typeName = t->cfg->schemaName();
@@ -955,44 +1082,64 @@ int32_t Engine::registerPartition(const uint8_t* peer, size_t peerLen, const uin
     if (dot != std::string::npos) typeName = typeName.substr(0, dot);
     e.sqlName = "sds_p_" + token + "__" + typeName;
     e.schemaFp = t->cfg->fingerprint();
-    e.ordinal = registry_.maxPid();
+    e.ordinal = e.pid - 1;
     e.ctimeMs = nowMs();
-    // Intent rule (§4.7): the frame is durable before p/<pid>/ exists.
-    int32_t rc = registry_.appendPartition(e);
-    if (rc < 0) return rc;
-    PathBuf hp;
-    pathPartition(&hp, cfg_.root.c_str(), e.pid, "h.fsh");
-    FileRef h;
-    // A10: created with EXCL; EEXIST (a reused pid) fails the REGISTER.
-    rc = openIo_->open(hp.c_str(), hp.len,
-                       kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_EXCL | FLATSQL_IO_CREATE_PARENTS,
-                       FileClass::Head, &h);
-    if (rc < 0) return rc;
-    openIo_->close(&h);
-    const uint8_t w = leastLoadedWriter();
-    Partition* p = makePartition(e, w);
-    p->mSeg = 0;
-    p->dSeg = 0;
-    p->nextSeg = 1;
-    p->segFirstPseq = 1;
-    p->lanesLoaded = false;
-    p->lastCkptNs = monoNs();
-    p->lastActivityNs = monoNs();
-    writers_[w]->pinned_.fetch_add(1);
-    if (!started_) {
-        writers_[w]->owned_.push_back(p);
-        writers_[w]->ownedCount_.fetch_add(1);
-    } else {
-        Cmd c;
-        c.kind = kCmdAdoptPartition;
-        c.a = e.pid;
-        c.b = 0;
-        while (!writers_[w]->mailbox().push(c)) cpuRelax();
-        writers_[w]->ring();
+    const std::vector<uint8_t> payload = Registry::encodePartition(e);
+    int32_t rc = registry_.writeFrame(kRegPartitionAdd, payload);
+    if (rc < 0) {
+        hold();
+        return rc;
     }
-    *pidOut = e.pid;
-    if (cfg_.lockStats) lockHist_.record(monoNs() - t0);
-    return 0;
+    reservedPid_ = e.pid;
+    auto pr = std::make_shared<PendingReg>();
+    pendingReg_["p" + key] = pr;
+    hold();
+    lk.unlock();
+    // Intent rule (§4.7): the frame is durable before p/<pid>/ exists.
+    rc = registry_.syncLog();
+    if (rc >= 0) {
+        PathBuf hp;
+        pathPartition(&hp, cfg_.root.c_str(), e.pid, "h.fsh");
+        FileRef h;
+        // A10: created with EXCL; EEXIST (a reused pid) fails the REGISTER.
+        rc = openIo_->open(hp.c_str(), hp.len,
+                           kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_EXCL | FLATSQL_IO_CREATE_PARENTS,
+                           FileClass::Head, &h);
+        if (rc >= 0) openIo_->close(&h);
+    }
+    lk.lock();
+    t0 = monoNs();
+    if (rc >= 0) rc = registry_.applyFrame(kRegPartitionAdd, payload);
+    if (rc >= 0) {
+        const uint8_t w = leastLoadedWriter();
+        Partition* p = makePartition(e, w);
+        p->mSeg = 0;
+        p->dSeg = 0;
+        p->nextSeg = 1;
+        p->segFirstPseq = 1;
+        p->lanesLoaded = false;
+        p->lastCkptNs = monoNs();
+        p->lastActivityNs = monoNs();
+        writers_[w]->pinned_.fetch_add(1);
+        if (!started_) {
+            writers_[w]->owned_.push_back(p);
+            writers_[w]->ownedCount_.fetch_add(1);
+        } else {
+            Cmd c;
+            c.kind = kCmdAdoptPartition;
+            c.a = e.pid;
+            c.b = 0;
+            while (!writers_[w]->mailbox().push(c)) cpuRelax();
+            writers_[w]->ring();
+        }
+        *pidOut = e.pid;
+    }
+    pr->ready = true;
+    pr->rc = rc;
+    pendingReg_.erase("p" + key);
+    regCv_.notify_all();
+    hold();
+    return rc;
 }
 
 }  // namespace ps

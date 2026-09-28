@@ -358,12 +358,23 @@ void Writer::commitRound() {
             queueSync(t->mergeMf, t, 2);
         }
         if (st->nArrivals) {
-            const int32_t rc = io_.write(t->g, st->arrivals, size_t(st->nArrivals) * kArrivalBytes, st->gOff);
+            FileRef& g = st->gSeal ? t->gNext : t->g;
+            const int32_t rc = io_.write(g, st->arrivals, size_t(st->nArrivals) * kArrivalBytes, st->gOff);
             if (rc < 0) {
                 st->err = rc;
                 continue;
             }
-            queueSync(t->g, t, 2);
+            queueSync(g, t, 2);
+        }
+        if (st->gSeal) {
+            // A15: the sealed segment's fence entry, durable before the
+            // switching batch (round 2).
+            const int32_t rc = io_.write(t->gFence, &st->fence, sizeof(st->fence), st->fenceOff);
+            if (rc < 0) {
+                st->err = rc;
+                continue;
+            }
+            queueSync(t->gFence, t, 2);
         }
     }
     commitSyncRounds_.fetch_add(jobs_.empty() ? 0 : 1, std::memory_order_relaxed);
@@ -418,6 +429,9 @@ void Writer::commitRound() {
             copy.consumed = false;
             copy.nTickets = 0;
             partitionPublish(this, p, &copy);
+            // Queue consumption (kills, TOMB_RANGE cursor) happens once.
+            st->killsTaken = 0;
+            st->rangeStep = false;
             const int32_t hrc = partitionWriteHead(this, p, due);
             if (hrc < 0) {
                 p->quarantined = true;
@@ -501,7 +515,8 @@ bool Writer::iterate(bool mayWait) {
         // partition holds zero slabs (§17).
         if (backlog || r->wantPage.load(std::memory_order_acquire))
             ringMapAhead(r, eng_->pool(), reserve, backlog ? p->mapAheadPages : 1);
-        if (!backlog && !p->rec.active && p->kills.empty() && !p->sealPending && !p->nPendingCtl &&
+        if (!backlog && !p->rec.active && p->kills.empty() && p->ranges.empty() && !p->sealPending &&
+            !p->nPendingCtl &&
             p->mergePhase != kMergeOutputsWritten)
             continue;
         if (!p->warm && partitionWarm(this, p) < 0) {
@@ -608,6 +623,26 @@ void Writer::processMailbox() {
                 std::memcpy(k.cid, c.data, kCidLen);
                 k.remaining = c.ticket;
                 p->kills.push_back(k);
+                break;
+            }
+            case kCmdTombRange: {
+                Partition* p = eng_->partition(uint32_t(c.a));
+                if (!p) {
+                    if (c.ticket && c.ticket->fetch_sub(1) == 1)
+                        wakeU32(reinterpret_cast<std::atomic<uint32_t>*>(c.ticket), -1);
+                    break;
+                }
+                if (p->ownerWriter.load(std::memory_order_acquire) != id_) {
+                    Writer* o = eng_->writer(p->ownerWriter.load());
+                    while (!o->mailbox().push(c)) cpuRelax();
+                    o->ring();
+                    break;
+                }
+                TombRange tr;
+                tr.seg = uint32_t(c.b);
+                std::memcpy(&tr.beforeMs, c.data, 8);
+                tr.remaining = c.ticket;
+                p->ranges.push_back(tr);
                 break;
             }
             case kCmdTypeDelete: {
@@ -842,6 +877,8 @@ int32_t Engine::stop(uint64_t deadlineMs) {
             w->io().close(&t->h);
             w->io().close(&t->m);
             w->io().close(&t->g);
+            w->io().close(&t->gNext);
+            w->io().close(&t->gFence);
             for (auto& kv : t->partM) w->io().close(&kv.second);
             t->partM.clear();
             for (auto& r : t->runs) w->io().close(&r.file);
@@ -878,6 +915,8 @@ void Engine::abandon() {
             w->io().close(&t->h);
             w->io().close(&t->m);
             w->io().close(&t->g);
+            w->io().close(&t->gNext);
+            w->io().close(&t->gFence);
             for (auto& kv : t->partM) w->io().close(&kv.second);
             t->partM.clear();
             for (auto& r : t->runs) w->io().close(&r.file);
@@ -924,6 +963,22 @@ int32_t Engine::rebalance(uint32_t pid, uint8_t to) {
     c.kind = kCmdRebalance;
     c.a = pid;
     c.b = to;
+    Writer* w = writers_[p->ownerWriter.load() % writers_.size()].get();
+    if (!w->mailbox().push(c)) return FLATSQL_IO_ERR_BUSY;
+    w->ring();
+    return 0;
+}
+
+int32_t Engine::tombRange(uint32_t pid, uint32_t seg, int64_t beforeMs, std::atomic<int32_t>* remaining) {
+    Partition* p = partition(pid);
+    if (!p) return FLATSQL_IO_ERR_NOENT;
+    if (remaining) remaining->store(1, std::memory_order_release);
+    Cmd c;
+    c.kind = kCmdTombRange;
+    c.a = pid;
+    c.b = seg;
+    c.ticket = remaining;
+    std::memcpy(c.data, &beforeMs, 8);
     Writer* w = writers_[p->ownerWriter.load() % writers_.size()].get();
     if (!w->mailbox().push(c)) return FLATSQL_IO_ERR_BUSY;
     w->ring();

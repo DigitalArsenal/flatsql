@@ -555,17 +555,49 @@ Inspector::TypeView Inspector::type(const uint8_t fid[4]) {
             std::memcpy(&le, slot + labelsAt + size_t(i) * sizeof(le), sizeof(le));
             v.labeled[le.pid] = le.labeledThrough;
         }
-    PathBuf gp;
-    pathTypeSeg(&gp, root_.c_str(), fid, 'g', v.head.gSeg, "fsg");
-    std::vector<uint8_t> g;
-    if (readFile(ctx_, gp, FileClass::Arrivals, &g)) {
-        for (uint64_t off = 0; off + kArrivalBytes <= v.head.gLen && off + kArrivalBytes <= g.size();
-             off += kArrivalBytes) {
+    // A15: sealed segments by the fence index, then the active one.
+    PathBuf fp;
+    pathType(&fp, root_.c_str(), fid, kArrivalFenceName);
+    std::vector<uint8_t> fb;
+    if (v.head.gSeg && !readFile(ctx_, fp, FileClass::Arrivals, &fb)) v.fenceErr = "fence missing";
+    for (uint32_t s = 0; s < v.head.gSeg && v.fenceErr.empty(); s++) {
+        ArrivalFence f;
+        if ((size_t(s) + 1) * sizeof(f) > fb.size()) {
+            v.fenceErr = "fence short";
+            break;
+        }
+        std::memcpy(&f, fb.data() + size_t(s) * sizeof(f), sizeof(f));
+        if (f.seg != s || f.crc != crc32c(&f, offsetof(ArrivalFence, crc))) {
+            v.fenceErr = "fence entry invalid";
+            break;
+        }
+        v.fence.push_back(f);
+    }
+    for (uint32_t s = 0; s <= v.head.gSeg; s++) {
+        const uint64_t len = s < v.head.gSeg ? (s < v.fence.size() ? v.fence[s].count * kArrivalBytes : 0)
+                                             : v.head.gLen;
+        PathBuf gp;
+        pathTypeSeg(&gp, root_.c_str(), fid, 'g', s, "fsg");
+        std::vector<uint8_t> g;
+        if (!readFile(ctx_, gp, FileClass::Arrivals, &g)) {
+            if (len && v.fenceErr.empty()) v.fenceErr = "segment missing";
+            continue;
+        }
+        if (g.size() < len && v.fenceErr.empty()) v.fenceErr = "segment short";
+        for (uint64_t off = 0; off + kArrivalBytes <= len && off + kArrivalBytes <= g.size(); off += kArrivalBytes) {
             ArrivalEntry a;
             std::memcpy(&a, g.data() + off, sizeof(a));
+            if (s < v.fence.size() && v.fenceErr.empty()) {
+                if (off == 0 && a.gseq != v.fence[s].firstGseq) v.fenceErr = "fence first gseq";
+                if (off + kArrivalBytes == len && a.gseq != v.fence[s].lastGseq) v.fenceErr = "fence last gseq";
+            }
+            if (s == v.head.gSeg && off == 0 && s > 0 && a.gseq != v.head.gSegFirstGseq && v.fenceErr.empty())
+                v.fenceErr = "head first gseq";
             v.arrivals.push_back(a);
         }
     }
+    for (size_t i = 1; i < v.arrivals.size() && v.fenceErr.empty(); i++)
+        if (v.arrivals[i].gseq <= v.arrivals[i - 1].gseq) v.fenceErr = "arrivals gseq not increasing";
     v.ok = true;
     return v;
 }

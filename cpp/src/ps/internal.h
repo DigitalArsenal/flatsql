@@ -176,6 +176,10 @@ struct Staged {
     // kill tickets satisfied by this commit
     std::atomic<int32_t>* tickets[64];
     uint32_t nTickets = 0;
+    uint32_t killsTaken = 0;      // type-level kills consumed (popped at publish)
+    bool rangeStep = false;       // a TOMB_RANGE step staged TOMBs
+    bool rangeDone = false;
+    uint64_t rangeNext = 0;
 };
 
 // Staged type batch (A10).
@@ -186,6 +190,10 @@ struct StagedType {
     uint32_t nArrivals = 0;
     uint64_t gOff = 0;
     uint32_t gSeg = 0;
+    bool gSeal = false;           // A15: the arrivals start segment gSeg (fence entry below)
+    ArrivalFence fence{};
+    uint64_t fenceOff = 0;
+    uint64_t lastGseq = 0;        // last arrival gseq of this batch
     uint64_t firstGseq = 0;
     uint64_t gseqHi = 0;
     uint8_t* batch = nullptr;

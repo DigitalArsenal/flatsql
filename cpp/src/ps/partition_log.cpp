@@ -1654,6 +1654,61 @@ static bool finalizeBatch(Ctx& c, Arena* batches) {
     return true;
 }
 
+// TOMB_RANGE step (§13): examines up to reconcileStep rows of the segment.
+void tombRangeStep(Ctx& c) {
+    Partition* p = c.p;
+    Staged* st = c.st;
+    TombRange& tr = p->ranges.front();
+    if (!tr.started) {
+        tr.started = true;
+        tr.next = tr.end = 0;
+        if (tr.seg == p->dSeg) {
+            tr.next = p->segFirstPseq;  // the active segment, as of now
+            tr.end = p->pseqHi + 1;
+        } else {
+            for (const auto& si : p->segs) {
+                if (si.seg != tr.seg || !si.sealed) continue;
+                tr.next = si.firstPseq;
+                tr.end = si.endPseq;
+            }
+        }
+    }
+    const uint32_t step = c.e->config().reconcileStep;
+    const uint32_t rows0 = c.sc->nRows;
+    uint64_t cur = tr.next;
+    for (uint32_t examined = 0; cur < tr.end && examined < step; examined++) {
+        if (c.sc->nRows + 4 > c.sc->capRows || c.sc->nEntries + 8 > c.sc->capEntries) break;
+        RecRow row;
+        const int32_t rc = readRow(c, cur, &row);
+        if (rc < 0) {
+            c.err = rc;
+            return;
+        }
+        if (row.kind == kRowPut && row.epochMs < tr.beforeMs && row.supersedeHash == 0 && !isDead(c, cur) &&
+            !stageKill(c, cur))
+            break;
+        if (c.err) return;
+        cur++;
+    }
+    const bool done = cur >= tr.end;
+    if (c.sc->nRows == rows0) {
+        // Nothing staged: the cursor moves now (TOMBs of earlier steps are
+        // already durable).
+        tr.next = cur;
+        if (done) {
+            std::atomic<int32_t>* rem = tr.remaining;
+            p->ranges.erase(p->ranges.begin());
+            if (rem && rem->fetch_sub(1, std::memory_order_acq_rel) == 1)
+                wakeU32(reinterpret_cast<std::atomic<uint32_t>*>(rem), -1);
+        }
+        return;
+    }
+    st->rangeStep = true;
+    st->rangeNext = cur;
+    st->rangeDone = done;
+    if (done && tr.remaining) st->tickets[st->nTickets++] = tr.remaining;
+}
+
 bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Arena* batches) {
     Engine* e = w->engine();
     Staged* st = batches->make<Staged>();
@@ -1683,20 +1738,19 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
         addCtl(c, kCtlMergeDone, body, sizeof(body));
         st->mergeDone = true;
     }
-    // Type-level kills from the mailbox (A14).
-    while (!p->kills.empty() && st->nTickets < 64) {
-        PendingKill& k = p->kills.back();
+    // Type-level kills from the mailbox (A14). They leave the queue when the
+    // batch publishes; a discarded batch retries them.
+    while (st->killsTaken < p->kills.size() && st->nTickets < 63) {
+        PendingKill& k = p->kills[p->kills.size() - 1 - st->killsTaken];
         uint8_t key[kCidKeyLen];
         cidSortKey(k.cid, key);
         StageScratch::Cid* cs = cidState(c, key);
         if (!cs) break;
         if (cs->putPseq && !stageKill(c, cs->putPseq)) break;
         if (k.remaining) st->tickets[st->nTickets++] = k.remaining;
-        const int saved = tHotPathDepth;
-        tHotPathDepth = 0;
-        p->kills.pop_back();
-        tHotPathDepth = saved;
+        st->killsTaken++;
     }
+    if (!p->ranges.empty() && st->nTickets < 64 && !c.err) tombRangeStep(c);
     const EngineConfig& cfg = e->config();
     uint64_t pos = st->endPos;
     const uint64_t tail = p->ring->tail.load(std::memory_order_acquire);
@@ -1876,6 +1930,8 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
         return false;
     }
     if (!st->consumed && st->nextPseq == st->firstPseq && !st->batch && st->nTickets == 0) {
+        // Kills of cids this partition does not hold, without tickets: done.
+        if (st->killsTaken) p->kills.resize(p->kills.size() - st->killsTaken);
         p->st = nullptr;
         return false;
     }
@@ -2117,6 +2173,11 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         r->ackedRseq.store(st->lastRseq, std::memory_order_release);
         r->ackGen.fetch_add(1, std::memory_order_release);
         if (r->prodWaiting.load(std::memory_order_acquire)) wakeU32(&r->ackGen, -1);
+    }
+    if (st->killsTaken) p->kills.resize(p->kills.size() - st->killsTaken);  // shrink: no allocation
+    if (st->rangeStep && !p->ranges.empty()) {
+        p->ranges.front().next = st->rangeNext;
+        if (st->rangeDone) p->ranges.erase(p->ranges.begin());
     }
     for (uint32_t i = 0; i < st->nTickets; i++) {
         if (st->tickets[i]->fetch_sub(1, std::memory_order_acq_rel) == 1)

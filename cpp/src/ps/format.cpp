@@ -40,7 +40,8 @@ size_t capKey(uint8_t* out, const uint8_t* s, size_t len) {
 }
 
 namespace {
-inline uint8_t rankOf(uint8_t v) { return v >= 26 ? uint8_t(v - 26) : uint8_t(v + 6); }
+// Base32 symbol value <-> text-order rank ('2'..'7' sort before 'a'..'z'):
+// rank(v) = v >= 26 ? v - 26 : v + 6 (the kRank table below).
 inline uint8_t valueOfRank(uint8_t r) { return r < 6 ? uint8_t(r + 26) : uint8_t(r - 6); }
 constexpr int kCidSymbols = (kCidLen * 8 + 4) / 5;  // 58
 }  // namespace
