@@ -134,6 +134,14 @@ set(FLATSQL_HEADERS
     include/flatsql/geo_geometry.h
 )
 
+# wasm32-wasip1-threads (wasi-sdk, cmake/wasi-threads-toolchain.cmake): the
+# partition store artifact flatsql-ps-threads.wasm and its test commands
+# (docs/PARTITION-STORE-WASM.md). That toolchain builds only those targets.
+if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/flatsql_ps_wasm.cmake)
+    return()
+endif()
+
 # Emscripten/WASM configuration
 if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
     message(STATUS "")

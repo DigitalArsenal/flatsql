@@ -8,6 +8,7 @@ cpp/build/
 cpp/build-wasm/
 cpp/build-release/
 cpp/build-test/
+cpp/build-ps-wasm/
 cpp/.emsdk/
 cpp/.cache/
 

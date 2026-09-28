@@ -18,8 +18,11 @@
 // ---- hot-path allocation counter (acceptance T1 #8) ---------------------------------
 std::atomic<uint64_t> gHotAllocs{0};
 std::atomic<uint64_t> gAllAllocs{0};
+#if !defined(__wasm__)
 #include <execinfo.h>
+#endif
 static void traceHot() {
+#if !defined(__wasm__)
     static std::atomic<int> printed{0};
     if (!std::getenv("PS_TRACE_HOT") || printed.fetch_add(1) >= 4) return;
     const int saved = flatsql::ps::tHotPathDepth;
@@ -29,6 +32,17 @@ static void traceHot() {
     backtrace_symbols_fd(frames, n, 2);
     std::fprintf(stderr, "----\n");
     flatsql::ps::tHotPathDepth = saved;
+#endif
+}
+// Allocation failure: bad_alloc where exceptions exist; the wasm commands are
+// built without them (-fno-exceptions), where it aborts.
+[[noreturn]] static void allocFailed() {
+#if defined(__cpp_exceptions)
+    throw std::bad_alloc();
+#else
+    std::fprintf(stderr, "operator new: out of memory\n");
+    std::abort();
+#endif
 }
 void* operator new(std::size_t n) {
     gAllAllocs.fetch_add(1, std::memory_order_relaxed);
@@ -37,14 +51,14 @@ void* operator new(std::size_t n) {
         traceHot();
     }
     void* p = std::malloc(n ? n : 1);
-    if (!p) throw std::bad_alloc();
+    if (!p) allocFailed();
     return p;
 }
 void* operator new[](std::size_t n) {
     gAllAllocs.fetch_add(1, std::memory_order_relaxed);
     if (flatsql::ps::tHotPathDepth > 0) gHotAllocs.fetch_add(1, std::memory_order_relaxed);
     void* p = std::malloc(n ? n : 1);
-    if (!p) throw std::bad_alloc();
+    if (!p) allocFailed();
     return p;
 }
 void* operator new(std::size_t n, const std::nothrow_t&) noexcept {

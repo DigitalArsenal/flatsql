@@ -141,8 +141,19 @@ unsigned usableHardwareThreads() {
 
 bool latencyBoxQuiet(unsigned* threads, double* load1, std::string* why) {
     const unsigned hw = usableHardwareThreads();
+#if defined(__wasm__)
+    // WASI has no load average and no CPU count: under a wasm host the
+    // latency bounds are reported, never enforced (they are native
+    // acceptance numbers, docs/PARTITION-STORE-WASM.md).
+    *threads = hw;
+    *load1 = -1;
+    *why = "wasm host (no load average or CPU count)";
+    return false;
+#endif
     double load[3] = {0, 0, 0};
+#if !defined(__wasm__)
     getloadavg(load, 3);
+#endif
     *threads = hw;
     *load1 = load[0];
     char b[160];

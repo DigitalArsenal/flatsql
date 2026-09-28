@@ -28,13 +28,27 @@ namespace ps {
 
 thread_local int tHotPathDepth = 0;
 
+namespace {
+std::atomic<uint64_t (*)(void*)> gTestMono{nullptr};
+std::atomic<int64_t (*)(void*)> gTestWall{nullptr};
+std::atomic<void*> gTestClockCtx{nullptr};
+}  // namespace
+
+void setTestClock(uint64_t (*mono)(void*), int64_t (*wall)(void*), void* ctx) {
+    gTestClockCtx.store(ctx, std::memory_order_release);
+    gTestMono.store(mono, std::memory_order_release);
+    gTestWall.store(wall, std::memory_order_release);
+}
+
 uint64_t monoNs() {
+    if (auto* f = gTestMono.load(std::memory_order_acquire)) return f(gTestClockCtx.load());
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
 }
 
 int64_t wallMs() {
+    if (auto* f = gTestWall.load(std::memory_order_acquire)) return f(gTestClockCtx.load());
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return int64_t(ts.tv_sec) * 1000 + int64_t(ts.tv_nsec / 1000000);
@@ -49,10 +63,19 @@ void cpuRelax() {
 }
 
 void sleepNs(uint64_t ns) {
+#if defined(__wasm__)
+    // A timed wait nobody notifies: sleeps without WASI poll_oneoff, which
+    // the browser and Node pool hosts do not provide.
+    if (ns == 0) return;
+    int32_t never = 0;
+    const int64_t t = ns > uint64_t(INT64_MAX) ? INT64_MAX : int64_t(ns);
+    __builtin_wasm_memory_atomic_wait32(&never, 0, t);
+#else
     struct timespec ts;
     ts.tv_sec = time_t(ns / 1000000000ull);
     ts.tv_nsec = long(ns % 1000000000ull);
     nanosleep(&ts, nullptr);
+#endif
 }
 
 void waitU32(std::atomic<uint32_t>* addr, uint32_t expected, uint64_t timeoutNs) {

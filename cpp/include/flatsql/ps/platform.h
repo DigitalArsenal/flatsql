@@ -22,6 +22,11 @@ static_assert(sizeof(void*) == 4 || sizeof(void*) == 8, "32- or 64-bit targets o
 uint64_t monoNs();
 // Wall clock, milliseconds since the Unix epoch.
 int64_t wallMs();
+// Deterministic mode (parity vectors, docs/PARTITION-STORE-WASM.md): while
+// set, monoNs() and wallMs() return these instead of the host clocks, so a
+// single-threaded run writes the same bytes on every host. nullptr restores
+// the host clocks. Tests only; set before an engine opens.
+void setTestClock(uint64_t (*mono)(void*), int64_t (*wall)(void*), void* ctx);
 
 // Block while *addr == expected, for at most timeoutNs (0 = do not block).
 // Spurious wakeups are allowed; callers re-check their condition.
