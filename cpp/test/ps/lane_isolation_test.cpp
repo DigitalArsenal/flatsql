@@ -125,19 +125,20 @@ PS_TEST(lane_isolation_bulk_nomem_T2_4) {
     report("interactive_p99_baseline_ms", p99b, "ms");
     report("interactive_p99_during_bulk_nomem_ms", p99l, "ms");
     report("interactive_p99_ratio", p99l / p99b, "x");
-    const unsigned hw = std::thread::hardware_concurrency();
+    unsigned hw = 0;
     double load[3] = {0, 0, 0};
-    getloadavg(load, 3);
+    std::string notQuiet;
+    const bool quiet = latencyBoxQuiet(&hw, &load[0], &notQuiet);
     report("hardware_threads", double(hw), "threads");
     report("load_average_1m", load[0], "");
     // Linux-8 acceptance: +/-10%, a property of a dedicated box. The hog is
     // one busy core streaming ~300 MB through its caches; on a box whose
     // cores are already busy with other work it steals time from the lanes
     // (no lock is shared: see the lock report below). Enforced on a quiet box
-    // with 8+ hardware threads, reported everywhere (PARTITION-STORE.md §9).
-    const bool quiet = hw >= 8 && load[0] < double(hw) / 4;
+    // with 8+ hardware threads running a release build, reported everywhere
+    // (PARTITION-STORE.md §20).
     if (quiet && argInt("enforce_ratio", 1)) CHECK(p99l <= p99b * 1.10);
-    if (!quiet) std::printf("  NOTE ratio not enforced: load %.1f on %u hardware threads (needs a quiet Linux-8 box)\n", load[0], hw);
+    if (!quiet) std::printf("  NOTE ratio not enforced: %s (needs a quiet Linux-8 box)\n", notQuiet.c_str());
     // Nothing poisoned: the same bulk lane runs the next statement, and its
     // arena is consistent and back near its idle footprint.
     Rows after = bulk.q("SELECT count(*) FROM OMM");

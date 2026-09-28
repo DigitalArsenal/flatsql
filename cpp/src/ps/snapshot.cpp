@@ -326,8 +326,14 @@ struct PostingScan::Source {
     const uint8_t* val = nullptr;
     uint8_t vlen = 0;
     bool valid = false;
+    // A lazy source holds only a lower bound of its first entry (key = the
+    // bound, no value) until it reaches the top of the heap; materialize()
+    // then reads its first block. A window over many runs reads the blocks
+    // of the runs it actually draws from.
+    bool lazy = false;
     virtual ~Source() = default;
     virtual bool advance(LaneStore* st) = 0;
+    virtual bool materialize(LaneStore*) { return valid; }
     int32_t err = 0;
 };
 
@@ -374,15 +380,26 @@ struct L1Source : PostingScan::Source {
     bool desc = false;
     uint8_t v = 0;
     bool done = false;
-    std::string lo, hi;
+    // The scan's bounds, shared by its sources: lo = bounds[0, loLen),
+    // hi = bounds[loLen, end).
+    std::shared_ptr<const std::string> bounds;
+    const uint8_t* loP = nullptr;
+    const uint8_t* hiP = nullptr;
+    size_t loN = 0, hiN = 0;
     bool hasLo = false, hasHi = false;
-    uint8_t buf[kL1BlockBytes];
+    int64_t pending = -1;  // lazy: the block materialize() reads first
+    std::unique_ptr<uint8_t[]> bufMem;  // one 4 KiB block, allocated on first read
+    uint8_t* buf = nullptr;
     std::vector<uint16_t> ents;  // entry offsets within buf (in range)
 
     bool loadBlock(LaneStore* st, int64_t b) {
         ents.clear();
         if (b < 0 || b >= int64_t(fences->size())) return false;
         block = b;
+        if (!buf) {
+            bufMem.reset(new uint8_t[kL1BlockBytes]);
+            buf = bufMem.get();
+        }
         const int32_t rc = st->readBlock(file, (*fences)[size_t(b)].blockOff, buf);
         if (rc < 0) {
             err = rc;
@@ -394,9 +411,9 @@ struct L1Source : PostingScan::Source {
         const uint8_t* at = it.p;
         bool pastHi = false, beforeLo = false;
         while (it.next(&k, &kl, &val)) {
-            if (hasLo && keyCmp(k, kl, reinterpret_cast<const uint8_t*>(lo.data()), lo.size()) < 0) {
+            if (hasLo && keyCmp(k, kl, loP, loN) < 0) {
                 beforeLo = true;
-            } else if (hasHi && keyCmp(k, kl, reinterpret_cast<const uint8_t*>(hi.data()), hi.size()) >= 0) {
+            } else if (hasHi && keyCmp(k, kl, hiP, hiN) >= 0) {
                 pastHi = true;
                 break;
             } else {
@@ -408,8 +425,8 @@ struct L1Source : PostingScan::Source {
         done = desc ? beforeLo : pastHi;
         return true;
     }
-    bool init(LaneStore* st, std::shared_ptr<LazyRun> r, const FileKey& f, uint16_t kind, const std::string& l,
-              bool hl, const std::string& h, bool hh, bool d) {
+    bool init(LaneStore* st, std::shared_ptr<LazyRun> r, const FileKey& f, uint16_t kind,
+              std::shared_ptr<const std::string> bnd, size_t loLen, bool hl, bool hh, bool d, bool allowLazy) {
         run = std::move(r);
         file = f;
         int32_t frc = 0;
@@ -420,8 +437,11 @@ struct L1Source : PostingScan::Source {
         }
         if (!fences || fences->empty()) return false;
         v = run->kindVlen(kind);
-        lo = l;
-        hi = h;
+        bounds = std::move(bnd);
+        loP = reinterpret_cast<const uint8_t*>(bounds->data());
+        loN = loLen;
+        hiP = loP + loLen;
+        hiN = bounds->size() - loLen;
         hasLo = hl;
         hasHi = hh;
         desc = d;
@@ -433,7 +453,7 @@ struct L1Source : PostingScan::Source {
                 size_t a = 0, b2 = fences->size();
                 while (a < b2) {
                     const size_t mid = (a + b2) / 2;
-                    if (prefixCmp(reinterpret_cast<const uint8_t*>(lo.data()), lo.size(), (*fences)[mid]) > 0)
+                    if (prefixCmp(loP, loN, (*fences)[mid]) > 0)
                         a = mid + 1;
                     else
                         b2 = mid;
@@ -447,7 +467,7 @@ struct L1Source : PostingScan::Source {
                 size_t a = 0, b2 = fences->size();
                 while (a < b2) {
                     const size_t mid = (a + b2) / 2;
-                    if (prefixCmp(reinterpret_cast<const uint8_t*>(hi.data()), hi.size(), (*fences)[mid]) >= 0)
+                    if (prefixCmp(hiP, hiN, (*fences)[mid]) >= 0)
                         a = mid + 1;
                     else
                         b2 = mid;
@@ -457,9 +477,36 @@ struct L1Source : PostingScan::Source {
             }
         }
         if (st->stats()) st->stats()->fenceReads++;
+        if (allowLazy && !desc) {
+            // Ascending: every entry in range is >= lo and >= the first key
+            // of block `start`, whose fence prefix is a prefix of it.
+            const L1Fence& fe = (*fences)[size_t(start)];
+            if (hasHi && prefixCmp(hiP, hiN, fe) < 0) return false;
+            pending = start;
+            lazy = true;
+            if (hasLo) {
+                key = loP;
+                klen = uint16_t(loN);
+            } else {
+                key = fe.prefix;
+                klen = fe.prefixLen;
+            }
+            val = nullptr;
+            vlen = 0;
+            return valid = true;
+        }
         if (!loadBlock(st, start)) return false;
         idx = desc ? int64_t(ents.size()) : -1;
         return true;
+    }
+    bool materialize(LaneStore* st) override {
+        if (!lazy) return valid;
+        lazy = false;
+        const int64_t b = pending;
+        pending = -1;
+        if (!loadBlock(st, b)) return valid = false;
+        idx = -1;
+        return advance(st);
     }
     bool advance(LaneStore* st) override {
         if (err) return valid = false;
@@ -478,7 +525,7 @@ struct L1Source : PostingScan::Source {
             if (nb < 0 || nb >= int64_t(fences->size())) return valid = false;
             // Past the range by the fence prefix alone?
             if (!desc && hasHi &&
-                prefixCmp(reinterpret_cast<const uint8_t*>(hi.data()), hi.size(), (*fences)[size_t(nb)]) < 0)
+                prefixCmp(hiP, hiN, (*fences)[size_t(nb)]) < 0)
                 return valid = false;
             if (!loadBlock(st, nb)) return valid = false;
             idx = desc ? int64_t(ents.size()) : -1;
@@ -504,6 +551,12 @@ bool PostingScan::before(int a, int b) const {
     const Source* x = srcs_[size_t(a)].get();
     const Source* y = srcs_[size_t(b)].get();
     int c = keyCmp(x->key, x->klen, y->key, y->klen);
+    if (c == 0 && (x->lazy || y->lazy)) {
+        // A lazy bound sorts before any entry with the same key (ascending
+        // only: descending scans never go lazy).
+        if (x->lazy != y->lazy) return x->lazy;
+        return a < b;
+    }
     if (c == 0) c = std::memcmp(x->val, y->val, std::min(x->vlen, y->vlen));
     if (c == 0) c = a < b ? -1 : 1;
     return desc_ ? c > 0 : c < 0;
@@ -527,6 +580,22 @@ void PostingScan::pick() {
     for (size_t i = 0; i < srcs_.size(); i++)
         if (srcs_[i]->valid) heap_.push_back(int(i));
     for (size_t i = heap_.size() / 2; i-- > 0;) siftDown(i);
+    settle();
+}
+
+// Materializes lazy sources until the top of the heap holds a real entry.
+void PostingScan::settle() {
+    while (!heap_.empty()) {
+        Source* s = srcs_[size_t(heap_[0])].get();
+        if (!s->lazy) break;
+        s->materialize(store_);
+        if (s->err && !err_) err_ = s->err;
+        if (!s->valid) {
+            heap_[0] = heap_.back();
+            heap_.pop_back();
+        }
+        if (!heap_.empty()) siftDown(0);
+    }
     cur_ = heap_.empty() ? -1 : heap_[0];
 }
 
@@ -541,7 +610,7 @@ bool PostingScan::next() {
         heap_.pop_back();
     }
     if (!heap_.empty()) siftDown(0);
-    cur_ = heap_.empty() ? -1 : heap_[0];
+    settle();
     return cur_ >= 0;
 }
 
@@ -1555,6 +1624,7 @@ PostingScan LaneStore::scan(const PartSnap& s, uint16_t kind, const uint8_t* lo,
     if (s.empty) return ps;
     const std::string los = lo ? std::string(reinterpret_cast<const char*>(lo), lol) : std::string();
     const std::string his = hi ? std::string(reinterpret_cast<const char*>(hi), hil) : std::string();
+    const auto bounds = std::make_shared<const std::string>(los + his);
     {
         int32_t rc = 0;
         const SectionList* list = sections(s, kind, &rc);
@@ -1581,15 +1651,15 @@ PostingScan LaneStore::scan(const PartSnap& s, uint16_t kind, const uint8_t* lo,
                     return ps;
                 }
                 if (!run->hasKind(kind)) continue;
-                std::unique_ptr<L1Source> src(new L1Source());
-                if (!src->init(this, run, f, kind, los, lo != nullptr, his, hi != nullptr, desc)) {
+                std::unique_ptr<L1Source> src(new L1Source);
+                if (!src->init(this, run, f, kind, bounds, los.size(), lo != nullptr, hi != nullptr, desc, true)) {
                     if (src->err) {
                         ps.err_ = src->err;
                         return ps;
                     }
                     continue;
                 }
-                src->advance(this);
+                if (!src->lazy) src->advance(this);
                 if (src->err) {
                     ps.err_ = src->err;
                     return ps;
@@ -1610,6 +1680,7 @@ PostingScan LaneStore::scanType(const TypeSnap& t, uint16_t kind, const uint8_t*
     if (t.empty) return ps;
     const std::string los = lo ? std::string(reinterpret_cast<const char*>(lo), lol) : std::string();
     const std::string his = hi ? std::string(reinterpret_cast<const char*>(hi), hil) : std::string();
+    const auto bounds = std::make_shared<const std::string>(los + his);
     {
         int32_t rc = 0;
         const SectionList* list = sections(t, kind, &rc);
@@ -1634,15 +1705,15 @@ PostingScan LaneStore::scanType(const TypeSnap& t, uint16_t kind, const uint8_t*
             return ps;
         }
         if (!run->hasKind(kind)) continue;
-        std::unique_ptr<L1Source> src(new L1Source());
-        if (!src->init(this, run, f, kind, los, lo != nullptr, his, hi != nullptr, desc)) {
+        std::unique_ptr<L1Source> src(new L1Source);
+        if (!src->init(this, run, f, kind, bounds, los.size(), lo != nullptr, hi != nullptr, desc, true)) {
             if (src->err) {
                 ps.err_ = src->err;
                 return ps;
             }
             continue;
         }
-        src->advance(this);
+        if (!src->lazy) src->advance(this);
         ps.srcs_.push_back(std::move(src));
     }
     ps.pick();

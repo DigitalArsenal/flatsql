@@ -55,6 +55,14 @@ bool waitLabeledEngine(Engine* e, const std::vector<uint32_t>& pids, uint64_t ti
 
 std::string cidTextOf(const std::vector<uint8_t>& frame);
 
+// Latency bounds are acceptance on a quiet Linux-8 box running a release
+// build. latencyBoxQuiet() says whether this run is one: an optimized build,
+// 8+ usable hardware threads (the affinity mask on Linux, so a cpuset-limited
+// container counts what it may use) and a 1-minute load below a quarter of
+// them. `why` names what disqualified it.
+unsigned usableHardwareThreads();
+bool latencyBoxQuiet(unsigned* threads, double* load1, std::string* why);
+
 }  // namespace pst
 
 #endif

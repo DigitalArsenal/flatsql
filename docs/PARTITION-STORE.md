@@ -161,7 +161,7 @@ Config TLV tags are listed in `flatsql_ps.h`.
 ```
 cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build cpp/build -j 8 --target flatsql_ps_test flatsql_ps_bench
-cpp/build/flatsql_ps_test                         # default suite (~1 min)
+cpp/build/flatsql_ps_test                         # default suite, T1 + T2 (~2 min)
 cpp/build/flatsql_ps_test --test=<name>           # one test, slow ones included
 cpp/build/flatsql_ps_test --crash-trials=N --crash-seed=S --test=crash_faults_T1_1
 cpp/build/flatsql_ps_bench --mode=scaling|host02|dirty|soak [--journal=1] [--io=mem|fs] [--dir=D]
@@ -454,6 +454,13 @@ vector for T6's Go decoder.
   kind.
 - **L1 runs** open lazily: footer and TOC, the metadata CRC checked once per
   lane, then a kind's fences on first use and its bloom while it fits.
+- **Ascending scans prime runs lazily.** A run joins a posting merge with a
+  lower bound of its first entry (the scan's `lo`, or its first block's fence
+  prefix) and reads its first 4 KiB block only when it reaches the top of the
+  merge. The default order (`EPOCH_CID`, newest first) and gseq order are
+  ascending, so a LIMIT window reads blocks only from the runs it draws rows
+  from, not one block from every run of every partition. Descending scans
+  prime eagerly (a fence gives no upper bound).
 - **The instance's shared cache** holds these immutable pieces (L0
   directories and sections, fences, blooms) for every lane: 64 shards, each
   only ever try-locked, so a busy shard is a miss and a lane never waits on
@@ -492,10 +499,42 @@ readers and are covered by T1's suites as well as T2's.
 | Catalog precedence at equal tcs: DEAD > PROMOTED > REPEAT > FIRST (writer `upsertCopy`, reader `catalog`/`labelOf`; REHOME candidates of one tcs resolved by liveness) | **T1 defect** found by the fan-out oracle: a batch that promoted a REPEAT and then killed it left two entries with one tcs; value order made the copy read as live, and a returning copy was labeled REPEAT instead of FIRST. |
 | A cid's catalog is gathered, resolved per copy and loaded without its dead copies | **T1 defect** found by the A14 reader test: a cid killed and re-added over 1,000 times overflowed the per-batch copy table, dropped its live REPEAT, and died without an heir (63 of 64 promotions at round 1,027). |
 | Writer threads tag themselves for the lock report | Lock-set disjointness instrumentation (T2 #1). |
+| Test fixture `buildRecord` passes a NUL-terminated file identifier | `FinishSizePrefixed` takes a C string; the fixture passed the type's four `fid` bytes, and Debug builds (CI) asserted when the next byte was not zero (T2's type variants). |
 
 ## 20. Acceptance (§18 T2 as amended)
 
-ACCEPTANCE_TABLE_PLACEHOLDER
+Machines: **Mac** = the owner's Mac Studio (Darwin 25.3.0, arm64, 28 hardware
+threads), shared with other lanes; the 1-minute load average is recorded per
+run (20–46 during these). **Mac mem** runs use the in-memory test host (no
+fsync), **Mac APFS** the native host on APFS (`F_FULLFSYNC`). **Docker** =
+Linux 6.12 arm64 in Docker Desktop on that Mac (a 16-vCPU VM shared with the
+Mac's load), either `--cpuset-cpus 0-7` (8 pinned vCPUs, "Docker-8") or
+`--cpus 8` (a CFS quota over 16 vCPUs, whose throttling periods show up as
+100 ms+ tails; used only for correctness and disjointness); ext4 on the VM's
+disk with `fdatasync`. None is a quiet Linux-8 box: latency bounds are enforced
+by the tests only on one (a release build, 8+ usable hardware threads, load
+below a quarter of them) and reported everywhere else. Numbers come from
+`MEASURED` lines of `flatsql_ps_test` and `flatsql_ps_bench --mode=test` on
+task-branch builds of 2026-09-28; rows 1, 4 and A28 are from the final build
+(lazy run priming, §17).
+
+| # | Acceptance | Result | Where |
+|---|---|---|---|
+| 1 | 8 writers saturate 256 partitions, 16 lanes, 10 min: `flatsql_partitions` p99 ≤ 1 ms; window LIMIT 1000 p99 ≤ 10 ms; reader and writer lock sets disjoint; max lane lock wait ≤ 1 ms | **Disjointness and lock wait pass everywhere; the latency bounds are not met on any box measured (all of them CPU-saturated by the test and by other work: needs a quiet Linux-8 box).** Every SQLite mutex and the shared index cache are acquired by lanes only (writer acquisitions 0 in every run); max lane lock wait 0.000–0.022 ms (the cache is only ever try-locked). The engine's own cost, writers stopped and one client (100 statements, 1–4 L0 blocks per partition after merges, 4.7–18 M records): Mac window p50 3.0–8.1 ms, p99 6.3–48 ms following the Mac's load, `flatsql_partitions` p99 0.95–1.3 ms; Docker-8 in-memory window p50 6.3 / p99 60 ms, ext4 p50 14.6 / p99 154 ms. Under saturation the lanes share the CPUs with 8 producer threads, the writers and their merges: Mac mem 40 s at load 46 (15.4 M records): `flatsql_partitions` p99 6.5 ms, window p50 14.5 / p99 91 ms, source window p99 77 ms, counters without a lane (A28) p50 0.42 / p99 2.0 ms. Docker-8 in-memory 30 s at VM load 12 (8.6 M records): `flatsql_partitions` p99 15.7 ms, window p50 75 / p99 259 ms. Docker-8 ext4 60 s at VM load 19 (8.1 M records): `flatsql_partitions` p99 24 ms, window p50 278 / p99 762 ms (an earlier build's run at VM load 18: p50 3.6 / p99 347 ms; host contention decides). Mac APFS 10 min at load 16 (earlier build, 14.8 M records, fsync-bound): 0 errors, window p50 70 / p99 370 ms. | `readers_under_saturating_writers_T2_1[_full]` (`--dir` for a real file system) |
+| 2 | 10,000 randomized workloads (a CID across up to 8 producers, supersede, tombstones, epoch-less types) equal a brute-force reference: one row per CID, FIRST semantics, order; rows examined ≤ LIMIT × (partitions + 1). A14: readers during FIRST deaths never miss a live CID | **Pass.** Mac mem: 10,000 workloads (49,833 promotions, 10,064 type deletes, 22,043 supersedes, 13,119 RECONCILEs), 229 s; every Q1–Q5 check (default order, LIMIT prefix and its examined bound, CID lookups, gseq order, partition counts) against the Inspector's reference. A14: 10 min, 2,979 rounds of FIRST deaths, 190,656 promotions, 5,179 reader statements, 0 missing CIDs, 0 gseq changes. Two T1 defects were found on the way (§19). Docker (`--cpus 8`): 500 workloads pass. | `fanout_randomized_vs_bruteforce_T2_2_full`, `fanout_readers_during_first_deaths_A14_full` |
+| 3 | −2^63, 2^53+1, 2^63−1 round-trip exactly through RB1 (C++ encoder; Go decoder vectors for T6) | **Pass.** Encoder/decoder in any byte split, the golden vector `vectors/rb1_int64.hex`, and parameters and literals through a lane. Docker: pass. | `int64_rb1_encoder_decoder_exact_T2_3`, `int64_exact_through_sql_lane_T2_3` |
+| 4 | Bulk statement past its 128 MiB arena → `SQLITE_NOMEM`, interactive p99 within ±10%, nothing poisoned; unbounded plan on an interactive lane → `FLATSQL_NEEDS_BULK` in ≤ 1 ms with 0 rows examined | **NOMEM, no poisoning and NEEDS_BULK pass; the ±10% ratio holds on Docker-8 and is noise-bound on the Mac.** Every hog returns `kRsNoMem`; the same lane then answers, its arena passes a full consistency check and holds 160 KiB. NEEDS_BULK: lane time p50 0.012–0.016 / p99 0.051–0.099 / max 0.17 ms, 0 rows examined, over 200 unbounded shapes (Mac and Docker). Ratio (p99 with the hog / without, four alternating rounds): Docker-8 at VM load 2.0 and 3.5: 1.030 and 1.087 (rounds 0.95–1.09 and 1.02–1.43); Docker `--cpus 8`: 0.947; Mac control runs (no hog) 1.02–1.05, with the hog 0.94–2.3 at load 20–47 (one busy core streaming 300 MB beside the lanes; no shared lock, see #1). | `lane_isolation_bulk_nomem_T2_4`, `lane_needs_bulk_under_1ms_zero_rows_T2_4` |
+| 5 | 1,000 compaction SWAPs under load: statements started before a SWAP complete with pre-SWAP rows. A12: 10-min bulk export under continuous compaction, 0 SNAPSHOT_GONE | **Pass.** Mac APFS: 1,000 SWAPs while ingest runs, 2,406 partition scans verified row by row against the frames sent, 987 of them spanning a SWAP (up to 28 SWAPs during one statement), 0 errors, every retired file set unlinked once announcements allowed. A12, Mac APFS 10 min: 2,769 type-level exports (84.5 M frames), 8,153 SWAPs, 8,090 retired sets unlinked, 0 SNAPSHOT_GONE. Negative control: unlinking without the announcement check gives SNAPSHOT_GONE. Docker (`--cpus 8`, in-memory): 1,000 SWAPs, 56 partition scans all spanning SWAPs (up to 257 during one), 0 errors; A12 10 min: 18,891 exports (296.5 M frames) across 300 SWAPs (the in-memory cap), 0 SNAPSHOT_GONE. | `snapshot_swaps_under_load_T2_5`, `snapshot_bulk_export_under_compaction_A12_full --dir=…`, `snapshot_unlink_without_announce_is_snapshot_gone` |
+| 6 | Arrivals paging while 8 writers produce: gseq strictly increasing within and across pages; no gseq ≤ the snapshot head appears after the snapshot; union of pages = the FIRST-live set at the snapshot. A14: a CID's gseq never changes while a copy lives | **Pass.** Mac mem: 62 syncs (18,716 pages of 500) against 1.44 M records from 8 producers into 32 partitions; every sync equals the oracle (final arrivals ≤ its MaxRowID), 0 violations, 0 gseq changes. Docker: 46 syncs, 9,648 pages, 921,888 records, 0 violations. | `arrivals_paging_while_writers_produce_T2_6` |
+| 7 | Page 10,000 of 100 rows on a 3 M-record type examines ≤ 2 × 100 rows plus fence reads | **Pass.** Mac mem, 3,000,000 records, 10% scattered deaths: OFFSET 999,900 in gseq order examined 100 rows and 132 arrival entries with 268 fence reads, 2.5 ms; pages equal a full scan's (60 random offsets, ascending and descending, 30% deaths). Docker: 100 rows, 150 entries, 196 fence reads, 7.3 ms. | `offset_paging_page_10000_T2_7_full`, `offset_paging_matches_reference_with_deaths` |
+| 8 | A full sync of a 99%-dead history examines ≤ 2 × (live rows + fence reads) | **Pass.** 100,000-entry history, 1,000 live. Deaths clustered: 1,000 rows and 1,008–1,009 arrival entries examined, 724–1,052 fence reads. Deaths scattered (1 in 100 live): 1,000 rows and 2,001 entries examined, 57,388–67,740 fence reads (deviation 4). Docker: clustered 1,000 rows / 1,008 entries / 707 fence reads; scattered 1,000 / 2,001 / 57,492. | `dead_history_full_sync_T2_8` |
+| A30 | A maximum-depth SQL expression on a lane | **Pass.** A depth-1000 expression (`SQLITE_MAX_EXPR_DEPTH`) runs; depth 1001 is refused; the lane serves on, canary intact. | `lane_max_depth_expression_A30` |
+| A28 | 8 clients reading at 10 KB/s: counter p99 ≤ 10 ms, window p99 ≤ 50 ms. A sandbox cartesian join returns `timeout` while the bulk lane stays free | **Counter bound met on the Mac and Docker-8 in-memory; window bound met only at Mac load 20; the sandbox contract passes.** 8 slow clients park their lanes while others read. Mac mem 40 s: counter p99 1.1 / 4.1 / 2.4 ms and window p99 31.9 / 58 / 64 ms at load 20 (earlier build) / 31 / 46. Docker-8: counter p99 6.4 (in-memory) and 14.1 ms (ext4), window p99 148 and 224 ms at VM load 12 and 19. The join returns `timeout` from the work budget while a bulk statement completes in 1.5–2.3 ms; meta tables are not public; sandbox SQL is refused on the shared bulk lane. | `readers_under_saturating_writers_T2_1_full`, `lane_sandbox_contract_A28` |
+
+A12's announcement protocol, A14's promotion reads, A15's page fill and
+MaxRowID, A17's CID order in the default merge, A18's `_source` and bounded
+`<TYPE>`, A21's cancellation polls, A28 and A30 are covered by the rows above
+and `lane_test.cpp`.
 
 ## 21. Design deviations (T2)
 
@@ -556,3 +595,41 @@ Each entry: what the design says, what was built, why, and the evidence.
     cache**; the host handle table is measured under WasmEdge (A29, T5/T6).
 14. **CounterReader reads heads** (O(partitions) preads), the A28 path without
     a lane; the Go snapshot refreshed on every acked commit is T6's.
+
+## 22. Running the T2 tests; what needs a Linux-8 box
+
+```
+cmake --build cpp/build -j 8 --target flatsql_ps_test flatsql_ps_bench
+cpp/build/flatsql_ps_test --test=lane_                     # lanes, parking, sandbox, isolation, A30, C ABI
+cpp/build/flatsql_ps_test --test=fanout_randomized_vs_bruteforce_T2_2_full   # 10,000 workloads
+cpp/build/flatsql_ps_test --test=fanout_readers_during_first_deaths_A14_full # 10 min
+cpp/build/flatsql_ps_test --test=snapshot_ [--dir=<real fs dir>]
+cpp/build/flatsql_ps_test --test=snapshot_bulk_export_under_compaction_A12_full --dir=<dir>  # 10 min
+cpp/build/flatsql_ps_test --test=offset_paging_page_10000_T2_7_full           # 3 M records
+cpp/build/flatsql_ps_bench --mode=test --test=readers_under_saturating_writers_T2_1_full [--dir=<dir>]
+```
+
+The default suite runs shortened forms of every slow test. Long runs that
+write a lot use `--dir` (the in-memory test host keeps every file it held).
+
+**T2 #1 and #4 on a quiet Linux-8 box** (8 cores, ext4, nothing else
+running), from a checkout at the landed commit:
+
+```
+cpp/build/flatsql_ps_bench --mode=test --test=readers_under_saturating_writers_T2_1_full --dir=<ext4 dir>
+cpp/build/flatsql_ps_test --test=lane_isolation_bulk_nomem_T2_4
+```
+
+Both enforce their bounds on such a box (a release build, 8+ usable hardware
+threads, 1-minute load below a quarter of them; the load is sampled at the end
+of the run, so the test's own writers count). The disjointness claim itself is
+measured under WasmEdge with the C host module in T5/T6 (A29).
+
+What to expect there: the window's own cost is 3–8 ms at p50 (§20 #1), so the
+10 ms p99 bound leaves little room for waiting on a CPU. The test runs 8
+producer threads, the writers and their merges and 16 lanes on 8 cores; when
+they saturate the CPUs, the window p99 is decided by the scheduler, not by the
+engine. If the bound fails there, the next steps are the design's own levers:
+fewer writer threads than cores (design §5.1: `clamp(cores−2, 1, 16)`), interactive
+lanes at a higher priority than writers (design A28 gives nice −5 only on ≤ 2 vCPU),
+and idle-lane sub-cursors (§21 deviation 1).

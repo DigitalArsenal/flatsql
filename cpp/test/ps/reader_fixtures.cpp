@@ -1,6 +1,13 @@
 // Reader test helpers (see reader_fixtures.h).
 #include "ps/reader_fixtures.h"
 
+#include <stdlib.h>
+
+#include <thread>
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 #include "flatsql/ps/platform.h"
 
 namespace pst {
@@ -121,6 +128,36 @@ std::string cidTextOf(const std::vector<uint8_t>& frame) {
     uint8_t cid[kCidLen];
     frameCid(frame, cid);
     return cidToText(cid);
+}
+
+unsigned usableHardwareThreads() {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) return unsigned(CPU_COUNT(&set));
+#endif
+    return std::thread::hardware_concurrency();
+}
+
+bool latencyBoxQuiet(unsigned* threads, double* load1, std::string* why) {
+    const unsigned hw = usableHardwareThreads();
+    double load[3] = {0, 0, 0};
+    getloadavg(load, 3);
+    *threads = hw;
+    *load1 = load[0];
+    char b[160];
+#ifndef NDEBUG
+    std::snprintf(b, sizeof(b), "debug build (load %.1f on %u hardware threads)", load[0], hw);
+    *why = b;
+    return false;
+#endif
+    if (hw < 8 || load[0] >= double(hw) / 4) {
+        std::snprintf(b, sizeof(b), "load %.1f on %u hardware threads", load[0], hw);
+        *why = b;
+        return false;
+    }
+    why->clear();
+    return true;
 }
 
 }  // namespace pst

@@ -347,6 +347,7 @@ public:
 private:
     friend class LaneStore;
     void pick();
+    void settle();
     bool before(int a, int b) const;
     void siftDown(size_t i);
     std::vector<std::unique_ptr<Source>> srcs_;

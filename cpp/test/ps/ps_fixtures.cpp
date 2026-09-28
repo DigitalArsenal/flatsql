@@ -204,7 +204,10 @@ std::vector<uint8_t> buildRecord(const TestType& t, const std::vector<Field>& fi
     }
     for (const auto& o : offs) b.AddOffset(o.first, flatbuffers::Offset<void>(o.second));
     const auto end = b.EndTable(start);
-    b.FinishSizePrefixed(flatbuffers::Offset<flatbuffers::Table>(end), reinterpret_cast<const char*>(t.fid));
+    // Finish() takes a NUL-terminated identifier (Debug builds assert its
+    // length); t.fid is four bytes without a terminator.
+    char fid[5] = {char(t.fid[0]), char(t.fid[1]), char(t.fid[2]), char(t.fid[3]), 0};
+    b.FinishSizePrefixed(flatbuffers::Offset<flatbuffers::Table>(end), fid);
     return std::vector<uint8_t>(b.GetBufferPointer(), b.GetBufferPointer() + b.GetSize());
 }
 

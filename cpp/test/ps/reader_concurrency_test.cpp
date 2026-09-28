@@ -72,6 +72,7 @@ void runConcurrency(uint64_t seconds, uint32_t parts, uint32_t lanes) {
     // Writers: 8 producer threads, 32 partitions each, never waiting for acks
     // (credits pace them: saturation).
     std::vector<std::thread> producers;
+    const uint64_t producersStart = monoNs();
     for (int t = 0; t < 8; t++)
         producers.emplace_back([&, t] {
             std::vector<std::unique_ptr<Producer>> ps;
@@ -147,9 +148,32 @@ void runConcurrency(uint64_t seconds, uint32_t parts, uint32_t lanes) {
         std::atomic<bool> slowStop{false};
         std::vector<std::thread> slow;
         for (int c = 0; c < 8; c++)
-            slow.emplace_back([&, c] {
-                while (!slowStop.load()) inter.q("SELECT _data FROM OMM LIMIT 1000", {}, 0, 400000000ull, 4096);
-                (void)c;
+            slow.emplace_back([&] {
+                // 4 KiB every 400 ms; a statement still streaming when the
+                // phase ends is cancelled (a whole one takes ~30 s).
+                ReaderClient rc(inter.inst.get());
+                Request req;
+                req.sql = "SELECT _data FROM OMM LIMIT 1000";
+                std::vector<uint8_t> buf(4096);
+                while (!slowStop.load()) {
+                    uint32_t slot;
+                    if (rc.submit(req, &slot) < 0) {
+                        errors++;
+                        return;
+                    }
+                    bool cancelled = false;
+                    for (;;) {
+                        if (!cancelled && slowStop.load()) {
+                            rc.cancel(slot);
+                            cancelled = true;
+                        }
+                        const int64_t n = rc.read(slot, buf.data(), buf.size(), 1000000000ull);
+                        if (n == 0) break;
+                        if (n > 0 && !cancelled) sleepNs(400000000ull);
+                    }
+                    const Outcome o = rc.finish(slot);
+                    if (o.status != 0 && !(cancelled && o.status == int32_t(flatsql::ps::kRsCancelled))) errors++;
+                }
             });
         const uint64_t slowUntil = monoNs() + uint64_t(argInt("slow_seconds", 3)) * 1000000000ull;
         std::mt19937_64 rng(99);
@@ -166,6 +190,7 @@ void runConcurrency(uint64_t seconds, uint32_t parts, uint32_t lanes) {
         for (auto& t : slow) t.join();
     }
     stop = true;
+    const double producerSeconds = double(monoNs() - producersStart) / 1e9;
     for (auto& t : producers) t.join();
     const LockReport lr = lockReport();
     // The intrinsic lane cost: one client, writers idle (their last L0
@@ -196,14 +221,16 @@ void runConcurrency(uint64_t seconds, uint32_t parts, uint32_t lanes) {
     for (uint32_t pid : pids) l0Total += s.e->partition(pid)->nL0;
     report("settled_l0_blocks_per_partition", double(l0Total) / double(pids.size()), "blocks");
     quietRun("settled");
-    const unsigned hw = std::thread::hardware_concurrency();
+    unsigned hw = 0;
     double load[3] = {0, 0, 0};
-    getloadavg(load, 3);
+    std::string notQuiet;
+    const bool quiet = latencyBoxQuiet(&hw, &load[0], &notQuiet);
     report("hardware_threads", double(hw), "threads");
     report("load_average_1m", load[0], "");
     report("seconds", double(seconds), "s");
     report("records_sent", double(sent.load()), "records");
-    report("records_per_second", double(sent.load()) / (double(seconds) + double(argInt("warmup_ms", 2000)) / 1000.0), "rec/s");
+    report("producer_seconds", producerSeconds, "s");
+    report("records_per_second", double(sent.load()) / producerSeconds, "rec/s");
     report("statements_counters", double(counters.e2e.size()), "");
     report("statements_windows", double(windows.e2e.size()), "");
     report("flatsql_partitions_p99_ms", pct(counters.e2e, 0.99), "ms");
@@ -228,8 +255,7 @@ void runConcurrency(uint64_t seconds, uint32_t parts, uint32_t lanes) {
     CHECK(disjoint);
     CHECK_EQ(errors.load(), uint64_t(0));
     // Latency and lock-wait bounds are Linux-8 acceptance: enforced on a
-    // quiet 8+ thread box, reported everywhere.
-    const bool quiet = hw >= 8 && load[0] < double(hw) / 4;
+    // quiet 8+ thread box running a release build, reported everywhere.
     if (quiet && argInt("enforce", 1)) {
         CHECK(double(lr.laneMaxWaitNs) / 1e6 <= 1.0);
         CHECK(pct(counters.e2e, 0.99) <= 1.0);
@@ -237,7 +263,7 @@ void runConcurrency(uint64_t seconds, uint32_t parts, uint32_t lanes) {
         CHECK(pct(slowCounters.e2e, 0.99) <= 10.0);
         CHECK(pct(slowWindows.e2e, 0.99) <= 50.0);
     } else {
-        std::printf("  NOTE latency bounds not enforced: load %.1f on %u hardware threads\n", load[0], hw);
+        std::printf("  NOTE latency bounds not enforced: %s\n", quiet ? "--enforce=0" : notQuiet.c_str());
     }
     s.close();
     if (!dir.empty()) std::filesystem::remove_all(dir);
