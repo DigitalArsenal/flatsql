@@ -126,7 +126,17 @@ journal. A negative control (half a data segment cut off) fails the verifier.
 
 ### 4.1 Slow runs
 
-Filled in with the numbers of the final build.
+- `crash_faults_T1_1_full` under the Node host (10,000 trials, 64 types, 256
+  partitions, the five crash modes, an A4 second crash every other trial, half
+  the stores journaled): pass in 377 s; 2,122,844 acked records verified,
+  410,159 merges, 1,167,880 journal records replayed, 125,016 guest threads
+  spawned on 10 pooled workers. Mac, load 24 rising to 35 during the run
+  (natively 243 s).
+- The whole default suite under the host, one guest process per test:
+  155 s of test time; the most concurrent guest threads was 54
+  (`readers_under_saturating_writers_T2_1`), each on its own worker thread;
+  the largest guest memory 1,902 MiB (the 1,536 MiB pre-grown heap included).
+- Deterministic vector under the C runner: 18.7 s interpreted (0.12 s natively).
 
 ### 4.2 Release
 
