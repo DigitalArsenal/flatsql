@@ -131,7 +131,7 @@ PS_TEST(type_promotion_keeps_gseq_A14_and_type_delete) {
 }
 
 static void noticeRun(double seconds) {
-    Store s(true, 2, true);
+    Store s(false, 2, true);  // no crash here: one in-memory copy per file
     s.cfg.noticeQueue = 1;  // A25: a full queue drops the notice
     REQUIRE(s.open() == 0);
     s.registerTypes({&ommType(), &mpeType()});

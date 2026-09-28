@@ -341,8 +341,11 @@ PS_TEST(writer_backpressure_flood_T1_5) {
     s.close();
 }
 
-static void rebalanceRun(double seconds, uint32_t writers, uint32_t partitions, bool requireHelperOverlap) {
-    Store s(true, writers, true);
+static void rebalanceRun(double seconds, uint32_t writers, uint32_t partitions, bool requireHelperOverlap,
+                         uint64_t roundPauseNs = 0) {
+    // No crash here: the in-memory host keeps one copy of each file, and the
+    // 10-minute run paces its producers so that copy stays in memory.
+    Store s(false, writers, true);
     s.cfg.audit = true;
     s.cfg.mergeL0Blocks = 4;  // merges during rebalancing (A26)
     s.cfg.mergeMinL0Bytes = 0;
@@ -375,6 +378,7 @@ static void rebalanceRun(double seconds, uint32_t writers, uint32_t partitions, 
                         sentPer[idx]++;
                     }
                 }
+                if (roundPauseNs) sleepNs(roundPauseNs);
             }
             for (size_t k = 0; k < ps.size(); k++) ps[k].waitAcked(last[k], 30000000000ull);
         });
@@ -447,7 +451,7 @@ static void rebalanceRun(double seconds, uint32_t writers, uint32_t partitions, 
 }
 
 PS_TEST(writer_single_writer_under_rebalance_T1_4) { rebalanceRun(double(argInt("rebalance-seconds", 8)), 4, 16, true); }
-PS_SLOW_TEST(writer_single_writer_under_rebalance_T1_4_full) { rebalanceRun(600.0, 8, 64, true); }
+PS_SLOW_TEST(writer_single_writer_under_rebalance_T1_4_full) { rebalanceRun(600.0, 8, 64, true, 10000000); }  // ~6,400 records/s
 
 PS_TEST(writer_memory_2048_partitions_64_active_T1_9) {
     Store s(true, 1, true);
