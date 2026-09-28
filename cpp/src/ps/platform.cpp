@@ -116,7 +116,7 @@ struct Crc32cTables {
     }
 };
 
-const Crc32cTables& crcTables() {
+[[maybe_unused]] const Crc32cTables& crcTables() {  // unused with hardware CRC32C
     static const Crc32cTables tables;
     return tables;
 }
