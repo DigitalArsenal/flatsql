@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
@@ -92,5 +93,62 @@ describe('standalone WASI artifact surface', () => {
     for (const exportName of REQUIRED_EXPORTS) {
       expect(exports.has(exportName)).toBe(true);
     }
+  });
+});
+
+/**
+ * The partition store artifact (wasm32-wasip1-threads; design §18 T4 #1):
+ * WASI preview1, wasi.thread-spawn, a shared env.memory of at most 32768
+ * pages and the seven env.flatsql_io_*; wasi_thread_start exported; no
+ * emscripten import; and it passes space-data-module-sdk's
+ * assertPthreadArtifact (shared memory, real atomics, the wasi-threads
+ * contract, no emscripten thread hooks). scripts/check-wasm-imports.mjs
+ * freezes the exact WASI list.
+ */
+describe('flatsql-ps-threads.wasm surface', () => {
+  const PS_ARTIFACT = fileURLToPath(new URL('../wasm/flatsql-ps-threads.wasm', import.meta.url));
+
+  test('imports exactly WASI preview1, wasi.thread-spawn, the shared env.memory and the seven flatsql_io_*', async () => {
+    const bytes = await readFile(PS_ARTIFACT);
+    const wasmModule = await WebAssembly.compile(bytes);
+    const imports = WebAssembly.Module.imports(wasmModule);
+
+    expect([...new Set(imports.map((i) => i.module))].sort()).toEqual(['env', 'wasi', 'wasi_snapshot_preview1']);
+    expect(imports.filter((i) => i.module === 'wasi').map((i) => `${i.kind}:${i.name}`)).toEqual(['function:thread-spawn']);
+    const env = imports.filter((i) => i.module === 'env');
+    expect(env.filter((i) => i.kind === 'memory').map((i) => i.name)).toEqual(['memory']);
+    expect(env.filter((i) => i.kind === 'function').map((i) => i.name).sort()).toEqual([...SUPPORTED_HOST_IO_IMPORTS].sort());
+    expect(env.length).toBe(8);
+    expect(imports.filter((i) => /^(__syscall_|_emscripten|emscripten_|__pthread_create_js)/.test(i.name))).toEqual([]);
+
+    const exports = WebAssembly.Module.exports(wasmModule).map((e) => e.name);
+    expect(exports).toContain('wasi_thread_start');
+    for (const name of ['flatsql_ps_init', 'flatsql_ps_start', 'flatsql_ps_stop', 'flatsql_ps_alloc', 'flatsql_ps_free']) {
+      expect(exports).toContain(name);
+    }
+
+    // The SDK guard runs in its own process: its module graph is plain ESM
+    // that this Jest environment does not load.
+    const guard = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `import { readFileSync } from 'node:fs';
+         import { analyzeWasmThreadFeatures, assertPthreadArtifact } from 'space-data-module-sdk/compiler';
+         const bytes = readFileSync(process.argv[1]);
+         assertPthreadArtifact(bytes);
+         process.stdout.write(JSON.stringify(analyzeWasmThreadFeatures(bytes)));`,
+        PS_ARTIFACT,
+      ],
+      { encoding: 'utf8' },
+    );
+    expect(guard.stderr).toBe('');
+    expect(guard.status).toBe(0);
+    const features = JSON.parse(guard.stdout);
+    expect(features.sharedMemory).toMatchObject({ source: 'import', module: 'env', name: 'memory', shared: true });
+    expect(features.sharedMemory.max).toBeLessThanOrEqual(32768);
+    expect(features.isIsomorphicPthreads).toBe(true);
+    expect(features.emscriptenThreadHooks).toEqual([]);
   });
 });

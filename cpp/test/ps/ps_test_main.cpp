@@ -1,6 +1,6 @@
 // Partition store tests: framework, fixtures, inspector, main.
 //
-// Usage: flatsql_ps_test [--test=<substring>] [--all] [--<param>=<value>]
+// Usage: flatsql_ps_test [--test=<substring>] [--all] [--list] [--<param>=<value>]
 // Slow tests (full acceptance durations) run only with --all or when named.
 #include <flatbuffers/flatbuffers.h>
 #include <flatbuffers/idl.h>
@@ -122,8 +122,14 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) pst::gArgs.push_back(argv[i]);
     const std::string filter = pst::argStr("test", "");
     bool all = false;
-    for (const auto& a : pst::gArgs)
+    for (const auto& a : pst::gArgs) {
         if (a == "--all") all = true;
+        if (a == "--list") {
+            // One test per line: "<name> fast|slow" (the default suite is the fast ones).
+            for (const auto& t : pst::registry()) std::printf("%s %s\n", t.name, t.slow ? "slow" : "fast");
+            return 0;
+        }
+    }
     int ran = 0;
     bool exact = false;
     for (const auto& t : pst::registry())

@@ -21,7 +21,8 @@
 //     runs a wasm command in a private root (FLATSQL_PS_ROOT to choose it,
 //     FLATSQL_PS_KEEP_ROOT=1 to keep it), with the checkout mounted at its own
 //     path and the FLATSQL_PS_* / PS_* environment; FLATSQL_PS_TIMEOUT_MS
-//     bounds the run. Prints the thread report to stderr.
+//     bounds the run. Prints the thread report to stderr (and writes it as
+//     JSON to FLATSQL_PS_REPORT when set).
 
 import fs from "node:fs";
 import os from "node:os";
@@ -417,6 +418,9 @@ if (invokedDirectly) {
     mounts: [{ guest: repo, host: repo }],
   });
   const t = r.threads;
+  if (process.env.FLATSQL_PS_REPORT) {
+    fs.writeFileSync(process.env.FLATSQL_PS_REPORT, `${JSON.stringify({ ...r, root: undefined })}\n`);
+  }
   process.stderr.write(
     `ps-node-host: exit ${r.exitCode}${r.error ? ` (${r.error})` : ""}; guest threads spawned ${t.guestThreadsSpawned}, ` +
       `max concurrent ${t.maxConcurrentGuestThreads} on ${t.distinctWorkerThreadIds} distinct worker threads` +

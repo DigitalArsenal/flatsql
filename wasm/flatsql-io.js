@@ -592,7 +592,10 @@ export function createFlatSqlIoImports(backend, memoryRef) {
   return {
     flatsql_io_open(pathPtr, pathLen, flags) {
       return guard(() => {
-        const bytes = heap().subarray(pathPtr, pathPtr + pathLen);
+        // Copy out of guest memory before decoding: TextDecoder rejects views
+        // of a SharedArrayBuffer (a wasi-threads memory), and a shared view
+        // could change under the decoder.
+        const bytes = heap().slice(pathPtr, pathPtr + pathLen);
         return backend.open(new TextDecoder().decode(bytes), flags) | 0;
       });
     },

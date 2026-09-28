@@ -71,8 +71,11 @@
   "scripts": {
     "build": "tsc",
     "build:wasm": "bash scripts/build-wasm.sh",
+    "build:wasm:ps": "bash scripts/build-wasm.sh --ps",
+    "build:wasm:ps-tests": "bash scripts/build-wasm.sh --ps-tests",
     "test": "node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js",
     "test:wasm": "node wasm/test-bulk-ingest.mjs",
+    "test:ps-wasm": "node scripts/ps-wasm-suite.mjs --crash-trials 1000",
     "dev": "tsc --watch",
     "serve": "vite docs --port 8081",
     "check:nav": "node scripts/check-sdn-stack-nav.mjs flatsql docs/index.html",
@@ -93,7 +96,8 @@
     "stress:sds:full-config": "bash scripts/stress-docker.sh full-config",
     "stress:sds:full": "bash scripts/stress-docker.sh full",
     "check:imports": "node scripts/check-wasm-imports.mjs",
-    "test:io": "node wasm/test-io-persistence.mjs"
+    "test:io": "node wasm/test-io-persistence.mjs",
+    "check:integrity": "node scripts/write-integrity.mjs --check"
   },
   "repository": {
     "type": "git",

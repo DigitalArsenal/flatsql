@@ -38,7 +38,8 @@ import {
 } from "./ps-node-imports.mjs";
 
 const { mode, wasmModule, memory, cfg } = workerData;
-const control = registerThread(cfg.control);
+// A pool worker counts as a guest OS thread once it runs a guest thread.
+let control = mode === "pool" ? new Int32Array(cfg.control) : registerThread(cfg.control);
 const pool = new Int32Array(cfg.pool);
 
 const built = createThreadImports(cfg, () => memory);
@@ -73,6 +74,7 @@ function fault(tid, error) {
 if (mode === "pool") {
   const slot = POOL_HEADER + workerData.slot * POOL_SLOT_WORDS;
   Atomics.store(pool, slot + 3, threadId);
+  let registered = false;
   for (;;) {
     Atomics.store(pool, slot, SLOT_IDLE);
     Atomics.add(pool, POOL_GEN, 1);
@@ -84,6 +86,10 @@ if (mode === "pool") {
     }
     const tid = Atomics.load(pool, slot + 1);
     const arg = Atomics.load(pool, slot + 2);
+    if (!registered) {
+      registerThread(cfg.control);
+      registered = true;
+    }
     Atomics.store(pool, slot, SLOT_RUNNING);
     const running = Atomics.add(pool, POOL_RUNNING, 1) + 1;
     for (;;) {

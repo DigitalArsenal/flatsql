@@ -26,8 +26,6 @@ packages/emsdk/
 .DS_Store
 Thumbs.db
 
-# Generated integrity metadata
-wasm/integrity.json
 
 # Stress test outputs
 stress/results/
