@@ -12,7 +12,6 @@
 // Needs the native test binary (cpp/build/flatsql_ps_test) and the wasm test
 // commands (npm run build:wasm:ps-tests).
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -65,21 +64,28 @@ describe('partition store parity vectors', () => {
   run('deterministic mode writes byte-identical files natively and under the Node host', async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'flatsql-ps-parity-'));
     try {
+      // Every file (path, size, sha256) must match; on a mismatch the
+      // differing lines are the evidence.
+      const same = (a: string, b: string) => {
+        if (a === b) return;
+        const al = a.split('\n');
+        const bl = new Set(b.split('\n'));
+        console.log(`native lines not under Node:\n${al.filter((l) => !bl.has(l)).slice(0, 40).join('\n')}`);
+        expect(b).toBe(a);
+      };
       // In memory: the same store root string on both sides.
-      const nMem = parityLine(native(['--test=parity_deterministic_bytes']), 'deterministic_bytes');
-      const out = path.join(dir, 'mem.txt');
+      const nMemOut = path.join(dir, 'native-mem.txt');
+      const nMem = parityLine(native(['--test=parity_deterministic_bytes', `--out=${nMemOut}`]), 'deterministic_bytes');
       await node(['--test=parity_deterministic_bytes', '--out=/mem.txt'], dir);
-      const wMem = readFileSync(out, 'utf8');
       expect(nMem).toMatch(/lines=\d{3}/);
+      same(readFileSync(nMemOut, 'utf8'), readFileSync(path.join(dir, 'mem.txt'), 'utf8'));
       // On the host's files: one path, native and as the guest sees it.
       const store = path.join(dir, 'files');
-      const nFiles = parityLine(native(['--test=parity_deterministic_bytes', `--dir=${store}`]), 'deterministic_bytes');
+      const nFilesOut = path.join(dir, 'native-files.txt');
+      native(['--test=parity_deterministic_bytes', `--dir=${store}`, `--out=${nFilesOut}`]);
       const guestRoot = path.join(dir, 'guest');
       await node(['--test=parity_deterministic_bytes', `--dir=${store}`, '--out=/files.txt'], guestRoot);
-      const wFiles = readFileSync(path.join(guestRoot, 'files.txt'), 'utf8');
-      const sha = (text: string) => createHash('sha256').update(text).digest('hex');
-      expect(nMem).toContain(`sha256=${sha(wMem)}`);
-      expect(nFiles).toContain(`sha256=${sha(wFiles)}`);
+      same(readFileSync(nFilesOut, 'utf8'), readFileSync(path.join(guestRoot, 'files.txt'), 'utf8'));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

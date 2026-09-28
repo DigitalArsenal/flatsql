@@ -238,9 +238,14 @@ PS_TEST(type_label_checkpoint_past_128_pids_A10) {
 
 PS_TEST(type_arrivals_segments_and_fence_A15) {
     // Arrivals seal every 40 entries; the fence index names each sealed
-    // segment's gseq range; reopen resumes the active segment.
+    // segment's gseq range; reopen resumes the active segment. A type batch
+    // never splits across segments (22.3a-3), so a batch into an empty
+    // segment may fill it past the seal size: type commits are capped at 40
+    // rows here, which bounds every sealed segment by 40 on any machine (a
+    // slow type owner once labeled more than 40 rows in one commit).
     Store s(true, 2, true);
     s.cfg.arrivalsSegBytes = 40 * kArrivalBytes;
+    s.cfg.typeCommitRows = 40;
     REQUIRE(s.open() == 0);
     s.registerTypes({&ommType()});
     const std::vector<uint32_t> pids = {s.partition("A", ommType()), s.partition("B", ommType())};
