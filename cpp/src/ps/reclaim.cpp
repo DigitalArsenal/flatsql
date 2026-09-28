@@ -202,10 +202,23 @@ int32_t partitionReclaimStep(Writer* w, Partition* p) {
         const bool forced = valve && p->retired.size() - i > 2048 && now - r.retireNs >= grace;
         if (!forced) {
             if (gate <= r.retireNs) break;  // FIFO: later items retired later
+            // The first passing check of every item past the gate is taken
+            // now: one pass starts the grace of all of them, not one per pass.
             if (!r.firstOkNs) r.firstOkNs = now;
-            if (now - r.firstOkNs < grace) break;
+            if (now - r.firstOkNs < grace) {
+                i++;
+                continue;
+            }
         }
-        if (r.it.letter == 'm' && p->lastDurableHeadNs <= r.retireNs) break;
+        if (r.it.letter == 'm' && p->lastDurableHeadNs <= r.retireNs) {
+            // A9: a meta segment goes only after a DURABLE_CKPT head names a
+            // later first_live_m_seg. A quiet partition gets one from the
+            // idle checkpoint, and the items behind do not wait for it (they
+            // would block the UNLINKED batches that bring such heads).
+            if (!p->metaSinceCkpt) p->metaSinceCkpt = 1;
+            i++;
+            continue;
+        }
         if (r.retireNs >= pin) break;  // a compaction in flight may read it
         if (jsafe <= r.retireNs) break;
         // The owner's own read handles go first (UNLINK_IF_UNUSED).
@@ -423,7 +436,10 @@ int32_t typeReclaimStep(Writer* w, TypeOwner* t) {
         if (!forced) {
             if (gate <= r.retireNs) break;
             if (!r.firstOkNs) r.firstOkNs = now;
-            if (now - r.firstOkNs < grace) break;
+            if (now - r.firstOkNs < grace) {
+                i++;
+                continue;
+            }
         }
         if (jsafe <= r.retireNs) break;
         PathBuf path;

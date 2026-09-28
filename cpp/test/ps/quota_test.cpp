@@ -348,9 +348,13 @@ PS_TEST(quota_disk_full_resumes_without_operator_T3_6) {
     CHECK(q.ballastRestores >= 1);
     CHECK(resumed > 0);
     CHECK_EQ(holes, 0);
-    // A reopen names exactly the files on disk.
+    // A reopen names exactly the files on disk (checked before the engine
+    // starts: a merge it would plan at once is not an orphan).
     s.close();
-    REQUIRE(s.open() == 0);
+    {
+        std::string err;
+        REQUIRE(Engine::open(s.cfg, &s.e, &err) == 0);
+    }
     for (uint32_t pid : pids) {
         const DirCheck dc = checkPartitionDir(s.fs.get(), s.fs.get(), s.root, pid);
         if (!dc.ok) std::fprintf(stderr, "  dir: %s\n", dc.err.c_str());
@@ -361,5 +365,6 @@ PS_TEST(quota_disk_full_resumes_without_operator_T3_6) {
     if (!tc.ok) std::fprintf(stderr, "  type dir: %s\n", tc.err.c_str());
     CHECK(tc.ok);
     CHECK_EQ(tc.bytes, s.e->typeDiskBytesOf(ommType().fid));
+    s.e->start();
     s.close();
 }

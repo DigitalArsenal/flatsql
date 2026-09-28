@@ -77,6 +77,7 @@ public:
     uint64_t totalBytes(const std::string& prefix);
     uint64_t syncCount() const { return syncs_.load(); }
     uint64_t openHandles();
+    std::vector<std::string> openPaths();  // one entry per open handle
 
 private:
     struct Op {

@@ -867,13 +867,19 @@ PS_TEST(type_logs_reclaimed_under_readers) {
     CHECK(cnt.status == 0 && cnt.rows.size() == 1 && uint64_t(cnt.i(0, 0)) == liveNow);
     CHECK(st.catalogEntriesDropped > 0);
     CHECK(tv.head.firstLiveMSeg > 0);  // sealed type meta segments were retired
-    // A reopen finds the same files, and the catalog still answers.
+    // A reopen finds the same files (checked before the engine starts: a
+    // merge it would plan at once is not an orphan), and the catalog still
+    // answers.
     s.close();
-    REQUIRE(s.open() == 0);
+    {
+        std::string err;
+        REQUIRE(Engine::open(s.cfg, &s.e, &err) == 0);
+    }
     const DirCheck tc2 = checkTypeDir(cs.io, cs.fs(), s.root, ommType().fid);
     if (!tc2.ok) std::fprintf(stderr, "  type dir after reopen: %s\n", tc2.err.c_str());
     CHECK(tc2.ok);
     CHECK_EQ(tc2.bytes, s.e->typeDiskBytesOf(ommType().fid));
+    s.e->start();
     Reader rd2(ic);
     int wrong2 = 0;
     for (int i = 0; i < 64; i++) {
@@ -884,4 +890,74 @@ PS_TEST(type_logs_reclaimed_under_readers) {
         if (c.status != 0 || c.rows.size() != 1 || c.i(0, 0) != (wantLive ? 1 : 0)) wrong2++;
     }
     CHECK_EQ(wrong2, 0);
+}
+
+// ---------------------------------------------------------------------------
+// A12 throughput: a backlog of retired files goes about one grace after the
+// reader gate passes, not one grace per file. Every file needs two passing
+// gate checks a grace apart; each maintenance pass takes the first check of
+// every file past the gate. (Taking one file's first check per pass made a
+// backlog of N files wait N graces: 60 s each in production.)
+PS_TEST(reclaim_backlog_goes_in_one_grace) {
+    CStore cs("backlog");
+    Store& s = cs.s;
+    s.cfg.sealBytes = 32u << 10;  // many segments: many SWAPs, many files
+    s.cfg.autoCompact = false;
+    s.cfg.reclaimGraceMs = 300;
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const uint32_t pid = s.partition("backlog", ommType());
+    {
+        Producer prod(s.e.get(), pid);
+        const auto attr = buildRecordAttr("backlog", "prov", "src", "b1");
+        uint64_t last = 0;
+        std::vector<std::vector<uint8_t>> frames;
+        for (int i = 0; i < 2000; i++) {
+            frames.push_back(ommFrame(0, i, 200));
+            last = send(s.e.get(), prod, frames.back(), attr, 1780000000000ll + i);
+        }
+        for (int i = 1; i < 2000; i += 2) {
+            uint8_t cid[kCidLen];
+            frameCid(frames[size_t(i)], cid);
+            uint64_t rs = 0;
+            REQUIRE(prod.enqueue(kEntTombCid, 0, 0, cid, nullptr, 0, nullptr, 0, &rs) == 0);
+            last = rs;
+        }
+        REQUIRE(prod.waitAcked(last, 60000000000ull) == 0);
+    }
+    REQUIRE(waitLabeledEngine(s.e.get(), {pid}, 60000000000ull));
+    sleepNs(400000000);
+    REQUIRE(waitMerged(cs.io, s.root, {pid}, 60000000000ull));
+    // A reader statement holds the gate while every segment is compacted.
+    Reader rd(s, LaneClass::Bulk, 1);
+    std::atomic<uint64_t> held{0};
+    s.e->setReaderGate([](void* ctx) -> uint64_t { return static_cast<std::atomic<uint64_t>*>(ctx)->load(); }, &held);
+    held = monoNs();
+    uint64_t swaps = 0;
+    for (const auto& sg : sealedSegments(cs.io, s.root, pid)) {
+        SwapResult r;
+        if (compactNow(s.e.get(), pid, sg.first, sg.second, &r) == 0) swaps++;
+    }
+    const EngineStats st0 = s.e->stats();
+    const uint64_t backlog = st0.retiredFiles - st0.unlinkedFiles;
+    // The statement ends: the whole backlog goes.
+    const uint64_t t0 = monoNs();
+    held = UINT64_MAX;
+    uint64_t left = backlog;
+    while (monoNs() - t0 < 60000000000ull) {
+        const EngineStats st = s.e->stats();
+        left = st.retiredFiles - st.unlinkedFiles;
+        if (!left) break;
+        sleepNs(5000000);
+    }
+    const double seconds = double(monoNs() - t0) / 1e9;
+    s.e->setReaderGate(nullptr, nullptr);
+    report("backlog_swaps", double(swaps), "swaps");
+    report("backlog_files", double(backlog), "files");
+    report("backlog_seconds_to_unlink", seconds, "s");
+    CHECK(backlog >= 40);
+    CHECK_EQ(left, uint64_t(0));
+    // Two gate checks a grace apart (0.3 s), then 64 unlinks a pass: well
+    // under the backlog's count of graces (the defect's cost).
+    CHECK(seconds < double(backlog) * 0.3 / 4);
 }

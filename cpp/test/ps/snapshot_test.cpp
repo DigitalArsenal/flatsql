@@ -212,6 +212,17 @@ void runSwapsUnderLoad(int targetSwaps, uint64_t maxSeconds) {
         unlinked = st.unlinkedFiles;
         if (unlinked == retired) break;
     }
+    if (unlinked != retired && h.s.cfg.io) {
+        // What still holds files open (the owner, a reader, a builder?).
+        std::map<std::string, int> kinds;
+        for (const std::string& path : h.s.fs->openPaths()) {
+            const std::string base = path.substr(path.rfind('/') + 1);
+            kinds[base.substr(0, base.find_first_of("-."))]++;
+        }
+        std::fprintf(stderr, "  open handles by file kind:");
+        for (const auto& kv : kinds) std::fprintf(stderr, " %s=%d", kv.first.c_str(), kv.second);
+        std::fprintf(stderr, "\n");
+    }
     report("swaps", double(swaps), "swaps");
     report("swap_requests_without_candidate", double(noCandidate), "requests");
     report("retired_files", double(retired), "files");

@@ -403,6 +403,14 @@ uint64_t FaultFs::totalBytes(const std::string& prefix) {
     return total;
 }
 
+std::vector<std::string> FaultFs::openPaths() {
+    std::lock_guard<std::mutex> g(mu_);
+    std::vector<std::string> out;
+    for (size_t i = 0; i < highWater_.load(); i++)
+        if (handles_[i].inUse.load()) out.push_back(handles_[i].path);
+    return out;
+}
+
 uint64_t FaultFs::openHandles() {
     std::lock_guard<std::mutex> g(mu_);
     uint64_t n = 0;

@@ -642,6 +642,7 @@ int32_t partitionMergeStep(Writer* w, Partition* p) {
     // A queued SWAP owns the manifest until it publishes.
     if (p->compactPhase == kCompactSwapQueued && p->mergePhase == kMergeIdle) return 0;
     if (p->mergePhase == kMergeIdle) {
+        if (p->mergeRetryNs && monoNs() < p->mergeRetryNs) return 0;
         if (!partitionWantsMerge(e, p)) return 0;
         const int32_t rc = partitionWarm(w, p);
         if (rc < 0) return rc;
@@ -677,6 +678,9 @@ int32_t partitionMergeStep(Writer* w, Partition* p) {
         if (res == 0) return 0;
         if (res < 0 || p->mplan.ownerEpoch != p->ownerEpoch) {
             partitionMergeAbort(w, p);
+            // T3: a failed build retries a little later (a full disk fails
+            // every attempt until the emergency frees space).
+            if (res < 0 && res != kMergeNotOwner) p->mergeRetryNs = monoNs() + 100000000ull;
             return res < 0 && res != kMergeNotOwner ? res : 0;
         }
         p->mergePhase = kMergeOutputsWritten;

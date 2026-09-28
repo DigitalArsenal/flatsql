@@ -1864,9 +1864,12 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
         }
         if (p->forceLaneCkpt) sc->forceLaneCkpt = true;
     }
+    // Rows need a slot in the head's L0 directory: at its cap, mailbox kills
+    // and TOMB_RANGE steps wait for the merge, as ring entries do.
+    const bool dirRoom = p->nL0 < kMaxL0Dir - 1;
     // Type-level kills from the mailbox (A14). They leave the queue when the
     // batch publishes; a discarded batch retries them.
-    while (st->killsTaken < p->kills.size() && st->nTickets < 63) {
+    while (dirRoom && st->killsTaken < p->kills.size() && st->nTickets < 63) {
         PendingKill& k = p->kills[p->kills.size() - 1 - st->killsTaken];
         uint8_t key[kCidKeyLen];
         cidSortKey(k.cid, key);
@@ -1876,7 +1879,7 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
         if (k.remaining) st->tickets[st->nTickets++] = k.remaining;
         st->killsTaken++;
     }
-    if (!p->ranges.empty() && st->nTickets < 64 && !c.err) tombRangeStep(c);
+    if (dirRoom && !p->ranges.empty() && st->nTickets < 64 && !c.err) tombRangeStep(c);
     const EngineConfig& cfg = e->config();
     uint64_t pos = st->endPos;
     const uint64_t tail = p->ring->tail.load(std::memory_order_acquire);

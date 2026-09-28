@@ -1131,9 +1131,14 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
             w->io().close(&t->mergeMf);
             t->mergeRun = SegRun();
             t->mergePhase = 0;
+            // A failed build retries a little later: a full disk fails every
+            // attempt until the emergency frees space.
+            t->mergeRetryNs = monoNs() + 100000000ull;
+            if (res == FLATSQL_IO_ERR_NOSPACE) e->signalNoSpace();
             // T3: outputs nothing ever named go now (NOSPACE retries leave
             // no debris behind). One that cannot go yet is retired: the next
             // manifest persists it until it does.
+            bool clean = true;
             for (const char letter : {'x', 'f'}) {
                 const RetireItem it = retireItem(letter, 0, t->mergeGen, 0);
                 PathBuf op;
@@ -1144,8 +1149,13 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
                     r.it = it;
                     r.retireNs = monoNs();
                     t->retired.push_back(r);
+                    clean = false;
                 }
             }
+            // With nothing left behind, the retry takes the same generation:
+            // failures never run the counter ahead of what heads persist, so
+            // open's cleanup range always covers the one a crash leaves.
+            if (clean && t->nextGen == t->mergeGen + 1) t->nextGen = t->mergeGen;
             return res;
         }
         t->mergePhase = 1;
@@ -1153,6 +1163,7 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
         return 1;
     }
     if (t->mergePhase != 0) return 0;
+    if (t->mergeRetryNs && monoNs() < t->mergeRetryNs) return 0;
     uint64_t bytes = 0;
     for (uint32_t i = 0; i < t->nL0; i++) bytes += t->l0[i].batchLen;
     // Type commits are frequent and small (a few labels each): the block

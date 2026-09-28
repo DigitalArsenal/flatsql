@@ -477,6 +477,7 @@ struct Partition {
     uint64_t pendingDurableHeadNs = 0;   // write time of the last DURABLE_CKPT head written
     bool forceLaneCkpt = false;          // A9: re-emit the lane table before retiring its m
     uint64_t lastCompactCheckNs = 0;
+    uint64_t mergeRetryNs = 0;           // T3: a merge that failed (NOSPACE) is retried after this
     // T3 quota: sealed segments as last published (planner input).
     std::mutex sumMu;                    // maintenance only (never a record path)
     std::vector<SegSummary> summary;
@@ -573,6 +574,7 @@ struct TypeOwner {
     uint64_t gSegLastGseq = 0;       // last arrival gseq in the current segment
     std::unordered_map<uint64_t, FileRef> partM;  // read handles keyed (pid << 32 | mSeg)
     uint64_t partMSweepNs = 0;       // T3: last close of handles on retired meta segments
+    uint64_t mergeRetryNs = 0;       // T3: a merge that failed (NOSPACE) is retried after this
     uint32_t manifestGenLoaded = 0;  // catalog manifest (live runs)
     uint64_t labelCkptOff = 0;       // A10 full-label checkpoint batch (> 128 pids)
     uint32_t labelCkptSeg = 0;

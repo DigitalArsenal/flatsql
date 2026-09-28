@@ -813,7 +813,7 @@ void Writer::maintenance() {
         const uint64_t idle = nowNsV - p->lastActivityNs;
         if (idle >= uint64_t(cfg.idleReclaimMs) * 1000000ull) ringReclaimIdle(p->ring, eng_->pool());
         if (p->warm && !p->rec.active && p->mergePhase == kMergeIdle && !p->nPendingCtl &&
-            !partitionCompactBusy(p) && idle >= uint64_t(cfg.idleCloseMs) * 1000000ull &&
+            !partitionCompactBusy(p) && p->retired.empty() && idle >= uint64_t(cfg.idleCloseMs) * 1000000ull &&
             p->ring->tail.load() == p->ring->head.load())
             partitionCool(this, p);
     }
