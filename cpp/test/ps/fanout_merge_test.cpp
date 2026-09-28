@@ -528,17 +528,47 @@ void runConcurrentFirstDeaths(uint64_t seconds) {
     const uint64_t until = monoNs() + seconds * 1000000000ull;
     int round = 1;
     uint64_t promotions0 = s.e->stats().promotions;
+    int badRound = -1;
     while (monoNs() < until) {
         const int live = (round + 1) % 2;  // holds the FIRST copies now
         const int next = round % 2;
         sendAll(next, round);  // REPEAT copies, durable
         REQUIRE(waitLabeledEngine(s.e.get(), {pa, pb}, 30000000000ull));
+        const uint64_t before = s.e->stats().promotions;
         const uint64_t r = reconcile(*prods[live], "prov", "src", "none");
         CHECK_EQ(prods[live]->waitAcked(r, 30000000000ull), 0);
         REQUIRE(waitLabeledEngine(s.e.get(), {pa, pb}, 30000000000ull));
+        const uint64_t got = s.e->stats().promotions - before;
+        if (got != uint64_t(n) && badRound < 0) {
+            badRound = round;
+            std::fprintf(stderr, "  round %d: %llu promotions of %d\n", round, (unsigned long long)got, n);
+            LaneStoreConfig lc;
+            lc.root = s.root;
+            lc.io = s.fs.get();
+            LaneStore st(lc);
+            st.open();
+            TypeSnap ts;
+            st.loadType(ommType().fid, &ts);
+            std::fprintf(stderr, "  type head: commit %llu nL0 %zu runs %zu gseqHi %llu firstLive %llu\n",
+                         (unsigned long long)ts.head.commitSeq, ts.l0.size(), ts.runs.size(),
+                         (unsigned long long)ts.head.gseqHi, (unsigned long long)ts.head.firstLiveCount);
+            for (int i = 0; i < 3; i++) {
+                uint8_t cid[kCidLen];
+                frameCid(recs[size_t(i)], cid);
+                std::vector<CatalogCopy> cat;
+                st.catalog(ts, cid, &cat);
+                std::sort(cat.begin(), cat.end(), [](const CatalogCopy& a, const CatalogCopy& b) { return a.tcs < b.tcs; });
+                std::fprintf(stderr, "  cid %d: %zu copies; last:", i, cat.size());
+                for (size_t k = cat.size() > 6 ? cat.size() - 6 : 0; k < cat.size(); k++)
+                    std::fprintf(stderr, " [p%u s%llu t%llu L%d g%llu]", cat[k].pid, (unsigned long long)cat[k].pseq,
+                                 (unsigned long long)cat[k].tcs, cat[k].label, (unsigned long long)cat[k].gseq);
+                std::fprintf(stderr, "\n");
+            }
+        }
         (void)pids;
         round++;
     }
+    CHECK_EQ(badRound, -1);
     stop = true;
     for (auto& t : readers) t.join();
     const uint64_t promotions = s.e->stats().promotions - promotions0;

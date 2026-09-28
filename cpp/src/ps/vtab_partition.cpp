@@ -104,14 +104,24 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
     if (pseq == 0 || pseq > bound) return 0;
     out->gseq = 0;
     if (type) {
-        uint8_t label = 0;
-        uint64_t gseq = 0;
-        bool found = false;
-        int32_t rc = store->labelOf(*type, snap->pid, pseq, &label, &gseq, &found);
+        // Every labeled PUT is FIRST or REPEAT, and a REPEAT label always
+        // leaves a REPEAT posting (bloom-tested): without one the row is
+        // FIRST, and its gseq is looked up only if a column or the sandbox
+        // window needs it. With one, the latest LABEL says whether it was
+        // promoted since (A14).
+        bool repeat = false;
+        int32_t rc = store->everRepeat(*type, snap->pid, pseq, &repeat);
         if (rc < 0) return rc;
-        if (!found || label != kLblFirst) return 0;  // unlabeled or REPEAT
-        if (gseq < gseqFloor) return 0;
-        out->gseq = gseq;
+        if (repeat || gseqFloor) {
+            uint8_t label = 0;
+            uint64_t gseq = 0;
+            bool found = false;
+            rc = store->labelOf(*type, snap->pid, pseq, &label, &gseq, &found);
+            if (rc < 0) return rc;
+            if (!found || label != kLblFirst) return 0;
+            if (gseq < gseqFloor) return 0;
+            out->gseq = gseq;
+        }
     }
     int32_t rc;
     if (!knownLive) {
@@ -160,9 +170,10 @@ public:
             const int32_t prc = pollEvery(f_.store, &poll_);
             if (prc < 0) return prc;
             uint64_t pseq = getBE64(scan_.val());
-            const std::string key(reinterpret_cast<const char*>(scan_.key()), scan_.klen());
-            if (key != lastKey_) {
-                lastKey_ = key;
+            // Duplicate instances of one PUT under one key (TAG kinds) are
+            // emitted once; no per-entry allocation.
+            if (keyCmp(scan_.key(), scan_.klen(), reinterpret_cast<const uint8_t*>(lastKey_.data()), lastKey_.size()) != 0) {
+                lastKey_.assign(reinterpret_cast<const char*>(scan_.key()), scan_.klen());
                 emitted_.clear();
             }
             if (instances_) {
@@ -183,7 +194,7 @@ public:
             if (rc < 0) return rc;
             if (rc == 0) continue;
             emitted_.push_back(pseq);
-            out->key = key;
+            out->key.assign(reinterpret_cast<const char*>(scan_.key()), scan_.klen());
             return 1;
         }
         return scan_.err() ? scan_.err() : 0;

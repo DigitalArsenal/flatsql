@@ -176,13 +176,49 @@ StageScratch::TCid* catalogState(TCtx& c, const uint8_t key[kCidKeyLen]) {
     StageScratch::TCid& tc = sc.tcids[sc.nTCids];
     std::memcpy(tc.key, key, kCidKeyLen);
     tc.copies = -1;
+    // Gather every committed entry, resolve the latest per copy, and keep
+    // the copies that still live: dead copies decide nothing (a copy never
+    // leaves DEAD), and a cid can have many of them.
+    sc.gather.clear();
     const int32_t rc = committedCatalog(c, key, [&](const uint8_t* v) {
-        upsertCopy(sc, &tc, getBE32(v), getBE64(v + 4), getBE64(v + 12), v[20], getBE64(v + 21),
-                   getBE32(v + 29));
+        if (sc.gather.size() == sc.gather.capacity()) {
+            const int saved = tHotPathDepth;
+            tHotPathDepth = 0;  // growth only for a cid with a long dead history
+            sc.gather.reserve(sc.gather.capacity() * 2);
+            tHotPathDepth = saved;
+        }
+        StageScratch::TCopy cp;
+        cp.pid = getBE32(v);
+        cp.pseq = getBE64(v + 4);
+        cp.tcs = getBE64(v + 12);
+        cp.label = v[20];
+        cp.gseq = getBE64(v + 21);
+        cp.len = getBE32(v + 29);
+        cp.next = -1;
+        sc.gather.push_back(cp);
     });
     if (rc < 0) {
         c.err = rc;
         return nullptr;
+    }
+    std::sort(sc.gather.begin(), sc.gather.end(), [](const StageScratch::TCopy& a, const StageScratch::TCopy& b) {
+        if (a.pid != b.pid) return a.pid < b.pid;
+        if (a.pseq != b.pseq) return a.pseq < b.pseq;
+        if (a.tcs != b.tcs) return a.tcs < b.tcs;
+        return labelRank(a.label) < labelRank(b.label);  // the last of a copy is its current state
+    });
+    uint32_t live = 0;
+    for (size_t i = 0; i < sc.gather.size(); i++) {
+        const bool lastOfCopy = i + 1 == sc.gather.size() || sc.gather[i + 1].pid != sc.gather[i].pid ||
+                                sc.gather[i + 1].pseq != sc.gather[i].pseq;
+        if (lastOfCopy && isLive(sc.gather[i].label)) live++;
+    }
+    if (sc.nTCopies + live + 64 > StageScratch::kTCopyCap) return nullptr;  // the batch commits first
+    for (size_t i = 0; i < sc.gather.size(); i++) {
+        const bool lastOfCopy = i + 1 == sc.gather.size() || sc.gather[i + 1].pid != sc.gather[i].pid ||
+                                sc.gather[i + 1].pseq != sc.gather[i].pseq;
+        const StageScratch::TCopy& g = sc.gather[i];
+        if (lastOfCopy && isLive(g.label)) upsertCopy(sc, &tc, g.pid, g.pseq, g.tcs, g.label, g.gseq, g.len);
     }
     tc.next = sc.tcidBuckets[b];
     sc.tcidBuckets[b] = int32_t(sc.nTCids);

@@ -70,7 +70,8 @@ ReaderLane::ReaderLane(ReaderInstance* inst, uint32_t id) : inst_(inst), id_(id)
     sc.root = cfg.root;
     sc.io = cfg.io;
     sc.maxHandles = cfg.maxHandlesPerLane;
-    sc.cacheBytes = cfg.lanes ? cfg.cacheBytes / cfg.lanes : cfg.cacheBytes;
+    sc.cacheBytes = cfg.laneCacheBytes;
+    sc.shared = inst->cache_.get();
     sc.verifyFrameCrc = cfg.verifyFrameCrc;
     store_.reset(new LaneStore(sc));
 }
@@ -110,6 +111,28 @@ int32_t ReaderLane::part(StmtCtx* s, uint32_t pid, PartSnap** out) {
     e.seq = ++s->snapSeq;
     e.snap = snap;
     s->parts.emplace(pid, e);
+    *out = snap.get();
+    return 0;
+}
+
+int32_t ReaderLane::partCounters(StmtCtx* s, uint32_t pid, PartSnap** out) {
+    auto it = s->parts.find(pid);
+    if (it != s->parts.end()) {
+        *out = it->second.snap.get();
+        return 0;
+    }
+    auto ct = s->counterParts.find(pid);
+    if (ct != s->counterParts.end()) {
+        *out = ct->second.snap.get();
+        return 0;
+    }
+    auto snap = std::make_shared<PartSnap>();
+    const int32_t rc = store_->loadPart(pid, snap.get(), false);
+    if (rc < 0) return rc;
+    StmtCtx::PartEntry e;
+    e.seq = ++s->snapSeq;
+    e.snap = snap;
+    s->counterParts.emplace(pid, e);
     *out = snap.get();
     return 0;
 }
@@ -345,6 +368,7 @@ void ReaderLane::finishStatement(Active* a, int32_t status, const std::string& m
     inst_->cStatements.fetch_add(1, std::memory_order_relaxed);
     a->ctx.parts.clear();
     a->ctx.typeParts.clear();
+    a->ctx.counterParts.clear();
     a->ctx.types.clear();
     retired_.clear();
     retiredTypes_.clear();
@@ -745,6 +769,7 @@ int32_t ReaderInstance::open(const ReaderConfig& cfgIn, std::unique_ptr<ReaderIn
     for (uint64_t i = 0; i < qcap; i++) inst->q_[i].seq.store(i);
     inst->qMask_ = qcap - 1;
     inst->shared_.reset(new LaneShared[cfg.lanes]);
+    inst->cache_.reset(new ReaderCache(cfg.cacheBytes));
     for (uint32_t i = 0; i < cfg.lanes; i++) {
         inst->lanes_.emplace_back(new ReaderLane(inst.get(), i));
         if (!inst->lanes_.back()->arena_.init(cfg.arenaBytes)) {

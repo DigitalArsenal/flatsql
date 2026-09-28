@@ -30,6 +30,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -221,6 +222,9 @@ struct Manifest {
     const ManifestSegRef* segForPseq(uint64_t pseq) const;  // merged range
 };
 
+struct L0Section;
+using SectionList = std::vector<std::shared_ptr<const L0Section>>;
+
 // ---- partition snapshot -----------------------------------------------------------
 struct PartSnap {
     uint32_t pid = 0;
@@ -232,6 +236,9 @@ struct PartSnap {
     bool lanesOverflow = false;
     std::shared_ptr<const Manifest> manifest;
     uint64_t visible = 0;            // row visibility bound (pseq_hi or V_p)
+    // L0 sections resolved once per statement, per kind (index = l0 index;
+    // null: the block has no such kind).
+    mutable std::unordered_map<uint16_t, SectionList> secs;
     uint64_t pseqHi() const { return empty ? 0 : head.pseqHi; }
 };
 
@@ -249,6 +256,7 @@ struct TypeSnap {
     // Sealed arrivals segments (fence index) and cumulative entry counts.
     std::shared_ptr<const std::vector<ArrivalFence>> fence;
     std::vector<uint64_t> segStart;           // position of each segment's first entry
+    mutable std::unordered_map<uint16_t, SectionList> secs;  // L0 sections per kind (once per statement)
     uint64_t labeledThrough(uint32_t pid) const {
         if (!labeled) return 0;
         auto it = labeled->find(pid);
@@ -270,8 +278,52 @@ struct CatalogCopy {
     uint32_t len = 0;
 };
 
+// ---- the instance's shared index cache ------------------------------------------------
+// Immutable index pieces (the kind directory of an L0 block, one kind's
+// section of it) shared by the lanes of one reader instance: a lane rarely
+// re-reads what another lane parsed. Sharded, each shard behind a mutex held
+// for one hash lookup and only ever TRIED: a busy shard is a miss, so a lane
+// never waits on another lane (and never on a writer, which never touches
+// it). Attempts that found the shard busy are reported as "reader_cache"
+// contention.
+class ReaderCache {
+public:
+    explicit ReaderCache(uint64_t bytes, uint32_t shards = 64);
+    std::shared_ptr<const void> get(const FileKey& key);
+    void put(const FileKey& key, std::shared_ptr<const void> obj, uint64_t bytes);
+    uint64_t used() const;
+    uint64_t capacity() const { return cap_; }
+
+private:
+    struct Entry {
+        std::shared_ptr<const void> obj;
+        uint64_t bytes = 0;
+        std::list<FileKey>::iterator lru;
+    };
+    struct alignas(64) Shard {
+        std::mutex mu;
+        std::unordered_map<FileKey, Entry, FileKeyHash> map;
+        std::list<FileKey> lru;
+        uint64_t used = 0;
+    };
+    Shard& shardOf(const FileKey& key);
+    bool lock(Shard& s);
+    std::unique_ptr<Shard[]> shards_;
+    uint32_t n_;
+    uint64_t cap_;
+};
+
 // ---- postings ----------------------------------------------------------------------
-struct L0Parsed;  // a parsed L0 block (cached)
+// One kind's section of an L0 block: its entries, their offsets, its bloom.
+struct L0Section {
+    std::vector<uint8_t> entries;
+    std::vector<uint32_t> offs;
+    std::vector<uint8_t> bloom;
+    uint8_t vlen = 0;
+    size_t lowerBound(const uint8_t* key, size_t klen) const;
+    const uint8_t* entry(size_t i) const { return entries.data() + offs[i]; }
+    uint64_t bytes() const { return entries.size() + offs.size() * 4 + bloom.size() + 96; }
+};
 
 // Ordered stream of one index kind over a snapshot: every L0 block the head
 // lists and every L1 run the manifest lists, merged in (key, value) order,
@@ -295,7 +347,10 @@ public:
 private:
     friend class LaneStore;
     void pick();
+    bool before(int a, int b) const;
+    void siftDown(size_t i);
     std::vector<std::unique_ptr<Source>> srcs_;
+    std::vector<int> heap_;
     int cur_ = -1;
     bool desc_ = false;
     int32_t err_ = 0;
@@ -324,12 +379,13 @@ public:
     const FileKey& key() const { return key_; }
 
 private:
+    // Fences and blooms are immutable: they live in the instance's shared
+    // cache (one copy for every lane); the run holds pointers while in use.
     struct Kind {
         L1TocEntry toc{};
-        bool fencesLoaded = false;
-        std::vector<L1Fence> fences;
+        std::shared_ptr<const std::vector<L1Fence>> fences;
         uint8_t bloomState = 0;  // 0 not tried, 1 resident, 2 not resident (budget)
-        std::vector<uint8_t> bloom;
+        std::shared_ptr<const std::vector<uint8_t>> bloom;
     };
     Kind* find(uint16_t kind);
     const Kind* find(uint16_t kind) const;
@@ -343,12 +399,15 @@ struct LaneStoreConfig {
     std::string root;
     Io* io = nullptr;
     uint32_t maxHandles = 512;
-    uint64_t cacheBytes = 16ull << 20;   // L0 blocks + L1 accelerators + manifests
+    uint64_t cacheBytes = 16ull << 20;   // private: manifests, run views
+    ReaderCache* shared = nullptr;       // L0 directories and sections (instance-wide); null: private
+    uint32_t frontEntries = 65536;       // lane-private front of the shared cache
     bool verifyFrameCrc = true;          // check RecRow.dataCrc on every payload read
 };
 
 class LaneStore {
 public:
+    friend class LazyRun;
     explicit LaneStore(const LaneStoreConfig& cfg);
     ~LaneStore();
 
@@ -389,6 +448,8 @@ public:
     // REHOME of a gseq; every catalog copy of a cid (latest tcs per copy).
     int32_t labelOf(const TypeSnap& t, uint32_t pid, uint64_t pseq, uint8_t* label, uint64_t* gseq,
                     bool* found);
+    // Was (pid, pseq) ever labeled REPEAT? (No: a labeled PUT is FIRST.)
+    int32_t everRepeat(const TypeSnap& t, uint32_t pid, uint64_t pseq, bool* repeat);
     int32_t rehomeOf(const TypeSnap& t, uint64_t gseq, std::vector<std::pair<uint32_t, uint64_t>>* candidates);
     int32_t catalog(const TypeSnap& t, const uint8_t cid[kCidLen], std::vector<CatalogCopy>* out);
 
@@ -426,15 +487,21 @@ public:
     LaneIo& io() { return io_; }
     const std::string& root() const { return cfg_.root; }
     const LaneStoreConfig& config() const { return cfg_; }
+    uint64_t sharedBudget() const { return cfg_.shared ? cfg_.shared->capacity() : cfg_.cacheBytes; }
     uint64_t cacheBytes() const { return cacheUsed_; }
     // Cooperative polling from long loops (every 4 K steps).
     int32_t poll() const { return guard_ ? guard_->poll() : 0; }
 
     // Internals shared with PostingScan sources.
     struct Cached;
-    std::shared_ptr<const L0Parsed> l0Block(uint32_t pid, uint32_t mSeg, uint64_t off, uint32_t len,
-                                            int32_t* rc);
-    std::shared_ptr<const L0Parsed> typeL0Block(const uint8_t fid[4], const TypeL0DirEntry& e, int32_t* rc);
+    // One kind's section of an unmerged L0 block (nullptr, rc 0: the block
+    // has no such kind).
+    std::shared_ptr<const L0Section> l0Section(const PartSnap& s, const L0DirEntry& e, uint16_t kind, int32_t* rc);
+    std::shared_ptr<const L0Section> typeL0Section(const TypeSnap& t, const TypeL0DirEntry& e, uint16_t kind,
+                                                   int32_t* rc);
+    // Every L0 section of a kind in a snapshot, resolved once per statement.
+    const SectionList* sections(const PartSnap& s, uint16_t kind, int32_t* rc);
+    const SectionList* sections(const TypeSnap& t, uint16_t kind, int32_t* rc);
     // Sources keep file KEYS, never handles: a handle may be evicted and its
     // number reused between two reads; a key is reopened by name.
     std::shared_ptr<LazyRun> run(uint32_t pid, uint32_t seg, uint32_t gen, uint64_t fileLen, FileKey* key,
@@ -455,6 +522,11 @@ private:
     FileKey segKey(const PartSnap& s, char letter, uint32_t seg) const;
     void cachePut(const FileKey& key, std::shared_ptr<const void> obj, uint64_t bytes);
     std::shared_ptr<const void> cacheGet(const FileKey& key);
+    // The shared cache when configured, else the private one.
+    void sharedPut(const FileKey& key, std::shared_ptr<const void> obj, uint64_t bytes);
+    std::shared_ptr<const void> sharedGet(const FileKey& key);
+    std::shared_ptr<const L0Section> section(const FileKey& mfile, uint64_t blockOff, uint32_t maxLen, uint16_t kind,
+                                             int32_t* rc);
 
     LaneStoreConfig cfg_;
     LaneIo io_;
@@ -483,6 +555,9 @@ private:
     std::list<FileKey> runLru_;
     uint64_t runUsed_ = 0;
     std::unordered_map<FileKey, bool, FileKeyHash> verifiedRuns_;
+    // Lane-private front of the shared cache (no lock on a hit); cleared
+    // whole when it reaches its entry cap.
+    std::unordered_map<FileKey, std::shared_ptr<const void>, FileKeyHash> front_;
     // Type configs by (fid, fp).
     std::map<std::pair<uint32_t, uint64_t>, std::shared_ptr<TypeInfo>> typeInfos_;
     // Label maps of types with > 128 partitions: (fid) -> (commitSeq, labels).

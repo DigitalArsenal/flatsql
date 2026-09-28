@@ -139,6 +139,7 @@ bool StageScratch::init(const EngineConfig& cfg) {
     tcids = callocArray<TCid>(kTCidCap);
     tcidBuckets = callocArray<int32_t>(kCidBuckets);
     tcopies = callocArray<TCopy>(kTCopyCap);
+    gather.reserve(4096);
     arrivals = callocArray<ArrivalEntry>(kArrivalCap);
     trows = callocArray<RecRow>(kTRowCap);
     if (!tcids || !tcidBuckets || !tcopies || !arrivals || !trows) return false;

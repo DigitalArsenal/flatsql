@@ -825,6 +825,7 @@ else()
         test/ps/lane_isolation_test.cpp
         test/ps/snapshot_test.cpp
         test/ps/arrivals_paging_test.cpp
+        test/ps/reader_concurrency_test.cpp
         test/io_fault.cpp
     )
     # Test-only: the flatsql schema parser compiles the test schemas at run
@@ -846,7 +847,8 @@ else()
     target_compile_definitions(flatsql_ps_test PRIVATE
         PS_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/ps/vectors")
 
-    add_executable(flatsql_ps_bench test/ps/bench_main.cpp test/ps/ps_fixtures.cpp test/io_fault.cpp)
+    add_executable(flatsql_ps_bench test/ps/bench_main.cpp test/ps/ps_fixtures.cpp test/io_fault.cpp
+        test/ps/reader_fixtures.cpp test/ps/reader_concurrency_test.cpp)
     target_link_libraries(flatsql_ps_bench PRIVATE flatsql_ps flatsql_ps_testutil)
     target_include_directories(flatsql_ps_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
     target_compile_options(flatsql_ps_bench PRIVATE -O2)

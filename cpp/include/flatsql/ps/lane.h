@@ -55,12 +55,13 @@ struct ReaderConfig {
     LaneClass cls = LaneClass::Interactive;
     uint32_t lanes = 2;
     uint64_t arenaBytes = 0;             // per lane; 0 = 8 MiB (interactive/sandbox), 128 MiB (bulk)
-    uint64_t cacheBytes = 16ull << 20;   // per instance, split across its lanes
+    uint64_t cacheBytes = 16ull << 20;   // the instance's shared index cache (§17 block cache)
+    uint64_t laneCacheBytes = 4ull << 20;  // per lane: manifests, L1 fences and blooms
     uint32_t maxParked = 8;              // parked statements per lane (A28)
     uint32_t slots = 0;                  // request slots; 0 = lanes * (maxParked + 1) + 16
     uint32_t reqBytes = 64u << 10;       // per slot: SQL + parameters
     uint32_t ringBytes = 256u << 10;     // per slot: result ring
-    uint32_t maxHandlesPerLane = 512;
+    uint32_t maxHandlesPerLane = 4096;  // host handles are virtual (T5: fd LRU underneath)
     uint64_t stackBytes = 2ull << 20;    // lane thread stacks (A30: >= 1 MiB)
     uint32_t lookasideSlotBytes = 256;
     uint32_t lookasideSlots = 512;
@@ -157,6 +158,7 @@ struct StmtCtx {
     };
     std::unordered_map<uint32_t, PartEntry> parts;
     std::unordered_map<uint32_t, PartEntry> typeParts;
+    std::unordered_map<uint32_t, PartEntry> counterParts;
     std::unordered_map<uint32_t, TypeEntry> types;
     int32_t vtabStatus = 0;        // a ReaderStatus raised inside a vtab (reported instead of SQLITE_*)
     std::string vtabMessage;
@@ -181,6 +183,8 @@ public:
     const ReaderConfig& config() const;
     // Snapshot helpers used by the vtabs (statement-scoped, taken once).
     int32_t part(StmtCtx* s, uint32_t pid, PartSnap** out);
+    // Counters only (the head; no manifest): meta tables.
+    int32_t partCounters(StmtCtx* s, uint32_t pid, PartSnap** out);
     int32_t type(StmtCtx* s, const uint8_t fid[4], TypeSnap** out);
     // A partition snapshot for type-level reads (taken after the type's).
     int32_t partForType(StmtCtx* s, uint32_t pid, const uint8_t fid[4], PartSnap** out);
@@ -282,6 +286,7 @@ private:
     ReaderConfig cfg_;
     std::vector<std::unique_ptr<ReaderLane>> lanes_;
     std::unique_ptr<LaneShared[]> shared_;
+    std::unique_ptr<ReaderCache> cache_;
     uint8_t* slotBase_ = nullptr;
     size_t slotStride_ = 0;
     size_t slotBytes_ = 0;

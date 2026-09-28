@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "flatsql/ps/lane_arena.h"
 #include "flatsql/ps/platform.h"
 
 namespace flatsql {
@@ -302,14 +303,21 @@ const ManifestSegRef* Manifest::segForPseq(uint64_t pseq) const {
 // ---------------------------------------------------------------------------
 // Parsed L0 blocks and posting sources
 // ---------------------------------------------------------------------------
-struct L0Parsed {
-    std::vector<uint8_t> bytes;
-    std::vector<L0KindInfo> kinds;
-    const L0KindInfo* find(uint16_t kind) const {
-        for (const auto& k : kinds)
-            if (k.kind == kind) return &k;
-        return nullptr;
+size_t L0Section::lowerBound(const uint8_t* key, size_t klen) const {
+    size_t a = 0, b = offs.size();
+    while (a < b) {
+        const size_t mid = (a + b) / 2;
+        const uint8_t* p = entries.data() + offs[mid];
+        if (keyCmp(p + 2, getU16(p), key, klen) < 0) a = mid + 1;
+        else b = mid;
     }
+    return a;
+}
+
+// Kind directory of an L0 block (offsets relative to the block).
+struct L0Dir {
+    uint32_t blockLen = 0;
+    std::vector<L0KindInfo> kinds;
 };
 
 struct PostingScan::Source {
@@ -325,52 +333,33 @@ struct PostingScan::Source {
 
 namespace {
 
-inline bool inRange(const uint8_t* k, size_t kl, const std::string& lo, bool hasLo, const std::string& hi,
-                    bool hasHi) {
-    if (hasLo && keyCmp(k, kl, reinterpret_cast<const uint8_t*>(lo.data()), lo.size()) < 0) return false;
-    if (hasHi && keyCmp(k, kl, reinterpret_cast<const uint8_t*>(hi.data()), hi.size()) >= 0) return false;
-    return true;
-}
 
 // One kind section of a parsed L0 block, restricted to the range.
 struct L0Source : PostingScan::Source {
-    std::shared_ptr<const L0Parsed> blk;
-    std::vector<const uint8_t*> ents;
+    std::shared_ptr<const L0Section> sec;
     int64_t idx = -1;
+    int64_t first = 0, last = 0;  // entry index range [first, last)
     bool desc = false;
-    uint8_t v = 0;
-    bool init(std::shared_ptr<const L0Parsed> b, uint16_t kind, const std::string& lo, bool hasLo,
-              const std::string& hi, bool hasHi, bool d) {
-        blk = std::move(b);
+    bool init(std::shared_ptr<const L0Section> sc, const std::string& lo, bool hasLo, const std::string& hi, bool hasHi,
+              bool d) {
+        sec = std::move(sc);
         desc = d;
-        const L0KindInfo* ki = blk->find(kind);
-        if (!ki || ki->n == 0) return false;
-        v = ki->vlen;
-        EntryIter it;
-        it.p = blk->bytes.data() + ki->entriesOff;
-        it.end = it.p + ki->entriesBytes;
-        it.vlen = ki->vlen;
-        const uint8_t *k, *val;
-        uint16_t kl;
-        const uint8_t* at = it.p;
-        while (it.next(&k, &kl, &val)) {
-            if (inRange(k, kl, lo, hasLo, hi, hasHi)) ents.push_back(at);
-            else if (hasHi && keyCmp(k, kl, reinterpret_cast<const uint8_t*>(hi.data()), hi.size()) >= 0)
-                break;
-            at = it.p;
-        }
-        if (ents.empty()) return false;
-        idx = desc ? int64_t(ents.size()) : -1;
+        if (!sec || sec->offs.empty()) return false;
+        first = hasLo ? int64_t(sec->lowerBound(reinterpret_cast<const uint8_t*>(lo.data()), lo.size())) : 0;
+        last = hasHi ? int64_t(sec->lowerBound(reinterpret_cast<const uint8_t*>(hi.data()), hi.size()))
+                     : int64_t(sec->offs.size());
+        if (first >= last) return false;
+        idx = desc ? last : first - 1;
         return true;
     }
     bool advance(LaneStore*) override {
         idx += desc ? -1 : 1;
-        if (idx < 0 || idx >= int64_t(ents.size())) return valid = false;
-        const uint8_t* p = ents[size_t(idx)];
+        if (idx < first || idx >= last) return valid = false;
+        const uint8_t* p = sec->entry(size_t(idx));
         klen = getU16(p);
         key = p + 2;
         val = p + 2 + klen;
-        vlen = v;
+        vlen = sec->vlen;
         return valid = true;
     }
 };
@@ -509,20 +498,36 @@ uint16_t PostingScan::klen() const { return srcs_[size_t(cur_)]->klen; }
 const uint8_t* PostingScan::val() const { return srcs_[size_t(cur_)]->val; }
 uint8_t PostingScan::vlen() const { return srcs_[size_t(cur_)]->vlen; }
 
-void PostingScan::pick() {
-    cur_ = -1;
-    for (size_t i = 0; i < srcs_.size(); i++) {
-        const Source* s = srcs_[i].get();
-        if (!s->valid) continue;
-        if (cur_ < 0) {
-            cur_ = int(i);
-            continue;
-        }
-        const Source* b = srcs_[size_t(cur_)].get();
-        int c = keyCmp(s->key, s->klen, b->key, b->klen);
-        if (c == 0) c = std::memcmp(s->val, b->val, std::min(s->vlen, b->vlen));
-        if (desc_ ? c > 0 : c < 0) cur_ = int(i);
+// Sources merge through a binary heap of indices (a partition can list up
+// to 48 unmerged L0 blocks plus its runs).
+bool PostingScan::before(int a, int b) const {
+    const Source* x = srcs_[size_t(a)].get();
+    const Source* y = srcs_[size_t(b)].get();
+    int c = keyCmp(x->key, x->klen, y->key, y->klen);
+    if (c == 0) c = std::memcmp(x->val, y->val, std::min(x->vlen, y->vlen));
+    if (c == 0) c = a < b ? -1 : 1;
+    return desc_ ? c > 0 : c < 0;
+}
+
+void PostingScan::siftDown(size_t i) {
+    const size_t n = heap_.size();
+    for (;;) {
+        size_t m = i;
+        const size_t l = 2 * i + 1, r = 2 * i + 2;
+        if (l < n && before(heap_[l], heap_[m])) m = l;
+        if (r < n && before(heap_[r], heap_[m])) m = r;
+        if (m == i) return;
+        std::swap(heap_[i], heap_[m]);
+        i = m;
     }
+}
+
+void PostingScan::pick() {
+    heap_.clear();
+    for (size_t i = 0; i < srcs_.size(); i++)
+        if (srcs_[i]->valid) heap_.push_back(int(i));
+    for (size_t i = heap_.size() / 2; i-- > 0;) siftDown(i);
+    cur_ = heap_.empty() ? -1 : heap_[0];
 }
 
 bool PostingScan::next() {
@@ -531,7 +536,12 @@ bool PostingScan::next() {
     s->advance(store_);
     if (s->err && !err_) err_ = s->err;
     if (store_ && store_->stats()) store_->stats()->indexEntries++;
-    pick();
+    if (!s->valid) {
+        heap_[0] = heap_.back();
+        heap_.pop_back();
+    }
+    if (!heap_.empty()) siftDown(0);
+    cur_ = heap_.empty() ? -1 : heap_[0];
     return cur_ >= 0;
 }
 
@@ -1156,70 +1166,185 @@ int32_t LaneStore::readBlock(const FileKey& key, uint64_t off, uint8_t* dst) {
     return 0;
 }
 
-std::shared_ptr<const L0Parsed> LaneStore::l0Block(uint32_t pid, uint32_t mSeg, uint64_t off, uint32_t len,
-                                                   int32_t* rc) {
-    FileKey key = pk('0', pid, mSeg);
-    key.extra = off;
-    if (auto c = cacheGet(key)) return std::static_pointer_cast<const L0Parsed>(c);
-    FileRef f;
-    *rc = io_.get(pk('m', pid, mSeg), &f);
-    if (*rc < 0) {
-        if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
-        return nullptr;
+std::shared_ptr<const void> LaneStore::sharedGet(const FileKey& key) {
+    if (!cfg_.shared) return cacheGet(key);
+    auto it = front_.find(key);
+    if (it != front_.end()) return it->second;
+    auto obj = cfg_.shared->get(key);
+    if (obj) {
+        if (front_.size() >= cfg_.frontEntries) front_.clear();
+        front_.emplace(key, obj);
     }
-    auto b = std::make_shared<L0Parsed>();
-    b->bytes.resize(len);
-    const int64_t got = io_.read(f, b->bytes.data(), len, off);
-    if (got != int64_t(len)) {
-        *rc = got < 0 ? int32_t(got) : kRsCorrupt;
-        return nullptr;
-    }
-    L0Header lh;
-    std::memcpy(&lh, b->bytes.data(), sizeof(lh));
-    if (lh.magic != kMagicL0 || lh.blockLen > len) {
-        *rc = kRsCorrupt;
-        return nullptr;
-    }
-    b->bytes.resize(lh.blockLen);
-    L0KindInfo kinds[64];
-    size_t nk = 0;
-    if (!parseL0Block(b->bytes.data(), b->bytes.size(), kinds, 64, &nk)) {
-        *rc = kRsCorrupt;
-        return nullptr;
-    }
-    b->kinds.assign(kinds, kinds + nk);
-    cachePut(key, b, b->bytes.size() + 128);
-    *rc = 0;
-    return b;
+    return obj;
 }
 
-std::shared_ptr<const L0Parsed> LaneStore::typeL0Block(const uint8_t fid[4], const TypeL0DirEntry& e, int32_t* rc) {
-    FileKey key = tk('0', fid, e.mSeg);
-    key.extra = e.mOff;
-    if (auto c = cacheGet(key)) return std::static_pointer_cast<const L0Parsed>(c);
-    FileRef f;
-    *rc = io_.get(tk('m', fid, e.mSeg), &f);
-    if (*rc < 0) {
-        if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
+void LaneStore::sharedPut(const FileKey& key, std::shared_ptr<const void> obj, uint64_t bytes) {
+    if (!cfg_.shared) {
+        cachePut(key, std::move(obj), bytes);
+        return;
+    }
+    if (front_.size() >= cfg_.frontEntries) front_.clear();
+    front_[key] = obj;
+    cfg_.shared->put(key, std::move(obj), bytes);
+}
+
+namespace {
+std::shared_ptr<L0Section> extractSection(const uint8_t* block, const L0KindInfo& k) {
+    auto sec = std::make_shared<L0Section>();
+    sec->vlen = k.vlen;
+    sec->entries.assign(block + k.entriesOff, block + k.entriesOff + k.entriesBytes);
+    if (k.bloomBytes) sec->bloom.assign(block + k.bloomOff, block + k.bloomOff + k.bloomBytes);
+    return sec;
+}
+bool indexSection(L0Section* sec, uint32_t n) {
+    sec->offs.reserve(n);
+    EntryIter it;
+    it.p = sec->entries.data();
+    it.end = it.p + sec->entries.size();
+    it.vlen = sec->vlen;
+    const uint8_t *k, *v;
+    uint16_t kl;
+    const uint8_t* at = it.p;
+    while (it.next(&k, &kl, &v)) {
+        sec->offs.push_back(uint32_t(at - sec->entries.data()));
+        at = it.p;
+    }
+    return sec->offs.size() == n;
+}
+}  // namespace
+
+std::shared_ptr<const L0Section> LaneStore::section(const FileKey& mfile, uint64_t blockOff, uint32_t maxLen,
+                                                    uint16_t kind, int32_t* rc) {
+    *rc = 0;
+    FileKey sk = mfile;
+    sk.letter = mfile.letter == 'm' ? 'S' : 's';
+    sk.extra = blockOff;
+    sk.gen = kind;
+    if (auto c = sharedGet(sk)) {
+        auto sec = std::static_pointer_cast<const L0Section>(c);
+        return sec->offs.empty() && sec->entries.empty() && sec->vlen == 0xff ? nullptr : sec;
+    }
+    FileKey dk = mfile;
+    dk.letter = mfile.letter == 'm' ? 'D' : 'd';
+    dk.extra = blockOff;
+    std::shared_ptr<const L0Dir> dir;
+    std::shared_ptr<L0Section> sec;
+    const L0KindInfo* ki = nullptr;
+    if (auto c = sharedGet(dk)) {
+        dir = std::static_pointer_cast<const L0Dir>(c);
+        for (const auto& k : dir->kinds)
+            if (k.kind == kind) ki = &k;
+        if (ki) {
+            // The directory is known (the block's CRC was checked when it was
+            // built): read just this section.
+            FileRef f;
+            *rc = io_.get(mfile, &f);
+            if (*rc < 0) {
+                if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
+                return nullptr;
+            }
+            sec = std::make_shared<L0Section>();
+            sec->vlen = ki->vlen;
+            sec->entries.resize(ki->entriesBytes);
+            if (ki->entriesBytes &&
+                io_.read(f, sec->entries.data(), ki->entriesBytes, blockOff + ki->entriesOff) != int64_t(ki->entriesBytes)) {
+                *rc = FLATSQL_IO_ERR_IO;
+                return nullptr;
+            }
+            if (ki->bloomBytes) {
+                sec->bloom.resize(ki->bloomBytes);
+                if (io_.read(f, sec->bloom.data(), ki->bloomBytes, blockOff + ki->bloomOff) != int64_t(ki->bloomBytes)) {
+                    *rc = FLATSQL_IO_ERR_IO;
+                    return nullptr;
+                }
+            }
+        }
+    } else {
+        // First touch: the whole block, CRC-checked; the directory is kept.
+        FileRef f;
+        *rc = io_.get(mfile, &f);
+        if (*rc < 0) {
+            if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
+            return nullptr;
+        }
+        L0Header lh;
+        if (io_.read(f, &lh, sizeof(lh), blockOff) != int64_t(sizeof(lh))) {
+            *rc = FLATSQL_IO_ERR_IO;
+            return nullptr;
+        }
+        if (lh.magic != kMagicL0 || lh.blockLen > maxLen || lh.blockLen < sizeof(L0Header) + 8) {
+            *rc = kRsCorrupt;
+            return nullptr;
+        }
+        std::vector<uint8_t> block(lh.blockLen);
+        if (io_.read(f, block.data(), block.size(), blockOff) != int64_t(block.size())) {
+            *rc = FLATSQL_IO_ERR_IO;
+            return nullptr;
+        }
+        L0KindInfo kinds[64];
+        size_t nk = 0;
+        if (!parseL0Block(block.data(), block.size(), kinds, 64, &nk)) {
+            *rc = kRsCorrupt;
+            return nullptr;
+        }
+        auto d = std::make_shared<L0Dir>();
+        d->blockLen = lh.blockLen;
+        d->kinds.assign(kinds, kinds + nk);
+        sharedPut(dk, d, 64 + nk * sizeof(L0KindInfo));
+        for (const auto& k : d->kinds)
+            if (k.kind == kind) ki = &k;
+        if (ki) sec = extractSection(block.data(), *ki);
+        dir = d;
+    }
+    if (!ki) {
+        // Absent kind: cache a marker so the next statement does not look.
+        auto none = std::make_shared<L0Section>();
+        none->vlen = 0xff;
+        sharedPut(sk, none, 96);
         return nullptr;
     }
-    auto b = std::make_shared<L0Parsed>();
-    b->bytes.resize(e.l0Len);
-    const int64_t got = io_.read(f, b->bytes.data(), e.l0Len, e.mOff + e.l0Off);
-    if (got != int64_t(e.l0Len)) {
-        *rc = got < 0 ? int32_t(got) : kRsCorrupt;
-        return nullptr;
-    }
-    L0KindInfo kinds[64];
-    size_t nk = 0;
-    if (!parseL0Block(b->bytes.data(), b->bytes.size(), kinds, 64, &nk)) {
+    if (!indexSection(sec.get(), ki->n)) {
         *rc = kRsCorrupt;
         return nullptr;
     }
-    b->kinds.assign(kinds, kinds + nk);
-    cachePut(key, b, b->bytes.size() + 128);
+    sharedPut(sk, sec, sec->bytes());
+    return sec;
+}
+
+std::shared_ptr<const L0Section> LaneStore::l0Section(const PartSnap& s, const L0DirEntry& e, uint16_t kind,
+                                                      int32_t* rc) {
+    return section(pk('m', s.pid, e.mSeg), e.mOff + e.l0Off, e.batchLen - e.l0Off, kind, rc);
+}
+
+std::shared_ptr<const L0Section> LaneStore::typeL0Section(const TypeSnap& t, const TypeL0DirEntry& e, uint16_t kind,
+                                                          int32_t* rc) {
+    return section(tk('m', t.fid, e.mSeg), e.mOff + e.l0Off, e.l0Len, kind, rc);
+}
+
+const SectionList* LaneStore::sections(const PartSnap& s, uint16_t kind, int32_t* rc) {
     *rc = 0;
-    return b;
+    auto it = s.secs.find(kind);
+    if (it != s.secs.end()) return &it->second;
+    SectionList list;
+    list.reserve(s.l0.size());
+    for (const L0DirEntry& e : s.l0) {
+        list.push_back(l0Section(s, e, kind, rc));
+        if (*rc < 0) return nullptr;
+    }
+    return &s.secs.emplace(kind, std::move(list)).first->second;
+}
+
+const SectionList* LaneStore::sections(const TypeSnap& t, uint16_t kind, int32_t* rc) {
+    *rc = 0;
+    auto it = t.secs.find(kind);
+    if (it != t.secs.end()) return &it->second;
+    SectionList list;
+    list.reserve(t.l0.size());
+    for (const TypeL0DirEntry& e : t.l0) {
+        list.push_back(typeL0Section(t, e, kind, rc));
+        if (*rc < 0) return nullptr;
+    }
+    return &t.secs.emplace(kind, std::move(list)).first->second;
 }
 
 std::shared_ptr<LazyRun> LaneStore::runGet(const FileKey& key, uint64_t fileLen, int32_t* rc) {
@@ -1329,26 +1454,31 @@ const std::vector<L1Fence>* LazyRun::fences(LaneStore* st, uint16_t kind, int32_
     *rc = 0;
     Kind* k = find(kind);
     if (!k) return nullptr;
-    if (!k->fencesLoaded) {
-        FileRef f;
-        *rc = st->io().get(key_, &f);
-        if (*rc < 0) {
-            if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
-            return nullptr;
+    if (!k->fences) {
+        FileKey fk = key_;
+        fk.letter = key_.letter == 'x' ? 'F' : 'f';
+        fk.extra = kind;
+        if (auto c = st->sharedGet(fk)) {
+            k->fences = std::static_pointer_cast<const std::vector<L1Fence>>(c);
+        } else {
+            FileRef f;
+            *rc = st->io().get(key_, &f);
+            if (*rc < 0) {
+                if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
+                return nullptr;
+            }
+            auto v = std::make_shared<std::vector<L1Fence>>(k->toc.nBlocks);
+            const size_t bytes = size_t(k->toc.nBlocks) * sizeof(L1Fence);
+            if (bytes && st->io().read(f, v->data(), bytes, k->toc.fenceOff) != int64_t(bytes)) {
+                *rc = FLATSQL_IO_ERR_IO;
+                return nullptr;
+            }
+            if (st->stats()) st->stats()->fenceReads++;
+            st->sharedPut(fk, v, bytes + 64);
+            k->fences = v;
         }
-        k->fences.resize(k->toc.nBlocks);
-        const size_t bytes = size_t(k->toc.nBlocks) * sizeof(L1Fence);
-        if (bytes && st->io().read(f, k->fences.data(), bytes, k->toc.fenceOff) != int64_t(bytes)) {
-            k->fences.clear();
-            *rc = FLATSQL_IO_ERR_IO;
-            return nullptr;
-        }
-        k->fencesLoaded = true;
-        bytes_ += bytes;
-        st->addRunBytes(int64_t(bytes));
-        if (st->stats()) st->stats()->fenceReads++;
     }
-    return &k->fences;
+    return k->fences.get();
 }
 
 int32_t LazyRun::lookup(LaneStore* st, uint16_t kind, const uint8_t* key, size_t klen, uint64_t hash,
@@ -1356,24 +1486,27 @@ int32_t LazyRun::lookup(LaneStore* st, uint16_t kind, const uint8_t* key, size_t
     *stop = false;
     Kind* k = find(kind);
     if (!k || k->toc.nBlocks == 0) return 0;
-    // Bloom: resident while it fits the lane budget (an eighth of it at most).
+    // Bloom: shared, resident while it fits (an eighth of the shared cache).
     if (k->bloomState == 0 && k->toc.bloomBytes) {
         k->bloomState = 2;
-        if (k->toc.bloomBytes <= st->config().cacheBytes / 8 && st->reserveRunBytes(k->toc.bloomBytes)) {
+        FileKey bk = key_;
+        bk.letter = key_.letter == 'x' ? 'B' : 'b';
+        bk.extra = kind;
+        if (auto c = st->sharedGet(bk)) {
+            k->bloom = std::static_pointer_cast<const std::vector<uint8_t>>(c);
+            k->bloomState = 1;
+        } else if (k->toc.bloomBytes <= st->sharedBudget() / 8) {
             FileRef f;
             int32_t rc = st->io().get(key_, &f);
             if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
-            k->bloom.resize(k->toc.bloomBytes);
-            if (st->io().read(f, k->bloom.data(), k->bloom.size(), k->toc.bloomOff) != int64_t(k->bloom.size())) {
-                k->bloom.clear();
-                return FLATSQL_IO_ERR_IO;
-            }
+            auto b = std::make_shared<std::vector<uint8_t>>(k->toc.bloomBytes);
+            if (st->io().read(f, b->data(), b->size(), k->toc.bloomOff) != int64_t(b->size())) return FLATSQL_IO_ERR_IO;
+            st->sharedPut(bk, b, b->size() + 64);
+            k->bloom = b;
             k->bloomState = 1;
-            bytes_ += k->bloom.size();
-            st->addRunBytes(int64_t(k->bloom.size()));
         }
     }
-    if (k->bloomState == 1 && !bloomTestHash(k->bloom.data(), k->bloom.size(), hash)) return 0;
+    if (k->bloomState == 1 && !bloomTestHash(k->bloom->data(), k->bloom->size(), hash)) return 0;
     int32_t rc = 0;
     const std::vector<L1Fence>* f = fences(st, kind, &rc);
     if (rc < 0) return rc;
@@ -1422,17 +1555,20 @@ PostingScan LaneStore::scan(const PartSnap& s, uint16_t kind, const uint8_t* lo,
     if (s.empty) return ps;
     const std::string los = lo ? std::string(reinterpret_cast<const char*>(lo), lol) : std::string();
     const std::string his = hi ? std::string(reinterpret_cast<const char*>(hi), hil) : std::string();
-    for (const L0DirEntry& e : s.l0) {
+    {
         int32_t rc = 0;
-        auto blk = l0Block(s.pid, e.mSeg, e.mOff + e.l0Off, e.batchLen - e.l0Off, &rc);
-        if (!blk) {
+        const SectionList* list = sections(s, kind, &rc);
+        if (!list) {
             ps.err_ = rc;
             return ps;
         }
+        for (const auto& sec : *list) {
+        if (!sec) continue;
         std::unique_ptr<L0Source> src(new L0Source());
-        if (!src->init(blk, kind, los, lo != nullptr, his, hi != nullptr, desc)) continue;
+        if (!src->init(sec, los, lo != nullptr, his, hi != nullptr, desc)) continue;
         src->advance(this);
         ps.srcs_.push_back(std::move(src));
+        }
     }
     if (s.manifest) {
         for (const ManifestSegRef& m : s.manifest->segs) {
@@ -1474,17 +1610,20 @@ PostingScan LaneStore::scanType(const TypeSnap& t, uint16_t kind, const uint8_t*
     if (t.empty) return ps;
     const std::string los = lo ? std::string(reinterpret_cast<const char*>(lo), lol) : std::string();
     const std::string his = hi ? std::string(reinterpret_cast<const char*>(hi), hil) : std::string();
-    for (const TypeL0DirEntry& e : t.l0) {
+    {
         int32_t rc = 0;
-        auto blk = typeL0Block(t.fid, e, &rc);
-        if (!blk) {
+        const SectionList* list = sections(t, kind, &rc);
+        if (!list) {
             ps.err_ = rc;
             return ps;
         }
-        std::unique_ptr<L0Source> src(new L0Source());
-        if (!src->init(blk, kind, los, lo != nullptr, his, hi != nullptr, desc)) continue;
-        src->advance(this);
-        ps.srcs_.push_back(std::move(src));
+        for (const auto& sec : *list) {
+            if (!sec) continue;
+            std::unique_ptr<L0Source> src(new L0Source());
+            if (!src->init(sec, los, lo != nullptr, his, hi != nullptr, desc)) continue;
+            src->advance(this);
+            ps.srcs_.push_back(std::move(src));
+        }
     }
     for (const SegRunRef& rr : t.runs) {
         FileKey f;
@@ -1513,21 +1652,14 @@ PostingScan LaneStore::scanType(const TypeSnap& t, uint16_t kind, const uint8_t*
 namespace {
 // Exact-key lookup in one L0 section (entries sorted by (key, value)).
 template <typename F>
-bool l0Lookup(const L0Parsed& b, uint16_t kind, const uint8_t* key, size_t klen, uint64_t h, F&& visit) {
-    const L0KindInfo* ki = b.find(kind);
-    if (!ki || !ki->n) return true;
-    if (ki->bloomBytes && !bloomTestHash(b.bytes.data() + ki->bloomOff, ki->bloomBytes, h)) return true;
-    EntryIter it;
-    it.p = b.bytes.data() + ki->entriesOff;
-    it.end = it.p + ki->entriesBytes;
-    it.vlen = ki->vlen;
-    const uint8_t *k, *v;
-    uint16_t kl;
-    while (it.next(&k, &kl, &v)) {
-        const int c = keyCmp(k, kl, key, klen);
-        if (c < 0) continue;
-        if (c > 0) break;
-        if (!visit(v)) return false;
+bool l0Lookup(const L0Section& b, const uint8_t* key, size_t klen, uint64_t h, F&& visit) {
+    if (b.offs.empty()) return true;
+    if (!b.bloom.empty() && !bloomTestHash(b.bloom.data(), b.bloom.size(), h)) return true;
+    for (size_t i = b.lowerBound(key, klen); i < b.offs.size(); i++) {
+        const uint8_t* p = b.entry(i);
+        const uint16_t kl = getU16(p);
+        if (keyCmp(p + 2, kl, key, klen) != 0) break;
+        if (!visit(p + 2 + kl)) return false;
     }
     return true;
 }
@@ -1537,11 +1669,12 @@ int32_t LaneStore::lookup(const PartSnap& s, uint16_t kind, const uint8_t* key, 
                           const std::function<bool(const uint8_t*)>& visit) {
     if (s.empty) return 0;
     const uint64_t h = bloomHash(key, klen);
-    for (const L0DirEntry& e : s.l0) {
+    {
         int32_t rc = 0;
-        auto blk = l0Block(s.pid, e.mSeg, e.mOff + e.l0Off, e.batchLen - e.l0Off, &rc);
-        if (!blk) return rc;
-        if (!l0Lookup(*blk, kind, key, klen, h, visit)) return 0;
+        const SectionList* list = sections(s, kind, &rc);
+        if (!list) return rc;
+        for (const auto& sec : *list)
+            if (sec && !l0Lookup(*sec, key, klen, h, visit)) return 0;
     }
     if (!s.manifest) return 0;
     for (const ManifestSegRef& m : s.manifest->segs) {
@@ -1563,11 +1696,12 @@ int32_t LaneStore::lookupType(const TypeSnap& t, uint16_t kind, const uint8_t* k
                               const std::function<bool(const uint8_t*)>& visit) {
     if (t.empty) return 0;
     const uint64_t h = bloomHash(key, klen);
-    for (const TypeL0DirEntry& e : t.l0) {
+    {
         int32_t rc = 0;
-        auto blk = typeL0Block(t.fid, e, &rc);
-        if (!blk) return rc;
-        if (!l0Lookup(*blk, kind, key, klen, h, visit)) return 0;
+        const SectionList* list = sections(t, kind, &rc);
+        if (!list) return rc;
+        for (const auto& sec : *list)
+            if (sec && !l0Lookup(*sec, key, klen, h, visit)) return 0;
     }
     for (const SegRunRef& rr : t.runs) {
         FileKey fk;
@@ -1628,6 +1762,17 @@ int32_t LaneStore::labelOf(const TypeSnap& t, uint32_t pid, uint64_t pseq, uint8
         return true;
     });
     return rc;
+}
+
+int32_t LaneStore::everRepeat(const TypeSnap& t, uint32_t pid, uint64_t pseq, bool* repeat) {
+    *repeat = false;
+    uint8_t k[12];
+    putBE32(k, pid);
+    putBE64(k + 4, pseq);
+    return lookupType(t, kIxTypeRepeat, k, 12, [&](const uint8_t*) {
+        *repeat = true;
+        return false;
+    });
 }
 
 int32_t LaneStore::rehomeOf(const TypeSnap& t, uint64_t gseq, std::vector<std::pair<uint32_t, uint64_t>>* cands) {
@@ -1790,20 +1935,12 @@ int32_t LaneStore::goneCount(const TypeSnap& t, uint64_t lo, uint64_t hi, uint64
     putBE64(klo, lo);
     putBE64(khi, hi);
     // Unmerged type L0 blocks: scan their (small) GONE sections.
-    for (const TypeL0DirEntry& e : t.l0) {
+    {
         int32_t rc = 0;
-        auto blk = typeL0Block(t.fid, e, &rc);
-        if (!blk) return rc;
-        const L0KindInfo* ki = blk->find(kIxTypeGone);
-        if (!ki || !ki->n) continue;
-        EntryIter it;
-        it.p = blk->bytes.data() + ki->entriesOff;
-        it.end = it.p + ki->entriesBytes;
-        it.vlen = ki->vlen;
-        const uint8_t *k, *v;
-        uint16_t kl;
-        while (it.next(&k, &kl, &v))
-            if (keyCmp(k, kl, klo, 8) >= 0 && keyCmp(k, kl, khi, 8) < 0) (*count)++;
+        const SectionList* list = sections(t, kIxTypeGone, &rc);
+        if (!list) return rc;
+        for (const auto& sec : *list)
+            if (sec) *count += sec->lowerBound(khi, 8) - sec->lowerBound(klo, 8);
     }
     // L1 runs: fences give whole-block counts; the two edge blocks are read.
     uint8_t buf[kL1BlockBytes];
@@ -1901,6 +2038,74 @@ int32_t LaneStore::seekLive(const TypeSnap& t, uint64_t begin, uint64_t end, uin
         *pos = lo;
     }
     return 0;
+}
+
+}  // namespace ps
+}  // namespace flatsql
+
+namespace flatsql {
+namespace ps {
+
+// ---------------------------------------------------------------------------
+// ReaderCache
+// ---------------------------------------------------------------------------
+ReaderCache::ReaderCache(uint64_t bytes, uint32_t shards)
+    : shards_(new Shard[shards ? shards : 1]), n_(shards ? shards : 1), cap_(bytes) {}
+
+ReaderCache::Shard& ReaderCache::shardOf(const FileKey& key) { return shards_[FileKeyHash()(key) % n_]; }
+
+// Lanes never wait on the shared cache: a shard another lane holds is a miss
+// (get) or a skipped insert (put); the caller reads the file instead.
+bool ReaderCache::lock(Shard& s) {
+    const bool got = s.mu.try_lock();
+    recordLaneLockWait(0, !got);
+    return got;
+}
+
+std::shared_ptr<const void> ReaderCache::get(const FileKey& key) {
+    Shard& s = shardOf(key);
+    if (!lock(s)) return nullptr;
+    std::shared_ptr<const void> out;
+    auto it = s.map.find(key);
+    if (it != s.map.end()) {
+        s.lru.splice(s.lru.begin(), s.lru, it->second.lru);
+        out = it->second.obj;
+    }
+    s.mu.unlock();
+    return out;
+}
+
+void ReaderCache::put(const FileKey& key, std::shared_ptr<const void> obj, uint64_t bytes) {
+    Shard& s = shardOf(key);
+    const uint64_t cap = cap_ / n_;
+    std::vector<std::shared_ptr<const void>> evicted;  // released outside the lock
+    if (!lock(s)) return;
+    if (!s.map.count(key)) {
+        while (s.used + bytes > cap && !s.lru.empty()) {
+            auto vit = s.map.find(s.lru.back());
+            s.used -= vit->second.bytes;
+            evicted.push_back(std::move(vit->second.obj));
+            s.map.erase(vit);
+            s.lru.pop_back();
+        }
+        s.lru.push_front(key);
+        Entry e;
+        e.obj = std::move(obj);
+        e.bytes = bytes;
+        e.lru = s.lru.begin();
+        s.map.emplace(key, std::move(e));
+        s.used += bytes;
+    }
+    s.mu.unlock();
+}
+
+uint64_t ReaderCache::used() const {
+    uint64_t u = 0;
+    for (uint32_t i = 0; i < n_; i++) {
+        std::lock_guard<std::mutex> g(shards_[i].mu);
+        u += shards_[i].used;
+    }
+    return u;
 }
 
 }  // namespace ps

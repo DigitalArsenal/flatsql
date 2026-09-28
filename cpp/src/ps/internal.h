@@ -118,6 +118,11 @@ struct StageScratch {
     uint32_t nTCids = 0;
     TCopy* tcopies = nullptr;
     uint32_t nTCopies = 0;
+    // Every committed catalog entry of one cid, gathered before resolution:
+    // a cid keeps its dead copies until compaction (T3), so it can hold far
+    // more entries than live copies. Grows (outside the hot-path count) only
+    // for such a cid.
+    std::vector<TCopy> gather;
     ArrivalEntry* arrivals = nullptr;
     uint32_t nArrivals = 0;
     static constexpr uint32_t kArrivalCap = 65536;

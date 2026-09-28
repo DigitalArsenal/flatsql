@@ -104,6 +104,9 @@ struct LockReport {
 };
 LockReport lockReport();
 void lockReportReset();
+// Lane-to-lane locks outside SQLite (the reader instance's shared index
+// cache) report through the same table, as "reader_cache".
+void recordLaneLockWait(uint64_t waitNs, bool contended);
 
 }  // namespace ps
 }  // namespace flatsql

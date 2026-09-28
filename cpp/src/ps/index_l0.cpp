@@ -26,6 +26,7 @@ bool isLookupKind(uint16_t kind) {
         case kIxTypeLabel:
         case kIxTypeRehome:
         case kIxTypeGone:
+        case kIxTypeRepeat:  // readers test REPEAT before any LABEL lookup
             return true;
         default:
             return false;

@@ -489,6 +489,7 @@ const char* mutexName(int id) {
         case SQLITE_MUTEX_STATIC_VFS1: return "static_vfs1";
         case SQLITE_MUTEX_STATIC_VFS2: return "static_vfs2";
         case SQLITE_MUTEX_STATIC_VFS3: return "static_vfs3";
+        case 15: return "reader_cache";
         default: return "other";
     }
 }
@@ -597,6 +598,8 @@ int32_t readerSqliteInit(std::string* err) {
     if (gInitRc < 0 && err) *err = gInitErr;
     return gInitRc;
 }
+
+void recordLaneLockWait(uint64_t waitNs, bool contended) { record(15, waitNs, contended); }
 
 LockReport lockReport() {
     LockReport r;

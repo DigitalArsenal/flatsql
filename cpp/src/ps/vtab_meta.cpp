@@ -226,7 +226,7 @@ int32_t fillPartitions(MetaCursor* c) {
     for (const PartInfo& pi : reg.parts) {
         if (!pi.pid || pi.dropped) continue;
         PartSnap* s = nullptr;
-        const int32_t rc = lane->part(c->stmt, pi.pid, &s);
+        const int32_t rc = lane->partCounters(c->stmt, pi.pid, &s);
         if (rc < 0) return rc;
         std::vector<Cell> r;
         r.push_back(ci(pi.pid));
@@ -260,7 +260,7 @@ int32_t fillLanes(MetaCursor* c) {
     for (const PartInfo& pi : reg.parts) {
         if (!pi.pid || pi.dropped) continue;
         PartSnap* s = nullptr;
-        int32_t rc = lane->part(c->stmt, pi.pid, &s);
+        int32_t rc = lane->partCounters(c->stmt, pi.pid, &s);
         if (rc < 0) return rc;
         if (s->empty) continue;
         std::vector<LaneCounter> counters;

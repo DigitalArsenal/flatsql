@@ -39,23 +39,58 @@ public:
             }
         }
         if (group_) return nextGroupBest(out);
+        if (!heapBuilt_) {
+            heapBuilt_ = true;
+            for (size_t i = 0; i < subs_.size(); i++)
+                if (live_[i]) heap_.push_back(int(i));
+            for (size_t i = heap_.size() / 2; i-- > 0;) siftDown(i);
+        }
         for (;;) {
-            int best = pick();
-            if (best < 0) return 0;
-            CurRow r = std::move(heads_[size_t(best)]);
+            if (heap_.empty()) return 0;
+            const int best = heap_[0];
+            // Swap, not move: the head keeps the caller's buffers (no
+            // allocation per row).
+            std::swap(*out, heads_[size_t(best)]);
+            CurRow& r = *out;
             const int32_t rc = subs_[size_t(best)]->next(&heads_[size_t(best)]);
             if (rc < 0) return rc;
             live_[size_t(best)] = rc == 1;
+            if (rc != 1) {
+                heap_[0] = heap_.back();
+                heap_.pop_back();
+            }
+            if (!heap_.empty()) siftDown(0);
             if (dedupe_ && haveLast_ && std::memcmp(r.row.cid, lastCid_, kCidLen) == 0 && r.key == lastKey_) continue;
             haveLast_ = true;
             std::memcpy(lastCid_, r.row.cid, kCidLen);
-            lastKey_ = r.key;
-            *out = std::move(r);
+            if (dedupe_) lastKey_.assign(r.key);
             return 1;
         }
     }
 
 private:
+    bool before(int x, int y) const {
+        const CurRow& a = heads_[size_t(x)];
+        const CurRow& b = heads_[size_t(y)];
+        int c = a.key.compare(b.key);
+        if (c == 0) c = std::memcmp(a.row.cid, b.row.cid, kCidLen);
+        if (c == 0) c = a.pid < b.pid ? -1 : a.pid > b.pid ? 1 : 0;
+        if (c == 0) c = a.row.pseq < b.row.pseq ? -1 : a.row.pseq > b.row.pseq ? 1 : 0;
+        if (c == 0) c = x < y ? -1 : 1;
+        return desc_ ? c > 0 : c < 0;
+    }
+    void siftDown(size_t i) {
+        const size_t n = heap_.size();
+        for (;;) {
+            size_t m = i;
+            const size_t l = 2 * i + 1, r = 2 * i + 2;
+            if (l < n && before(heap_[l], heap_[m])) m = l;
+            if (r < n && before(heap_[r], heap_[m])) m = r;
+            if (m == i) return;
+            std::swap(heap_[i], heap_[m]);
+            i = m;
+        }
+    }
     int pick() const {
         int best = -1;
         for (size_t i = 0; i < subs_.size(); i++) {
@@ -106,6 +141,8 @@ private:
     bool desc_, dedupe_, group_;
     size_t groupTrim_;
     bool started_ = false;
+    bool heapBuilt_ = false;
+    std::vector<int> heap_;
     bool haveLast_ = false;
     uint8_t lastCid_[kCidLen];
     std::string lastKey_;

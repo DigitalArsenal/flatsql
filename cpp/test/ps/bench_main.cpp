@@ -471,6 +471,20 @@ int main(int argc, char** argv) {
     if (mode == "host02") return modeHost02();
     if (mode == "dirty") return modeDirty();
     if (mode == "soak") return modeSoak();
+    if (mode == "test") {
+        // Registered measurement tests (reader_concurrency_test.cpp) in a
+        // binary whose operator new keeps no global counter.
+        const std::string name = argStr("test", "");
+        int ran = 0;
+        for (const auto& t : registry())
+            if (!name.empty() && std::string(t.name).find(name) != std::string::npos) {
+                std::printf("[ RUN  ] %s\n", t.name);
+                t.fn();
+                std::printf("[ %s ] %s\n", gFailures ? "FAIL" : " OK ", t.name);
+                ran++;
+            }
+        return ran && !gFailures ? 0 : 1;
+    }
     std::fprintf(stderr, "unknown --mode\n");
     return 2;
 }
