@@ -379,6 +379,7 @@ struct CompactPlan {
     std::vector<PresenceSeg> presence;  // compacted non-input segments, ascending
     std::atomic<bool> abort{false};
     std::atomic<int32_t> result{0};     // 0 running, 1 built, < 0 error
+    uint64_t createdNs = 0;             // files retired after this stay until the SWAP or abort
     // Outputs.
     uint64_t first = 0, end = 0;
     bool empty = false;
@@ -530,6 +531,7 @@ int32_t planCompaction(Writer* w, Partition* p, uint32_t seg, uint32_t segEnd, S
     c->segEnd = segEnd;
     c->req = req;
     c->forced = forced;
+    c->createdNs = monoNs();
     c->ownerEpoch = p->ownerEpoch;
     c->ownerWord = &p->ring->ownerWordV;
     const uint64_t labeled = p->labeledThrough.load(std::memory_order_acquire);
@@ -1225,10 +1227,23 @@ int32_t queueSwap(Writer* w, Partition* p) {
 
 bool partitionCompactBusy(const Partition* p) { return p->compactPhase != kCompactIdle; }
 
+uint64_t partitionCompactPinNs(const Partition* p) {
+    // A plan reads the runs, m segments and files current when it was made:
+    // anything retired since stays until it is applied or abandoned.
+    return p->cplan && p->compactPhase != kCompactIdle ? p->cplan->createdNs : UINT64_MAX;
+}
+
 int32_t partitionCompactStep(Writer* w, Partition* p) {
     Engine* e = w->engine();
     const EngineConfig& cfg = e->config();
-    if (p->quarantined) return 0;
+    if (p->quarantined) {
+        // Requests on a quarantined partition end now (with an error).
+        while (!p->swaps.empty()) {
+            compactDone(p->swaps.front(), FLATSQL_IO_ERR_ACCESS);
+            p->swaps.erase(p->swaps.begin());
+        }
+        return 0;
+    }
     switch (p->compactPhase) {
         case kCompactIdle: {
             // The intent may ride with a merge's; only the SWAP needs no merge in flight.
@@ -1320,7 +1335,9 @@ int32_t partitionCompactStep(Writer* w, Partition* p) {
                 SwapResult* req = p->cplan->req;
                 partitionCompactAbort(w, p);
                 if (req) compactDone(req, res < 0 ? res : kCompactNotOwner);
-                return res < 0 && res != kCompactNotOwner && res != kCompactAborted && res != kCompactNotWorth ? res : 0;
+                // A build that failed leaves the inputs as they were: the
+                // partition carries on (NOSPACE starts the emergency).
+                return res == FLATSQL_IO_ERR_NOSPACE ? res : 0;
             }
             p->compactPhase = kCompactBuilt;
         }

@@ -185,6 +185,7 @@ int32_t partitionReclaimStep(Writer* w, Partition* p) {
     // a statement gets the retryable SNAPSHOT_GONE instead of the writer
     // ever waiting on it.
     const bool valve = p->retired.size() > 2048;
+    const uint64_t pin = partitionCompactPinNs(p);
     const int saved = tHotPathDepth;
     tHotPathDepth = 0;
     uint32_t done = 0;
@@ -199,6 +200,7 @@ int32_t partitionReclaimStep(Writer* w, Partition* p) {
             if (now - r.firstOkNs < grace) break;
         }
         if (r.it.letter == 'm' && p->lastDurableHeadNs <= r.retireNs) break;
+        if (r.retireNs >= pin) break;  // a compaction in flight may read it
         if (jsafe <= r.retireNs) break;
         // The owner's own read handles go first (UNLINK_IF_UNUSED).
         if (r.it.letter == 'm') {

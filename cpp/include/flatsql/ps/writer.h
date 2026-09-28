@@ -111,7 +111,8 @@ struct EngineConfig {
     uint64_t quotaBytes = 0;               // §13: cap on the store's on-disk bytes (0: none)
     double quotaLowWater = 0.85;           // §22.4-3: evict down to this share of the cap
     uint32_t quotaIntervalMs = 100;        // planner cadence
-    uint32_t tombRangeStep = 512;          // rows examined per TOMB_RANGE step (each <= 10 ms, T3 #3)
+    uint32_t tombRangeStep = 512;          // rows examined per TOMB_RANGE step at most
+    uint32_t tombRangeBudgetUs = 4000;     // and CPU time per step (each <= 10 ms, T3 #3)
     uint64_t ballastBytes = 0;             // A13: released on ENOSPC (servers: 256 MiB; 0: none)
     Io* io = nullptr;               // default: the seven imports
     int64_t (*clockMs)(void*) = nullptr;  // injectable wall clock

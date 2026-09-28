@@ -1732,8 +1732,12 @@ void tombRangeStep(Ctx& c) {
         ~StepTime() { e->evictHist().record(monoNs() - t0); }
     } stepTime{c.e, t0};
     uint64_t cur = tr.next;
+    const uint64_t budgetNs = uint64_t(c.e->config().tombRangeBudgetUs) * 1000;
     for (uint32_t examined = 0; cur < tr.end && examined < step; examined++) {
         if (c.sc->nRows + 4 > c.sc->capRows || c.sc->nEntries + 8 > c.sc->capEntries) break;
+        // Bounded in time too: a kill looks up the row's tag instances in
+        // every run, so rows cost more as the partition grows (and under wasm).
+        if (budgetNs && (examined & 7) == 7 && monoNs() - t0 >= budgetNs) break;
         RecRow row;
         const int32_t rc = readRow(c, cur, &row);
         if (rc < 0) {

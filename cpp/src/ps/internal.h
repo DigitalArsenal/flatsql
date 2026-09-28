@@ -272,6 +272,7 @@ enum CompactPhase : uint8_t {
 };
 int32_t partitionCompactStep(Writer* w, Partition* p);         // maintenance
 bool partitionCompactBusy(const Partition* p);
+uint64_t partitionCompactPinNs(const Partition* p);            // reclaim waits for a plan's files
 void partitionCompactIntentDurable(Partition* p);              // publish of the INTENT batch
 void partitionCompactStage(const Partition* p, Counters* ct);  // counters of a consumed SWAP
 const std::vector<RetireItem>* partitionCompactRetiring(const Partition* p);
