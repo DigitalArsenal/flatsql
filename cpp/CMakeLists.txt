@@ -853,6 +853,9 @@ else()
     target_include_directories(flatsql_ps_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
     target_compile_options(flatsql_ps_bench PRIVATE -O2)
 
+    # T3 compaction/quota/split sources register themselves here.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/src/ps/sources-t3.cmake OPTIONAL)
+
     add_executable(flatsql_full_text_search_test tests/full_text_search_test.cpp)
     target_link_libraries(flatsql_full_text_search_test PRIVATE flatsql_lib)
 
