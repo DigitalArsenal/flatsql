@@ -18,6 +18,9 @@
  *     flatsql_io imports — a module keeps the generic hook set, and growing
  *     private imports is a new host capability, which is an owner decision.
  *
+ * flatsql-ps-threads.wasm (the partition store) has its own closed surface:
+ * checkPsThreads below.
+ *
  *   node scripts/check-wasm-imports.mjs [--dir cpp/build-wasm]
  */
 
@@ -47,10 +50,138 @@ const FLATSQL_IO_SEVEN = [
 ];
 
 /**
+ * The partition store artifact (wasm32-wasip1-threads, design §18 T4 #1):
+ * WASI preview1 (this frozen list, every name of which the SDK's browser and
+ * Node pool hosts provide), wasi.thread-spawn, a shared env.memory of at most
+ * 32768 pages, and the seven env.flatsql_io_*. Nothing else.
+ */
+const PS_WASI = [
+  'clock_time_get',
+  'fd_close',
+  'fd_prestat_dir_name',
+  'fd_prestat_get',
+  'fd_seek',
+  'fd_write',
+  'proc_exit',
+  'random_get',
+  'sched_yield',
+];
+const PS_EXPORTS = [
+  '_initialize',
+  'flatsql_ps_alloc',
+  'flatsql_ps_free',
+  'flatsql_ps_init',
+  'flatsql_ps_layout',
+  'flatsql_ps_pump',
+  'flatsql_ps_reader_layout',
+  'flatsql_ps_register_partition',
+  'flatsql_ps_register_type',
+  'flatsql_ps_ring',
+  'flatsql_ps_start',
+  'flatsql_ps_stats',
+  'flatsql_ps_stop',
+  'flatsql_ps_wake',
+  'memory',
+  'wasi_thread_start',
+];
+const PS_MAX_PAGES = 32768;
+
+/** Limits of the imported memory (WebAssembly.Module.imports omits them). */
+function importedMemory(bytes) {
+  let at = 8;
+  const leb = () => {
+    let result = 0;
+    let shift = 0;
+    for (;;) {
+      const b = bytes[at++];
+      result += (b & 0x7f) * 2 ** shift;
+      shift += 7;
+      if (!(b & 0x80)) return result;
+    }
+  };
+  const name = () => {
+    const n = leb();
+    const text = Buffer.from(bytes.subarray(at, at + n)).toString('utf8');
+    at += n;
+    return text;
+  };
+  while (at < bytes.length) {
+    const id = bytes[at++];
+    const size = leb();
+    const end = at + size;
+    if (id === 2) {
+      const count = leb();
+      for (let i = 0; i < count; i++) {
+        const module = name();
+        const field = name();
+        const kind = bytes[at++];
+        if (kind === 0) leb();
+        else if (kind === 1) {
+          at += 1;
+          if (leb() & 1) leb();
+          leb();
+        } else if (kind === 2) {
+          const flags = leb();
+          const initial = leb();
+          const maximum = flags & 1 ? leb() : null;
+          return { module, field, initial, maximum, shared: (flags & 2) !== 0 };
+        } else if (kind === 3) at += 2;
+        else return null;
+      }
+      return null;
+    }
+    at = end;
+  }
+  return null;
+}
+
+function checkPsThreads(path) {
+  const bytes = new Uint8Array(readFileSync(path));
+  const module = new WebAssembly.Module(bytes);
+  const imports = WebAssembly.Module.imports(module);
+  const modules = [...new Set(imports.map((i) => i.module))].sort();
+  if (JSON.stringify(modules) !== JSON.stringify(['env', 'wasi', 'wasi_snapshot_preview1'])) {
+    fail(`import modules must be env, wasi, wasi_snapshot_preview1; got [${modules}]`);
+  } else {
+    pass('import modules: env, wasi, wasi_snapshot_preview1');
+  }
+  const wasi = imports.filter((i) => i.module === 'wasi_snapshot_preview1').map((i) => i.name).sort();
+  if (JSON.stringify(wasi) !== JSON.stringify(PS_WASI)) fail(`WASI import set changed: expected [${PS_WASI}], got [${wasi}]`);
+  else pass(`WASI preview1 surface is exactly [${PS_WASI}]`);
+  const threads = imports.filter((i) => i.module === 'wasi');
+  if (threads.length !== 1 || threads[0].name !== 'thread-spawn' || threads[0].kind !== 'function') {
+    fail(`wasi module must import only thread-spawn; got [${threads.map((i) => i.name)}]`);
+  } else {
+    pass('wasi.thread-spawn');
+  }
+  const env = imports.filter((i) => i.module === 'env');
+  const io = env.filter((i) => i.kind === 'function').map((i) => i.name).sort();
+  if (JSON.stringify(io) !== JSON.stringify(FLATSQL_IO_SEVEN)) fail(`env functions must be the seven flatsql_io_*; got [${io}]`);
+  else pass('env functions are exactly the seven flatsql_io_*');
+  const memories = env.filter((i) => i.kind === 'memory');
+  const mem = importedMemory(bytes);
+  if (memories.length !== 1 || memories[0].name !== 'memory' || env.length !== 8) {
+    fail(`env must import exactly one memory (env.memory) besides the seven functions`);
+  } else if (!mem || !mem.shared || mem.maximum === null || mem.maximum > PS_MAX_PAGES) {
+    fail(`env.memory must be shared with a maximum <= ${PS_MAX_PAGES} pages; got ${JSON.stringify(mem)}`);
+  } else {
+    pass(`env.memory shared, ${mem.initial}..${mem.maximum} pages`);
+  }
+  const emscripten = imports.filter((i) => i.name.startsWith('__syscall_') || i.name.startsWith('_emscripten') ||
+    i.name.startsWith('emscripten_') || i.name === '__pthread_create_js');
+  if (emscripten.length) fail(`emscripten imports present: ${emscripten.map((i) => i.name).join(', ')}`);
+  else pass('0 emscripten imports');
+  const exports = WebAssembly.Module.exports(module).map((e) => e.name).sort();
+  if (JSON.stringify(exports) !== JSON.stringify(PS_EXPORTS)) fail(`exports changed: expected [${PS_EXPORTS}], got [${exports}]`);
+  else pass('exports: the flatsql_ps C ABI, wasi_thread_start, _initialize, memory');
+}
+
+/**
  * `engine` artifacts own durable storage and therefore carry the seven I/O
  * imports. `module` artifacts are SDK plugins and must not.
  */
 const TARGETS = [
+  { file: 'flatsql-ps-threads.wasm', role: 'ps-threads', required: true },
   { file: 'flatsql-wasi-noeh.wasm', role: 'engine', required: true },
   { file: 'flatsql-wasi.wasm', role: 'engine', required: true },
   { file: 'flatsql-sdn-node.wasm', role: 'module', required: false },
@@ -97,6 +228,10 @@ for (const target of TARGETS) {
   }
 
   console.log(`\n${target.file} (${target.role})`);
+  if (target.role === 'ps-threads') {
+    checkPsThreads(path);
+    continue;
+  }
   const imports = importsOf(path);
   const wasi = imports.filter((i) => i.module === 'wasi_snapshot_preview1').map((i) => i.name).sort();
   const io = imports.filter((i) => i.name.startsWith('flatsql_io_')).map((i) => i.name).sort();
