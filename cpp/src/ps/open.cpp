@@ -945,13 +945,11 @@ int32_t Engine::openPartitions(std::string* err) {
             pathPartitionSeg(&ap, cfg_.root.c_str(), p->pid, 'a', p->intentSeg, "fsa");
             FileRef rf, af;
             if (io->open(rp.c_str(), rp.len, kOpenRW, FileClass::Rows, &rf) == 0) {
-                if (io->size(rf) > int64_t(p->intentROff)) io->truncate(rf, p->intentROff);
-                io->sync(rf);
+                if (io->size(rf) > int64_t(p->intentROff) && io->truncate(rf, p->intentROff) >= 0) io->sync(rf);
                 io->close(&rf);
             }
             if (io->open(ap.c_str(), ap.len, kOpenRW, FileClass::Attrs, &af) == 0) {
-                if (io->size(af) > int64_t(p->intentAOff)) io->truncate(af, p->intentAOff);
-                io->sync(af);
+                if (io->size(af) > int64_t(p->intentAOff) && io->truncate(af, p->intentAOff) >= 0) io->sync(af);
                 io->close(&af);
             }
             p->intentGen = 0;

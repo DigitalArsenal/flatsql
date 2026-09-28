@@ -81,6 +81,8 @@ void openCost(uint64_t total, bool realFs) {
     const EngineStats st = s.e->stats();
     report(realFs ? "open_clean_ms_real_fs" : "open_clean_ms_mem", openMs, "ms");
     report(realFs ? "open_clean_read_bytes_real_fs" : "open_clean_read_bytes_mem", double(st.openReadBytes), "bytes");
+    report(realFs ? "open_clean_syncs_real_fs" : "open_clean_syncs_mem", double(st.openSyncs), "syncs");
+    report(realFs ? "open_clean_write_bytes_real_fs" : "open_clean_write_bytes_mem", double(st.openWriteBytes), "bytes");
     CHECK(openMs <= 150.0);
     CHECK(st.openReadBytes <= (1u << 20));
     CHECK_EQ(st.openDataBytes, uint64_t(0));
@@ -92,7 +94,9 @@ void openCost(uint64_t total, bool realFs) {
 
 PS_TEST(open_clean_256_partitions_T1_2) { openCost(uint64_t(argInt("open-records", 200000)), false); }
 PS_SLOW_TEST(open_clean_1M_records_256_partitions_T1_2_full) { openCost(1000000, false); }
-PS_SLOW_TEST(open_clean_1M_records_256_partitions_T1_2_real_fs) { openCost(1000000, true); }
+PS_SLOW_TEST(open_clean_1M_records_256_partitions_T1_2_real_fs) {
+    openCost(uint64_t(argInt("open-real-records", 1000000)), true);
+}
 
 PS_TEST(open_after_drop_unsynced_reads_bounded_meta) {
     Store s(true, 4, true);

@@ -726,6 +726,8 @@ struct EngineStats {
     uint64_t openReadBytes = 0;
     uint64_t openDataBytes = 0;
     uint64_t openMetaBytes = 0;
+    uint64_t openSyncs = 0;             // fsyncs issued by open (files and directories)
+    uint64_t openWriteBytes = 0;
     uint64_t adoptedBatches = 0;
     uint32_t poolSlabsInUse = 0;
     uint32_t poolSlabsPeak = 0;
@@ -808,7 +810,9 @@ public:
     // Internals shared by the implementation files.
     SyncPool& syncPool() { return syncPool_; }
     // Maintenance helper: builds merge outputs off the writer threads.
-    void submitMaintenance(std::function<void(IoCtx*)> job);
+    void submitMaintenance(std::function<void(IoCtx*)> job) { submitMaintenance(false, std::move(job)); }
+    // urgent: ahead of queued partition merges (a type merge gates labeling).
+    void submitMaintenance(bool urgent, std::function<void(IoCtx*)> job);
     IoCtx* helperIo() { return helperIo_.get(); }
     // A8: queues a journal checkpoint; false when no checkpoint thread runs.
     bool submitCheckpoint(std::function<void(IoCtx*)> job);

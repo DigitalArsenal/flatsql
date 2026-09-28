@@ -174,7 +174,9 @@ static void noticeRun(double seconds) {
                 const uint64_t dt = monoNs() - t0;
                 uint64_t m = maxAckNs.load();
                 while (dt > m && !maxAckNs.compare_exchange_weak(m, dt)) {}
-                if (rng() % 4 == 0) sleepNs(rng() % 2000000);
+                // Random load below the owners' labeling throughput: A25 is
+                // about dropped notices never stalling anyone, not saturation.
+                sleepNs(rng() % 2000000);
             }
         });
     }

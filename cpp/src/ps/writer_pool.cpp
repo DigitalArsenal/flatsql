@@ -809,10 +809,11 @@ void Engine::typeAddPartition(TypeOwner* t, Partition* p) {
     t->nParts.store(i + 1, std::memory_order_release);
 }
 
-void Engine::submitMaintenance(std::function<void(IoCtx*)> job) {
+void Engine::submitMaintenance(bool urgent, std::function<void(IoCtx*)> job) {
     {
         std::lock_guard<std::mutex> g(helperMu_);
-        helperJobs_.push_back(std::move(job));
+        if (urgent) helperJobs_.push_front(std::move(job));
+        else helperJobs_.push_back(std::move(job));
     }
     helperCv_.notify_one();
 }
@@ -1107,6 +1108,9 @@ EngineStats Engine::stats() const {
     s.openReadBytes = openIoStats_.totalReadBytes();
     s.openDataBytes = openIoStats_.readBytes(FileClass::Data);
     s.openMetaBytes = openIoStats_.readBytes(FileClass::Meta);
+    s.openSyncs = openIoStats_.totalSyncs();
+    for (size_t k = 0; k < size_t(FileClass::Count); k++)
+        s.openWriteBytes += openIoStats_.writeBytes(FileClass(k));
     s.adoptedBatches = adoptedBatches;
     s.poolSlabsInUse = pool_.inUse();
     s.poolSlabsPeak = pool_.peakInUse();

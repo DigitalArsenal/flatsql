@@ -984,9 +984,10 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
     if (t->mergePhase != 0) return 0;
     uint64_t bytes = 0;
     for (uint32_t i = 0; i < t->nL0; i++) bytes += t->l0[i].batchLen;
-    const bool want = t->nL0 >= kMaxTypeL0Dir - 8 ||
-                      (t->nL0 >= e->config().mergeL0Blocks && bytes >= e->config().mergeMinL0Bytes) ||
-                      bytes >= e->config().mergeL0Bytes;
+    // Type commits are frequent and small (a few labels each): the block
+    // count alone triggers a merge, well before the directory limit makes
+    // labeling wait (typeStage).
+    const bool want = t->nL0 >= e->config().mergeL0Blocks || bytes >= e->config().mergeL0Bytes;
     if (!want) return 0;
     int32_t rc = typeWarm(w, t);
     if (rc < 0) return rc;
@@ -1018,7 +1019,7 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
     t->mergePhase = 2;
     if (e->config().mergeHelpers && !e->config().cooperative) {
         Writer* owner = w;
-        e->submitMaintenance([t, owner](IoCtx* io) {
+        e->submitMaintenance(true, [t, owner](IoCtx* io) {
             const int32_t r = writeTypeMergeOutputs(io, owner->eng_root(), t);
             t->mergeResult.store(r < 0 ? r : 1, std::memory_order_release);
             owner->ring();

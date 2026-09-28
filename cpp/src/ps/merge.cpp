@@ -642,6 +642,10 @@ void partitionMergeAbort(Writer* w, Partition* p) {
     w->io().close(&m.run.file);
     m.run.run.reset();
     if (p->mergePhase >= kMergeIntentDurable) {
+        // The durable head may still name this INTENT: the next checkpoint
+        // head (at the latest the one stop writes) clears it, so open has no
+        // orphan cleanup to do after a clean stop.
+        if (!p->metaSinceCkpt) p->metaSinceCkpt = 1;
         PathBuf xp, mfp;
         pathPartitionRun(&xp, w->eng_root(), p->pid, m.seg, m.gen);
         pathPartitionManifest(&mfp, w->eng_root(), p->pid, m.gen);
