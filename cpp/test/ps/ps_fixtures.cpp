@@ -718,8 +718,13 @@ DirCheck checkPartitionDir(Io* io, FaultFs* fs, const std::string& root, uint32_
         }
     } else {
         std::error_code ec;
-        for (const auto& e : std::filesystem::directory_iterator(dir, ec))
-            if (e.is_regular_file()) present[e.path().string()] = uint64_t(e.file_size());
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            // A file unlinked while the walk runs (reclamation) is not present.
+            std::error_code fe;
+            if (!e.is_regular_file(fe) || fe) continue;
+            const uintmax_t sz = e.file_size(fe);
+            if (!fe) present[e.path().string()] = uint64_t(sz);
+        }
     }
     for (const auto& kv : present) {
         dc.bytes += kv.second;
@@ -825,8 +830,13 @@ DirCheck checkTypeDir(Io* io, FaultFs* fs, const std::string& root, const uint8_
         }
     } else {
         std::error_code ec;
-        for (const auto& e : std::filesystem::directory_iterator(dir, ec))
-            if (e.is_regular_file()) present[e.path().string()] = uint64_t(e.file_size());
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            // A file unlinked while the walk runs (reclamation) is not present.
+            std::error_code fe;
+            if (!e.is_regular_file(fe) || fe) continue;
+            const uintmax_t sz = e.file_size(fe);
+            if (!fe) present[e.path().string()] = uint64_t(sz);
+        }
     }
     for (const auto& kv : present) {
         const std::string base = kv.first.substr(kv.first.rfind('/') + 1);

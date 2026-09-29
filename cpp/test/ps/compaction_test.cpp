@@ -328,6 +328,30 @@ struct LatencySeries {
     }
 };
 
+// Histogram deltas: the p99 of what a LockHist recorded after a snapshot.
+struct LockHistSnap {
+    uint64_t b[48];
+};
+LockHistSnap snapHist(const LockHist& h) {
+    LockHistSnap s;
+    for (int i = 0; i < 48; i++) s.b[i] = h.buckets[i].load();
+    return s;
+}
+double histP99Since(const LockHist& h, const LockHistSnap& s0) {
+    uint64_t d[48], total = 0;
+    for (int i = 0; i < 48; i++) {
+        d[i] = h.buckets[i].load() - s0.b[i];
+        total += d[i];
+    }
+    if (!total) return 0;
+    uint64_t seen = 0;
+    for (int i = 0; i < 48; i++) {
+        seen += d[i];
+        if (double(seen) >= 0.99 * double(total)) return double(uint64_t(1) << (i + 1)) / 1e6;  // bucket upper bound
+    }
+    return 0;
+}
+
 void runHalfDead(int parts, int perPart, uint64_t minPreSwap, uint64_t maxSeconds) {
     CStore cs("halfdead");
     Store& s = cs.s;
@@ -473,8 +497,10 @@ void runHalfDead(int parts, int perPart, uint64_t minPreSwap, uint64_t maxSecond
     sleepNs(uint64_t(windowS * 1e9));
     const double ackBase = ack.p99(), laneBase = lane.p99();
     const double commitBase = double(s.e->commitHist().percentileNs(0.99)) / 1e6;
+    const double maintBase = double(s.e->maintHist().percentileNs(0.99)) / 1e6;
     ack.clear();
     lane.clear();
+    const LockHistSnap commit0 = snapHist(s.e->commitHist()), maint0 = snapHist(s.e->maintHist());
     // Compact every sealed segment of every partition (oldest first).
     const uint64_t c0 = monoNs();
     uint64_t swaps = 0, dropped = 0;
@@ -520,6 +546,7 @@ void runHalfDead(int parts, int perPart, uint64_t minPreSwap, uint64_t maxSecond
     }
     // Latency during compaction: the whole period SWAPs ran in.
     const double ackDuring = ack.p99(), laneDuring = lane.p99();
+    const double commitDuring = histP99Since(s.e->commitHist(), commit0), maintDuring = histP99Since(s.e->maintHist(), maint0);
     const size_t ackSamples = ack.ms.size(), laneSamples = lane.ms.size();
     stop = true;
     producer.join();
@@ -536,6 +563,9 @@ void runHalfDead(int parts, int perPart, uint64_t minPreSwap, uint64_t maxSecond
     report("halfdead_ack_p99_baseline_ms", ackBase, "ms");
     report("halfdead_ack_p99_compacting_ms", ackDuring, "ms");
     report("halfdead_commit_round_p99_ms", commitBase, "ms");
+    report("halfdead_commit_round_p99_compacting_ms", commitDuring, "ms");
+    report("halfdead_maintenance_step_p99_baseline_ms", maintBase, "ms");
+    report("halfdead_maintenance_step_p99_compacting_ms", maintDuring, "ms");
     report("halfdead_lane_p99_baseline_ms", laneBase, "ms");
     report("halfdead_lane_p99_compacting_ms", laneDuring, "ms");
     report("halfdead_statements", double(statements.load()), "statements");

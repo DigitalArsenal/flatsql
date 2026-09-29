@@ -131,6 +131,7 @@ bool StageScratch::init(const EngineConfig& cfg) {
     entries = callocArray<StagedEntry>(capEntries);
     order = callocArray<StagedEntry*>(capEntries);
     order2 = callocArray<StagedEntry*>(capEntries);
+    sortKeys = callocArray<SortKey>(capEntries);
     keys = callocArray<uint8_t>(capKeys);
     plain = callocArray<uint8_t>(capPlain);
     extract = callocArray<uint8_t>(capExtract);
@@ -150,7 +151,7 @@ bool StageScratch::init(const EngineConfig& cfg) {
     trows = callocArray<RecRow>(kTRowCap);
     if (!tcids || !tcidBuckets || !tcopies || !arrivals || !trows) return false;
     for (uint32_t i = 0; i < kCidBuckets; i++) tcidBuckets[i] = -1;
-    if (!rows || !attrs || !entries || !order || !order2 || !keys || !plain || !extract || !section ||
+    if (!rows || !attrs || !entries || !order || !order2 || !sortKeys || !keys || !plain || !extract || !section ||
         !cids || !cidBuckets || !deadKeys || !deadVals || !instPut || !instHash || !instPseq)
         return false;
     for (uint32_t i = 0; i < kCidBuckets; i++) cidBuckets[i] = -1;
@@ -163,6 +164,7 @@ void StageScratch::freeAll() {
     std::free(entries);
     std::free(order);
     std::free(order2);
+    std::free(sortKeys);
     std::free(keys);
     std::free(plain);
     std::free(extract);
@@ -1695,7 +1697,7 @@ static bool finalizeBatch(Ctx& c, Arena* batches) {
         }
     }
     for (uint32_t i = 0; i < sc.nEntries; i++) sc.order[i] = &sc.entries[i];
-    sortStagedBuckets(sc.order, sc.nEntries, sc.order2);
+    sortStagedBuckets(sc.order, sc.nEntries, sc.order2, sc.sortKeys);
     const size_t l0Len = sc.nRows ? l0BlockSize(sc.order, sc.nEntries) : 0;
     const size_t rowsLen = size_t(sc.nRows) * sizeof(RecRow);
     const size_t attrLen = pad8(sc.attrBytes);

@@ -55,6 +55,7 @@ struct StageScratch {
     StagedEntry* entries = nullptr;
     StagedEntry** order = nullptr;
     StagedEntry** order2 = nullptr;   // bucket scratch for the postings sort
+    SortKey* sortKeys = nullptr;      // prefix keys for the postings sort
     uint32_t capEntries = 0;
     uint8_t* keys = nullptr;
     uint32_t capKeys = 0;

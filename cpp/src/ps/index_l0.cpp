@@ -125,7 +125,7 @@ inline bool keyValLess(const StagedEntry* a, const StagedEntry* b) {
 }
 }  // namespace
 
-void sortStagedBuckets(StagedEntry** e, size_t n, StagedEntry** tmp) {
+void sortStagedBuckets(StagedEntry** e, size_t n, StagedEntry** tmp, SortKey* kp) {
     // Counting pass by kind (few distinct kinds per batch), stable scatter,
     // then each kind on its own: most kinds of a record batch arrive already
     // in (key, value) order (tag postings share one key, values are pseqs in
@@ -171,7 +171,32 @@ void sortStagedBuckets(StagedEntry** e, size_t n, StagedEntry** tmp) {
         bool sorted = true;
         for (size_t i = 1; i < m && sorted; i++)
             if (keyValLess(b[i], b[i - 1])) sorted = false;
-        if (!sorted) std::sort(b, b + m, keyValLess);
+        if (sorted) continue;
+        if (!kp || m < 64) {
+            std::sort(b, b + m, keyValLess);
+            continue;
+        }
+        // Random keys (CIDs, epoch+CID): sort by the 8 bytes after the
+        // bucket's common prefix as an integer, the full comparison only
+        // breaks ties. Zero padding keeps short keys in key order.
+        size_t cp = b[0]->klen;
+        for (size_t i = 1; i < m && cp; i++) {
+            const size_t lim = std::min<size_t>(cp, b[i]->klen);
+            size_t q = 0;
+            while (q < lim && b[i]->key[q] == b[0]->key[q]) q++;
+            cp = q;
+        }
+        for (size_t i = 0; i < m; i++) {
+            uint64_t v = 0;
+            const StagedEntry* s = b[i];
+            for (size_t q = 0; q < 8; q++) v = (v << 8) | (cp + q < s->klen ? s->key[cp + q] : 0);
+            kp[i].k = v;
+            kp[i].e = b[i];
+        }
+        std::sort(kp, kp + m, [](const SortKey& x, const SortKey& y) {
+            return x.k != y.k ? x.k < y.k : keyValLess(x.e, y.e);
+        });
+        for (size_t i = 0; i < m; i++) b[i] = kp[i].e;
     }
     std::memcpy(e, tmp, n * sizeof(StagedEntry*));
 }

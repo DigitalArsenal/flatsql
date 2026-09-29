@@ -58,7 +58,12 @@ struct StagedEntry {
 void sortStaged(StagedEntry** e, size_t n);
 // The same order, by kind buckets (tmp: n pointers of scratch): kinds whose
 // entries already arrive in (key, value) order cost one linear check.
-void sortStagedBuckets(StagedEntry** e, size_t n, StagedEntry** tmp);
+struct SortKey {
+    uint64_t k;
+    StagedEntry* e;
+};
+// kp (n entries of scratch, optional) speeds up buckets with random keys.
+void sortStagedBuckets(StagedEntry** e, size_t n, StagedEntry** tmp, SortKey* kp = nullptr);
 
 #pragma pack(push, 1)
 struct L0Header {

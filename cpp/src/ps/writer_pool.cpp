@@ -1407,7 +1407,7 @@ EngineStats Engine::stats() const {
         scratch += w->arena_.capacity() + w->framesArena_.capacity();
         const StageScratch* sc = w->sc_;
         scratch += uint64_t(sc->capRows) * sizeof(RecRow) + sc->capAttrs +
-                   uint64_t(sc->capEntries) * (sizeof(StagedEntry) + 2 * sizeof(void*)) + sc->capKeys +
+                   uint64_t(sc->capEntries) * (sizeof(StagedEntry) + 2 * sizeof(void*) + sizeof(SortKey)) + sc->capKeys +
                    sc->capPlain + sc->capExtract + sc->capSection;
     }
     s.committedBytes = s.poolCommittedBytes + scratch + s.descriptorBytes + s.acceleratorBytes +
