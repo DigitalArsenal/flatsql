@@ -8,7 +8,7 @@ fan-out merge, admission and results. Part III (§23–§30) is T3: compaction,
 reclamation, meta-segment retirement, disk accounting and quota. Part IV
 (§31–§35) is T3b: store-migrate gseqs, the entry-size setting, hot-partition
 splitting and arrivals compaction; §36 records the quota eviction race T3 #3
-met on Linux. The design is
+met on Linux. Part V (§37) bounds a reader instance's memory. The design is
 the stack's `docs/architecture/flatsql-partition-store.md` (§22 overrides
 §0–§21; §22.4 holds the owner rulings). This file records what was built, how
 to run it, the measured acceptance, and every place the build departs from the
@@ -457,7 +457,8 @@ vector for T6's Go decoder.
   and binary-searched. A statement resolves each snapshot's sections once per
   kind.
 - **L1 runs** open lazily: footer and TOC, the metadata CRC checked once per
-  lane, then a kind's fences on first use and its bloom while it fits.
+  lane, then a kind's fences a page (128 fences, 5 KiB) at a time and its
+  bloom while it fits (§37).
 - **Ascending scans prime runs lazily.** A run joins a posting merge with a
   lower bound of its first entry (the scan's `lo`, or its first block's fence
   prefix) and reads its first 4 KiB block only when it reaches the top of the
@@ -466,13 +467,14 @@ vector for T6's Go decoder.
   from, not one block from every run of every partition. Descending scans
   prime eagerly (a fence gives no upper bound).
 - **The instance's shared cache** holds these immutable pieces (L0
-  directories and sections, fences, blooms) for every lane: 64 shards, each
-  only ever try-locked, so a busy shard is a miss and a lane never waits on
-  another lane (writers never touch it). A lane-private front map serves
-  repeated hits without any lock.
-- Default budgets: 16 MiB shared per instance, 4 MiB private per lane,
-  4,096 host handles per lane (the host's handles are virtual; T5 bounds real
-  fds with its LRU).
+  directories and sections, fence pages, blooms) for every lane: one shard
+  per MiB of budget (1 to 64), each only ever try-locked, so a busy shard is
+  a miss and a lane never waits on another lane (writers never touch it). A
+  lane-private front, an LRU by bytes, serves repeated hits without any lock.
+- Default budgets: 16 MiB shared per instance, 4 MiB per lane for each of
+  its private cache, its resident runs and its front, 4,096 host handles per
+  lane (the host's handles are virtual; T5 bounds real fds with its LRU).
+  Every cache is bounded by bytes (§37).
 
 ## 18. Arrivals, offset paging, dead history (A14, A15)
 
@@ -1462,3 +1464,113 @@ emergency past the test's minute on a loaded box (one episode, three
 segments evicted, the ballast never back). It predates this change: on
 linux/amd64 Debug at a host load near 40, 4 of 100 runs on 2f6d86e and 1 of
 100 here; under ThreadSanitizer, 3 of 6 and 1 of 10.
+
+# Part V: reader memory
+
+## 37. Reader memory is bounded by bytes, not by the store
+
+A point reader instance grew while a writer committed: about 5 MB per 20,000
+statements in SDN's probe, a guest `bad_alloc` at 28 minutes in T6's daemon
+soak, and flat once ingest stopped. Nothing leaked per statement (SQLite
+allocates from the lane's fixed arena, every statement is finalized). A cache
+had no byte bound:
+
+- **The lane-private front** of the shared cache (`LaneStore::front_`) was
+  bounded by 65,536 entries only. Every shared-cache hit and put entered it,
+  so it kept every L0 directory and section, fence vector and bloom the lane
+  had used after the 16 MiB shared cache evicted them. Every commit and merge
+  adds keys (type L0 sections are keyed by block offset), so under ingest it
+  only grew; the entry cap lay gigabytes away.
+- A resident run pinned its fences and blooms without charging them to the
+  lane's run budget.
+- The shared cache inserted an object larger than its shard's share of the
+  budget after emptying the shard (up to 64 x the largest object over
+  budget); the private cache did the same with an object over its budget.
+- The set of runs a lane had verified grew by one entry per run ever opened.
+- A run's fences were read whole per kind: 40 bytes per 4 KiB block, about
+  1% of the run, so a lookup in a large type run held its fences whole.
+
+Built:
+
+- The front is an LRU by bytes (`LaneStoreConfig::frontBytes`, set to
+  `ReaderConfig::laneCacheBytes`) and by entries.
+- `ReaderCache` never caches an object larger than a shard's share, and has
+  one shard per MiB of budget (1 to 64: 16 at the default 16 MiB, so a shard
+  holds the largest L0 sections). The private cache never caches an object
+  larger than its budget. Such an object is read again by the next statement
+  that needs it. A manifest is charged its memory (about 200 bytes per
+  segment), not its file size.
+- A resident run is charged its blooms.
+- The verified runs are a 1,024-entry LRU of runs evicted from the lane's
+  run cache (a resident run needs no entry).
+- **Fence pages.** `FenceView` reads a kind's fences a page at a time
+  (`ReaderConfig::fencePageEntries`, 128 fences, 5 KiB) through the shared
+  cache: lookups binary-search across pages, scans walk them, GONE counts sum
+  them. A lookup holds one page whatever the run's size.
+
+**The bound.** Per reader instance, index state is at most
+
+    cacheBytes + lanes x (3 x laneCacheBytes + maxHandlesPerLane x 256 B + 1,024 x 128 B)
+
+(the instance cache; per lane its private cache, resident runs and front,
+its handle table and verified runs): 42.25 MiB with the defaults (16 MiB,
+4 MiB, 2 lanes, 4,096 handles), on top of the fixed arenas and slots. It does
+not depend on the store's size, the statement count or the commit rate.
+
+**Tests.** `ps_test_main.cpp` gives every test allocation a 16-byte header
+and counts the live bytes allocated on reader lane threads, the reader's
+state beyond its fixed arenas, wherever they are freed.
+
+- `reader_point_memory_plateaus_under_commits`: a 2-lane point instance with
+  a 1 MiB instance cache and 256 KiB lane caches runs 164,000 statements
+  (GetRecord by CID and a CID IN at type level, a partition point read) from
+  two clients while producers commit and merges run, then idle rounds. It
+  checks the bound, the lanes' budgets after every round, a flat second half
+  and flat idle rounds. Mac, native: 2.7-3.2 MiB against the 3.9 MiB bound;
+  the engine before this change reaches 7.9 MiB in the same run (linear, 1.1
+  MiB per 20,000 statements) and fails. Under the Node wasm host: 2.72-2.76
+  MiB.
+- `reader_lookups_and_scans_across_fence_pages`: two fences per page against
+  the default and the records written: type and partition point lookups,
+  index range scans both ways, offset paging after deaths (17,986 fence pages
+  past the first read in one run). `fanout_randomized_vs_bruteforce_small_fence_pages`
+  and `offset_paging_matches_reference_small_fence_pages` rerun those
+  suites with two per page; `--fence-page=N` sets it for every reader the
+  fixtures build (the default suite passes with 2).
+- `reader_memory_soak_writer` and `reader_memory_soak_reader` (slow, named):
+  two processes on one directory. The writer grows the store past
+  `--store-mib` (16 partitions, 1.8 KB records, 12 MiB/s) and appends acked
+  CIDs to a file; the reader (native, or the wasm command under the Node host)
+  looks them up in rounds of 20,000 and reports its lane live bytes and its
+  process memory.
+
+Soak, store 65 MiB to 1,200 MiB, Mac Studio (Node 25 for wasm, heap
+pre-grown to `PS_WASM_HEAP_MB`):
+
+| Reader | Caches | Statements | Lane live bytes | Process |
+|---|---|---|---|---|
+| native, before | 2 MiB / 512 KiB | 860,000 | 3.1 -> 57.2 MiB, linear | RSS 21.0 -> 90.2 MiB |
+| native, after | 2 MiB / 512 KiB | 820,000 | 2.4 -> 3.4 MiB (bound 9.25) | RSS 19.6 -> 28.3 MiB |
+| native, after | defaults | 840,000 | 2.7 -> 15.1 MiB (bound 44.25), filling its caches | RSS 20.8 -> 42.9 MiB |
+| wasm, before | 2 MiB / 512 KiB | 800,000 | 2.7 -> 61.4 MiB, linear | linear memory 68.2 -> 103.5 MiB |
+| wasm, after | 2 MiB / 512 KiB | 1,040,000 | 2.1 -> 3.3 MiB | linear memory 68.2 MiB throughout |
+| wasm, after | defaults | 800,000 | 2.3 -> 15.7 MiB (bound 44.25) | linear memory 132.2 MiB throughout |
+
+Native RSS beyond the live bytes is the allocator's high water and the
+harness's CID list (2.7 MiB). The soak reader's frames are never rebuilt:
+`ommRecord` computes `0.0001 + meanMotion * 1e-6`, which one target contracts
+to a fused multiply-add and another does not, so about 11% of a native
+writer's records have other CIDs when a wasm reader rebuilds them.
+
+**What else grows with the store** (bytes per record or segment; none is
+held across statements by the reader beyond the budgets above):
+
+| Where | What | Size | Status |
+|---|---|---|---|
+| reader: `snapshot.cpp` `loadManifest` | a partition's manifest, per statement | about 200 B per segment (3 KiB per GiB at 64 MiB segments) | cached within the lane budget; one larger than it (past about 1.3 TB in one partition) is read per statement: needs a paged manifest |
+| reader: `LazyRun::open` | the run's metadata CRC, once per lane | reads 1% (fences) plus the blooms (1.25 B per entry) of every run it opens | memory bounded (1 MiB buffer); the reads grow with the run: needs per-page CRCs |
+| reader: `loadType` | arrivals fence and segment starts, per statement | 48 B per 64 MiB arrivals segment (2.8M records) | small |
+| reader: labels past 128 partitions, registry, vtab schema | per partition | not per record | small |
+| writer: `L1Run::load` (`index_l1.cpp:168`) | every run's fences and all its blooms, held by `SegRun::run` for each warm partition's segments and each type's catalog runs | 1% of each run plus 1.25 B per entry | grows with the store: a terabyte store holds gigabytes in the writer instance; needs the reader's paging |
+| writer: `SegmentInfo::cdir` (`compaction.cpp:382`) | a compacted segment's presence directory, kept once loaded | 0.13 B per record | grows with the store |
+| writer: `Partition::segs`, `summary`, the file ledger | per segment | a few hundred bytes per segment | grows with segments |
