@@ -773,7 +773,7 @@ appended.
   first posting (FIRST or REPEAT) is also among them: a copy never leaves
   DEAD, and no older run holds any of its postings. A full fold drops every
   dead copy. GONE and REHOME entries stay: they are keyed by gseq for
-  arrivals order, and arrivals are not compacted yet (§30).
+  arrivals order, and leave with their arrival entries (T3b, §33).
 - **Reader gate in production.** The writer is its own wasm instance: the host
   reads every reader instance's lane announcements
   (`FlatsqlPsReaderLayout.laneAnnounce`) and passes the minimum through
@@ -831,11 +831,11 @@ lines of `flatsql_ps_test` (RelWithDebInfo) on the task-branch build landed on
 
 | # | Acceptance | Result | Where |
 |---|---|---|---|
-| 1 | A partition with 50% dead bytes compacts to ≤ 55% of its prior disk bytes; owner commit p99 and interactive lane p99 ≤ 1.5× baseline during compaction; 1,000 pre-SWAP statements complete correctly | **Size and statements pass; the latency ratio is not met on the Mac (needs a quiet Linux-8 box).** Mac mem, load 31–35: 4 partitions × 20,000 OMM records, half killed: 106.4 MB → 51.9 MB (0.488×); 1,003 bulk statements that started before a SWAP returned exactly the live rows with their bytes, 0 errors (2,177 SWAPs). Latency over the whole SWAP period (the compaction plus the re-compactions that produced those statements; 16,093 samples): ack p99 0.133 → 18.5 ms, interactive lane p99 0.339 → 3.75 ms, commit round p99 1.05 ms. | `compaction_half_dead_T3_1_full` |
+| 1 | A partition with 50% dead bytes compacts to ≤ 55% of its prior disk bytes; owner commit p99 and interactive lane p99 ≤ 1.5× baseline during compaction; 1,000 pre-SWAP statements complete correctly | **Size and statements pass; the latency ratio is not met on the Mac (needs a quiet Linux-8 box; T3b's Linux runs: §34).** Mac mem, load 31–35: 4 partitions × 20,000 OMM records, half killed: 106.4 MB → 51.9 MB (0.488×); 1,003 bulk statements that started before a SWAP returned exactly the live rows with their bytes, 0 errors (2,177 SWAPs). Latency over the whole SWAP period (the compaction plus the re-compactions that produced those statements; 16,093 samples): ack p99 0.133 → 18.5 ms, interactive lane p99 0.339 → 3.75 ms, commit round p99 1.05 ms. | `compaction_half_dead_T3_1_full` |
 | 2 | CAT supersede, 20% changed per cycle, 100 cycles: disk plateaus ≤ 1.3× live bytes; A9: `m` bytes ≤ one active plus one sealed segment | **Pass with the 15% trigger (deviation 24), "live bytes" read as the live set's compacted footprint.** Mac mem, load 31–33: 20,000 CAT objects, 100 cycles (each updates a random 20%), the store measured at rest after each cycle: disk peaked at 1.120× the footprint of the same live set fully compacted (19.5 MB); 346 compactions, 520 meta segments retired, 5,291 files unlinked; at most 1 meta segment on disk (A9). With §11's 25% trigger it peaks at 1.31–1.38× (six runs). Against the records' own bytes (Σ len − 4 of live PUTs, 4.9 MB) the disk is 4.5×: a fully compacted CAT record costs about 4× its frame in rows, attributes and postings, which no compaction removes | `compaction_cat_supersede_plateau_T3_2_full` |
 | 3 | Quota at 80% of current bytes: oldest records evicted first; no supersede-lane head evicted; disk ≤ cap within 3 passes; each eviction step ≤ 10 ms | **Pass (arrival order, §22.4-3).** Mac mem, load 33–35: the store with its type logs 14.1 MB, cap 11.3 MB: under the cap after 1 pass (14 segments), 0 of 256 CAT heads evicted, in each partition the evicted records are exactly its oldest (0 holes); step max 3.4 ms over 15 steps. Across partitions eviction is by whole segment, so a survivor can be older than an evicted record of another partition (288 of 6,367 records here). The 10 ms bound is enforced on a quiet box (the wasm suite at load 41 measured past it). | `quota_arrival_order_heads_spared_T3_3` |
 | 4 | 1,000 crash points during compaction: exactly one of the old or new set is live, 0 orphans, 0 acked records lost; A12: crash points inside the grace window, Σ on-disk sizes = Σ `disk_bytes` after each reopen | **Pass.** Mac mem, load 28–38: 3,224 trials, 1,000 with a compaction planned but not applied at the crash, 1,744 with retired files waiting; all five crash modes (664 drop-all, 637 drop-subset, 658 torn, 623 reordered, 642 kill -9); 41,825 compactions, 291,864 files unlinked, 24,719 meta segments retired (partitions and the type's), 723,969 dead catalog entries folded out; after every reopen each partition directory and the type directory held exactly the named files with sizes equal to the engine's disk bytes, every acked live record live with its bytes, every acked kill dead, counters equal to a recount; once labels caught up, `first_live_count` equal to the live records and 16 catalog lookups right. 507 s. The T1 crash harness (merges, A9, reclamation; compaction off: its oracle keeps dead bytes) checks the partition directories after every reopen too; the wasm build runs it ×1000. | `orphan_crash_points_during_compaction_T3_4_full`, `crash_faults_T1_1` |
-| 5 | Hot split at 4× single-writer capacity with 4 helpers | **Not built** (§30). | – |
+| 5 | Hot split at 4× single-writer capacity with 4 helpers | **Built in T3b** (§32); ratio and correctness in §34–§35. | `hot_split_*`, `flatsql_ps_bench --mode=hotsplit` |
 | 6 | Fill the disk to ENOSPC under ingest: ingest resumes with 0 acked losses and no operator action | **Pass.** Mac mem, load 34–35, a 16 MiB device, 1 MiB ballast, two OMM producers for 4 s: 17 episodes, the ballast released 17 times and restored 16, 41,112 records acked after a recovery, 6,318 alive at the end; in each partition the surviving acked records are exactly its newest (0 holes); after a reopen (before the engine starts) the partition and type directories hold exactly the named files at the engine's disk bytes. Before type-log reclamation the type logs filled 16 of the device's 17 MB and the run ended in the emergency with no survivor. | `quota_disk_full_resumes_without_operator_T3_6` |
 
 §22 amendments naming T3:
@@ -846,8 +846,8 @@ lines of `flatsql_ps_test` (RelWithDebInfo) on the task-branch build landed on
 | A11 intents | INTENT_COMPACT built; merge and compaction intents coexist in one batch. |
 | A12 reclamation lifecycle | Built (§25): RETIRE/UNLINKED, reader gate twice a grace apart, open replays the set. |
 | A13 ENOSPC, ballast, arrival order | Built with deviations 12–13. |
-| A15 arrivals compaction | **Half built**: dead catalog copies are folded out of the type's runs and the type logs are reclaimed and counted (§25–§27); arrivals entries and GONE postings of dead gseqs stay (§30). |
-| A26 stage-1 prep states | Not built (with #5). |
+| A15 arrivals compaction | Type-log half built here (§25–§27); the arrivals half in T3b (§33). |
+| A26 stage-1 prep states | Built in T3b (§32, deviations 27–28, 31). |
 
 ## 29. Design deviations (T3)
 
@@ -944,26 +944,8 @@ lines of `flatsql_ps_test` (RelWithDebInfo) on the task-branch build landed on
 
 ## 30. Not built yet; running the T3 tests
 
-Remaining T3 scope:
-
-- **#5 hot split** with stage-1 helpers and sealed-segment re-homing (§12), and
-  A26's ring prep states (FREE → CLAIMED(epoch) → PREPARED). Sealed segments'
-  merges and compactions already build off the owner (deviation 1 here, T1
-  deviation 1); what is missing is stage-1 (verify, sha256, key extraction
-  claimed in ranges by idle writers) and its trigger. Its acceptance (≥ 2.5×
-  the unsplit rate with 4 helpers) is a throughput ratio that needs a quiet
-  many-core box to mean anything.
-- **A15 arrivals compaction**: arrivals entries (24 B) and the GONE posting
-  of every dead gseq stay, about 40 B per record ever ingested; the quota
-  counts them but nothing shrinks them (the type-log test: 2.4 MB of catalog
-  runs, mostly GONE, and 2.5 MB of arrivals after 104,100 records with 835
-  alive). The type-log half (catalog runs, manifests, meta segments, dead
-  catalog copies) is built (§25). The arrivals half must drop an entry and its
-  GONE posting in one commit, or offset paging (live = entries − GONE, T2)
-  miscounts: the plan is to rewrite sealed arrivals segments inside the type
-  merge that drops their GONE postings, named by the merge's generation in
-  its manifest.
-- **#1 latency ratio** on a quiet Linux-8 box.
+The T3 scope left open at 697a177 (#5 hot split, A15's arrivals half, A26,
+and the #1 latency ratio on a quiet Linux-8 box) went to T3b: §32–§35.
 
 ```
 cpp/build/flatsql_ps_test --test=compaction_          # basic, T3 #1 and #2 (short forms)
@@ -975,7 +957,8 @@ cpp/build/flatsql_ps_test --test=type_logs_reclaimed_under_readers
 ```
 
 **T3 #1 on a quiet Linux-8 box** (8 cores, ext4, nothing else running), from a
-checkout at the landed commit; the test enforces the 1.5× bounds on such a box:
+checkout at the landed commit; the test enforces the 1.5× bounds on such a box
+(what it enforces since T3b: §34):
 
 ```
 cpp/build/flatsql_ps_test --test=compaction_half_dead_T3_1_full --dir=<ext4 dir>
@@ -1078,3 +1061,330 @@ RETAGs and REPEAT copies; eleven condition sets at type and partition level
 against an ANY-instance oracle, the full `_source` form, the alias, an
 epoch-ordered window, column and CID plans). With `omit = 0` restored it
 fails 18 checks.
+
+## 32. Hot-partition split: stage-1 helpers and prep states (§12, A26)
+
+A partition keeps one appender, its owner, split or not. Splitting is a
+runtime state of the owner: nothing on disk changes, so open, readers and the
+crash rules are those of an unsplit partition.
+
+**Code.** `ps/stage1.h` (slot protocol), `src/ps/stage1.cpp` (publish, take,
+stage-1 computation, helpers), `src/ps/hot_split.cpp` (trigger, split, merge
+back). `partition_log.cpp` stages from a prepared result when there is one.
+
+**Trigger (§12).** A partition is split when its backlog stays above
+`hotSplitBacklogPct` (50) of its ring cap for `hotSplitAfterMs` (30 s) while no
+other partition of its owner has a backlog, on an engine with 2 writers or
+more. It merges back when the backlog stays under `hotUnsplitPct` (10) for
+`hotUnsplitAfterMs` (30 s). `Engine::setHotSplit(pid, on)` forces either
+(tests, hosts); a forced split stays until it is forced off. A quarantined
+partition merges back. Up to 16 split partitions are offered to helpers; a
+17th is split but its owner prepares everything itself.
+
+**Window.** The first split allocates the partition's prep window (2,048
+slots, 1.7 MB, heap, never freed while the engine runs). The owner publishes
+the upcoming ring entries (position, length, kind) in ordinal order, up to
+2,048 ahead of the entry it will stage next, and tops the window up when fewer
+than half are ahead. A split partition's ring pages are mapped for the whole
+ring (the producer runs a full ring ahead of the owner, so helpers always have
+entries), and it commits up to `hotCommitFrames` (4,096) frames per round
+instead of `commitFrames` (1,024).
+
+**Slot states (A26).** Each slot's state word is `{ordinal << 3 | state}` and
+moves by CAS:
+
+| From | To | By |
+|---|---|---|
+| (taken) | FREE(k) | the owner publishes ordinal k |
+| FREE(k) | CLAIMED(k) | a helper, after taking k from the claim counter |
+| CLAIMED(k) | WRITING(k) | the helper, its result computed |
+| WRITING(k) | READY(k) | the helper, its result copied into the slot |
+| FREE(k) or CLAIMED(k) | OWNER(k) | the owner, staging k itself |
+
+The owner takes ordinals in ring order. READY: it stages from the result.
+FREE: it takes the entry. CLAIMED: it waits up to `prepClaimWaitUs` (20 µs)
+for the helper, then takes the entry (counted as stolen). WRITING: it waits
+for one result copy. Ordinals never repeat, so a helper whose entry was taken
+fails its CLAIMED → WRITING CAS and discards what it computed (counted as
+wasted), even if the ring pages it read were recycled meanwhile.
+
+**Helpers.** An idle writer (no work of its own) prepares up to
+`prepHelpBudget` (256) entries per iteration; a publish wakes up to
+`hotHelpers` (4) writers. A helper writes nothing but its claimed slot: no
+file, no ring slab, no partition state. Per record entry it runs what
+`stageRecord` does before it touches partition state: the frame check, the CID
+check or computation (sha256), the attribute check, the tag and lane hashes,
+the CRC32C of the stored bytes, and the key extraction (kept when its strings
+fit in 480 bytes). It also looks the CID up among the owner's committed
+postings (the dedupe hint): the owner publishes its L1 run set (by version)
+and the CID entries and blooms of its unmerged L0 blocks (immutable copies),
+and a helper searches those with its own file handles. The owner then
+searches only the L0 blocks committed after the hint and the entries it has
+staged. Dedupe, supersede, pseq assignment, rows, postings and the commit stay
+with the owner.
+
+**Rebalance and stop.** A HANDOFF of a split partition moves it split: the
+window's positions belong to the partition, and the new owner continues from
+them. A helper counts
+itself into the window before it reads the split flag; the owner leaves the
+window only when it is unsplit and no helper is inside. `Engine::stop` drops
+the helpers' views before it closes files.
+
+**Counters.** `EngineStats` splits, unsplits, prepPrepared, prepUsed,
+prepStolen, prepWasted, prepHinted, l0FullStalls; `flatsql_ps_stats` entries
+26–33.
+
+**A fix to T1's L0 accelerator** found by the crash harness with splits: when
+the partition's accelerator memory could not hold a block's bloom, the loader
+stopped at that kind and the kinds after it (TAG_OF among them) read as having
+no postings in the block, so a kill missed the record's tag instances and its
+lane counters went wrong. The loader now lists every kind and leaves out only
+the blooms it cannot hold. Split partitions map their whole ring and made the
+memory run out in the harness; any partition could.
+
+Deviations from §12 and A26:
+
+26. **No SPLIT frame and no time boundary.** Sealed segments' merges and
+    compactions already build off the owner (T1 deviation 1, T3 deviation 1),
+    so §12's re-homing needs nothing new; what a split adds is stage 1. A
+    split therefore writes nothing and survives nothing: after a restart the
+    trigger decides again.
+27. **Entries are claimed one at a time from a published window**, not in
+    ranges: a helper that stalls holds one entry, which the owner takes after
+    20 µs.
+28. **Prep states carry an ordinal, not an epoch** (A26: FREE →
+    CLAIMED(epoch) → PREPARED): helpers write no file and no slab, so the
+    owner's epoch guards nothing they do; the ordinal is what makes a stale
+    claim fail. WRITING and OWNER are added so the owner can take an entry
+    without waiting on a stalled helper.
+29. **Merge back** (not in §12) at under 10% for 30 s, and a forced split
+    (`setHotSplit`).
+30. **Dedupe hints** (not in §12): after stage 1 the owner's largest per-entry
+    cost was the CID lookup in its runs.
+31. **A26's "helpers SIGSTOPped for 100 ms"** is a 100 ms sleep inside every
+    Nth claim (`testPrepStallNs`, `testPrepStallEvery`): a single thread
+    cannot be SIGSTOPped.
+
+Tests:
+
+- `hot_split_equals_unsplit_reference_T3_5`: the same CAT workload (puts,
+  supersedes, re-tags, duplicates, kills) through a split and an unsplit
+  engine with an injected clock: rows, frames, attributes and SQL results
+  equal; one appending thread per ownership interval; pseqs gap-free.
+- `hot_split_rebalance_stalled_helpers_A26` (6 s; `_full` 600 s): a split
+  partition flooded while 5 others trickle in a 48 MiB slab pool (slabs
+  recycle across partitions), rebalances every 50 ms, a 100 ms helper stall
+  every 97 claims: 0 non-owner writes, one (writer, thread) per
+  ownership epoch, contiguous pseqs, and after a reopen every stored frame
+  hashes to its row's CID and CRC with every sent CID present.
+- `hot_split_trigger_splits_and_merges_back`: the §12 trigger and the merge
+  back with an injected clock.
+- `hot_split_throughput_T3_5` (`_full`): the §18 ratio, enforced on a quiet
+  box only.
+- The T1 crash harness splits up to 16 partitions in half its stores, at
+  setup and after every reopen.
+
+## 33. Arrivals compaction (A15, arrivals half)
+
+T3 built the type-log half of A15 (§25). The arrivals half removes the
+arrival entries of dead gseqs, with their GONE postings.
+
+**Rule.** A type merge that folds GONE postings looks at every sealed arrivals
+segment (its fence entry, fixed when the merge is planned). A segment whose
+entries those GONE postings cover by at least `arrivalsCompactRatio` (0.25) is
+rewritten without them into `ga-<gen>.fsg`, `<gen>` being the merge's output
+generation, and the merge's run leaves out those GONE postings and the REHOME
+postings of the same gseqs. Entries and their GONE postings leave in the same
+MERGE_DONE, so live = entries − GONE holds in every snapshot and offset paging
+(T2) is unchanged. GONE postings of other runs, and of the active segment,
+stay with their entries. `arrivalsCompactRatio = 0` turns the rewrite off.
+
+**Manifest.** The type manifest carries an arrivals table (magic FSAC) after
+its retire set (T3 deviation 18): per rewritten segment {seg, gen, offset,
+count, first gseq, last gseq}, 40 bytes. Readers and open take a segment's
+entries from its `ga` file at that offset and its count from the table; the
+fence file is unchanged. Manifests without the table read as before.
+
+**Files.** A rewritten segment's `g-<seg>` and a superseded `ga` file are
+retired through the type's retire set (A12, letters `g` and `G`). When a
+merge rewrites segments, a `ga` file that holds entries for less than half of
+its bytes is written again, so old `ga` files do not pin bytes. Open sweeps
+`ga` files that no manifest names, and counts in the disk bytes the `ga`
+files the manifest names instead of the originals they replace; a merge in
+flight counts its outputs.
+
+**Quota.** The quota planner triggers the rewrite through its evictions: an
+evicted record's GONE posting reaches the next type merge. The planner does
+not request type merges itself (deviation 32).
+
+**Counters.** `EngineStats` arrivalSegsCompacted and arrivalEntriesDropped;
+`flatsql_ps_stats` entries 34–35.
+
+Deviation:
+
+32. **The quota planner does not start type merges** (A15: "can be triggered
+    by the quota planner"). Its evictions produce the GONE postings, and the
+    type owner merges on its own cadence (L0 fill); an eviction wave that
+    frees little arrivals space frees it at the next merge.
+
+Tests:
+
+- `type_arrivals_compaction_A15`: 3 partitions, 150 records each per round,
+  70% of the live records killed per round, 3 s, with offset paging over
+  arrivals (`ORDER BY _gseq LIMIT 40 OFFSET n`) and `count(*)` checked against
+  the live records' gseqs every 10 rounds, then a reopen; the same run with
+  the rewrite off for comparison. Mac mem, load 10: off, 191,228 entries
+  appended and 191,228 kept, 4,589,472 bytes of arrivals (24 per appended
+  entry); on, 151,188 appended and 425 kept (211 records live), 10,200 bytes
+  (0.067 per appended entry), 7,838 segments rewritten, 150,763 entries
+  dropped, 204 paging checks, 0 wrong; the type directory holds exactly the
+  named files at the engine's type disk bytes, before and after the reopen.
+- `orphan_crash_points_during_compaction_T3_4` (`_full`): half the stores
+  seal arrivals segments every 48 entries; after each reopen, arrivals strictly
+  increasing, no dead gseq's entry visible past its segment's fence, offset
+  pages equal to the live gseqs. Mac mem, load 7–12, `_full`: 2,787 trials,
+  1,000 crash points during compaction, 1,649 in the grace window, 7,592
+  arrivals segments rewritten, 76,499 entries dropped, all five crash modes
+  (567 drop-all, 583 drop-subset, 538 torn, 545 reordered, 554 kill -9),
+  394 s.
+- The T1 crash harness keeps every published gseq's entry (its oracle), so it
+  runs with the rewrite off.
+
+## 34. T3 #1 and #5 on Linux-8 (T3b item 3)
+
+**Machine.** The Linux-8 of T2: Docker Engine 29.2.0 (Docker Desktop's
+linux/arm64 VM, kernel 6.12.67-linuxkit, 16 vCPUs) on the owner's Mac Studio
+(Apple M3 Ultra, 28 cores, 256 GB), an `ubuntu:22.04` container limited to 8
+CPUs with `--cpus 8` (CFS quota 800000/100000) or pinned with
+`--cpuset-cpus 0-7`, `--memory 24g`, g++ 11.4 RelWithDebInfo, ext4 on the VM's
+virtual disk (a file on the Mac's APFS). It is not quiet: the Mac ran other
+lanes throughout (1-minute load 6–16 on 28 cores), and the VM's load average,
+recorded before each run, includes the benchmarks' own threads. Source: a `git
+archive` of the landed tree's `cpp/`.
+
+```
+docker run --rm --platform linux/arm64 --cpus 8 --memory 24g \
+  -v <checkout>:/src:ro -v <flatbuffers c72a8bed>:/fb:ro ubuntu:22.04 bash -c '
+  apt-get update && apt-get install -y cmake g++ make
+  cmake -S /src/cpp -B /tmp/b -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFLATBUFFERS_DIR=/fb
+  cmake --build /tmp/b -j 8 --target flatsql_ps_test flatsql_ps_bench
+  /tmp/b/flatsql_ps_bench --mode=hotsplit --records=2000000                        # x3
+  /tmp/b/flatsql_ps_bench --mode=hotsplit --io=fs --dir=/tmp/hs --records=1000000  # x2
+  /tmp/b/flatsql_ps_test --test=compaction_half_dead_T3_1_full --dir=/tmp/c1       # ext4
+  /tmp/b/flatsql_ps_test --test=compaction_half_dead_T3_1_full'                    # in memory
+```
+
+### T3 #5: hot split throughput
+
+One partition, one closed-loop producer (the ring stays full: the offered load
+is whatever the partition takes), 5 writers, the same engine unsplit and then
+split with 4 helpers. `mem` is the in-memory host; `ext4` commits with
+fdatasync.
+
+| Run | Unsplit rec/s | Split rec/s | Ratio |
+|---|---|---|---|
+| mem, `--cpus 8`, VM load 2.0 | 185,205 | 450,587 | 2.43 |
+| mem, `--cpus 8`, 3.8 | 179,775 | 467,213 | 2.60 |
+| mem, `--cpus 8`, 5.7 | 182,512 | 472,698 | 2.59 |
+| mem, `--cpuset-cpus 0-7`, 5.1 | 176,825 | 479,294 | 2.71 |
+| mem, `--cpuset-cpus 0-7`, 5.4 | 185,216 | 479,830 | 2.59 |
+| mem, `--cpuset-cpus 0-7`, 5.6 | 176,934 | 476,050 | 2.69 |
+| ext4, `--cpus 8`, 6.5 | 142,799 | 320,235 | 2.24 |
+| ext4, `--cpus 8`, 6.9 | 157,696 | 326,783 | 2.07 |
+| ext4, `--cpuset-cpus 0-7`, 5.5 | 156,950 | 324,930 | 2.07 |
+| ext4, `--cpuset-cpus 0-7`, 5.1 | 150,486 | 333,085 | 2.21 |
+
+In memory: 2.43–2.71×, median 2.60, at least 2.5 in 5 of 6 runs. The build
+before the accelerator fix (49d4a1d, the same split path) measured 2.61, 2.63,
+2.56 (`--cpus 8`) and 2.51, 2.59, 2.56 (`--cpuset-cpus`) in memory, 1.64–2.30
+on ext4.
+
+The split partition's stage-1 results: about 1.86 M of 2 M entries prepared
+with a dedupe hint the owner used, 57–151 taken back from a helper after
+20 µs. With fdatasync every commit, the owner's syncs do not shrink with
+helpers, so the ext4 ratio is lower (the owner's CPU is no longer the whole
+cost).
+
+### T3 #1: latency during compaction
+
+`compaction_half_dead_T3_1_full`: 4 partitions × 20,000 OMM records, every
+other one killed; a paced producer on a fifth partition (ack latency), an
+interactive lane asking 100-row windows, 3 bulk lanes reading whole
+partitions; a 3 s baseline, then the compaction **pass** (every sealed
+segment of the four compacted once), then the **storm**: forced
+re-compactions until 1,000 bulk statements started before a SWAP. Ratios are
+p99 during / p99 at baseline; commit round and maintenance step p99 come from
+the engine's histograms (quarter-octave buckets), ack and lane p99 from every
+sample.
+
+| Run | Pass s | Commit round | Lane | Ack | Storm: commit / lane / ack |
+|---|---|---|---|---|---|
+| ext4 a, `--cpus 8`, VM load 2.0 | 0.64 | 1.57 / 2.62 ms = 0.60 | 0.49 / 0.81 ms = 0.61 | 26.5 / 8.8 ms = 3.01 | 2.8 / 0.76 / 3.9 |
+| ext4 b, `--cpus 8`, 5.7 | 2.97 | 41.9 / 21.0 = 2.00 | 0.45 / 0.83 = 0.55 | 102.9 / 77.9 = 1.32 | 2.8 / 0.51 / 1.8 |
+| ext4 c¹, `--cpus 8`, 2.8 | 0.71 | 1.00 | 1.34 / 0.91 = 1.47 | 27.6 / 14.6 = 1.89 | – |
+| ext4 d¹, `--cpus 8`, 8.9 | 3.90 | 1.67 | 1.62 / 0.85 = 1.90 | 263.4 / 56.6 = 4.66 | – |
+| ext4 e¹, `--cpus 8`, 10.2 | 1.89 | 3.50 | 0.53 / 0.57 = 0.92 | 176.9 / 43.0 = 4.11 | – |
+| ext4 f, `--cpus 8`, 6.8 | 0.80 | 4.19 / 4.19 = 1.00 | 0.56 / 0.86 = 0.65 | 51.4 / 21.0 = 2.45 | 1.0 / 0.62 / 2.9 |
+| ext4 g, `--cpuset-cpus 0-7`, 5.5 | 0.69 | 3.67 / 2.10 = 1.75 | 0.85 / 0.61 = 1.39 | 31.9 / 11.8 = 2.70 | 1.5 / 0.85 / 4.0 |
+| mem, `--cpus 8`, 9.6 | 0.16 | 0.082 / 0.066 = 1.25 | 0.44 / 0.68 = 0.65 | 0.139 / 0.234 = 0.60 | 40 / 7.1 / 50 |
+| mem, `--cpus 8`, 7.2 | 0.17 | 0.066 / 0.066 = 1.00 | 0.39 / 0.66 = 0.60 | 0.143 / 0.249 = 0.57 | 32 / 7.0 / 46 |
+| mem, `--cpuset-cpus 0-7`, 5.7 | 0.16 | 0.066 / 0.057 = 1.14 | 0.42 / 0.73 = 0.57 | 0.138 / 0.216 = 0.64 | 46 / 6.4 / 51 |
+
+¹ The "once at the end" half of the A/B runs in the notes below (the landed
+behavior); their log kept the pass ratios and the ack and lane baselines
+only. Rows a, b and the first in-memory row ran the working tree just before
+the landed commit (the same engine and test). The in-memory passes gave
+81–85 lane samples, under the 100 the test needs to enforce.
+
+- **In memory** the pass stays within 1.5× on all three.
+- **On ext4** the lane p99 stays within 1.5× in 6 of 7 runs, the commit round
+  p99 in 3 of 7, the ack p99 in 1 of 7. The baseline itself moves by 9× from
+  run to run (ack p99 8.8–78 ms): the virtual disk shares the Mac's SSD with
+  the other lanes. The builder syncing its outputs every 1 MiB instead of
+  once at the end (three runs of each, interleaved) gave ack ratios 1.07,
+  1.80, 6.67 against 1.89, 4.66, 4.11 and commit round ratios 2.5, 1.67, 19.2
+  against 1.0, 1.67, 3.5: nothing the variance does not cover, so it is not
+  kept.
+- **The storm** (5,000–7,000 forced SWAPs) raises ack p99 1.8–4× on ext4 and
+  46–51× in memory, and the in-memory lane p99 6–7×. Its SWAPs are the test's
+  device for collecting pre-SWAP statements, not compactions the trigger
+  would start.
+
+So **T3 #1's latency ratio is not shown on this machine**: the pass meets it
+in memory, the ext4 runs are dominated by the virtual disk. It needs a quiet
+Linux box with its own disk; the test enforces the bound there (deviation
+33).
+
+Deviation:
+
+33. **T3 #1 is measured and enforced on the compaction pass** with the
+    design's two metrics (owner commit round p99, interactive lane p99), when
+    the pass gives 100 samples of each; the storm and the ack p99 are
+    reported. T3 enforced ack and lane p99 over the storm, whose thousands of
+    back-to-back SWAPs are not "the compaction" of §18.
+
+## 35. T3b acceptance, what remains
+
+| Item | Result |
+|---|---|
+| 0: store-migrate gseqs, TLV 19, tag conditions | **Done** (ad07b80, §31); released as 3.2.0 by T6. |
+| 1: T3 #5 hot split, A26 | **Built** (§32). Correctness: split = unsplit reference (rows, frames, attributes, SQL), gap-free pseqs, one appending thread per ownership interval; A26 (6 s, Mac mem, load 5–48): 108 rebalances, 163 helper stalls of 100 ms, 44 ownership intervals, 0 non-owner writes, after a reopen 1,094,610 rows checked with 0 corrupt frames. Throughput on the Docker Linux-8 in memory: 2.43–2.71×, median 2.60, ≥ 2.5 in 5 of 6 runs; on ext4 with fdatasync 2.07–2.24× (§34). |
+| 2: A15 arrivals half | **Built** (§33): 0.067 bytes of arrivals per appended entry under churn against 24 without it, offset paging exact, disk bytes = the files, 1,000 crash points with arrivals rewrites. The planner triggers it through its evictions only (deviation 32). |
+| 3: ratios on quiet Linux-8 | Measured on the Docker Linux-8 (§34): #5 as above; **#1 not shown** there (ext4 variance), met in memory. |
+| 4: artifact, CI, gauntlet | `wasm/flatsql-ps-threads.wasm` rebuilt with the Linux wasi-sdk 30 (exports unchanged). |
+
+Remaining:
+
+- **T3 #1 on a quiet Linux-8 box with a local disk**: `cpp/build/flatsql_ps_test
+  --test=compaction_half_dead_T3_1_full --dir=<ext4 dir>` (it enforces the
+  bound when the load is under a quarter of the cores); and the hot split's
+  ext4 ratio there (`flatsql_ps_bench --mode=hotsplit --io=fs --dir=<dir>`).
+- The quota planner requesting type merges (deviation 32).
+
+```
+cpp/build/flatsql_ps_test --test=hot_split_           # T3 #5, A26, trigger
+cpp/build/flatsql_ps_test --test=hot_split_rebalance_stalled_helpers_A26_full   # 10 min
+cpp/build/flatsql_ps_test --test=type_arrivals_compaction_A15 [--seconds=N]
+cpp/build/flatsql_ps_test --test=orphan_crash_points_during_compaction_T3_4_full
+cpp/build/flatsql_ps_bench --mode=hotsplit [--helpers=4] [--io=mem|fs] [--dir=D] [--records=N]
+```
