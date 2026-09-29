@@ -197,6 +197,49 @@ struct StmtShared {
     // partition and statement.
     PartSnap* prunedFor(PartSnap* s, uint64_t pseq);
     bool allowed(uint32_t pid) const { return pids.empty() || std::binary_search(pids.begin(), pids.end(), pid); }
+    // A row, read ahead when a snapshot is read in ascending pseq order (a
+    // window read in arrivals order): up to 32 rows per read.
+    int32_t readRow(LaneStore* st, const PartSnap& s, uint64_t pseq, RecRow* out);
+    // The lane tuple of a row's tag instance (RecRow.laneId: provider,
+    // source, batch, producer peer and key), from the partition's lane table
+    // read once per statement. nullptr: unknown (then read the attribute).
+    const LaneStore::LaneTuple* laneOf(LaneStore* st, const PartSnap& s, uint32_t laneId);
+    // The tag instances (the PUT itself, RETAGs) of PUT `put`: its TAG_OF
+    // postings in the unmerged blocks and in the runs of the segments that
+    // can hold them, the last block of each run kept (sequential lookups
+    // read each block once).
+    int32_t tagInstances(LaneStore* st, const PartSnap& s, uint64_t put, std::vector<uint64_t>* out);
+    // A row's stored frame. When the row was read ahead, one read covers it
+    // and the frames of the rows read after it in its segment (up to 256
+    // KiB): frames are appended in pseq order.
+    int32_t readFrame(LaneStore* st, const PartSnap& s, const RecRow& r, uint8_t* dst);
+
+private:
+    struct FrameSpan {
+        const PartSnap* snap = nullptr;
+        uint32_t seg = 0;
+        uint64_t off = 0;
+        std::vector<uint8_t> data;
+    };
+    FrameSpan span_;
+    struct RowAhead {
+        const PartSnap* snap = nullptr;
+        uint64_t first = 0, next = 0;
+        std::vector<RecRow> rows;
+    };
+    std::vector<RowAhead> ahead_;
+    struct Lanes {
+        const PartSnap* snap = nullptr;
+        bool ok = false;
+        std::vector<LaneStore::LaneTuple> tuples;  // sorted by id
+    };
+    std::vector<Lanes> lanes_;
+    struct CachedBlock {
+        FileKey key;
+        int64_t block = -1;
+        std::vector<uint8_t> data;
+    };
+    std::vector<CachedBlock> blocks_;
 };
 
 // Shared row filters (partition or type level).
@@ -213,6 +256,7 @@ struct RowFilter {
     TagMatch tags;                // post-filter: a live tag instance matching every condition
     bool knownLive = false;       // liveness already established (arrivals joins)
     bool wantGseq = false;        // type level: always resolve the row's gseq (sorted plans)
+    bool readAhead = false;       // rows come in ascending pseq order per partition: read ahead
     std::shared_ptr<StmtShared> shared;  // pruning and REPEAT state (may be null)
     // Applies visibility, liveness, labels, tags; reads the PUT row.
     // Returns 1 (keep, *row filled), 0 (skip), < 0 error.
@@ -233,8 +277,8 @@ struct RowFilter {
 
 // Does a PUT row's own tag instance match `m` and live at `bound`? (`s`
 // holds the row; `deadSnap` answers TAG_DEAD, possibly pruned.)
-int32_t ownTagMatches(LaneStore* st, const PartSnap& s, const PartSnap& deadSnap, const RecRow& r, const TagMatch& m,
-                      uint64_t bound, bool* yes, std::vector<uint8_t>* scratch);
+int32_t ownTagMatches(LaneStore* st, StmtShared* sh, const PartSnap& s, const PartSnap& deadSnap, const RecRow& r,
+                      const TagMatch& m, uint64_t bound, bool* yes, std::vector<uint8_t>* scratch);
 // Does the type snapshot list REPEAT postings (in its L0 blocks or runs)?
 int32_t typeHasRepeats(LaneStore* st, const TypeSnap& t, bool* yes);
 

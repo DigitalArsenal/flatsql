@@ -128,6 +128,169 @@ PartSnap* StmtShared::prunedFor(PartSnap* s, uint64_t pseq) {
     return pruned.back().snap.get();
 }
 
+int32_t StmtShared::readRow(LaneStore* st, const PartSnap& s, uint64_t pseq, RecRow* out) {
+    RowAhead* ra = nullptr;
+    for (RowAhead& r : ahead_)
+        if (r.snap == &s) ra = &r;
+    if (!ra) {
+        if (ahead_.size() >= 64) ahead_.erase(ahead_.begin());
+        ahead_.push_back(RowAhead());
+        ra = &ahead_.back();
+        ra->snap = &s;
+    }
+    if (pseq >= ra->first && pseq < ra->first + ra->rows.size()) {
+        *out = ra->rows[size_t(pseq - ra->first)];
+        ra->next = pseq + 1;
+        return 0;
+    }
+    // Ascending just past what was read: read ahead; otherwise one row (a
+    // random access reads no more than it uses).
+    const bool ascending = ra->next && pseq >= ra->next && pseq < ra->next + 32;
+    uint64_t n = 1;
+    if (ascending && s.pseqHi() >= pseq) n = std::min<uint64_t>(32, s.pseqHi() - pseq + 1);
+    ra->rows.resize(size_t(n));
+    const int32_t rc = st->readRows(s, pseq, uint32_t(n), ra->rows.data());
+    if (rc < 0) {
+        ra->rows.clear();
+        return rc;
+    }
+    ra->first = pseq;
+    ra->next = pseq + 1;
+    *out = ra->rows[0];
+    return 0;
+}
+
+int32_t StmtShared::readFrame(LaneStore* st, const PartSnap& s, const RecRow& r, uint8_t* dst) {
+    const bool hit = span_.snap == &s && span_.seg == r.seg && r.off >= span_.off &&
+                     uint64_t(r.off) + r.len <= span_.off + span_.data.size();
+    if (!hit) {
+        uint64_t end = uint64_t(r.off) + r.len;
+        for (const RowAhead& ra : ahead_) {
+            if (ra.snap != &s) continue;
+            for (const RecRow& x : ra.rows) {
+                if (x.pseq <= r.pseq || x.seg != r.seg || x.kind != kRowPut || !x.len) continue;
+                const uint64_t xe = uint64_t(x.off) + x.len;
+                if (x.off < r.off || xe - r.off > (256u << 10)) break;
+                if (xe > end) end = xe;
+            }
+        }
+        span_.data.resize(size_t(end - r.off));
+        const int32_t rc = st->readFramePart(s, r, 0, uint32_t(span_.data.size()), span_.data.data());
+        if (rc < 0) {
+            span_.snap = nullptr;
+            return rc;
+        }
+        span_.snap = &s;
+        span_.seg = r.seg;
+        span_.off = r.off;
+    }
+    std::memcpy(dst, span_.data.data() + (r.off - span_.off), r.len);
+    if (st->config().verifyFrameCrc && r.dataCrc && crc32c(dst, r.len) != r.dataCrc) return kRsCorrupt;
+    return 0;
+}
+
+const LaneStore::LaneTuple* StmtShared::laneOf(LaneStore* st, const PartSnap& s, uint32_t laneId) {
+    if (!laneId) return nullptr;
+    Lanes* l = nullptr;
+    for (Lanes& x : lanes_)
+        if (x.snap == &s) l = &x;
+    if (!l) {
+        lanes_.push_back(Lanes());
+        l = &lanes_.back();
+        l->snap = &s;
+        l->ok = st->laneTuples(s, &l->tuples) >= 0;
+        std::sort(l->tuples.begin(), l->tuples.end(),
+                  [](const LaneStore::LaneTuple& a, const LaneStore::LaneTuple& b) { return a.id < b.id; });
+    }
+    if (!l->ok) return nullptr;
+    auto it = std::lower_bound(l->tuples.begin(), l->tuples.end(), laneId,
+                               [](const LaneStore::LaneTuple& a, uint32_t id) { return a.id < id; });
+    return it != l->tuples.end() && it->id == laneId ? &*it : nullptr;
+}
+
+int32_t StmtShared::tagInstances(LaneStore* st, const PartSnap& s, uint64_t put, std::vector<uint64_t>* out) {
+    out->clear();
+    if (s.empty) return 0;
+    uint8_t key[8];
+    putBE64(key, put);
+    int32_t rc = 0;
+    const SectionList* list = st->sections(s, kIxTagOf, &rc);
+    if (!list) return rc;
+    for (const auto& sec : *list) {
+        if (!sec) continue;
+        for (size_t i = sec->lowerBound(key, 8); i < sec->offs.size(); i++) {
+            const uint8_t* p = sec->entry(i);
+            const uint16_t kl = getU16(p);
+            if (kl < 8 || std::memcmp(p + 2, key, 8) != 0) break;
+            out->push_back(getBE64(p + 2 + kl));
+        }
+    }
+    if (!s.manifest) return 0;
+    for (const ManifestSegRef& m : s.manifest->segs) {
+        // A TAG_OF posting keyed by `put` is written by its instance, never
+        // before its target.
+        if (m.sealed && m.firstPseq && m.endPseq <= put) continue;
+        for (const SegRunRef& rr : m.runs) {
+            FileKey fk;
+            auto run = st->run(s.pid, m.seg, rr.gen, rr.fileLen, &fk, &rc);
+            if (!run) return rc;
+            const std::vector<L1Fence>* f = run->fences(st, kIxTagOf, &rc);
+            if (rc < 0) return rc;
+            if (!f || f->empty()) continue;
+            if (prefixCmp(key, 8, (*f)[0]) < 0 && std::memcmp((*f)[0].prefix, key, std::min<size_t>(8, (*f)[0].prefixLen)) != 0)
+                continue;  // every key of the run is past `put`
+            // Last block whose first key is below (put, 0).
+            size_t a = 0, b = f->size();
+            while (a < b) {
+                const size_t mid = (a + b) / 2;
+                if (prefixCmp(key, 8, (*f)[mid]) > 0) a = mid + 1;
+                else b = mid;
+            }
+            const uint8_t vlen = run->kindVlen(kIxTagOf);
+            for (size_t blk = a == 0 ? 0 : a - 1; blk < f->size(); blk++) {
+                if (blk > (a == 0 ? 0 : a - 1) &&
+                    std::memcmp((*f)[blk].prefix, key, std::min<size_t>(8, (*f)[blk].prefixLen)) != 0)
+                    break;
+                CachedBlock* cb = nullptr;
+                for (CachedBlock& c : blocks_)
+                    if (c.key == fk) cb = &c;
+                if (!cb) {
+                    if (blocks_.size() >= 256) blocks_.erase(blocks_.begin());
+                    blocks_.push_back(CachedBlock());
+                    cb = &blocks_.back();
+                    cb->key = fk;
+                }
+                if (cb->block != int64_t(blk)) {
+                    cb->data.resize(kL1BlockBytes);
+                    rc = st->readBlock(fk, (*f)[blk].blockOff, cb->data.data());
+                    if (rc < 0) {
+                        cb->block = -1;
+                        return rc;
+                    }
+                    cb->block = int64_t(blk);
+                }
+                EntryIter it = l1BlockIter(cb->data.data(), vlen);
+                const uint8_t *ek, *ev;
+                uint16_t el;
+                bool past = false;
+                while (it.next(&ek, &el, &ev)) {
+                    const int c = el >= 8 ? std::memcmp(ek, key, 8) : keyCmp(ek, el, key, 8);
+                    if (c < 0) continue;
+                    if (c > 0) {
+                        past = true;
+                        break;
+                    }
+                    out->push_back(getBE64(ev));
+                }
+                if (past) break;
+            }
+        }
+    }
+    std::sort(out->begin(), out->end());
+    out->erase(std::unique(out->begin(), out->end()), out->end());
+    return 0;
+}
+
 int32_t typeHasRepeats(LaneStore* st, const TypeSnap& t, bool* yes) {
     *yes = false;
     if (t.empty) return 0;
@@ -151,14 +314,28 @@ int32_t typeHasRepeats(LaneStore* st, const TypeSnap& t, bool* yes) {
     return 0;
 }
 
-int32_t ownTagMatches(LaneStore* st, const PartSnap& s, const PartSnap& deadSnap, const RecRow& r, const TagMatch& m,
-                      uint64_t bound, bool* yes, std::vector<uint8_t>* scratch) {
+// Does a tag instance's lane tuple meet the conditions? (The lane of a row
+// is the tuple of its own tag: provider, source, batch, producer peer.)
+bool laneMatches(const TagMatch& m, const LaneStore::LaneTuple& t) {
+    return (!m.hasProvider || t.provider == m.provider) && (!m.hasSource || t.source == m.source) &&
+           (!m.hasBatch || t.batch == m.batch) && (!m.hasPeer || t.peer == m.peer);
+}
+
+int32_t ownTagMatches(LaneStore* st, StmtShared* sh, const PartSnap& s, const PartSnap& deadSnap, const RecRow& r,
+                      const TagMatch& m, uint64_t bound, bool* yes, std::vector<uint8_t>* scratch) {
     *yes = false;
     if (!(r.flags & kRowHasAttr) || r.attrLen == 0) return 0;
-    int32_t rc = st->readAttr(s, r, scratch);
-    if (rc < 0) return rc;
-    AttrView av;
-    if (!parseAttr(scratch->data(), scratch->size(), &av) || !m.matches(av.tag)) return 0;
+    int32_t rc;
+    const LaneStore::LaneTuple* lt = sh ? sh->laneOf(st, s, r.laneId) : nullptr;
+    if (lt) {
+        // The lane table answers without reading the attribute.
+        if (!laneMatches(m, *lt)) return 0;
+    } else {
+        rc = st->readAttr(s, r, scratch);
+        if (rc < 0) return rc;
+        AttrView av;
+        if (!parseAttr(scratch->data(), scratch->size(), &av) || !m.matches(av.tag)) return 0;
+    }
     bool dead = false;
     rc = st->isTagDead(deadSnap, r.pseq, bound, &dead);
     if (rc < 0) return rc;
@@ -171,26 +348,39 @@ namespace {
 // matching `m` at `bound`. TAG_OF and TAG_DEAD postings keyed by `put` are
 // read from the segments that can hold them only.
 int32_t liveTagIn(LaneStore* st, StmtShared* sh, PartSnap* s, uint64_t put, uint64_t bound, const TagMatch& m,
-                  bool* yes, std::vector<uint8_t>* attr) {
+                  bool* yes, std::vector<uint8_t>* attr, bool skipPut = false) {
     *yes = false;
     PartSnap* ps = sh ? sh->prunedFor(s, put) : s;
-    uint8_t lo[8], hi[8];
-    putBE64(lo, put);
-    putBE64(hi, put + 1);
     std::vector<uint64_t> insts;
-    PostingScan sc = st->scan(*ps, kIxTagOf, lo, 8, hi, 8, false);
-    if (sc.err()) return sc.err();
-    for (; sc.valid(); sc.next()) insts.push_back(getBE64(sc.val()));
-    if (sc.err()) return sc.err();
+    if (sh) {
+        const int32_t rc = sh->tagInstances(st, *s, put, &insts);
+        if (rc < 0) return rc;
+    } else {
+        uint8_t lo[8], hi[8];
+        putBE64(lo, put);
+        putBE64(hi, put + 1);
+        PostingScan sc = st->scan(*ps, kIxTagOf, lo, 8, hi, 8, false);
+        if (sc.err()) return sc.err();
+        for (; sc.valid(); sc.next()) insts.push_back(getBE64(sc.val()));
+        if (sc.err()) return sc.err();
+    }
     for (uint64_t inst : insts) {
-        if (inst > bound) continue;
+        if (inst > bound || (skipPut && inst == put)) continue;
         bool dead = false;
         int32_t rc = st->isTagDead(*ps, inst, bound, &dead);
         if (rc < 0) return rc;
         if (dead) continue;
         RecRow ir;
-        rc = st->readRow(*s, inst, &ir);
+        rc = sh ? sh->readRow(st, *s, inst, &ir) : st->readRow(*s, inst, &ir);
         if (rc < 0) return rc;
+        const LaneStore::LaneTuple* lt = sh ? sh->laneOf(st, *s, ir.laneId) : nullptr;
+        if (lt) {
+            if (laneMatches(m, *lt)) {
+                *yes = true;
+                return 0;
+            }
+            continue;
+        }
         rc = st->readAttr(*s, ir, attr);
         if (rc < 0) return rc;
         AttrView av;
@@ -251,7 +441,7 @@ int32_t RowFilter::anyCopyTag(const RecRow& row, const TagMatch& m, bool* yes) {
     std::vector<uint8_t> attr;
     PartSnap* ds = shared ? shared->prunedFor(snap, row.pseq) : snap;
     // The copy's own tag first (the common case: one read of its attribute).
-    int32_t rc = ownTagMatches(store, *snap, *ds, row, m, bound, yes, &attr);
+    int32_t rc = ownTagMatches(store, shared.get(), *snap, *ds, row, m, bound, yes, &attr);
     if (rc < 0 || *yes) return rc;
     std::vector<CopyRef> others;
     TypeSnap* ts = type ? type : copies;
@@ -260,15 +450,15 @@ int32_t RowFilter::anyCopyTag(const RecRow& row, const TagMatch& m, bool* yes) {
         if (rc < 0) return rc;
         for (CopyRef& c : others) {
             PartSnap* cds = shared->prunedFor(c.snap, c.pseq);
-            rc = ownTagMatches(store, *c.snap, *cds, c.row, m, c.bound, yes, &attr);
+            rc = ownTagMatches(store, shared.get(), *c.snap, *cds, c.row, m, c.bound, yes, &attr);
             if (rc < 0 || *yes) return rc;
         }
     }
     // RETAG instances: this copy's, then every other copy's.
-    rc = liveTagIn(store, shared.get(), snap, row.pseq, bound, m, yes, &attr);
+    rc = liveTagIn(store, shared.get(), snap, row.pseq, bound, m, yes, &attr, true);
     if (rc < 0 || *yes) return rc;
     for (CopyRef& c : others) {
-        rc = liveTagIn(store, shared.get(), c.snap, c.pseq, c.bound, m, yes, &attr);
+        rc = liveTagIn(store, shared.get(), c.snap, c.pseq, c.bound, m, yes, &attr, true);
         if (rc < 0 || *yes) return rc;
     }
     return 0;
@@ -307,7 +497,7 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
         if (rc < 0) return rc;
         if (dead) return 0;
     }
-    rc = store->readRow(*snap, pseq, &out->row);
+    rc = shared && readAhead ? shared->readRow(store, *snap, pseq, &out->row) : store->readRow(*snap, pseq, &out->row);
     if (rc < 0) return rc;
     if (out->row.kind != kRowPut) return 0;
     if (tags.any) {
@@ -363,10 +553,10 @@ int32_t RowFilter::acceptInstance(uint64_t put, const TagMatch& m, CurRow* out) 
     rc = store->readRow(*fs, first->pseq, &fr);
     if (rc < 0) return rc;
     bool yes = false;
-    rc = ownTagMatches(store, *fs, *shared->prunedFor(fs, first->pseq), fr, m, fb, &yes, &attr);
+    rc = ownTagMatches(store, shared.get(), *fs, *shared->prunedFor(fs, first->pseq), fr, m, fb, &yes, &attr);
     if (rc < 0) return rc;
     if (!yes) {
-        rc = liveTagIn(store, shared.get(), fs, first->pseq, fb, m, &yes, &attr);
+        rc = liveTagIn(store, shared.get(), fs, first->pseq, fb, m, &yes, &attr, true);
         if (rc < 0) return rc;
     }
     if (yes) return 0;
@@ -393,10 +583,10 @@ int32_t RowFilter::acceptInstance(uint64_t put, const TagMatch& m, CurRow* out) 
         rc = store->isDead(*shared->prunedFor(q, c.pseq), c.pseq, qb, &qd);
         if (rc < 0) return rc;
         if (qd) continue;
-        rc = ownTagMatches(store, *q, *shared->prunedFor(q, c.pseq), qr, m, qb, &yes, &attr);
+        rc = ownTagMatches(store, shared.get(), *q, *shared->prunedFor(q, c.pseq), qr, m, qb, &yes, &attr);
         if (rc < 0) return rc;
         if (!yes) {
-            rc = liveTagIn(store, shared.get(), q, c.pseq, qb, m, &yes, &attr);
+            rc = liveTagIn(store, shared.get(), q, c.pseq, qb, m, &yes, &attr, true);
             if (rc < 0) return rc;
         }
         if (yes) return 0;
@@ -421,6 +611,9 @@ public:
                 bool instances)
         : f_(f), kind_(kind), lo_(std::move(lo)), hi_(std::move(hi)), hasLo_(hasLo), hasHi_(hasHi), desc_(desc),
           instances_(instances) {
+        // Epoch and tag postings meet a partition's rows roughly in pseq
+        // order (ascending scans): read rows ahead. CID postings do not.
+        f_.readAhead = !desc_ && kind_ != kIxCid;
         if (instances_ && f_.tags.any) {
             // Tag conditions hold on the instance the posting names (ANY-row
             // semantics): checked here, not again on the record's PUT. The
@@ -468,14 +661,20 @@ public:
                 if (rc < 0) return rc;
                 if (dead) continue;
                 RecRow ir;
-                rc = f_.store->readRow(*f_.snap, pseq, &ir);
+                rc = f_.shared && f_.readAhead ? f_.shared->readRow(f_.store, *f_.snap, pseq, &ir)
+                                               : f_.store->readRow(*f_.snap, pseq, &ir);
                 if (rc < 0) return rc;
                 if (ir.kind != kRowRetag && ir.kind != kRowPut) continue;
                 if (instCheck_) {
-                    rc = f_.store->readAttr(*f_.snap, ir, &attr_);
-                    if (rc < 0) return rc;
-                    AttrView av;
-                    if (!parseAttr(attr_.data(), attr_.size(), &av) || !inst_.matches(av.tag)) continue;
+                    const LaneStore::LaneTuple* lt = f_.shared ? f_.shared->laneOf(f_.store, *f_.snap, ir.laneId) : nullptr;
+                    if (lt) {
+                        if (!laneMatches(inst_, *lt)) continue;
+                    } else {
+                        rc = f_.store->readAttr(*f_.snap, ir, &attr_);
+                        if (rc < 0) return rc;
+                        AttrView av;
+                        if (!parseAttr(attr_.data(), attr_.size(), &av) || !inst_.matches(av.tag)) continue;
+                    }
                 }
                 if (ir.kind == kRowRetag) pseq = ir.targetPseq;
             }
@@ -1219,6 +1418,7 @@ struct RecCursor : sqlite3_vtab_cursor {
     int64_t gseqVal = -1;
     std::string aliasSource;
     int64_t pointArg = 0;        // kAccObjPoint: the target (epoch seconds)
+    std::shared_ptr<StmtShared> shared;  // the plan's per-statement state (frames read ahead)
 };
 
 // _object from the stored frame (plans that do not read OBJECT_EPOCH): the
@@ -1331,7 +1531,9 @@ int loadFrame(RecCursor* c) {
     if (c->frameOk) return c->frameRc;
     c->frameOk = true;
     c->frame.resize(c->cur.row.len);
-    c->frameRc = c->vt->lane->store().readFrame(*c->cur.snap, c->cur.row, c->frame.data());
+    LaneStore& st = c->vt->lane->store();
+    c->frameRc = c->shared ? c->shared->readFrame(&st, *c->cur.snap, c->cur.row, c->frame.data())
+                           : st.readFrame(*c->cur.snap, c->cur.row, c->frame.data());
     return c->frameRc;
 }
 
@@ -1577,7 +1779,7 @@ bool cidArg(sqlite3_value* v, uint8_t cid[kCidLen]) {
 
 // Implemented in vtab_fanout.cpp for type-level plans.
 int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Plan& p, sqlite3_value** argv,
-                         std::unique_ptr<RowSource>* out);
+                         std::unique_ptr<RowSource>* out, std::shared_ptr<StmtShared>* shOut);
 
 namespace {
 
@@ -1586,7 +1788,8 @@ int32_t buildSources(RecCursor* c, sqlite3_value** argv, int argc) {
     ReaderLane* lane = vt->lane;
     const Plan& p = c->plan;
     (void)argc;
-    if (vt->kind != kVkPartition) return buildTypeSources(lane, c->stmt, vt, p, argv, &c->src);
+    c->shared.reset();
+    if (vt->kind != kVkPartition) return buildTypeSources(lane, c->stmt, vt, p, argv, &c->src, &c->shared);
     PartSnap* snap = nullptr;
     int32_t rc = lane->part(c->stmt, vt->pid, &snap);
     if (rc < 0) return rc;
@@ -1621,6 +1824,11 @@ int32_t buildSources(RecCursor* c, sqlite3_value** argv, int argc) {
             } else if (p.aHi >= 0) {
                 return 0;
             }
+            // Pseq order: rows and frames read ahead (§37).
+            f.shared = std::make_shared<StmtShared>();
+            f.shared->lane = lane;
+            f.readAhead = !p.desc;
+            c->shared = f.shared;
             c->src = makePseqRows(f, lo, hi, p.desc);
             return 0;
         }
@@ -1629,7 +1837,7 @@ int32_t buildSources(RecCursor* c, sqlite3_value** argv, int argc) {
     // Index-driven partition plans share the type-level builder's key logic:
     // a partition vtab is the fan-out restricted to one partition, without
     // labels (partition-level visibility).
-    return buildTypeSources(lane, c->stmt, vt, p, argv, &c->src);
+    return buildTypeSources(lane, c->stmt, vt, p, argv, &c->src, &c->shared);
 }
 
 }  // namespace

@@ -376,6 +376,7 @@ public:
             f.knownLive = knownLive;
             f.shared = shared_;
             f.copies = ts_;
+            f.readAhead = !desc_;
             rc = f.accept(c.second, out);
             if (rc < 0) return rc;
             if (rc == 0) continue;
@@ -1093,7 +1094,7 @@ int32_t windowFloor(ReaderLane* lane, StmtCtx*, TypeSnap* type, uint64_t n, uint
 // Builds the row source of a record vtab plan (type level, and the
 // index-driven partition-level plans).
 int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Plan& p, sqlite3_value** argv,
-                         std::unique_ptr<RowSource>* out) {
+                         std::unique_ptr<RowSource>* out, std::shared_ptr<StmtShared>* shOut) {
     LaneStore& st = lane->store();
     const bool partLevel = vt->kind == kVkPartition;
     const uint8_t* fid = vt->type->fid;
@@ -1139,6 +1140,7 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
     auto sh = std::make_shared<StmtShared>();
     sh->lane = lane;
     sh->fid = fid;
+    if (shOut) *shOut = sh;
     if (!partLevel) {
         sh->pids = pids;
         if (tags.any) {
