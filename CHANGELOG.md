@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.2.0
+
+- store-migrate gseqs: `RecordAttr.migrated_gseq` (field 6) on a FIRST copy keeps that gseq
+  (the legacy `sdn_record_index.rowid`) when it is above the type's committed `gseq_hi`; any
+  other case allocates and counts a fallback. `flatsql_ps_stats` appends entries 24
+  (migrated gseqs used) and 25 (fallbacks); a type commit's arrivals are sorted by gseq
+  (docs/PARTITION-STORE.md §31).
+- Writer init TLV 19: `maxEntryBytes` (u64, clamped to [64 KiB, 1 GiB]; default 1 MiB + 4 KiB).
+- Tag conditions (`_provider`, `_batch`, `_peer_id`, `_source`, `_source_name`) match when one
+  live tag instance (the PUT or a RETAG) satisfies all of them, the legacy ANY-row semantics
+  (§31.1).
+- `wasm/flatsql-ps-threads.wasm` sha256
+  `a90d9488187e527bccd3f02ce3f68be6443690bc1a2ee6c6786c64c907376e36` (2,261,085 bytes).
+
 ## 3.1.0
 
 - The partition store gains compaction, reclamation and quota (docs/PARTITION-STORE.md
