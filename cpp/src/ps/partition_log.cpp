@@ -2162,6 +2162,13 @@ int32_t partitionWriteHead(Writer* w, Partition* p, bool durable) {
     int32_t rc = w->io().write(p->h, slot, used, at);
     if (rc < 0) return rc;
     if (durable) p->pendingDurableHeadNs = monoNs();
+    // A12: readers starting from now read this head, which no longer names
+    // what the round retired (pending items sit at the tail).
+    if (!p->retired.empty() && p->retired.back().retireNs == kRetirePendingNs) {
+        const uint64_t now = monoNs();
+        for (size_t i = p->retired.size(); i-- > 0 && p->retired[i].retireNs == kRetirePendingNs;)
+            p->retired[i].retireNs = now;
+    }
     return 0;
 }
 
@@ -2206,7 +2213,8 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         if (st->retireSet) {
             const int saved = tHotPathDepth;
             tHotPathDepth = 0;
-            const uint64_t now = monoNs();
+            // A12: the retirements count from the head this round writes.
+            const uint64_t now = kRetirePendingNs;
             const size_t before = p->retired.size();
             if (st->nRetiring) {
                 std::vector<RetireItem> meta(p->retiring.begin(), p->retiring.begin() + st->nRetiring);

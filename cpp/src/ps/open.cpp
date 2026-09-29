@@ -859,6 +859,10 @@ int32_t Engine::writeOpenTypeHeads(std::string* err) {
             uint32_t used;
             encodeTypeHead(t, slot, &used, true);
             const uint64_t off = (t->headGen % 2) * kHeadSlotBytes;
+            if (off + kHeadSlotBytes > t->hExtent) {  // whole slots until the file holds both
+                std::memset(slot + used, 0, kHeadSlotBytes - used);
+                used = kHeadSlotBytes;
+            }
             rc = io->write(t->h, slot, used, off);
             if (rc >= 0 && off + used > t->hExtent) t->hExtent = off + used;
             if (rc >= 0) rc = io->sync(t->h);

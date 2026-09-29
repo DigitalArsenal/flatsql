@@ -386,9 +386,14 @@ struct SwapResult {
 // every file except the ones still growing (h, l, the active d and m, whose
 // extents the partition tracks). Retired files stay until unlinked (A12:
 // disk_bytes drops at UNLINKED).
+// A retirement counts from the first head write after its batch commits:
+// until then a reader that starts reads the previous head, which still names
+// the file (A12). Items wait with this stamp until that write.
+constexpr uint64_t kRetirePendingNs = UINT64_MAX;
+
 struct RetiredFile {
     RetireItem it{};
-    uint64_t retireNs = 0;    // when the batch naming it became durable
+    uint64_t retireNs = 0;    // when a head no longer naming it was written (kRetirePendingNs: not yet)
     uint64_t firstOkNs = 0;   // first passing reader-gate check (A12: a second one a grace later)
     uint64_t retryNs = 0;     // BUSY: not tried again before this
 };

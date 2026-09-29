@@ -195,6 +195,7 @@ int32_t partitionReclaimStep(Writer* w, Partition* p) {
     int32_t out = 0;
     while (i < p->retired.size() && done < cfg.reclaimBatch) {
         RetiredFile& r = p->retired[i];
+        if (r.retireNs == kRetirePendingNs) break;  // no head has stopped naming it yet (FIFO)
         if (now < r.retryNs) {
             i++;
             continue;
@@ -428,6 +429,7 @@ int32_t typeReclaimStep(Writer* w, TypeOwner* t) {
     size_t i = 0;
     while (i < t->retired.size() && done < cfg.reclaimBatch) {
         RetiredFile& r = t->retired[i];
+        if (r.retireNs == kRetirePendingNs) break;  // no head has stopped naming it yet (FIFO)
         if (now < r.retryNs) {
             i++;
             continue;

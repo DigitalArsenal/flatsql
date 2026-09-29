@@ -437,8 +437,22 @@ int32_t typeWriteHead(Writer* w, TypeOwner* t, bool durable) {
     uint32_t used;
     encodeTypeHead(t, slot, &used, durable);
     const uint64_t off = (t->headGen % 2) * kHeadSlotBytes;
+    // Whole slots until the file holds both: the head never grows after that
+    // (a full disk cannot fail a head write, A13).
+    if (off + kHeadSlotBytes > t->hExtent) {
+        std::memset(slot + used, 0, kHeadSlotBytes - used);
+        used = kHeadSlotBytes;
+    }
     const int32_t rc = w->io().write(t->h, slot, used, off);
-    if (rc >= 0 && off + used > t->hExtent) t->hExtent = off + used;
+    if (rc < 0) return rc;
+    if (off + used > t->hExtent) t->hExtent = off + used;
+    // A12: readers starting from now read this head, which no longer names
+    // what the round retired (pending items sit at the tail).
+    if (!t->retired.empty() && t->retired.back().retireNs == kRetirePendingNs) {
+        const uint64_t now = monoNs();
+        for (size_t i = t->retired.size(); i-- > 0 && t->retired[i].retireNs == kRetirePendingNs;)
+            t->retired[i].retireNs = now;
+    }
     return rc;
 }
 
@@ -860,7 +874,7 @@ void typePublish(Writer* w, TypeOwner* t, StagedType* st) {
         // folded runs; they and the previous manifest are retired (A12).
         const int saved = tHotPathDepth;
         tHotPathDepth = 0;  // once per merge
-        const uint64_t nowNs = monoNs();
+        const uint64_t nowNs = kRetirePendingNs;  // A12: counts from the next head write
         auto retire = [&](char letter, uint32_t gen, uint64_t size) {
             RetiredFile r;
             r.it = retireItem(letter, 0, gen, size);
