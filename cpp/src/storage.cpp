@@ -1,5 +1,6 @@
 #include "flatsql/storage.h"
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -118,7 +119,7 @@ size_t StreamingFlatBufferStore::ingest(const uint8_t* data, size_t length, Inge
         writeOffset_ += SIZE_PREFIX_LENGTH + fbSize;
 
         // Assign sequence and index
-        uint64_t seq = nextSequence_++;
+        uint64_t seq = takeSequence(storeOffset);
         sequenceToOffset_[seq] = storeOffset;
         offsetToSequence_[storeOffset] = seq;
         recordCount_++;
@@ -184,7 +185,7 @@ uint64_t StreamingFlatBufferStore::ingestOne(const uint8_t* sizePrefixedData, si
     writeOffset_ += SIZE_PREFIX_LENGTH + fbSize;
 
     // Assign sequence
-    uint64_t seq = nextSequence_++;
+    uint64_t seq = takeSequence(storeOffset);
     sequenceToOffset_[seq] = storeOffset;
     offsetToSequence_[storeOffset] = seq;
     recordCount_++;
@@ -236,7 +237,7 @@ uint64_t StreamingFlatBufferStore::ingestFlatBuffer(const uint8_t* data, size_t 
     writeOffset_ += length;
 
     // Assign sequence
-    uint64_t seq = nextSequence_++;
+    uint64_t seq = takeSequence(storeOffset);
     sequenceToOffset_[seq] = storeOffset;
     offsetToSequence_[storeOffset] = seq;
     recordCount_++;
@@ -291,7 +292,7 @@ void StreamingFlatBufferStore::loadAndRebuild(const uint8_t* data, size_t length
             );
         }
 
-        uint64_t seq = nextSequence_++;
+        uint64_t seq = takeSequence(offset);
         sequenceToOffset_[seq] = offset;
         offsetToSequence_[offset] = seq;
         recordCount_++;
@@ -570,6 +571,109 @@ StreamingFlatBufferStore::getRecordInfoVector(std::string_view fileId) const {
         return nullptr;
     }
     return &it->second;
+}
+
+// ==================== Sequence runs ====================
+
+uint64_t StreamingFlatBufferStore::takeSequence(uint64_t offset) {
+    while (runCursor_ < sequenceRuns_.size() && sequenceRuns_[runCursor_].offset < offset) {
+        runCursor_++;  // a run that does not start on a frame is never reached
+    }
+    if (runCursor_ < sequenceRuns_.size() && sequenceRuns_[runCursor_].offset == offset) {
+        const uint64_t first = sequenceRuns_[runCursor_].firstSeq;
+        if (first < nextSequence_) {
+            // A run may only skip forward. One that goes back would hand out
+            // a sequence a record already has.
+            sequenceRunsConsistent_ = false;
+        } else {
+            nextSequence_ = first;
+        }
+        runCursor_++;
+    }
+    return nextSequence_++;
+}
+
+void StreamingFlatBufferStore::setSequenceRuns(std::vector<SequenceRun> runs) {
+    sequenceRuns_ = std::move(runs);
+    runCursor_ = 0;
+    while (runCursor_ < sequenceRuns_.size() && sequenceRuns_[runCursor_].offset < writeOffset_) {
+        runCursor_++;
+    }
+}
+
+void StreamingFlatBufferStore::startSequenceRunAtEnd(uint64_t firstSeq) {
+    if (firstSeq <= nextSequence_) return;  // numbering already reaches it
+    // A run at the end replaces one already waiting there.
+    if (!sequenceRuns_.empty() && sequenceRuns_.back().offset == writeOffset_) {
+        sequenceRuns_.back().firstSeq = firstSeq;
+    } else {
+        sequenceRuns_.push_back(SequenceRun{writeOffset_, firstSeq});
+    }
+    runCursor_ = 0;
+    while (runCursor_ < sequenceRuns_.size() && sequenceRuns_[runCursor_].offset < writeOffset_) {
+        runCursor_++;
+    }
+    nextSequence_ = firstSeq;
+    // The run is consumed by the next append at writeOffset_: takeSequence
+    // sees first == nextSequence_ and keeps it.
+}
+
+// ==================== Compaction ====================
+
+uint64_t StreamingFlatBufferStore::frameBytesAt(uint64_t offset) const noexcept {
+    if (offset > writeOffset_ || writeOffset_ - offset < SIZE_PREFIX_LENGTH) return 0;
+    const uint64_t size = readLE32(&data_[static_cast<size_t>(offset)]);
+    if (size > writeOffset_ - offset - SIZE_PREFIX_LENGTH) return 0;
+    return SIZE_PREFIX_LENGTH + size;
+}
+
+bool StreamingFlatBufferStore::planCompacted(const std::vector<uint64_t>& keep,
+                                             std::vector<KeptFrame>& frames,
+                                             uint64_t* packedSize) const {
+    std::vector<KeptFrame> placed;
+    placed.reserve(keep.size());
+    uint64_t at = 0;
+    for (const uint64_t offset : keep) {
+        const uint64_t bytes = frameBytesAt(offset);
+        if (bytes == 0 || offset < at) return false;
+        auto seqIt = offsetToSequence_.find(offset);
+        placed.push_back(KeptFrame{offset, at, seqIt == offsetToSequence_.end() ? 0 : seqIt->second});
+        at += bytes;
+    }
+    frames.swap(placed);
+    if (packedSize) *packedSize = at;
+    return true;
+}
+
+void StreamingFlatBufferStore::compactInPlace(const std::vector<KeptFrame>& frames, uint64_t packedSize,
+                                              std::vector<SequenceRun> runs) {
+    // Ascending, and newOffset <= oldOffset for every frame: moving them in
+    // order never overwrites a frame that has not moved yet.
+    for (const auto& frame : frames) {
+        const uint64_t bytes = SIZE_PREFIX_LENGTH + readLE32(&data_[static_cast<size_t>(frame.oldOffset)]);
+        if (frame.newOffset != frame.oldOffset) {
+            std::memmove(&data_[static_cast<size_t>(frame.newOffset)],
+                         &data_[static_cast<size_t>(frame.oldOffset)], static_cast<size_t>(bytes));
+        }
+    }
+    writeOffset_ = packedSize;
+
+    // Fresh maps rather than clear(): clear() keeps every bucket array.
+    std::unordered_map<uint64_t, uint64_t>().swap(sequenceToOffset_);
+    std::unordered_map<uint64_t, uint64_t>().swap(offsetToSequence_);
+    std::unordered_map<std::string, std::vector<FileRecordInfo>>().swap(fileIdToRecords_);
+    sequenceToOffset_.reserve(frames.size());
+    offsetToSequence_.reserve(frames.size());
+    for (const auto& frame : frames) {
+        sequenceToOffset_[frame.sequence] = frame.newOffset;
+        offsetToSequence_[frame.newOffset] = frame.sequence;
+        const uint32_t size = readLE32(&data_[static_cast<size_t>(frame.newOffset)]);
+        const std::string fileId = extractFileId(&data_[static_cast<size_t>(frame.newOffset) + SIZE_PREFIX_LENGTH], size);
+        fileIdToRecords_[fileId].push_back({frame.newOffset, frame.sequence});
+    }
+    recordCount_ = frames.size();
+    setSequenceRuns(std::move(runs));
+    generation_++;
 }
 
 }  // namespace flatsql

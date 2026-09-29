@@ -574,6 +574,74 @@ Proof: `cpp/test/state_persistence_test.cpp` cases 6 and 7 (native) and
 `wasm/test-io-persistence.mjs` `runSourceMatrix` (standalone WASI-noeh + the
 emscripten bundle, over node-fs and the chunked sdn-js store).
 
+### 6.4.2 Arena compaction (`flatsql_compact_arena`)
+
+The arena only grows: `markDeleted` hides a row and keeps its bytes. A host
+that keeps a bounded window (SDN's hot window: evict the oldest, tombstone
+deleted and superseded rows) fills any budget with dead rows — host-02 filled
+512 MiB within hours. `compactArena` packs the arena with the rows a query
+can still see.
+
+- **Liveness is what SQL can see.** A frame is dropped when every virtual
+  table that can show it has tombstoned its sequence (a partition reads its
+  own rows; a base name that is still a virtual table reads every frame of
+  its file identifier; a base name a unified view replaced reads nothing). A
+  frame no table shows is kept.
+- **Sequences survive.** A row's sequence is its rowid, its record-encryption
+  index and the key hosts track it by. The stream stays SDS wire bytes only,
+  so the numbering lives beside it, in the index file:
+
+  ```
+  _flatsql_seq_runs   start, first_seq   the frame at start has first_seq; the
+                                         frames after it count up by one
+  _flatsql_state      next_sequence      never handed out twice, even for rows
+                                         dropped from the end of the arena
+  ```
+
+  A state with runs writes `format_version` **2**, so a build that does not
+  know runs answers `-2` instead of renumbering; a state without runs stays
+  **1**, readable by every older build.
+- **In place, bounded.** Kept frames move down in order; nothing is allocated
+  for the bytes, so the peak is the arena that was already there. The
+  capacity is kept (wasm linear memory never shrinks; a shrunk arena regrows
+  by doubling into a fragmented heap). Index rows' `data_offset`s, the
+  partition map, per-table record lists and the tombstone sets are rewritten;
+  tombstones of dropped rows go with them.
+- **In steps.** One call does at most `maxStepBytes` of I/O; reads, ingests,
+  tombstones and flushes may run between calls. Inside an open transaction
+  (a host that mirrors in its own transaction) the arena is packed in memory
+  only and the call answers `2`: the persist runs at the next call outside a
+  transaction, or at the next flush, which persists it first.
+
+**The swap on disk is a redo log** (the host contract has no rename):
+
+1. the old state is flushed whole, then the packed stream is written to
+   `<db>.fsdata.compact` and fsynced (its directory entry made durable with
+   `CREATE_PARENTS`);
+2. ONE commit at `synchronous=FULL` rewrites everything keyed by offset — the
+   partition map, the runs, the index rows' offsets, the mark — and records
+   `compact_pending` = the packed size;
+3. the packed stream is copied over `<db>.fsdata` in place, the stream is cut
+   at the mark and fsynced;
+4. `compact_pending` is deleted (durably) and the temp stream unlinked.
+
+Before step 2 the old state is whole on disk. From step 2 on,
+`flatsql_open_state` finishes steps 3 and 4 from the temp stream before it
+reads anything. The stream is never shorter than the packed size while
+`compact_pending` is set, so a host's own mark-versus-stream check stays
+quiet through a crash. A pending swap whose temp stream is missing (or whose
+stream was cut below the packed size by a host's discard) is discarded whole —
+stream, partition map, runs — and the torn path rebuilds an empty index.
+
+Proof: `cpp/test/arena_compaction_test.cpp` — every query identical before
+and after (in memory, disk-backed, in steps, in a transaction), reads between
+steps equal to a model, and crash injection at every mutating host-I/O call of
+a compaction in two modes (kill -9; power loss: only fsynced bytes survive)
+in WAL at `synchronous=NORMAL` and in rollback-journal mode: the reopened state
+is always the old one or the new one, and a fresh row is always numbered past
+every row it holds. Without the `synchronous=FULL` layout commit the power-loss
+sweep fails (the stream is rewritten under a commit that rolls back).
+
 ### 6.5 Browser satisfaction (`wasm/flatsql-io.js`)
 
 Three backends, one interface, shared by the emscripten bundle and the

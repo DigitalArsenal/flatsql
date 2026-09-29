@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <set>
 #include <mutex>
 #include <iomanip>
 #include <sstream>
@@ -39,6 +40,13 @@ namespace flatsql {
 namespace {
 
 constexpr int kFormatVersion = 1;
+
+// Format 2 is format 1 plus sequence runs (_flatsql_seq_runs): the stream was
+// compacted, so its frames are no longer numbered 1, 2, 3, ... A build that
+// does not know runs must not open such a state and renumber it, and "2" is
+// what makes it answer -2 instead. Written only while runs exist; a state
+// without runs stays "1".
+constexpr int kFormatVersionRuns = 2;
 
 // The source-partition layout, versioned SEPARATELY from kFormatVersion on
 // purpose. Bumping kFormatVersion invalidates every persisted index row on
@@ -129,6 +137,17 @@ void FlatSQLDatabase::clearDerivedState() {}
 int FlatSQLDatabase::restoreSourceIndex() { return kStateNoFilesystem; }
 int FlatSQLDatabase::persistSourceIndex(uint64_t) { return kStateNoFilesystem; }
 void FlatSQLDatabase::rebindSourceViews() {}
+int FlatSQLDatabase::restoreSequenceRuns(uint64_t, const std::string&) { return kStateNoFilesystem; }
+int FlatSQLDatabase::persistSequenceRuns(uint64_t) { return kStateNoFilesystem; }
+void FlatSQLDatabase::resumeSequenceAfterReplayUnlocked() {}
+int FlatSQLDatabase::compactionBeginTempUnlocked() { return kStateNoFilesystem; }
+int FlatSQLDatabase::compactionWriteFramesUnlocked(const std::vector<uint64_t>&, size_t*, uint64_t, bool) {
+    return kStateNoFilesystem;
+}
+int FlatSQLDatabase::compactionCommitLayoutUnlocked(const CompactedLayout&) { return kStateNoFilesystem; }
+int FlatSQLDatabase::compactionCopyStepUnlocked(uint64_t) { return kStateNoFilesystem; }
+void FlatSQLDatabase::abortArenaCompactionUnlocked() { compaction_ = ArenaCompaction{}; }
+int FlatSQLDatabase::finishInterruptedCompactionOnOpen(uint64_t, uint64_t) { return kStateNoFilesystem; }
 
 #else
 
@@ -161,6 +180,16 @@ constexpr const char* kSourceRangesDDL =
     "CREATE TABLE IF NOT EXISTS _flatsql_source_ranges("
     "\"start\" TEXT PRIMARY KEY, \"stop\" TEXT NOT NULL, source TEXT NOT NULL)"
     " WITHOUT ROWID";
+
+// Sequence runs (arena compaction): the frame at "start" has sequence
+// first_seq, and the frames after it count up by one until the next run.
+// Decimal TEXT like every other offset here.
+constexpr const char* kSequenceRunsDDL =
+    "CREATE TABLE IF NOT EXISTS _flatsql_seq_runs("
+    "\"start\" TEXT PRIMARY KEY, first_seq TEXT NOT NULL) WITHOUT ROWID";
+
+// The compaction's temp stream is written in chunks of this size.
+constexpr size_t kCompactStage = size_t(1) << 20;
 
 // Cells arrive as int64 or TEXT depending on how SQLite typed the column.
 // Accept both; anything else is a corrupt row, reported as 0 by the caller.
@@ -424,14 +453,7 @@ int FlatSQLDatabase::openState() {
     }
     if (state.rows.empty()) return kStateAbsent;
 
-    // 1a. Source partitions come back BEFORE anything else, and before every
-    //     early return below: a -2/-4 boot hands the caller to reindexAll(),
-    //     which replays from zero and needs the same routing. Offsets are
-    //     schema-independent, so a schema change never invalidates them.
-    const int sourceRc = restoreSourceIndex();
-    if (sourceRc < 0) return sourceRc;
-
-    std::string version, fingerprint, flushed, tableCount;
+    std::string version, fingerprint, flushed, tableCount, pending, nextSequence;
     std::map<std::string, std::string> persistedTables;
     for (const auto& row : state.rows) {
         if (row.size() < 2) continue;
@@ -442,12 +464,46 @@ int FlatSQLDatabase::openState() {
         else if (*key == "schema")        fingerprint = *val;
         else if (*key == "flushed_offset") flushed = *val;
         else if (*key == "schema_table_count") tableCount = *val;
+        else if (*key == "compact_pending") pending = *val;
+        else if (*key == "next_sequence") nextSequence = *val;
         else if (key->compare(0, 13, "schema_table:") == 0)
             persistedTables.emplace(key->substr(13), *val);
     }
 
+    // 1. An arena compaction that committed its layout and then stopped is
+    //    finished here, before anything reads the stream or the partition
+    //    map (docs/STORAGE-DURABILITY.md §6.4.2). One that stopped before its
+    //    commit left only a temp stream nothing names: it goes.
+    if (pending.empty()) {
+        const std::string temp = compactTempPath();
+        if (flatsql_io_open(temp.c_str(), static_cast<int32_t>(temp.size()), FLATSQL_IO_PROBE) == 0) {
+            flatsql_io_open(temp.c_str(), static_cast<int32_t>(temp.size()),
+                            FLATSQL_IO_UNLINK | FLATSQL_IO_UNLINK_IF_UNUSED);
+        }
+    } else {
+        const int rc = finishInterruptedCompactionOnOpen(
+            std::strtoull(pending.c_str(), nullptr, 10),
+            std::strtoull(flushed.c_str(), nullptr, 10));
+        if (rc < 0) return rc;
+        QueryResult reread;
+        if (sqliteEngine_->executeNoThrow(
+                "SELECT v FROM _flatsql_state WHERE k='format_version'", {}, reread, &err) &&
+            !reread.rows.empty() && !reread.rows[0].empty()) {
+            if (const auto* v = std::get_if<std::string>(&reread.rows[0][0])) version = *v;
+        }
+    }
+    persistedNextSequence_ = nextSequence.empty() ? 0 : std::strtoull(nextSequence.c_str(), nullptr, 10);
+
+    // 1a. Source partitions come back BEFORE anything else, and before every
+    //     early return below: a -2/-4 boot hands the caller to reindexAll(),
+    //     which replays from zero and needs the same routing. Offsets are
+    //     schema-independent, so a schema change never invalidates them.
+    const int sourceRc = restoreSourceIndex();
+    if (sourceRc < 0) return sourceRc;
+
     // 2. Format and schema must match, or the index rows mean something else.
-    if (version != std::to_string(kFormatVersion)) return kStateVersionMismatch;
+    if (version != std::to_string(kFormatVersion) &&
+        version != std::to_string(kFormatVersionRuns)) return kStateVersionMismatch;
     std::unordered_set<std::string> addedTables;
     if (!tableCount.empty() || fingerprint != schemaFingerprint(schema_)) {
         // Older state has only an aggregate fingerprint and cannot prove an
@@ -478,6 +534,10 @@ int FlatSQLDatabase::openState() {
     if (streamSize < 0) return kStateCorrupt;
     if (static_cast<uint64_t>(streamSize) < mark) return kStateTorn;
 
+    // 3a. A compacted stream numbers its frames by its runs.
+    const int runsRc = restoreSequenceRuns(static_cast<uint64_t>(streamSize), version);
+    if (runsRc < 0) return runsRc;
+
     // 4. Restore. Everything below the mark keeps its on-disk index rows; the
     //    tail is re-indexed. This is the entire win: a boot pays for a scan of
     //    the stream, not for rebuilding every index.
@@ -493,6 +553,8 @@ int FlatSQLDatabase::openState() {
     }
     const int replayed = loadStreamFromDisk(mark, addedTables);
     if (replayed < 0) return replayed;
+    if (!storage_->sequenceRunsConsistent()) return kStateCorrupt;
+    resumeSequenceAfterReplayUnlocked();
 
     flushedOffset_ = mark;
 
@@ -524,6 +586,18 @@ int FlatSQLDatabase::reindexStep(size_t maxRecords) {
     if (!file.ok()) return fail(kStateAbsent);
 
     if (!reindexBatch_) {
+        // A compaction between steps: a swap already committed is finished
+        // first (the stream must be the arena's layout before the arena is
+        // thrown away); a plan not swapped yet is dropped.
+        if (compaction_.phase == ArenaCompaction::Phase::Copying) {
+            const int rc = compactionCopyStepUnlocked(UINT64_MAX);
+            if (rc < 0) return rc;
+            lastCompaction_ = compaction_.report;
+            lastCompaction_.completed = true;
+            compaction_ = ArenaCompaction{};
+        } else if (compaction_.phase != ArenaCompaction::Phase::Idle) {
+            abortArenaCompactionUnlocked();  // the arena is rebuilt from the stream
+        }
         const double size = flatsql_io_size(file.h);
         if (size < 0) return kStateCorrupt;
         reindexBatch_ = std::make_unique<SQLiteWriteBatch>(*sqliteEngine_);
@@ -537,6 +611,24 @@ int FlatSQLDatabase::reindexStep(size_t maxRecords) {
         storage_->reset();
         const int sourceRc = restoreSourceIndex();
         if (sourceRc < 0) return fail(sourceRc);
+        std::string version;
+        persistedNextSequence_ = 0;
+        QueryResult state;
+        std::string err;
+        if (sqliteEngine_->executeNoThrow(
+                "SELECT k, v FROM _flatsql_state WHERE k IN ('format_version','next_sequence')",
+                {}, state, &err)) {
+            for (const auto& row : state.rows) {
+                if (row.size() < 2) continue;
+                const auto* key = std::get_if<std::string>(&row[0]);
+                const auto* val = std::get_if<std::string>(&row[1]);
+                if (!key || !val) continue;
+                if (*key == "format_version") version = *val;
+                else persistedNextSequence_ = std::strtoull(val->c_str(), nullptr, 10);
+            }
+        }
+        const int runsRc = restoreSequenceRuns(reindexStreamSize_, version);
+        if (runsRc < 0) return fail(runsRc);
     }
 
     auto readExact = [&file](uint8_t* dst, size_t size, uint64_t offset) {
@@ -576,6 +668,11 @@ int FlatSQLDatabase::reindexStep(size_t maxRecords) {
     }
     if (reindexReadOffset_ + 4 <= reindexStreamSize_) return 1;
 
+    if (!storage_->sequenceRunsConsistent()) return fail(kStateCorrupt);
+    resumeSequenceAfterReplayUnlocked();
+    // The runs table is rewritten to exactly what this rebuild used.
+    rewriteSequenceRunsOnFlush_ = true;
+
     // These bytes came from the durable stream. Rebuild only the index and
     // its checkpoint; do not rewrite the source stream during recovery.
     flushedOffset_ = storage_->getWriteOffset();
@@ -596,6 +693,16 @@ int FlatSQLDatabase::flushState() {
 
 int FlatSQLDatabase::flushStateUnlocked() {
     if (!diskBacked_ || !sqliteEngine_) return kStateNoFilesystem;
+
+    // An arena compacted inside a transaction has a layout the stream does
+    // not: persisting that layout (the compaction's own redo-log swap) IS the
+    // flush, and nothing may be appended to the old stream first.
+    if (compaction_.phase == ArenaCompaction::Phase::Unpersisted ||
+        (compaction_.phase == ArenaCompaction::Phase::Writing && compaction_.fromCurrentArena)) {
+        if (!sqlite3_get_autocommit(sqliteEngine_->getDb())) return kStateCorrupt;
+        const int rc = finishPendingPersistUnlocked();
+        return rc < 0 ? rc : kStateOk;
+    }
 
     const uint64_t writeOffset = storage_->getWriteOffset();
     if (writeOffset < flushedOffset_) return kStateCorrupt;  // arena went backwards
@@ -648,7 +755,8 @@ int FlatSQLDatabase::flushStateUnlocked() {
             "INSERT OR REPLACE INTO _flatsql_state(k,v) VALUES"
             "('format_version',?),('schema',?),('stream',?),('flushed_offset',?),"
             "('source_index',?)",
-            {Value(std::to_string(kFormatVersion)),
+            {Value(std::to_string(storage_->sequenceRuns().empty() ? kFormatVersion
+                                                                   : kFormatVersionRuns)),
              Value(schemaFingerprint(schema_)),
              Value(streamPath_),
              Value(std::to_string(writeOffset)),
@@ -656,7 +764,8 @@ int FlatSQLDatabase::flushStateUnlocked() {
             ignored, &err) &&
         // Same transaction, same mark: the partition can never describe more
         // stream than the mark admits, in either direction.
-        persistSourceIndex(writeOffset) == kStateOk;
+        persistSourceIndex(writeOffset) == kStateOk &&
+        persistSequenceRuns(flushedOffset_) == kStateOk;
     if (ok && tablesChanged) {
         ok = sqliteEngine_->executeNoThrow(
             "DELETE FROM _flatsql_state WHERE substr(k,1,13)='schema_table:'", {}, ignored, &err);
@@ -680,6 +789,419 @@ int FlatSQLDatabase::flushStateUnlocked() {
     }
 
     flushedOffset_ = writeOffset;
+    rewriteSequenceRunsOnFlush_ = false;
+    return kStateOk;
+}
+
+// ==================== Sequence runs ====================
+
+int FlatSQLDatabase::restoreSequenceRuns(uint64_t streamSize, const std::string& formatVersion) {
+    QueryResult rows;
+    std::string err;
+    if (!sqliteEngine_->executeNoThrow(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='_flatsql_seq_runs'",
+            {}, rows, &err)) {
+        return kStateCorrupt;
+    }
+    bool exists = false;
+    if (!rows.rows.empty() && !rows.rows[0].empty()) {
+        if (const auto* n = std::get_if<int64_t>(&rows.rows[0][0])) exists = *n > 0;
+    }
+    std::vector<StreamingFlatBufferStore::SequenceRun> runs;
+    if (formatVersion != std::to_string(kFormatVersionRuns)) {
+        // Format 1 numbers frames 1, 2, 3, ... Rows left in the table belong
+        // to a compacted layout that a later format-1 state replaced (a build
+        // without runs re-derived it); they describe nothing now.
+        if (exists && !sqliteEngine_->executeNoThrow("DELETE FROM _flatsql_seq_runs", {}, rows, &err)) {
+            return kStateCorrupt;
+        }
+        storage_->setSequenceRuns({});
+        return kStateOk;
+    }
+    if (!exists) return kStateCorrupt;  // format 2 is written only with its runs
+    if (!sqliteEngine_->executeNoThrow("SELECT \"start\", first_seq FROM _flatsql_seq_runs",
+                                       {}, rows, &err)) {
+        return kStateCorrupt;
+    }
+    if (rows.rows.empty()) return kStateCorrupt;
+    for (const auto& row : rows.rows) {
+        if (row.size() < 2) return kStateCorrupt;
+        bool okOffset = false, okFirst = false;
+        const uint64_t offset = cellToU64(row[0], &okOffset);
+        const uint64_t first = cellToU64(row[1], &okFirst);
+        if (!okOffset || !okFirst || first == 0) return kStateCorrupt;
+        runs.push_back({offset, first});
+    }
+    std::sort(runs.begin(), runs.end(),
+              [](const auto& a, const auto& b) { return a.offset < b.offset; });
+    std::vector<StreamingFlatBufferStore::SequenceRun> kept;
+    for (const auto& run : runs) {
+        if (!kept.empty() && run.firstSeq <= kept.back().firstSeq) return kStateCorrupt;
+        // A run past the end of the stream describes frames that are not
+        // there (a torn or discarded stream); the next flush forgets it.
+        if (run.offset > streamSize) {
+            rewriteSequenceRunsOnFlush_ = true;
+            continue;
+        }
+        kept.push_back(run);
+    }
+    storage_->setSequenceRuns(std::move(kept));
+    return kStateOk;
+}
+
+// Called inside flushState's transaction: the runs this flush has not
+// written yet (every run when rewriteSequenceRunsOnFlush_), and the next
+// sequence, so a sequence given to a row that a compaction later dropped is
+// never given out again.
+int FlatSQLDatabase::persistSequenceRuns(uint64_t fromOffset) {
+    QueryResult ignored;
+    std::string err;
+    const auto& runs = storage_->sequenceRuns();
+    bool any = rewriteSequenceRunsOnFlush_;
+    for (const auto& run : runs) {
+        if (run.offset >= fromOffset) any = true;
+    }
+    if (any) {
+        if (!sqliteEngine_->executeNoThrow(kSequenceRunsDDL, {}, ignored, &err)) return kStateCorrupt;
+        if (rewriteSequenceRunsOnFlush_ &&
+            !sqliteEngine_->executeNoThrow("DELETE FROM _flatsql_seq_runs", {}, ignored, &err)) {
+            return kStateCorrupt;
+        }
+        for (const auto& run : runs) {
+            if (!rewriteSequenceRunsOnFlush_ && run.offset < fromOffset) continue;
+            if (!sqliteEngine_->executeNoThrow(
+                    "INSERT OR REPLACE INTO _flatsql_seq_runs(\"start\", first_seq) VALUES(?,?)",
+                    {Value(std::to_string(run.offset)), Value(std::to_string(run.firstSeq))},
+                    ignored, &err)) {
+                return kStateCorrupt;
+            }
+        }
+    }
+    if (!sqliteEngine_->executeNoThrow(
+            "INSERT OR REPLACE INTO _flatsql_state(k,v) VALUES('next_sequence',?)",
+            {Value(std::to_string(storage_->nextSequence()))}, ignored, &err)) {
+        return kStateCorrupt;
+    }
+    return kStateOk;
+}
+
+// After a replay: sequences given out before the last flush stay given out,
+// even to rows a compaction dropped from the end of the arena.
+void FlatSQLDatabase::resumeSequenceAfterReplayUnlocked() {
+    if (persistedNextSequence_ > storage_->nextSequence()) {
+        storage_->startSequenceRunAtEnd(persistedNextSequence_);
+    }
+}
+
+// ==================== Arena compaction: the disk half ====================
+//
+// docs/STORAGE-DURABILITY.md §6.4.2. The stream and the database are two files
+// and the host contract has no rename, so the swap is a redo log:
+//
+//   1. the compacted stream is written to <stream>.compact and fsynced (its
+//      directory entry made durable by CREATE_PARENTS);
+//   2. ONE durable commit (synchronous=FULL) rewrites everything keyed by
+//      offset — the partition map, the sequence runs, the index rows' data
+//      offsets, the mark — and records compact_pending = the new size;
+//   3. the new stream is copied over <stream> in place, the stream is cut to
+//      the mark and fsynced;
+//   4. compact_pending is deleted and the temp stream unlinked.
+//
+// Before 2 the old state is whole: the old stream was flushed complete first
+// and is never touched until 3. From 2 on, openState finishes 3 and 4 from
+// the temp stream. The stream is never shorter than the new layout while
+// compact_pending is set (the old stream was the whole arena, and 3 only
+// rewrites bytes below the new size), which is also what keeps a host's own
+// mark-versus-stream check quiet through a crash.
+
+namespace {
+
+bool writeAllAt(int32_t handle, const uint8_t* data, uint64_t size, uint64_t offset) {
+    uint64_t done = 0;
+    while (done < size) {
+        const uint64_t remain = size - done;
+        const int32_t want = static_cast<int32_t>(remain > uint64_t(kIoChunk) ? kIoChunk : remain);
+        const int32_t wrote = flatsql_io_write(handle, data + done, want, static_cast<double>(offset + done));
+        if (wrote <= 0) return false;
+        done += static_cast<uint64_t>(wrote);
+    }
+    return true;
+}
+
+bool readAllAt(int32_t handle, uint8_t* data, uint64_t size, uint64_t offset) {
+    uint64_t done = 0;
+    while (done < size) {
+        const uint64_t remain = size - done;
+        const int32_t want = static_cast<int32_t>(remain > uint64_t(kIoChunk) ? kIoChunk : remain);
+        const int32_t got = flatsql_io_read(handle, data + done, want, static_cast<double>(offset + done));
+        if (got <= 0) return false;
+        done += static_cast<uint64_t>(got);
+    }
+    return true;
+}
+
+// synchronous=FULL for the commits made while it lives, then the host's own
+// level again. The compaction's commits decide which stream is the real one,
+// so each must be on the disk before the next file operation depends on it;
+// SDN runs WAL at NORMAL, where a commit may roll back on power loss.
+class DurableCommits {
+public:
+    explicit DurableCommits(SQLiteEngine& engine) : engine_(engine) {
+        QueryResult rows;
+        if (engine_.executeNoThrow("PRAGMA synchronous", {}, rows, nullptr) &&
+            !rows.rows.empty() && !rows.rows[0].empty()) {
+            if (const auto* level = std::get_if<int64_t>(&rows.rows[0][0])) previous_ = *level;
+        }
+        ok_ = engine_.executeNoThrow("PRAGMA synchronous=FULL", {}, rows, &error_);
+    }
+    ~DurableCommits() {
+        if (previous_ < 0) return;
+        QueryResult ignored;
+        engine_.executeNoThrow("PRAGMA synchronous=" + std::to_string(previous_), {}, ignored, nullptr);
+    }
+    bool ok() const { return ok_; }
+    const std::string& error() const { return error_; }
+
+private:
+    SQLiteEngine& engine_;
+    int64_t previous_ = -1;
+    bool ok_ = false;
+    std::string error_;
+};
+
+}  // namespace
+
+int FlatSQLDatabase::compactionBeginTempUnlocked() {
+    const std::string temp = compactTempPath();
+    IoHandle file(flatsql_io_open(temp.c_str(), static_cast<int32_t>(temp.size()),
+                                  FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE |
+                                  FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS));
+    if (!file.ok()) return compactionFail(kStateNoFilesystem, "cannot create " + temp);
+    compaction_.tempBytes = 0;
+    compaction_.written = 0;
+    return kStateOk;
+}
+
+int FlatSQLDatabase::compactionWriteFramesUnlocked(const std::vector<uint64_t>& offsets,
+                                                   size_t* cursor, uint64_t budget, bool sync) {
+    const std::string temp = compactTempPath();
+    IoHandle file(flatsql_io_open(temp.c_str(), static_cast<int32_t>(temp.size()),
+                                  FLATSQL_IO_READ | FLATSQL_IO_WRITE));
+    if (!file.ok()) return compactionFail(kStateNoFilesystem, "cannot open " + temp);
+    const uint8_t* arena = storage_->getDataBuffer();
+    std::vector<uint8_t> stage;
+    stage.reserve(kCompactStage);
+    auto flushStage = [&]() {
+        if (stage.empty()) return true;
+        if (!writeAllAt(file.h, stage.data(), stage.size(), compaction_.tempBytes)) return false;
+        compaction_.tempBytes += stage.size();
+        stage.clear();
+        return true;
+    };
+    uint64_t done = 0;
+    while (*cursor < offsets.size() && done < budget) {
+        const uint64_t offset = offsets[*cursor];
+        const uint64_t bytes = storage_->frameBytesAt(offset);
+        if (bytes == 0) return compactionFail(kStateCorrupt, "no frame at arena offset " + std::to_string(offset));
+        if (!stage.empty() && stage.size() + bytes > kCompactStage && !flushStage()) {
+            return compactionFail(kStateCorrupt, "write to " + temp + " failed");
+        }
+        if (bytes > kCompactStage) {
+            if (!writeAllAt(file.h, arena + offset, bytes, compaction_.tempBytes)) {
+                return compactionFail(kStateCorrupt, "write to " + temp + " failed");
+            }
+            compaction_.tempBytes += bytes;
+        } else {
+            stage.insert(stage.end(), arena + offset, arena + offset + bytes);
+        }
+        ++*cursor;
+        done += bytes;
+    }
+    if (!flushStage()) return compactionFail(kStateCorrupt, "write to " + temp + " failed");
+    if (sync && flatsql_io_sync(file.h) < 0) return compactionFail(kStateCorrupt, "fsync of " + temp + " failed");
+    return kStateOk;
+}
+
+int FlatSQLDatabase::compactionCommitLayoutUnlocked(const CompactedLayout& layout) {
+    QueryResult rows;
+    std::string err;
+    // This commit is what openState rolls forward from, and step 3 destroys
+    // the old stream: it must be on the disk first.
+    DurableCommits durable(*sqliteEngine_);
+    if (!durable.ok()) return compactionFail(kStateCorrupt, "PRAGMA synchronous=FULL: " + durable.error());
+    bool ok = false;
+    {
+        SQLiteWriteBatch batch(*sqliteEngine_);
+        ok = batch.ok();
+        auto exec = [&](const std::string& sql, std::vector<Value> params = {}) {
+            return ok && (ok = sqliteEngine_->executeNoThrow(sql, params, rows, &err));
+        };
+        exec(kSequenceRunsDDL);
+        exec("DELETE FROM _flatsql_seq_runs");
+        for (const auto& run : layout.runs) {
+            exec("INSERT INTO _flatsql_seq_runs(\"start\", first_seq) VALUES(?,?)",
+                 {Value(std::to_string(run.offset)), Value(std::to_string(run.firstSeq))});
+        }
+        exec(kSourcesDDL);
+        exec(kSourceRangesDDL);
+        for (size_t i = 0; i < registeredSources_.size(); i++) {
+            exec("INSERT OR REPLACE INTO _flatsql_sources(name, ord) VALUES(?,?)",
+                 {Value(registeredSources_[i]), Value(std::to_string(i))});
+        }
+        exec("DELETE FROM _flatsql_source_ranges");
+        for (const auto& range : layout.ranges) {
+            exec("INSERT INTO _flatsql_source_ranges(\"start\",\"stop\",source) VALUES(?,?,?)",
+                 {Value(std::to_string(range.start)), Value(std::to_string(range.end)),
+                  Value(range.source)});
+        }
+        if (ok && !rewriteIndexOffsetsUnlocked(layout.frames, &err)) ok = false;
+        exec("INSERT OR REPLACE INTO _flatsql_state(k,v) VALUES"
+             "('flushed_offset',?),('next_sequence',?),('format_version',?),('compact_pending',?)",
+             {Value(std::to_string(layout.size)), Value(std::to_string(layout.nextSequence)),
+              Value(std::to_string(layout.runs.empty() ? kFormatVersion : kFormatVersionRuns)),
+              Value(std::to_string(layout.size))});
+        ok = ok && batch.commit();
+    }
+    if (!ok) return compactionFail(kStateCorrupt, "layout commit failed: " + err);
+    rewriteSequenceRunsOnFlush_ = false;
+    return kStateOk;
+}
+
+int FlatSQLDatabase::compactionCopyStepUnlocked(uint64_t budget) {
+    IoHandle file(flatsql_io_open(streamPath_.c_str(), static_cast<int32_t>(streamPath_.size()),
+                                  FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE));
+    if (!file.ok()) return compactionFail(kStateNoFilesystem, "cannot open " + streamPath_);
+    const uint8_t* arena = storage_->getDataBuffer();
+    uint64_t done = 0;
+    while (compaction_.copied < compaction_.newSize && done < budget) {
+        const uint64_t remain = compaction_.newSize - compaction_.copied;
+        const uint64_t chunk = std::min<uint64_t>(remain, std::min<uint64_t>(budget - done, kCompactStage));
+        if (!writeAllAt(file.h, arena + compaction_.copied, chunk, compaction_.copied)) {
+            return compactionFail(kStateCorrupt, "write to " + streamPath_ + " failed");
+        }
+        compaction_.copied += chunk;
+        done += chunk;
+    }
+    if (compaction_.copied < compaction_.newSize) return kCompactPending;
+    // Cut at the mark, not at the new size: a flush between steps appended
+    // its frames past the new size, and everything past the mark is the old
+    // layout's tail.
+    if (flatsql_io_truncate(file.h, static_cast<double>(flushedOffset_)) < 0 ||
+        flatsql_io_sync(file.h) < 0) {
+        return compactionFail(kStateCorrupt, "cut and fsync of " + streamPath_ + " failed");
+    }
+    QueryResult ignored;
+    std::string err;
+    {
+        // Durable before the temp stream goes: a pending swap with no temp
+        // stream can only be discarded.
+        DurableCommits durable(*sqliteEngine_);
+        if (!durable.ok() ||
+            !sqliteEngine_->executeNoThrow("DELETE FROM _flatsql_state WHERE k='compact_pending'",
+                                           {}, ignored, &err)) {
+            return compactionFail(kStateCorrupt, "clear compact_pending: " + err + durable.error());
+        }
+    }
+    const std::string temp = compactTempPath();
+    flatsql_io_open(temp.c_str(), static_cast<int32_t>(temp.size()),
+                    FLATSQL_IO_UNLINK | FLATSQL_IO_UNLINK_IF_UNUSED);
+    return kStateOk;
+}
+
+void FlatSQLDatabase::abortArenaCompactionUnlocked() {
+    // A swap whose layout is committed is never abandoned: only finished.
+    if (compaction_.phase == ArenaCompaction::Phase::Copying) return;
+    if (diskBacked_ && !streamPath_.empty()) {
+        const std::string temp = compactTempPath();
+        flatsql_io_open(temp.c_str(), static_cast<int32_t>(temp.size()),
+                        FLATSQL_IO_UNLINK | FLATSQL_IO_UNLINK_IF_UNUSED);
+    }
+    compaction_ = ArenaCompaction{};
+}
+
+// compact_pending names a committed layout whose stream copy may not have
+// finished. Finish it from the temp stream, or — when the temp stream is not
+// the one the commit named, or the stream was cut below the new size by some
+// other hand — discard the record state whole (stream, partition map, runs):
+// its bytes can no longer be trusted, and the torn path rebuilds an empty
+// index over the existing tables (sdn-engine-partition-map-discard-trap).
+int FlatSQLDatabase::finishInterruptedCompactionOnOpen(uint64_t pendingSize, uint64_t mark) {
+    const std::string temp = compactTempPath();
+    QueryResult ignored;
+    std::string err;
+    bool rolledForward = false;
+    {
+        IoHandle stream(flatsql_io_open(streamPath_.c_str(), static_cast<int32_t>(streamPath_.size()),
+                                        FLATSQL_IO_READ | FLATSQL_IO_WRITE));
+        IoHandle staged(flatsql_io_open(temp.c_str(), static_cast<int32_t>(temp.size()),
+                                        FLATSQL_IO_READ));
+        const double streamSize = stream.ok() ? flatsql_io_size(stream.h) : -1;
+        const double stagedSize = staged.ok() ? flatsql_io_size(staged.h) : -1;
+        if (stream.ok() && staged.ok() && stagedSize >= 0 && streamSize >= 0 &&
+            static_cast<uint64_t>(stagedSize) == pendingSize &&
+            static_cast<uint64_t>(streamSize) >= pendingSize && mark >= pendingSize) {
+            std::vector<uint8_t> chunk(kCompactStage);
+            uint64_t at = 0;
+            uint64_t nextFrame = 0;
+            bool whole = true;
+            while (at < pendingSize && whole) {
+                const uint64_t n = std::min<uint64_t>(kCompactStage, pendingSize - at);
+                if (!readAllAt(staged.h, chunk.data(), n, at)) {
+                    whole = false;
+                    break;
+                }
+                // The frames must tile the temp stream exactly.
+                while (nextFrame < at + n) {
+                    uint8_t prefix[4];
+                    if (nextFrame + 4 <= at + n) {
+                        std::memcpy(prefix, chunk.data() + (nextFrame - at), 4);
+                    } else if (!readAllAt(staged.h, prefix, 4, nextFrame)) {
+                        whole = false;
+                        break;
+                    }
+                    const uint64_t length = uint64_t(prefix[0]) | (uint64_t(prefix[1]) << 8) |
+                                            (uint64_t(prefix[2]) << 16) | (uint64_t(prefix[3]) << 24);
+                    nextFrame += 4 + length;
+                }
+                if (!whole) break;
+                if (!writeAllAt(stream.h, chunk.data(), n, at)) {
+                    return kStateCorrupt;  // nothing decided; the next open retries
+                }
+                at += n;
+            }
+            if (whole && nextFrame == pendingSize) {
+                if (flatsql_io_truncate(stream.h, static_cast<double>(mark)) < 0 ||
+                    flatsql_io_sync(stream.h) < 0) {
+                    return kStateCorrupt;  // retried at the next open
+                }
+                rolledForward = true;
+            }
+        }
+    }
+    DurableCommits durable(*sqliteEngine_);
+    if (!durable.ok()) return kStateCorrupt;
+    if (!rolledForward) {
+        IoHandle stream(flatsql_io_open(streamPath_.c_str(), static_cast<int32_t>(streamPath_.size()),
+                                        FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE));
+        if (!stream.ok() || flatsql_io_truncate(stream.h, 0) < 0 || flatsql_io_sync(stream.h) < 0) {
+            return kStateCorrupt;
+        }
+        if (!sqliteEngine_->executeNoThrow(kSourceRangesDDL, {}, ignored, &err) ||
+            !sqliteEngine_->executeNoThrow("DELETE FROM _flatsql_source_ranges", {}, ignored, &err) ||
+            !sqliteEngine_->executeNoThrow(kSequenceRunsDDL, {}, ignored, &err) ||
+            !sqliteEngine_->executeNoThrow("DELETE FROM _flatsql_seq_runs", {}, ignored, &err) ||
+            !sqliteEngine_->executeNoThrow(
+                "INSERT OR REPLACE INTO _flatsql_state(k,v) VALUES('format_version',?)",
+                {Value(std::to_string(kFormatVersion))}, ignored, &err)) {
+            return kStateCorrupt;
+        }
+    }
+    if (!sqliteEngine_->executeNoThrow("DELETE FROM _flatsql_state WHERE k='compact_pending'",
+                                       {}, ignored, &err)) {
+        return kStateCorrupt;
+    }
+    flatsql_io_open(temp.c_str(), static_cast<int32_t>(temp.size()),
+                    FLATSQL_IO_UNLINK | FLATSQL_IO_UNLINK_IF_UNUSED);
     return kStateOk;
 }
 

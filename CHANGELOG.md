@@ -1,5 +1,40 @@
 # Changelog
 
+## 3.4.0
+
+- Format-1 arena compaction (docs/STORAGE-DURABILITY.md §6.4.2): `compactArena` /
+  C API `flatsql_compact_arena(handle, maxStepBytes)` packs the record arena in place with
+  only the rows a query can still see. Every surviving row keeps its sequence (sequence runs
+  in `_flatsql_seq_runs`, `next_sequence` in `_flatsql_state`; a state with runs writes
+  `format_version` 2, which older builds refuse with -2 instead of renumbering). Offsets are
+  rewritten everywhere they live: index rows' `data_offset`, the partition map, per-table
+  record lists; tombstones of dropped rows go with them. Nothing is allocated for the bytes
+  (the peak is the arena already there). It runs in bounded I/O steps with reads, ingests,
+  tombstones and flushes allowed between them; inside an open transaction it packs in memory
+  and returns 2, and the persist runs at the next call outside a transaction or at the next
+  flush. The persist is a redo log (`<db>.fsdata.compact`, one `synchronous=FULL` layout
+  commit with `compact_pending`, in-place copy, cut at the mark) that `flatsql_open_state`
+  finishes after a crash at any point. `flatsql_arena_stat(handle, which)` reports the arena
+  (size, capacity, records, dead bytes) and the last compaction.
+- WAL restored on the wasi engines (`flatsql-wasi.wasm`, `flatsql-wasi-noeh.wasm`): the VFS
+  implements `xShm*` on the heap (the single-connection case SQLite's own unix VFS handles
+  the same way) and `SQLITE_OMIT_WAL` is off those two targets (feat/wal-heap-shm, 51471e7,
+  cherry-picked). SDN's embedded engine (2.0.3 plus that commit) opens its control database
+  in `journal_mode=WAL`; every release since 2.0.3 had built these targets without WAL and
+  could not have opened it.
+- A partition's virtual table shows only its own rows: an index scan or a rowid lookup on
+  `Table@source` used to return rows of every partition sharing the base table's index table
+  (and, by rowid, rows of other tables).
+- Index inserts are `INSERT OR REPLACE` on (key, sequence): the tail past the mark replayed at
+  open after a crash between the stream's fsync and the mark's commit no longer throws (a
+  trap on the no-exceptions artifact).
+- Artifacts (sha256): `wasm/flatsql.wasm`
+  `eb61e4d65b90e3f5c5651a820b74f85fa200e3e46a0cbd9417fb82ed2db85bf8`, `wasm/flatsql-wasi.wasm`
+  `8e6a491141fa8334bcdb4fe2d3c848ea3fe7255b48fd6e9a1e012e873bca8c7a`, `wasm/flatsql-wasi-noeh.wasm`
+  `8f11fd49ee2e6961b9c1c22dd891d5a6645d0faf481f815408c0f1f5d3a385ab` (emscripten/emsdk 4.0.23, FlatBuffers 8af3053e).
+- Partition store: a reader's index state is bounded by bytes, not by the store
+  (docs/PARTITION-STORE.md §37); `flatsql-ps-threads.wasm` rebuilt for it.
+
 ## 3.3.1
 
 - flatsql_sdn_node links flatbuffers util.cpp again; no published artifact changes.

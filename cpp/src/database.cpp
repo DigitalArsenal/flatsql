@@ -416,6 +416,18 @@ void TableStore::onIngest(const uint8_t* data, size_t length, uint64_t sequence,
     }
 }
 
+void TableStore::remapRecordInfos() {
+    size_t kept = 0;
+    for (const auto& info : recordInfos_) {
+        const auto offset = storage_.getOffsetForSequence(info.sequence);
+        if (!offset) continue;
+        recordInfos_[kept++] = {*offset, info.sequence};
+    }
+    recordInfos_.resize(kept);
+    recordInfos_.shrink_to_fit();
+    recordCount_ = kept;
+}
+
 std::vector<StoredRecord> TableStore::findByIndex(const std::string& column, const Value& value) {
     std::vector<StoredRecord> results;
 
@@ -1718,7 +1730,13 @@ void FlatSQLDatabase::createUnifiedView(
 
 void FlatSQLDatabase::markDeleted(const std::string& tableName, uint64_t sequence) {
     std::unique_lock lock(*accessMutex_);
+    const size_t before = sqliteEngine_->getDeletedCount(tableName);
     sqliteEngine_->markDeleted(tableName, sequence);
+    if (sqliteEngine_->getDeletedCount(tableName) > before) {
+        if (const auto offset = storage_->getOffsetForSequence(sequence)) {
+            deadBytes_ += storage_->frameBytesAt(*offset);
+        }
+    }
     invalidateQueryResultCacheUnlocked();
 }
 
@@ -1730,7 +1748,489 @@ size_t FlatSQLDatabase::getDeletedCount(const std::string& tableName) const {
 void FlatSQLDatabase::clearTombstones(const std::string& tableName) {
     std::unique_lock lock(*accessMutex_);
     sqliteEngine_->clearTombstones(tableName);
+    recomputeDeadBytesUnlocked();
     invalidateQueryResultCacheUnlocked();
+}
+
+// ==================== Arena compaction ====================
+//
+// The arena is append-only: MarkDeleted hides a row, it never gives its bytes
+// back. compactArena rewrites the arena with the rows a query can still see.
+// The disk half (the temp stream, the layout commit, the copy) is in
+// flatsql_state.cpp; docs/STORAGE-DURABILITY.md §6.4.2 has the protocol.
+
+void FlatSQLDatabase::recomputeDeadBytesUnlocked() {
+    uint64_t dead = 0;
+    if (sqliteEngine_) {
+        for (const auto& name : sqliteEngine_->listSources()) {
+            const SourceInfo* source = sqliteEngine_->getSource(name);
+            if (!source || source->store != storage_.get()) continue;
+            for (const uint64_t sequence : source->tombstones) {
+                if (const auto offset = storage_->getOffsetForSequence(sequence)) {
+                    dead += storage_->frameBytesAt(*offset);
+                }
+            }
+        }
+    }
+    deadBytes_ = dead;
+}
+
+FlatSQLDatabase::ArenaStats FlatSQLDatabase::arenaStats() const {
+    std::shared_lock lock(*accessMutex_);
+    ArenaStats stats;
+    stats.size = storage_->getWriteOffset();
+    stats.capacity = storage_->getCapacity();
+    stats.records = storage_->getRecordCount();
+    stats.deadBytes = deadBytes_;
+    stats.compacting = compaction_.phase != ArenaCompaction::Phase::Idle;
+    return stats;
+}
+
+FlatSQLDatabase::ArenaCompactionReport FlatSQLDatabase::lastArenaCompaction() const {
+    std::shared_lock lock(*accessMutex_);
+    return lastCompaction_;
+}
+
+int FlatSQLDatabase::compactionFail(int code, std::string message) {
+    compactionError_ = "compact_arena: " + std::move(message);
+    return code;
+}
+
+// A frame is dead when every virtual table that can show it has tombstoned
+// its sequence, and at least one can show it. Which tables can show a frame
+// is what the SQL schema says right now: a partition ("OMM@celestrak") reads
+// its own record list, a base table that is still a virtual table reads every
+// frame of its file identifier, and a base name that a unified view replaced
+// reads nothing of its own. A frame no table can show (an unrouted file
+// identifier, a partition not registered yet) is kept: nothing tombstoned it.
+bool FlatSQLDatabase::planLiveFramesUnlocked(uint64_t from, uint64_t to,
+                                             std::vector<uint64_t>& keep,
+                                             uint64_t* dropped) {
+    QueryResult rows;
+    std::string err;
+    if (!sqliteEngine_->executeNoThrow(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND "
+            "sql LIKE 'CREATE VIRTUAL TABLE%'", {}, rows, &err)) {
+        compactionError_ = "compact_arena: read the schema: " + err;
+        return false;
+    }
+    std::unordered_set<std::string> vtabs;
+    for (const auto& row : rows.rows) {
+        if (!row.empty()) {
+            if (const auto* name = std::get_if<std::string>(&row[0])) vtabs.insert(*name);
+        }
+    }
+
+    std::unordered_map<std::string, std::vector<const SourceInfo*>> byFileId;
+    std::unordered_map<const void*, const SourceInfo*> byRecordList;
+    for (const auto& name : sqliteEngine_->listSources()) {
+        const SourceInfo* source = sqliteEngine_->getSource(name);
+        if (!source || source->store != storage_.get() || !vtabs.count(name)) continue;
+        if (source->sourceRecordInfos) {
+            byRecordList[source->sourceRecordInfos] = source;
+        } else {
+            byFileId[source->fileId].push_back(source);
+        }
+    }
+
+    // Which partition shows each frame, by sequence (a frame is routed to at
+    // most one table at ingest).
+    std::vector<std::pair<uint64_t, const SourceInfo*>> owned;
+    for (const auto& [name, table] : tables_) {
+        (void)name;
+        const auto it = byRecordList.find(&table->getRecordInfos());
+        if (it == byRecordList.end()) continue;
+        for (const auto& info : table->getRecordInfos()) {
+            if (info.offset >= from && info.offset < to) owned.push_back({info.sequence, it->second});
+        }
+    }
+    std::sort(owned.begin(), owned.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    const uint8_t* arena = storage_->getDataBuffer();
+    size_t ownedAt = 0;
+    uint64_t offset = from;
+    uint64_t dead = 0;
+    while (offset < to) {
+        const uint64_t bytes = storage_->frameBytesAt(offset);
+        if (bytes == 0 || offset + bytes > to) {
+            compactionError_ = "compact_arena: no whole frame at arena offset " + std::to_string(offset);
+            return false;
+        }
+        const uint64_t sequence = storage_->getSequenceForOffset(offset);
+        bool visible = false;
+        bool hidden = true;
+        while (ownedAt < owned.size() && owned[ownedAt].first < sequence) ownedAt++;
+        if (ownedAt < owned.size() && owned[ownedAt].first == sequence) {
+            visible = true;
+            if (!owned[ownedAt].second->tombstones.count(sequence)) hidden = false;
+        }
+        if (bytes >= SIZE_PREFIX_LENGTH + FILE_IDENTIFIER_OFFSET + FILE_IDENTIFIER_LENGTH) {
+            const std::string fileId(reinterpret_cast<const char*>(
+                arena + offset + SIZE_PREFIX_LENGTH + FILE_IDENTIFIER_OFFSET), FILE_IDENTIFIER_LENGTH);
+            const auto sources = byFileId.find(fileId);
+            if (sources != byFileId.end()) {
+                for (const SourceInfo* source : sources->second) {
+                    visible = true;
+                    if (!source->tombstones.count(sequence)) hidden = false;
+                }
+            }
+        }
+        if (visible && hidden) {
+            dead++;
+        } else {
+            keep.push_back(offset);
+        }
+        offset += bytes;
+    }
+    if (dropped) *dropped += dead;
+    return true;
+}
+
+int FlatSQLDatabase::compactArena(uint64_t maxStepBytes) {
+    std::unique_lock lock(*accessMutex_);
+    return compactArenaUnlocked(maxStepBytes);
+}
+
+bool FlatSQLDatabase::hasIndexTablesUnlocked() const {
+    for (const auto& [name, table] : tables_) {
+        (void)name;
+        if (!table->getIndexNames().empty()) return true;
+    }
+    return false;
+}
+
+// In a transaction: the layout commit would be neither atomic with the stream
+// nor durable inside the caller's transaction, so only memory changes. The
+// stream on disk keeps the old layout, whole, until the persist.
+int FlatSQLDatabase::compactInMemoryUnlocked() {
+    if (hasIndexTablesUnlocked()) {
+        return compactionFail(kStateCorrupt,
+            "a transaction is open and this database has index tables (their rows carry offsets)");
+    }
+    if (compaction_.phase == ArenaCompaction::Phase::Copying) {
+        // A layout is committed and its stream copy is under way from these
+        // very bytes: they may not move until it is done.
+        return kCompactDeferred;
+    }
+    if (compaction_.phase == ArenaCompaction::Phase::Writing && !compaction_.fromCurrentArena) {
+        abortArenaCompactionUnlocked();  // the old layout is still whole on disk
+    }
+    std::vector<uint64_t> keep;
+    uint64_t dropped = 0;
+    const uint64_t end = storage_->getWriteOffset();
+    if (!planLiveFramesUnlocked(0, end, keep, &dropped)) return kStateCorrupt;
+    if (dropped == 0) {
+        return compaction_.phase == ArenaCompaction::Phase::Idle ? 0 : kCompactDeferred;
+    }
+    if (compaction_.phase == ArenaCompaction::Phase::Writing) {
+        abortArenaCompactionUnlocked();  // writing an unpersisted layout: start over
+        compaction_.phase = ArenaCompaction::Phase::Unpersisted;
+    }
+    ArenaCompactionReport report;
+    report.beforeBytes = end;
+    report.beforeCapacity = storage_->getCapacity();
+    report.steps = 1;
+    report.droppedRecords = dropped;
+    const ArenaCompaction::Phase phase = compaction_.phase;
+    compaction_.report = report;
+    compaction_.phase = ArenaCompaction::Phase::Idle;  // finalize adopts in memory only
+    const bool disk = diskBacked_;
+    diskBacked_ = false;
+    const int rc = finalizeArenaCompactionUnlocked(std::move(keep), dropped);
+    diskBacked_ = disk;
+    if (rc < 0) {
+        compaction_.phase = phase;
+        return rc;
+    }
+    if (!disk) return 0;
+    compaction_ = ArenaCompaction{};
+    compaction_.phase = ArenaCompaction::Phase::Unpersisted;
+    lastCompaction_.completed = false;
+    return kCompactDeferred;
+}
+
+int FlatSQLDatabase::finishPendingPersistUnlocked() {
+    int rc;
+    do {
+        rc = compactArenaUnlocked(0);
+    } while (rc == kCompactPending);
+    return rc;
+}
+
+int FlatSQLDatabase::compactArenaUnlocked(uint64_t maxStepBytes) {
+    compactionError_.clear();
+    const bool unbounded = maxStepBytes == 0;
+    const uint64_t budget = unbounded ? UINT64_MAX : maxStepBytes;
+    if (reindexUnavailable_) return compactionFail(kStateCorrupt, "state: reindex incomplete");
+    if (!sqliteEngine_) return compactionFail(kStateCorrupt, "no engine");
+    if (!sqlite3_get_autocommit(sqliteEngine_->getDb())) return compactInMemoryUnlocked();
+
+    for (;;) {
+        switch (compaction_.phase) {
+            case ArenaCompaction::Phase::Unpersisted: {
+                // Persist the layout swapped in a transaction: the whole
+                // arena is the plan, and the old stream is not flushed to
+                // (its layout is not the arena's).
+                ArenaCompaction next;
+                next.fromCurrentArena = true;
+                next.generation = storage_->generation();
+                next.planEnd = storage_->getWriteOffset();
+                next.report = lastCompaction_;
+                next.report.steps++;
+                for (uint64_t offset = 0; offset < next.planEnd;) {
+                    const uint64_t bytes = storage_->frameBytesAt(offset);
+                    if (bytes == 0) return compactionFail(kStateCorrupt, "no whole frame at arena offset " + std::to_string(offset));
+                    next.keep.push_back(offset);
+                    offset += bytes;
+                }
+                compaction_ = std::move(next);
+                compaction_.phase = ArenaCompaction::Phase::Writing;
+                const int rc = compactionBeginTempUnlocked();
+                if (rc < 0) {
+                    compaction_ = ArenaCompaction{};
+                    compaction_.phase = ArenaCompaction::Phase::Unpersisted;
+                    return rc;
+                }
+                if (!unbounded) return kCompactPending;
+                continue;
+            }
+            case ArenaCompaction::Phase::Idle: {
+                if (diskBacked_) {
+                    // The old state on disk becomes the whole arena first, so
+                    // the stream stays at least as long as the rewritten one
+                    // at every moment of the swap (openState relies on it).
+                    const int rc = flushStateUnlocked();
+                    if (rc < 0) return compactionFail(rc, "flush before compaction failed");
+                }
+                ArenaCompaction next;
+                next.generation = storage_->generation();
+                next.planEnd = storage_->getWriteOffset();
+                next.report.beforeBytes = next.planEnd;
+                next.report.beforeCapacity = storage_->getCapacity();
+                next.report.steps = 1;
+                uint64_t dropped = 0;
+                if (!planLiveFramesUnlocked(0, next.planEnd, next.keep, &dropped)) {
+                    return kStateCorrupt;
+                }
+                if (dropped == 0) return 0;  // nothing to reclaim
+                next.report.droppedRecords = dropped;
+                compaction_ = std::move(next);
+                if (!diskBacked_) {
+                    std::vector<uint64_t> keep = std::move(compaction_.keep);
+                    return finalizeArenaCompactionUnlocked(std::move(keep), dropped);
+                }
+                const int rc = compactionBeginTempUnlocked();
+                if (rc < 0) {
+                    abortArenaCompactionUnlocked();
+                    return rc;
+                }
+                compaction_.phase = ArenaCompaction::Phase::Writing;
+                if (!unbounded) return kCompactPending;
+                continue;
+            }
+            case ArenaCompaction::Phase::Writing: {
+                compaction_.report.steps++;
+                const bool unpersisted = compaction_.fromCurrentArena;
+                // Abandoning an unpersisted layout's write leaves it
+                // unpersisted, never idle: the stream still has the old one.
+                auto abandon = [this, unpersisted]() {
+                    abortArenaCompactionUnlocked();
+                    if (unpersisted) compaction_.phase = ArenaCompaction::Phase::Unpersisted;
+                };
+                if (storage_->generation() != compaction_.generation ||
+                    storage_->getWriteOffset() < compaction_.planEnd) {
+                    abandon();
+                    return compactionFail(kStateCorrupt, "the arena was reset between steps");
+                }
+                if (compaction_.written < compaction_.keep.size()) {
+                    const int rc = compactionWriteFramesUnlocked(
+                        compaction_.keep, &compaction_.written, budget, false);
+                    if (rc < 0) {
+                        abandon();
+                        return rc;
+                    }
+                    if (!unbounded) return kCompactPending;
+                    continue;
+                }
+                // Everything planned is in the temp stream. The frames
+                // appended since are planned now, flushed in the old layout
+                // first so the old state stays complete until the swap (an
+                // unpersisted layout has no old state to keep complete).
+                if (!unpersisted) {
+                    const int flushed = flushStateUnlocked();
+                    if (flushed < 0) {
+                        abandon();
+                        return compactionFail(flushed, "flush before the swap failed");
+                    }
+                }
+                std::vector<uint64_t> keep = std::move(compaction_.keep);
+                uint64_t dropped = compaction_.report.droppedRecords;
+                if (!planLiveFramesUnlocked(compaction_.planEnd, storage_->getWriteOffset(), keep, &dropped)) {
+                    abandon();
+                    return kStateCorrupt;
+                }
+                const int rc = finalizeArenaCompactionUnlocked(std::move(keep), dropped);
+                if (rc < 0) {
+                    if (unpersisted) compaction_.phase = ArenaCompaction::Phase::Unpersisted;
+                    return rc;
+                }
+                if (!unbounded) return kCompactPending;
+                continue;
+            }
+            case ArenaCompaction::Phase::Copying: {
+                compaction_.report.steps++;
+                const int rc = compactionCopyStepUnlocked(budget);
+                if (rc < 0) return rc;  // stays Copying: the next call retries
+                if (rc == kCompactPending) {
+                    if (!unbounded) return kCompactPending;
+                    continue;
+                }
+                lastCompaction_ = compaction_.report;
+                lastCompaction_.completed = true;
+                compaction_ = ArenaCompaction{};
+                return 0;
+            }
+        }
+    }
+}
+
+bool FlatSQLDatabase::rewriteIndexOffsetsUnlocked(
+        const std::vector<StreamingFlatBufferStore::KeptFrame>& frames, std::string* err) {
+    std::set<std::string> indexTables;
+    for (const auto& [name, table] : tables_) {
+        (void)name;
+        for (const auto& column : table->getIndexNames()) {
+            if (SqliteIndex* index = table->getIndex(column)) indexTables.insert(index->getIndexTableName());
+        }
+    }
+    if (indexTables.empty()) return true;
+    QueryResult ignored;
+    auto exec = [&](const std::string& sql, const std::vector<Value>& params = {}) {
+        return sqliteEngine_->executeNoThrow(sql, params, ignored, err);
+    };
+    if (!exec("DROP TABLE IF EXISTS _flatsql_compact_map") ||
+        !exec("CREATE TABLE _flatsql_compact_map(seq INTEGER PRIMARY KEY, off INTEGER NOT NULL)")) {
+        return false;
+    }
+    for (const auto& frame : frames) {
+        if (!exec("INSERT INTO _flatsql_compact_map(seq, off) VALUES(?,?)",
+                  {Value(static_cast<int64_t>(frame.sequence)), Value(static_cast<int64_t>(frame.newOffset))})) {
+            return false;
+        }
+    }
+    for (const auto& table : indexTables) {
+        const std::string quoted = "\"" + table + "\"";
+        if (!exec("DELETE FROM " + quoted + " WHERE sequence NOT IN (SELECT seq FROM _flatsql_compact_map)") ||
+            !exec("UPDATE " + quoted + " SET data_offset = m.off FROM _flatsql_compact_map AS m"
+                  " WHERE m.seq = " + quoted + ".sequence")) {
+            return false;
+        }
+    }
+    return exec("DROP TABLE _flatsql_compact_map");
+}
+
+int FlatSQLDatabase::finalizeArenaCompactionUnlocked(std::vector<uint64_t>&& keep, uint64_t dropped) {
+    CompactedLayout layout;
+    if (!storage_->planCompacted(keep, layout.frames, &layout.size)) {
+        abortArenaCompactionUnlocked();
+        return compactionFail(kStateCorrupt, "the plan names an offset that is not a whole frame");
+    }
+    layout.nextSequence = storage_->nextSequence();
+
+    // Sequence runs: wherever a kept frame's sequence is not one past the
+    // previous kept frame's, and at the end when the next sequence is not.
+    uint64_t expected = 1;
+    for (const auto& frame : layout.frames) {
+        if (frame.sequence != expected) layout.runs.push_back({frame.newOffset, frame.sequence});
+        expected = frame.sequence + 1;
+    }
+    if (layout.nextSequence != expected) layout.runs.push_back({layout.size, layout.nextSequence});
+
+    // The partition map in the new offsets: a source's kept frames are
+    // contiguous wherever its old frames were, minus the dead ones between.
+    size_t rangeCursor = 0;
+    for (const auto& frame : layout.frames) {
+        const std::string* source = sourceForOffset(frame.oldOffset, &rangeCursor);
+        if (!source) continue;
+        const uint64_t end = frame.newOffset + storage_->frameBytesAt(frame.oldOffset);
+        if (!layout.ranges.empty() && layout.ranges.back().source == *source &&
+            layout.ranges.back().end == frame.newOffset) {
+            layout.ranges.back().end = end;
+        } else {
+            layout.ranges.push_back(SourceRange{frame.newOffset, end, *source});
+        }
+    }
+
+    if (diskBacked_) {
+        // The temp stream gets the frames it does not hold yet (appended
+        // since the plan), and becomes durable before the layout commit
+        // names it.
+        const int wrote = compactionWriteFramesUnlocked(keep, &compaction_.written, UINT64_MAX, true);
+        if (wrote < 0) {
+            abortArenaCompactionUnlocked();
+            return wrote;
+        }
+        if (compaction_.tempBytes != layout.size) {
+            abortArenaCompactionUnlocked();
+            return compactionFail(kStateCorrupt, "the temp stream holds " +
+                std::to_string(compaction_.tempBytes) + " bytes, the compacted arena " +
+                std::to_string(layout.size));
+        }
+        const int committed = compactionCommitLayoutUnlocked(layout);
+        if (committed < 0) {
+            abortArenaCompactionUnlocked();
+            return committed;
+        }
+    } else {
+        SQLiteWriteBatch batch(*sqliteEngine_);
+        std::string err;
+        if (!batch.ok() || !rewriteIndexOffsetsUnlocked(layout.frames, &err) || !batch.commit()) {
+            abortArenaCompactionUnlocked();
+            return compactionFail(kStateCorrupt, "index rewrite failed: " + err + batch.error());
+        }
+    }
+
+    // Adopt. From here the new layout is the one on disk (pending the copy)
+    // and the one in memory.
+    ArenaCompactionReport report = compaction_.report;
+    report.droppedRecords = dropped;
+    report.keptRecords = layout.frames.size();
+    report.sequenceRuns = layout.runs.size();
+    report.afterBytes = layout.size;
+    storage_->compactInPlace(layout.frames, layout.size, std::move(layout.runs));
+    report.afterCapacity = storage_->getCapacity();
+    sourceRanges_ = std::move(layout.ranges);
+    for (auto& [name, table] : tables_) {
+        (void)name;
+        table->remapRecordInfos();
+    }
+    // A tombstone whose row is gone is gone with it.
+    for (const auto& name : sqliteEngine_->listSources()) {
+        SourceInfo* source = sqliteEngine_->getSource(name);
+        if (!source || source->store != storage_.get() || source->tombstones.empty()) continue;
+        std::unordered_set<uint64_t> still;
+        for (const uint64_t sequence : source->tombstones) {
+            if (storage_->hasRecord(sequence)) still.insert(sequence);
+        }
+        source->tombstones.swap(still);
+    }
+    recomputeDeadBytesUnlocked();
+    invalidateQueryResultCacheUnlocked();
+    lastCompaction_ = report;
+    if (diskBacked_) {
+        flushedOffset_ = layout.size;
+        compaction_.keep.clear();
+        compaction_.keep.shrink_to_fit();
+        compaction_.report = report;
+        compaction_.newSize = layout.size;
+        compaction_.copied = 0;
+        compaction_.phase = ArenaCompaction::Phase::Copying;
+        return kCompactPending;
+    }
+    lastCompaction_.completed = true;
+    compaction_ = ArenaCompaction{};
+    return 0;
 }
 
 // ==================== Encryption ====================

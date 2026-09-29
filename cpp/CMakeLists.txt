@@ -208,6 +208,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
                 \"_flatsql_ingest_with_source\", \"_flatsql_ingest_one_with_source\", \
                 \"_flatsql_set_arena_limit\", \
+                \"_flatsql_compact_arena\", \"_flatsql_arena_stat\", \
                 \"_flatsql_get_sources_count\", \"_flatsql_get_source_name\", \
                 \"_flatsql_query\", \"_flatsql_query_params\", \"_flatsql_query_many\", \
                 \"_flatsql_build_query_cache_key\", \
@@ -286,7 +287,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_TEMP_STORE=3
         SQLITE_THREADSAFE=0
         SQLITE_OMIT_LOAD_EXTENSION=1
-        SQLITE_OMIT_WAL=1
+        # SQLITE_OMIT_WAL intentionally NOT set: the VFS implements xShm* on
+        # the heap, so journal_mode=WAL works on this lane.
         SQLITE_OMIT_DEPRECATED=1
         SQLITE_OMIT_SHARED_CACHE=1
         SQLITE_DEFAULT_MEMSTATUS=0
@@ -314,6 +316,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
                 \"_flatsql_ingest_with_source\", \"_flatsql_ingest_one_with_source\", \
                 \"_flatsql_set_arena_limit\", \
+                \"_flatsql_compact_arena\", \"_flatsql_arena_stat\", \
                 \"_flatsql_get_sources_count\", \"_flatsql_get_source_name\", \
                 \"_flatsql_query\", \"_flatsql_query_params\", \"_flatsql_query_many\", \
                 \"_flatsql_build_query_cache_key\", \
@@ -401,7 +404,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
         SQLITE_TEMP_STORE=3
         SQLITE_THREADSAFE=0
         SQLITE_OMIT_LOAD_EXTENSION=1
-        SQLITE_OMIT_WAL=1
+        # SQLITE_OMIT_WAL intentionally NOT set: the VFS implements xShm* on
+        # the heap, so journal_mode=WAL works on this lane.
         SQLITE_OMIT_DEPRECATED=1
         SQLITE_OMIT_SHARED_CACHE=1
         SQLITE_DEFAULT_MEMSTATUS=0
@@ -894,6 +898,28 @@ else()
     add_executable(flatsql_arena_limit_test test/arena_limit_test.cpp)
     target_link_libraries(flatsql_arena_limit_test PRIVATE flatsql_lib)
     add_test(NAME FlatSQLArenaLimitTest COMMAND flatsql_arena_limit_test)
+
+    # Arena compaction: equivalence, steps, crash injection at every host-I/O
+    # call, churn soak. The test supplies the seven flatsql_io_* functions (an
+    # in-memory filesystem with power-loss semantics), so it compiles the
+    # engine sources without flatsql_io_native.cpp instead of linking
+    # flatsql_lib.
+    add_executable(flatsql_arena_compaction_test test/arena_compaction_test.cpp
+        ${FLATSQL_LIB_SOURCES} src/flatsql_vfs.cpp
+        ${FLATBUFFERS_SRC_DIR}/util.cpp ${FLATBUFFERS_SRC_DIR}/options.cpp)
+    target_compile_definitions(flatsql_arena_compaction_test PRIVATE FLATSQL_ENABLE_IO_VFS=1)
+    target_include_directories(flatsql_arena_compaction_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+        ${SQLEAN_DIR}
+    )
+    target_link_libraries(flatsql_arena_compaction_test PRIVATE sqlite3 Threads::Threads)
+    if(OpenSSL_FOUND)
+        target_link_libraries(flatsql_arena_compaction_test PRIVATE OpenSSL::Crypto)
+        target_include_directories(flatsql_arena_compaction_test PRIVATE ${OPENSSL_INCLUDE_DIR})
+    endif()
+    add_test(NAME FlatSQLArenaCompactionTest COMMAND flatsql_arena_compaction_test)
     # Database-key record encryption (field-encryption format 3). The schema
     # compiler serializes the test's binary schemas. Every backend has record
     # encryption (OpenSSL, or the fallback from FlatBuffers 8af3053e on).

@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace flatsql {
 
@@ -167,7 +168,64 @@ public:
         sequenceToOffset_.clear();
         offsetToSequence_.clear();
         fileIdToRecords_.clear();
+        sequenceRuns_.clear();
+        runCursor_ = 0;
+        sequenceRunsConsistent_ = true;
+        generation_++;
     }
+
+    // ---- Sequence runs (arena compaction) ---------------------------------
+    //
+    // A record's sequence is its rowid, its record-encryption index and the
+    // key hosts track it by, so it must survive a compaction and every replay
+    // after one. The stream carries SDS wire bytes and nothing else, so the
+    // numbering lives beside it: a run says "the frame at `offset` has
+    // sequence `firstSeq`", and the frames after it count up by one until the
+    // next run. A stream that was never compacted has no runs and numbers its
+    // frames 1, 2, 3, ... exactly as before.
+    struct SequenceRun {
+        uint64_t offset = 0;
+        uint64_t firstSeq = 0;
+    };
+    // Replace the runs (sorted by offset). Runs at or past writeOffset_ apply
+    // to frames appended from here on; runs below it are history.
+    void setSequenceRuns(std::vector<SequenceRun> runs);
+    const std::vector<SequenceRun>& sequenceRuns() const { return sequenceRuns_; }
+    // Add a run at the current end so the next frame gets `firstSeq`.
+    void startSequenceRunAtEnd(uint64_t firstSeq);
+    // False once a run asked for a sequence at or below one already given out.
+    bool sequenceRunsConsistent() const { return sequenceRunsConsistent_; }
+    // Bumped by reset() and by a compaction: a plan made against an older
+    // generation no longer describes the arena.
+    uint64_t generation() const { return generation_; }
+
+    // ---- Compaction ---------------------------------------------------------
+    struct KeptFrame {
+        uint64_t oldOffset;
+        uint64_t newOffset;
+        uint64_t sequence;
+    };
+    // Size of the frame at `offset` including its 4-byte prefix, or 0 when
+    // `offset` is not a whole frame inside the arena.
+    uint64_t frameBytesAt(uint64_t offset) const noexcept;
+    // Where each frame at `keep` (ascending offsets, each a frame start)
+    // lands when the arena is packed from offset 0 in that order, and the
+    // packed size. False when an offset is not a whole frame.
+    bool planCompacted(const std::vector<uint64_t>& keep, std::vector<KeptFrame>& frames,
+                       uint64_t* packedSize) const;
+    // Pack the arena IN PLACE to that plan: every kept frame moves down to its
+    // planned offset, in order (a frame only ever moves down, so none is
+    // overwritten before it moves), and keeps its sequence; the maps are
+    // rebuilt, the old ones released. Nothing is allocated for the bytes, so
+    // the compaction's peak memory is the arena it already had. The capacity
+    // is kept: wasm linear memory never shrinks, and an arena shrunk to its
+    // live bytes regrows by doubling into a fragmented heap (measured at
+    // host-02 shape: 1.4 GiB of linear memory against 1.0 GiB in place).
+    // setArenaLimit bounds it. nextSequence() is unchanged.
+    void compactInPlace(const std::vector<KeptFrame>& frames, uint64_t packedSize,
+                        std::vector<SequenceRun> runs);
+    // Bytes the arena has allocated (its capacity), as opposed to its size.
+    uint64_t getCapacity() const { return data_.size(); }
 
     // Extract file identifier from a FlatBuffer (bytes 4-7)
     static std::string extractFileId(const uint8_t* flatbuffer, size_t length);
@@ -191,6 +249,9 @@ public:
 private:
     void ensureCapacity(size_t needed);
     void indexRecord(const std::string& fileId, uint64_t offset);
+    // The sequence of a frame appended at `offset`: the next one, unless a
+    // run starts there.
+    uint64_t takeSequence(uint64_t offset);
 
     std::vector<uint8_t> data_;
     size_t arenaLimit_ = kDefaultArenaLimit;
@@ -206,6 +267,11 @@ private:
 
     // fileId → list of record info for O(1) iteration by file type
     std::unordered_map<std::string, std::vector<FileRecordInfo>> fileIdToRecords_;
+
+    std::vector<SequenceRun> sequenceRuns_;  // sorted by offset
+    size_t runCursor_ = 0;                   // first run not yet reached
+    bool sequenceRunsConsistent_ = true;
+    uint64_t generation_ = 0;
 };
 
 // Backwards compatibility alias

@@ -1,8 +1,8 @@
 {
   "algorithm": "sha384",
-  "hash": "JWRTdWbV8EJ/0t0YI2Dun2xEqFT/5CBm53E8feeI9+4ULvqj+BpHfWPpW21DAOiM",
-  "sri": "sha384-JWRTdWbV8EJ/0t0YI2Dun2xEqFT/5CBm53E8feeI9+4ULvqj+BpHfWPpW21DAOiM",
-  "size": 2171442,
+  "hash": "PAY8EKMzvf5QkghYRLfSmTMOEc7rHYUQyMoV1w+uwGMq+HP3A73Ij/ZyI/KtKFXP",
+  "sri": "sha384-PAY8EKMzvf5QkghYRLfSmTMOEc7rHYUQyMoV1w+uwGMq+HP3A73Ij/ZyI/KtKFXP",
+  "size": 2246620,
   "files": {
     "flatsql-ps-threads.wasm": {
       "sha256": "28f56226f97c16bc7e88c88c81003b0685a22a65f272e8cad7837ad380d0dd6d",
@@ -10,19 +10,19 @@
       "size": 2334491
     },
     "flatsql-wasi-noeh.wasm": {
-      "sha256": "7315eb0361513578c7a011db8b1e10a7d41625e8fae59c276b61e2d1529bb591",
-      "sri": "sha384-sbtoG+Ne4mkC7j/hfJ3nvx/IOzvB3bjv24x+pkTn8CVuF0ghKtBbZ01ZdIxki7Rj",
-      "size": 2062044
+      "sha256": "8f11fd49ee2e6961b9c1c22dd891d5a6645d0faf481f815408c0f1f5d3a385ab",
+      "sri": "sha384-Y7JqN0TgofROVAG/jtJb623501xOW9G8BZ3QwKUUudEgmGM2f1R8tYitm872ATUg",
+      "size": 2154784
     },
     "flatsql-wasi.wasm": {
-      "sha256": "989ea9fc7be9539bda7878e5202bee46b4ba45fd59d8718b01a2a8a6c7cb1afd",
-      "sri": "sha384-avovLPDagClSRBYZRRA7k6ys490F67ef9i5G/0WMckwDRyTUKo5lYT/3kCUBzZad",
-      "size": 2147171
+      "sha256": "8e6a491141fa8334bcdb4fe2d3c848ea3fe7255b48fd6e9a1e012e873bca8c7a",
+      "sri": "sha384-vuSaOKS04thKQ51uvexi4JUNpW6Ptgs6yy6ONdffkjJIBVtULhvaXPY+4k7YFL6v",
+      "size": 2249367
     },
     "flatsql.wasm": {
-      "sha256": "45e291c9293fc0c2c27e87cd410c813cd54f97ba6c3459d328122c1c37909d1f",
-      "sri": "sha384-JWRTdWbV8EJ/0t0YI2Dun2xEqFT/5CBm53E8feeI9+4ULvqj+BpHfWPpW21DAOiM",
-      "size": 2171442
+      "sha256": "eb61e4d65b90e3f5c5651a820b74f85fa200e3e46a0cbd9417fb82ed2db85bf8",
+      "sri": "sha384-PAY8EKMzvf5QkghYRLfSmTMOEc7rHYUQyMoV1w+uwGMq+HP3A73Ij/ZyI/KtKFXP",
+      "size": 2246620
     }
   }
 }

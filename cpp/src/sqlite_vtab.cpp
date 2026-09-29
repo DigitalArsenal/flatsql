@@ -503,6 +503,27 @@ void foldCursorStats(FlatBufferCursor* cursor) {
     cursor->indexEntriesRead = 0;
 }
 
+// Whether the row with this sequence is one of this table's rows. A
+// partition ("OMM@celestrak") holds only the rows routed to it, but it shares
+// its index tables (and the sequence space) with every other partition of the
+// same base table, so an index entry or a rowid can name another partition's
+// row — or, by rowid, another table's. A base table that is still a virtual
+// table reads every frame of its file identifier.
+bool tableHoldsRow(const FlatBufferVTab* vtab, uint64_t sequence, const uint8_t* data, uint32_t length) {
+    if (vtab->sourceRecordInfos) {
+        const auto& infos = *vtab->sourceRecordInfos;  // ascending by sequence
+        const auto it = std::lower_bound(
+            infos.begin(), infos.end(), sequence,
+            [](const StreamingFlatBufferStore::FileRecordInfo& info, uint64_t seq) {
+                return info.sequence < seq;
+            });
+        return it != infos.end() && it->sequence == sequence;
+    }
+    if (vtab->fileId.size() != FILE_IDENTIFIER_LENGTH) return true;
+    return length >= FILE_IDENTIFIER_OFFSET + FILE_IDENTIFIER_LENGTH &&
+           std::memcmp(data + FILE_IDENTIFIER_OFFSET, vtab->fileId.data(), FILE_IDENTIFIER_LENGTH) == 0;
+}
+
 // Position the cursor on the next live index entry, or at EOF.
 int advanceIndexScan(FlatBufferCursor* cursor) {
     FlatBufferVTab* vtab = cursor->vtab;
@@ -528,7 +549,7 @@ int advanceIndexScan(FlatBufferCursor* cursor) {
         }
         uint32_t len = 0;
         const uint8_t* data = vtab->store->getDataAtOffset(offset, &len);
-        if (!data) {
+        if (!data || !tableHoldsRow(vtab, sequence, data, len)) {
             continue;
         }
         cursor->currentOffset = offset;
@@ -691,7 +712,7 @@ int FlatBufferVTabModule::xFilter(sqlite3_vtab_cursor* pCursor, int idxNum, cons
             } else {
                 uint32_t len = 0;
                 const uint8_t* data = vtab->store->getDataAtOffset(offsetOpt.value(), &len);
-                if (data) {
+                if (data && tableHoldsRow(vtab, static_cast<uint64_t>(rowid), data, len)) {
                     cursor->currentOffset = offsetOpt.value();
                     cursor->currentSequence = static_cast<uint64_t>(rowid);
                     cursor->currentData = data;

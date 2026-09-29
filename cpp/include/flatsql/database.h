@@ -102,6 +102,11 @@ public:
         return recordInfos_;
     }
 
+    // After an arena compaction: keep the records the store still holds, at
+    // their new offsets, in the same order. The vector object stays the same
+    // one (virtual tables hold a pointer to it); its old capacity is released.
+    void remapRecordInfos();
+
 private:
     TableDef tableDef_;
     std::string fileId_;  // 4-byte file identifier for routing
@@ -437,6 +442,60 @@ public:
 
     // High-water mark a host may resume its own journal from.
     uint64_t flushedOffset() const { return flushedOffset_; }
+
+    // ---- Arena compaction (docs/STORAGE-DURABILITY.md §6.4.2) -----------------
+    // The record arena only ever grows: a tombstoned row keeps its bytes until
+    // the arena is rewritten. compactArena rewrites it with only the rows a
+    // query can still see. Every surviving row KEEPS its sequence (rowid,
+    // record-encryption index); offsets, the partition map, the index rows'
+    // data offsets and the persisted stream are rewritten to match.
+    //
+    // It runs in steps so a host can release its lock between them: each call
+    // does at most about `maxStepBytes` of I/O (0: everything in this call).
+    // Returns kCompactPending (1) while more steps remain, 0 when there is
+    // nothing (left) to do, or a negative state code with
+    // lastCompactionError() set. Reads, ingests, tombstones and flushes may run
+    // between steps. A crash at any point leaves the old state or the new one,
+    // and openState accepts either (it finishes an interrupted swap).
+    //
+    // Inside an open transaction (a host that mirrors records in the same
+    // transaction as its own rows) the compaction cannot commit its layout,
+    // so it swaps the arena in memory only and returns kCompactDeferred (2):
+    // the room is there at once, and the next call outside a transaction
+    // persists the new layout in steps. A flush in between persists it first.
+    // (A database with index tables is refused in a transaction: their rows
+    // carry offsets and would have to be rewritten in the caller's
+    // transaction.)
+    static constexpr int kCompactPending = 1;
+    static constexpr int kCompactDeferred = 2;
+    int compactArena(uint64_t maxStepBytes);
+    const std::string& lastCompactionError() const { return compactionError_; }
+
+    struct ArenaStats {
+        uint64_t size = 0;        // bytes of frames in the arena
+        uint64_t capacity = 0;    // bytes the arena has allocated
+        uint64_t records = 0;     // frames in the arena
+        uint64_t deadBytes = 0;   // frame bytes of tombstoned rows (see below)
+        bool compacting = false;  // a compaction is between steps
+    };
+    // deadBytes counts each tombstone once per partition that set it, the
+    // moment it is set. It is what a compaction can expect to reclaim, not a
+    // promise: compactArena decides liveness itself.
+    ArenaStats arenaStats() const;
+
+    struct ArenaCompactionReport {
+        uint64_t beforeBytes = 0;     // arena bytes when the compaction planned
+        uint64_t afterBytes = 0;      // arena bytes it adopted
+        uint64_t beforeCapacity = 0;
+        uint64_t afterCapacity = 0;
+        uint64_t keptRecords = 0;
+        uint64_t droppedRecords = 0;
+        uint64_t sequenceRuns = 0;
+        uint64_t steps = 0;
+        bool completed = false;
+    };
+    // The last compaction that adopted a new arena.
+    ArenaCompactionReport lastArenaCompaction() const;
 
     // Path of the SDS FlatBuffer stream that backs this database.
     const std::string& streamPath() const { return streamPath_; }
@@ -882,6 +941,72 @@ private:
     int restoreSourceIndex();
     int persistSourceIndex(uint64_t upToOffset);
     void rebindSourceViews();
+
+    // Sequence runs + next sequence (arena compaction). restore reads them for
+    // a stream of `streamSize` bytes (format 2 only; format-1 state has none
+    // and any stale rows are dropped); persist writes the runs a flush has not
+    // written yet, and the next sequence.
+    int restoreSequenceRuns(uint64_t streamSize, const std::string& formatVersion);
+    int persistSequenceRuns(uint64_t fromOffset);
+    void resumeSequenceAfterReplayUnlocked();
+    uint64_t persistedNextSequence_ = 0;
+    bool rewriteSequenceRunsOnFlush_ = false;
+
+    // Arena compaction state between steps (database.cpp, flatsql_state.cpp).
+    struct ArenaCompaction {
+        // Unpersisted: the arena was swapped in memory inside a transaction;
+        // the stream on disk still has the old layout.
+        enum class Phase : uint8_t { Idle, Unpersisted, Writing, Copying };
+        Phase phase = Phase::Idle;
+        bool fromCurrentArena = false;  // Writing an Unpersisted layout
+        uint64_t generation = 0;     // storage generation the plan belongs to
+        uint64_t planEnd = 0;        // arena bytes the plan covers
+        std::vector<uint64_t> keep;  // frames kept below planEnd (old offsets)
+        size_t written = 0;          // keep entries already in the temp file
+        uint64_t tempBytes = 0;      // bytes in the temp file
+        uint64_t newSize = 0;        // Copying: bytes of the rewritten stream
+        uint64_t copied = 0;         // Copying: bytes copied into the stream
+        ArenaCompactionReport report;
+    };
+    ArenaCompaction compaction_;
+    ArenaCompactionReport lastCompaction_;
+    std::string compactionError_;
+    uint64_t deadBytes_ = 0;
+
+    int compactionFail(int code, std::string message);
+    int compactArenaUnlocked(uint64_t maxStepBytes);
+    // The in-transaction form: plan, build and adopt in memory only.
+    int compactInMemoryUnlocked();
+    // Run a pending persist (Unpersisted, or Writing it) to the end.
+    int finishPendingPersistUnlocked();
+    bool hasIndexTablesUnlocked() const;
+    // Frames in [from, to) a query can still see, as arena offsets.
+    bool planLiveFramesUnlocked(uint64_t from, uint64_t to, std::vector<uint64_t>& keep,
+                                uint64_t* dropped);
+    // Build, persist (disk-backed) and adopt the compacted arena.
+    int finalizeArenaCompactionUnlocked(std::vector<uint64_t>&& keep, uint64_t dropped);
+    void recomputeDeadBytesUnlocked();
+    std::string compactTempPath() const { return streamPath_ + ".compact"; }
+    // flatsql_state.cpp: the disk half.
+    int compactionBeginTempUnlocked();
+    int compactionWriteFramesUnlocked(const std::vector<uint64_t>& offsets, size_t* cursor,
+                                      uint64_t budget, bool sync);
+    struct CompactedLayout {
+        std::vector<StreamingFlatBufferStore::KeptFrame> frames;
+        std::vector<SourceRange> ranges;
+        std::vector<StreamingFlatBufferStore::SequenceRun> runs;
+        uint64_t size = 0;
+        uint64_t nextSequence = 0;
+    };
+    int compactionCommitLayoutUnlocked(const CompactedLayout& layout);
+    // Index rows carry their record's arena offset: rows of dropped records
+    // go, the rest move with their record. SQL only; the caller owns the
+    // transaction. False with *err set.
+    bool rewriteIndexOffsetsUnlocked(const std::vector<StreamingFlatBufferStore::KeptFrame>& frames,
+                                     std::string* err);
+    int compactionCopyStepUnlocked(uint64_t budget);
+    void abortArenaCompactionUnlocked();
+    int finishInterruptedCompactionOnOpen(uint64_t pendingSize, uint64_t mark);
 };
 
 }  // namespace flatsql

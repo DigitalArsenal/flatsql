@@ -147,8 +147,13 @@ SqliteIndex::SqliteIndex(sqlite3* db, const std::string& tableName,
         throw std::runtime_error("Failed to create index table: " + err);
     }
 
-    // Prepare statements
-    std::string insertSql = "INSERT INTO \"" + indexTableName_ +
+    // Prepare statements. OR REPLACE: (key, sequence) names one record, so a
+    // second insert of it is that record indexed again — the stream tail past
+    // the mark replayed at open after a crash between the stream's fsync and
+    // the mark's commit, whose index rows were already committed. A plain
+    // INSERT threw there, which the no-exceptions wasm build turns into a
+    // trap that poisons the instance.
+    std::string insertSql = "INSERT OR REPLACE INTO \"" + indexTableName_ +
         "\" (key, data_offset, data_length, sequence) VALUES (?, ?, ?, ?)";
     rc = sqlite3_prepare_v2(db_, insertSql.c_str(), -1, &insertStmt_, nullptr);
     if (rc != SQLITE_OK) {

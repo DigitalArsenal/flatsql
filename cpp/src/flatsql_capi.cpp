@@ -898,6 +898,63 @@ double flatsql_flushed_offset(void* handle) {
         static_cast<FlatSQLDatabase*>(handle)->flushedOffset());
 }
 
+// ---- Arena compaction (docs/STORAGE-DURABILITY.md §6.4.2) --------------------
+// Rewrites the record arena with only the rows a query can still see; every
+// row keeps its sequence. One call does at most about maxStepBytes of I/O
+// (0: all of it): 1 = call again, 0 = done (or nothing to reclaim), 2 = the
+// arena was swapped in memory inside an open transaction and the next call
+// outside one persists it, negative = a state code with flatsql_get_error()
+// set. Reads, ingests, tombstones and
+// flushes may run between calls; a crash between any two leaves a state
+// flatsql_open_state accepts.
+EMSCRIPTEN_KEEPALIVE
+int flatsql_compact_arena(void* handle, double maxStepBytes) {
+    if (!handle) return FlatSQLDatabase::kStateNoFilesystem;
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    const uint64_t budget = maxStepBytes > 0 ? static_cast<uint64_t>(maxStepBytes) : 0;
+    const int rc = db->compactArena(budget);
+    if (rc < 0) g_lastError = db->lastCompactionError();
+    return rc;
+}
+
+// Arena figures, by index:
+//   0 size (bytes of frames)      1 capacity (bytes allocated)
+//   2 records                     3 dead bytes (tombstoned rows' frames)
+//   4 1 while a compaction is between steps
+// and of the last compaction that adopted a new arena:
+//   10 bytes before   11 bytes after   12 capacity before  13 capacity after
+//   14 rows kept      15 rows dropped  16 sequence runs    17 steps
+//   18 1 when its stream swap finished
+EMSCRIPTEN_KEEPALIVE
+double flatsql_arena_stat(void* handle, int which) {
+    if (!handle) return -1;
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    if (which < 10) {
+        const auto stats = db->arenaStats();
+        switch (which) {
+            case 0: return static_cast<double>(stats.size);
+            case 1: return static_cast<double>(stats.capacity);
+            case 2: return static_cast<double>(stats.records);
+            case 3: return static_cast<double>(stats.deadBytes);
+            case 4: return stats.compacting ? 1 : 0;
+            default: return -1;
+        }
+    }
+    const auto last = db->lastArenaCompaction();
+    switch (which) {
+        case 10: return static_cast<double>(last.beforeBytes);
+        case 11: return static_cast<double>(last.afterBytes);
+        case 12: return static_cast<double>(last.beforeCapacity);
+        case 13: return static_cast<double>(last.afterCapacity);
+        case 14: return static_cast<double>(last.keptRecords);
+        case 15: return static_cast<double>(last.droppedRecords);
+        case 16: return static_cast<double>(last.sequenceRuns);
+        case 17: return static_cast<double>(last.steps);
+        case 18: return last.completed ? 1 : 0;
+        default: return -1;
+    }
+}
+
 // Path of the SDS FlatBuffer stream backing this handle ("" when ephemeral).
 EMSCRIPTEN_KEEPALIVE
 const char* flatsql_stream_path(void* handle) {
