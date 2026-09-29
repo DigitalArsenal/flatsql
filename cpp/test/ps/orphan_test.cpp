@@ -270,6 +270,9 @@ struct OrphanHarness {
             return false;
         }
         Reader rd(s, LaneClass::Interactive, 1);
+        // A12: files a statement may still read wait for it.
+        s.e->setReaderGate([](void* ctx) -> uint64_t { return static_cast<ReaderInstance*>(ctx)->oldestActiveStart(); },
+                           rd.inst.get());
         const Rows t = rd.q("SELECT first_live_count FROM flatsql_types WHERE type = 'OMM'");
         if (t.status != 0 || t.rows.size() != 1 || uint64_t(t.i(0, 0)) != live) {
             std::fprintf(stderr, "  [%s] first_live_count %lld, %llu live records\n", phase,
@@ -283,8 +286,14 @@ struct OrphanHarness {
             if (pool.empty()) continue;
             const Rec* r = pool[rng() % pool.size()];
             const Rows c = rd.q("SELECT count(*) FROM OMM WHERE _cid = ?", {Param::text(cidTextOf(r->frame))});
-            if (c.status != 0 || c.rows.size() != 1 || c.i(0, 0) != (wantLive ? 1 : 0)) wrong++;
+            if (c.status != 0 || c.rows.size() != 1 || c.i(0, 0) != (wantLive ? 1 : 0)) {
+                wrong++;
+                std::fprintf(stderr, "  [%s] cid %s (%s): status %d %s, %lld rows\n", phase,
+                             cidTextOf(r->frame).c_str(), wantLive ? "live" : "dead", c.status, c.error.c_str(),
+                             c.rows.size() == 1 ? (long long)c.i(0, 0) : -1ll);
+            }
         }
+        s.e->setReaderGate(nullptr, nullptr);
         if (wrong) {
             std::fprintf(stderr, "  [%s] %d catalog lookups wrong\n", phase, wrong);
             gFailures++;
