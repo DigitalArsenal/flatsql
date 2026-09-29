@@ -715,8 +715,11 @@ appended.
   into one range item.
 - **Unlink.** Maintenance unlinks a retired file with `UNLINK_IF_UNUSED` once
   the reader gate (the start of the oldest running reader statement) is past
-  the time its retirement became durable, checked twice a grace apart (60 s by
-  default); in journal mode once every journal record older than the
+  its retirement time, checked twice a grace apart (60 s by
+  default). The retirement time is that of the first head write after the
+  batch commits (the head that stops naming the file): a statement that
+  starts earlier may read the previous head. In journal mode also once every
+  journal record older than the
   retirement is checkpointed; a meta segment once a DURABLE_CKPT head names a
   later `first_live_m_seg` (a quiet partition writes one; later items do not
   wait for it, and a partition with retired files never goes cold). Each pass
