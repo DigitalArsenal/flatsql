@@ -667,8 +667,10 @@ int32_t planCompaction(Writer* w, Partition* p, uint32_t seg, uint32_t segEnd, S
         const uint32_t last = s.lastSeg ? s.lastSeg : s.seg;
         const bool in = s.seg >= seg && last <= segEnd;
         // Kill postings live at or after their targets: runs of the inputs and
-        // of every later segment.
-        if (s.firstPseq && s.endPseq > c->first && !s.empty)
+        // of every later segment. The active segment has no end yet (0) once
+        // a merge has given it a first pseq, and its runs hold the kills of
+        // every merged batch since it opened.
+        if (s.firstPseq && (s.endPseq > c->first || !s.sealed) && !s.empty)
             for (const auto& r : s.runs) c->scanRuns.emplace_back(s.seg, r.gen, r.fileLen);
         else if (!s.firstPseq)  // active / unmerged entries only list runs by seg
             for (const auto& r : s.runs) c->scanRuns.emplace_back(s.seg, r.gen, r.fileLen);

@@ -33,11 +33,33 @@ struct QRec {
     bool acked = false;
 };
 
+// The engine's reader gate for the inspector below, which reads the files
+// while eviction, compaction and reclamation (at a 1 ms grace here) go on:
+// while it reads, every file retired after it started stays, as for a
+// reader statement, so it sees one whole state instead of a file unlinked
+// under it.
+struct InspectGate {
+    Store& s;
+    std::atomic<uint64_t> start{UINT64_MAX};  // UINT64_MAX: no inspection running
+    explicit InspectGate(Store& st) : s(st) {
+        s.e->setReaderGate(
+            [](void* c) -> uint64_t { return c ? static_cast<std::atomic<uint64_t>*>(c)->load() : UINT64_MAX; },
+            &start);
+    }
+    ~InspectGate() {
+        if (s.e) s.e->setReaderGate(nullptr, nullptr);
+    }
+};
+
 // Live PUTs of a partition by cid (Inspector: the files, not a reader).
-std::map<std::string, uint64_t> livePuts(Store& s, uint32_t pid) {
+std::map<std::string, uint64_t> livePuts(Store& s, uint32_t pid, InspectGate* gate) {
     std::map<std::string, uint64_t> out;
+    gate->start = monoNs();
     Inspector ins(s.fs.get(), s.root);
     PartView v = ins.partition(pid);
+    gate->start = UINT64_MAX;
+    if (!v.ok) std::fprintf(stderr, "  partition %u unreadable: %s\n", pid, v.err.c_str());
+    CHECK(v.ok);
     if (!v.ok) return out;
     const Recount rc = recount(v);
     for (const RecRow& r : v.rows)
@@ -97,6 +119,7 @@ PS_TEST(quota_arrival_order_heads_spared_T3_3) {
     // whole segment (A13), so its arrival order shows at this granularity.
     s.cfg.compactMaxOutputBytes = 512u << 10;
     REQUIRE(s.open() == 0);
+    InspectGate gate(s);
     s.registerTypes({&ommType(), &catType()});
     const int nOmm = 3;
     std::vector<uint32_t> pids;
@@ -161,7 +184,7 @@ PS_TEST(quota_arrival_order_heads_spared_T3_3) {
     uint64_t evicted = 0, olderSurvivorsGlobal = 0;
     int64_t newestEvicted = INT64_MIN;
     std::vector<std::map<std::string, uint64_t>> live;
-    for (int p = 0; p < nOmm; p++) live.push_back(livePuts(s, pids[size_t(p)]));
+    for (int p = 0; p < nOmm; p++) live.push_back(livePuts(s, pids[size_t(p)], &gate));
     for (int p = 0; p < nOmm; p++) {
         bool seenLive = false;
         int holes = 0;
@@ -181,7 +204,7 @@ PS_TEST(quota_arrival_order_heads_spared_T3_3) {
         for (const QRec& r : recs[size_t(p)])
             if (live[size_t(p)].count(cidKey(r.frame)) && r.arrival < newestEvicted) olderSurvivorsGlobal++;
     // Supersede-lane heads are never evicted.
-    const auto catLive = livePuts(s, catPid);
+    const auto catLive = livePuts(s, catPid, &gate);
     int headsLost = 0, heads = 0;
     for (const auto& f : catLatest) {
         if (f.empty()) continue;
@@ -232,13 +255,16 @@ PS_TEST(quota_tomb_range_follows_rows_coalesced_into_older_segment) {
     // segment id then found no segment B and killed nothing, so B's records
     // outlived newer evicted ones. The planner's range names B's rows by
     // pseq, which coalescing keeps, and the eviction's compaction request for
-    // B compacts the output that holds it.
+    // B compacts the output that holds it, removing every record the range
+    // killed, including those whose kills a merge has already folded into
+    // the active segment's runs.
     Store s(true, 1, true);
     s.cfg.sealBytes = 64u << 10;
-    s.cfg.sealAgeMs = 50;
+    s.cfg.sealAgeMs = 600000;   // segments seal by size; the tombstones stay in the active one
     s.cfg.mergeL0Blocks = 4;
     s.cfg.mergeMinL0Bytes = 0;
     s.cfg.reclaimGraceMs = 1;
+    s.cfg.tombRangeStep = 16;   // one L0 block per step: the active segment merges some
     s.cfg.autoCompact = false;  // the only compactions are the ones requested here
     REQUIRE(s.open() == 0);
     s.registerTypes({&ommType()});
@@ -296,6 +322,14 @@ PS_TEST(quota_tomb_range_follows_rows_coalesced_into_older_segment) {
         CHECK(v.segFirst.count(segA) == 1 && v.segFirst.count(segB) == 0);
     }
     // The planner's range, from its summary taken before the coalescing.
+    uint64_t hi0 = 0;
+    {
+        Inspector ins(s.fs.get(), s.root);
+        const PartView v = ins.partition(pid);
+        REQUIRE(v.ok);
+        hi0 = v.head.pseqHi;  // the tombstones come after
+        REQUIRE(v.head.segFirstPseq <= hi0 + 1);
+    }
     std::atomic<int32_t> ticket{0};
     REQUIRE(s.e->tombRange(pid, segB, INT64_MAX, &ticket, firstB, endB) == 0);
     for (const uint64_t t0 = monoNs(); ticket.load() != 0 && monoNs() - t0 < 60000000000ull;) sleepNs(1000000);
@@ -324,8 +358,18 @@ PS_TEST(quota_tomb_range_follows_rows_coalesced_into_older_segment) {
     }
     // The eviction's compaction request names B: it compacts the output
     // holding B, and B's rows go while A's stay (once the tombstones are
-    // labeled: a compaction removes only rows whose killer is).
+    // labeled: a compaction removes only rows whose killer is), with the
+    // first tombstones merged into the active segment's runs.
     REQUIRE(waitLabeledEngine(s.e.get(), {pid}, 60000000000ull));
+    {
+        bool merged = false;
+        for (const uint64_t t0 = monoNs(); !merged && monoNs() - t0 < 60000000000ull; sleepNs(2000000)) {
+            Inspector ins(s.fs.get(), s.root);
+            const PartView v = ins.partition(pid);
+            merged = v.ok && v.head.mergedThrough > hi0 && v.head.segFirstPseq <= hi0 + 1;
+        }
+        REQUIRE(merged);
+    }
     {
         SwapResult r;
         r.requestSeg = segB;
@@ -363,6 +407,7 @@ PS_TEST(quota_disk_full_resumes_without_operator_T3_6) {
     s.cfg.typeMetaSegBytes = 256u << 10;  // the type meta log rotates (and retires) at this size
     s.cfg.ballastBytes = 1u << 20;
     REQUIRE(s.open() == 0);
+    InspectGate gate(s);
     s.registerTypes({&ommType()});
     std::vector<uint32_t> pids;
     for (int p = 0; p < 2; p++) pids.push_back(s.partition("full" + std::to_string(p), ommType()));
@@ -444,7 +489,7 @@ PS_TEST(quota_disk_full_resumes_without_operator_T3_6) {
     uint64_t acked = 0, alive = 0;
     int holes = 0;
     for (size_t p = 0; p < pids.size(); p++) {
-        const auto live = livePuts(s, pids[p]);
+        const auto live = livePuts(s, pids[p], &gate);
         if (getenv("PS_QDEBUG")) {
             std::string runs;
             int cur = -1, n = 0;
