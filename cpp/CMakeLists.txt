@@ -471,6 +471,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
             ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
             ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
             ${FLATBUFFERS_SRC_DIR}/reflection.cpp
+            ${FLATBUFFERS_SRC_DIR}/util.cpp
             ${FLATBUFFERS_SRC_DIR}/options.cpp
             src/sdn_node.cpp
             ${FLATSQL_SDN_NODE_GENERATED_DIR}/invoke_support.cpp
