@@ -71,6 +71,9 @@ struct OrphanHarness {
         // The type meta log rotates often: its segments retire and unlink
         // with the catalog runs and manifests merges replace.
         s.cfg.typeMetaSegBytes = (seed & 16) ? (8u << 10) : (32u << 10);
+        // T3b (A15): half the stores seal arrivals segments often, so type
+        // merges rewrite them (and drop their GONE postings) under crashes.
+        if (((seed * 0x9E3779B97F4A7C15ull) >> 63) != 0) s.cfg.arrivalsSegBytes = 24 * 48;
     }
 
     bool setup() {
@@ -293,6 +296,25 @@ struct OrphanHarness {
                              c.rows.size() == 1 ? (long long)c.i(0, 0) : -1ll);
             }
         }
+        // T3b (A15): arrivals order (entries - GONE) holds exactly the live
+        // records, strictly increasing, and offset pages are slices of it.
+        {
+            Reader bulk(s, LaneClass::Bulk, 1);
+            const Rows all = bulk.q("SELECT _gseq FROM OMM ORDER BY _gseq");
+            bool ok = all.status == 0 && all.rows.size() == live;
+            for (size_t i = 1; ok && i < all.rows.size(); i++) ok = all.i(i, 0) > all.i(i - 1, 0);
+            for (int k = 0; ok && k < 3 && !all.rows.empty(); k++) {
+                const size_t off = size_t(rng() % all.rows.size());
+                const Rows pg = bulk.q("SELECT _gseq FROM OMM ORDER BY _gseq LIMIT 25 OFFSET " + std::to_string(off));
+                ok = pg.status == 0 && pg.rows.size() == std::min<size_t>(25, all.rows.size() - off);
+                for (size_t i = 0; ok && i < pg.rows.size(); i++) ok = pg.i(i, 0) == all.i(off + i, 0);
+            }
+            if (!ok) {
+                std::fprintf(stderr, "  [%s] arrivals order: %zu rows (status %d), %llu live records\n", phase,
+                             all.rows.size(), all.status, (unsigned long long)live);
+                wrong++;
+            }
+        }
         s.e->setReaderGate(nullptr, nullptr);
         if (wrong) {
             std::fprintf(stderr, "  [%s] %d catalog lookups wrong\n", phase, wrong);
@@ -305,7 +327,7 @@ struct OrphanHarness {
 void runOrphanTrials(int wantDuring, int maxTrials, uint64_t seed0) {
     int trials = 0, during = 0, inGrace = 0;
     std::map<int, int> modes;
-    uint64_t compactions = 0, unlinked = 0, metaRetired = 0, catalogDropped = 0;
+    uint64_t compactions = 0, unlinked = 0, metaRetired = 0, catalogDropped = 0, arrRewritten = 0, arrDropped = 0;
     uint64_t seed = seed0;
     while ((during < wantDuring) && trials < maxTrials) {
         OrphanHarness h(seed++);
@@ -324,6 +346,8 @@ void runOrphanTrials(int wantDuring, int maxTrials, uint64_t seed0) {
             unlinked += st.unlinkedFiles;
             metaRetired += st.metaSegsRetired;
             catalogDropped += st.catalogEntriesDropped;
+            arrRewritten += st.arrivalSegsCompacted;
+            arrDropped += st.arrivalEntriesDropped;
             const auto mode = FaultFs::CrashMode(h.rng() % FaultFs::kModeCount);
             modes[mode]++;
             h.crash(mode);
@@ -351,6 +375,8 @@ void runOrphanTrials(int wantDuring, int maxTrials, uint64_t seed0) {
     report("orphan_files_unlinked", double(unlinked), "files");
     report("orphan_meta_segments_retired", double(metaRetired), "segments");
     report("orphan_catalog_entries_dropped", double(catalogDropped), "entries");
+    report("orphan_arrival_segments_rewritten", double(arrRewritten), "segments");
+    report("orphan_arrival_entries_dropped", double(arrDropped), "entries");
     const char* names[] = {"drop_all", "drop_subset", "tear_last_512", "reorder", "kill9_keep_all"};
     for (const auto& kv : modes) {
         char key[64];

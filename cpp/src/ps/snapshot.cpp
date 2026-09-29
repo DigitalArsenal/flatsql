@@ -79,6 +79,7 @@ void filePath(const std::string& root, const FileKey& k, PathBuf* out) {
                 case 'h': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/t/%s/h.fsh", r, hex); break;
                 case 'm': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/t/%s/m-%06x.fsl", r, hex, k.seg); break;
                 case 'g': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/t/%s/g-%06x.fsg", r, hex, k.seg); break;
+                case 'G': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/t/%s/ga-%06x.fsg", r, hex, k.gen); break;
                 case 'F': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/t/%s/%s", r, hex, kArrivalFenceName); break;
                 case 'x': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/t/%s/x-%06x.fsx", r, hex, k.gen); break;
                 case 'f': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/t/%s/mf-%06x.fsm", r, hex, k.gen); break;
@@ -113,6 +114,7 @@ FileClass fileClassOf(const FileKey& k) {
         case 'h': return FileClass::TypeHead;
         case 'm': return FileClass::TypeMeta;
         case 'g':
+        case 'G':
         case 'F': return FileClass::Arrivals;
         case 'x': return FileClass::Index;
         case 'f': return FileClass::Manifest;
@@ -1114,12 +1116,16 @@ int32_t LaneStore::loadType(const uint8_t fid[4], TypeSnap* out) {
         rc = loadTypeLabels(fid, out);
         if (rc < 0) return rc;
     }
-    // Catalog runs (type manifest).
+    // Catalog runs (type manifest) and, T3b, the compacted arrivals table.
+    struct TypeManifestView {
+        std::vector<SegRunRef> runs;
+        std::vector<ArrOverride> arr;
+    };
     if (h.manifestGen) {
         const FileKey mk = tk('f', fid, 0, h.manifestGen);
-        std::shared_ptr<const std::vector<SegRunRef>> runs;
+        std::shared_ptr<const TypeManifestView> runs;
         if (auto c = cacheGet(mk)) {
-            runs = std::static_pointer_cast<const std::vector<SegRunRef>>(c);
+            runs = std::static_pointer_cast<const TypeManifestView>(c);
         } else {
             FileRef f;
             rc = io_.get(mk, &f);
@@ -1134,17 +1140,19 @@ int32_t LaneStore::loadType(const uint8_t fid[4], TypeSnap* out) {
             const uint32_t n = getU32(man.data() + 4);
             const size_t body = 16 + size_t(n) * 16;
             if (body + 8 > man.size() || crc32c(man.data(), body) != getU32(man.data() + body)) return kRsCorrupt;
-            auto v = std::make_shared<std::vector<SegRunRef>>();
+            auto v = std::make_shared<TypeManifestView>();
             for (uint32_t i = 0; i < n; i++) {
                 SegRunRef r;
                 r.gen = getU32(man.data() + 16 + size_t(i) * 16);
                 r.fileLen = getU64(man.data() + 16 + size_t(i) * 16 + 8);
-                v->push_back(r);
+                v->runs.push_back(r);
             }
+            if (!parseTypeArrivalsTable(man.data(), man.size(), body + 8, &v->arr)) return kRsCorrupt;
             cachePut(mk, v, man.size() + 64);
             runs = v;
         }
-        out->runs = *runs;
+        out->runs = runs->runs;
+        out->arr = runs->arr;
     }
     // Arrivals fence index (sealed segments are immutable: cache by count).
     const FileKey fk = tk('F', fid, h.gSeg);
@@ -1168,6 +1176,21 @@ int32_t LaneStore::loadType(const uint8_t fid[4], TypeSnap* out) {
         if (stats_) stats_->fenceReads++;
         cachePut(fk, v, size_t(h.gSeg) * sizeof(ArrivalFence) + 64);
         out->fence = v;
+    }
+    if (!out->arr.empty()) {
+        // T3b (A15): the rewritten segments' counts and gseq bounds.
+        auto eff = std::make_shared<std::vector<ArrivalFence>>(*out->fence);
+        out->arrOf.assign(h.gSeg, -1);
+        for (size_t i = 0; i < out->arr.size(); i++) {
+            const ArrOverride& o = out->arr[i];
+            if (o.seg >= h.gSeg) return kRsCorrupt;
+            out->arrOf[o.seg] = int32_t(i);
+            ArrivalFence& f = (*eff)[o.seg];
+            f.count = o.count;
+            f.firstGseq = o.firstGseq;
+            f.lastGseq = o.lastGseq;
+        }
+        out->fence = eff;
     }
     out->segStart.assign(size_t(h.gSeg) + 1, 0);
     for (uint32_t i = 0; i < h.gSeg; i++) out->segStart[i + 1] = out->segStart[i] + (*out->fence)[i].count;
@@ -2044,10 +2067,13 @@ int32_t LaneStore::arrivalsRead(const TypeSnap& t, uint64_t pos, uint32_t n, Arr
             seg < t.segStart.size() - 1 ? t.segStart[seg + 1] : t.segStart.back() + t.head.gLen / kArrivalBytes;
         const uint32_t take = uint32_t(std::min<uint64_t>(segEnd - p, n - done));
         FileRef f;
-        int32_t rc = io_.get(tk('g', t.fid, uint32_t(seg)), &f);
+        const ArrOverride* o =
+            (!t.arrOf.empty() && seg < t.arrOf.size() && t.arrOf[seg] >= 0) ? &t.arr[size_t(t.arrOf[seg])] : nullptr;
+        int32_t rc = io_.get(o ? tk('G', t.fid, 0, o->gen) : tk('g', t.fid, uint32_t(seg)), &f);
         if (rc == FLATSQL_IO_ERR_NOENT) return kRsSnapshotGone;
         if (rc < 0) return rc;
-        const int64_t got = io_.read(f, out + done, size_t(take) * kArrivalBytes, (p - t.segStart[seg]) * kArrivalBytes);
+        const int64_t got = io_.read(f, out + done, size_t(take) * kArrivalBytes,
+                                     (o ? o->off : 0) + (p - t.segStart[seg]) * kArrivalBytes);
         if (got != int64_t(size_t(take) * kArrivalBytes)) return got < 0 ? int32_t(got) : kRsCorrupt;
         done += take;
     }

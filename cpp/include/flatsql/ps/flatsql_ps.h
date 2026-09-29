@@ -150,7 +150,11 @@ int32_t flatsql_ps_set_quota(double bytes);
  * data bytes, open meta bytes, adopted batches, pool slabs in use, pool slabs
  * peak, pool committed bytes, committed bytes, migrated gseqs used, migrated
  * gseq fallbacks (store-migrate: RecordAttr.migrated_gseq, PARTITION-STORE.md
- * §31). */
+ * §31), hot splits, merges back, stage-1 results prepared, used, stolen,
+ * wasted, dedupe lookups a hint shortened, stagings stopped at a full L0
+ * directory (hot split, §32), arrivals segments rewritten, arrival entries
+ * dropped (arrivals compaction, §33). Hosts read the length the first call
+ * returns: entries are only ever appended. */
 
 #ifdef __cplusplus
 }

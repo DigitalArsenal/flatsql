@@ -665,23 +665,48 @@ Inspector::TypeView Inspector::type(const uint8_t fid[4]) {
         }
         v.fence.push_back(f);
     }
+    // T3b (A15): segments a type merge rewrote (the manifest's table).
+    if (v.head.manifestGen) {
+        PathBuf mp;
+        pathTypeManifest(&mp, root_.c_str(), fid, v.head.manifestGen);
+        std::vector<uint8_t> man;
+        if (readFile(ctx_, mp, FileClass::Manifest, &man) && man.size() >= 24 && getU32(man.data()) == kMagicManifest) {
+            const size_t body = 16 + size_t(getU32(man.data() + 4)) * 16;
+            if (body + 8 <= man.size() && !parseTypeArrivalsTable(man.data(), man.size(), body + 8, &v.arr))
+                v.fenceErr = "arrivals table invalid";
+        }
+    }
     for (uint32_t s = 0; s <= v.head.gSeg; s++) {
-        const uint64_t len = s < v.head.gSeg ? (s < v.fence.size() ? v.fence[s].count * kArrivalBytes : 0)
-                                             : v.head.gLen;
+        const ArrOverride* o = nullptr;
+        for (const auto& x : v.arr)
+            if (x.seg == s) o = &x;
+        const uint64_t len = o ? o->count * kArrivalBytes
+                               : s < v.head.gSeg ? (s < v.fence.size() ? v.fence[s].count * kArrivalBytes : 0)
+                                                 : v.head.gLen;
         PathBuf gp;
-        pathTypeSeg(&gp, root_.c_str(), fid, 'g', s, "fsg");
+        if (o) pathTypeArrivalsCompact(&gp, root_.c_str(), fid, o->gen);
+        else pathTypeSeg(&gp, root_.c_str(), fid, 'g', s, "fsg");
         std::vector<uint8_t> g;
         if (!readFile(ctx_, gp, FileClass::Arrivals, &g)) {
             if (len && v.fenceErr.empty()) v.fenceErr = "segment missing";
             continue;
         }
+        if (o) {
+            if (g.size() < o->off + len) {
+                if (v.fenceErr.empty()) v.fenceErr = "compacted segment short";
+                continue;
+            }
+            g.erase(g.begin(), g.begin() + ptrdiff_t(o->off));
+        }
         if (g.size() < len && v.fenceErr.empty()) v.fenceErr = "segment short";
+        const uint64_t firstG = o ? o->firstGseq : (s < v.fence.size() ? v.fence[s].firstGseq : 0);
+        const uint64_t lastG = o ? o->lastGseq : (s < v.fence.size() ? v.fence[s].lastGseq : 0);
         for (uint64_t off = 0; off + kArrivalBytes <= len && off + kArrivalBytes <= g.size(); off += kArrivalBytes) {
             ArrivalEntry a;
             std::memcpy(&a, g.data() + off, sizeof(a));
             if (s < v.fence.size() && v.fenceErr.empty()) {
-                if (off == 0 && a.gseq != v.fence[s].firstGseq) v.fenceErr = "fence first gseq";
-                if (off + kArrivalBytes == len && a.gseq != v.fence[s].lastGseq) v.fenceErr = "fence last gseq";
+                if (off == 0 && a.gseq != firstG) v.fenceErr = "fence first gseq";
+                if (off + kArrivalBytes == len && a.gseq != lastG) v.fenceErr = "fence last gseq";
             }
             if (s == v.head.gSeg && off == 0 && s > 0 && a.gseq != v.head.gSegFirstGseq && v.fenceErr.empty())
                 v.fenceErr = "head first gseq";
@@ -866,8 +891,15 @@ DirCheck checkTypeDir(Io* io, FaultFs* fs, const std::string& root, const uint8_
             add(sg < h.mSeg ? required : optional, pb);
         }
         for (uint32_t sg = 0; sg <= h.gSeg + 1; sg++) {
+            bool rewritten = false;
+            for (const auto& o : v.arr) rewritten = rewritten || o.seg == sg;
+            if (rewritten) continue;  // T3b: its entries live in a ga-*.fsg (the original is retired)
             pathTypeSeg(&pb, root.c_str(), fid, 'g', sg, "fsg");
             add(sg < h.gSeg ? required : optional, pb);
+        }
+        for (const auto& o : v.arr) {
+            pathTypeArrivalsCompact(&pb, root.c_str(), fid, o.gen);
+            add(required, pb);
         }
         pathType(&pb, root.c_str(), fid, kArrivalFenceName);
         add(h.gSeg ? required : optional, pb);

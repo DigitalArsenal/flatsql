@@ -41,9 +41,7 @@ uint32_t osThreadId() {
 // Small building blocks
 // ---------------------------------------------------------------------------
 void LockHist::record(uint64_t ns) {
-    int b = ns ? 63 - __builtin_clzll(ns) : 0;
-    if (b > 47) b = 47;
-    buckets[b].fetch_add(1, std::memory_order_relaxed);
+    buckets[bucketOf(ns)].fetch_add(1, std::memory_order_relaxed);
     count.fetch_add(1, std::memory_order_relaxed);
     uint64_t m = maxNs.load(std::memory_order_relaxed);
     while (ns > m && !maxNs.compare_exchange_weak(m, ns)) {}
@@ -54,9 +52,9 @@ uint64_t LockHist::percentileNs(double q) const {
     if (!total) return 0;
     const uint64_t target = uint64_t(q * double(total));
     uint64_t acc = 0;
-    for (int b = 0; b < 48; b++) {
+    for (int b = 0; b < kBuckets; b++) {
         acc += buckets[b].load();
-        if (acc > target) return (uint64_t(1) << (b + 1)) - 1;  // upper bound of the bucket
+        if (acc > target) return upperNs(b);  // upper bound of the bucket
     }
     return maxNs.load();
 }
@@ -1388,6 +1386,8 @@ EngineStats Engine::stats() const {
     s.unsplits = cUnsplits.load();
     s.prepHelperStalls = cPrepStalls.load();
     s.l0FullStalls = cL0Full.load();
+    s.arrivalSegsCompacted = cArrSegsCompacted.load();
+    s.arrivalEntriesDropped = cArrDropped.load();
     uint64_t prepBytes = 0;
     for (uint32_t pid = 1; pid <= maxPid && pid < partsCap_; pid++) {
         const Partition* p = parts_[pid].load(std::memory_order_acquire);

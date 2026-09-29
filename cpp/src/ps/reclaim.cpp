@@ -393,7 +393,7 @@ uint64_t typeDiskBytesNow(const TypeOwner* t, uint64_t* retiredOut) {
                  std::max(t->gExtent, t->gLen) + t->fenceExtent + retired;
     for (const auto& run : t->runs) b += run.fileLen;
     if (t->manifestGenLoaded) b += t->manifestBytes;
-    if (t->mergePhase == 1) b += t->mergeRun.fileLen + t->mergeManifestBytes;  // built, MERGE_DONE pending
+    if (t->mergePhase == 1) b += t->mergeRun.fileLen + t->mergeManifestBytes + t->mergeArrLen;  // built, MERGE_DONE pending
     if (retiredOut) *retiredOut = retired;
     return b;
 }
@@ -516,7 +516,7 @@ int32_t typeOpenReclaim(IoCtx* io, const char* root, TypeOwner* t, const std::ve
     // that came back would never be looked for again.
     uint32_t hi = t->nextGen + 64;
     for (uint32_t g = t->manifestGenLoaded + 1; rc >= 0 && g <= hi && g - t->manifestGenLoaded <= 4096; g++) {
-        for (const char letter : {'x', 'f'}) {
+        for (const char letter : {'x', 'f', 'G'}) {
             PathBuf path;
             typeRetirePath(&path, root, t->fid, retireItem(letter, 0, g, 0));
             if (io->probe(path.c_str(), path.len) != 0) continue;
@@ -542,8 +542,20 @@ int32_t typeOpenReclaim(IoCtx* io, const char* root, TypeOwner* t, const std::ve
     n = fileSize(io, path);
     t->mExtent = n > 0 ? uint64_t(n) : 0;
     t->gSealedBytes = 0;
+    size_t ov = 0;
     for (uint32_t s = 0; s < t->gSeg; s++) {
+        while (ov < t->arrOverrides.size() && t->arrOverrides[ov].seg < s) ov++;
+        if (ov < t->arrOverrides.size() && t->arrOverrides[ov].seg == s) continue;  // T3b: rewritten (ga-*)
         pathTypeSeg(&path, root, t->fid, 'g', s, "fsg");
+        n = fileSize(io, path);
+        if (n > 0) t->gSealedBytes += uint64_t(n);
+    }
+    // T3b (A15): the ga-<gen>.fsg files the arrivals table names.
+    std::vector<uint32_t> gens;
+    for (const ArrOverride& o : t->arrOverrides)
+        if (std::find(gens.begin(), gens.end(), o.gen) == gens.end()) gens.push_back(o.gen);
+    for (uint32_t g : gens) {
+        pathTypeArrivalsCompact(&path, root, t->fid, g);
         n = fileSize(io, path);
         if (n > 0) t->gSealedBytes += uint64_t(n);
     }

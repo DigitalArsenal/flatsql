@@ -950,6 +950,18 @@ void typePublish(Writer* w, TypeOwner* t, StagedType* st) {
             w->io().close(&t->runs.back().file);
             t->runs.pop_back();
         }
+        // T3b (A15): the rewritten arrivals segments replace their files.
+        t->arrOverrides = t->mergeArrOut;
+        if (t->mergeArrSegsCompacted) {
+            for (const RetireItem& it : t->mergeArrRetire) {
+                retire(char(it.letter), it.gen, it.size);
+                t->retired.back().it = it;  // with its segment
+                t->gSealedBytes -= std::min<uint64_t>(t->gSealedBytes, it.size);
+            }
+            t->gSealedBytes += t->mergeArrLen;
+            e->cArrSegsCompacted.fetch_add(t->mergeArrSegsCompacted, std::memory_order_relaxed);
+            e->cArrDropped.fetch_add(t->mergeArrDropped, std::memory_order_relaxed);
+        }
         tHotPathDepth = saved;
         t->runs.push_back(std::move(t->mergeRun));
         t->mergeRun = SegRun();
@@ -1097,9 +1109,198 @@ int32_t deadCopies(IoCtx* io, const std::vector<MergeL0Input>& l0s, const std::v
     return 0;
 }
 
+// T3b (A15, arrivals half). A sealed arrivals segment whose entries the GONE
+// postings among this merge's inputs cover at least arrivalsCompactRatio of
+// is rewritten into ga-<gen>.fsg without them, and the run leaves those GONE
+// postings (and REHOME postings of the same gseqs) out: an entry and its GONE
+// posting go in one MERGE_DONE, so live = entries - GONE holds in every
+// snapshot (offset paging, T2). GONE postings of other merges' runs, and of
+// the active segment, stay with their entries.
+struct ArrivalsDrop {
+    std::vector<uint64_t> gone;     // GONE gseqs among the inputs (sorted)
+    std::vector<uint64_t> dropped;  // gseqs whose entries this merge removed (sorted)
+    DeadCopies* dead = nullptr;
+    bool has(const std::vector<uint64_t>& v, uint64_t g) const { return std::binary_search(v.begin(), v.end(), g); }
+};
+
+bool collectGone(void* ctx, uint16_t, const uint8_t* k, uint16_t klen, const uint8_t*, uint8_t) {
+    if (klen == 8) static_cast<ArrivalsDrop*>(ctx)->gone.push_back(getBE64(k));
+    return true;
+}
+
+// The run's filter: dead catalog copies (T3) and the dropped gseqs' GONE and
+// REHOME postings.
+bool keepMergeEntry(void* ctx, uint16_t kind, const uint8_t* k, uint16_t klen, const uint8_t* v, uint8_t vlen) {
+    auto* a = static_cast<ArrivalsDrop*>(ctx);
+    if ((kind == kIxTypeGone || kind == kIxTypeRehome) && klen == 8 && !a->dropped.empty() &&
+        a->has(a->dropped, getBE64(k)))
+        return false;
+    if (a->dead && !a->dead->dead.empty()) return keepLiveCopies(a->dead, kind, k, klen, v, vlen);
+    return true;
+}
+
+int32_t compactArrivals(IoCtx* io, const char* root, TypeOwner* t, uint32_t gen, double ratio,
+                        const std::vector<MergeL0Input>& l0s, ArrivalsDrop* ad) {
+    t->mergeArrOut = t->mergeArrPlan;
+    const uint32_t nSegs = t->mergeArrSegs;
+    if (nSegs == 0 || !(ratio > 0)) return 0;  // ratio 0: arrivals compaction off
+    int32_t rc = scanKind(io, kIxTypeGone, l0s, t->mergeFoldRuns, collectGone, ad);
+    if (rc < 0 || ad->gone.empty()) return rc;
+    std::sort(ad->gone.begin(), ad->gone.end());
+    ad->gone.erase(std::unique(ad->gone.begin(), ad->gone.end()), ad->gone.end());
+    // The fence entries of the sealed segments at planning (immutable).
+    std::vector<ArrivalFence> fence(nSegs);
+    {
+        PathBuf fp;
+        pathType(&fp, root, t->fid, kArrivalFenceName);
+        FileRef f;
+        rc = io->open(fp.c_str(), fp.len, FLATSQL_IO_READ, FileClass::Arrivals, &f);
+        if (rc < 0) return rc;
+        const int64_t n = io->read(f, fence.data(), size_t(nSegs) * sizeof(ArrivalFence), 0);
+        io->close(&f);
+        if (n != int64_t(size_t(nSegs) * sizeof(ArrivalFence))) return FLATSQL_IO_ERR_IO;
+        for (uint32_t s = 0; s < nSegs; s++)
+            if (fence[s].seg != s || fence[s].crc != crc32c(&fence[s], offsetof(ArrivalFence, crc)))
+                return FLATSQL_IO_ERR_IO;
+    }
+    auto overrideOf = [&](const std::vector<ArrOverride>& tab, uint32_t s) -> const ArrOverride* {
+        auto it = std::lower_bound(tab.begin(), tab.end(), s, [](const ArrOverride& o, uint32_t x) { return o.seg < x; });
+        return it != tab.end() && it->seg == s ? &*it : nullptr;
+    };
+    std::vector<uint8_t> out;
+    std::vector<ArrOverride> fresh;
+    std::vector<RetireItem> retire;
+    std::vector<uint8_t> buf;
+    for (uint32_t s = 0; s < nSegs; s++) {
+        const ArrivalFence& f = fence[s];
+        const ArrOverride* o = overrideOf(t->mergeArrPlan, s);
+        const uint64_t count = o ? o->count : f.count;
+        if (count == 0) continue;
+        const auto lo = std::lower_bound(ad->gone.begin(), ad->gone.end(), f.firstGseq);
+        const auto hi = std::upper_bound(ad->gone.begin(), ad->gone.end(), f.lastGseq);
+        const uint64_t dead = uint64_t(hi - lo);
+        if (dead == 0 || double(dead) < ratio * double(count)) continue;
+        // Read the segment's entries where they are now.
+        PathBuf sp;
+        if (o) pathTypeArrivalsCompact(&sp, root, t->fid, o->gen);
+        else pathTypeSeg(&sp, root, t->fid, 'g', s, "fsg");
+        FileRef sf;
+        rc = io->open(sp.c_str(), sp.len, FLATSQL_IO_READ, FileClass::Arrivals, &sf);
+        if (rc < 0) return rc;
+        buf.resize(size_t(count) * kArrivalBytes);
+        const int64_t n = io->read(sf, buf.data(), buf.size(), o ? o->off : 0);
+        const int64_t fileSize = io->size(sf);
+        io->close(&sf);
+        if (n != int64_t(buf.size())) return FLATSQL_IO_ERR_IO;
+        ArrOverride no{};
+        no.seg = s;
+        no.gen = gen;
+        no.off = out.size();
+        uint64_t prev = 0;
+        for (size_t i = 0; i < size_t(count); i++) {
+            ArrivalEntry a;
+            std::memcpy(&a, buf.data() + i * kArrivalBytes, sizeof(a));
+            if (a.gseq <= prev) return FLATSQL_IO_ERR_IO;  // not strictly increasing: never rewrite that
+            prev = a.gseq;
+            if (ad->has(ad->gone, a.gseq)) {
+                ad->dropped.push_back(a.gseq);
+                continue;
+            }
+            if (!no.count) no.firstGseq = a.gseq;
+            no.lastGseq = a.gseq;
+            no.count++;
+            out.insert(out.end(), buf.data() + i * kArrivalBytes, buf.data() + (i + 1) * kArrivalBytes);
+        }
+        fresh.push_back(no);
+        if (!o) retire.push_back(retireItem('g', s, 0, uint64_t(fileSize > 0 ? fileSize : 0)));
+    }
+    if (fresh.empty()) return 0;
+    std::sort(ad->dropped.begin(), ad->dropped.end());
+    // The new table: the plan's, the rewritten segments replaced.
+    std::vector<ArrOverride> tab;
+    size_t j = 0;
+    for (const ArrOverride& o : t->mergeArrPlan) {
+        while (j < fresh.size() && fresh[j].seg < o.seg) tab.push_back(fresh[j++]);
+        if (j < fresh.size() && fresh[j].seg == o.seg) tab.push_back(fresh[j++]);
+        else tab.push_back(o);
+    }
+    while (j < fresh.size()) tab.push_back(fresh[j++]);
+    // An older ga file still named for less than half its bytes has its
+    // remaining segments copied into this one (verbatim), so it can go: the
+    // rewritten files never hold more than twice what they name.
+    {
+        std::vector<std::pair<uint32_t, uint64_t>> named;  // gen -> bytes still named
+        for (const ArrOverride& o : tab) {
+            if (o.gen == gen) continue;
+            bool found = false;
+            for (auto& n : named)
+                if (n.first == o.gen) {
+                    n.second += o.count * kArrivalBytes;
+                    found = true;
+                }
+            if (!found) named.push_back({o.gen, o.count * kArrivalBytes});
+        }
+        for (const auto& n : named) {
+            PathBuf gp;
+            pathTypeArrivalsCompact(&gp, root, t->fid, n.first);
+            FileRef gf;
+            if (io->open(gp.c_str(), gp.len, FLATSQL_IO_READ, FileClass::Arrivals, &gf) < 0) continue;
+            const int64_t size = io->size(gf);
+            if (size > 0 && n.second * 2 < uint64_t(size)) {
+                for (ArrOverride& o : tab) {
+                    if (o.gen != n.first) continue;
+                    buf.resize(size_t(o.count) * kArrivalBytes);
+                    if (o.count && io->read(gf, buf.data(), buf.size(), o.off) != int64_t(buf.size())) {
+                        io->close(&gf);
+                        return FLATSQL_IO_ERR_IO;
+                    }
+                    o.gen = gen;
+                    o.off = out.size();
+                    out.insert(out.end(), buf.begin(), buf.end());
+                }
+            }
+            io->close(&gf);
+        }
+    }
+    // ga files the old table named and the new one does not: retired.
+    for (const ArrOverride& o : t->mergeArrPlan) {
+        bool named = false;
+        for (const ArrOverride& n : tab) named = named || n.gen == o.gen;
+        bool listed = false;
+        for (const RetireItem& r : retire) listed = listed || (r.letter == 'G' && r.gen == o.gen);
+        if (named || listed) continue;
+        PathBuf gp;
+        pathTypeArrivalsCompact(&gp, root, t->fid, o.gen);
+        FileRef gf;
+        int64_t size = 0;
+        if (io->open(gp.c_str(), gp.len, FLATSQL_IO_READ, FileClass::Arrivals, &gf) == 0) {
+            size = io->size(gf);
+            io->close(&gf);
+        }
+        retire.push_back(retireItem('G', 0, o.gen, uint64_t(size > 0 ? size : 0)));
+    }
+    // The rewritten entries, durable before MERGE_DONE (like the run).
+    PathBuf op;
+    pathTypeArrivalsCompact(&op, root, t->fid, gen);
+    FileRef of;
+    rc = io->open(op.c_str(), op.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC | FLATSQL_IO_CREATE_PARENTS,
+                  FileClass::Arrivals, &of);
+    if (rc < 0) return rc;
+    if (!out.empty()) rc = io->write(of, out.data(), out.size(), 0);
+    if (rc >= 0) rc = io->sync(of);
+    io->close(&of);
+    if (rc < 0) return rc;
+    t->mergeArrOut = std::move(tab);
+    t->mergeArrRetire = std::move(retire);
+    t->mergeArrLen = out.size();
+    t->mergeArrDropped = ad->dropped.size();
+    t->mergeArrSegsCompacted = fresh.size();
+    return 0;
+}
+
 // Builds a planned catalog merge's run and manifest (no sync). Reads only the
 // plan and immutable files: may run on a helper thread.
-int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t) {
+int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t, double arrivalsRatio) {
     const uint32_t k = t->mergeK;
     const uint32_t gen = t->mergeGen;
     std::vector<std::vector<uint8_t>> blocks(k);
@@ -1134,10 +1335,15 @@ int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t) {
     DeadCopies dead;
     rc = deadCopies(io, l0s, t->mergeFoldRuns, t->mergeKeepRuns.empty(), &dead);
     if (rc < 0) return rc;
+    ArrivalsDrop ad;
+    ad.dead = &dead;
+    rc = compactArrivals(io, root, t, gen, arrivalsRatio, l0s, &ad);
+    if (rc < 0) return rc;
     uint64_t nEntries = 0;
+    const bool filter = !dead.dead.empty() || !ad.dropped.empty();
     const int64_t xLen = mergeToL1(io, run.file, 0, gen, uint16_t(t->mergeFold ? 1 : 0), t->mergeBatches[0].commitSeq,
                                    t->mergeBatches[k - 1].commitSeq, l0s, t->mergeFoldRuns, &nEntries,
-                                   dead.dead.empty() ? nullptr : keepLiveCopies, &dead);
+                                   filter ? keepMergeEntry : nullptr, &ad);
     t->mergeDropped.store(dead.dropped, std::memory_order_relaxed);
     if (xLen < 0) return int32_t(xLen);
     run.fileLen = uint64_t(xLen);
@@ -1159,8 +1365,16 @@ int32_t writeTypeMergeOutputs(IoCtx* io, const char* root, TypeOwner* t) {
     man.resize(at + 8, 0);
     putU32(man.data() + at, crc32c(man.data(), at));
     // T3: the runs and manifests this one replaces, and those still waiting
-    // for readers (open unlinks them after a crash).
-    appendTypeRetireSet(&man, t->mergeRetire);
+    // for readers (open unlinks them after a crash); T3b: the arrivals files
+    // it stops naming, then the compacted arrivals segments.
+    if (t->mergeArrRetire.empty()) {
+        appendTypeRetireSet(&man, t->mergeRetire);
+    } else {
+        std::vector<RetireItem> all = t->mergeRetire;
+        all.insert(all.end(), t->mergeArrRetire.begin(), t->mergeArrRetire.end());
+        appendTypeRetireSet(&man, all);
+    }
+    if (!t->mergeArrOut.empty()) appendTypeArrivalsTable(&man, t->mergeArrOut);
     t->mergeManifestBytes = man.size();
     PathBuf mp;
     pathTypeManifest(&mp, root, t->fid, gen);
@@ -1189,7 +1403,7 @@ void typeMergeStop(Writer* w, TypeOwner* t) {
     w->io().close(&t->mergeMf);
     t->mergeRun = SegRun();
     if (t->mergePhase == 2) {
-        for (const char letter : {'x', 'f'}) {
+        for (const char letter : {'x', 'f', 'G'}) {
             PathBuf op;
             typeRetirePath(&op, w->eng_root(), t->fid, retireItem(letter, 0, t->mergeGen, 0));
             w->io().unlink(op.c_str(), op.len, true);
@@ -1236,7 +1450,7 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
             // no debris behind). One that cannot go yet is retired: the next
             // manifest persists it until it does.
             bool clean = true;
-            for (const char letter : {'x', 'f'}) {
+            for (const char letter : {'x', 'f', 'G'}) {
                 const RetireItem it = retireItem(letter, 0, t->mergeGen, 0);
                 PathBuf op;
                 typeRetirePath(&op, w->eng_root(), t->fid, it);
@@ -1302,24 +1516,34 @@ int32_t typeMergeStep(Writer* w, TypeOwner* t) {
     // the manifest it replaces and the runs it folds.
     t->mergeRetire.clear();
     for (const auto& r : t->retired)
-        if (r.it.letter == 'x' || r.it.letter == 'f') t->mergeRetire.push_back(r.it);
+        if (r.it.letter == 'x' || r.it.letter == 'f' || r.it.letter == 'g' || r.it.letter == 'G')
+            t->mergeRetire.push_back(r.it);
     if (t->manifestGenLoaded) t->mergeRetire.push_back(retireItem('f', 0, t->manifestGenLoaded, t->manifestBytes));
     for (size_t i = t->runs.size() - t->mergeFold; i < t->runs.size(); i++)
         t->mergeRetire.push_back(retireItem('x', 0, t->runs[i].gen, t->runs[i].fileLen));
+    // T3b (A15): the arrivals table and the sealed segments the build may rewrite.
+    t->mergeArrPlan = t->arrOverrides;
+    t->mergeArrSegs = t->gSeg;
+    t->mergeArrOut.clear();
+    t->mergeArrRetire.clear();
+    t->mergeArrLen = 0;
+    t->mergeArrDropped = 0;
+    t->mergeArrSegsCompacted = 0;
     t->runs.reserve(t->runs.size() + 1);
     t->mergeRun = SegRun();
     t->mergeResult.store(0, std::memory_order_release);
     t->mergePhase = 2;
     if (e->config().mergeHelpers && !e->config().cooperative) {
         Writer* owner = w;
-        e->submitMaintenance(true, [t, owner](IoCtx* io) {
-            const int32_t r = writeTypeMergeOutputs(io, owner->eng_root(), t);
+        const double ratio = e->config().arrivalsCompactRatio;
+        e->submitMaintenance(true, [t, owner, ratio](IoCtx* io) {
+            const int32_t r = writeTypeMergeOutputs(io, owner->eng_root(), t, ratio);
             t->mergeResult.store(r < 0 ? r : 1, std::memory_order_release);
             owner->ring();
         });
         return 1;
     }
-    rc = writeTypeMergeOutputs(&w->io(), w->eng_root(), t);
+    rc = writeTypeMergeOutputs(&w->io(), w->eng_root(), t, e->config().arrivalsCompactRatio);
     t->mergeResult.store(rc < 0 ? rc : 1, std::memory_order_release);
     return typeMergeStep(w, t);
 }

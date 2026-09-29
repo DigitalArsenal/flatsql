@@ -473,6 +473,20 @@ struct ArrivalFence {
 static_assert(sizeof(ArrivalFence) == 40, "ArrivalFence is 40 bytes");
 constexpr const char* kArrivalFenceName = "g.fsf";
 
+// T3b (A15, arrivals half): a sealed arrivals segment rewritten by a type
+// merge without the entries whose GONE postings that merge dropped. Its
+// entries live in ga-<gen>.fsg at `off`; the type manifest lists every such
+// segment (an appendix after the retire set).
+struct ArrOverride {
+    uint32_t seg;
+    uint32_t gen;          // ga-<gen>.fsg
+    uint64_t off;          // byte offset of the segment's entries in that file
+    uint64_t count;        // entries left (0: every entry was dead)
+    uint64_t firstGseq;    // of the entries left (0 when none)
+    uint64_t lastGseq;
+};
+static_assert(sizeof(ArrOverride) == 40, "ArrOverride is 40 bytes");
+
 // ---- A8 per-writer commit journal (§22.4 ruling 5) --------------------------
 // One record per commit round of a writer: every byte the round wrote to
 // partition and type files (d, l, m, g, g.fsf, type m) as offset-addressed
@@ -587,6 +601,7 @@ void pathTypeSeg(PathBuf* out, const char* root, const uint8_t fid[4], char lett
                  uint32_t seg, const char* ext);
 void pathTypeRun(PathBuf* out, const char* root, const uint8_t fid[4], uint32_t gen);
 void pathTypeManifest(PathBuf* out, const char* root, const uint8_t fid[4], uint32_t gen);
+void pathTypeArrivalsCompact(PathBuf* out, const char* root, const uint8_t fid[4], uint32_t gen);  // ga-<gen>.fsg
 void pathTypeConfig(PathBuf* out, const char* root, const uint8_t fid[4], uint64_t fp);
 // A8 commit journal of writer w, file 0 (a) or 1 (b).
 void pathJournal(PathBuf* out, const char* root, uint32_t writer, int file);

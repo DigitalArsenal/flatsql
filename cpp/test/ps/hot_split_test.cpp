@@ -302,7 +302,14 @@ static void hotSplitRebalanceRun(double seconds) {
     CHECK_EQ(corrupt, uint64_t(0));
     s.close();
 }
-PS_TEST(hot_split_rebalance_stalled_helpers_A26) { hotSplitRebalanceRun(double(argInt("hot-a26-seconds", 6))); }
+#if defined(__wasm__)
+constexpr long kA26Seconds = 3;       // the in-memory host keeps every byte in a 4 GiB space
+constexpr long kTputRecords = 100000;
+#else
+constexpr long kA26Seconds = 6;
+constexpr long kTputRecords = 200000;
+#endif
+PS_TEST(hot_split_rebalance_stalled_helpers_A26) { hotSplitRebalanceRun(double(argInt("hot-a26-seconds", kA26Seconds))); }
 PS_SLOW_TEST(hot_split_rebalance_stalled_helpers_A26_full) { hotSplitRebalanceRun(600.0); }
 
 // The §12 trigger: a backlog over half the ring for the configured time, on
@@ -391,5 +398,5 @@ static void hotSplitThroughput(uint64_t records) {
     if (latencyBoxQuiet(&threads, &load, &why)) CHECK(ratio >= 2.5);
     else std::printf("  ratio %.3f reported, not enforced: %s\n", ratio, why.c_str());
 }
-PS_TEST(hot_split_throughput_T3_5) { hotSplitThroughput(uint64_t(argInt("hot-records", 200000))); }
+PS_TEST(hot_split_throughput_T3_5) { hotSplitThroughput(uint64_t(argInt("hot-records", kTputRecords))); }
 PS_SLOW_TEST(hot_split_throughput_T3_5_full) { hotSplitThroughput(uint64_t(argInt("hot-records", 2000000))); }

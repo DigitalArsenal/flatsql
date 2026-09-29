@@ -821,6 +821,12 @@ int32_t Engine::openTypes(std::string* err) {
                             t->runs.push_back(std::move(r));
                         }
                         parseTypeRetireSet(man.data(), man.size(), body + 8, &typeRetired);
+                        // T3b (A15): compacted arrivals segments.
+                        if (!parseTypeArrivalsTable(man.data(), man.size(), body + 8, &t->arrOverrides)) {
+                            if (err) *err = "type manifest arrivals table invalid";
+                            io->close(&f);
+                            return FLATSQL_IO_ERR_IO;
+                        }
                     }
                     t->manifestBytes = uint64_t(size);
                 }

@@ -267,8 +267,12 @@ struct TypeSnap {
     // pid -> labeled_through (shared: > 128 pids rebuild it from the log)
     std::shared_ptr<const std::unordered_map<uint32_t, uint64_t>> labeled;
     // Sealed arrivals segments (fence index) and cumulative entry counts.
+    // T3b (A15): segments a type merge rewrote count, start and end as the
+    // manifest's table says, and are read from ga-<gen>.fsg.
     std::shared_ptr<const std::vector<ArrivalFence>> fence;
     std::vector<uint64_t> segStart;           // position of each segment's first entry
+    std::vector<ArrOverride> arr;             // the manifest's arrivals table (by seg)
+    std::vector<int32_t> arrOf;               // seg -> index in arr (-1: g-<seg>.fsg), when arr is not empty
     mutable std::unordered_map<uint16_t, SectionList> secs;  // L0 sections per kind (once per statement)
     uint64_t labeledThrough(uint32_t pid) const {
         if (!labeled) return 0;

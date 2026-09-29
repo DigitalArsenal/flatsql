@@ -116,6 +116,10 @@ struct EngineConfig {
     uint32_t tombRangeStep = 512;          // rows examined per TOMB_RANGE step at most
     uint32_t tombRangeBudgetUs = 4000;     // and CPU time per step (each <= 10 ms, T3 #3)
     uint64_t ballastBytes = 0;             // A13: released on ENOSPC (servers: 256 MiB; 0: none)
+    // T3b (A15): a type merge rewrites a sealed arrivals segment when the GONE
+    // postings among its inputs cover at least this share of the segment
+    // (0: arrival entries are never removed).
+    double arrivalsCompactRatio = 0.25;
     // T3b hot split (§12, A26): a partition whose backlog stays over
     // hotSplitBacklogPct of its ring cap for hotSplitAfterMs, while its
     // owner has no other partition with backlog, has its stage-1 work
@@ -141,12 +145,28 @@ struct EngineConfig {
 
 // ---- instrumentation ---------------------------------------------------------
 struct LockHist {
-    // Hold-time histogram, log2 buckets of nanoseconds (bucket i: [2^i, 2^(i+1))).
-    std::atomic<uint64_t> buckets[48];
+    // Hold-time histogram of nanoseconds: 48 octaves [2^i, 2^(i+1)), each in
+    // four equal sub-buckets (T3b: a percentile is within 25% of its value,
+    // fine enough for T3 #1's 1.5x bound; whole octaves were not).
+    static constexpr int kSub = 4;
+    static constexpr int kBuckets = 48 * kSub;
+    std::atomic<uint64_t> buckets[kBuckets];
     std::atomic<uint64_t> maxNs{0};
     std::atomic<uint64_t> count{0};
     LockHist() {
         for (auto& b : buckets) b.store(0);
+    }
+    static int bucketOf(uint64_t ns) {
+        const int o = ns ? 63 - __builtin_clzll(ns) : 0;
+        if (o > 47) return kBuckets - 1;
+        const int sub = o >= 2 ? int((ns >> (o - 2)) & 3) : 0;
+        return o * kSub + sub;
+    }
+    // Largest value bucket i holds.
+    static uint64_t upperNs(int i) {
+        const int o = i / kSub, sub = i % kSub;
+        if (o < 2) return (uint64_t(1) << (o + 1)) - 1;
+        return (uint64_t(1) << o) + (uint64_t(sub + 1) << (o - 2)) - 1;
     }
     void record(uint64_t ns);
     uint64_t percentileNs(double q) const;
@@ -660,6 +680,19 @@ struct TypeOwner {
     uint64_t fenceExtent = 0;             // g.fsf
     std::atomic<uint64_t> diskBytesPub{0};
     std::atomic<uint64_t> retiredBytesPub{0};
+
+    // T3b (A15, arrivals half): sealed arrivals segments a type merge rewrote
+    // without the dead entries whose GONE postings it dropped (the manifest's
+    // table, sorted by seg). gSealedBytes counts their ga-<gen>.fsg files
+    // instead of the originals.
+    std::vector<ArrOverride> arrOverrides;
+    std::vector<ArrOverride> mergeArrPlan;    // plan: the table at planning
+    uint32_t mergeArrSegs = 0;                // plan: sealed segments (fence entries) at planning
+    std::vector<ArrOverride> mergeArrOut;     // build: the table MERGE_DONE installs
+    std::vector<RetireItem> mergeArrRetire;   // build: files it stops naming (with sizes)
+    uint64_t mergeArrLen = 0;                 // build: ga-<mergeGen>.fsg bytes (0: none)
+    uint64_t mergeArrDropped = 0;             // build: arrival entries left out
+    uint64_t mergeArrSegsCompacted = 0;
 };
 
 // ---- writer mailbox --------------------------------------------------------------
@@ -920,6 +953,9 @@ struct EngineStats {
     uint64_t prepHinted = 0;       // dedupe lookups a stage-1 hint shortened to the L0 blocks
     uint64_t prepHelperStalls = 0; // injected stalls (tests)
     uint64_t l0FullStalls = 0;     // stagings that stopped at a full L0 directory (merge or labels behind)
+    // T3b (A15, arrivals half)
+    uint64_t arrivalSegsCompacted = 0;   // sealed arrivals segments rewritten
+    uint64_t arrivalEntriesDropped = 0;  // dead arrival entries (and their GONE postings) removed
     uint64_t diskBytes = 0;        // sum over partitions (published values)
     // store-migrate (§16.1-5): FIRST copies labeled with their migrated gseq,
     // and copies that carried one but did not get it (labeled REPEAT, or the
@@ -1053,6 +1089,7 @@ public:
         cRetired{0}, cUnlinked{0}, cUnlinkBusy{0}, cMetaRetired{0}, cCompactInFlight{0}, cCatalogDropped{0};
     std::atomic<uint64_t> cMigratedGseq{0}, cMigratedGseqFallback{0};
     std::atomic<uint64_t> cSplits{0}, cUnsplits{0}, cPrepStalls{0}, cL0Full{0};
+    std::atomic<uint64_t> cArrSegsCompacted{0}, cArrDropped{0};
     uint64_t framesParsedAtOpen = 0;
     uint64_t adoptedBatches = 0;
     uint64_t journalReplayRecords = 0;

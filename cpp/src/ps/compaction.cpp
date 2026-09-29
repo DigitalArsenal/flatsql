@@ -264,8 +264,38 @@ void typeRetirePath(PathBuf* out, const char* root, const uint8_t fid[4], const 
         case 'm': pathTypeSeg(out, root, fid, 'm', it.seg, "fsl"); break;
         case 'x': pathTypeRun(out, root, fid, it.gen); break;
         case 'f': pathTypeManifest(out, root, fid, it.gen); break;
+        case 'g': pathTypeSeg(out, root, fid, 'g', it.seg, "fsg"); break;
+        case 'G': pathTypeArrivalsCompact(out, root, fid, it.gen); break;
         default: out->buf[0] = 0; out->len = 0; break;
     }
+}
+
+void appendTypeArrivalsTable(std::vector<uint8_t>* man, const std::vector<ArrOverride>& table) {
+    const size_t at = man->size();
+    const size_t body = 8 + table.size() * sizeof(ArrOverride);
+    man->resize(at + body + 8, 0);
+    uint8_t* b = man->data() + at;
+    putU32(b, kMagicTypeArrivals);
+    putU32(b + 4, uint32_t(table.size()));
+    if (!table.empty()) std::memcpy(b + 8, table.data(), table.size() * sizeof(ArrOverride));
+    putU32(b + body, crc32c(b, body));
+}
+
+bool parseTypeArrivalsTable(const uint8_t* man, size_t len, size_t at, std::vector<ArrOverride>* out) {
+    out->clear();
+    // Past the retire set.
+    if (at + 16 <= len && getU32(man + at) == kMagicTypeRetire) {
+        const uint32_t n = getU32(man + at + 4);
+        if (n > (1u << 20)) return false;
+        at += 8 + size_t(n) * sizeof(RetireItem) + 8;
+    }
+    if (at + 16 > len || getU32(man + at) != kMagicTypeArrivals) return true;
+    const uint32_t n = getU32(man + at + 4);
+    const size_t body = 8 + size_t(n) * sizeof(ArrOverride);
+    if (n > (1u << 24) || at + body + 8 > len || crc32c(man + at, body) != getU32(man + at + body)) return false;
+    out->resize(n);
+    if (n) std::memcpy(out->data(), man + at + 8, size_t(n) * sizeof(ArrOverride));
+    return true;
 }
 
 void appendTypeRetireSet(std::vector<uint8_t>* man, const std::vector<RetireItem>& items) {

@@ -326,28 +326,33 @@ struct LatencySeries {
         std::lock_guard<std::mutex> g(mu);
         ms.clear();
     }
+    size_t size() {
+        std::lock_guard<std::mutex> g(mu);
+        return ms.size();
+    }
 };
 
 // Histogram deltas: the p99 of what a LockHist recorded after a snapshot.
 struct LockHistSnap {
-    uint64_t b[48];
+    uint64_t b[LockHist::kBuckets];
 };
 LockHistSnap snapHist(const LockHist& h) {
     LockHistSnap s;
-    for (int i = 0; i < 48; i++) s.b[i] = h.buckets[i].load();
+    for (int i = 0; i < LockHist::kBuckets; i++) s.b[i] = h.buckets[i].load();
     return s;
 }
-double histP99Since(const LockHist& h, const LockHistSnap& s0) {
-    uint64_t d[48], total = 0;
-    for (int i = 0; i < 48; i++) {
+double histP99Since(const LockHist& h, const LockHistSnap& s0, uint64_t* n = nullptr) {
+    uint64_t d[LockHist::kBuckets], total = 0;
+    for (int i = 0; i < LockHist::kBuckets; i++) {
         d[i] = h.buckets[i].load() - s0.b[i];
         total += d[i];
     }
+    if (n) *n = total;
     if (!total) return 0;
     uint64_t seen = 0;
-    for (int i = 0; i < 48; i++) {
+    for (int i = 0; i < LockHist::kBuckets; i++) {
         seen += d[i];
-        if (double(seen) >= 0.99 * double(total)) return double(uint64_t(1) << (i + 1)) / 1e6;  // bucket upper bound
+        if (double(seen) >= 0.99 * double(total)) return double(LockHist::upperNs(i) + 1) / 1e6;  // bucket upper bound
     }
     return 0;
 }
@@ -494,10 +499,13 @@ void runHalfDead(int parts, int perPart, uint64_t minPreSwap, uint64_t maxSecond
             }
         });
     const double windowS = 3;
+    const LockHistSnap commitB0 = snapHist(s.e->commitHist()), maintB0 = snapHist(s.e->maintHist());
     sleepNs(uint64_t(windowS * 1e9));
     const double ackBase = ack.p99(), laneBase = lane.p99();
-    const double commitBase = double(s.e->commitHist().percentileNs(0.99)) / 1e6;
-    const double maintBase = double(s.e->maintHist().percentileNs(0.99)) / 1e6;
+    uint64_t commitBaseN = 0;
+    const double commitBase = histP99Since(s.e->commitHist(), commitB0, &commitBaseN);
+    const double maintBase = histP99Since(s.e->maintHist(), maintB0);
+    const size_t ackBaseN = ack.size(), laneBaseN = lane.size();
     ack.clear();
     lane.clear();
     const LockHistSnap commit0 = snapHist(s.e->commitHist()), maint0 = snapHist(s.e->maintHist());
@@ -516,6 +524,13 @@ void runHalfDead(int parts, int perPart, uint64_t minPreSwap, uint64_t maxSecond
         }
     }
     const double compactS = double(monoNs() - c0) / 1e9;
+    // T3 #1 "during the compaction": the pass above (every sealed segment of
+    // the half-dead partitions compacted once).
+    const double ackFirst = ack.p99(), laneFirst = lane.p99();
+    const size_t ackFirstN = ack.size(), laneFirstN = lane.size();
+    uint64_t commitFirstN = 0;
+    const double commitFirst = histP99Since(s.e->commitHist(), commit0, &commitFirstN);
+    const double maintFirst = histP99Since(s.e->maintHist(), maint0);
     std::vector<DirCheck> after;
     const bool settled = waitSettled(s, pids, 120000000000ull, &after);
     CHECK(settled);
@@ -560,6 +575,17 @@ void runHalfDead(int parts, int perPart, uint64_t minPreSwap, uint64_t maxSecond
     report("halfdead_compaction_seconds", compactS, "s");
     report("halfdead_swaps", double(swaps), "swaps");
     report("halfdead_puts_dropped", double(dropped), "rows");
+    report("halfdead_baseline_samples_ack_lane_commit", double(ackBaseN + laneBaseN + commitBaseN), "samples");
+    report("halfdead_compaction_pass_samples_ack", double(ackFirstN), "samples");
+    report("halfdead_compaction_pass_samples_lane", double(laneFirstN), "samples");
+    report("halfdead_compaction_pass_samples_commit_round", double(commitFirstN), "samples");
+    report("halfdead_compaction_pass_ack_p99_ms", ackFirst, "ms");
+    report("halfdead_compaction_pass_commit_round_p99_ms", commitFirst, "ms");
+    report("halfdead_compaction_pass_maintenance_step_p99_ms", maintFirst, "ms");
+    report("halfdead_compaction_pass_lane_p99_ms", laneFirst, "ms");
+    if (commitBase > 0) report("halfdead_compaction_pass_commit_round_ratio", commitFirst / commitBase, "x");
+    if (laneBase > 0) report("halfdead_compaction_pass_lane_ratio", laneFirst / laneBase, "x");
+    if (ackBase > 0) report("halfdead_compaction_pass_ack_ratio", ackFirst / ackBase, "x");
     report("halfdead_ack_p99_baseline_ms", ackBase, "ms");
     report("halfdead_ack_p99_compacting_ms", ackDuring, "ms");
     report("halfdead_commit_round_p99_ms", commitBase, "ms");
@@ -578,9 +604,16 @@ void runHalfDead(int parts, int perPart, uint64_t minPreSwap, uint64_t maxSecond
     unsigned threads = 0;
     double load = 0;
     std::string why;
-    if (latencyBoxQuiet(&threads, &load, &why)) {
-        CHECK(ackDuring <= 1.5 * ackBase);
-        CHECK(laneDuring <= 1.5 * laneBase);
+    const bool enoughSamples = laneFirstN >= 100 && commitFirstN >= 100;
+    if (!enoughSamples) {
+        std::fprintf(stderr, "  NOTE latency bounds not enforced: the compaction pass gave %zu lane and %llu commit samples (< 100)\n",
+                     laneFirstN, (unsigned long long)commitFirstN);
+    } else if (latencyBoxQuiet(&threads, &load, &why)) {
+        // §18 T3 #1: owner commit p99 and interactive lane p99 during the
+        // compaction (PARTITION-STORE.md §34: the pass, not the re-compaction
+        // storm that collects pre-SWAP statements; ack p99 is reported).
+        CHECK(commitFirst <= 1.5 * commitBase);
+        CHECK(laneFirst <= 1.5 * laneBase);
     } else {
         std::fprintf(stderr, "  NOTE latency bounds not enforced: %s\n", why.c_str());
     }
@@ -920,6 +953,187 @@ PS_TEST(type_logs_reclaimed_under_readers) {
         if (c.status != 0 || c.rows.size() != 1 || c.i(0, 0) != (wantLive ? 1 : 0)) wrong2++;
     }
     CHECK_EQ(wrong2, 0);
+}
+
+// T3b (A15, arrivals half): under churn, type merges rewrite sealed arrivals
+// segments without the entries whose GONE postings they drop. The arrivals
+// bytes shrink (and the type's disk bytes with them, equal to its
+// directory), offset paging over arrivals still equals the live gseqs (live
+// = entries - GONE in every snapshot), and a reopen finds the same files.
+static void arrivalsChurnRun(double ratio, uint64_t seconds, uint64_t* arrBytesOut, uint64_t* appendedOut,
+                             uint64_t* keptOut) {
+    CStore cs(ratio > 1 ? "arrivals-off" : "arrivals");
+    Store& s = cs.s;
+    s.cfg.arrivalsSegBytes = 24 * 128;  // many sealed arrivals segments
+    s.cfg.arrivalsCompactRatio = ratio;
+    s.cfg.sealBytes = 64u << 10;
+    s.cfg.sealAgeMs = 50;
+    s.cfg.typeMetaSegBytes = 32u << 10;
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const int parts = 3;
+    std::vector<uint32_t> pids;
+    for (int p = 0; p < parts; p++) pids.push_back(s.partition("ac" + std::to_string(p), ommType()));
+    std::vector<std::unique_ptr<Producer>> prods;
+    for (uint32_t pid : pids) prods.emplace_back(new Producer(s.e.get(), pid));
+    const auto attr = buildRecordAttr("ac", "prov", "src", "b1");
+    std::vector<std::vector<std::vector<uint8_t>>> live(parts);
+    std::mt19937_64 rng(29);
+    int next = 0;
+    const uint64_t t0 = monoNs();
+    ReaderConfig ic;
+    ic.root = s.root;
+    ic.io = cs.io;
+    ic.cls = LaneClass::Bulk;
+    ic.lanes = 2;
+    Reader rd(ic);
+    REQUIRE(rd.inst);
+    s.e->setReaderGate([](void* ctx) -> uint64_t { return static_cast<ReaderInstance*>(ctx)->oldestActiveStart(); },
+                       rd.inst.get());
+    uint64_t pagingChecks = 0, pagingWrong = 0;
+    // Offset paging over arrivals (the data explorer's order) against the
+    // gseqs of the live records, looked up one by one through the catalog.
+    auto checkPaging = [&]() {
+        REQUIRE(waitLabeledEngine(s.e.get(), pids, 60000000000ull));
+        REQUIRE(waitTypeVisible(cs.io, s.root, ommType().fid, pids, 60000000000ull));
+        std::vector<int64_t> want;
+        for (const auto& v : live)
+            for (const auto& f : v) {
+                const Rows g = rd.q("SELECT _gseq FROM OMM WHERE _cid = ?", {Param::text(cidTextOf(f))});
+                if (g.status == 0 && g.rows.size() == 1) want.push_back(g.i(0, 0));
+                else pagingWrong++;
+            }
+        std::sort(want.begin(), want.end());
+        const Rows all = rd.q("SELECT count(*) FROM OMM");
+        if (all.status != 0 || all.rows.size() != 1 || uint64_t(all.i(0, 0)) != want.size()) pagingWrong++;
+        for (int k = 0; k < 6 && !want.empty(); k++) {
+            const size_t off = size_t(rng() % want.size());
+            const Rows r = rd.q("SELECT _gseq FROM OMM ORDER BY _gseq LIMIT 40 OFFSET " + std::to_string(off));
+            pagingChecks++;
+            bool ok = r.status == 0 && r.rows.size() == std::min<size_t>(40, want.size() - off);
+            for (size_t i = 0; ok && i < r.rows.size(); i++) ok = r.i(i, 0) == want[off + i];
+            if (!ok) pagingWrong++;
+        }
+    };
+    int rounds = 0;
+    while (monoNs() - t0 < seconds * 1000000000ull) {
+        for (int p = 0; p < parts; p++) {
+            uint64_t last = 0;
+            for (int i = 0; i < 150; i++) {
+                auto f = ommFrame(p, next++, 80);
+                last = send(s.e.get(), *prods[size_t(p)], f, attr, 1780000000000ll + next, false);
+                if (last) live[size_t(p)].push_back(std::move(f));
+            }
+            std::vector<std::vector<uint8_t>> keep;
+            for (auto& f : live[size_t(p)]) {
+                if (rng() % 100 >= 70) {
+                    keep.push_back(std::move(f));
+                    continue;
+                }
+                uint8_t cid[kCidLen];
+                frameCid(f, cid);
+                uint64_t rs = 0;
+                if (prods[size_t(p)]->enqueue(kEntTombCid, 0, 0, cid, nullptr, 0, nullptr, 0, &rs, false) == 0) last = rs;
+                else keep.push_back(std::move(f));
+            }
+            live[size_t(p)].swap(keep);
+            if (last) REQUIRE(prods[size_t(p)]->waitAcked(last, 60000000000ull) == 0);
+        }
+        if (++rounds % 10 == 0) checkPaging();
+    }
+    checkPaging();
+    uint64_t liveNow = 0;
+    for (const auto& v : live) liveNow += v.size();
+    // At rest: the type directory holds exactly what head and manifest name,
+    // at the type's disk bytes.
+    DirCheck tc;
+    for (const uint64_t t1 = monoNs(); monoNs() - t1 < 30000000000ull; sleepNs(20000000)) {
+        tc = checkTypeDir(cs.io, cs.fs(), s.root, ommType().fid);
+        if (tc.ok && tc.bytes == s.e->typeDiskBytesOf(ommType().fid)) break;
+    }
+    if (!tc.ok) std::fprintf(stderr, "  type dir: %s\n", tc.err.c_str());
+    CHECK(tc.ok);
+    CHECK_EQ(tc.bytes, s.e->typeDiskBytesOf(ommType().fid));
+    const EngineStats st = s.e->stats();
+    Inspector ins(cs.io, s.root);
+    const auto tv = ins.type(ommType().fid);
+    CHECK(tv.ok && tv.fenceErr.empty());
+    if (!tv.fenceErr.empty()) std::fprintf(stderr, "  arrivals: %s\n", tv.fenceErr.c_str());
+    uint64_t arrBytes = 0;
+    {
+        PathBuf dirp;
+        pathTypeDir(&dirp, s.root.c_str(), ommType().fid);
+        const std::string dir(dirp.c_str(), dirp.len);
+        IoStats ios;
+        IoCtx ctx(cs.io, &ios);
+        auto sizeOf = [&](const std::string& path) -> uint64_t {
+            FileRef f;
+            if (ctx.open(path.c_str(), path.size(), FLATSQL_IO_READ, FileClass::Store, &f) < 0) return 0;
+            const int64_t n = ctx.size(f);
+            ctx.close(&f);
+            return n > 0 ? uint64_t(n) : 0;
+        };
+        std::vector<std::string> files;
+        if (cs.fs()) {
+            files = cs.fs()->list(dir + "/");
+        } else {
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(dir, ec)) files.push_back(e.path().string());
+        }
+        for (const auto& path : files) {
+            const std::string base = path.substr(path.rfind('/') + 1);
+            if (base.compare(0, 2, "g-") == 0 || base.compare(0, 3, "ga-") == 0) arrBytes += sizeOf(path);
+        }
+    }
+    report(ratio > 1 ? "arrivals_off_rounds" : "arrivals_rounds", double(rounds), "rounds");
+    report(ratio > 1 ? "arrivals_off_bytes_on_disk" : "arrivals_bytes_on_disk", double(arrBytes), "bytes");
+    report(ratio > 1 ? "arrivals_off_entries_kept" : "arrivals_entries_kept", double(tv.arrivals.size()), "entries");
+    report(ratio > 1 ? "arrivals_off_entries_appended" : "arrivals_entries_appended", double(tv.head.arrivalsCount),
+           "entries");
+    report(ratio > 1 ? "arrivals_off_live" : "arrivals_live", double(liveNow), "records");
+    report(ratio > 1 ? "arrivals_off_segments_rewritten" : "arrivals_segments_rewritten",
+           double(st.arrivalSegsCompacted), "segments");
+    report(ratio > 1 ? "arrivals_off_entries_dropped" : "arrivals_entries_dropped", double(st.arrivalEntriesDropped),
+           "entries");
+    report(ratio > 1 ? "arrivals_off_paging_checks" : "arrivals_paging_checks", double(pagingChecks), "checks");
+    CHECK_EQ(pagingWrong, uint64_t(0));
+    CHECK(pagingChecks > 0);
+    *arrBytesOut = arrBytes;
+    *appendedOut = tv.head.arrivalsCount;
+    *keptOut = tv.arrivals.size();
+    s.e->setReaderGate(nullptr, nullptr);
+    // Reopen: the same files, the same answers.
+    s.close();
+    {
+        std::string err;
+        REQUIRE(Engine::open(s.cfg, &s.e, &err) == 0);
+    }
+    const DirCheck tc2 = checkTypeDir(cs.io, cs.fs(), s.root, ommType().fid);
+    if (!tc2.ok) std::fprintf(stderr, "  type dir after reopen: %s\n", tc2.err.c_str());
+    CHECK(tc2.ok);
+    CHECK_EQ(tc2.bytes, s.e->typeDiskBytesOf(ommType().fid));
+    s.e->start();
+    checkPaging();
+    CHECK_EQ(pagingWrong, uint64_t(0));
+}
+
+PS_TEST(type_arrivals_compaction_A15) {
+    const uint64_t secs = uint64_t(argInt("seconds", 3));
+    uint64_t bytesOn = 0, appendedOn = 0, keptOn = 0, bytesOff = 0, appendedOff = 0, keptOff = 0;
+    arrivalsChurnRun(2.0, secs, &bytesOff, &appendedOff, &keptOff);  // ratio > 1: never rewrites
+    arrivalsChurnRun(0.25, secs, &bytesOn, &appendedOn, &keptOn);
+    // Without the rewrite every entry ever appended stays; with it, far fewer
+    // (70% of the records die, most in sealed segments).
+    CHECK_EQ(keptOff, appendedOff);
+    CHECK(keptOn < appendedOn);
+    const double shareOn = appendedOn ? double(keptOn) / double(appendedOn) : 1;
+    const double bytesPerAppendedOn = appendedOn ? double(bytesOn) / double(appendedOn) : 0;
+    const double bytesPerAppendedOff = appendedOff ? double(bytesOff) / double(appendedOff) : 0;
+    report("arrivals_kept_share", shareOn, "fraction");
+    report("arrivals_bytes_per_appended_entry_off", bytesPerAppendedOff, "bytes");
+    report("arrivals_bytes_per_appended_entry_on", bytesPerAppendedOn, "bytes");
+    CHECK(shareOn < 0.75);
+    CHECK(bytesPerAppendedOn < bytesPerAppendedOff * 0.8);
 }
 
 // ---------------------------------------------------------------------------

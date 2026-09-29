@@ -2276,8 +2276,8 @@ int32_t loadAccelFromBlock(Partition* p, SlabPool& pool, uint32_t idx, const uin
     L0KindInfo kinds[L0Accel::kMaxKinds];
     size_t nk = 0;
     L0Accel& a = p->acc[idx];
-    if (!parseL0Block(block, len, kinds, L0Accel::kMaxKinds, &nk)) return FLATSQL_IO_ERR_IO;
     a.nKinds = 0;
+    if (!parseL0Block(block, len, kinds, L0Accel::kMaxKinds, &nk)) return FLATSQL_IO_ERR_IO;
     for (size_t i = 0; i < nk; i++) {
         L0Accel::Kind& k = a.kinds[a.nKinds++];
         k.kind = kinds[i].kind;
@@ -2289,13 +2289,17 @@ int32_t loadAccelFromBlock(Partition* p, SlabPool& pool, uint32_t idx, const uin
         k.bloomBytes = 0;
         k.entries = nullptr;
         if (kinds[i].bloomBytes) {
+            // Accelerator memory exhausted: this kind is searched without its
+            // bloom. Every kind is still listed (a kind left out would read
+            // as having no postings in this block).
             uint64_t pos;
             void* mem = p->chain.alloc(pool, kinds[i].bloomBytes, &pos);
-            if (!mem) return FLATSQL_IO_ERR_NOSPACE;
-            if (i == 0 || a.chainPos == 0) a.chainPos = pos;
-            std::memcpy(mem, block + kinds[i].bloomOff, kinds[i].bloomBytes);
-            k.bloom = static_cast<const uint8_t*>(mem);
-            k.bloomBytes = kinds[i].bloomBytes;
+            if (mem) {
+                if (i == 0 || a.chainPos == 0) a.chainPos = pos;
+                std::memcpy(mem, block + kinds[i].bloomOff, kinds[i].bloomBytes);
+                k.bloom = static_cast<const uint8_t*>(mem);
+                k.bloomBytes = kinds[i].bloomBytes;
+            }
         }
         if (k.kind == kIxCid && p->hot.load(std::memory_order_relaxed) && kinds[i].entriesBytes) {
             // Entries, then the bloom (stage-1 helpers probe it before searching).
@@ -2440,11 +2444,12 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
             a.l0Len = st->l0Len;
             a.chainPos = 0;
             p->nL0++;
-            if (st->l0Len && loadAccelFromBlock(p, e->pool(), idx, st->batch + st->l0Off, st->l0Len) < 0) {
-                // Accelerator memory exhausted: lookups fall back to reading
-                // the section (no bloom) -- correctness is unaffected.
-                for (int k = 0; k < a.nKinds; k++) a.kinds[k].bloom = nullptr;
-            }
+            // Bloom memory exhausted: the kinds concerned are searched without
+            // their bloom (T3b: the accelerator used to stop at that kind,
+            // and the kinds after it read as having no postings). The parse
+            // cannot fail on a block this batch built.
+            a.nKinds = 0;
+            if (st->l0Len) (void)loadAccelFromBlock(p, e->pool(), idx, st->batch + st->l0Off, st->l0Len);
             p->segRecords += nRows;
         }
         if (st->sealAfter) {

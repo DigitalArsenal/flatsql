@@ -259,7 +259,9 @@ int32_t flatsql_ps_stats(uint8_t* out, int32_t len) {
                           s.noticesDropped, s.framesParsedAtOpen, s.openReadBytes,
                           s.openDataBytes, s.openMetaBytes, s.adoptedBatches, s.poolSlabsInUse,
                           s.poolSlabsPeak, s.poolCommittedBytes, s.committedBytes,
-                          s.migratedGseqs, s.migratedGseqFallbacks};
+                          s.migratedGseqs, s.migratedGseqFallbacks, s.splits, s.unsplits,
+                          s.prepPrepared, s.prepUsed, s.prepStolen, s.prepWasted, s.prepHinted,
+                          s.l0FullStalls, s.arrivalSegsCompacted, s.arrivalEntriesDropped};
     const int32_t n = int32_t(sizeof(v));
     if (!out || len < n) return n;
     for (size_t i = 0; i < sizeof(v) / 8; i++) putU64(out + i * 8, v[i]);

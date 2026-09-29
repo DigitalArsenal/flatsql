@@ -113,9 +113,13 @@ struct Harness {
         // dead or alive: compaction (T3) removes dead ones, so it stays off
         // here (orphan_test.cpp crashes compactions against a liveness
         // oracle). Merge retirements, A9 meta retirement and reclamation run.
+        // Published gseqs keep their arrival entries: the arrivals half of
+        // compaction (A15) drops dead records' entries, so it is off too
+        // (orphan_test.cpp crashes it).
         s.cfg.autoCompact = false;
+        s.cfg.arrivalsCompactRatio = 0;
         s.cfg.reclaimGraceMs = 5;
-        splitSome = (seed & 64) != 0;
+        splitSome = (seed & 64) != 0 && argInt("crash-split", 1) != 0;
     }
 
     TestType& type(int k) { return crashTypes(nTypes)[size_t(k)]; }
@@ -405,6 +409,12 @@ struct Harness {
                 if (kv.second.first) rec[kv.first] = kv.second;
             if (head != rec) {
                 std::fprintf(stderr, "  [%s] pid %u lane counters differ from recount\n", phase, p.pid);
+                for (const auto& kv : head)
+                    std::fprintf(stderr, "    head lane %u: %lld rows %lld bytes\n", kv.first, (long long)kv.second.first,
+                                 (long long)kv.second.second);
+                for (const auto& kv : rec)
+                    std::fprintf(stderr, "    rows lane %u: %lld rows %lld bytes\n", kv.first, (long long)kv.second.first,
+                                 (long long)kv.second.second);
                 gFailures++;
             }
             // Acked records: a PUT with that cid whose stored bytes hash to it.

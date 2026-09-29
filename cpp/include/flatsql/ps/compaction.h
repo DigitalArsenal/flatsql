@@ -216,6 +216,14 @@ void typeRetirePath(PathBuf* out, const char* root, const uint8_t fid[4], const 
 void appendTypeRetireSet(std::vector<uint8_t>* man, const std::vector<RetireItem>& items);
 // `at`: the first byte after the manifest's CRC trailer. False when absent or invalid.
 bool parseTypeRetireSet(const uint8_t* man, size_t len, size_t at, std::vector<RetireItem>* out);
+// T3b (A15): compacted arrivals segments, an appendix after the retire set:
+// [u32 magic][u32 n][n x ArrOverride][u32 crc][u32 pad]. Retire letters: 'g'
+// an original g-<seg>.fsg, 'G' a ga-<gen>.fsg no segment names any more.
+constexpr uint32_t kMagicTypeArrivals = fourcc('F', 'S', 'A', 'C');
+void appendTypeArrivalsTable(std::vector<uint8_t>* man, const std::vector<ArrOverride>& table);
+// `at`: the first byte after the manifest's CRC trailer (the retire set is
+// skipped). Absent: an empty table (true); invalid: false.
+bool parseTypeArrivalsTable(const uint8_t* man, size_t len, size_t at, std::vector<ArrOverride>* out);
 
 // ---- ctl bodies ---------------------------------------------------------------------
 // INTENT_COMPACT{seg u32, segEnd u32, gen u32, pad u32}: outputs c-<seg>-<gen>.*,

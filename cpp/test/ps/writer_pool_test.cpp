@@ -840,12 +840,14 @@ PS_TEST(writer_capi_tlv19_max_entry_and_stats) {
     std::memcpy(&got, reinterpret_cast<const uint8_t*>(ring) + L.offMaxEntry, 8);
     CHECK_EQ(got, maxEntry);
     const int32_t n = flatsql_ps_stats(nullptr, 0);
-    CHECK_EQ(n, int32_t(26 * 8));
+    CHECK_EQ(n, int32_t(36 * 8));
     std::vector<uint8_t> st(size_t(n > 0 ? n : 0));
     CHECK_EQ(flatsql_ps_stats(st.data(), n), n);
-    if (n == 26 * 8) {
+    if (n == 36 * 8) {
         CHECK_EQ(getU64(st.data() + 24 * 8), uint64_t(0));  // migrated gseqs used
         CHECK_EQ(getU64(st.data() + 25 * 8), uint64_t(0));  // migrated gseq fallbacks
+        CHECK_EQ(getU64(st.data() + 26 * 8), uint64_t(0));  // hot splits
+        CHECK_EQ(getU64(st.data() + 35 * 8), uint64_t(0));  // arrival entries dropped
     }
     CHECK_EQ(flatsql_ps_stop(5000), 0);
     std::filesystem::remove_all(dir);

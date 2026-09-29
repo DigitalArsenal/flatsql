@@ -138,6 +138,7 @@ public:
         TypeHeadFixed head{};
         std::vector<ArrivalEntry> arrivals;   // every segment, in order (A15)
         std::vector<ArrivalFence> fence;      // one per sealed segment
+        std::vector<ArrOverride> arr;         // T3b: the manifest's compacted arrivals segments
         std::string fenceErr;                 // fence/segment inconsistency
         std::map<uint32_t, uint64_t> labeled;
     };
