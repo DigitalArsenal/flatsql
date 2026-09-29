@@ -1143,10 +1143,9 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
     if (shOut) *shOut = sh;
     if (!partLevel) {
         sh->pids = pids;
-        if (tags.any) {
-            rc = typeHasRepeats(&st, *ts, &sh->repeats);
-            if (rc < 0) return rc;
-        }
+        rc = typeHasRepeats(&st, *ts, &sh->repeats);
+        if (rc < 0) return rc;
+        sh->repeatsKnown = true;
     }
     // Per-partition filter.
     auto filterFor = [&](uint32_t pid, RowFilter* f) -> int32_t {

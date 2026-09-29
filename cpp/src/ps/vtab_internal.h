@@ -181,6 +181,7 @@ struct StmtShared {
     // Type level: the type snapshot lists REPEAT postings (a CID may have
     // live copies in several partitions; tag conditions then look at all).
     bool repeats = false;
+    bool repeatsKnown = false;    // `repeats` was computed (type level)
     // Partitions the plan reads (sorted); copies elsewhere are not visible.
     std::vector<uint32_t> pids;
     struct Pruned {
@@ -213,8 +214,32 @@ struct StmtShared {
     // and the frames of the rows read after it in its segment (up to 256
     // KiB): frames are appended in pseq order.
     int32_t readFrame(LaneStore* st, const PartSnap& s, const RecRow& r, uint8_t* dst);
+    // Liveness lookups that skip a snapshot holding no posting of the kind
+    // at all (a partition nothing was ever killed in, or whose tags were
+    // never reconciled): the DEAD and TAG_DEAD lookups cost a bloom probe
+    // and a block per run otherwise.
+    int32_t isDead(LaneStore* st, const PartSnap& s, uint64_t pseq, uint64_t bound, bool* dead);
+    int32_t isTagDead(LaneStore* st, const PartSnap& s, uint64_t inst, uint64_t bound, bool* dead);
+    bool mayHave(LaneStore* st, const PartSnap& s, uint16_t kind);
+    // The highest pseq of any tag instance, in snapshot `s`, whose lane tuple
+    // meets `m` (the lane counters' max_pseq; UINT64_MAX when unknown). A
+    // record copy with pseq above it matches no condition: its own tag is its
+    // lane's, and its RETAGs come after it.
+    uint64_t laneMaxPseq(LaneStore* st, const PartSnap& s, const TagMatch& m);
 
 private:
+    struct LaneMax {
+        const PartSnap* snap;
+        const TagMatch* m;
+        uint64_t max;
+    };
+    std::vector<LaneMax> laneMax_;
+    struct KindHas {
+        const PartSnap* snap;
+        uint16_t kind;
+        bool has;
+    };
+    std::vector<KindHas> kinds_;
     struct FrameSpan {
         const PartSnap* snap = nullptr;
         uint32_t seg = 0;
@@ -238,6 +263,8 @@ private:
         FileKey key;
         int64_t block = -1;
         std::vector<uint8_t> data;
+        std::vector<uint16_t> offs;       // entry offsets in `data`
+        uint64_t firstHead = 0, lastHead = 0;  // first and last keys' 8-byte heads (BE)
     };
     std::vector<CachedBlock> blocks_;
 };

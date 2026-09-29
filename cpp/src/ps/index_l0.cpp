@@ -199,7 +199,7 @@ void sortStagedBuckets(StagedEntry** e, size_t n, StagedEntry** tmp, SortKey* kp
         });
         for (size_t i = 0; i < m; i++) b[i] = kp[i].e;
     }
-    std::memcpy(e, tmp, n * sizeof(StagedEntry*));
+    if (n) std::memcpy(e, tmp, n * sizeof(StagedEntry*));
 }
 
 namespace {
@@ -259,8 +259,8 @@ size_t writeL0Block(uint8_t* out, StagedEntry* const* e, size_t n, uint64_t firs
         uint8_t* p = sec + sizeof(L0KindHeader);
         for (size_t k = i; k < j; k++) {
             putU16(p, e[k]->klen);
-            std::memcpy(p + 2, e[k]->key, e[k]->klen);
-            std::memcpy(p + 2 + e[k]->klen, e[k]->val, e[k]->vlen);
+            if (e[k]->klen) std::memcpy(p + 2, e[k]->key, e[k]->klen);
+            if (e[k]->vlen) std::memcpy(p + 2 + e[k]->klen, e[k]->val, e[k]->vlen);
             p += 2 + e[k]->klen + e[k]->vlen;
         }
         const size_t padEntries = pad8(bytes) - bytes;

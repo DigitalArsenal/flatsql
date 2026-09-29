@@ -67,12 +67,12 @@ int32_t L1Writer::add(const uint8_t* key, uint16_t klen, const uint8_t* val, boo
     if (4 + need + 4 > kL1BlockBytes) return err_ = FLATSQL_IO_ERR_GENERIC;
     if (blockN_ == 0) {
         firstKeyLen_ = uint8_t(klen < kFencePrefix ? klen : kFencePrefix);
-        std::memcpy(firstKey_, key, firstKeyLen_);
+        if (firstKeyLen_) std::memcpy(firstKey_, key, firstKeyLen_);
     }
     uint8_t* p = block_.data() + 4 + used;
     putU16(p, klen);
-    std::memcpy(p + 2, key, klen);
-    std::memcpy(p + 2 + klen, val, vlen);
+    if (klen) std::memcpy(p + 2, key, klen);
+    if (vlen) std::memcpy(p + 2 + klen, val, vlen);
     blockN_++;
     if (live) blockLive_++;
     putU16(block_.data(), uint16_t(blockN_));
@@ -191,7 +191,7 @@ int32_t L1Run::load(IoCtx* io, const FileRef& f, uint64_t fileLen) {
         const size_t bo = size_t(k.toc.bloomOff - ft.metaOff);
         if (fo + fb > meta.size() || bo + k.toc.bloomBytes > meta.size()) return -1;
         k.fences.resize(k.toc.nBlocks);
-        std::memcpy(k.fences.data(), meta.data() + fo, fb);
+        if (fb) std::memcpy(k.fences.data(), meta.data() + fo, fb);  // a null destination is UB even for 0 bytes
         k.bloom.assign(meta.data() + bo, meta.data() + bo + k.toc.bloomBytes);
     }
     nEntries_ = h.nEntries;

@@ -98,6 +98,7 @@ bool TagMatch::matches(const TagView& t) const {
 }
 
 // ---- §37: pruned snapshots, REPEAT state, tags on every copy -------------------
+bool laneMatches(const TagMatch& m, const LaneStore::LaneTuple& t);
 PartSnap* StmtShared::prunedFor(PartSnap* s, uint64_t pseq) {
     if (!s || !s->manifest || s->manifest->segs.size() < 4) return s;
     const auto& segs = s->manifest->segs;
@@ -189,6 +190,72 @@ int32_t StmtShared::readFrame(LaneStore* st, const PartSnap& s, const RecRow& r,
     return 0;
 }
 
+bool StmtShared::mayHave(LaneStore* st, const PartSnap& s, uint16_t kind) {
+    for (const KindHas& k : kinds_)
+        if (k.snap == &s && k.kind == kind) return k.has;
+    bool has = false;
+    int32_t rc = 0;
+    if (!s.empty) {
+        const SectionList* list = st->sections(s, kind, &rc);
+        if (!list) has = true;  // unknown: look
+        else
+            for (const auto& sec : *list)
+                if (sec && !sec->offs.empty()) has = true;
+        if (!has && s.manifest) {
+            for (const ManifestSegRef& m : s.manifest->segs) {
+                for (const SegRunRef& rr : m.runs) {
+                    FileKey fk;
+                    auto run = st->run(s.pid, m.seg, rr.gen, rr.fileLen, &fk, &rc);
+                    if (!run || run->kindEntries(kind) > 0) {
+                        has = true;
+                        break;
+                    }
+                }
+                if (has) break;
+            }
+        }
+    }
+    if (kinds_.size() >= 256) kinds_.erase(kinds_.begin());
+    kinds_.push_back({&s, kind, has});
+    return has;
+}
+
+uint64_t StmtShared::laneMaxPseq(LaneStore* st, const PartSnap& s, const TagMatch& m) {
+    for (const LaneMax& l : laneMax_)
+        if (l.snap == &s && l.m == &m) return l.max;
+    uint64_t mx = 0;
+    std::vector<LaneCounter> lc;
+    if (s.empty) {
+        mx = 0;
+    } else if (st->laneCounters(s, &lc) < 0) {
+        mx = UINT64_MAX;
+    } else {
+        for (const LaneCounter& c : lc) {
+            const LaneStore::LaneTuple* t = laneOf(st, s, c.laneId);
+            if (!t) {
+                mx = UINT64_MAX;  // a lane without its tuple: look at rows
+                break;
+            }
+            if (laneMatches(m, *t) && c.maxPseq > mx) mx = c.maxPseq;
+        }
+    }
+    if (laneMax_.size() >= 64) laneMax_.erase(laneMax_.begin());
+    laneMax_.push_back({&s, &m, mx});
+    return mx;
+}
+
+int32_t StmtShared::isDead(LaneStore* st, const PartSnap& s, uint64_t pseq, uint64_t bound, bool* dead) {
+    *dead = false;
+    if (!mayHave(st, s, kIxDead)) return 0;
+    return st->isDead(s, pseq, bound, dead);
+}
+
+int32_t StmtShared::isTagDead(LaneStore* st, const PartSnap& s, uint64_t inst, uint64_t bound, bool* dead) {
+    *dead = false;
+    if (!mayHave(st, s, kIxTagDead)) return 0;
+    return st->isTagDead(s, inst, bound, dead);
+}
+
 const LaneStore::LaneTuple* StmtShared::laneOf(LaneStore* st, const PartSnap& s, uint32_t laneId) {
     if (!laneId) return nullptr;
     Lanes* l = nullptr;
@@ -208,6 +275,15 @@ const LaneStore::LaneTuple* StmtShared::laneOf(LaneStore* st, const PartSnap& s,
     return it != l->tuples.end() && it->id == laneId ? &*it : nullptr;
 }
 
+namespace {
+// The 8-byte head of a posting key (big-endian), 0-padded when shorter.
+uint64_t keyHead(const uint8_t* k, uint16_t kl) {
+    uint8_t b[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    std::memcpy(b, k, kl < 8 ? kl : 8);
+    return getBE64(b);
+}
+}  // namespace
+
 int32_t StmtShared::tagInstances(LaneStore* st, const PartSnap& s, uint64_t put, std::vector<uint64_t>* out) {
     out->clear();
     if (s.empty) return 0;
@@ -226,12 +302,43 @@ int32_t StmtShared::tagInstances(LaneStore* st, const PartSnap& s, uint64_t put,
         }
     }
     if (!s.manifest) return 0;
+    // The entries of `put` in a loaded block: binary search on the heads.
+    auto collect = [&](const CachedBlock& cb, uint8_t vlen) {
+        size_t a = 0, b = cb.offs.size();
+        while (a < b) {
+            const size_t mid = (a + b) / 2;
+            const uint8_t* e = cb.data.data() + cb.offs[mid];
+            if (keyHead(e + 2, getU16(e)) < put) a = mid + 1;
+            else b = mid;
+        }
+        for (size_t i = a; i < cb.offs.size(); i++) {
+            const uint8_t* e = cb.data.data() + cb.offs[i];
+            const uint16_t kl = getU16(e);
+            if (keyHead(e + 2, kl) != put) break;
+            out->push_back(getBE64(e + 2 + kl));
+            (void)vlen;
+        }
+    };
     for (const ManifestSegRef& m : s.manifest->segs) {
         // A TAG_OF posting keyed by `put` is written by its instance, never
         // before its target.
         if (m.sealed && m.firstPseq && m.endPseq <= put) continue;
         for (const SegRunRef& rr : m.runs) {
             FileKey fk;
+            fk.space = FileKey::kPart;
+            fk.letter = 'x';
+            fk.id = s.pid;
+            fk.seg = m.seg;
+            fk.gen = rr.gen;
+            CachedBlock* cb = nullptr;
+            for (CachedBlock& c : blocks_)
+                if (c.key == fk) cb = &c;
+            // Rows come in pseq order: the block read for the previous
+            // lookup usually holds this one's entries whole.
+            if (cb && cb->block >= 0 && cb->firstHead < put && put < cb->lastHead) {
+                collect(*cb, 0);
+                continue;
+            }
             auto run = st->run(s.pid, m.seg, rr.gen, rr.fileLen, &fk, &rc);
             if (!run) return rc;
             FenceView f;
@@ -254,9 +361,6 @@ int32_t StmtShared::tagInstances(LaneStore* st, const PartSnap& s, uint64_t put,
                 if (!fe) return rc;
                 // Past the key: a later block whose first key's head is above it.
                 if (blk > first && std::memcmp(fe->prefix, key, std::min<size_t>(8, fe->prefixLen)) > 0) break;
-                CachedBlock* cb = nullptr;
-                for (CachedBlock& c : blocks_)
-                    if (c.key == fk) cb = &c;
                 if (!cb) {
                     if (blocks_.size() >= 256) blocks_.erase(blocks_.begin());
                     blocks_.push_back(CachedBlock());
@@ -265,27 +369,36 @@ int32_t StmtShared::tagInstances(LaneStore* st, const PartSnap& s, uint64_t put,
                 }
                 if (cb->block != int64_t(blk)) {
                     cb->data.resize(kL1BlockBytes);
+                    cb->offs.clear();
                     rc = st->readBlock(fk, fe->blockOff, cb->data.data());
                     if (rc < 0) {
                         cb->block = -1;
                         return rc;
                     }
                     cb->block = int64_t(blk);
-                }
-                EntryIter it = l1BlockIter(cb->data.data(), vlen);
-                const uint8_t *ek, *ev;
-                uint16_t el;
-                bool past = false;
-                while (it.next(&ek, &el, &ev)) {
-                    const int c = el >= 8 ? std::memcmp(ek, key, 8) : keyCmp(ek, el, key, 8);
-                    if (c < 0) continue;
-                    if (c > 0) {
-                        past = true;
-                        break;
+                    EntryIter it = l1BlockIter(cb->data.data(), vlen);
+                    const uint8_t *ek, *ev;
+                    uint16_t el;
+                    const uint8_t* at = it.p;
+                    while (it.next(&ek, &el, &ev)) {
+                        cb->offs.push_back(uint16_t(at - cb->data.data()));
+                        at = it.p;
                     }
-                    out->push_back(getBE64(ev));
+                    if (!cb->offs.empty()) {
+                        const uint8_t* e0 = cb->data.data() + cb->offs.front();
+                        const uint8_t* e1 = cb->data.data() + cb->offs.back();
+                        cb->firstHead = keyHead(e0 + 2, getU16(e0));
+                        cb->lastHead = keyHead(e1 + 2, getU16(e1));
+                    } else {
+                        cb->firstHead = cb->lastHead = 0;
+                    }
                 }
-                if (past) break;
+                const size_t before = out->size();
+                collect(*cb, vlen);
+                // The run's entries of `put` end in this block unless its
+                // last key is `put` itself.
+                if (cb->offs.empty() || cb->lastHead > put) break;
+                (void)before;
             }
         }
     }
@@ -340,7 +453,7 @@ int32_t ownTagMatches(LaneStore* st, StmtShared* sh, const PartSnap& s, const Pa
         if (!parseAttr(scratch->data(), scratch->size(), &av) || !m.matches(av.tag)) return 0;
     }
     bool dead = false;
-    rc = st->isTagDead(deadSnap, r.pseq, bound, &dead);
+    rc = sh ? sh->isTagDead(st, deadSnap, r.pseq, bound, &dead) : st->isTagDead(deadSnap, r.pseq, bound, &dead);
     if (rc < 0) return rc;
     *yes = !dead;
     return 0;
@@ -370,7 +483,7 @@ int32_t liveTagIn(LaneStore* st, StmtShared* sh, PartSnap* s, uint64_t put, uint
     for (uint64_t inst : insts) {
         if (inst > bound || (skipPut && inst == put)) continue;
         bool dead = false;
-        int32_t rc = st->isTagDead(*ps, inst, bound, &dead);
+        int32_t rc = sh ? sh->isTagDead(st, *ps, inst, bound, &dead) : st->isTagDead(*ps, inst, bound, &dead);
         if (rc < 0) return rc;
         if (dead) continue;
         RecRow ir;
@@ -435,6 +548,8 @@ int32_t otherCopies(LaneStore* st, StmtShared* sh, StmtCtx* stmt, TypeSnap* ts, 
 }  // namespace
 
 int32_t RowFilter::hasLiveTag(uint64_t put, const TagMatch& m, bool* yes) {
+    *yes = false;
+    if (shared && put > shared->laneMaxPseq(store, *snap, m)) return 0;
     std::vector<uint8_t> attr;
     return liveTagIn(store, shared.get(), snap, put, bound, m, yes, &attr);
 }
@@ -443,8 +558,10 @@ int32_t RowFilter::anyCopyTag(const RecRow& row, const TagMatch& m, bool* yes) {
     *yes = false;
     std::vector<uint8_t> attr;
     PartSnap* ds = shared ? shared->prunedFor(snap, row.pseq) : snap;
+    // A copy after the last instance of every matching lane cannot match.
+    const bool thisCan = !shared || row.pseq <= shared->laneMaxPseq(store, *snap, m);
     // The copy's own tag first (the common case: one read of its attribute).
-    int32_t rc = ownTagMatches(store, shared.get(), *snap, *ds, row, m, bound, yes, &attr);
+    int32_t rc = thisCan ? ownTagMatches(store, shared.get(), *snap, *ds, row, m, bound, yes, &attr) : 0;
     if (rc < 0 || *yes) return rc;
     std::vector<CopyRef> others;
     TypeSnap* ts = type ? type : copies;
@@ -452,15 +569,19 @@ int32_t RowFilter::anyCopyTag(const RecRow& row, const TagMatch& m, bool* yes) {
         rc = otherCopies(store, shared.get(), stmt, ts, row.cid, snap->pid, row.pseq, &others);
         if (rc < 0) return rc;
         for (CopyRef& c : others) {
+            if (c.pseq > shared->laneMaxPseq(store, *c.snap, m)) continue;
             PartSnap* cds = shared->prunedFor(c.snap, c.pseq);
             rc = ownTagMatches(store, shared.get(), *c.snap, *cds, c.row, m, c.bound, yes, &attr);
             if (rc < 0 || *yes) return rc;
         }
     }
     // RETAG instances: this copy's, then every other copy's.
-    rc = liveTagIn(store, shared.get(), snap, row.pseq, bound, m, yes, &attr, true);
-    if (rc < 0 || *yes) return rc;
+    if (thisCan) {
+        rc = liveTagIn(store, shared.get(), snap, row.pseq, bound, m, yes, &attr, true);
+        if (rc < 0 || *yes) return rc;
+    }
     for (CopyRef& c : others) {
+        if (c.pseq > shared->laneMaxPseq(store, *c.snap, m)) continue;
         rc = liveTagIn(store, shared.get(), c.snap, c.pseq, c.bound, m, yes, &attr, true);
         if (rc < 0 || *yes) return rc;
     }
@@ -479,7 +600,8 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
         // window needs it. With one, the latest LABEL says whether it was
         // promoted since (A14).
         bool repeat = false;
-        int32_t rc = store->everRepeat(*type, snap->pid, pseq, &repeat);
+        // A type without REPEAT postings has no REPEAT copy to look up.
+        int32_t rc = shared && shared->repeatsKnown && !shared->repeats ? 0 : store->everRepeat(*type, snap->pid, pseq, &repeat);
         if (rc < 0) return rc;
         if (repeat || gseqFloor || wantGseq) {
             uint8_t label = 0;
@@ -496,7 +618,7 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
     if (!knownLive) {
         bool dead = false;
         PartSnap* ds = shared ? shared->prunedFor(snap, pseq) : snap;
-        rc = store->isDead(*ds, pseq, bound, &dead);
+        rc = shared ? shared->isDead(store, *ds, pseq, bound, &dead) : store->isDead(*ds, pseq, bound, &dead);
         if (rc < 0) return rc;
         if (dead) return 0;
     }
@@ -531,7 +653,7 @@ int32_t RowFilter::acceptInstance(uint64_t put, const TagMatch& m, CurRow* out) 
     if (rc < 0) return rc;
     if (!found || label != kLblRepeat) return 0;
     bool dead = false;
-    rc = store->isDead(*shared->prunedFor(snap, put), put, bound, &dead);
+    rc = shared->isDead(store, *shared->prunedFor(snap, put), put, bound, &dead);
     if (rc < 0) return rc;
     if (dead) return 0;
     RecRow r;
@@ -583,7 +705,7 @@ int32_t RowFilter::acceptInstance(uint64_t put, const TagMatch& m, CurRow* out) 
         if (rc < 0) return rc;
         if (qr.kind != kRowPut) continue;
         bool qd = false;
-        rc = store->isDead(*shared->prunedFor(q, c.pseq), c.pseq, qb, &qd);
+        rc = shared->isDead(store, *shared->prunedFor(q, c.pseq), c.pseq, qb, &qd);
         if (rc < 0) return rc;
         if (qd) continue;
         rc = ownTagMatches(store, shared.get(), *q, *shared->prunedFor(q, c.pseq), qr, m, qb, &yes, &attr);
@@ -660,7 +782,8 @@ public:
                 if (pseq == 0 || pseq > f_.bound) continue;
                 bool dead = false;
                 PartSnap* ds = f_.shared ? f_.shared->prunedFor(f_.snap, pseq) : f_.snap;
-                int32_t rc = f_.store->isTagDead(*ds, pseq, f_.bound, &dead);
+                int32_t rc = f_.shared ? f_.shared->isTagDead(f_.store, *ds, pseq, f_.bound, &dead)
+                                       : f_.store->isTagDead(*ds, pseq, f_.bound, &dead);
                 if (rc < 0) return rc;
                 if (dead) continue;
                 RecRow ir;
