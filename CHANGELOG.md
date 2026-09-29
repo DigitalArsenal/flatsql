@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.1.0
+
+- The partition store gains compaction, reclamation and quota (docs/PARTITION-STORE.md
+  Part III): live-frame compaction of sealed segments behind an INTENT_COMPACT/SWAP pair,
+  retired files unlinked behind the reader gate, meta-segment and type-log retirement,
+  exact `disk_bytes` per partition and type, arrival-order quota eviction to 0.85 of the
+  cap, and a space emergency with a ballast file on ENOSPC.
+- Two new exports on `flatsql-ps-threads.wasm`: `flatsql_ps_reader_gate(oldestStartNs)`
+  (the host passes the oldest running reader statement's start, so retired files outlive
+  every statement that may read them) and `flatsql_ps_set_quota(bytes)`.
+- `wasm/flatsql-ps-threads.wasm` sha256
+  `075dd0a104694df39b2776c34dc6444be224442717967d9cea5dd9af15964379` (2,237,656 bytes).
+
 ## 3.0.0
 
 - The partition store ships as `wasm/flatsql-ps-threads.wasm` (`flatsql/ps-threads.wasm`):
