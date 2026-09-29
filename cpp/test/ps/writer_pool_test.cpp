@@ -8,8 +8,10 @@
 #include <random>
 #include <map>
 #include <set>
+#include <filesystem>
 #include <thread>
 
+#include "flatsql/ps/flatsql_ps.h"
 #include "flatsql/ps/platform.h"
 #include "ps/ps_test.h"
 
@@ -769,4 +771,82 @@ PS_TEST(writer_commit_journal_one_sync_per_round_A8) {
     CHECK_EQ(s.e->stats().journalReplayRecords, uint64_t(0));
     CHECK_EQ(s.e->stats().openJournalBytes, uint64_t(0));
     s.close();
+}
+
+// Writer TLV 19 / EngineConfig::maxEntryBytes: the largest ring entry. A 9 MiB
+// frame is refused under the default (1 MiB + 4 KiB) and stored under a
+// 10 MiB setting, the writer arena growing to hold two such entries.
+PS_TEST(writer_max_entry_bytes_configurable) {
+    const auto big = iqcRecord("E1", "2026-09-01T00:00:00Z", 9u << 20, 7);
+    const auto attr = buildRecordAttr("big", "prov", "src", "b");
+    {
+        Store s(true, 1, true);
+        REQUIRE(s.open() == 0);
+        s.registerTypes({&iqcType()});
+        Producer prod(s.e.get(), s.partition("big", iqcType()));
+        CHECK_EQ(send(s.e.get(), prod, big, attr, 1, false), uint64_t(0));
+        s.close();
+    }
+    Store s(true, 1, true);
+    s.cfg.maxEntryBytes = 10u << 20;
+    REQUIRE(s.open() == 0);
+    CHECK(s.e->config().arenaBytes >= 4 * ((10ull << 20) + 4096));
+    s.registerTypes({&iqcType()});
+    const uint32_t pid = s.partition("big", iqcType());
+    {
+        Producer prod(s.e.get(), pid);
+        CHECK_EQ(prod.ringDesc()->maxEntry, uint64_t(10u << 20));
+        const uint64_t r = send(s.e.get(), prod, big, attr, 1);
+        REQUIRE(r);
+        CHECK_EQ(prod.waitAcked(r, 20000000000ull), 0);
+    }
+    s.close();
+    REQUIRE(s.open() == 0);
+    Inspector ins(s.fs.get(), s.root);
+    const PartView v = ins.partition(pid);
+    REQUIRE(v.err.empty() && v.rows.size() == 1);
+    CHECK(ins.frame(pid, v.rows[0]) == big);
+    s.close();
+}
+
+// The same setting through the C ABI (flatsql_ps_init tag 19), and the two
+// store-migrate counters at the end of flatsql_ps_stats.
+PS_TEST(writer_capi_tlv19_max_entry_and_stats) {
+    const std::string dir = std::filesystem::temp_directory_path().string() + "/flatsql-ps-tlv19-" +
+                            std::to_string(monoNs());
+    std::filesystem::create_directories(dir);
+    std::vector<uint8_t> cfg;
+    auto tlv = [&](uint16_t tag, const void* v, uint32_t n) {
+        const size_t at = cfg.size();
+        cfg.resize(at + 6 + n);
+        putU16(cfg.data() + at, tag);
+        putU32(cfg.data() + at + 2, n);
+        std::memcpy(cfg.data() + at + 6, v, n);
+    };
+    tlv(1, dir.data(), uint32_t(dir.size()));
+    const uint64_t maxEntry = 3u << 20;
+    tlv(19, &maxEntry, 8);
+    REQUIRE(flatsql_ps_init(FLATSQL_PS_ROLE_WRITER, cfg.data(), int32_t(cfg.size())) == 0);
+    REQUIRE(flatsql_ps_start() == 0);
+    const auto& type = ommType();
+    CHECK(flatsql_ps_register_type(type.config.data(), int32_t(type.config.size())) >= 0);
+    const int32_t pid = flatsql_ps_register_partition(reinterpret_cast<const uint8_t*>("tlv19"), 5, type.fid);
+    CHECK(pid > 0);
+    FlatsqlPsLayout L;
+    REQUIRE(flatsql_ps_layout(&L) >= 0);
+    const uintptr_t ring = uintptr_t(flatsql_ps_ring(pid));
+    REQUIRE(ring != 0);
+    uint64_t got = 0;
+    std::memcpy(&got, reinterpret_cast<const uint8_t*>(ring) + L.offMaxEntry, 8);
+    CHECK_EQ(got, maxEntry);
+    const int32_t n = flatsql_ps_stats(nullptr, 0);
+    CHECK_EQ(n, int32_t(26 * 8));
+    std::vector<uint8_t> st(size_t(n > 0 ? n : 0));
+    CHECK_EQ(flatsql_ps_stats(st.data(), n), n);
+    if (n == 26 * 8) {
+        CHECK_EQ(getU64(st.data() + 24 * 8), uint64_t(0));  // migrated gseqs used
+        CHECK_EQ(getU64(st.data() + 25 * 8), uint64_t(0));  // migrated gseq fallbacks
+    }
+    CHECK_EQ(flatsql_ps_stop(5000), 0);
+    std::filesystem::remove_all(dir);
 }

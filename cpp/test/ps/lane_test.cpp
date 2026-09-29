@@ -324,3 +324,135 @@ PS_TEST(lane_c_abi_mailbox_protocol) {
     CHECK_EQ(flatsql_ps_stop(5000), 0);
     std::filesystem::remove_all(dir);
 }
+
+// Tag conditions have the legacy tag table's ANY-row semantics (A2): a record
+// matches when one live tag instance, its PUT's own tag or a RETAG, satisfies
+// every condition. The vtab evaluates them itself; SQLite's re-check against
+// the projected columns (the PUT's own tag only) used to drop every record
+// matched through a RETAG (T6 #7: a provider window of 200 read as 100).
+PS_TEST(lane_tag_conditions_match_any_instance_A2) {
+    Store s(true, 2, true);
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const uint32_t gp = s.partition("gp", ommType());
+    const uint32_t gp2 = s.partition("gp2", ommType());
+    std::vector<std::vector<uint8_t>> recs;
+    for (int i = 0; i < 350; i++) recs.push_back(ommRecord(uint32_t(60000 + i), "T-" + std::to_string(i), ep(i), 1.0 + i));
+    struct Tag {
+        std::string provider, source, batch, peer;
+    };
+    const Tag t1{"P1", "S1", "b1", "peer1"}, t2{"P2", "S2", "b2", "peer2"}, t3{"P1", "S1", "b3", "peer3"};
+    // Instances per partition: record index -> tags.
+    std::map<uint32_t, std::map<int, std::vector<Tag>>> inst;
+    auto sendRange = [&](uint32_t pid, const std::string& peer, int from, int to, const Tag& t) {
+        Producer prod(s.e.get(), pid);
+        const auto attr = buildRecordAttr(peer, t.provider, t.source, t.batch, "", t.peer);
+        uint64_t last = 0;
+        for (int i = from; i < to; i++) {
+            last = send(s.e.get(), prod, recs[size_t(i)], attr, 5000 + i);
+            inst[pid][i].push_back(t);
+        }
+        CHECK_EQ(prod.waitAcked(last, 10000000000ull), 0);
+        CHECK(waitLabeledEngine(s.e.get(), {gp, gp2}, 10000000000ull));
+    };
+    sendRange(gp, "gp", 0, 200, t1);     // PUTs tagged t1
+    sendRange(gp, "gp", 100, 300, t2);   // 100..199 RETAG with t2; 200..299 PUTs tagged t2
+    sendRange(gp2, "gp2", 250, 350, t3); // 250..299 REPEAT copies; 300..349 FIRST in gp2
+    REQUIRE(waitTypeVisible(s.fs.get(), s.root, ommType().fid, {gp, gp2}, 10000000000ull));
+    // Every instance of every copy is live: RETAG rows were written.
+    CHECK_EQ(s.e->stats().retags, uint64_t(100));
+    auto firstPid = [&](int i) { return i < 300 ? gp : gp2; };
+    struct Cond {
+        const char* provider = nullptr;
+        const char* source = nullptr;
+        const char* batch = nullptr;
+        const char* peer = nullptr;
+    };
+    auto oracle = [&](uint32_t pid, bool typeLevel, const Cond& c) {
+        std::set<std::string> out;
+        for (int i = 0; i < 350; i++) {
+            const uint32_t at = typeLevel ? firstPid(i) : pid;
+            auto it = inst[at].find(i);
+            if (it == inst[at].end()) continue;
+            for (const Tag& t : it->second)
+                if ((!c.provider || t.provider == c.provider) && (!c.source || t.source == c.source) &&
+                    (!c.batch || t.batch == c.batch) && (!c.peer || t.peer == c.peer)) {
+                    out.insert(cidTextOf(recs[size_t(i)]));
+                    break;
+                }
+        }
+        return out;
+    };
+    Reader bulk(s, LaneClass::Bulk, 2);
+    REQUIRE(bulk.inst);
+    auto run = [&](const std::string& table, const Cond& c, const std::string& extraWhere = "") {
+        std::string sql = "SELECT _cid FROM \"" + table + "\" WHERE 1";
+        std::vector<Param> ps;
+        if (c.provider) { sql += " AND _provider = ?"; ps.push_back(Param::text(c.provider)); }
+        if (c.source) { sql += " AND _source_name = ?"; ps.push_back(Param::text(c.source)); }
+        if (c.batch) { sql += " AND _batch = ?"; ps.push_back(Param::text(c.batch)); }
+        if (c.peer) { sql += " AND _peer_id = ?"; ps.push_back(Param::text(c.peer)); }
+        sql += extraWhere;
+        const Rows r = bulk.q(sql, ps);
+        CHECK_EQ(r.status, 0);
+        std::set<std::string> got;
+        for (size_t i = 0; i < r.rows.size(); i++) got.insert(r.s(i, 0));
+        CHECK_EQ(got.size(), r.rows.size());  // one row per record
+        return got;
+    };
+    const std::vector<Cond> conds = {
+        {"P2", nullptr, nullptr, nullptr}, {nullptr, nullptr, "b2", nullptr}, {nullptr, nullptr, nullptr, "peer2"},
+        {nullptr, "S2", nullptr, nullptr}, {"P1", nullptr, nullptr, nullptr}, {nullptr, "S2", "b2", nullptr},
+        {nullptr, "S1", "b2", nullptr},    {"P1", nullptr, "b1", nullptr},    {"P1", nullptr, "b3", nullptr},
+        {"P1", "S1", "b1", "peer1"},       {"P2", "S1", nullptr, nullptr},
+    };
+    size_t retagMatched = 0;
+    for (const Cond& c : conds) {
+        const auto want = oracle(0, true, c);
+        const auto got = run("OMM", c);
+        CHECK(got == want);
+        if (got != want)
+            std::fprintf(stderr, "  OMM %s/%s/%s/%s: %zu rows, oracle %zu\n", c.provider ? c.provider : "-",
+                         c.source ? c.source : "-", c.batch ? c.batch : "-", c.peer ? c.peer : "-", got.size(),
+                         want.size());
+        for (uint32_t pid : {gp, gp2}) {
+            const auto pw = oracle(pid, false, c);
+            const auto pg = run(pid == gp ? "sds_p_gp__OMM" : "sds_p_gp2__OMM", c);
+            CHECK(pg == pw);
+        }
+        for (int i = 100; i < 200; i++) retagMatched += got.count(cidTextOf(recs[size_t(i)])) && c.provider &&
+                                                         std::string(c.provider) == "P2";
+    }
+    CHECK_EQ(retagMatched, size_t(100));  // the RETAG'd records are in the P2 window
+    CHECK_EQ(oracle(0, true, {"P2", nullptr, nullptr, nullptr}).size(), size_t(200));
+    // The full '<TYPE>@<source>' form, an epoch-ordered window, and the alias.
+    Rows r = bulk.q("SELECT count(*) FROM OMM WHERE _source = 'OMM@S2'");
+    CHECK_EQ(r.status, 0);
+    CHECK_EQ(r.i(0, 0), 200);
+    r = bulk.q("SELECT count(*) FROM OMM WHERE _source = 'omm@S2'");  // compared as projected
+    CHECK_EQ(r.i(0, 0), 0);
+    r = bulk.q("SELECT count(*) FROM \"OMM@S2\" WHERE _batch = 'b2'");
+    CHECK_EQ(r.i(0, 0), 200);
+    r = bulk.q("SELECT count(*) FROM \"OMM@S2\" WHERE _batch = 'b1'");
+    CHECK_EQ(r.i(0, 0), 0);
+    Reader inter(s, LaneClass::Interactive, 2);
+    r = inter.q("SELECT _cid, _epoch FROM OMM WHERE _source = 'OMM@S2' ORDER BY _epoch DESC LIMIT 150");
+    CHECK_EQ(r.status, 0);
+    CHECK_EQ(r.rows.size(), size_t(150));
+    for (size_t i = 1; i < r.rows.size(); i++) CHECK(r.i(i - 1, 1) >= r.i(i, 1));
+    // Other plans (a column index, a CID) apply the conditions to any live
+    // instance of the record.
+    r = bulk.q("SELECT count(*) FROM OMM WHERE NORAD_CAT_ID = ? AND _provider = 'P2'", {Param::i64(60150)});
+    CHECK_EQ(r.i(0, 0), 1);
+    r = bulk.q("SELECT count(*) FROM OMM WHERE NORAD_CAT_ID = ? AND _provider = 'P2'", {Param::i64(60050)});
+    CHECK_EQ(r.i(0, 0), 0);
+    r = bulk.q("SELECT count(*) FROM OMM WHERE _cid = ? AND _batch = 'b2'", {Param::text(cidTextOf(recs[150]))});
+    CHECK_EQ(r.i(0, 0), 1);
+    r = bulk.q("SELECT count(*) FROM OMM WHERE _cid = ? AND _batch = 'b3'", {Param::text(cidTextOf(recs[260]))});
+    CHECK_EQ(r.i(0, 0), 0);  // b3 tags only the REPEAT copy in gp2
+    // The projection still shows the PUT's own tag.
+    r = bulk.q("SELECT _provider, _batch FROM OMM WHERE _cid = ?", {Param::text(cidTextOf(recs[150]))});
+    REQUIRE(r.rows.size() == 1);
+    CHECK(r.s(0, 0) == "P1" && r.s(0, 1) == "b1");
+    s.close();
+}

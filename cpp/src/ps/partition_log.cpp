@@ -67,6 +67,7 @@ bool parseAttr(const uint8_t* attr, size_t len, AttrView* out) {
         viewStr(ra->supersede_key(), &out->supersedeKey, &out->supersedeKeyLen);
     }
     if (ra->licence_key()) viewStr(ra->licence_key(), &out->licenceKey, &out->licenceKeyLen);
+    out->migratedGseq = ra->migrated_gseq();
     out->valid = true;
     return true;
 }
@@ -1198,7 +1199,7 @@ StepResult stageRecord(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* reje
     r->len = storedLen;
     r->flags = uint8_t(flags | (sealed ? kRowSealed : 0) |
                        (h.attrLen ? (kRowHasAttr | kRowAttrInM) : 0) |
-                       (nKilled ? kRowSupersedes : 0));
+                       (nKilled ? kRowSupersedes : 0) | (av.migratedGseq ? kRowMigratedGseq : 0));
     r->cidLen = kCidLen;
     r->dataCrc = crc32c(fdst, storedLen);
     r->epochMs = ex.hasEpoch ? ex.epochMs : h.arrivalMs;

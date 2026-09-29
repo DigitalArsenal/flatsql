@@ -95,6 +95,7 @@ int32_t flatsql_ps_init(int32_t role, const uint8_t* cfg, int32_t cfgLen) {
             case 16: c.autoCompact = len && v[0]; break;
             case 17: c.compactThreads = u32(); break;
             case 18: c.commitJournal = len && v[0]; break;
+            case 19: c.maxEntryBytes = u64(); break;
             default: break;
         }
         off += 6 + int32_t(len);
@@ -257,7 +258,8 @@ int32_t flatsql_ps_stats(uint8_t* out, int32_t len) {
                           s.typeCommits, s.firstLabels, s.repeatLabels, s.promotions,
                           s.noticesDropped, s.framesParsedAtOpen, s.openReadBytes,
                           s.openDataBytes, s.openMetaBytes, s.adoptedBatches, s.poolSlabsInUse,
-                          s.poolSlabsPeak, s.poolCommittedBytes, s.committedBytes};
+                          s.poolSlabsPeak, s.poolCommittedBytes, s.committedBytes,
+                          s.migratedGseqs, s.migratedGseqFallbacks};
     const int32_t n = int32_t(sizeof(v));
     if (!out || len < n) return n;
     for (size_t i = 0; i < sizeof(v) / 8; i++) putU64(out + i * 8, v[i]);

@@ -167,7 +167,8 @@ struct RecordAttr FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_SUPERSEDE_KEY = 8,
     VT_SOURCE_TIMESTAMP = 10,
     VT_LICENCE_KEY = 12,
-    VT_TAGS = 14
+    VT_TAGS = 14,
+    VT_MIGRATED_GSEQ = 16
   };
   const ::flatbuffers::Vector<uint8_t> *peer_id() const {
     return GetPointer<const ::flatbuffers::Vector<uint8_t> *>(VT_PEER_ID);
@@ -187,6 +188,9 @@ struct RecordAttr FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   const ::flatbuffers::Vector<::flatbuffers::Offset<flatsql::ps::fb::SourceTag>> *tags() const {
     return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<flatsql::ps::fb::SourceTag>> *>(VT_TAGS);
   }
+  uint64_t migrated_gseq() const {
+    return GetField<uint64_t>(VT_MIGRATED_GSEQ, 0);
+  }
   template <bool B = false>
   bool Verify(::flatbuffers::VerifierTemplate<B> &verifier) const {
     return VerifyTableStart(verifier) &&
@@ -202,6 +206,7 @@ struct RecordAttr FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyOffset(verifier, VT_TAGS) &&
            verifier.VerifyVector(tags()) &&
            verifier.VerifyVectorOfTables(tags()) &&
+           VerifyField<uint64_t>(verifier, VT_MIGRATED_GSEQ, 8) &&
            verifier.EndTable();
   }
 };
@@ -228,6 +233,9 @@ struct RecordAttrBuilder {
   void add_tags(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<flatsql::ps::fb::SourceTag>>> tags) {
     fbb_.AddOffset(RecordAttr::VT_TAGS, tags);
   }
+  void add_migrated_gseq(uint64_t migrated_gseq) {
+    fbb_.AddElement<uint64_t>(RecordAttr::VT_MIGRATED_GSEQ, migrated_gseq, 0);
+  }
   explicit RecordAttrBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -246,8 +254,10 @@ inline ::flatbuffers::Offset<RecordAttr> CreateRecordAttr(
     ::flatbuffers::Offset<::flatbuffers::String> supersede_key = 0,
     int64_t source_timestamp = 0,
     ::flatbuffers::Offset<::flatbuffers::String> licence_key = 0,
-    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<flatsql::ps::fb::SourceTag>>> tags = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<flatsql::ps::fb::SourceTag>>> tags = 0,
+    uint64_t migrated_gseq = 0) {
   RecordAttrBuilder builder_(_fbb);
+  builder_.add_migrated_gseq(migrated_gseq);
   builder_.add_source_timestamp(source_timestamp);
   builder_.add_tags(tags);
   builder_.add_licence_key(licence_key);
@@ -264,7 +274,8 @@ inline ::flatbuffers::Offset<RecordAttr> CreateRecordAttrDirect(
     const char *supersede_key = nullptr,
     int64_t source_timestamp = 0,
     const char *licence_key = nullptr,
-    const std::vector<::flatbuffers::Offset<flatsql::ps::fb::SourceTag>> *tags = nullptr) {
+    const std::vector<::flatbuffers::Offset<flatsql::ps::fb::SourceTag>> *tags = nullptr,
+    uint64_t migrated_gseq = 0) {
   auto peer_id__ = peer_id ? _fbb.CreateVector<uint8_t>(*peer_id) : 0;
   auto signature__ = signature ? _fbb.CreateVector<uint8_t>(*signature) : 0;
   auto supersede_key__ = supersede_key ? _fbb.CreateString(supersede_key) : 0;
@@ -277,7 +288,8 @@ inline ::flatbuffers::Offset<RecordAttr> CreateRecordAttrDirect(
       supersede_key__,
       source_timestamp,
       licence_key__,
-      tags__);
+      tags__,
+      migrated_gseq);
 }
 
 inline const flatsql::ps::fb::RecordAttr *GetRecordAttr(const void *buf) {

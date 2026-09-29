@@ -400,7 +400,7 @@ int metaFilter(sqlite3_vtab_cursor* cur, int, const char* idxStr, int argc, sqli
                 c->hi = std::min<uint64_t>(c->hi, uint64_t(hv));
             }
             c->desc = d != 0;
-            c->arr = makeArrivalRows(c->vt->lane, c->stmt, c->ts, c->lo, c->hi, c->desc, std::string(), false, 0);
+            c->arr = makeArrivalRows(c->vt->lane, c->stmt, c->ts, c->lo, c->hi, c->desc, TagMatch(), 0);
             rc = c->arr->next(&c->cur);
             if (rc < 0) break;
             c->arrEof = rc == 0;

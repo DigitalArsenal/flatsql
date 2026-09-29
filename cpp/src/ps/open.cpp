@@ -307,6 +307,11 @@ int32_t Engine::open(const EngineConfig& cfgIn, std::unique_ptr<Engine>* out, st
     EngineConfig& cfg = e->cfg_;
     if (cfg.writers == 0) cfg.writers = 1;
     if (cfg.writers > 64) cfg.writers = 64;
+    // The largest ring entry (writer TLV 19). The frames half of each
+    // writer's arena holds two, so an entry of that size always stages.
+    if (cfg.maxEntryBytes < (64u << 10)) cfg.maxEntryBytes = 64u << 10;
+    if (cfg.maxEntryBytes > (1ull << 30)) cfg.maxEntryBytes = 1ull << 30;
+    if (cfg.arenaBytes < 4 * (cfg.maxEntryBytes + 4096)) cfg.arenaBytes = 4 * (cfg.maxEntryBytes + 4096);
     if (!cfg.io) cfg.io = importIo();
     e->openIoHolder_.reset(new IoCtx(cfg.io, &e->openIoStats_));
     e->openIo_ = e->openIoHolder_.get();

@@ -293,3 +293,149 @@ PS_TEST(type_arrivals_segments_and_fence_A15) {
     CHECK(verify(500) > segs);
     s.close();
 }
+
+// ---- store-migrate gseqs (design §16.1-5; PARTITION-STORE.md §31) -----------
+namespace {
+std::vector<uint8_t> migAttr(const std::string& peer, uint64_t gseq) {
+    return buildRecordAttr(peer, "prov", "src", "b", "", "", "", "", 0, "", gseq);
+}
+struct ArrivalAt {
+    uint64_t gseq;
+    uint32_t pid;
+    uint64_t pseq;
+};
+void checkArrivals(const Inspector::TypeView& tv, const std::vector<ArrivalAt>& want) {
+    CHECK_EQ(tv.arrivals.size(), want.size());
+    for (size_t i = 0; i < want.size() && i < tv.arrivals.size(); i++) {
+        CHECK_EQ(tv.arrivals[i].gseq, want[i].gseq);
+        CHECK_EQ(tv.arrivals[i].pid, want[i].pid);
+        CHECK_EQ(tv.arrivals[i].pseq, want[i].pseq);
+        CHECK(tv.arrivals[i].flags & kArrivalFirst);
+    }
+}
+}  // namespace
+
+PS_TEST(type_migrated_gseq_preserved_fallback_and_stats) {
+    Store s(true, 1, true);
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const uint32_t pa = s.partition("MA", ommType()), pb = s.partition("MB", ommType());
+    std::vector<std::vector<uint8_t>> recs;
+    for (int i = 0; i < 12; i++) recs.push_back(ommRecord(uint32_t(40000 + i), "M", ep(i), 5.0 + i));
+    // A: five FIRST copies with legacy rowids 100..500, fed in rowid order.
+    {
+        Producer prod(s.e.get(), pa);
+        uint64_t last = 0;
+        for (int i = 0; i < 5; i++) last = send(s.e.get(), prod, recs[size_t(i)], migAttr("MA", uint64_t(100 * (i + 1))), i);
+        CHECK_EQ(prod.waitAcked(last, 10000000000ull), 0);
+        CHECK(waitLabeled(s.e.get(), {pa, pb}, 5000000000ull));
+    }
+    TypeOwner* t = s.e->type(ommType().fid);
+    CHECK_EQ(s.e->stats().migratedGseqs, uint64_t(5));
+    CHECK_EQ(s.e->stats().migratedGseqFallbacks, uint64_t(0));
+    CHECK_EQ(t->publishedGseqHi.load(), uint64_t(500));
+    CHECK_EQ(s.e->gseqNext(), uint64_t(501));
+    // B: a rowid at or below the type's gseq_hi falls back to a new gseq (and
+    // is counted); a higher one is kept; a copy of A's first record is
+    // labeled REPEAT and its rowid is not used (counted).
+    {
+        Producer prod(s.e.get(), pb);
+        send(s.e.get(), prod, recs[5], migAttr("MB", 250), 5);
+        send(s.e.get(), prod, recs[6], migAttr("MB", 600), 6);
+        const uint64_t last = send(s.e.get(), prod, recs[0], migAttr("MB", 100), 7);
+        CHECK_EQ(prod.waitAcked(last, 10000000000ull), 0);
+        CHECK(waitLabeled(s.e.get(), {pa, pb}, 5000000000ull));
+    }
+    CHECK_EQ(s.e->stats().migratedGseqs, uint64_t(6));
+    CHECK_EQ(s.e->stats().migratedGseqFallbacks, uint64_t(2));
+    CHECK_EQ(s.e->stats().repeatLabels, uint64_t(1));
+    // An ordinary record continues above everything.
+    {
+        Producer prod(s.e.get(), pa);
+        const uint64_t last = send(s.e.get(), prod, recs[7], buildRecordAttr("MA", "prov", "src", "b"), 8);
+        CHECK_EQ(prod.waitAcked(last, 10000000000ull), 0);
+        CHECK(waitLabeled(s.e.get(), {pa, pb}, 5000000000ull));
+    }
+    s.close();
+    REQUIRE(s.open() == 0);
+    CHECK_EQ(s.e->gseqNext(), uint64_t(602));
+    Inspector ins(s.fs.get(), s.root);
+    const auto tv = ins.type(ommType().fid);
+    REQUIRE(tv.ok);
+    checkArrivals(tv, {{100, pa, 1}, {200, pa, 2}, {300, pa, 3}, {400, pa, 4}, {500, pa, 5},
+                       {501, pb, 1}, {600, pb, 2}, {601, pa, 6}});
+    CHECK_EQ(tv.head.gseqHi, uint64_t(601));
+    CHECK_EQ(tv.head.firstLiveCount, uint64_t(8));
+    // The flag rides only the PUT rows whose attribute carries a gseq.
+    const PartView va = ins.partition(pa), vb = ins.partition(pb);
+    REQUIRE(va.err.empty() && vb.err.empty());
+    REQUIRE(va.rows.size() == 6 && vb.rows.size() == 3);
+    for (size_t i = 0; i < 6; i++) CHECK_EQ(bool(va.rows[i].flags & kRowMigratedGseq), i < 5);
+    for (size_t i = 0; i < 3; i++) CHECK(vb.rows[i].flags & kRowMigratedGseq);
+    s.close();
+}
+
+// One type commit labels two partitions whose migrated gseqs interleave: its
+// arrivals are appended in gseq order. Crashing after the partition commits
+// (labels lost) or after the type commit (labels durable) gives the same
+// arrivals after reopen, and allocation continues above them.
+PS_TEST(type_migrated_gseq_one_commit_sorted_and_crash_reopen) {
+    for (int mode = 0; mode < 2; mode++) {
+        Store s(true, 1, false);  // cooperative: commits at explicit pumps
+        REQUIRE(s.open() == 0);
+        s.registerTypes({&ommType()});
+        const uint32_t pa = s.partition("MA", ommType()), pb = s.partition("MB", ommType());
+        uint64_t ra = 0, rb = 0;
+        {
+            Producer a(s.e.get(), pa), b(s.e.get(), pb);
+            // Ring pages first: an idle ring holds none until a producer asks
+            // and a pump maps them (§17), so all four entries land before
+            // any commit.
+            const auto r0 = ommRecord(41000, "S", ep(1), 1.0), r2 = ommRecord(41002, "S", ep(3), 3.0);
+            uint64_t r0seq = send(s.e.get(), a, r0, migAttr("MA", 900), 1, false);
+            uint64_t r2seq = send(s.e.get(), b, r2, migAttr("MB", 700), 3, false);
+            s.e->pump(0);
+            if (!r0seq) r0seq = send(s.e.get(), a, r0, migAttr("MA", 900), 1, false);
+            if (!r2seq) r2seq = send(s.e.get(), b, r2, migAttr("MB", 700), 3, false);
+            REQUIRE(r0seq && r2seq);
+            REQUIRE((ra = send(s.e.get(), a, ommRecord(41001, "S", ep(2), 2.0), migAttr("MA", 950), 2, false)));
+            REQUIRE((rb = send(s.e.get(), b, ommRecord(41003, "S", ep(4), 4.0), migAttr("MB", 920), 4, false)));
+            s.e->pump(0);  // both partition batches commit (durable) in one round
+            CHECK(a.acked(ra) && b.acked(rb));
+        }
+        TypeOwner* t = s.e->type(ommType().fid);
+        CHECK_EQ(t->publishedArrivals.load(), uint64_t(0));
+        if (mode == 1) {
+            s.e->pump(0);  // one type commit labels both partitions
+            CHECK_EQ(t->publishedArrivals.load(), uint64_t(4));
+            CHECK_EQ(s.e->stats().migratedGseqs, uint64_t(4));
+        }
+        s.crash(FaultFs::kDropAll, uint64_t(mode + 1));
+        REQUIRE(s.open() == 0);
+        for (int i = 0; i < 4; i++) s.e->pump(0);
+        t = s.e->type(ommType().fid);
+        CHECK_EQ(t->publishedArrivals.load(), uint64_t(4));
+        CHECK_EQ(s.e->stats().migratedGseqs, uint64_t(mode == 0 ? 4 : 0));
+        CHECK_EQ(s.e->stats().migratedGseqFallbacks, uint64_t(0));
+        CHECK_EQ(s.e->gseqNext(), uint64_t(951));
+        {
+            Producer a(s.e.get(), pa);
+            const auto r4 = ommRecord(41004, "S", ep(5), 5.0);
+            const auto attr = buildRecordAttr("MA", "prov", "src", "b");
+            uint64_t r = send(s.e.get(), a, r4, attr, 5, false);
+            if (!r) {
+                s.e->pump(0);
+                r = send(s.e.get(), a, r4, attr, 5, false);
+            }
+            REQUIRE(r);
+            for (int i = 0; i < 4; i++) s.e->pump(0);
+            CHECK(a.acked(r));
+        }
+        s.close();
+        Inspector ins(s.fs.get(), s.root);
+        const auto tv = ins.type(ommType().fid);
+        REQUIRE(tv.ok);
+        checkArrivals(tv, {{700, pb, 1}, {900, pa, 1}, {920, pb, 2}, {950, pa, 2}, {951, pa, 3}});
+        CHECK_EQ(tv.head.gseqHi, uint64_t(951));
+    }
+}

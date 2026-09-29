@@ -31,21 +31,27 @@ static const char* kMetaColTypes[kMcCount] = {"INTEGER", "TEXT",    "BLOB",    "
 // Plans
 // ---------------------------------------------------------------------------
 std::string Plan::encode() const {
-    char buf[160];
-    snprintf(buf, sizeof(buf), "%c:%u:%u:%u:%u:%d:%d:%d:%u:%u:%d:%d:%u:%d:%d:%u", bounded ? 'B' : 'U',
+    char buf[200];
+    snprintf(buf, sizeof(buf), "%c:%u:%u:%u:%u:%d:%d:%d:%u:%u:%d:%d:%u:%d:%d:%u:%d:%d:%d:%d:%d", bounded ? 'B' : 'U',
              unsigned(access), unsigned(desc), unsigned(tagKind), unsigned(col), int(aKey), int(aLo), int(aHi),
              unsigned(loOp), unsigned(hiOp), int(aProducer), int(aSource), unsigned(sourceFull), int(aLimit),
-             int(aOffset), unsigned(orderConsumed));
+             int(aOffset), unsigned(orderConsumed), int(aTag[0]), int(aTag[1]), int(aTag[2]), int(aTag[3]),
+             int(aTag[4]));
     return buf;
 }
 
 bool Plan::decode(const char* s) {
     if (!s || (s[0] != 'B' && s[0] != 'U')) return false;
     unsigned acc, d, tk, c, lop, hop, sf, oc;
-    int k, lo, hi, pr, so, li, of;
-    if (sscanf(s + 1, ":%u:%u:%u:%u:%d:%d:%d:%u:%u:%d:%d:%u:%d:%d:%u", &acc, &d, &tk, &c, &k, &lo, &hi, &lop, &hop,
-               &pr, &so, &sf, &li, &of, &oc) != 15)
+    int k, lo, hi, pr, so, li, of, t0, t1, t2, t3, t4;
+    if (sscanf(s + 1, ":%u:%u:%u:%u:%d:%d:%d:%u:%u:%d:%d:%u:%d:%d:%u:%d:%d:%d:%d:%d", &acc, &d, &tk, &c, &k, &lo,
+               &hi, &lop, &hop, &pr, &so, &sf, &li, &of, &oc, &t0, &t1, &t2, &t3, &t4) != 20)
         return false;
+    aTag[0] = int8_t(t0);
+    aTag[1] = int8_t(t1);
+    aTag[2] = int8_t(t2);
+    aTag[3] = int8_t(t3);
+    aTag[4] = int8_t(t4);
     bounded = s[0] == 'B';
     access = uint8_t(acc);
     desc = d != 0;
@@ -68,7 +74,20 @@ bool Plan::decode(const char* s) {
 // ---------------------------------------------------------------------------
 // Row filter
 // ---------------------------------------------------------------------------
-int32_t RowFilter::hasLiveSource(uint64_t put, const std::string& src, bool* yes) {
+namespace {
+bool eqBytes(const std::string& want, const uint8_t* p, size_t n) {
+    return want.size() == n && (n == 0 || std::memcmp(want.data(), p, n) == 0);
+}
+}  // namespace
+
+bool TagMatch::matches(const TagView& t) const {
+    if (!t.present) return false;
+    return (!hasProvider || eqBytes(provider, t.provider, t.providerLen)) &&
+           (!hasBatch || eqBytes(batch, t.batch, t.batchLen)) && (!hasPeer || eqBytes(peer, t.peer, t.peerLen)) &&
+           (!hasSource || eqBytes(source, t.source, t.sourceLen));
+}
+
+int32_t RowFilter::hasLiveTag(uint64_t put, const TagMatch& m, bool* yes) {
     *yes = false;
     uint8_t lo[8], hi[8];
     putBE64(lo, put);
@@ -91,8 +110,8 @@ int32_t RowFilter::hasLiveSource(uint64_t put, const std::string& src, bool* yes
         rc = store->readAttr(*snap, ir, &attr);
         if (rc < 0) return rc;
         AttrView av;
-        if (!parseAttr(attr.data(), attr.size(), &av) || !av.tag.present) continue;
-        if (av.tag.sourceLen == src.size() && std::memcmp(av.tag.source, src.data(), src.size()) == 0) {
+        if (!parseAttr(attr.data(), attr.size(), &av)) continue;
+        if (m.matches(av.tag)) {
             *yes = true;
             return 0;
         }
@@ -133,9 +152,9 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
     rc = store->readRow(*snap, pseq, &out->row);
     if (rc < 0) return rc;
     if (out->row.kind != kRowPut) return 0;
-    if (hasSource) {
+    if (tags.any) {
         bool yes = false;
-        rc = hasLiveSource(pseq, source, &yes);
+        rc = hasLiveTag(pseq, tags, &yes);
         if (rc < 0) return rc;
         if (!yes) return 0;
     }
@@ -154,7 +173,23 @@ public:
     PostingRows(const RowFilter& f, uint16_t kind, std::string lo, bool hasLo, std::string hi, bool hasHi, bool desc,
                 bool instances)
         : f_(f), kind_(kind), lo_(std::move(lo)), hi_(std::move(hi)), hasLo_(hasLo), hasHi_(hasHi), desc_(desc),
-          instances_(instances) {}
+          instances_(instances) {
+        if (instances_ && f_.tags.any) {
+            // Tag conditions hold on the instance the posting names (ANY-row
+            // semantics): checked here, not again on the record's PUT. The
+            // scanned key alone needs no attribute read when it is exact
+            // (not capped to prefix + hash).
+            inst_ = f_.tags;
+            f_.tags = TagMatch();
+            const TagMatch& m = inst_;
+            const bool scannedOnly =
+                m.count() == 1 && ((kind_ == kIxTagProvider && m.hasProvider && m.provider.size() <= kMaxKeyLen) ||
+                                   (kind_ == kIxTagBatch && m.hasBatch && m.batch.size() <= kMaxKeyLen) ||
+                                   (kind_ == kIxTagPeer && m.hasPeer && m.peer.size() <= kMaxKeyLen) ||
+                                   (kind_ == kIxSourceEpoch && m.hasSource && m.source.size() <= kMaxKeyLen));
+            instCheck_ = !scannedOnly;
+        }
+    }
 
     int32_t next(CurRow* out) override {
         if (!started_) {
@@ -186,8 +221,14 @@ public:
                 RecRow ir;
                 rc = f_.store->readRow(*f_.snap, pseq, &ir);
                 if (rc < 0) return rc;
+                if (ir.kind != kRowRetag && ir.kind != kRowPut) continue;
+                if (instCheck_) {
+                    rc = f_.store->readAttr(*f_.snap, ir, &attr_);
+                    if (rc < 0) return rc;
+                    AttrView av;
+                    if (!parseAttr(attr_.data(), attr_.size(), &av) || !inst_.matches(av.tag)) continue;
+                }
                 if (ir.kind == kRowRetag) pseq = ir.targetPseq;
-                else if (ir.kind != kRowPut) continue;
             }
             if (std::find(emitted_.begin(), emitted_.end(), pseq) != emitted_.end()) continue;
             const int32_t rc = f_.accept(pseq, out);
@@ -205,6 +246,9 @@ private:
     uint16_t kind_;
     std::string lo_, hi_;
     bool hasLo_, hasHi_, desc_, instances_;
+    TagMatch inst_;           // conditions on the instance (instances_)
+    bool instCheck_ = false;  // read each instance's attribute to check them
+    std::vector<uint8_t> attr_;
     bool started_ = false;
     PostingScan scan_;
     std::string lastKey_;
@@ -600,6 +644,7 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         const int k = tagEq[1] >= 0 ? 1 : tagEq[0] >= 0 ? 0 : 2;
         p.tagKind = uint8_t(k);
         use(tagEq[k], &p.aKey);
+        p.aTag[k] = p.aKey;
         anyIn = isIn(tagEq[k]);
         p.bounded = true;
         cost = 1000;
@@ -610,6 +655,7 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
             const int s = sourceNameEq >= 0 ? sourceNameEq : sourceEq;
             p.sourceFull = sourceNameEq < 0;
             use(s, &p.aKey);
+            p.aTag[sourceNameEq >= 0 ? 3 : 4] = p.aKey;
             anyIn = isIn(s);
         }
         if (epochEq >= 0) {
@@ -701,9 +747,26 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         cost = 1e9;
         rows = 1e9;
     }
-    if (p.access != kAccSource && p.access != kAccCid && !alias && (sourceEq >= 0 || sourceNameEq >= 0)) {
-        // post-filter handled by SQLite (not claimed)
+    // Tag conditions (A2, ANY-row semantics): the vtab evaluates every one
+    // itself, on the tag instance a posting names or, for other plans, on
+    // any live instance of the record (RowFilter::hasLiveTag). SQLite must
+    // not re-check them against the projected columns, which show only the
+    // PUT's own tag: that dropped every record matched through a RETAG.
+    // <TYPE>_current groups first and filters after, as SQL says: its tag
+    // conditions stay SQLite's.
+    bool tagIn = false;
+    if (!current) {
+        const int tagC[5] = {tagEq[0], tagEq[1], tagEq[2], sourceNameEq, sourceEq};
+        for (int k = 0; k < 5; k++) {
+            if (tagC[k] < 0) continue;
+            if (p.aTag[k] < 0) {
+                use(tagC[k], &p.aTag[k]);
+                if (isIn(tagC[k])) tagIn = true;
+            }
+            info->aConstraintUsage[tagC[k]].omit = 1;
+        }
     }
+    if (tagIn) p.orderConsumed = false;  // one xFilter per IN value
     if (alias && p.access != kAccSource) p.aSource = 0;  // the alias source post-filters (see xFilter)
     if (producerEq >= 0 && typeLevel) use(producerEq, &p.aProducer);
     if (limitC >= 0 && p.orderConsumed) {
@@ -726,7 +789,7 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
     // filters), so the vtab can own the OFFSET (SQLite then skips none).
     if (offsetC >= 0 && typeLevel && !alias && !current && p.orderConsumed &&
         (p.access == kAccGseq || p.access == kAccFull) && producerEq < 0 && sourceEq < 0 && sourceNameEq < 0 &&
-        cidEq < 0 && colEq < 0) {
+        tagEq[0] < 0 && tagEq[1] < 0 && tagEq[2] < 0 && cidEq < 0 && colEq < 0) {
         use(offsetC, &p.aOffset);
         info->aConstraintUsage[offsetC].omit = 1;
     }
@@ -1087,6 +1150,7 @@ int32_t buildSources(RecCursor* c, sqlite3_value** argv, int argc) {
     f.stmt = c->stmt;
     f.snap = snap;
     f.bound = snap->pseqHi();
+    if (!buildTagMatch(vt, p, argv, &f.tags)) return 0;  // contradictory tag conditions: empty
     auto arg = [&](int8_t a) { return argv[a - 1]; };
     switch (p.access) {
         case kAccCid: {

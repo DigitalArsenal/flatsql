@@ -169,10 +169,10 @@ private:
 // ---- arrivals (gseq order) ----------------------------------------------------
 class ArrivalRows : public RowSource {
 public:
-    ArrivalRows(ReaderLane* lane, StmtCtx* stmt, TypeSnap* ts, uint64_t lo, uint64_t hi, bool desc, const std::string& src,
-                bool hasSrc, std::vector<uint32_t> allowed, uint64_t offset = 0)
-        : lane_(lane), stmt_(stmt), ts_(ts), lo_(lo), hi_(hi), desc_(desc), src_(src), hasSrc_(hasSrc),
-          allowed_(std::move(allowed)), offset_(offset) {}
+    ArrivalRows(ReaderLane* lane, StmtCtx* stmt, TypeSnap* ts, uint64_t lo, uint64_t hi, bool desc, const TagMatch& tags,
+                std::vector<uint32_t> allowed, uint64_t offset = 0)
+        : lane_(lane), stmt_(stmt), ts_(ts), lo_(lo), hi_(hi), desc_(desc), tags_(tags), allowed_(std::move(allowed)),
+          offset_(offset) {}
 
     int32_t next(CurRow* out) override {
         LaneStore& st = lane_->store();
@@ -367,8 +367,7 @@ public:
             f.stmt = stmt_;
             f.snap = snap;
             f.bound = std::min(snap->pseqHi(), ts_->labeledThrough(c.first));
-            f.source = src_;
-            f.hasSource = hasSrc_;
+            f.tags = tags_;
             f.knownLive = knownLive;
             rc = f.accept(c.second, out);
             if (rc < 0) return rc;
@@ -389,8 +388,7 @@ private:
     TypeSnap* ts_;
     uint64_t lo_, hi_;
     bool desc_;
-    std::string src_;
-    bool hasSrc_;
+    TagMatch tags_;
     std::vector<uint32_t> allowed_;  // sorted; empty = every partition
     uint64_t offset_ = 0;
     std::vector<std::pair<uint32_t, uint64_t>> cands_;
@@ -405,9 +403,9 @@ private:
 // ---- a CID at type level: the catalog (the only cross-partition lookup) -----
 class CidRowsType : public RowSource {
 public:
-    CidRowsType(ReaderLane* lane, StmtCtx* stmt, TypeSnap* ts, const uint8_t cid[kCidLen], const std::string& src,
-                bool hasSrc, uint64_t floor, std::vector<uint32_t> allowed)
-        : lane_(lane), stmt_(stmt), ts_(ts), src_(src), hasSrc_(hasSrc), floor_(floor), allowed_(std::move(allowed)) {
+    CidRowsType(ReaderLane* lane, StmtCtx* stmt, TypeSnap* ts, const uint8_t cid[kCidLen], const TagMatch& tags,
+                uint64_t floor, std::vector<uint32_t> allowed)
+        : lane_(lane), stmt_(stmt), ts_(ts), tags_(tags), floor_(floor), allowed_(std::move(allowed)) {
         std::memcpy(cid_, cid, kCidLen);
     }
     int32_t next(CurRow* out) override {
@@ -432,8 +430,7 @@ public:
             f.stmt = stmt_;
             f.snap = snap;
             f.bound = std::min(snap->pseqHi(), ts_->labeledThrough(c.pid));
-            f.source = src_;
-            f.hasSource = hasSrc_;
+            f.tags = tags_;
             rc = f.accept(c.pseq, out);
             if (rc < 0) return rc;
             if (rc == 0) continue;
@@ -449,8 +446,7 @@ private:
     StmtCtx* stmt_;
     TypeSnap* ts_;
     uint8_t cid_[kCidLen];
-    std::string src_;
-    bool hasSrc_;
+    TagMatch tags_;
     uint64_t floor_;
     std::vector<uint32_t> allowed_;
     bool done_ = false;
@@ -552,16 +548,42 @@ std::unique_ptr<RowSource> makeConcat(std::vector<std::unique_ptr<RowSource>> su
 }
 
 std::unique_ptr<RowSource> makeArrivalRows(ReaderLane* lane, StmtCtx* stmt, TypeSnap* type, uint64_t lo, uint64_t hi,
-                                           bool desc, const std::string& source, bool hasSource, uint32_t onlyPid) {
+                                           bool desc, const TagMatch& tags, uint32_t onlyPid) {
     std::vector<uint32_t> allowed;
     if (onlyPid) allowed.push_back(onlyPid);
-    return std::unique_ptr<RowSource>(new ArrivalRows(lane, stmt, type, lo, hi, desc, source, hasSource, allowed));
+    return std::unique_ptr<RowSource>(new ArrivalRows(lane, stmt, type, lo, hi, desc, tags, allowed));
 }
 
 std::unique_ptr<RowSource> makeCidRowsType(ReaderLane* lane, StmtCtx* stmt, TypeSnap* type, const TypeInfo*,
-                                           const uint8_t cid[kCidLen], const std::string& source, bool hasSource,
-                                           uint64_t gseqFloor) {
-    return std::unique_ptr<RowSource>(new CidRowsType(lane, stmt, type, cid, source, hasSource, gseqFloor, {}));
+                                           const uint8_t cid[kCidLen], const TagMatch& tags, uint64_t gseqFloor) {
+    return std::unique_ptr<RowSource>(new CidRowsType(lane, stmt, type, cid, tags, gseqFloor, {}));
+}
+
+bool buildTagMatch(const RecVtab* vt, const Plan& p, sqlite3_value** argv, TagMatch* out) {
+    *out = TagMatch();
+    auto arg = [&](int8_t a) { return argv[a - 1]; };
+    bool ok = true;
+    if (vt->kind == kVkAlias) ok = out->setSource(vt->source) && ok;
+    if (p.aTag[0] >= 0) out->setProvider(argText(arg(p.aTag[0])));
+    if (p.aTag[1] >= 0) out->setBatch(argText(arg(p.aTag[1])));
+    if (p.aTag[2] >= 0) {
+        sqlite3_value* v = arg(p.aTag[2]);
+        if (sqlite3_value_type(v) == SQLITE_BLOB) {
+            const void* b = sqlite3_value_blob(v);
+            out->setPeer(b ? std::string(static_cast<const char*>(b), size_t(sqlite3_value_bytes(v))) : std::string());
+        } else {
+            out->setPeer(argText(v));
+        }
+    }
+    if (p.aTag[3] >= 0) ok = out->setSource(argText(arg(p.aTag[3]))) && ok;
+    if (p.aTag[4] >= 0) {
+        // '<TYPE>@<source name>', compared as the column projects it.
+        const std::string full = argText(arg(p.aTag[4]));
+        const std::string prefix = vt->typeName + "@";
+        if (full.size() < prefix.size() || full.compare(0, prefix.size(), prefix) != 0) ok = false;
+        else ok = out->setSource(full.substr(prefix.size())) && ok;
+    }
+    return ok;
 }
 
 int32_t windowFloor(ReaderLane* lane, StmtCtx*, TypeSnap* type, uint64_t n, uint64_t* floor) {
@@ -589,23 +611,11 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
         rc = lane->type(stmt, fid, &ts);
         if (rc < 0) return rc;
     }
-    // Source restriction (alias, or a source constraint).
-    std::string source;
-    bool hasSource = false;
-    if (vt->kind == kVkAlias) {
-        source = vt->source;
-        hasSource = true;
-    } else if (p.access == kAccSource) {
-        source = argText(arg(p.aKey));
-        hasSource = true;
-        if (p.sourceFull) {
-            const std::string prefix = vt->typeName + "@";
-            if (source.size() < prefix.size() || strncasecmp(source.c_str(), prefix.c_str(), prefix.size()) != 0) {
-                out->reset(new Concat({}));
-                return 0;
-            }
-            source = source.substr(prefix.size());
-        }
+    // Tag conditions (the alias source among them), ANY-row semantics.
+    TagMatch tags;
+    if (!buildTagMatch(vt, p, argv, &tags)) {
+        out->reset(new Concat({}));
+        return 0;
     }
     // Partition set (pruned by _producer).
     std::vector<uint32_t> pids;
@@ -642,11 +652,9 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
         f->type = ts;
         f->bound = partLevel ? snap->pseqHi() : std::min(snap->pseqHi(), ts->labeledThrough(pid));
         f->gseqFloor = floor;
-        // The alias restricts by a post-filter unless the scan is by source.
-        if (hasSource && p.access != kAccSource) {
-            f->source = source;
-            f->hasSource = true;
-        }
+        // Instance scans (source, tag) check the conditions on each posting's
+        // instance; other plans on any live instance of the record.
+        f->tags = tags;
         return 0;
     };
     std::vector<std::unique_ptr<RowSource>> subs;
@@ -664,7 +672,7 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
                 *out = makeCidRowsPartition(f, cid);
                 return 0;
             }
-            out->reset(new CidRowsType(lane, stmt, ts, cid, source, hasSource, floor,
+            out->reset(new CidRowsType(lane, stmt, ts, cid, tags, floor,
                                        p.aProducer >= 0 ? pids : std::vector<uint32_t>()));
             return 0;
         }
@@ -690,7 +698,7 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
                 int64_t v;
                 if (argInt(arg(p.aOffset), &v) && v > 0) offset = uint64_t(v);
             }
-            out->reset(new ArrivalRows(lane, stmt, ts, eff, uhi, p.desc, source, hasSource, allowed, offset));
+            out->reset(new ArrivalRows(lane, stmt, ts, eff, uhi, p.desc, tags, allowed, offset));
             return 0;
         }
         case kAccEpoch: {
@@ -750,7 +758,7 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
                 out->reset(new Concat({}));
                 return 0;
             }
-            const std::string cap = capKeyStr(source);
+            const std::string cap = capKeyStr(tags.source);
             const std::string klo = strI64Key(cap, lo);
             const std::string khi = hi == INT64_MAX ? strPrefixEnd(cap) : strI64Key(cap, hi + 1);
             for (uint32_t pid : pids) {
@@ -788,7 +796,7 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
                 }
             } else {
                 kind = p.tagKind == 0 ? kIxTagProvider : p.tagKind == 1 ? kIxTagBatch : kIxTagPeer;
-                key = capKeyStr(argText(arg(p.aKey)));
+                key = capKeyStr(p.tagKind == 0 ? tags.provider : p.tagKind == 1 ? tags.batch : tags.peer);
             }
             std::string hi = key;
             hi.push_back('\0');  // exclusive upper bound: the next key after `key`

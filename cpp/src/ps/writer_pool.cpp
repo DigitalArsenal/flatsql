@@ -1303,6 +1303,8 @@ EngineStats Engine::stats() const {
     s.firstLabels = cFirst.load();
     s.repeatLabels = cRepeat.load();
     s.promotions = cPromotions.load();
+    s.migratedGseqs = cMigratedGseq.load();
+    s.migratedGseqFallbacks = cMigratedGseqFallback.load();
     s.mergeNotOwner = cMergeNotOwner.load();
     s.helperStalls = cHelperStalls.load();
     s.handoffHelperWaits = cHandoffHelperWaits.load();
@@ -1552,7 +1554,8 @@ std::vector<uint8_t> buildRecordAttr(const std::string& peerId, const std::strin
                                      const std::string& source, const std::string& batch,
                                      const std::string& contentKey, const std::string& producerPeer,
                                      const std::string& producerKey, const std::string& supersedeKey,
-                                     int64_t sourceTimestamp, const std::string& licenceKey) {
+                                     int64_t sourceTimestamp, const std::string& licenceKey,
+                                     uint64_t migratedGseq) {
     flatbuffers::FlatBufferBuilder b(256);
     flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<fb::SourceTag>>> tags = 0;
     const bool hasTag = !provider.empty() || !source.empty() || !batch.empty() || !producerPeer.empty() ||
@@ -1575,7 +1578,7 @@ std::vector<uint8_t> buildRecordAttr(const std::string& peerId, const std::strin
     flatbuffers::Offset<flatbuffers::String> sk = 0, lk = 0;
     if (!supersedeKey.empty()) sk = b.CreateString(supersedeKey);
     if (!licenceKey.empty()) lk = b.CreateString(licenceKey);
-    auto ra = fb::CreateRecordAttr(b, peer, 0, sk, sourceTimestamp, lk, tags);
+    auto ra = fb::CreateRecordAttr(b, peer, 0, sk, sourceTimestamp, lk, tags, migratedGseq);
     fb::FinishRecordAttrBuffer(b, ra);
     return std::vector<uint8_t>(b.GetBufferPointer(), b.GetBufferPointer() + b.GetSize());
 }

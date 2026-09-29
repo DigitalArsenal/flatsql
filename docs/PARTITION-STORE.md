@@ -5,7 +5,9 @@ partition logs, one writer per partition on a pinned pool, durable acks,
 per-commit indexes, type owners, and durable-tail open. Part II (§12–§21) is
 T2: reader instances and lanes, the snapshot protocol, the SQL surface, the
 fan-out merge, admission and results. Part III (§23–§30) is T3: compaction,
-reclamation, meta-segment retirement, disk accounting and quota. The design is
+reclamation, meta-segment retirement, disk accounting and quota. Part IV
+(§31–) is T3b: store-migrate gseqs, the entry-size setting, hot-partition
+splitting and arrivals compaction. The design is
 the stack's `docs/architecture/flatsql-partition-store.md` (§22 overrides
 §0–§21; §22.4 holds the owner rulings). This file records what was built, how
 to run it, the measured acceptance, and every place the build departs from the
@@ -978,3 +980,101 @@ checkout at the landed commit; the test enforces the 1.5× bounds on such a box:
 ```
 cpp/build/flatsql_ps_test --test=compaction_half_dead_T3_1_full --dir=<ext4 dir>
 ```
+
+# Part IV: T3b
+
+## 31. store-migrate gseqs, the entry-size setting, tag conditions
+
+store-migrate (T6, design §16.1-5) gives every migrated FIRST copy gseq = its
+legacy `sdn_record_index.rowid`, so per-schema MaxRowID and the FTS rowids
+carry over.
+
+- **Input.** `RecordAttr.migrated_gseq` (`ulong`, field 6, appended to
+  `schemas/flatsql_attr.fbs`; absent = 0, so older attributes are
+  unchanged byte for byte). `buildRecordAttr(..., migratedGseq)` writes it.
+- **Row.** A new PUT whose attribute carries one gets row flag
+  `MIGRATED_GSEQ` (0x80). The gseq stays in the attribute (in the same meta
+  batch, `ATTR_IN_M`): the RecRow has no spare u64 (offsets 108–127 hold
+  `supersedeHash`, `tagHash` and `aux`), and the attribute is as durable as
+  the row. Deviation from the T6 proposal "(b) the RecRow reserved u64 at
+  offset 116", which T1's layout had already given to `tagHash`.
+- **Labeling.** The type owner reads the flagged rows' attributes in windows
+  over the chunk it labels (one read per chunk of up to 4,096 rows when the
+  attributes fit in 1 MiB). A flagged copy labeled FIRST keeps its gseq when it
+  is above the type's committed `gseq_hi` and no arrival of the same type
+  commit holds it; the engine's gseq counter is then raised to at least gseq
+  + 1. Otherwise it gets an allocated gseq and counts a fallback; a flagged
+  copy labeled REPEAT counts a fallback too. A type commit's new arrivals are
+  sorted by gseq before they are appended, so arrivals stay strictly
+  increasing whatever order partitions are labeled in.
+- **Counters.** `EngineStats::migratedGseqs` and `migratedGseqFallbacks`,
+  appended to `flatsql_ps_stats` (entries 24 and 25). store-migrate's
+  verification (§16.1-7) needs fallbacks = 0; they are counted per labeling
+  decision, so a type commit that fails and is relabeled counts again.
+- **Crash.** The gseq is read from durable rows and attributes, so a crash
+  that loses the type commit relabels the same copies with the same gseqs.
+  An allocated fallback gseq that was never published can be reassigned
+  (as for every allocated gseq).
+- **What T6 must do** (its (d)): feed each type's FIRST copies in rowid
+  order and wait for `labeled_through` before crossing partitions, and run
+  with fallbacks = 0. gseqs are unique per type; across types a fallback could
+  reuse a legacy rowid another type migrates later, which is one more reason
+  a fallback fails the migration.
+- **Entry size.** Writer TLV 19 = `maxEntryBytes` (u64; default 1 MiB +
+  4 KiB, clamped to [64 KiB, 1 GiB]): the largest ring entry (header,
+  RecordAttr and frame). Each writer's arena grows to at least 4 ×
+  (maxEntryBytes + 4 KiB), so the frames half holds two entries. Frames
+  larger than a segment (A27 jumbo segments) are still not built.
+
+Tests: `type_migrated_gseq_preserved_fallback_and_stats` (kept, fallback
+below `gseq_hi`, REPEAT copy, ordinary allocation continues above, flags on
+disk, reopen), `type_migrated_gseq_one_commit_sorted_and_crash_reopen` (two
+partitions' interleaved gseqs in one type commit come out sorted; a crash
+before and after the type commit gives the same arrivals),
+`writer_max_entry_bytes_configurable` (a 9 MiB frame refused by default,
+stored and read back at 10 MiB), `writer_capi_tlv19_max_entry_and_stats`
+(tag 19 through `flatsql_ps_init`, the 26-entry stats array).
+
+### 31.1 Tag conditions match any live tag instance (A2)
+
+`_provider`, `_batch`, `_peer_id`, `_source` and `_source_name` conditions
+have the legacy tag table's ANY-row semantics (`indexedRecordWindowSQL`: a
+CID matches when one of its tag rows satisfies every requested condition).
+In format 2 a record's tag instances are its PUT's own tag and its RETAG rows
+(A2). As T2 built it, the vtab scanned tag postings (which name every
+instance, RETAGs included) but left each constraint for SQLite to re-check
+against the projected column, which shows only the PUT's own tag, so every
+record matched through a RETAG was dropped (T6 #7 on a migrated copy: a
+provider window of 200 read as 100; a source + batch window lost the
+re-tagged records).
+
+Now `xBestIndex` consumes every tag condition (`omit = 1`) and the vtab
+evaluates them all on one instance:
+
+- A tag or source posting scan (the plan's key) checks the remaining
+  conditions on the instance the posting names (its RecordAttr), then emits
+  the instance's record. A single condition that is the scanned key needs no
+  attribute read unless the key was capped (over 512 bytes).
+- Any other plan (CID, column index, epoch, arrivals order, full scan)
+  keeps a record when one of its live tag instances matches every condition
+  (`RowFilter::hasLiveTag`, the TAG_OF postings), as the alias table's source
+  filter already did.
+- An untagged record matches no tag condition (as the index-driven plans
+  already behaved, T2 deviation 8), and conditions that contradict each other
+  (two sources) return no rows.
+- `_source = '<TYPE>@<name>'` is compared as the column projects it: the type
+  prefix is case-sensitive (a lower-case prefix returned no rows before
+  either, after SQLite's re-check).
+- `_peer_id` conditions match the tag's producer peer (the TAG_PEER postings
+  the T2 plan scanned); the `_peer_id` column still projects the storing
+  call's `RecordAttr.peer_id`. Before, SQLite compared that BLOB column with
+  the argument, so a text argument never matched.
+- `<TYPE>_current` groups first and filters after, as SQL says: its tag
+  conditions stay SQLite's (the current version's own tag).
+- Projected columns are unchanged: they show the PUT's own tag.
+
+Test: `lane_tag_conditions_match_any_instance_A2` (two partitions, PUT tags,
+RETAGs and REPEAT copies; eleven condition sets at type and partition level
+against an ANY-instance oracle, the full `_source` form, the alias, an
+epoch-ordered window, column and CID plans). With `omit = 0` restored it
+fails 18 checks.

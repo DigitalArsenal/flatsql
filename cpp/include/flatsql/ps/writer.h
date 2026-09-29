@@ -873,6 +873,11 @@ struct EngineStats {
     uint64_t typeDiskBytes = 0;          // T3 (§13): Σ type logs on disk
     uint64_t compactInFlight = 0;  // planned, not yet applied or aborted
     uint64_t diskBytes = 0;        // sum over partitions (published values)
+    // store-migrate (§16.1-5): FIRST copies labeled with their migrated gseq,
+    // and copies that carried one but did not get it (labeled REPEAT, or the
+    // gseq was not above the type's gseq_hi). Counted per labeling decision.
+    uint64_t migratedGseqs = 0;
+    uint64_t migratedGseqFallbacks = 0;
 };
 
 class Engine {
@@ -962,6 +967,11 @@ public:
     uint32_t incarnation() const { return incarnation_; }
     int64_t nowMs() const { return cfg_.clockMs ? cfg_.clockMs(cfg_.clockCtx) : wallMsNow(); }
     uint64_t allocGseq(uint32_t n) { return gseqNext_.fetch_add(n, std::memory_order_relaxed); }
+    // store-migrate (§16.1-5): a migrated gseq was used; allocation continues above it.
+    void raiseGseqNext(uint64_t next) {
+        uint64_t cur = gseqNext_.load(std::memory_order_relaxed);
+        while (cur < next && !gseqNext_.compare_exchange_weak(cur, next, std::memory_order_relaxed)) {}
+    }
     uint64_t gseqNext() const { return gseqNext_.load(); }
     bool stopping() const { return stop_.load(std::memory_order_acquire); }
     uint32_t reserveSlabs() const { return reserveSlabs_; }
@@ -980,6 +990,7 @@ public:
         cHelperStalls{0}, cHelperJobs{0}, cHandoffHelperWaits{0};
     std::atomic<uint64_t> cCompactions{0}, cCompactAborts{0}, cCompactBytesIn{0}, cCompactBytesOut{0},
         cRetired{0}, cUnlinked{0}, cUnlinkBusy{0}, cMetaRetired{0}, cCompactInFlight{0}, cCatalogDropped{0};
+    std::atomic<uint64_t> cMigratedGseq{0}, cMigratedGseqFallback{0};
     uint64_t framesParsedAtOpen = 0;
     uint64_t adoptedBatches = 0;
     uint64_t journalReplayRecords = 0;
@@ -1138,7 +1149,8 @@ std::vector<uint8_t> buildRecordAttr(const std::string& peerId, const std::strin
                                      const std::string& producerKey = "",
                                      const std::string& supersedeKey = "",
                                      int64_t sourceTimestamp = 0,
-                                     const std::string& licenceKey = "");
+                                     const std::string& licenceKey = "",
+                                     uint64_t migratedGseq = 0);
 
 }  // namespace ps
 }  // namespace flatsql

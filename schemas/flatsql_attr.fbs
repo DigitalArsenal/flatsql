@@ -35,6 +35,11 @@ table RecordAttr {
   // (provider, source, batch) key of the LICENCE frame that covers the record.
   licence_key: string;
   tags: [SourceTag];
+  // store-migrate only (design §16.1-5): the legacy sdn_record_index.rowid of
+  // a FIRST copy. The type owner gives the copy this gseq when it is labeled
+  // FIRST and the gseq is above the type's gseq_hi; otherwise it allocates
+  // one and counts a fallback (docs/PARTITION-STORE.md §31). 0 = absent.
+  migrated_gseq: ulong;
 }
 
 root_type RecordAttr;

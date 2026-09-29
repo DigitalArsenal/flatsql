@@ -34,6 +34,7 @@ struct AttrView {
     bool hasSupersedeKey = false;
     const uint8_t* licenceKey = nullptr;
     size_t licenceKeyLen = 0;
+    uint64_t migratedGseq = 0;  // store-migrate: the legacy rowid of a FIRST copy (0 = absent)
 };
 
 // Verifies and views a RecordAttr (flatsql_attr.fbs). len == 0: no attr.

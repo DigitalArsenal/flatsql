@@ -256,8 +256,18 @@ void resetTypeScratch(StageScratch& sc) {
     sc.keyBytes = 0;
 }
 
-// One partition row seen by the type owner.
-bool labelRow(TCtx& c, Partition* p, const RecRow& r) {
+// A gseq already given to an arrival of this type batch (store-migrate: a
+// migrated gseq below the batch's highest; rare, so a linear scan).
+bool arrivalHas(const StageScratch& sc, uint64_t gseq) {
+    for (uint32_t i = 0; i < sc.nArrivals; i++)
+        if (sc.arrivals[i].gseq == gseq) return true;
+    return false;
+}
+
+// One partition row seen by the type owner. `migrated`: the row carries a
+// store-migrate gseq (kRowMigratedGseq), `migGseq` its value (0 when the
+// attribute could not be read).
+bool labelRow(TCtx& c, Partition* p, const RecRow& r, bool migrated = false, uint64_t migGseq = 0) {
     StageScratch& sc = *c.sc;
     const uint64_t tcs = c.st->commitSeq;
     // Capacity first: a row is labeled completely or not at all.
@@ -287,22 +297,38 @@ bool labelRow(TCtx& c, Partition* p, const RecRow& r) {
                 !addPosting(c, kIxTypeRepeat, k, 12, v, 8))
                 return false;
             c.e->cRepeat.fetch_add(1, std::memory_order_relaxed);
+            // A migrated gseq on a copy that is not the first: not used.
+            if (migrated) c.e->cMigratedGseqFallback.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
         if (sc.nArrivals >= StageScratch::kArrivalCap) return false;
-        const uint64_t gseq = c.e->allocGseq(1);
+        // store-migrate (§16.1-5): the FIRST copy keeps its legacy rowid as
+        // gseq when that is above everything the type has published and no
+        // arrival of this batch holds it (the batch's arrivals are sorted by
+        // gseq before they are appended, so arrivals stay strictly
+        // increasing). Otherwise a new gseq, and a counted fallback.
+        uint64_t gseq = 0;
+        if (migrated && migGseq > c.t->gseqHi && (migGseq > c.st->gseqHi || !arrivalHas(sc, migGseq))) {
+            gseq = migGseq;
+            c.e->raiseGseqNext(migGseq + 1);
+        } else {
+            gseq = c.e->allocGseq(1);
+        }
         ArrivalEntry& a = sc.arrivals[sc.nArrivals++];
         a.gseq = gseq;
         a.pid = p->pid;
         a.flags = kArrivalFirst;
         a.rsv = 0;
         a.pseq = r.pseq;
-        if (!c.st->firstGseq) c.st->firstGseq = gseq;
         if (gseq > c.st->gseqHi) c.st->gseqHi = gseq;
         upsertCopy(sc, tc, p->pid, r.pseq, tcs, kLabelFirst, gseq, r.len);
         if (!postCatalog(c, key, p->pid, r.pseq, tcs, kLabelFirst, gseq, r.len) ||
             !postLabel(c, p->pid, r.pseq, tcs, gseq, kLabelFirst))
             return false;
+        if (migrated) {
+            if (gseq == migGseq) c.e->cMigratedGseq.fetch_add(1, std::memory_order_relaxed);
+            else c.e->cMigratedGseqFallback.fetch_add(1, std::memory_order_relaxed);
+        }
         c.st->firstLiveCount++;
         c.st->firstLiveBytes += r.len - 4;
         c.st->arrivalsCount++;
@@ -688,13 +714,41 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
                 c.err = n < 0 ? int32_t(n) : FLATSQL_IO_ERR_IO;
                 break;
             }
+            // store-migrate rows (kRowMigratedGseq) carry their gseq in the
+            // attribute, which sits in this batch after the rows (ATTR_IN_M):
+            // read in windows over the chunk's migrated attributes.
+            uint64_t migEnd = 0;
+            for (size_t r = 0; r < nRows; r++) {
+                const RecRow& row = sc->trows[r];
+                if (row.kind == kRowPut && (row.flags & kRowMigratedGseq) && (row.flags & kRowAttrInM))
+                    migEnd = std::max<uint64_t>(migEnd, row.attrOff + row.attrLen);
+            }
+            uint64_t wLo = 0, wHi = 0;
+            auto migratedGseqOf = [&](const RecRow& row) -> uint64_t {
+                if (!(row.flags & kRowAttrInM) || row.attrLen == 0 || row.attrLen > sc->capPlain) return 0;
+                if (row.attrOff < wLo || row.attrOff + row.attrLen > wHi) {
+                    const uint64_t len = std::min<uint64_t>(
+                        sc->capPlain, std::max<uint64_t>(migEnd, row.attrOff + row.attrLen) - row.attrOff);
+                    if (w->io().read(*f, sc->plain, size_t(len), row.attrOff) != int64_t(len)) {
+                        wLo = wHi = 0;
+                        return 0;
+                    }
+                    wLo = row.attrOff;
+                    wHi = row.attrOff + len;
+                }
+                AttrView av;
+                return parseAttr(sc->plain + (row.attrOff - wLo), row.attrLen, &av) ? av.migratedGseq : 0;
+            };
             size_t r = 0;
             for (; r < nRows; r++) {
-                if (sc->trows[r].pseq != from + r) {
+                const RecRow& row = sc->trows[r];
+                if (row.pseq != from + r) {
                     c.err = FLATSQL_IO_ERR_IO;
                     break;
                 }
-                if (!labelRow(c, p, sc->trows[r])) break;  // scratch full or I/O error
+                const bool migrated = row.kind == kRowPut && (row.flags & kRowMigratedGseq);
+                if (!labelRow(c, p, row, migrated, migrated ? migratedGseqOf(row) : 0))
+                    break;  // scratch full or I/O error
             }
             if (r > 0) through = from + r - 1;
             done += uint32_t(r);
@@ -740,6 +794,13 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
     }
     if (!c.err && t->mergePhase == 1) st->mergeDone = true;
     if (c.err || (st->nLabels == 0 && sc->nArrivals == 0 && sc->nEntries == 0 && !st->mergeDone)) return false;
+    // Arrivals in gseq order: allocated gseqs rise in labeling order, but
+    // migrated ones (store-migrate) follow their partitions' order.
+    if (!std::is_sorted(sc->arrivals, sc->arrivals + sc->nArrivals,
+                        [](const ArrivalEntry& a, const ArrivalEntry& b) { return a.gseq < b.gseq; }))
+        std::sort(sc->arrivals, sc->arrivals + sc->nArrivals,
+                  [](const ArrivalEntry& a, const ArrivalEntry& b) { return a.gseq < b.gseq; });
+    st->firstGseq = sc->nArrivals ? sc->arrivals[0].gseq : 0;
     // Arrivals bytes (frames arena).
     const uint32_t gBytes = sc->nArrivals * kArrivalBytes;
     if (gBytes) {

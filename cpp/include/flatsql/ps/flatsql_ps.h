@@ -138,7 +138,19 @@ int32_t flatsql_ps_set_quota(double bytes);
  *   6 ring cap u64  7 cooperative u8  8 create u8  9 require MIGRATED u8
  *  10 zero-fill step u64  11 arena bytes u64  12 seal bytes u64
  *  T3: 13 quota bytes u64  14 ballast bytes u64  15 reclaim grace ms u64
- *      16 auto compaction u8  17 compaction threads u32  18 commit journal u8 */
+ *      16 auto compaction u8  17 compaction threads u32  18 commit journal u8
+ *  19 max entry bytes u64: the largest ring entry (header, RecordAttr and
+ *     frame; default 1 MiB + 4 KiB). The per-writer arena grows to hold two
+ *     such entries. Frames larger than a segment (A27 jumbo) are not built.
+ *
+ * Writer stats (flatsql_ps_stats), u64 each in this order: commits, sync
+ * rounds, iterations with a commit, rows appended, dedupe hits, retags,
+ * tombs, rejects, merges, seals, type commits, FIRST labels, REPEAT labels,
+ * promotions, notices dropped, frames parsed at open, open read bytes, open
+ * data bytes, open meta bytes, adopted batches, pool slabs in use, pool slabs
+ * peak, pool committed bytes, committed bytes, migrated gseqs used, migrated
+ * gseq fallbacks (store-migrate: RecordAttr.migrated_gseq, PARTITION-STORE.md
+ * §31). */
 
 #ifdef __cplusplus
 }

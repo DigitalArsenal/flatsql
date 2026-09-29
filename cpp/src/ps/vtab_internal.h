@@ -17,6 +17,8 @@
 namespace flatsql {
 namespace ps {
 
+struct TagView;
+
 // Hidden columns follow the schema columns, in this order.
 enum MetaCol : int {
     kMcPseq = 0,
@@ -72,8 +74,35 @@ struct Plan {
     int8_t aLimit = -1;
     int8_t aOffset = -1;
     bool orderConsumed = false;
+    // Tag conditions the vtab evaluates itself (omitted from SQLite's
+    // re-check), argv indexes: _provider, _batch, _peer_id, _source_name,
+    // _source ('<TYPE>@<name>'). See TagMatch.
+    int8_t aTag[5] = {-1, -1, -1, -1, -1};
     std::string encode() const;
     bool decode(const char* s);
+};
+
+// A statement's tag conditions, with the legacy tag table's ANY-row
+// semantics: a record matches when ONE of its live tag instances (its PUT's
+// own tag or a RETAG, A2) satisfies every condition. An untagged record
+// matches none (T2 deviation 8). _peer_id matches the tag's producer peer,
+// the TAG_PEER postings.
+struct TagMatch {
+    bool any = false;
+    bool hasProvider = false, hasBatch = false, hasPeer = false, hasSource = false;
+    std::string provider, batch, peer, source;
+    void setProvider(const std::string& v) { any = hasProvider = true; provider = v; }
+    void setBatch(const std::string& v) { any = hasBatch = true; batch = v; }
+    void setPeer(const std::string& v) { any = hasPeer = true; peer = v; }
+    // false: a different source is already required (no row can match).
+    bool setSource(const std::string& v) {
+        if (hasSource && source != v) return false;
+        any = hasSource = true;
+        source = v;
+        return true;
+    }
+    int count() const { return int(hasProvider) + int(hasBatch) + int(hasPeer) + int(hasSource); }
+    bool matches(const TagView& t) const;
 };
 
 struct RecVtab : sqlite3_vtab {
@@ -119,15 +148,18 @@ struct RowFilter {
     TypeSnap* type = nullptr;     // type level: labels (FIRST only) and gseq
     uint64_t bound = 0;           // visibility: pseq_hi or V_p
     uint64_t gseqFloor = 0;       // sandbox window (A18): skip gseq < floor
-    std::string source;           // post-filter: a live tag instance with this source
-    bool hasSource = false;
+    TagMatch tags;                // post-filter: a live tag instance matching every condition
     bool knownLive = false;       // liveness already established (arrivals joins)
-    // Applies visibility, liveness, labels, source; reads the PUT row.
+    // Applies visibility, liveness, labels, tags; reads the PUT row.
     // Returns 1 (keep, *row filled), 0 (skip), < 0 error.
     int32_t accept(uint64_t pseq, CurRow* out);
-    // Does PUT `put` have a live tag instance whose source is `source`?
-    int32_t hasLiveSource(uint64_t put, const std::string& source, bool* yes);
+    // Does PUT `put` have a live tag instance matching `m`?
+    int32_t hasLiveTag(uint64_t put, const TagMatch& m, bool* yes);
 };
+
+// The plan's tag conditions (and an alias table's source) from its
+// arguments. false: they contradict each other, no row can match.
+bool buildTagMatch(const RecVtab* vt, const Plan& p, sqlite3_value** argv, TagMatch* out);
 
 // Partition-level sources (vtab_partition.cpp).
 std::unique_ptr<RowSource> makePostingRows(const RowFilter& f, uint16_t kind, std::string lo, bool hasLo,
@@ -140,11 +172,9 @@ std::unique_ptr<RowSource> makeMerger(std::vector<std::unique_ptr<RowSource>> su
                                       size_t groupPrefixTrim);
 std::unique_ptr<RowSource> makeConcat(std::vector<std::unique_ptr<RowSource>> subs);
 std::unique_ptr<RowSource> makeArrivalRows(ReaderLane* lane, StmtCtx* stmt, TypeSnap* type, uint64_t lo, uint64_t hi,
-                                           bool desc, const std::string& source, bool hasSource,
-                                           uint32_t onlyPid);
+                                           bool desc, const TagMatch& tags, uint32_t onlyPid);
 std::unique_ptr<RowSource> makeCidRowsType(ReaderLane* lane, StmtCtx* stmt, TypeSnap* type, const TypeInfo* ti,
-                                           const uint8_t cid[kCidLen], const std::string& source, bool hasSource,
-                                           uint64_t gseqFloor);
+                                           const uint8_t cid[kCidLen], const TagMatch& tags, uint64_t gseqFloor);
 
 // Sandbox window floor (A18): the gseq of the arrivals entry N from the tail.
 int32_t windowFloor(ReaderLane* lane, StmtCtx* stmt, TypeSnap* type, uint64_t n, uint64_t* floor);

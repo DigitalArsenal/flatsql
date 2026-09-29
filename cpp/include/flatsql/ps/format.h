@@ -68,6 +68,10 @@ enum RowFlag : uint8_t {
     kRowJumbo = 0x10,
     kRowCidVerified = 0x20,
     kRowTxn = 0x40,
+    // A PUT whose RecordAttr carries migrated_gseq (store-migrate, design
+    // §16.1-5). The type owner reads the gseq from the attribute when it
+    // labels the row (PARTITION-STORE.md §31).
+    kRowMigratedGseq = 0x80,
 };
 
 // ---- index kinds (L0 / L1 postings) ----------------------------------------
