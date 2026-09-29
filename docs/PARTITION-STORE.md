@@ -6,8 +6,9 @@ per-commit indexes, type owners, and durable-tail open. Part II (§12–§21) is
 T2: reader instances and lanes, the snapshot protocol, the SQL surface, the
 fan-out merge, admission and results. Part III (§23–§30) is T3: compaction,
 reclamation, meta-segment retirement, disk accounting and quota. Part IV
-(§31–) is T3b: store-migrate gseqs, the entry-size setting, hot-partition
-splitting and arrivals compaction. The design is
+(§31–§35) is T3b: store-migrate gseqs, the entry-size setting, hot-partition
+splitting and arrivals compaction; §36 records the quota eviction race T3 #3
+met on Linux. The design is
 the stack's `docs/architecture/flatsql-partition-store.md` (§22 overrides
 §0–§21; §22.4 holds the owner rulings). This file records what was built, how
 to run it, the measured acceptance, and every place the build departs from the
@@ -806,9 +807,11 @@ and not counted. The crash tests check the type directory the same way.
   (`EngineConfig::quotaBytes`, `Engine::setQuota`, `flatsql_ps_set_quota`), it
   evicts whole sealed segments in arrival order across partitions (their
   `minArrival` zone) down to 0.85 of the cap: a `TOMB_RANGE{seg, all}` on the
-  owner (bounded 512-row steps; supersede-lane heads and control kinds are
-  spared; each step also stops after 4 ms of CPU), then, once the tombstones
-  are durable, a compaction of the segment. One wave at a time.
+  owner that names the segment's rows by pseq (deviation 34; bounded 512-row
+  steps; supersede-lane heads and control kinds are spared; each step also
+  stops after 4 ms of CPU), then, once the tombstones are durable, a
+  compaction of the segment, or of the output it has been coalesced into
+  since. One wave at a time.
 - **ENOSPC.** A commit that fails NOSPACE starts an emergency: record entries
   stop being consumed (producers see zero credits; nothing is acked), the
   ballast file (`fsql2/ballast`, `ballastBytes`) is released, and waves evict one
@@ -1388,3 +1391,74 @@ cpp/build/flatsql_ps_test --test=type_arrivals_compaction_A15 [--seconds=N]
 cpp/build/flatsql_ps_test --test=orphan_crash_points_during_compaction_T3_4_full
 cpp/build/flatsql_ps_bench --mode=hotsplit [--helpers=4] [--io=mem|fs] [--dir=D] [--records=N]
 ```
+
+## 36. Eviction ranges name rows, not segments (T3 #3 on Linux)
+
+`quota_arrival_order_heads_spared_T3_3` failed now and then on the ubuntu CI
+job (holes 585 on 71065d3; 616, then 471 on 49e7ac7). It reproduced in Docker
+(Debug, the test looped): 3 of 100 runs on linux/arm64 with 4 CPUs, 1 of 150
+on linux/amd64 with 4 CPUs and stress-ng on 2. Each failure had the same
+interleaving (traced on arm64, 4 of 100):
+
+1. The planner chose partition p's oldest segments from its summary, A
+   (`[0-1]`), B (`2`), C and later, and queued a TOMB_RANGE for each by
+   segment id.
+2. A's range started. Its first steps put A past the dead-share trigger, and
+   maintenance compacted A, which left it small.
+3. Maintenance coalesced the shrunken A with its small neighbour B into one
+   output named A (`[0-2]`).
+4. B's range reached the front of the queue and looked for segment 2. There
+   was none, so it examined nothing and completed.
+
+B's records outlived C's and every later evicted record, and stayed after the
+wave had settled: an engine bug, not the test's view.
+
+34. **An eviction's TOMB_RANGE names the segment's rows** (§13:
+    `TOMB_RANGE{seg, epoch < t}`). The summary carries each sealed segment's
+    `[firstPseq, endPseq)`, which compaction and coalescing never renumber,
+    and the planner's range examines exactly those rows wherever they live
+    now (`Engine::tombRange(pid, seg, bound, ticket, firstPseq, endPseq)`;
+    without a range, `seg` is still resolved when the range starts). A
+    compaction request for a segment coalesced since compacts the output
+    that holds it. Before, it failed NOENT, the wave's space came back only
+    through maintenance, and the next pass could evict below the low-water
+    mark.
+35. **A compaction reads the kills in the active segment's runs.** It
+    collected the runs of the segments that end after its inputs. The active
+    segment has no end until it seals, so the kills a merge had folded into
+    its runs were missed and their rows kept (an eviction's own compaction
+    met this whenever its tombstones merged before the SWAP was planned).
+
+`quota_tomb_range_follows_rows_coalesced_into_older_segment` replays both:
+A and B coalesce, B's range runs from the pseqs taken before that, one L0
+block per step so that some of the tombstones merge into the active segment,
+then B's compaction request. Before the fix, 0 of B's 157 records die and
+the request returns NOENT. With deviation 34 but not 35, the compaction
+drops 29 of the 157.
+
+The quota tests read the files under the engine's reader gate, the way a
+statement does (reclamation runs at a 1 ms grace there), and a partition
+they cannot read fails the test instead of reading as an empty live set.
+The planner's counters are atomic (ThreadSanitizer: quotaStats() read them
+while writer 0 counted).
+
+After the fix (Docker Linux, Debug, the test alone, looped):
+
+| Commit | Machine | Load | Runs | Failures |
+|---|---|---|---|---|
+| bedfe06 (deviation 34) | linux/arm64 | 4 CPUs, stress-ng on 2 | 520 | 0 |
+| 5f4af36 (34, 35) | linux/amd64 | 4 CPUs, stress-ng on 2 | 520 | 0 |
+| a416695 | linux/arm64 | 3 CPUs, stress-ng on 3 | 520 | 0 |
+
+The quota tests also pass under ThreadSanitizer (linux/arm64). The native
+suite (Mac 76 tests; Linux ctest 14 of 14), `crash_faults_T1_1_full` (10,000
+trials) and `orphan_crash_points_during_compaction_T3_4_full` pass. The T3 #4
+harness's arrivals check ran on a second reader instance the reader gate did
+not cover, so a statement could lose a file to reclamation and end
+SNAPSHOT_GONE (on 2f6d86e too: seed 9003, trial 48); the gate now covers both.
+
+Open: `quota_disk_full_resumes_without_operator_T3_6` can stay in its first
+emergency past the test's minute on a loaded box (one episode, three
+segments evicted, the ballast never back). It predates this change: on
+linux/amd64 Debug at a host load near 40, 4 of 100 runs on 2f6d86e and 1 of
+100 here; under ThreadSanitizer, 3 of 6 and 1 of 10.

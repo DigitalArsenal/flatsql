@@ -273,9 +273,16 @@ struct OrphanHarness {
             return false;
         }
         Reader rd(s, LaneClass::Interactive, 1);
-        // A12: files a statement may still read wait for it.
-        s.e->setReaderGate([](void* ctx) -> uint64_t { return static_cast<ReaderInstance*>(ctx)->oldestActiveStart(); },
-                           rd.inst.get());
+        Reader bulk(s, LaneClass::Bulk, 1);
+        // A12: files a statement may still read wait for it, on either
+        // reader instance (the host passes the minimum over all of them).
+        ReaderInstance* readers[2] = {rd.inst.get(), bulk.inst.get()};
+        s.e->setReaderGate(
+            [](void* ctx) -> uint64_t {
+                ReaderInstance** r = static_cast<ReaderInstance**>(ctx);
+                return std::min(r[0]->oldestActiveStart(), r[1]->oldestActiveStart());
+            },
+            readers);
         const Rows t = rd.q("SELECT first_live_count FROM flatsql_types WHERE type = 'OMM'");
         if (t.status != 0 || t.rows.size() != 1 || uint64_t(t.i(0, 0)) != live) {
             std::fprintf(stderr, "  [%s] first_live_count %lld, %llu live records\n", phase,
@@ -299,7 +306,6 @@ struct OrphanHarness {
         // T3b (A15): arrivals order (entries - GONE) holds exactly the live
         // records, strictly increasing, and offset pages are slices of it.
         {
-            Reader bulk(s, LaneClass::Bulk, 1);
             const Rows all = bulk.q("SELECT _gseq FROM OMM ORDER BY _gseq");
             bool ok = all.status == 0 && all.rows.size() == live;
             for (size_t i = 1; ok && i < all.rows.size(); i++) ok = all.i(i, 0) > all.i(i - 1, 0);
