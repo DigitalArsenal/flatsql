@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.3.1
+
+- flatsql_sdn_node links flatbuffers util.cpp again; no published artifact changes.
+  (`idl_parser.cpp` needs its `AbsolutePath` and `ClassicLocale::instance_`; a9c0943 had
+  dropped it from that target. `wasm/flatsql.wasm`, `flatsql-wasi.wasm`,
+  `flatsql-wasi-noeh.wasm` and `flatsql-ps-threads.wasm` are 3.3.0's.)
+
 ## 3.3.0
 
 - Database-key record encryption follows FlatBuffers field-encryption format 3: each record is
