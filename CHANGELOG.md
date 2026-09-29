@@ -1,5 +1,31 @@
 # Changelog
 
+## 3.3.0
+
+- Database-key record encryption follows FlatBuffers field-encryption format 3: each record is
+  encrypted under its own key (DeriveBufferKey(sequence), the record index being its rowid by
+  stream order) with an IV per instance position. `ingestOneEncrypted`, `encryptRecord` and
+  `decryptRecord` take the record index; a database holding records in tables with
+  (encrypted) columns must declare stored format 3, and format 2 is refused (README
+  "Database-key encryption" has the migration from 3.2.0). C API:
+  `flatsql_set_encryption_key` (+storedFormat), `flatsql_encrypt_buffer` and
+  `flatsql_decrypt_buffer` (+recordIndex), `flatsql_ingest_one_encrypted`.
+- Every build derives keys with HKDF-SHA256: the wasm builds (`flatsql.wasm`,
+  `flatsql-wasi.wasm`, `flatsql-wasi-noeh.wasm`) take FlatBuffers 8af3053e, whose fallback
+  backend implements HKDF-SHA256, AES-256-CTR and HMAC-SHA256, so they accept a key for a
+  database with (encrypted) columns; native builds without a real HKDF-SHA256 refuse one.
+  `computeHMAC`/`verifyHMAC` use `flatbuffers::HMACSha256` in every build.
+- Partition store (docs/PARTITION-STORE.md §32-§35): the hot-partition split with stage-1
+  helpers and prep states, arrivals compaction (A15: sealed arrivals segments rewritten
+  without the GONE and REHOME postings they cover), the L0 accelerator fix, prefix-key sort
+  for random-key posting buckets, and `flatsql_ps_stats` entries 26-35.
+- Artifacts (sha256): `wasm/flatsql.wasm`
+  `45e291c9293fc0c2c27e87cd410c813cd54f97ba6c3459d328122c1c37909d1f`, `wasm/flatsql-wasi.wasm`
+  `989ea9fc7be9539bda7878e5202bee46b4ba45fd59d8718b01a2a8a6c7cb1afd`,
+  `wasm/flatsql-wasi-noeh.wasm` `7315eb0361513578c7a011db8b1e10a7d41625e8fae59c276b61e2d1529bb591`,
+  `wasm/flatsql-ps-threads.wasm` `e61120642b300997f59ef064d7cc6375bfc937e7cc4d551b47695f6d23ef03e6`
+  (2,325,490 bytes).
+
 ## 3.2.0
 
 - store-migrate gseqs: `RecordAttr.migrated_gseq` (field 6) on a FIRST copy keeps that gseq
