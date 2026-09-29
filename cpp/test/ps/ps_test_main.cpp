@@ -12,6 +12,7 @@
 #include <cstring>
 #include <new>
 
+#include "flatsql/ps/lane_arena.h"
 #include "flatsql/ps/platform.h"
 #include "ps/ps_test.h"
 
@@ -44,38 +45,74 @@ static void traceHot() {
     std::abort();
 #endif
 }
+// ---- reader memory accounting (reader_memory_test.cpp) ------------------------------
+// Every operator new block carries a 16-byte header: its size and whether a
+// reader lane thread (one with a bound lane arena) allocated it. The live
+// bytes of lane allocations are what a reader instance holds beyond its
+// fixed arenas, caches included, wherever the block is later freed.
+std::atomic<int64_t> gLaneLiveBytes{0};
+std::atomic<int64_t> gAllLiveBytes{0};
+namespace {
+constexpr uint64_t kTagLane = 0x6c616e656c616e65ull;   // "lanelane"
+constexpr uint64_t kTagOther = 0x6f746865726f7468ull;  // "otheroth"
+struct alignas(16) AllocHeader {
+    uint64_t tag;
+    uint64_t n;
+};
+static_assert(sizeof(AllocHeader) == 16, "keeps malloc's 16-byte alignment");
+void* allocTracked(std::size_t n) {
+    AllocHeader* h = static_cast<AllocHeader*>(std::malloc(sizeof(AllocHeader) + (n ? n : 1)));
+    if (!h) return nullptr;
+    const bool lane = flatsql::ps::laneArenaCurrent() != nullptr;
+    h->tag = lane ? kTagLane : kTagOther;
+    h->n = n;
+    if (lane) gLaneLiveBytes.fetch_add(int64_t(n), std::memory_order_relaxed);
+    gAllLiveBytes.fetch_add(int64_t(n), std::memory_order_relaxed);
+    return h + 1;
+}
+void freeTracked(void* p) {
+    if (!p) return;
+    AllocHeader* h = static_cast<AllocHeader*>(p) - 1;
+    if (h->tag == kTagLane) gLaneLiveBytes.fetch_sub(int64_t(h->n), std::memory_order_relaxed);
+    gAllLiveBytes.fetch_sub(int64_t(h->n), std::memory_order_relaxed);
+    std::free(h);
+}
+}  // namespace
 void* operator new(std::size_t n) {
     gAllAllocs.fetch_add(1, std::memory_order_relaxed);
     if (flatsql::ps::tHotPathDepth > 0) {
         gHotAllocs.fetch_add(1, std::memory_order_relaxed);
         traceHot();
     }
-    void* p = std::malloc(n ? n : 1);
+    void* p = allocTracked(n);
     if (!p) allocFailed();
     return p;
 }
 void* operator new[](std::size_t n) {
     gAllAllocs.fetch_add(1, std::memory_order_relaxed);
     if (flatsql::ps::tHotPathDepth > 0) gHotAllocs.fetch_add(1, std::memory_order_relaxed);
-    void* p = std::malloc(n ? n : 1);
+    void* p = allocTracked(n);
     if (!p) allocFailed();
     return p;
 }
 void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
     if (flatsql::ps::tHotPathDepth > 0) gHotAllocs.fetch_add(1, std::memory_order_relaxed);
-    return std::malloc(n ? n : 1);
+    return allocTracked(n);
 }
 void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
     if (flatsql::ps::tHotPathDepth > 0) gHotAllocs.fetch_add(1, std::memory_order_relaxed);
-    return std::malloc(n ? n : 1);
+    return allocTracked(n);
 }
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p) noexcept { freeTracked(p); }
+void operator delete[](void* p) noexcept { freeTracked(p); }
+void operator delete(void* p, std::size_t) noexcept { freeTracked(p); }
+void operator delete[](void* p, std::size_t) noexcept { freeTracked(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { freeTracked(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { freeTracked(p); }
 
 namespace pst {
 
+extern uint32_t gReaderFencePage;  // reader_fixtures.cpp
 int gFailures = 0;
 static std::vector<std::string> gArgs;
 
@@ -120,6 +157,8 @@ int main(int argc, char** argv) {
     }
 #endif
     for (int i = 1; i < argc; i++) pst::gArgs.push_back(argv[i]);
+    // Readers the fixtures build read this many fences per page (0: 128).
+    pst::gReaderFencePage = uint32_t(pst::argInt("fence-page", 0));
     const std::string filter = pst::argStr("test", "");
     bool all = false;
     for (const auto& a : pst::gArgs) {

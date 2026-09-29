@@ -56,7 +56,8 @@ struct ReaderConfig {
     uint32_t lanes = 2;
     uint64_t arenaBytes = 0;             // per lane; 0 = 8 MiB (interactive/sandbox), 128 MiB (bulk)
     uint64_t cacheBytes = 16ull << 20;   // the instance's shared index cache (§17 block cache)
-    uint64_t laneCacheBytes = 4ull << 20;  // per lane: manifests, L1 fences and blooms
+    uint64_t laneCacheBytes = 4ull << 20;  // per lane: its private cache, its resident runs and its front
+    uint32_t fencePageEntries = 128;     // L1 fences read per page (tests: small, to cross pages)
     uint32_t maxParked = 8;              // parked statements per lane (A28)
     uint32_t slots = 0;                  // request slots; 0 = lanes * (maxParked + 1) + 16
     uint32_t reqBytes = 64u << 10;       // per slot: SQL + parameters

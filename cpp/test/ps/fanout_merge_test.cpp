@@ -438,6 +438,14 @@ PS_TEST(fanout_randomized_vs_bruteforce_T2_2) {
     runFanoutWorkloads(int(argInt("workloads", 200)), uint64_t(argInt("seed", 7)));
 }
 
+// The same with two fences per page: every lookup and scan of an L1 run
+// crosses fence pages (FenceView).
+PS_TEST(fanout_randomized_vs_bruteforce_small_fence_pages) {
+    gReaderFencePage = 2;
+    runFanoutWorkloads(int(argInt("fence-workloads", 40)), uint64_t(argInt("seed", 11)));
+    gReaderFencePage = 0;
+}
+
 PS_SLOW_TEST(fanout_randomized_vs_bruteforce_T2_2_full) {
     runFanoutWorkloads(int(argInt("workloads", 10000)), uint64_t(argInt("seed", 20260928)));
 }

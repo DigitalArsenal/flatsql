@@ -12,6 +12,8 @@
 
 namespace pst {
 
+uint32_t gReaderFencePage = 0;
+
 namespace {
 ReaderConfig baseConfig(Io* io, const std::string& root, LaneClass cls, uint32_t lanes, uint64_t arenaBytes,
                         uint32_t ringBytes) {
@@ -22,6 +24,7 @@ ReaderConfig baseConfig(Io* io, const std::string& root, LaneClass cls, uint32_t
     c.lanes = lanes;
     c.arenaBytes = arenaBytes;
     c.ringBytes = ringBytes;
+    if (gReaderFencePage) c.fencePageEntries = gReaderFencePage;
     return c;
 }
 }  // namespace

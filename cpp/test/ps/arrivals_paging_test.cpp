@@ -174,7 +174,8 @@ PS_TEST(arrivals_paging_while_writers_produce_T2_6) {
     s.close();
 }
 
-PS_TEST(offset_paging_matches_reference_with_deaths) {
+namespace {
+void offsetPagingWithDeaths() {
     Store s(false, 2, true);
     REQUIRE(s.open() == 0);
     std::vector<uint32_t> pids;
@@ -207,6 +208,17 @@ PS_TEST(offset_paging_matches_reference_with_deaths) {
         CHECK(pg.outcome.rowsExamined <= 200);
     }
     s.close();
+}
+}  // namespace
+
+PS_TEST(offset_paging_matches_reference_with_deaths) { offsetPagingWithDeaths(); }
+
+// The same with two fences per page: GONE counts from L1 fences cross fence
+// pages (FenceView).
+PS_TEST(offset_paging_matches_reference_small_fence_pages) {
+    gReaderFencePage = 2;
+    offsetPagingWithDeaths();
+    gReaderFencePage = 0;
 }
 
 namespace {

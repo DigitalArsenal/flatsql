@@ -32,6 +32,10 @@ struct Rows {
     const std::string& s(size_t r, size_t c) const { return rows[r][c].s; }
 };
 
+// Fences per page for readers the fixtures build (0: the default); tests
+// set a small one so that lookups and scans cross fence pages.
+extern uint32_t gReaderFencePage;
+
 struct Reader {
     std::unique_ptr<ReaderInstance> inst;
     explicit Reader(Store& s, LaneClass cls = LaneClass::Bulk, uint32_t lanes = 2, uint64_t arenaBytes = 0,

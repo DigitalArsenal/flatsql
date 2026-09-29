@@ -302,11 +302,16 @@ struct CatalogCopy {
 // for one hash lookup and only ever TRIED: a busy shard is a miss, so a lane
 // never waits on another lane (and never on a writer, which never touches
 // it). Attempts that found the shard busy are reported as "reader_cache"
-// contention.
+// contention. Bounded by bytes: an object larger than a shard's share of
+// the budget is never cached (its reader keeps it for the statement).
 class ReaderCache {
 public:
     explicit ReaderCache(uint64_t bytes, uint32_t shards = 64);
-    std::shared_ptr<const void> get(const FileKey& key);
+    // Shards for a budget: one per MiB, 1 to 64 (a shard holds the largest
+    // index sections an L0 block has).
+    static uint32_t shardsFor(uint64_t bytes);
+    // *bytes (when given): what the entry was charged.
+    std::shared_ptr<const void> get(const FileKey& key, uint64_t* bytes = nullptr);
     void put(const FileKey& key, std::shared_ptr<const void> obj, uint64_t bytes);
     uint64_t used() const;
     uint64_t capacity() const { return cap_; }
@@ -376,19 +381,46 @@ private:
 };
 
 // ---- L1 runs, read lazily ------------------------------------------------------------------
+class LaneStore;
+
+// One kind's fences of an L1 run (one per 4 KiB block), read a page at a
+// time through the instance's shared cache: a lookup holds one page however
+// large the run is (a run's fences are about 1% of it).
+class FenceView {
+public:
+    static constexpr uint32_t kDefaultPage = 128;  // fences per page (5 KiB)
+    FenceView() = default;
+    FenceView(LaneStore* st, const FileKey& run, uint16_t kind, uint64_t fenceOff, uint32_t n);
+    uint32_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+    // The fence of block i < size(); nullptr with *rc set when its page
+    // cannot be read.
+    const L1Fence* at(uint32_t i, int32_t* rc);
+
+private:
+    LaneStore* st_ = nullptr;
+    FileKey run_;
+    uint16_t kind_ = 0;
+    uint64_t off_ = 0;
+    uint32_t n_ = 0;
+    uint32_t page_n_ = kDefaultPage;
+    uint32_t pageNo_ = UINT32_MAX;
+    std::shared_ptr<const std::vector<L1Fence>> page_;
+};
+
 // A reader's view of one L1 run (x-*.fsx): the footer and TOC at open, the
 // whole metadata region CRC-checked once per lane, then each kind's fences
-// on first use and its bloom only while it fits the lane's budget (a lookup
-// without a resident bloom searches the fences and reads one block).
-class LaneStore;
+// a page at a time and its bloom only while it fits the lane's budget (a
+// lookup without a resident bloom searches the fences and reads one block).
+// A resident run is charged its TOC and its blooms.
 class LazyRun {
 public:
     int32_t open(LaneStore* st, const FileKey& key, uint64_t fileLen, bool verified);
     bool hasKind(uint16_t kind) const { return find(kind) != nullptr; }
     uint8_t kindVlen(uint16_t kind) const;
     uint64_t kindEntries(uint16_t kind) const;
-    // Fences of a kind (loaded on first use); nullptr when the kind is absent.
-    const std::vector<L1Fence>* fences(LaneStore* st, uint16_t kind, int32_t* rc);
+    // Fences of a kind; false when the kind is absent.
+    bool fences(LaneStore* st, uint16_t kind, FenceView* out);
     // Every entry whose key == key: visit(val) -> continue? Sets *stop when
     // the visitor stopped.
     int32_t lookup(LaneStore* st, uint16_t kind, const uint8_t* key, size_t klen, uint64_t hash,
@@ -397,11 +429,12 @@ public:
     const FileKey& key() const { return key_; }
 
 private:
-    // Fences and blooms are immutable: they live in the instance's shared
-    // cache (one copy for every lane); the run holds pointers while in use.
+    friend class LaneStore;
+    // Fence pages and blooms are immutable: they live in the instance's
+    // shared cache (one copy for every lane); the run holds its blooms while
+    // resident, charged to the lane's run budget.
     struct Kind {
         L1TocEntry toc{};
-        std::shared_ptr<const std::vector<L1Fence>> fences;
         uint8_t bloomState = 0;  // 0 not tried, 1 resident, 2 not resident (budget)
         std::shared_ptr<const std::vector<uint8_t>> bloom;
     };
@@ -413,19 +446,35 @@ private:
 };
 
 // ---- the lane's store view -------------------------------------------------------------
+// A lane's index state is bounded by bytes, never by the store's size:
+// its private cache (cacheBytes), its resident runs (cacheBytes, blooms
+// included) and its front of the shared cache (frontBytes); what is evicted
+// is read again from the files.
 struct LaneStoreConfig {
     std::string root;
     Io* io = nullptr;
     uint32_t maxHandles = 512;
-    uint64_t cacheBytes = 16ull << 20;   // private: manifests, run views
-    ReaderCache* shared = nullptr;       // L0 directories and sections (instance-wide); null: private
-    uint32_t frontEntries = 65536;       // lane-private front of the shared cache
+    uint64_t cacheBytes = 16ull << 20;   // private: manifests, arrivals fences, presence dirs; runs
+    ReaderCache* shared = nullptr;       // L0 directories and sections, fence pages, blooms; null: private
+    uint64_t frontBytes = 4ull << 20;    // lane-private front of the shared cache (LRU by bytes)
+    uint32_t frontEntries = 65536;       // and by entries
+    uint32_t verifiedRuns = 1024;        // evicted runs whose metadata CRC this lane remembers checking
+    uint32_t fencePage = FenceView::kDefaultPage;  // fences per page (tests: small, to cross pages)
     bool verifyFrameCrc = true;          // check RecRow.dataCrc on every payload read
+};
+
+// What a lane's store holds (tests, stats).
+struct LaneStoreUsage {
+    uint64_t cacheBytes = 0;   // private cache
+    uint64_t runBytes = 0;     // resident runs
+    uint64_t frontBytes = 0;   // front of the shared cache
+    size_t cacheEntries = 0, runs = 0, frontEntries = 0, verifiedRuns = 0;
 };
 
 class LaneStore {
 public:
     friend class LazyRun;
+    friend class FenceView;
     explicit LaneStore(const LaneStoreConfig& cfg);
     ~LaneStore();
 
@@ -511,6 +560,7 @@ public:
     const LaneStoreConfig& config() const { return cfg_; }
     uint64_t sharedBudget() const { return cfg_.shared ? cfg_.shared->capacity() : cfg_.cacheBytes; }
     uint64_t cacheBytes() const { return cacheUsed_; }
+    LaneStoreUsage usage() const;
     // Cooperative polling from long loops (every 4 K steps).
     int32_t poll() const { return guard_ ? guard_->poll() : 0; }
 
@@ -529,10 +579,13 @@ public:
     std::shared_ptr<LazyRun> run(uint32_t pid, uint32_t seg, uint32_t gen, uint64_t fileLen, FileKey* key,
                                  int32_t* rc);
     std::shared_ptr<LazyRun> typeRun(const uint8_t fid[4], uint32_t gen, uint64_t fileLen, FileKey* key, int32_t* rc);
-    // Run accelerator budget (fences and blooms of resident runs).
+    // Run accelerator budget (TOCs and blooms of resident runs).
     bool reserveRunBytes(uint64_t bytes);  // may evict other runs; false: over budget
-    void addRunBytes(int64_t delta) { runUsed_ = uint64_t(int64_t(runUsed_) + delta); }
+    // A run took `bytes` more (a bloom): charged while the run is resident.
+    void chargeRun(LazyRun* run, uint64_t bytes);
     int32_t readBlock(const FileKey& key, uint64_t off, uint8_t* dst);  // one 4 KiB L1 block
+    // Fences [first, first + n) of a run's kind (a FenceView page).
+    int32_t readFences(const FileKey& run, uint64_t off, uint32_t n, std::vector<L1Fence>* out);
 
 private:
     int32_t readHead(const FileKey& key, uint16_t kind, std::vector<uint8_t>* slot, bool* missing);
@@ -578,10 +631,24 @@ private:
     std::unordered_map<FileKey, RunEntry, FileKeyHash> runs_;
     std::list<FileKey> runLru_;
     uint64_t runUsed_ = 0;
-    std::unordered_map<FileKey, bool, FileKeyHash> verifiedRuns_;
-    // Lane-private front of the shared cache (no lock on a hit); cleared
-    // whole when it reaches its entry cap.
-    std::unordered_map<FileKey, std::shared_ptr<const void>, FileKeyHash> front_;
+    // Runs evicted from runs_ whose metadata region this lane CRC-checked
+    // (a resident run is verified): the newest cfg_.verifiedRuns, oldest
+    // out first, so retired runs age out.
+    std::unordered_map<FileKey, std::list<FileKey>::iterator, FileKeyHash> verifiedRuns_;
+    std::list<FileKey> verifiedOrder_;  // front: most recently evicted
+    void noteVerified(const FileKey& key);
+    // Lane-private front of the shared cache (no lock on a hit), LRU by
+    // bytes: it keeps what this lane uses once the shared cache has evicted
+    // it, within frontBytes.
+    struct FrontEntry {
+        std::shared_ptr<const void> obj;
+        uint64_t bytes = 0;
+        std::list<FileKey>::iterator lru;
+    };
+    std::unordered_map<FileKey, FrontEntry, FileKeyHash> front_;
+    std::list<FileKey> frontLru_;
+    uint64_t frontUsed_ = 0;
+    void frontAdmit(const FileKey& key, std::shared_ptr<const void> obj, uint64_t bytes);
     // Type configs by (fid, fp).
     std::map<std::pair<uint32_t, uint64_t>, std::shared_ptr<TypeInfo>> typeInfos_;
     // Label maps of types with > 128 partitions: (fid) -> (commitSeq, labels).

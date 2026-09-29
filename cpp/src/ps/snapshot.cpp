@@ -389,11 +389,28 @@ struct L0Source : PostingScan::Source {
     }
 };
 
+// The first block b in [0, n) for which pred(fence b) is false, the fences
+// being partitioned (every true before every false).
+template <class Pred>
+int32_t fencePartition(FenceView& fv, Pred pred, uint32_t* out) {
+    uint32_t a = 0, b = fv.size();
+    while (a < b) {
+        const uint32_t mid = a + (b - a) / 2;
+        int32_t rc = 0;
+        const L1Fence* f = fv.at(mid, &rc);
+        if (!f) return rc;
+        if (pred(*f)) a = mid + 1;
+        else b = mid;
+    }
+    *out = a;
+    return 0;
+}
+
 // One kind of an L1 run: blocks read on demand (4 KiB each).
 struct L1Source : PostingScan::Source {
     std::shared_ptr<LazyRun> run;
     FileKey file;
-    const std::vector<L1Fence>* fences = nullptr;
+    FenceView fences;  // read a page at a time
     int64_t block = -1;
     int64_t idx = -1;
     bool desc = false;
@@ -407,19 +424,29 @@ struct L1Source : PostingScan::Source {
     size_t loN = 0, hiN = 0;
     bool hasLo = false, hasHi = false;
     int64_t pending = -1;  // lazy: the block materialize() reads first
+    L1Fence startFence{};  // lazy: its fence (key points into its prefix)
     std::unique_ptr<uint8_t[]> bufMem;  // one 4 KiB block, allocated on first read
     uint8_t* buf = nullptr;
     std::vector<uint16_t> ents;  // entry offsets within buf (in range)
 
+    // The fence of block b; nullptr with err set when unreadable.
+    const L1Fence* fenceAt(int64_t b) {
+        int32_t rc = 0;
+        const L1Fence* f = fences.at(uint32_t(b), &rc);
+        if (!f) err = rc;
+        return f;
+    }
     bool loadBlock(LaneStore* st, int64_t b) {
         ents.clear();
-        if (b < 0 || b >= int64_t(fences->size())) return false;
+        if (b < 0 || b >= int64_t(fences.size())) return false;
         block = b;
         if (!buf) {
             bufMem.reset(new uint8_t[kL1BlockBytes]);
             buf = bufMem.get();
         }
-        const int32_t rc = st->readBlock(file, (*fences)[size_t(b)].blockOff, buf);
+        const L1Fence* fe = fenceAt(b);
+        if (!fe) return false;
+        const int32_t rc = st->readBlock(file, fe->blockOff, buf);
         if (rc < 0) {
             err = rc;
             return false;
@@ -448,13 +475,7 @@ struct L1Source : PostingScan::Source {
               std::shared_ptr<const std::string> bnd, size_t loLen, bool hl, bool hh, bool d, bool allowLazy) {
         run = std::move(r);
         file = f;
-        int32_t frc = 0;
-        fences = run->fences(st, kind, &frc);
-        if (frc < 0) {
-            err = frc;
-            return false;
-        }
-        if (!fences || fences->empty()) return false;
+        if (!run->fences(st, kind, &fences) || fences.empty()) return false;
         v = run->kindVlen(kind);
         bounds = std::move(bnd);
         loP = reinterpret_cast<const uint8_t*>(bounds->data());
@@ -469,27 +490,25 @@ struct L1Source : PostingScan::Source {
             // Last block whose prefix is strictly below lo's prefix.
             start = 0;
             if (hasLo) {
-                size_t a = 0, b2 = fences->size();
-                while (a < b2) {
-                    const size_t mid = (a + b2) / 2;
-                    if (prefixCmp(loP, loN, (*fences)[mid]) > 0)
-                        a = mid + 1;
-                    else
-                        b2 = mid;
+                uint32_t a = 0;
+                const int32_t rc =
+                    fencePartition(fences, [&](const L1Fence& fe) { return prefixCmp(loP, loN, fe) > 0; }, &a);
+                if (rc < 0) {
+                    err = rc;
+                    return false;
                 }
                 start = a == 0 ? 0 : int64_t(a) - 1;
             }
         } else {
             // Last block whose prefix is <= hi's prefix.
-            start = int64_t(fences->size()) - 1;
+            start = int64_t(fences.size()) - 1;
             if (hasHi) {
-                size_t a = 0, b2 = fences->size();
-                while (a < b2) {
-                    const size_t mid = (a + b2) / 2;
-                    if (prefixCmp(hiP, hiN, (*fences)[mid]) >= 0)
-                        a = mid + 1;
-                    else
-                        b2 = mid;
+                uint32_t a = 0;
+                const int32_t rc =
+                    fencePartition(fences, [&](const L1Fence& fe) { return prefixCmp(hiP, hiN, fe) >= 0; }, &a);
+                if (rc < 0) {
+                    err = rc;
+                    return false;
                 }
                 start = int64_t(a) - 1;
                 if (start < 0) return false;
@@ -499,7 +518,10 @@ struct L1Source : PostingScan::Source {
         if (allowLazy && !desc) {
             // Ascending: every entry in range is >= lo and >= the first key
             // of block `start`, whose fence prefix is a prefix of it.
-            const L1Fence& fe = (*fences)[size_t(start)];
+            const L1Fence* fp = fenceAt(start);
+            if (!fp) return false;
+            startFence = *fp;
+            const L1Fence& fe = startFence;
             if (hasHi && prefixCmp(hiP, hiN, fe) < 0) return false;
             pending = start;
             lazy = true;
@@ -541,11 +563,13 @@ struct L1Source : PostingScan::Source {
             }
             if (done) return valid = false;
             const int64_t nb = block + (desc ? -1 : 1);
-            if (nb < 0 || nb >= int64_t(fences->size())) return valid = false;
+            if (nb < 0 || nb >= int64_t(fences.size())) return valid = false;
             // Past the range by the fence prefix alone?
-            if (!desc && hasHi &&
-                prefixCmp(hiP, hiN, (*fences)[size_t(nb)]) < 0)
-                return valid = false;
+            if (!desc && hasHi) {
+                const L1Fence* fe = fenceAt(nb);
+                if (!fe) return valid = false;
+                if (prefixCmp(hiP, hiN, *fe) < 0) return valid = false;
+            }
             if (!loadBlock(st, nb)) return valid = false;
             idx = desc ? int64_t(ents.size()) : -1;
         }
@@ -658,6 +682,9 @@ void LaneStore::endStatement() {
 }
 
 void LaneStore::cachePut(const FileKey& key, std::shared_ptr<const void> obj, uint64_t bytes) {
+    // Larger than the whole budget: its reader keeps it for the statement,
+    // the next one reads it again (the budget is a bound, never exceeded).
+    if (bytes > cfg_.cacheBytes) return;
     auto it = cache_.find(key);
     if (it != cache_.end()) return;
     while (cacheUsed_ + bytes > cfg_.cacheBytes && !cacheLru_.empty()) {
@@ -680,6 +707,18 @@ std::shared_ptr<const void> LaneStore::cacheGet(const FileKey& key) {
     if (it == cache_.end()) return nullptr;
     cacheLru_.splice(cacheLru_.begin(), cacheLru_, it->second.lru);
     return it->second.obj;
+}
+
+LaneStoreUsage LaneStore::usage() const {
+    LaneStoreUsage u;
+    u.cacheBytes = cacheUsed_;
+    u.runBytes = runUsed_;
+    u.frontBytes = frontUsed_;
+    u.cacheEntries = cache_.size();
+    u.runs = runs_.size();
+    u.frontEntries = front_.size();
+    u.verifiedRuns = verifiedRuns_.size();
+    return u;
 }
 
 int32_t LaneStore::open() {
@@ -918,7 +957,10 @@ int32_t LaneStore::loadManifest(uint32_t pid, uint32_t gen, std::shared_ptr<cons
         }
         m->segs.push_back(std::move(r));
     }
-    cachePut(key, m, buf.size() + 256);
+    // Charged its memory (about 200 bytes per segment), not its file size.
+    uint64_t mb = sizeof(Manifest) + m->segs.capacity() * sizeof(ManifestSegRef);
+    for (const auto& r : m->segs) mb += r.runs.capacity() * sizeof(SegRunRef) + (r.runs.empty() ? 0 : 32);
+    cachePut(key, m, mb);
     *out = m;
     return 0;
 }
@@ -1148,7 +1190,8 @@ int32_t LaneStore::loadType(const uint8_t fid[4], TypeSnap* out) {
                 v->runs.push_back(r);
             }
             if (!parseTypeArrivalsTable(man.data(), man.size(), body + 8, &v->arr)) return kRsCorrupt;
-            cachePut(mk, v, man.size() + 64);
+            cachePut(mk, v,
+                     sizeof(*v) + v->runs.capacity() * sizeof(SegRunRef) + v->arr.capacity() * sizeof(ArrOverride) + 64);
             runs = v;
         }
         out->runs = runs->runs;
@@ -1399,12 +1442,13 @@ int32_t LaneStore::readBlock(const FileKey& key, uint64_t off, uint8_t* dst) {
 std::shared_ptr<const void> LaneStore::sharedGet(const FileKey& key) {
     if (!cfg_.shared) return cacheGet(key);
     auto it = front_.find(key);
-    if (it != front_.end()) return it->second;
-    auto obj = cfg_.shared->get(key);
-    if (obj) {
-        if (front_.size() >= cfg_.frontEntries) front_.clear();
-        front_.emplace(key, obj);
+    if (it != front_.end()) {
+        frontLru_.splice(frontLru_.begin(), frontLru_, it->second.lru);
+        return it->second.obj;
     }
+    uint64_t bytes = 0;
+    auto obj = cfg_.shared->get(key, &bytes);
+    if (obj) frontAdmit(key, obj, bytes);
     return obj;
 }
 
@@ -1413,9 +1457,33 @@ void LaneStore::sharedPut(const FileKey& key, std::shared_ptr<const void> obj, u
         cachePut(key, std::move(obj), bytes);
         return;
     }
-    if (front_.size() >= cfg_.frontEntries) front_.clear();
-    front_[key] = obj;
+    frontAdmit(key, obj, bytes);
     cfg_.shared->put(key, std::move(obj), bytes);
+}
+
+// The front keeps, within frontBytes, what this lane used last: evicted
+// from the shared cache or not, least recently used first out.
+void LaneStore::frontAdmit(const FileKey& key, std::shared_ptr<const void> obj, uint64_t bytes) {
+    if (bytes > cfg_.frontBytes) return;
+    auto it = front_.find(key);
+    if (it != front_.end()) {
+        frontUsed_ -= it->second.bytes;
+        frontLru_.erase(it->second.lru);
+        front_.erase(it);
+    }
+    while (!frontLru_.empty() && (frontUsed_ + bytes > cfg_.frontBytes || front_.size() >= cfg_.frontEntries)) {
+        auto vit = front_.find(frontLru_.back());
+        frontUsed_ -= vit->second.bytes;
+        front_.erase(vit);
+        frontLru_.pop_back();
+    }
+    frontLru_.push_front(key);
+    FrontEntry e;
+    e.obj = std::move(obj);
+    e.bytes = bytes;
+    e.lru = frontLru_.begin();
+    front_.emplace(key, std::move(e));
+    frontUsed_ += bytes;
 }
 
 namespace {
@@ -1588,12 +1656,44 @@ std::shared_ptr<LazyRun> LaneStore::runGet(const FileKey& key, uint64_t fileLen,
     const bool verified = verifiedRuns_.count(key) != 0;
     *rc = r->open(this, key, fileLen, verified);
     if (*rc < 0) return nullptr;
-    verifiedRuns_[key] = true;
     reserveRunBytes(r->bytes());
     runLru_.push_front(key);
     runs_.emplace(key, RunEntry{r, runLru_.begin()});
     runUsed_ += r->bytes();
     return r;
+}
+
+void LaneStore::noteVerified(const FileKey& key) {
+    auto it = verifiedRuns_.find(key);
+    if (it != verifiedRuns_.end()) {
+        verifiedOrder_.splice(verifiedOrder_.begin(), verifiedOrder_, it->second);
+        return;
+    }
+    verifiedOrder_.push_front(key);
+    verifiedRuns_.emplace(key, verifiedOrder_.begin());
+    while (verifiedOrder_.size() > cfg_.verifiedRuns) {
+        verifiedRuns_.erase(verifiedOrder_.back());
+        verifiedOrder_.pop_back();
+    }
+}
+
+void LaneStore::chargeRun(LazyRun* run, uint64_t bytes) {
+    run->bytes_ += bytes;
+    auto it = runs_.find(run->key());
+    if (it == runs_.end() || it->second.run.get() != run) return;  // not resident (its user holds it)
+    runUsed_ += bytes;
+    reserveRunBytes(0);
+}
+
+int32_t LaneStore::readFences(const FileKey& run, uint64_t off, uint32_t n, std::vector<L1Fence>* out) {
+    FileRef f;
+    const int32_t rc = io_.get(run, &f);
+    if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsSnapshotGone : rc;
+    out->resize(n);
+    const size_t bytes = size_t(n) * sizeof(L1Fence);
+    if (bytes && io_.read(f, out->data(), bytes, off) != int64_t(bytes)) return FLATSQL_IO_ERR_IO;
+    if (stats_) stats_->fenceReads++;
+    return 0;
 }
 
 bool LaneStore::reserveRunBytes(uint64_t bytes) {
@@ -1604,6 +1704,7 @@ bool LaneStore::reserveRunBytes(uint64_t bytes) {
         const uint64_t b = vit->second.run->bytes();
         runUsed_ = runUsed_ >= b ? runUsed_ - b : 0;
         runs_.erase(vit);
+        noteVerified(runLru_.back());  // reopened soon: no second CRC pass
         runLru_.pop_back();
     }
     return runUsed_ + bytes <= budget;
@@ -1680,35 +1781,42 @@ int32_t LazyRun::open(LaneStore* st, const FileKey& key, uint64_t fileLen, bool 
     return 0;
 }
 
-const std::vector<L1Fence>* LazyRun::fences(LaneStore* st, uint16_t kind, int32_t* rc) {
-    *rc = 0;
-    Kind* k = find(kind);
-    if (!k) return nullptr;
-    if (!k->fences) {
-        FileKey fk = key_;
-        fk.letter = key_.letter == 'x' ? 'F' : 'f';
-        fk.extra = kind;
-        if (auto c = st->sharedGet(fk)) {
-            k->fences = std::static_pointer_cast<const std::vector<L1Fence>>(c);
+bool LazyRun::fences(LaneStore* st, uint16_t kind, FenceView* out) {
+    const Kind* k = find(kind);
+    if (!k) return false;
+    *out = FenceView(st, key_, kind, k->toc.fenceOff, k->toc.nBlocks);
+    return true;
+}
+
+FenceView::FenceView(LaneStore* st, const FileKey& run, uint16_t kind, uint64_t fenceOff, uint32_t n)
+    : st_(st), run_(run), kind_(kind), off_(fenceOff), n_(n),
+      page_n_(std::max<uint32_t>(1, st->config().fencePage)) {}
+
+const L1Fence* FenceView::at(uint32_t i, int32_t* rc) {
+    const uint32_t pageNo = i / page_n_;
+    if (pageNo != pageNo_ || !page_) {
+        // Page key: the run's key, letter F, extra = kind | page << 16.
+        FileKey pk = run_;
+        pk.letter = 'F';
+        pk.extra = uint64_t(kind_) | (uint64_t(pageNo) << 16);
+        if (auto c = st_->sharedGet(pk)) {
+            page_ = std::static_pointer_cast<const std::vector<L1Fence>>(c);
         } else {
-            FileRef f;
-            *rc = st->io().get(key_, &f);
+            auto v = std::make_shared<std::vector<L1Fence>>();
+            const uint32_t first = pageNo * page_n_;
+            const uint32_t n = std::min(page_n_, n_ - first);
+            *rc = st_->readFences(run_, off_ + uint64_t(first) * sizeof(L1Fence), n, v.get());
             if (*rc < 0) {
-                if (*rc == FLATSQL_IO_ERR_NOENT) *rc = kRsSnapshotGone;
+                page_.reset();
+                pageNo_ = UINT32_MAX;
                 return nullptr;
             }
-            auto v = std::make_shared<std::vector<L1Fence>>(k->toc.nBlocks);
-            const size_t bytes = size_t(k->toc.nBlocks) * sizeof(L1Fence);
-            if (bytes && st->io().read(f, v->data(), bytes, k->toc.fenceOff) != int64_t(bytes)) {
-                *rc = FLATSQL_IO_ERR_IO;
-                return nullptr;
-            }
-            if (st->stats()) st->stats()->fenceReads++;
-            st->sharedPut(fk, v, bytes + 64);
-            k->fences = v;
+            st_->sharedPut(pk, v, uint64_t(n) * sizeof(L1Fence) + 64);
+            page_ = std::move(v);
         }
+        pageNo_ = pageNo;
     }
-    return k->fences.get();
+    return &(*page_)[i - pageNo * page_n_];
 }
 
 int32_t LazyRun::lookup(LaneStore* st, uint16_t kind, const uint8_t* key, size_t klen, uint64_t hash,
@@ -1735,23 +1843,21 @@ int32_t LazyRun::lookup(LaneStore* st, uint16_t kind, const uint8_t* key, size_t
             k->bloom = b;
             k->bloomState = 1;
         }
+        // The run holds its bloom while resident: charged to the lane's runs.
+        if (k->bloomState == 1) st->chargeRun(this, k->bloom->size() + 64);
     }
     if (k->bloomState == 1 && !bloomTestHash(k->bloom->data(), k->bloom->size(), hash)) return 0;
-    int32_t rc = 0;
-    const std::vector<L1Fence>* f = fences(st, kind, &rc);
-    if (rc < 0) return rc;
-    if (!f || f->empty()) return 0;
+    FenceView f(st, key_, kind, k->toc.fenceOff, k->toc.nBlocks);
     // Last block whose first-key prefix is strictly below the key's.
-    size_t a = 0, b = f->size();
-    while (a < b) {
-        const size_t mid = (a + b) / 2;
-        if (prefixCmp(key, klen, (*f)[mid]) > 0) a = mid + 1;
-        else b = mid;
-    }
+    uint32_t a = 0;
+    int32_t rc = fencePartition(f, [&](const L1Fence& fe) { return prefixCmp(key, klen, fe) > 0; }, &a);
+    if (rc < 0) return rc;
     uint8_t buf[kL1BlockBytes];
-    for (size_t blk = a == 0 ? 0 : a - 1; blk < f->size(); blk++) {
-        if (blk > 0 && prefixCmp(key, klen, (*f)[blk]) < 0) break;
-        rc = st->readBlock(key_, (*f)[blk].blockOff, buf);
+    for (uint32_t blk = a == 0 ? 0 : a - 1; blk < f.size(); blk++) {
+        const L1Fence* fe = f.at(blk, &rc);
+        if (!fe) return rc;
+        if (blk > 0 && prefixCmp(key, klen, *fe) < 0) break;
+        rc = st->readBlock(key_, fe->blockOff, buf);
         if (rc < 0) return rc;
         EntryIter it = l1BlockIter(buf, k->toc.vlen);
         const uint8_t *ek, *ev;
@@ -2184,25 +2290,26 @@ int32_t LaneStore::goneCount(const TypeSnap& t, uint64_t lo, uint64_t hi, uint64
         int32_t rc = 0;
         auto run = typeRun(t.fid, rr.gen, rr.fileLen, &fk, &rc);
         if (!run) return rc;
-        const std::vector<L1Fence>* f = run->fences(this, kIxTypeGone, &rc);
-        if (rc < 0) return rc;
-        if (!f || f->empty()) continue;
-        const size_t nb = f->size();
+        FenceView f;
+        if (!run->fences(this, kIxTypeGone, &f) || f.empty()) continue;
         // Block b holds keys in [prefix(b), prefix(b+1)); GONE keys are 8
         // bytes, so a fence prefix is the block's exact first key.
-        auto blockFor = [&](const uint8_t* key) -> size_t {  // last block with first key <= key
-            size_t a = 0, b = nb;
-            while (a < b) {
-                const size_t mid = (a + b) / 2;
-                if (prefixCmp(key, 8, (*f)[mid]) >= 0) a = mid + 1;
-                else b = mid;
-            }
-            return a == 0 ? 0 : a - 1;
+        auto blockFor = [&](const uint8_t* key, uint32_t* out) -> int32_t {  // last block with first key <= key
+            uint32_t a = 0;
+            const int32_t r2 = fencePartition(f, [&](const L1Fence& fe) { return prefixCmp(key, 8, fe) >= 0; }, &a);
+            if (r2 < 0) return r2;
+            *out = a == 0 ? 0 : a - 1;
+            return 0;
         };
-        const size_t ba = blockFor(klo);
-        const size_t bb = blockFor(khi);
-        auto countBlock = [&](size_t b) -> int32_t {
-            const int32_t r2 = readBlock(fk, (*f)[b].blockOff, buf);
+        uint32_t ba = 0, bb = 0;
+        rc = blockFor(klo, &ba);
+        if (rc >= 0) rc = blockFor(khi, &bb);
+        if (rc < 0) return rc;
+        auto countBlock = [&](uint32_t b) -> int32_t {
+            int32_t r2 = 0;
+            const L1Fence* fe = f.at(b, &r2);
+            if (!fe) return r2;
+            r2 = readBlock(fk, fe->blockOff, buf);
             if (r2 < 0) return r2;
             if (stats_) stats_->fenceReads++;
             EntryIter it = l1BlockIter(buf, 8);
@@ -2215,7 +2322,11 @@ int32_t LaneStore::goneCount(const TypeSnap& t, uint64_t lo, uint64_t hi, uint64
         rc = countBlock(ba);
         if (rc < 0) return rc;
         if (bb != ba) {
-            for (size_t b = ba + 1; b < bb; b++) *count += (*f)[b].n;
+            for (uint32_t b = ba + 1; b < bb; b++) {
+                const L1Fence* fe = f.at(b, &rc);
+                if (!fe) return rc;
+                *count += fe->n;
+            }
             rc = countBlock(bb);
             if (rc < 0) return rc;
         }
@@ -2287,6 +2398,10 @@ namespace ps {
 ReaderCache::ReaderCache(uint64_t bytes, uint32_t shards)
     : shards_(new Shard[shards ? shards : 1]), n_(shards ? shards : 1), cap_(bytes) {}
 
+uint32_t ReaderCache::shardsFor(uint64_t bytes) {
+    return uint32_t(std::max<uint64_t>(1, std::min<uint64_t>(64, bytes >> 20)));
+}
+
 ReaderCache::Shard& ReaderCache::shardOf(const FileKey& key) { return shards_[FileKeyHash()(key) % n_]; }
 
 // Lanes never wait on the shared cache: a shard another lane holds is a miss
@@ -2297,7 +2412,7 @@ bool ReaderCache::lock(Shard& s) {
     return got;
 }
 
-std::shared_ptr<const void> ReaderCache::get(const FileKey& key) {
+std::shared_ptr<const void> ReaderCache::get(const FileKey& key, uint64_t* bytes) {
     Shard& s = shardOf(key);
     if (!lock(s)) return nullptr;
     std::shared_ptr<const void> out;
@@ -2305,6 +2420,7 @@ std::shared_ptr<const void> ReaderCache::get(const FileKey& key) {
     if (it != s.map.end()) {
         s.lru.splice(s.lru.begin(), s.lru, it->second.lru);
         out = it->second.obj;
+        if (bytes) *bytes = it->second.bytes;
     }
     s.mu.unlock();
     return out;
@@ -2313,6 +2429,7 @@ std::shared_ptr<const void> ReaderCache::get(const FileKey& key) {
 void ReaderCache::put(const FileKey& key, std::shared_ptr<const void> obj, uint64_t bytes) {
     Shard& s = shardOf(key);
     const uint64_t cap = cap_ / n_;
+    if (bytes > cap) return;  // never over budget: its reader keeps it for the statement
     std::vector<std::shared_ptr<const void>> evicted;  // released outside the lock
     if (!lock(s)) return;
     if (!s.map.count(key)) {

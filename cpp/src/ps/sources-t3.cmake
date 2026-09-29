@@ -1,4 +1,5 @@
-# FlatSQL partition store T3 (compaction, reclamation, quota, hot split):
+# FlatSQL partition store T3 (compaction, reclamation, quota, hot split) and
+# later sources and tests:
 # sources registered on the targets cpp/CMakeLists.txt defines. Included from
 # the native section after flatsql_ps, flatsql_ps_test and flatsql_ps_bench;
 # paths are relative to cpp/ (include() evaluates in the including scope).
@@ -15,5 +16,6 @@ if(TARGET flatsql_ps_test)
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/orphan_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/quota_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/hot_split_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/reader_memory_test.cpp
     )
 endif()

@@ -71,6 +71,8 @@ ReaderLane::ReaderLane(ReaderInstance* inst, uint32_t id) : inst_(inst), id_(id)
     sc.io = cfg.io;
     sc.maxHandles = cfg.maxHandlesPerLane;
     sc.cacheBytes = cfg.laneCacheBytes;
+    sc.frontBytes = cfg.laneCacheBytes;
+    sc.fencePage = cfg.fencePageEntries;
     sc.shared = inst->cache_.get();
     sc.verifyFrameCrc = cfg.verifyFrameCrc;
     store_.reset(new LaneStore(sc));
@@ -776,7 +778,7 @@ int32_t ReaderInstance::open(const ReaderConfig& cfgIn, std::unique_ptr<ReaderIn
     for (uint64_t i = 0; i < qcap; i++) inst->q_[i].seq.store(i);
     inst->qMask_ = qcap - 1;
     inst->shared_.reset(new LaneShared[cfg.lanes]);
-    inst->cache_.reset(new ReaderCache(cfg.cacheBytes));
+    inst->cache_.reset(new ReaderCache(cfg.cacheBytes, ReaderCache::shardsFor(cfg.cacheBytes)));
     for (uint32_t i = 0; i < cfg.lanes; i++) {
         inst->lanes_.emplace_back(new ReaderLane(inst.get(), i));
         if (!inst->lanes_.back()->arena_.init(cfg.arenaBytes)) {
