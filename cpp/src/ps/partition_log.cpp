@@ -1793,7 +1793,12 @@ void tombRangeStep(Ctx& c) {
     if (!tr.started) {
         tr.started = true;
         tr.next = tr.end = 0;
-        if (tr.seg == p->dSeg) {
+        if (tr.endPseq > tr.firstPseq) {
+            // Rows keep their pseqs through compaction and coalescing: the
+            // range covers the rows it was given wherever they live now.
+            tr.next = tr.firstPseq;
+            tr.end = std::min<uint64_t>(tr.endPseq, p->pseqHi + 1);
+        } else if (tr.seg == p->dSeg) {
             tr.next = p->segFirstPseq;  // the active segment, as of now
             tr.end = p->pseqHi + 1;
         } else {

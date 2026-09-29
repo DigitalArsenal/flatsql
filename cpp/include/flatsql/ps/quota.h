@@ -33,6 +33,8 @@ struct SegSummary {
     uint32_t cgen = 0;        // a compaction's output (coalesced ones keep the first id)
     int64_t minArrival = INT64_MAX;
     int64_t maxArrival = INT64_MIN;
+    uint64_t firstPseq = 0;   // its rows [firstPseq, endPseq): pseqs survive
+    uint64_t endPseq = 0;     // compaction and coalescing, segment ids do not
     uint64_t bytes = 0;       // the segment's files on disk
     bool empty = false;       // compacted with nothing left
 };

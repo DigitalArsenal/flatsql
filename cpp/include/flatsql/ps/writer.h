@@ -398,6 +398,8 @@ struct TombRange {
     uint32_t seg = 0;
     int64_t beforeMs = 0;
     std::atomic<int32_t>* remaining = nullptr;
+    uint64_t firstPseq = 0;  // the rows to examine, [firstPseq, endPseq);
+    uint64_t endPseq = 0;    // none given: the segment's, resolved at start
     bool started = false;
     uint64_t next = 0;   // pseq cursor
     uint64_t end = 0;    // exclusive
@@ -704,7 +706,7 @@ enum CmdKind : uint32_t {
     kCmdKillCid = 4,          // a = pid, ptr = PendingKill*
     kCmdTypeDelete = 5,       // ptr = TypeOwner*, cid in data, remaining ticket
     kCmdStop = 6,
-    kCmdTombRange = 7,        // a = pid, b = seg, data[0..8) = epoch bound (ms), ticket
+    kCmdTombRange = 7,        // a = pid, b = seg, data[0..8) = epoch bound (ms), [8..24) = pseq range, ticket
     kCmdSwap = 8,             // a = pid, ptr = SwapResult* (a compaction request)
     kCmdHotSplit = 9,         // a = pid, b = 1 split / 0 unsplit (T3b, tests and hosts)
 };
@@ -995,7 +997,11 @@ public:
                       std::atomic<int32_t>* remaining);
     // Quota planner command (T3 issues it): TOMB_RANGE{seg, epoch < beforeMs}
     // on one partition. `remaining` (set to 1) reaches 0 when it is done.
-    int32_t tombRange(uint32_t pid, uint32_t seg, int64_t beforeMs, std::atomic<int32_t>* remaining);
+    // With endPseq > firstPseq it examines exactly those rows (the segment's
+    // pseqs when it was chosen, which no later compaction renumbers);
+    // otherwise segment `seg`'s rows as of the range's start.
+    int32_t tombRange(uint32_t pid, uint32_t seg, int64_t beforeMs, std::atomic<int32_t>* remaining,
+                      uint64_t firstPseq = 0, uint64_t endPseq = 0);
     // Compaction (T3, §11): compacts r->requestSeg..requestSegEnd, or the
     // engine's choice (the best candidate, else the oldest-generation fully
     // merged sealed segment). `r->remaining` reaches 0 once the SWAP is

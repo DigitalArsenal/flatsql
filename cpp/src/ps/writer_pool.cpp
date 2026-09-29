@@ -688,6 +688,8 @@ void Writer::processMailbox() {
                 TombRange tr;
                 tr.seg = uint32_t(c.b);
                 std::memcpy(&tr.beforeMs, c.data, 8);
+                std::memcpy(&tr.firstPseq, c.data + 8, 8);
+                std::memcpy(&tr.endPseq, c.data + 16, 8);
                 tr.remaining = c.ticket;
                 p->ranges.push_back(tr);
                 break;
@@ -1257,7 +1259,8 @@ int32_t Engine::rebalance(uint32_t pid, uint8_t to) {
     return 0;
 }
 
-int32_t Engine::tombRange(uint32_t pid, uint32_t seg, int64_t beforeMs, std::atomic<int32_t>* remaining) {
+int32_t Engine::tombRange(uint32_t pid, uint32_t seg, int64_t beforeMs, std::atomic<int32_t>* remaining,
+                          uint64_t firstPseq, uint64_t endPseq) {
     Partition* p = partition(pid);
     if (!p) return FLATSQL_IO_ERR_NOENT;
     if (remaining) remaining->store(1, std::memory_order_release);
@@ -1267,6 +1270,8 @@ int32_t Engine::tombRange(uint32_t pid, uint32_t seg, int64_t beforeMs, std::ato
     c.b = seg;
     c.ticket = remaining;
     std::memcpy(c.data, &beforeMs, 8);
+    std::memcpy(c.data + 8, &firstPseq, 8);
+    std::memcpy(c.data + 16, &endPseq, 8);
     Writer* w = writers_[p->ownerWriter.load() % writers_.size()].get();
     if (!w->mailbox().push(c)) return FLATSQL_IO_ERR_BUSY;
     w->ring();

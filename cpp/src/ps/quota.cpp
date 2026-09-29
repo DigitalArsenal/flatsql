@@ -66,6 +66,8 @@ void partitionPublishSummary(Partition* p) {
         x.cgen = s.cgen;
         x.minArrival = s.minArrival;
         x.maxArrival = s.maxArrival;
+        x.firstPseq = s.firstPseq;
+        x.endPseq = s.endPseq;
         x.bytes = segmentDiskBytes(p, s);
         x.empty = s.empty;
         v.push_back(x);
@@ -292,7 +294,10 @@ void quotaStep(Writer* w) {
         ev->seg = s.seg;
         ev->lastSeg = s.lastSeg;
         ev->bytes = s.bytes;
-        if (e->tombRange(s.pid, s.seg, INT64_MAX, &ev->ticket) != 0) continue;
+        // The range names the segment's rows by pseq: until the owner starts
+        // it, maintenance may coalesce the segment into an output named by
+        // an older one, and a range by segment id would then find nothing.
+        if (e->tombRange(s.pid, s.seg, INT64_MAX, &ev->ticket, s.firstPseq, s.endPseq) != 0) continue;
         q.tried.insert(std::make_tuple(s.pid, s.seg, s.cgen));
         freed += s.bytes;
         q.evicted++;

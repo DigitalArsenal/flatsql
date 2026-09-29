@@ -469,9 +469,11 @@ bool planOwns(const CompactPlan& c) {
     return ownerEpoch(w) == c.ownerEpoch && ownerState(w) == kOwnOwned;
 }
 
-SegmentInfo* findSegInfo(Partition* p, uint32_t seg) {
-    for (auto& s : p->segs)
-        if (s.seg == seg) return &s;
+// The segment holding original segment `seg`: itself, or the coalesced
+// output [s.seg, s.lastSeg] it went into.
+const SegmentInfo* findSegCovering(const Partition* p, uint32_t seg) {
+    for (const auto& s : p->segs)
+        if (s.seg <= seg && seg <= (s.lastSeg ? s.lastSeg : s.seg)) return &s;
     return nullptr;
 }
 
@@ -1358,8 +1360,15 @@ int32_t partitionCompactStep(Writer* w, Partition* p) {
                 if (req && req->requestSeg != UINT32_MAX) {
                     seg = req->requestSeg;
                     segEnd = req->requestSegEnd ? req->requestSegEnd : seg;
-                    const SegmentInfo* s = findSegInfo(p, seg);
-                    if (s && s->lastSeg > segEnd) segEnd = s->lastSeg;
+                    // Outputs are named by their first input: a requested
+                    // segment coalesced since lives in an output named lower.
+                    const SegmentInfo* s = findSegCovering(p, seg);
+                    if (s) {
+                        seg = s->seg;
+                        if (s->lastSeg > segEnd) segEnd = s->lastSeg;
+                    }
+                    const SegmentInfo* t = findSegCovering(p, segEnd);
+                    if (t && t->lastSeg > segEnd) segEnd = t->lastSeg;
                     have = s != nullptr;
                 } else {
                     have = !req && pickCandidate(e, p, &seg, &segEnd);

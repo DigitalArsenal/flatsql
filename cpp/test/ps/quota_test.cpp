@@ -225,6 +225,132 @@ PS_TEST(quota_arrival_order_heads_spared_T3_3) {
 }
 
 // ---------------------------------------------------------------------------
+PS_TEST(quota_tomb_range_follows_rows_coalesced_into_older_segment) {
+    // The eviction race behind T3 #3's intermittent holes: the planner chose
+    // segment B, and before B's TOMB_RANGE started, maintenance coalesced B
+    // into an output named by the older segment A. A range resolved by
+    // segment id then found no segment B and killed nothing, so B's records
+    // outlived newer evicted ones. The planner's range names B's rows by
+    // pseq, which coalescing keeps, and the eviction's compaction request for
+    // B compacts the output that holds it.
+    Store s(true, 1, true);
+    s.cfg.sealBytes = 64u << 10;
+    s.cfg.sealAgeMs = 50;
+    s.cfg.mergeL0Blocks = 4;
+    s.cfg.mergeMinL0Bytes = 0;
+    s.cfg.reclaimGraceMs = 1;
+    s.cfg.autoCompact = false;  // the only compactions are the ones requested here
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType()});
+    const uint32_t pid = s.partition("qren", ommType());
+    {
+        Producer prod(s.e.get(), pid);
+        uint64_t last = 0;
+        for (int i = 0; i < 1500; i++)
+            last = send(s.e.get(), prod,
+                        ommRecord(uint32_t(i + 1), "R-" + std::to_string(i), "2026-06-01T00:00:00Z", double(i), 200),
+                        buildRecordAttr("q", "prov", "src", "b1"), 1780000000000ll + i);
+        REQUIRE(prod.waitAcked(last, 60000000000ull) == 0);
+    }
+    REQUIRE(waitLabeledEngine(s.e.get(), {pid}, 60000000000ull));
+    // Every sealed segment merged (compactable), the store at rest.
+    for (const uint64_t t0 = monoNs(); monoNs() - t0 < 60000000000ull; sleepNs(5000000)) {
+        Inspector ins(s.fs.get(), s.root);
+        const PartView v = ins.partition(pid);
+        if (v.ok && v.head.mergedThrough + 1 >= v.head.segFirstPseq) break;
+    }
+    settle(s, {pid}, {&ommType()}, 60000000000ull);
+    // Segments A < B < C of the durable manifest: B's rows are [firstB, endB).
+    uint32_t segA = 0, segB = 0;
+    uint64_t firstA = 0, firstB = 0, endB = 0;
+    {
+        Inspector ins(s.fs.get(), s.root);
+        const PartView v = ins.partition(pid);
+        REQUIRE(v.ok);
+        REQUIRE(v.segFirst.size() >= 4);
+        auto it = v.segFirst.begin();
+        segA = it->first;
+        firstA = it->second;
+        ++it;
+        segB = it->first;
+        firstB = it->second;
+        ++it;
+        endB = it->second;
+        REQUIRE(endB <= v.head.segFirstPseq);  // B is sealed
+        REQUIRE(firstA < firstB && firstB < endB);
+    }
+    // Maintenance's move, made deterministic: A and B coalesce into one
+    // output named A.
+    {
+        SwapResult r;
+        r.requestSeg = segA;
+        r.requestSegEnd = segB;
+        REQUIRE(s.e->swapSegment(pid, &r) == 0);
+        for (const uint64_t t0 = monoNs(); r.remaining.load() != 0 && monoNs() - t0 < 60000000000ull;)
+            sleepNs(1000000);
+        REQUIRE(r.remaining.load() == 0);
+        CHECK_EQ(r.status, 0);
+        Inspector ins(s.fs.get(), s.root);
+        const PartView v = ins.partition(pid);
+        REQUIRE(v.ok);
+        CHECK(v.segFirst.count(segA) == 1 && v.segFirst.count(segB) == 0);
+    }
+    // The planner's range, from its summary taken before the coalescing.
+    std::atomic<int32_t> ticket{0};
+    REQUIRE(s.e->tombRange(pid, segB, INT64_MAX, &ticket, firstB, endB) == 0);
+    for (const uint64_t t0 = monoNs(); ticket.load() != 0 && monoNs() - t0 < 60000000000ull;) sleepNs(1000000);
+    REQUIRE(ticket.load() == 0);
+    auto deadIn = [&](const PartView& v, uint64_t a, uint64_t b, uint64_t* puts) {
+        const Recount rc = recount(v);
+        uint64_t dead = 0;
+        *puts = 0;
+        for (uint64_t ps = a; ps < b; ps++) {
+            const RecRow& r = v.rows[ps - 1];
+            if (r.kind == kRowPut) ++*puts;
+            if ((r.kind == kRowPut && rc.dead.count(ps)) || r.kind == kRowVoid) dead++;
+        }
+        return dead;
+    };
+    {
+        Inspector ins(s.fs.get(), s.root);
+        const PartView v = ins.partition(pid);
+        REQUIRE(v.ok);
+        uint64_t putsA = 0, putsB = 0, putsC = 0;
+        CHECK_EQ(deadIn(v, firstA, firstB, &putsA), uint64_t(0));
+        CHECK_EQ(deadIn(v, firstB, endB, &putsB), endB - firstB);  // every one of B's records
+        CHECK_EQ(putsB, endB - firstB);
+        CHECK_EQ(deadIn(v, endB, v.head.segFirstPseq, &putsC), uint64_t(0));
+        CHECK_EQ(putsA, firstB - firstA);
+    }
+    // The eviction's compaction request names B: it compacts the output
+    // holding B, and B's rows go while A's stay (once the tombstones are
+    // labeled: a compaction removes only rows whose killer is).
+    REQUIRE(waitLabeledEngine(s.e.get(), {pid}, 60000000000ull));
+    {
+        SwapResult r;
+        r.requestSeg = segB;
+        r.requestSegEnd = segB;
+        REQUIRE(s.e->swapSegment(pid, &r) == 0);
+        for (const uint64_t t0 = monoNs(); r.remaining.load() != 0 && monoNs() - t0 < 60000000000ull;)
+            sleepNs(1000000);
+        REQUIRE(r.remaining.load() == 0);
+        CHECK_EQ(r.status, 0);
+        CHECK_EQ(r.putsDropped, endB - firstB);
+        Inspector ins(s.fs.get(), s.root);
+        const PartView v = ins.partition(pid);
+        REQUIRE(v.ok);
+        uint64_t voids = 0, liveA = 0;
+        const Recount rc = recount(v);
+        for (uint64_t ps = firstB; ps < endB; ps++) voids += v.rows[ps - 1].kind == kRowVoid;
+        for (uint64_t ps = firstA; ps < firstB; ps++)
+            liveA += v.rows[ps - 1].kind == kRowPut && !rc.dead.count(ps);
+        CHECK_EQ(voids, endB - firstB);
+        CHECK_EQ(liveA, firstB - firstA);
+    }
+    s.close();
+}
+
+// ---------------------------------------------------------------------------
 PS_TEST(quota_disk_full_resumes_without_operator_T3_6) {
     Store s(true, 2, true);
     s.cfg.sealBytes = 64u << 10;
