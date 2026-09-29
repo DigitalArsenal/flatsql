@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -177,6 +178,21 @@ private:
     std::vector<Path> require_;
     std::vector<Alt> supersede_;
 };
+
+// Where the FlatBuffer starts in a frame [u32 size][record] of a type with
+// file identifier `fid` (PARTITION-STORE.md §38). A record is a bare
+// FlatBuffer (identifier at frame offset 8: the root at 4), or a buffer that
+// carries its own size prefix and is stored as is (FinishSizePrefixed:
+// dataset-publication PNMs, the local EPM): its u32 at frame offset 4 is
+// len - 8 and its identifier sits at 12, the root at 8. The stored bytes and
+// the CID (over the record) are the same either way.
+inline size_t frameRootOffset(const uint8_t* frame, size_t len, const uint8_t fid[4]) {
+    if (len >= 12 && std::memcmp(frame + 8, fid, 4) == 0) return 4;
+    if (len >= 16 && uint32_t(frame[4] | frame[5] << 8 | frame[6] << 16 | uint32_t(frame[7]) << 24) == len - 8 &&
+        std::memcmp(frame + 12, fid, 4) == 0)
+        return 8;
+    return 4;
+}
 
 // Sealed envelope check (A19): encfield "SDF1"/"SDFN" + version 1.
 bool sealedEnvelopeValid(const uint8_t* bytes, size_t len);

@@ -8,6 +8,8 @@
 #include <map>
 #include <set>
 
+#include <flatbuffers/reflection.h>
+
 #include "flatsql/ps/platform.h"
 #include "ps/reader_fixtures.h"
 
@@ -472,4 +474,136 @@ PS_TEST(query_gaps_type_tags_every_copy_and_gseq_pages_A2) {
     CHECK_EQ(r.status, 0);
     CHECK_EQ(r.i(0, 0), r.i(0, 1));
     w.s.close();
+}
+
+// §38: a record stored with its own size prefix (a FinishSizePrefixed buffer
+// kept as is: dataset-publication PNMs, the local EPM) is accepted, keyed and
+// projected like the same record without it; its stored bytes and CID are
+// the record's own.
+namespace {
+
+std::vector<uint8_t> readVector(const std::string& name) {
+    std::vector<uint8_t> out;
+    FILE* f = std::fopen((std::string(PS_VECTOR_DIR) + "/" + name).c_str(), "rb");
+    if (!f) return out;
+    uint8_t buf[65536];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.insert(out.end(), buf, buf + n);
+    std::fclose(f);
+    return out;
+}
+
+TestType typeFromBfbs(const std::vector<uint8_t>& bfbs, const char* name, const char* fid, const std::string& rules) {
+    TestType t;
+    t.name = name;
+    std::memcpy(t.fid, fid, 4);
+    t.bfbs = bfbs;
+    t.rules = rules;
+    t.config = TypeConfig::build(t.name, t.fid, t.bfbs, t.rules, t.maxFrame, t.ringCap,
+                                 TypeConfig::kVerifyBfbs | TypeConfig::kVerifyCid);
+    t.schema = reflection::GetSchema(t.bfbs.data());
+    return t;
+}
+
+// The record with its own size prefix, framed: [u32 n + 4][u32 n][FlatBuffer].
+std::vector<uint8_t> prefixedFrame(const std::vector<uint8_t>& frame) {
+    std::vector<uint8_t> out(4);
+    putU32(out.data(), uint32_t(frame.size()));
+    out.insert(out.end(), frame.begin(), frame.end());
+    return out;
+}
+
+}  // namespace
+
+PS_TEST(query_gaps_size_prefixed_records_accepted) {
+    const std::vector<uint8_t> pnmBfbs = readVector("PNM.bfbs");
+    REQUIRE(!pnmBfbs.empty());
+    TestType pnm = typeFromBfbs(pnmBfbs, "PNM.fbs", "$PNM", "col 1 str:FILE_ID\n");
+    // The local EPM (SDN registers it with no extraction rules).
+    TestType epm = makeTypeVariant(2, "$EPM", "EPM.fbs");
+    epm.rules.clear();
+    epm.config = TypeConfig::build(epm.name, epm.fid, epm.bfbs, "", epm.maxFrame, epm.ringCap,
+                                   TypeConfig::kVerifyBfbs | TypeConfig::kVerifyCid);
+    Store s(true, 1, true);
+    REQUIRE(s.open() == 0);
+    s.registerTypes({&ommType(), &catType(), &pnm, &epm});
+    struct Case {
+        TestType* t;
+        std::vector<uint8_t> frame;  // the bare record, framed
+        std::string col;             // an indexed column and its value
+        std::string strVal;
+        int64_t intVal = 0;
+    };
+    std::vector<Case> cases;
+    for (int placement = 0; placement < 2; placement++) {
+        const std::string tag = placement ? "P" : "B";
+        cases.push_back({&ommType(), ommRecord(uint32_t(70000 + placement), "2026-0" + tag, "2026-09-01T00:00:0" + std::to_string(placement) + "Z", 15.5),
+                         "NORAD_CAT_ID", "", 70000 + placement});
+        cases.push_back({&catType(), catRecord(uint32_t(71000 + placement), "CAT-" + tag, "uri://" + tag, "c" + tag, "SAT " + tag),
+                         "NORAD_CAT_ID", "", 71000 + placement});
+        cases.push_back({&pnm, buildRecord(pnm, {Field::str("FILE_ID", "file-" + tag), Field::str("FILE_NAME", "n-" + tag)}),
+                         "FILE_ID", "file-" + tag, 0});
+        cases.push_back({&epm, catRecord(uint32_t(72000 + placement), "EPM-" + tag, "uri://e" + tag, "e" + tag, "ENT " + tag),
+                         "", "", 0});
+        if (placement) {
+            // The EPM variant shares CAT's layout under "$EPM".
+            cases.back().frame = buildRecord(epm, {Field::u64("NORAD_CAT_ID", 72001), Field::str("OBJECT_ID", "EPM-P")});
+            for (size_t i = cases.size() - 4; i < cases.size(); i++) cases[i].frame = prefixedFrame(cases[i].frame);
+        } else {
+            cases.back().frame = buildRecord(epm, {Field::u64("NORAD_CAT_ID", 72000), Field::str("OBJECT_ID", "EPM-B")});
+        }
+    }
+    int64_t arrival = 1790000000000ll;
+    for (Case& c : cases) {
+        const uint32_t pid = s.partition("prod-" + c.t->name, *c.t);
+        Producer prod(s.e.get(), pid);
+        const uint64_t r = send(s.e.get(), prod, c.frame, buildRecordAttr("p", "prov", "src", "b1"), arrival++);
+        REQUIRE(r != 0);
+        CHECK_EQ(prod.waitAcked(r, 20000000000ull), 0);
+        CHECK_EQ(prod.rejectCode(r), 0);
+        if (prod.rejectCode(r) != 0) std::fprintf(stderr, "  %s rejected %d\n", c.t->name.c_str(), prod.rejectCode(r));
+    }
+    std::vector<uint32_t> pids;
+    for (TestType* t : {&ommType(), &catType(), &pnm, &epm}) pids.push_back(s.partition("prod-" + t->name, *t));
+    REQUIRE(waitLabeledEngine(s.e.get(), pids, 20000000000ull));
+    Reader bulk(s, LaneClass::Bulk, 1);
+    REQUIRE(bulk.inst);
+    for (const Case& c : cases) {
+        const std::string typ = c.t->name.substr(0, 3);
+        // Stored as sent: _data is the record (with its own prefix when it
+        // came with one), and the CID is the record's.
+        const std::string cid = cidTextOf(c.frame);
+        Rows r = bulk.q("SELECT _data, _cid FROM " + typ + " WHERE _cid = ?", {Param::text(cid)});
+        CHECK_EQ(r.status, 0);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.s(0, 0) == std::string(c.frame.begin() + 4, c.frame.end()));
+        CHECK(r.s(0, 1) == cid);
+        if (c.col.empty()) continue;
+        // Keys were extracted from the FlatBuffer after the record's prefix:
+        // the column index finds it and the column projects.
+        const Param key = c.strVal.empty() ? Param::i64(c.intVal) : Param::text(c.strVal);
+        r = bulk.q("SELECT _cid, " + c.col + " FROM " + typ + " WHERE " + c.col + " = ?", {key});
+        CHECK_EQ(r.status, 0);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.s(0, 0) == cid);
+        if (c.strVal.empty()) CHECK_EQ(r.i(0, 1), c.intVal);
+        else CHECK(r.s(0, 1) == c.strVal);
+    }
+    // The OMM epoch came from the payload in both placements.
+    Rows r = bulk.q("SELECT NORAD_CAT_ID, _epoch FROM OMM ORDER BY NORAD_CAT_ID");
+    CHECK_EQ(r.status, 0);
+    REQUIRE(r.rows.size() == 2);
+    CHECK_EQ(r.i(0, 1), int64_t(1788220800000ll));
+    CHECK_EQ(r.i(1, 1), int64_t(1788220801000ll));
+    // A record whose inner prefix does not match its length is still refused.
+    {
+        std::vector<uint8_t> bad = prefixedFrame(buildRecord(pnm, {Field::str("FILE_ID", "bad")}));
+        putU32(bad.data() + 4, getU32(bad.data() + 4) + 1);
+        Producer prod(s.e.get(), pids[2]);
+        const uint64_t rq = send(s.e.get(), prod, bad, buildRecordAttr("p", "prov", "src", "b1"), arrival++);
+        REQUIRE(rq != 0);
+        CHECK_EQ(prod.waitAcked(rq, 20000000000ull), 0);
+        CHECK_EQ(prod.rejectCode(rq), int32_t(kRejFid));
+    }
+    s.close();
 }

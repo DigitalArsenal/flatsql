@@ -1,5 +1,6 @@
 // FlatSQL partition store: L0 blocks, blooms, key helpers (see ps/index.h).
 #include <algorithm>
+#include <cstddef>
 
 #include "flatsql/ps/index.h"
 #include "flatsql/ps/platform.h"
@@ -316,9 +317,11 @@ bool parseL0Block(const uint8_t* block, size_t len, L0KindInfo* kinds, size_t ma
 }
 
 bool EntryIter::next(const uint8_t** key, uint16_t* klen, const uint8_t** val) {
-    if (p + 2 > end) return false;
+    // Distances, not p + n: a default iterator has p = end = nullptr, and an
+    // offset applied to null is undefined (UBSan).
+    if (end - p < 2) return false;
     const uint16_t kl = getU16(p);
-    if (p + 2 + kl + vlen > end) return false;
+    if (end - p < ptrdiff_t(2) + kl + vlen) return false;
     *klen = kl;
     *key = p + 2;
     *val = p + 2 + kl;

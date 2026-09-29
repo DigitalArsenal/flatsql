@@ -234,23 +234,26 @@ int32_t StmtShared::tagInstances(LaneStore* st, const PartSnap& s, uint64_t put,
             FileKey fk;
             auto run = st->run(s.pid, m.seg, rr.gen, rr.fileLen, &fk, &rc);
             if (!run) return rc;
-            const std::vector<L1Fence>* f = run->fences(st, kIxTagOf, &rc);
-            if (rc < 0) return rc;
-            if (!f || f->empty()) continue;
-            if (prefixCmp(key, 8, (*f)[0]) < 0 && std::memcmp((*f)[0].prefix, key, std::min<size_t>(8, (*f)[0].prefixLen)) != 0)
-                continue;  // every key of the run is past `put`
-            // Last block whose first key is below (put, 0).
-            size_t a = 0, b = f->size();
+            FenceView f;
+            if (!run->fences(st, kIxTagOf, &f) || f.empty()) continue;
+            // The block that can hold the first (put, *) key: the last one
+            // whose first-key prefix is below the key's (fence prefixes are
+            // 23 bytes, so equal 8-byte heads compare as below).
+            uint32_t a = 0, b = f.size();
             while (a < b) {
-                const size_t mid = (a + b) / 2;
-                if (prefixCmp(key, 8, (*f)[mid]) > 0) a = mid + 1;
+                const uint32_t mid = (a + b) / 2;
+                const L1Fence* fe = f.at(mid, &rc);
+                if (!fe) return rc;
+                if (prefixCmp(key, 8, *fe) > 0) a = mid + 1;
                 else b = mid;
             }
+            const uint32_t first = a == 0 ? 0 : a - 1;
             const uint8_t vlen = run->kindVlen(kIxTagOf);
-            for (size_t blk = a == 0 ? 0 : a - 1; blk < f->size(); blk++) {
-                if (blk > (a == 0 ? 0 : a - 1) &&
-                    std::memcmp((*f)[blk].prefix, key, std::min<size_t>(8, (*f)[blk].prefixLen)) != 0)
-                    break;
+            for (uint32_t blk = first; blk < f.size(); blk++) {
+                const L1Fence* fe = f.at(blk, &rc);
+                if (!fe) return rc;
+                // Past the key: a later block whose first key's head is above it.
+                if (blk > first && std::memcmp(fe->prefix, key, std::min<size_t>(8, fe->prefixLen)) > 0) break;
                 CachedBlock* cb = nullptr;
                 for (CachedBlock& c : blocks_)
                     if (c.key == fk) cb = &c;
@@ -262,7 +265,7 @@ int32_t StmtShared::tagInstances(LaneStore* st, const PartSnap& s, uint64_t put,
                 }
                 if (cb->block != int64_t(blk)) {
                     cb->data.resize(kL1BlockBytes);
-                    rc = st->readBlock(fk, (*f)[blk].blockOff, cb->data.data());
+                    rc = st->readBlock(fk, fe->blockOff, cb->data.data());
                     if (rc < 0) {
                         cb->block = -1;
                         return rc;
@@ -1559,7 +1562,7 @@ int schemaColumn(RecCursor* c, sqlite3_context* ctx, int i) {
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
-    const uint8_t* buf = c->frame.data() + 4;
+    const uint8_t* buf = c->frame.data() + frameRootOffset(c->frame.data(), c->frame.size(), c->vt->type->fid);
     const flatbuffers::Table* t = flatbuffers::GetRoot<flatbuffers::Table>(buf);
     const ColumnDef& col = c->vt->type->cols[size_t(i)];
     const uint16_t vo = col.voffset;
