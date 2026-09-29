@@ -115,6 +115,7 @@ struct Harness {
         // oracle). Merge retirements, A9 meta retirement and reclamation run.
         s.cfg.autoCompact = false;
         s.cfg.reclaimGraceMs = 5;
+        splitSome = (seed & 64) != 0;
     }
 
     TestType& type(int k) { return crashTypes(nTypes)[size_t(k)]; }
@@ -128,8 +129,14 @@ struct Harness {
         for (uint32_t i = 0; i < nParts / 2; i++) addPartition();
         ctlPid = s.partition("node-local", ctlType());
         durablePids[ctlPid] = "node_local";
+        // T3b: in half the stores the partitions are split (up to the 16
+        // helpers serve), so crashes land while helpers prepare their
+        // entries (§12, A26).
+        if (splitSome)
+            for (size_t i = 0; i < parts.size() && i < 16; i++) s.e->setHotSplit(parts[i].pid, true);
         return true;
     }
+    bool splitSome = false;
 
     void addPartition() {
         PState ps;
@@ -318,6 +325,7 @@ struct Harness {
             totals.dedupeHits += st.dedupeHits;
             totals.firstLabels += st.firstLabels;
             totals.promotions += st.promotions;
+            totals.prepUsed += st.prepUsed;
         }
         s.fs->freeze();
         if (s.e) s.e->abandon();
@@ -491,6 +499,8 @@ struct Harness {
             }
         }
         s.e->start();
+        if (splitSome)
+            for (size_t i = 0; i < parts.size() && i < 16; i++) s.e->setHotSplit(parts[i].pid, true);
         return gFailures == before;
     }
 
@@ -598,6 +608,7 @@ void runTrials(int trials, int types, uint32_t partitions, uint64_t seed0) {
         sum.dedupeHits += h.totals.dedupeHits;
         sum.firstLabels += h.totals.firstLabels;
         sum.promotions += h.totals.promotions;
+        sum.prepUsed += h.totals.prepUsed;
         h.s.close();
     }
     report("crash_trials", double(done), "trials");
@@ -610,6 +621,7 @@ void runTrials(int trials, int types, uint32_t partitions, uint64_t seed0) {
     report("crash_dedupe_hits", double(sum.dedupeHits), "entries");
     report("crash_first_labels", double(sum.firstLabels), "labels");
     report("crash_promotions", double(sum.promotions), "promotions");
+    report("crash_split_prepared_entries_used", double(sum.prepUsed), "entries");
     report("crash_adopted_tail_batches", double(adopted), "batches");
     report("crash_arrivals_segments_sealed", double(arrivalSeals), "segments");
     report("crash_tomb_range_commands", double(rangeTotal), "commands");

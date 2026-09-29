@@ -38,7 +38,7 @@ struct AttrView {
 };
 
 // Verifies and views a RecordAttr (flatsql_attr.fbs). len == 0: no attr.
-bool parseAttr(const uint8_t* attr, size_t len, AttrView* out);
+bool parseAttr(const uint8_t* attr, size_t len, AttrView* out, bool verify = true);
 // A2 tuple identity hash (provider, source, batch, content key, producer
 // peer, producer key); 0 is reserved for "no tag".
 uint64_t tagTupleHash(const TagView& t);
@@ -54,6 +54,7 @@ struct StageScratch {
     uint32_t capAttrs = 0;
     StagedEntry* entries = nullptr;
     StagedEntry** order = nullptr;
+    StagedEntry** order2 = nullptr;   // bucket scratch for the postings sort
     uint32_t capEntries = 0;
     uint8_t* keys = nullptr;
     uint32_t capKeys = 0;
@@ -244,6 +245,25 @@ int32_t partitionWarm(Writer* w, Partition* p);
 void partitionAccount(Partition* p);
 void partitionCool(Writer* w, Partition* p);
 bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Arena* batches);
+
+// ---- T3b stage 1 (stage1.cpp) and hot split (hot_split.cpp) ------------------
+// Owner: publishes the next window of a split partition's ring entries.
+void prepPublish(Writer* w, Partition* p);
+// Owner: takes the entry at `pos` (ordinal order, pos == takePos) and
+// returns its prepared result, or nullptr when the owner stages it itself.
+// The result stays valid until the next take or publish.
+const PrepResult* prepTake(Writer* w, Partition* p, uint64_t pos);
+// Owner: takes every ordinal whose entry ends at or before newPos.
+void prepTakeThrough(Writer* w, Partition* p, uint64_t newPos);
+// Owner: publishes its L1 run set when it changed (dedupe hints).
+void prepPublishRuns(Writer* w, Partition* p);
+// Stage 1 of one ring entry (pure; any writer). With `runs`, the result
+// carries a dedupe hint: the CID's postings in that run set.
+void prepCompute(Engine* e, Partition* p, StageScratch* sc, uint64_t pos, uint32_t entryLen, PrepResult* out,
+                 const PrepHelperView* runs, const PrepRunSet* set, IoCtx* io, uint8_t* lookupScratch);
+void prepUnpack(const PrepResult& r, Extracted* ex);
+// Owner maintenance: the split / merge-back triggers (§12).
+void hotSplitStep(Writer* w, Partition* p, uint64_t nowNs);
 int32_t partitionReadRow(Writer* w, Partition* p, uint64_t pseq, RecRow* out);
 int32_t partitionEnsureFiles(Writer* w, Partition* p);
 int32_t partitionWriteHead(Writer* w, Partition* p, bool durable);

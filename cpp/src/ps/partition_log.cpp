@@ -38,14 +38,18 @@ bool eqField(const uint8_t* a, size_t an, const uint8_t* b, size_t bn) {
 }
 }  // namespace
 
-bool parseAttr(const uint8_t* attr, size_t len, AttrView* out) {
+bool parseAttr(const uint8_t* attr, size_t len, AttrView* out, bool verify) {
     *out = AttrView();
     if (len == 0) {
         out->valid = true;
         return true;
     }
-    flatbuffers::Verifier v(attr, len, 16, 1024);
-    if (!fb::VerifyRecordAttrBuffer(v)) return false;
+    // verify = false only for bytes stage 1 verified (T3b: the same ring
+    // bytes, which a producer never changes after publishing them).
+    if (verify) {
+        flatbuffers::Verifier v(attr, len, 16, 1024);
+        if (!fb::VerifyRecordAttrBuffer(v)) return false;
+    }
     const fb::RecordAttr* ra = fb::GetRecordAttr(attr);
     const auto* tags = ra->tags();
     out->nTags = tags ? int(tags->size()) : 0;
@@ -126,6 +130,7 @@ bool StageScratch::init(const EngineConfig& cfg) {
     attrs = callocArray<uint8_t>(capAttrs);
     entries = callocArray<StagedEntry>(capEntries);
     order = callocArray<StagedEntry*>(capEntries);
+    order2 = callocArray<StagedEntry*>(capEntries);
     keys = callocArray<uint8_t>(capKeys);
     plain = callocArray<uint8_t>(capPlain);
     extract = callocArray<uint8_t>(capExtract);
@@ -145,7 +150,7 @@ bool StageScratch::init(const EngineConfig& cfg) {
     trows = callocArray<RecRow>(kTRowCap);
     if (!tcids || !tcidBuckets || !tcopies || !arrivals || !trows) return false;
     for (uint32_t i = 0; i < kCidBuckets; i++) tcidBuckets[i] = -1;
-    if (!rows || !attrs || !entries || !order || !keys || !plain || !extract || !section ||
+    if (!rows || !attrs || !entries || !order || !order2 || !keys || !plain || !extract || !section ||
         !cids || !cidBuckets || !deadKeys || !deadVals || !instPut || !instHash || !instPseq)
         return false;
     for (uint32_t i = 0; i < kCidBuckets; i++) cidBuckets[i] = -1;
@@ -157,6 +162,7 @@ void StageScratch::freeAll() {
     std::free(attrs);
     std::free(entries);
     std::free(order);
+    std::free(order2);
     std::free(keys);
     std::free(plain);
     std::free(extract);
@@ -322,15 +328,51 @@ int32_t scanL0Section(Ctx& c, const L0Accel& a, const L0Accel::Kind& k, F&& visi
 // Visits every committed posting value for (kind, key): unmerged L0 blocks
 // (bloom-gated) and L1 runs (bloom-gated). visit(val) -> continue?
 template <typename F>
-int32_t committedPostings(Ctx& c, uint16_t kind, const uint8_t* key, size_t klen, F&& visit) {
+int32_t committedPostings(Ctx& c, uint16_t kind, const uint8_t* key, size_t klen, F&& visit, bool runs = true,
+                          const uint64_t* bloomH = nullptr, uint64_t coveredThrough = 0) {
     Partition* p = c.p;
     bool stop = false;
-    const uint64_t h = bloomHash(key, klen);
+    const uint64_t h = bloomH ? *bloomH : bloomHash(key, klen);
     for (uint32_t i = 0; i < p->nL0 && !stop; i++) {
         const L0Accel& a = p->acc[i];
+        // T3b: blocks a stage-1 hint already searched (every row <= through).
+        if (coveredThrough && a.nRows && a.firstPseq + a.nRows - 1 <= coveredThrough) continue;
         const L0Accel::Kind* k = a.find(kind);
         if (!k || k->n == 0) continue;
         if (k->bloom && !bloomTestHash(k->bloom, k->bloomBytes, h)) continue;
+        if (k->entries) {
+            // In memory (T3b): binary search over fixed-size entries, else a scan.
+            const size_t es = 2 + klen + k->vlen;
+            const uint8_t* base = k->entries;
+            size_t lo = 0, hi = k->n;
+            if (uint64_t(k->n) * es == k->entriesBytes) {
+                while (lo < hi) {
+                    const size_t mid = (lo + hi) / 2;
+                    const uint8_t* e = base + mid * es;
+                    if (keyCmp(e + 2, getU16(e), key, klen) < 0) lo = mid + 1;
+                    else hi = mid;
+                }
+                for (size_t j = lo; j < k->n && !stop; j++) {
+                    const uint8_t* e = base + j * es;
+                    if (keyCmp(e + 2, getU16(e), key, klen) != 0) break;
+                    if (!visit(e + 2 + klen)) stop = true;
+                }
+            } else {
+                EntryIter it;
+                it.p = base;
+                it.end = base + k->entriesBytes;
+                it.vlen = k->vlen;
+                const uint8_t *ek, *ev;
+                uint16_t el;
+                while (!stop && it.next(&ek, &el, &ev)) {
+                    const int cmp = keyCmp(ek, el, key, klen);
+                    if (cmp < 0) continue;
+                    if (cmp > 0) break;
+                    if (!visit(ev)) stop = true;
+                }
+            }
+            continue;
+        }
         const int32_t rc = scanL0Section(c, a, *k, [&](const uint8_t* ek, uint16_t el, const uint8_t* ev) {
             const int cmp = keyCmp(ek, el, key, klen);
             if (cmp < 0) return true;
@@ -344,7 +386,7 @@ int32_t committedPostings(Ctx& c, uint16_t kind, const uint8_t* key, size_t klen
         if (rc < 0) return rc;
     }
     for (auto& si : p->segs) {
-        if (stop) break;
+        if (stop || !runs) break;
         for (auto& run : si.runs) {
             if (stop) break;
             if (!run.run || !run.run->mayContainHash(kind, h)) continue;
@@ -456,20 +498,30 @@ int32_t readAttrOf(Ctx& c, const RecRow& r, uint8_t* buf, size_t cap, uint32_t* 
 }
 
 // cid state (current live PUT) with the per-batch cache.
-StageScratch::Cid* cidState(Ctx& c, const uint8_t key[kCidKeyLen]) {
+StageScratch::Cid* cidState(Ctx& c, const uint8_t key[kCidKeyLen], const PrepResult* pr = nullptr) {
     StageScratch& sc = *c.sc;
-    const uint32_t b = uint32_t(hash64(key, kCidKeyLen) % StageScratch::kCidBuckets);
+    const uint32_t b = uint32_t((pr ? pr->cidHash : hash64(key, kCidKeyLen)) % StageScratch::kCidBuckets);
     for (int32_t i = sc.cidBuckets[b]; i >= 0; i = sc.cids[i].next)
         if (std::memcmp(sc.cids[i].key, key, kCidKeyLen) == 0) return &sc.cids[i];
     if (sc.nCids >= StageScratch::kCidCap) return nullptr;
-    // Committed: the highest live PUT pseq carrying this cid.
+    // Committed: the highest live PUT pseq carrying this cid. A stage-1 hint
+    // (T3b) holds the CID's postings in the L1 runs of the current run set;
+    // then only the unmerged L0 blocks are searched here.
     uint64_t best = 0;
     uint64_t cands[64];
     uint32_t nc = 0;
-    const int32_t rc = committedPostings(c, kIxCid, key, kCidKeyLen, [&](const uint8_t* v) {
-        if (nc < 64) cands[nc++] = getBE64(v);
-        return true;
-    });
+    const bool hinted = pr && pr->hintOk && c.p->prep && pr->hintVersion == c.p->prep->runVersion;
+    if (hinted) {
+        for (uint32_t i = 0; i < pr->hintN; i++) cands[nc++] = pr->hint[i];
+        c.p->prep->hinted.fetch_add(1, std::memory_order_relaxed);
+    }
+    const int32_t rc = committedPostings(
+        c, kIxCid, key, kCidKeyLen,
+        [&](const uint8_t* v) {
+            if (nc < 64) cands[nc++] = getBE64(v);
+            return true;
+        },
+        !hinted, pr ? &pr->cidBloom : nullptr, hinted ? pr->hintThrough : 0);
     if (rc < 0) {
         c.err = rc;
         return nullptr;
@@ -578,9 +630,9 @@ int32_t forEachLiveInstance(Ctx& c, uint64_t put, F&& visit) {
 
 // Lane index for a tag (interning a new tuple: the only allocation a new
 // tuple costs, once per tuple).
-int32_t laneFor(Ctx& c, const TagView& t, uint32_t* laneIndex) {
+int32_t laneFor(Ctx& c, const TagView& t, uint32_t* laneIndex, const uint64_t* hash = nullptr) {
     Partition* p = c.p;
-    const uint64_t h = laneHash(t);
+    const uint64_t h = hash ? *hash : laneHash(t);
     auto range = p->laneByHash.equal_range(h);
     for (auto it = range.first; it != range.second; ++it) {
         const Lane& l = p->lanes[it->second];
@@ -966,21 +1018,39 @@ StepResult stageRecord(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* reje
         st.sealAfter = true;
         return kStop;
     }
-    // Plaintext frame (contiguous for verification).
-    const uint8_t* plain = ringContiguous(p->ring, c.e->pool(), framePos, h.frameLen);
-    if (!plain) {
-        ringRead(p->ring, c.e->pool(), framePos, sc.plain, h.frameLen);
-        plain = sc.plain;
+    // T3b (§12): a split partition's entry may come prepared by a helper
+    // (checks, CID, CRC, extraction); the owner keeps what needs its state.
+    const PrepResult* pr = nullptr;
+    if (p->prep && p->prep->on) pr = prepTake(c.w, p, pos);
+    const uint8_t* plain = nullptr;
+    auto loadPlain = [&]() {
+        plain = ringContiguous(p->ring, c.e->pool(), framePos, h.frameLen);
+        if (!plain) {
+            ringRead(p->ring, c.e->pool(), framePos, sc.plain, h.frameLen);
+            plain = sc.plain;
+        }
+    };
+    uint8_t cid[kCidLen];
+    uint8_t flags = 0;
+    if (pr) {
+        if (pr->reject) {
+            *rejectCode = pr->reject;
+            return kRejected;
+        }
+        std::memcpy(cid, pr->cid, kCidLen);
+        flags = pr->rowFlags;
     }
-    int32_t rc = cfg->checkFrame(plain, h.frameLen);
+    // Plaintext frame (contiguous for verification).
+    if (!pr) loadPlain();
+    int32_t rc = pr ? 0 : cfg->checkFrame(plain, h.frameLen);
     if (rc) {
         *rejectCode = rc;
         return kRejected;
     }
     // CID over the plaintext (router computed it before sealing, §6.1).
-    uint8_t cid[kCidLen];
-    uint8_t flags = 0;
-    if (h.flags & kEntCidPresent) {
+    if (pr) {
+        // prepared
+    } else if (h.flags & kEntCidPresent) {
         std::memcpy(cid, h.cid, kCidLen);
         if (cfg->flags() & TypeConfig::kVerifyCid) {
             uint8_t check[kCidLen];
@@ -1012,15 +1082,16 @@ StepResult stageRecord(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* reje
         }
     }
     AttrView av;
-    if (!parseAttr(attr, h.attrLen, &av)) {
+    if (!parseAttr(attr, h.attrLen, &av, pr == nullptr)) {
         *rejectCode = kRejAttr;
         return kRejected;
     }
     const TagView& tag = av.tag;
-    const uint64_t tagHash = tagTupleHash(tag);
+    const uint64_t tagHash = pr ? pr->tagHash : tagTupleHash(tag);
     uint8_t cidKey[kCidKeyLen];
-    cidSortKey(cid, cidKey);
-    StageScratch::Cid* cs = cidState(c, cidKey);
+    if (pr) std::memcpy(cidKey, pr->cidKey, kCidKeyLen);
+    else cidSortKey(cid, cidKey);
+    StageScratch::Cid* cs = cidState(c, cidKey, pr);
     if (!cs) return c.err ? kStop : kStop;
     const int64_t now = h.arrivalMs;
 
@@ -1073,9 +1144,14 @@ StepResult stageRecord(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* reje
         return kConsumed;
     }
 
-    // New PUT. Extract keys from the plaintext.
+    // New PUT. Extract keys from the plaintext (or the prepared extraction).
     Extracted ex;
-    cfg->extract(plain, h.frameLen, &ex, sc.extract, sc.capExtract);
+    if (pr && pr->exOk) {
+        prepUnpack(*pr, &ex);
+    } else {
+        if (!plain) loadPlain();
+        cfg->extract(plain, h.frameLen, &ex, sc.extract, sc.capExtract);
+    }
     // Supersede (§4.6, record_supersede.go).
     uint8_t stored[kMaxKeyLen + 64];
     size_t storedLen2 = 0;
@@ -1162,7 +1238,7 @@ StepResult stageRecord(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* reje
     uint32_t laneIdx = 0;
     uint32_t laneId = 0;
     if (tag.present) {
-        if (laneFor(c, tag, &laneIdx)) return kStop;
+        if (laneFor(c, tag, &laneIdx, pr ? &pr->laneHash : nullptr)) return kStop;
         laneId = p->lanes[laneIdx].id;
     }
     // Frame into the frames arena (the stored bytes: plaintext or sealed).
@@ -1176,8 +1252,10 @@ StepResult stageRecord(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* reje
             *rejectCode = kRejSealed;
             return kRejected;
         }
-    } else {
+    } else if (plain) {
         std::memcpy(fdst, plain, h.frameLen);
+    } else {
+        ringRead(p->ring, c.e->pool(), framePos, fdst, h.frameLen);
     }
     if (!st.frames) st.frames = fdst;
     const uint32_t frameOff = uint32_t(st.dOff + st.dBytes);
@@ -1201,7 +1279,7 @@ StepResult stageRecord(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* reje
                        (h.attrLen ? (kRowHasAttr | kRowAttrInM) : 0) |
                        (nKilled ? kRowSupersedes : 0) | (av.migratedGseq ? kRowMigratedGseq : 0));
     r->cidLen = kCidLen;
-    r->dataCrc = crc32c(fdst, storedLen);
+    r->dataCrc = pr ? pr->dataCrc : crc32c(fdst, storedLen);
     r->epochMs = ex.hasEpoch ? ex.epochMs : h.arrivalMs;
     r->arrivalMs = h.arrivalMs;
     r->targetPseq = nKilled ? killed[0] : 0;
@@ -1617,7 +1695,7 @@ static bool finalizeBatch(Ctx& c, Arena* batches) {
         }
     }
     for (uint32_t i = 0; i < sc.nEntries; i++) sc.order[i] = &sc.entries[i];
-    sortStaged(sc.order, sc.nEntries);
+    sortStagedBuckets(sc.order, sc.nEntries, sc.order2);
     const size_t l0Len = sc.nRows ? l0BlockSize(sc.order, sc.nEntries) : 0;
     const size_t rowsLen = size_t(sc.nRows) * sizeof(RecRow);
     const size_t attrLen = pad8(sc.attrBytes);
@@ -1884,6 +1962,15 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
     const EngineConfig& cfg = e->config();
     uint64_t pos = st->endPos;
     const uint64_t tail = p->ring->tail.load(std::memory_order_acquire);
+    // T3b: a split partition publishes its next window for the helpers.
+    const bool prepOn = p->prep && p->prep->on;
+    // A split partition commits bigger batches: its L0 directory (48 blocks)
+    // then spans more rows, so merges keep up with the faster owner.
+    const uint32_t frameCap = prepOn ? std::max(cfg.commitFrames, cfg.hotCommitFrames) : cfg.commitFrames;
+    if (prepOn) {
+        prepPublishRuns(w, p);
+        prepPublish(w, p);
+    }
     uint32_t frames0 = 0;
     struct Rej {
         uint64_t rseq;
@@ -1901,8 +1988,11 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
     // is acked); kills, TOMB_RANGE and maintenance records still commit.
     const bool noSpace = e->spaceEmergency();
     while (!noSpace && !st->sealAfter && !c.err && pos + sizeof(EntryHeader) <= tail) {
-        if (st->dBytes >= cfg.commitBytes || frames0 >= cfg.commitFrames) break;
-        if (p->nL0 >= kMaxL0Dir - 1) break;  // wait for a merge (type labeling lags)
+        if (st->dBytes >= cfg.commitBytes || frames0 >= frameCap) break;
+        if (p->nL0 >= kMaxL0Dir - 1) {  // wait for a merge (type labeling lags)
+            e->cL0Full.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
         if (nRej >= rejRoom) break;
         EntryHeader h;
         ringRead(p->ring, e->pool(), pos, &h, sizeof(h));
@@ -2050,6 +2140,9 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
         st->endPos = pos;
         st->lastRseq = h.rseq;
         st->consumed = true;
+        // Every consumed ordinal is taken (entries staged without a take:
+        // non-records, transactions, early rejects).
+        if (prepOn && pos > p->prep->takePos) prepTakeThrough(w, p, pos);
     }
     if (c.err) {
         // Nothing of this batch is committed; entries are re-read next time.
@@ -2192,6 +2285,7 @@ int32_t loadAccelFromBlock(Partition* p, SlabPool& pool, uint32_t idx, const uin
         k.entriesBytes = kinds[i].entriesBytes;
         k.bloom = nullptr;
         k.bloomBytes = 0;
+        k.entries = nullptr;
         if (kinds[i].bloomBytes) {
             uint64_t pos;
             void* mem = p->chain.alloc(pool, kinds[i].bloomBytes, &pos);
@@ -2201,6 +2295,23 @@ int32_t loadAccelFromBlock(Partition* p, SlabPool& pool, uint32_t idx, const uin
             k.bloom = static_cast<const uint8_t*>(mem);
             k.bloomBytes = kinds[i].bloomBytes;
         }
+        if (k.kind == kIxCid && p->hot.load(std::memory_order_relaxed) && kinds[i].entriesBytes) {
+            // Entries, then the bloom (stage-1 helpers probe it before searching).
+            const int saved = tHotPathDepth;
+            tHotPathDepth = 0;  // once per commit of a split partition
+            auto v = std::make_shared<std::vector<uint8_t>>(size_t(kinds[i].entriesBytes) + kinds[i].bloomBytes);
+            std::memcpy(v->data(), block + kinds[i].entriesOff, kinds[i].entriesBytes);
+            if (kinds[i].bloomBytes)
+                std::memcpy(v->data() + kinds[i].entriesBytes, block + kinds[i].bloomOff, kinds[i].bloomBytes);
+            tHotPathDepth = saved;
+            k.entries = v->data();
+            a.cidEntries = std::move(v);
+        }
+    }
+    if (!p->hot.load(std::memory_order_relaxed) || !a.cidEntries) {
+        bool used = false;
+        for (int i = 0; i < a.nKinds; i++) used = used || a.kinds[i].entries;
+        if (!used) a.cidEntries.reset();
     }
     return 0;
 }

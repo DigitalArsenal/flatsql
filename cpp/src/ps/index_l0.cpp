@@ -76,9 +76,13 @@ void bloomAdd(uint8_t* bits, size_t bytes, const uint8_t* key, size_t klen) {
     const uint64_t m = uint64_t(bytes) * 8;
     const uint64_t h1 = h & 0xffffffffull;
     const uint64_t h2 = (h >> 32) | 1;
+    // bit_i = (h1 + i*h2) mod m, stepped with two divisions instead of K.
+    uint64_t bit = h1 % m;
+    const uint64_t step = h2 % m;
     for (int i = 0; i < kBloomK; i++) {
-        const uint64_t bit = (h1 + uint64_t(i) * h2) % m;
         bits[bit >> 3] |= uint8_t(1u << (bit & 7));
+        bit += step;
+        if (bit >= m) bit -= m;
     }
 }
 
@@ -92,9 +96,12 @@ bool bloomTestHash(const uint8_t* bits, size_t bytes, uint64_t h) {
     const uint64_t m = uint64_t(bytes) * 8;
     const uint64_t h1 = h & 0xffffffffull;
     const uint64_t h2 = (h >> 32) | 1;
+    uint64_t bit = h1 % m;
+    const uint64_t step = h2 % m;
     for (int i = 0; i < kBloomK; i++) {
-        const uint64_t bit = (h1 + uint64_t(i) * h2) % m;
         if (!(bits[bit >> 3] & (1u << (bit & 7)))) return false;
+        bit += step;
+        if (bit >= m) bit -= m;
     }
     return true;
 }
@@ -109,6 +116,65 @@ inline bool stagedLess(const StagedEntry* a, const StagedEntry* b) {
 }  // namespace
 
 void sortStaged(StagedEntry** e, size_t n) { std::sort(e, e + n, stagedLess); }
+
+namespace {
+inline bool keyValLess(const StagedEntry* a, const StagedEntry* b) {
+    const int c = keyCmp(a->key, a->klen, b->key, b->klen);
+    if (c) return c < 0;
+    return keyCmp(a->val, a->vlen, b->val, b->vlen) < 0;
+}
+}  // namespace
+
+void sortStagedBuckets(StagedEntry** e, size_t n, StagedEntry** tmp) {
+    // Counting pass by kind (few distinct kinds per batch), stable scatter,
+    // then each kind on its own: most kinds of a record batch arrive already
+    // in (key, value) order (tag postings share one key, values are pseqs in
+    // append order), so a linear check skips them; the rest sort alone.
+    constexpr size_t kMaxKinds = 64;
+    uint16_t kinds[kMaxKinds];
+    size_t counts[kMaxKinds];
+    size_t nk = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint16_t k = e[i]->kind;
+        size_t j = 0;
+        while (j < nk && kinds[j] != k) j++;
+        if (j == nk) {
+            if (nk == kMaxKinds) {
+                sortStaged(e, n);
+                return;
+            }
+            kinds[nk] = k;
+            counts[nk++] = 0;
+        }
+        counts[j]++;
+    }
+    // Kinds ascending; offsets in that order.
+    size_t order[kMaxKinds];
+    for (size_t j = 0; j < nk; j++) order[j] = j;
+    std::sort(order, order + nk, [&](size_t a, size_t b) { return kinds[a] < kinds[b]; });
+    size_t start[kMaxKinds], fill[kMaxKinds];
+    size_t at = 0;
+    for (size_t r = 0; r < nk; r++) {
+        start[order[r]] = at;
+        fill[order[r]] = at;
+        at += counts[order[r]];
+    }
+    for (size_t i = 0; i < n; i++) {
+        const uint16_t k = e[i]->kind;
+        size_t j = 0;
+        while (kinds[j] != k) j++;
+        tmp[fill[j]++] = e[i];
+    }
+    for (size_t j = 0; j < nk; j++) {
+        StagedEntry** b = tmp + start[j];
+        const size_t m = counts[j];
+        bool sorted = true;
+        for (size_t i = 1; i < m && sorted; i++)
+            if (keyValLess(b[i], b[i - 1])) sorted = false;
+        if (!sorted) std::sort(b, b + m, keyValLess);
+    }
+    std::memcpy(e, tmp, n * sizeof(StagedEntry*));
+}
 
 namespace {
 // Distinct keys of one kind run [i, j) (bloom sizing).

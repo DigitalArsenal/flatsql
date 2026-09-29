@@ -7,6 +7,8 @@
 //   flatsql_ps_bench --mode=dirty --rate=R [--dir=D]   (A8: ack p99 at 1/10/50
 //                    dirty partitions)
 //   Any mode: --journal=1 commits through the per-writer journal (A8 fallback).
+//   flatsql_ps_bench --mode=hotsplit [--helpers=4] [--io=mem|fs] [--records=1000000]
+//                    (T3b #5: one hot partition unsplit vs split)
 //   flatsql_ps_bench --mode=soak [--seconds=1800] [--dir=D]   (lock holds,
 //                    hot-path allocations)
 // Every number is printed as "MEASURED <key> = <value> <unit>" together with
@@ -125,6 +127,8 @@ struct Bench {
         cfg.journalCkptBytes = uint64_t(argInt("journal-ckpt-mb", 8)) << 20;
         cfg.journalCkptPaced = argInt("journal-paced", 1) != 0;
         cfg.lockStats = true;
+        cfg.mergeHelpers = uint32_t(argInt("merge-helpers", 1));
+        cfg.commitFrames = uint32_t(argInt("commit-frames", 1024));
         if (memIo) {
             mem.reset(new FaultFs(false));
             cfg.io = mem.get();
@@ -219,6 +223,8 @@ double closedLoop(Bench& b, uint64_t records, uint32_t producers, size_t pad) {
         });
     }
     while (ready.load() < producers) sleepNs(100000);
+    std::fprintf(stderr, "INGEST_START\n");
+    std::fflush(stderr);
     t0 = monoNs();
     go.store(true);
     for (auto& t : ts) t.join();
@@ -383,6 +389,88 @@ int modeScaling() {
     return 0;
 }
 
+// T3b #5 (§12): one hot partition, producers at many times one writer's
+// capacity (closed loop: the ring stays full), the same engine unsplit and
+// split with `helpers` idle writers preparing stage 1.
+int modeHotSplit() {
+    const bool memIo = argStr("io", "mem") == "mem";
+    const uint64_t records = uint64_t(argInt("records", 1000000));
+    const size_t pad = size_t(argInt("pad", 200));
+    const uint32_t helpers = uint32_t(argInt("helpers", 4));
+    double rates[2] = {0, 0};
+    const std::string phase = argStr("phase", "both");
+    for (int split = 0; split < 2; split++) {
+        if ((phase == "split" && !split) || (phase == "unsplit" && split)) continue;
+        Bench b(1 + helpers, memIo);
+        b.cfg.hotSplit = false;  // no automatic trigger: the run decides
+        b.cfg.hotHelpers = helpers;
+        if (!b.open(1)) return 1;
+        if (split) {
+            b.e->setHotSplit(b.pids[0], true);
+            const uint64_t until = monoNs() + 5000000000ull;
+            while (!b.e->isHot(b.pids[0]) && monoNs() < until) sleepNs(1000000);
+            if (!b.e->isHot(b.pids[0])) {
+                std::fprintf(stderr, "split did not start\n");
+                return 1;
+            }
+        }
+        std::atomic<bool> monDone{false};
+        uint64_t fillSum = 0, fillN = 0, emptyN = 0, mapped = 0, lagSum = 0, l0Sum = 0;
+        std::thread mon([&] {
+            RingDesc* r = b.e->ring(b.pids[0]);
+            Partition* pp = b.e->partition(b.pids[0]);
+            while (!monDone.load()) {
+                lagSum += pp->durablePseqHi.load() - pp->labeledThrough.load();
+                l0Sum += pp->pub.nL0;
+                if (r->tail.load() == 0) {  // CIDs still being computed (untimed)
+                    sleepNs(200000);
+                    continue;
+                }
+                const uint64_t used = r->tail.load() - r->head.load();
+                fillSum += used;
+                fillN++;
+                if (used == 0) emptyN++;
+                mapped += r->mappedPages.load();
+                sleepNs(200000);
+            }
+        });
+        rates[split] = closedLoop(b, records, 1, pad);
+        monDone.store(true);
+        mon.join();
+        if (fillN) {
+            report(split ? "hotsplit_split_ring_fill_avg_kb" : "hotsplit_unsplit_ring_fill_avg_kb",
+                   double(fillSum) / double(fillN) / 1024.0, "KiB");
+            report(split ? "hotsplit_split_ring_empty_share" : "hotsplit_unsplit_ring_empty_share",
+                   double(emptyN) / double(fillN), "share");
+            report(split ? "hotsplit_split_mapped_pages_avg" : "hotsplit_unsplit_mapped_pages_avg",
+                   double(mapped) / double(fillN), "pages");
+            report(split ? "hotsplit_split_label_lag_avg" : "hotsplit_unsplit_label_lag_avg",
+                   double(lagSum) / double(fillN), "rows");
+            report(split ? "hotsplit_split_l0_blocks_avg" : "hotsplit_unsplit_l0_blocks_avg",
+                   double(l0Sum) / double(fillN), "blocks");
+        }
+        const EngineStats st = b.e->stats();
+        char key[96];
+        std::snprintf(key, sizeof(key), "hotsplit_%s_%s_records_per_s", memIo ? "mem" : "fs", split ? "split" : "unsplit");
+        report(key, rates[split], "records/s");
+        if (split) {
+            report("hotsplit_prep_prepared", double(st.prepPrepared), "entries");
+            report("hotsplit_prep_used", double(st.prepUsed), "entries");
+            report("hotsplit_prep_stolen", double(st.prepStolen), "entries");
+            report("hotsplit_prep_wasted", double(st.prepWasted), "entries");
+            report("hotsplit_prep_hinted", double(st.prepHinted), "entries");
+        }
+        report(split ? "hotsplit_split_rows" : "hotsplit_unsplit_rows", double(st.rowsAppended), "rows");
+        report(split ? "hotsplit_split_l0_full_stalls" : "hotsplit_unsplit_l0_full_stalls", double(st.l0FullStalls), "stalls");
+        report(split ? "hotsplit_split_merges" : "hotsplit_unsplit_merges", double(st.merges), "merges");
+        report(split ? "hotsplit_split_commits" : "hotsplit_unsplit_commits", double(st.commits), "commits");
+    }
+    char key[96];
+    std::snprintf(key, sizeof(key), "hotsplit_%s_ratio_split_over_unsplit_%u_helpers", memIo ? "mem" : "fs", helpers);
+    if (rates[0] > 0 && rates[1] > 0) report(key, rates[1] / rates[0], "x");
+    return 0;
+}
+
 int modeHost02() {
     const uint32_t partitions = uint32_t(argInt("partitions", 50));
     const double secs = double(argInt("seconds", 20));
@@ -468,6 +556,7 @@ int main(int argc, char** argv) {
     const std::string mode = argStr("mode", "scaling");
     report("commit_journal", double(argInt("journal", 0) != 0), "mode");
     if (mode == "scaling") return modeScaling();
+    if (mode == "hotsplit") return modeHotSplit();
     if (mode == "host02") return modeHost02();
     if (mode == "dirty") return modeDirty();
     if (mode == "soak") return modeSoak();

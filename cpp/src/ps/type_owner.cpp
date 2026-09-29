@@ -555,6 +555,7 @@ int32_t typeWarm(Writer* w, TypeOwner* t) {
                     kk.entriesBytes = kinds[k].entriesBytes;
                     kk.bloom = nullptr;
                     kk.bloomBytes = 0;
+                    kk.entries = nullptr;
                     if (kinds[k].bloomBytes) {
                         uint64_t pos;
                         void* mem = t->chain.alloc(w->engine()->pool(), kinds[k].bloomBytes, &pos);
@@ -828,7 +829,7 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
     }
     // Type batch (A10).
     for (uint32_t i = 0; i < sc->nEntries; i++) sc->order[i] = &sc->entries[i];
-    sortStaged(sc->order, sc->nEntries);
+    sortStagedBuckets(sc->order, sc->nEntries, sc->order2);
     const size_t l0Len = sc->nEntries ? l0BlockSize(sc->order, sc->nEntries) : 0;
     const bool full = nParts > kMaxInlineLabels && (!t->haveLabelCkpt || t->forceFullLabels ||
                                                     t->metaSinceCkpt >= e->config().ckptMetaBytes);
@@ -1002,6 +1003,7 @@ void typePublish(Writer* w, TypeOwner* t, StagedType* st) {
                     kk.entriesBytes = kinds[k].entriesBytes;
                     kk.bloom = nullptr;
                     kk.bloomBytes = 0;
+                    kk.entries = nullptr;
                     if (kinds[k].bloomBytes) {
                         uint64_t pos;
                         void* mem = t->chain.alloc(e->pool(), kinds[k].bloomBytes, &pos);

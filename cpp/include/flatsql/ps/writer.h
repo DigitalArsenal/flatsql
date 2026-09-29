@@ -34,6 +34,7 @@
 #include "flatsql/ps/quota.h"
 #include "flatsql/ps/registry.h"
 #include "flatsql/ps/ring.h"
+#include "flatsql/ps/stage1.h"
 
 namespace flatsql {
 namespace ps {
@@ -115,6 +116,24 @@ struct EngineConfig {
     uint32_t tombRangeStep = 512;          // rows examined per TOMB_RANGE step at most
     uint32_t tombRangeBudgetUs = 4000;     // and CPU time per step (each <= 10 ms, T3 #3)
     uint64_t ballastBytes = 0;             // A13: released on ENOSPC (servers: 256 MiB; 0: none)
+    // T3b hot split (§12, A26): a partition whose backlog stays over
+    // hotSplitBacklogPct of its ring cap for hotSplitAfterMs, while its
+    // owner has no other partition with backlog, has its stage-1 work
+    // (checks, CID, CRC, extraction) prepared by idle writers; under
+    // hotUnsplitPct for hotUnsplitAfterMs it is merged back.
+    bool hotSplit = true;
+    uint32_t hotSplitBacklogPct = 50;
+    uint32_t hotSplitAfterMs = 30000;
+    uint32_t hotUnsplitPct = 10;
+    uint32_t hotUnsplitAfterMs = 30000;
+    uint32_t hotHelpers = 4;               // writers woken to prepare a split partition
+    uint32_t hotCommitFrames = 4096;       // frames per commit of a split partition (scratch permitting)
+    uint32_t prepHelpBudget = 256;         // entries one helper call prepares at most
+    uint32_t prepClaimWaitUs = 20;         // the owner waits this long for a claimed entry, then takes it
+    // Tests (A26): every Nth stage-1 claim stalls this long after claiming,
+    // standing in for a SIGSTOPped helper.
+    uint64_t testPrepStallNs = 0;
+    uint32_t testPrepStallEvery = 0;
     Io* io = nullptr;               // default: the seven imports
     int64_t (*clockMs)(void*) = nullptr;  // injectable wall clock
     void* clockCtx = nullptr;
@@ -204,6 +223,9 @@ struct L0Accel {
     uint64_t l0Off = 0;      // absolute file offset of the L0 block
     uint32_t l0Len = 0;
     uint8_t nKinds = 0;
+    // T3b: a split partition's copy of this block's CID entries (Kind::entries
+    // points into it). Allocated once per commit, never per record.
+    std::shared_ptr<const std::vector<uint8_t>> cidEntries;
     struct Kind {
         uint16_t kind;
         uint8_t vlen;
@@ -212,6 +234,10 @@ struct L0Accel {
         uint32_t entriesBytes;
         const uint8_t* bloom; // in the partition's SlabChain (nullptr: no bloom)
         uint32_t bloomBytes;
+        // T3b: a split partition keeps its unmerged blocks' CID entries in
+        // memory too (the owner's dedupe binary-searches them instead of
+        // reading the section); nullptr otherwise.
+        const uint8_t* entries = nullptr;
     } kinds[kMaxKinds];
     const Kind* find(uint16_t k) const {
         for (int i = 0; i < nKinds; i++)
@@ -511,6 +537,15 @@ struct Partition {
     std::atomic<uint64_t> labeledThrough{0};  // written by the type owner
     std::atomic<uint32_t> pendingWork{0};     // mailbox items queued for this partition
 
+    // T3b hot split (§12, A26; hot_split.cpp, stage1.cpp)
+    std::atomic<uint32_t> hot{0};        // idle writers prepare this partition's entries
+    std::unique_ptr<PrepWindow> prep;    // allocated at the first split, kept for the run
+    std::atomic<PrepWindow*> prepPub{nullptr};  // the same, for stats()
+    uint64_t hotSinceNs = 0;             // backlog over the split line since
+    uint64_t coolSinceNs = 0;            // backlog under the unsplit line since
+    int8_t hotForce = -1;                // tests / host: 1 split now, 0 unsplit now
+    bool hotManual = false;              // split by setHotSplit: no automatic merge-back
+
     // staging (valid during one writer iteration)
     Staged* st = nullptr;
 };
@@ -638,6 +673,7 @@ enum CmdKind : uint32_t {
     kCmdStop = 6,
     kCmdTombRange = 7,        // a = pid, b = seg, data[0..8) = epoch bound (ms), ticket
     kCmdSwap = 8,             // a = pid, ptr = SwapResult* (a compaction request)
+    kCmdHotSplit = 9,         // a = pid, b = 1 split / 0 unsplit (T3b, tests and hosts)
 };
 
 struct Cmd {
@@ -730,6 +766,7 @@ public:
     uint64_t partitionCommitsWithFrames() const { return framedCommits_.load(std::memory_order_relaxed); }
     uint64_t partitionBatches() const { return batches_.load(std::memory_order_relaxed); }
     uint8_t* lookupScratch() { return lookupScratch_.data(); }
+    const std::vector<Partition*>& ownedPartitions() const { return owned_; }
 
 private:
     friend class Engine;
@@ -769,6 +806,7 @@ private:
     std::vector<std::pair<void*, uint8_t>> headSyncs_;  // checkpoint heads to sync next round
     uint64_t lastCommitNs_ = 0;
     StageScratch* sc_ = nullptr;
+    std::unique_ptr<PrepResult> prepScratch_;  // T3b: one stage-1 result being computed
     Arena framesArena_;
     std::vector<uint8_t> lookupScratch_;
     size_t rr_ = 0;
@@ -872,6 +910,16 @@ struct EngineStats {
     uint64_t catalogEntriesDropped = 0;  // T3 (A15): dead copies' CID/LABEL/REPEAT entries folded out
     uint64_t typeDiskBytes = 0;          // T3 (§13): Σ type logs on disk
     uint64_t compactInFlight = 0;  // planned, not yet applied or aborted
+    // T3b hot split (§12)
+    uint64_t splits = 0;
+    uint64_t unsplits = 0;
+    uint64_t prepPrepared = 0;     // stage-1 results a helper completed
+    uint64_t prepUsed = 0;         // results the owner staged from
+    uint64_t prepStolen = 0;       // entries the owner took before a helper finished
+    uint64_t prepWasted = 0;       // helper results discarded
+    uint64_t prepHinted = 0;       // dedupe lookups a stage-1 hint shortened to the L0 blocks
+    uint64_t prepHelperStalls = 0; // injected stalls (tests)
+    uint64_t l0FullStalls = 0;     // stagings that stopped at a full L0 directory (merge or labels behind)
     uint64_t diskBytes = 0;        // sum over partitions (published values)
     // store-migrate (§16.1-5): FIRST copies labeled with their migrated gseq,
     // and copies that carried one but did not get it (labeled REPEAT, or the
@@ -954,6 +1002,19 @@ public:
     // Doorbell for a partition's owner (and HANDOFF target, A24).
     void ringOwner(uint32_t pid);
 
+    // T3b hot split (§12): split (true) or merge back (false) a partition now,
+    // at its owner's next iteration, whatever its backlog.
+    int32_t setHotSplit(uint32_t pid, bool on);
+    bool isHot(uint32_t pid) const;
+    // An idle writer prepares up to `budget` entries of split partitions it
+    // does not own. Returns the entries it prepared.
+    uint32_t prepHelp(Writer* w, uint32_t budget);
+    // The owner published entries: wake up to hotHelpers idle writers.
+    void wakePrepHelpers(uint8_t owner);
+    void hotAdd(Partition* p);
+    void hotRemove(Partition* p);
+    void hotClose();  // stop/abandon: helpers' run handles closed while the host is up
+
     EngineStats stats() const;
     const EngineConfig& config() const { return cfg_; }
     IoStats& openStats() { return openIoStats_; }
@@ -991,6 +1052,7 @@ public:
     std::atomic<uint64_t> cCompactions{0}, cCompactAborts{0}, cCompactBytesIn{0}, cCompactBytesOut{0},
         cRetired{0}, cUnlinked{0}, cUnlinkBusy{0}, cMetaRetired{0}, cCompactInFlight{0}, cCatalogDropped{0};
     std::atomic<uint64_t> cMigratedGseq{0}, cMigratedGseqFallback{0};
+    std::atomic<uint64_t> cSplits{0}, cUnsplits{0}, cPrepStalls{0}, cL0Full{0};
     uint64_t framesParsedAtOpen = 0;
     uint64_t adoptedBatches = 0;
     uint64_t journalReplayRecords = 0;
@@ -1099,6 +1161,12 @@ private:
     std::vector<std::thread> helpers_;
     bool helperStop_ = false;
     std::atomic<uint64_t> gseqNext_{1};
+    // T3b: split partitions, read lock-free by idle writers.
+    static constexpr uint32_t kMaxHot = 16;
+    std::atomic<Partition*> hot_[kMaxHot] = {};
+    std::atomic<uint32_t> nHot_{0};
+    std::mutex hotMu_;
+    std::atomic<uint64_t> prepClaims_{0};   // test stall counter
     uint32_t incarnation_ = 0;
     std::atomic<bool> stop_{false};
     bool started_ = false;

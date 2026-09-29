@@ -250,6 +250,7 @@ Writer::Writer(Engine* eng, uint8_t id) : eng_(eng), id_(id), io_(nullptr, nullp
     io_ = IoCtx(eng->config().io ? eng->config().io : importIo(), &ioStats_);
     sc_ = new StageScratch();
     sc_->init(eng->config());
+    prepScratch_.reset(new PrepResult());
     arena_.init(size_t(eng->config().arenaBytes / 2));
     framesArena_.init(size_t(eng->config().arenaBytes / 2));
     lookupScratch_.resize(kL1BlockBytes * 2);
@@ -547,8 +548,14 @@ bool Writer::iterate(bool mayWait) {
         const bool backlog = r->tail.load(std::memory_order_acquire) != r->head.load(std::memory_order_acquire);
         // Pages only for a ring with traffic or a producer asking: an idle
         // partition holds zero slabs (§17).
-        if (backlog || r->wantPage.load(std::memory_order_acquire))
-            ringMapAhead(r, eng_->pool(), reserve, backlog ? p->mapAheadPages : 1);
+        if (backlog || r->wantPage.load(std::memory_order_acquire)) {
+            // T3b: a split partition's producer runs ahead of the owner by the
+            // whole ring, so helpers always have entries to prepare.
+            const uint32_t ahead = p->hot.load(std::memory_order_relaxed)
+                                       ? uint32_t((r->cap + r->maxEntry) / r->slabBytes)
+                                       : (backlog ? p->mapAheadPages : 1);
+            ringMapAhead(r, eng_->pool(), reserve, ahead);
+        }
         if (!backlog && !p->rec.active && p->kills.empty() && p->ranges.empty() && !p->sealPending &&
             !p->nPendingCtl && p->mergePhase != kMergeOutputsWritten && !p->retireDirty && p->retiring.empty() &&
             p->unlinked.empty() && !p->forceLaneCkpt)
@@ -584,6 +591,8 @@ bool Writer::iterate(bool mayWait) {
     const uint64_t m0 = eng_->config().lockStats ? monoNs() : 0;
     maintenance();
     if (m0) eng_->maintHist().record(monoNs() - m0);
+    // T3b (§12): an idle writer prepares entries of split partitions.
+    if (!any && eng_->prepHelp(this, eng_->config().prepHelpBudget) > 0) any = true;
     if (!any && mayWait && !eng_->stopping()) {
         const uint64_t idleFor = monoNs() - lastWorkNs_;
         const uint64_t timeoutNs = idleFor > 1000000000ull ? uint64_t(eng_->config().idleWaitUs) * 1000
@@ -703,6 +712,18 @@ void Writer::processMailbox() {
                 p->swaps.push_back(r);
                 break;
             }
+            case kCmdHotSplit: {
+                Partition* p = eng_->partition(uint32_t(c.a));
+                if (!p) break;
+                if (p->ownerWriter.load(std::memory_order_acquire) != id_) {
+                    Writer* o = eng_->writer(p->ownerWriter.load());
+                    while (!o->mailbox().push(c)) cpuRelax();
+                    o->ring();
+                    break;
+                }
+                p->hotForce = c.b ? 1 : 0;
+                break;
+            }
             case kCmdTypeDelete: {
                 TypeOwner* t = static_cast<TypeOwner*>(c.ptr);
                 TypeOwner::Delete d;
@@ -794,6 +815,7 @@ void Writer::maintenance() {
     // Checkpoint heads waiting for a round that is not coming: sync now.
     if (!headSyncs_.empty() && nowNsV - lastCommitNs_ > 2000000ull) flushHeadSyncs();
     for (Partition* p : owned_) {
+        hotSplitStep(this, p, nowNsV);  // T3b (§12)
         if (p->quarantined) continue;
         // Seal by age (§4.2) and next-segment pre-creation at 50%.
         if (!p->sealPending && (p->dLen > 0 || p->segRecords > 0) && cfg.sealAgeMs > 0 && p->segOpenedMs &&
@@ -1123,6 +1145,7 @@ int32_t Engine::stop(uint64_t deadlineMs) {
     // A8 journal: every journaled byte into durable files, journals emptied,
     // so the next open replays nothing.
     for (auto& w : writers_) w->journalMaintenance(true);
+    hotClose();  // T3b: helpers are stopped; their run handles close here
     for (auto& w : writers_) {
         w->io().close(&w->jf_[0]);
         w->io().close(&w->jf_[1]);
@@ -1168,6 +1191,7 @@ void Engine::abandon() {
     stopCheckpointThread();
     syncPool_.stop();
     started_ = false;
+    hotClose();  // T3b: helpers are stopped; their run handles close here
     for (auto& w : writers_) {
         w->io().close(&w->jf_[0]);
         w->io().close(&w->jf_[1]);
@@ -1360,6 +1384,22 @@ EngineStats Engine::stats() const {
     s.metaSegsRetired = cMetaRetired.load();
     s.catalogEntriesDropped = cCatalogDropped.load();
     s.compactInFlight = cCompactInFlight.load();
+    s.splits = cSplits.load();
+    s.unsplits = cUnsplits.load();
+    s.prepHelperStalls = cPrepStalls.load();
+    s.l0FullStalls = cL0Full.load();
+    uint64_t prepBytes = 0;
+    for (uint32_t pid = 1; pid <= maxPid && pid < partsCap_; pid++) {
+        const Partition* p = parts_[pid].load(std::memory_order_acquire);
+        const PrepWindow* pw = p ? p->prepPub.load(std::memory_order_acquire) : nullptr;
+        if (!pw) continue;
+        prepBytes += sizeof(PrepWindow);
+        s.prepPrepared += pw->prepared.load(std::memory_order_relaxed);
+        s.prepUsed += pw->used.load(std::memory_order_relaxed);
+        s.prepStolen += pw->stolen.load(std::memory_order_relaxed);
+        s.prepWasted += pw->wasted.load(std::memory_order_relaxed);
+        s.prepHinted += pw->hinted.load(std::memory_order_relaxed);
+    }
     // Engine-accounted committed memory of the writer instance: touched pool
     // slabs, arenas and scratch, descriptors and L1 accelerators.
     uint64_t scratch = 0;
@@ -1367,11 +1407,11 @@ EngineStats Engine::stats() const {
         scratch += w->arena_.capacity() + w->framesArena_.capacity();
         const StageScratch* sc = w->sc_;
         scratch += uint64_t(sc->capRows) * sizeof(RecRow) + sc->capAttrs +
-                   uint64_t(sc->capEntries) * (sizeof(StagedEntry) + sizeof(void*)) + sc->capKeys +
+                   uint64_t(sc->capEntries) * (sizeof(StagedEntry) + 2 * sizeof(void*)) + sc->capKeys +
                    sc->capPlain + sc->capExtract + sc->capSection;
     }
     s.committedBytes = s.poolCommittedBytes + scratch + s.descriptorBytes + s.acceleratorBytes +
-                       uint64_t(partsCap_) * sizeof(void*);
+                       uint64_t(partsCap_) * sizeof(void*) + prepBytes;
     return s;
 }
 
