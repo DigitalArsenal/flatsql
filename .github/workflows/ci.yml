@@ -55,9 +55,10 @@ jobs:
       with:
         version: '4.0.23'
 
-    - name: Clone FlatBuffers
+    - name: Clone FlatBuffers (DigitalArsenal pin)
       run: |
-        git clone --depth 1 https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
+        git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
+        git -C ../flatbuffers checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
 
     - name: Configure WASM Build
       working-directory: cpp
@@ -71,6 +72,18 @@ jobs:
       run: |
         ls -la cpp/build-wasm/flatsql.js cpp/build-wasm/flatsql.wasm cpp/build-wasm/flatsql-wasi.wasm
         echo "WASM build successful!"
+
+    # npm-publish.yml publishes this build's flatsql.js, flatsql.wasm and
+    # flatsql-wasi.wasm and checks them against the committed integrity.json.
+    - name: The committed artifacts are this source's build
+      run: |
+        sha256sum cpp/build-wasm/flatsql.js cpp/build-wasm/flatsql.wasm \
+          cpp/build-wasm/flatsql-wasi.wasm cpp/build-wasm/flatsql-wasi-noeh.wasm
+        for f in flatsql.js flatsql.wasm flatsql-wasi.wasm flatsql-wasi-noeh.wasm; do
+          if ! cmp -s "cpp/build-wasm/$f" "wasm/$f"; then
+            echo "::warning::wasm/$f differs from this commit's build; a release commit must carry the rebuilt artifacts and integrity.json"
+          fi
+        done
 
   # The partition store artifact (docs/PARTITION-STORE-WASM.md): build it with
   # the pinned wasi-sdk and DigitalArsenal flatbuffers, check its import
@@ -103,7 +116,7 @@ jobs:
     - name: Clone FlatBuffers (DigitalArsenal pin)
       run: |
         git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
-        git -C ../flatbuffers checkout 5bdda94c6541e5f87b211f27c4ac112548f46be5
+        git -C ../flatbuffers checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
 
     - name: Install dependencies
       run: npm ci --ignore-scripts

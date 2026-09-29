@@ -28,22 +28,25 @@ if(NOT EXISTS "${SQLITE_DIR}/sqlite3.c")
     message(FATAL_ERROR "SQLite amalgamation not found at ${SQLITE_DIR}")
 endif()
 
-# OpenSSL for HMAC-SHA256 buffer authentication
+# OpenSSL: the FlatBuffers crypto backend of native builds (below)
 find_package(OpenSSL QUIET)
 if(NOT OpenSSL_FOUND AND APPLE)
     set(OPENSSL_ROOT_DIR "/opt/homebrew/opt/openssl@3")
     find_package(OpenSSL QUIET)
 endif()
 if(OpenSSL_FOUND)
-    message(STATUS "OpenSSL found: ${OPENSSL_VERSION} - HMAC authentication available")
+    message(STATUS "OpenSSL found: ${OPENSSL_VERSION} - FlatBuffers crypto backend: OpenSSL")
 else()
-    message(WARNING "OpenSSL not found - HMAC authentication will not be available")
+    message(STATUS "OpenSSL not found - FlatBuffers crypto backend: fallback")
 endif()
 
-# FlatBuffers encryption source. Native builds with OpenSSL compile it with the
-# OpenSSL backend (below). Without one it is the fallback backend, whose key
-# derivation is not HKDF-SHA256: record encryption (field-encryption format 3)
-# then refuses a key (FlatSQLDatabase::recordEncryptionAvailable).
+# FlatBuffers encryption source: HKDF-SHA256, AES-256-CTR and HMAC-SHA256 for
+# record encryption (field-encryption format 3) and computeHMAC. Native builds
+# with OpenSSL compile it with the OpenSSL backend (below); the wasm builds and
+# native builds without OpenSSL compile the fallback backend, which derives the
+# same keys from FlatBuffers 8af3053e on. Against an older FlatBuffers the
+# fallback's derivation is not HKDF-SHA256 and record encryption refuses a key
+# (FlatSQLDatabase::recordEncryptionAvailable).
 set(FLATBUFFERS_ENCRYPTION_SOURCES
     ${FLATBUFFERS_SRC_DIR}/encryption.cpp
 )
@@ -627,9 +630,8 @@ else()
     if(OpenSSL_FOUND)
         target_link_libraries(flatsql_lib PUBLIC OpenSSL::Crypto)
         target_include_directories(flatsql_lib PUBLIC ${OPENSSL_INCLUDE_DIR})
-        target_compile_definitions(flatsql_lib PRIVATE FLATSQL_HAVE_OPENSSL=1)
-        # HKDF-SHA256 and AES-256-CTR from OpenSSL: the backend FlatBuffers
-        # itself builds with (FLATBUFFERS_USE_OPENSSL).
+        # HKDF-SHA256, AES-256-CTR and HMAC-SHA256 from OpenSSL: the backend
+        # FlatBuffers itself builds with (FLATBUFFERS_USE_OPENSSL).
         set_source_files_properties(${FLATBUFFERS_SRC_DIR}/encryption.cpp
             PROPERTIES COMPILE_DEFINITIONS FLATBUFFERS_USE_OPENSSL=1)
     endif()
@@ -892,8 +894,8 @@ else()
     target_link_libraries(flatsql_arena_limit_test PRIVATE flatsql_lib)
     add_test(NAME FlatSQLArenaLimitTest COMMAND flatsql_arena_limit_test)
     # Database-key record encryption (field-encryption format 3). The schema
-    # compiler serializes the test's binary schemas; a build with OpenSSL must
-    # have record encryption.
+    # compiler serializes the test's binary schemas. Every backend has record
+    # encryption (OpenSSL, or the fallback from FlatBuffers 8af3053e on).
     add_executable(flatsql_db_key_encryption_test test/db_key_encryption_test.cpp
         ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
         ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
@@ -901,7 +903,7 @@ else()
         ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp)
     target_link_libraries(flatsql_db_key_encryption_test PRIVATE flatsql_lib)
     target_compile_definitions(flatsql_db_key_encryption_test PRIVATE
-        FLATSQL_EXPECT_RECORD_ENCRYPTION=$<BOOL:${OpenSSL_FOUND}>)
+        FLATSQL_EXPECT_RECORD_ENCRYPTION=1)
     add_test(NAME FlatSQLDbKeyEncryptionTest COMMAND flatsql_db_key_encryption_test)
     add_test(NAME FlatSQLVfsTest COMMAND flatsql_vfs_test)
     add_test(NAME FlatSQLStatePersistenceTest COMMAND flatsql_state_persistence_test)

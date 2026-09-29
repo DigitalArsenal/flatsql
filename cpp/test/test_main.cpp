@@ -5,6 +5,8 @@
 #include <sqlite3.h>
 #include <iostream>
 #include <cassert>
+#include <cstring>
+#include <stdexcept>
 
 using namespace flatsql;
 
@@ -813,18 +815,28 @@ void testEncryptionRoundTrip() {
 
         std::vector<uint8_t> buffer = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
         uint8_t mac[32];
-        bool computed = db.computeHMAC(buffer.data(), buffer.size(), mac);
-        if (computed) {
-            // Verify should succeed with original data
-            assert(db.verifyHMAC(buffer.data(), buffer.size(), mac));
-
-            // Tamper with the buffer
-            buffer[0] = 99;
-            assert(!db.verifyHMAC(buffer.data(), buffer.size(), mac));
-            std::cout << "  HMAC authentication: OK" << std::endl;
-        } else {
-            std::cout << "  HMAC authentication: SKIPPED (no OpenSSL)" << std::endl;
+        // Every FlatBuffers crypto backend has HMAC-SHA256 (the fallback from
+        // FlatBuffers 8af3053e on).
+        if (!db.computeHMAC(buffer.data(), buffer.size(), mac)) {
+            throw std::runtime_error("computeHMAC failed with a key set");
         }
+        // HMAC-SHA256(key 01 02 .. 20, 01 02 .. 0a) from node:crypto.
+        const uint8_t expected[32] = {
+            0xc0, 0x8a, 0xb0, 0x1b, 0x89, 0x7c, 0x31, 0x70, 0x01, 0x4c, 0xdc, 0x42,
+            0xa0, 0xd1, 0x34, 0x48, 0x26, 0x1e, 0x8e, 0x88, 0xf7, 0x51, 0xa9, 0xfd,
+            0x8f, 0xc7, 0x48, 0x19, 0x9b, 0xdf, 0xcd, 0x41};
+        if (std::memcmp(mac, expected, sizeof(expected)) != 0) {
+            throw std::runtime_error("computeHMAC is not HMAC-SHA256 under the database key");
+        }
+        if (!db.verifyHMAC(buffer.data(), buffer.size(), mac)) {
+            throw std::runtime_error("verifyHMAC rejected its own MAC");
+        }
+        // Tamper with the buffer
+        buffer[0] = 99;
+        if (db.verifyHMAC(buffer.data(), buffer.size(), mac)) {
+            throw std::runtime_error("verifyHMAC accepted a tampered buffer");
+        }
+        std::cout << "  HMAC authentication: OK" << std::endl;
     }
 
     // Test different field IDs produce different ciphertexts

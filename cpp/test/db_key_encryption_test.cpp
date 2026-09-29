@@ -202,7 +202,8 @@ bool contains(const std::string& text, const char* part) {
 }
 
 void unavailable() {
-    // The fallback backend: a database with (encrypted) columns refuses a key.
+    // A backend without HKDF-SHA256 (the fallback before FlatBuffers 8af3053e):
+    // a database with (encrypted) columns refuses a key.
     uint8_t key[32];
     keyBytes(key);
     auto owned = openDatabase();
@@ -404,7 +405,7 @@ int main() {
     if (!available_) {
         unavailable();
         if (FLATSQL_EXPECT_RECORD_ENCRYPTION) {
-            std::cerr << "  FAIL: this build has OpenSSL but no HKDF-SHA256 record encryption" << std::endl;
+            std::cerr << "  FAIL: no HKDF-SHA256 record encryption (FlatBuffers before 8af3053e?)" << std::endl;
             g_failures++;
         }
     } else {

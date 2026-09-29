@@ -48,7 +48,7 @@ jobs:
       - name: Clone FlatBuffers (DigitalArsenal pin)
         run: |
           git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
-          git -C ../flatbuffers checkout 5bdda94c6541e5f87b211f27c4ac112548f46be5
+          git -C ../flatbuffers checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
 
       - name: Build WASM
         working-directory: cpp

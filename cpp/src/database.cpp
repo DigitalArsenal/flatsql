@@ -11,10 +11,6 @@
 #include <stdexcept>
 #include <unordered_set>
 
-#ifdef FLATSQL_HAVE_OPENSSL
-#include <openssl/hmac.h>
-#endif
-
 #if defined(__EMSCRIPTEN__)
 #include <malloc.h>
 #endif
@@ -1750,8 +1746,8 @@ constexpr uint8_t kBufferKeyVector[32] = {
 
 const char* const kNoRecordEncryption =
     "this build cannot encrypt (encrypted) columns: its FlatBuffers crypto backend does "
-    "not derive keys with HKDF-SHA256 (format 3 needs it; build with OpenSSL, see README "
-    "\"Database-key encryption\")";
+    "not derive keys with HKDF-SHA256 (format 3 needs it; build against FlatBuffers "
+    "8af3053e or later, see README \"Database-key encryption\")";
 
 const char* const kFormat2Refused =
     "field-encryption format 2 (records encrypted by flatsql 3.2.0 or earlier, all under "
@@ -2029,34 +2025,20 @@ void FlatSQLDatabase::setHMACVerification(bool enabled) {
     hmacEnabled_ = enabled;
 }
 
+// HMAC-SHA256 under the database key, from the FlatBuffers crypto backend
+// (OpenSSL natively, the fallback backend in the wasm builds).
 bool FlatSQLDatabase::computeHMAC(const uint8_t* buffer, size_t length, uint8_t* outMAC) const {
-    if (!encryptionCtx_) return false;
-#ifdef FLATSQL_HAVE_OPENSSL
-    const uint8_t* key = encryptionCtx_->GetKey();
-    unsigned int macLen = 32;
-    HMAC(EVP_sha256(), key, 32, buffer, length, outMAC, &macLen);
+    if (!encryptionCtx_ || !outMAC || (!buffer && length > 0)) return false;
+    flatbuffers::HMACSha256(encryptionCtx_->GetKey(), flatbuffers::kEncryptionKeySize,
+                            buffer, length, outMAC);
     return true;
-#else
-    (void)buffer; (void)length; (void)outMAC;
-    return false;
-#endif
 }
 
 bool FlatSQLDatabase::verifyHMAC(const uint8_t* buffer, size_t length, const uint8_t* mac) const {
-    if (!encryptionCtx_) return false;
-#ifdef FLATSQL_HAVE_OPENSSL
-    uint8_t computed[32];
-    computeHMAC(buffer, length, computed);
-    // Constant-time comparison to prevent timing attacks
-    uint8_t diff = 0;
-    for (int i = 0; i < 32; i++) {
-        diff |= computed[i] ^ mac[i];
-    }
-    return diff == 0;
-#else
-    (void)buffer; (void)length; (void)mac;
-    return false;
-#endif
+    if (!encryptionCtx_ || !mac || (!buffer && length > 0)) return false;
+    // Constant-time comparison.
+    return flatbuffers::HMACSha256Verify(encryptionCtx_->GetKey(), flatbuffers::kEncryptionKeySize,
+                                         buffer, length, mac);
 }
 
 }  // namespace flatsql

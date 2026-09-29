@@ -621,10 +621,11 @@ public:
 
     /**
      * True when this build's FlatBuffers crypto backend derives format-3
-     * buffer keys with HKDF-SHA256 (a known-answer check). The fallback
-     * backend (no OpenSSL or Crypto++) does not: its derivation has 256
-     * outputs, so records would share key streams. Without it a database
-     * with (encrypted) columns refuses a key.
+     * buffer keys with HKDF-SHA256 (a known-answer check). Every backend
+     * does from FlatBuffers 8af3053e: OpenSSL natively, the fallback backend
+     * in the wasm builds. The fallback before it did not (its derivation had
+     * 256 outputs, so records would share key streams). Without it a
+     * database with (encrypted) columns refuses a key.
      */
     static bool recordEncryptionAvailable() noexcept;
 
@@ -672,11 +673,11 @@ public:
     bool isHMACVerificationEnabled() const { return hmacEnabled_; }
 
     /**
-     * Compute HMAC-SHA256 for a FlatBuffer.
+     * Compute HMAC-SHA256 for a FlatBuffer, keyed with the database key.
      * @param buffer    FlatBuffer data
      * @param length    Buffer length
      * @param outMAC    Output: 32-byte HMAC (caller must provide 32 bytes)
-     * @return true on success
+     * @return true on success; false without a key
      */
     bool computeHMAC(const uint8_t* buffer, size_t length, uint8_t* outMAC) const;
 
