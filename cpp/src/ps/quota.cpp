@@ -30,7 +30,8 @@ struct QuotaState {
     std::atomic<bool> noSpace{false};
     bool emergency = false;
     uint64_t emergencyCap = 0;
-    uint64_t passes = 0, evicted = 0, emergencies = 0, releases = 0, restores = 0;
+    // Counters: writer 0 counts, quotaStats() reads them on any thread.
+    std::atomic<uint64_t> passes{0}, evicted{0}, emergencies{0}, releases{0}, restores{0};
     std::atomic<uint64_t> usage{0}, cap{0};
     // Ballast (A13).
     FileRef ballast;
