@@ -765,6 +765,28 @@ SELECT _source, COUNT(*) as count FROM User GROUP BY _source;
 SELECT * FROM User WHERE _source = 'satellite-1';
 ```
 
+## Database-key encryption
+
+Fields marked `(encrypted)` in the schema are stored encrypted under the database key and decrypted when SQL reads them. The format is FlatBuffers field-encryption format 3: each record gets its own key, derived from the database key and the record's index, and each encrypted value gets its own IV, its position in the record. No two records and no two values share a key stream.
+
+The record index is the record's sequence, its `rowid`. Records are numbered 1, 2, 3, ... in stream order, so the stream carries the index: an exported stream loaded into an empty database (`loadAndRebuild`) gives every record the index it was encrypted with. Load an encrypted stream into an empty database only.
+
+```javascript
+db.registerFileId('SECR', 'Secret');
+db.setEncryptionKey(key);                         // 32 bytes
+const seq = db.ingestOneEncrypted(record, bfbs);  // encrypted as record `seq`
+db.query('SELECT code FROM Secret');              // plaintext
+```
+
+- `bfbs` is the table's binary schema with builtin attributes (`flatc -b --schema --bfbs-builtins`). It must mark the same fields `(encrypted)` as the database schema, or the call is refused.
+- `ingestOneEncrypted(record, bfbs, source?)` assigns the sequence and encrypts under it in one step. `encryptBuffer(record, bfbs, recordIndex)` and `decryptBuffer(record, bfbs, recordIndex)` take the index explicitly.
+- `(encrypted)` columns are never indexed. A predicate on one scans and decrypts.
+- A database that already holds records in tables with `(encrypted)` columns needs their format declared: `setEncryptionKey(key, { format: 3 })`. Nothing in the stream marks the format.
+
+**Crypto backend.** Format 3 derives keys with HKDF-SHA256. Native builds get it from OpenSSL, which CMake finds as it does for HMAC. The wasm builds compile the FlatBuffers fallback backend, whose key derivation is not HKDF-SHA256: it has 256 outputs, so records would share key streams. There a database with `(encrypted)` columns refuses a key, with an error that names HKDF-SHA256. `FlatSQLDatabase::recordEncryptionAvailable()` tells which build you have.
+
+**Format 2 (flatsql 3.2.0 and earlier).** Those versions encrypted every record under the same field keys, those of record 0, derived by the fallback backend. This version refuses format 2: `setEncryptionKey(key, { format: 2 })` throws, and a database that holds records must declare format 3. To migrate, use flatsql 3.2.0 and the old key to read each record of `exportData()` back as plaintext with `decryptBuffer(record, bfbs)`. Then ingest the plaintext records into a new database with `ingestOneEncrypted`, on a build with record encryption.
+
 ## License
 
 [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) — source-available, free for any noncommercial purpose. Commercial use requires a separate license from Edgesource Corporation See [LICENSE](LICENSE).

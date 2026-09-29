@@ -148,6 +148,11 @@ public:
 
     // Statistics
     uint64_t getRecordCount() const { return recordCount_; }
+
+    // The sequence the next appended record gets. Records are numbered 1, 2,
+    // 3, ... in stream order, so a replay of the same stream into an empty
+    // store gives every record the sequence it had.
+    uint64_t nextSequence() const { return nextSequence_; }
     uint64_t getDataSize() const { return writeOffset_; }
 
     // Drop every in-memory record. The stream on disk is NOT touched — this

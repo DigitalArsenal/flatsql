@@ -40,7 +40,10 @@ else()
     message(WARNING "OpenSSL not found - HMAC authentication will not be available")
 endif()
 
-# FlatBuffers encryption source (uses fallback AES-CTR, no external crypto needed)
+# FlatBuffers encryption source. Native builds with OpenSSL compile it with the
+# OpenSSL backend (below). Without one it is the fallback backend, whose key
+# derivation is not HKDF-SHA256: record encryption (field-encryption format 3)
+# then refuses a key (FlatSQLDatabase::recordEncryptionAvailable).
 set(FLATBUFFERS_ENCRYPTION_SOURCES
     ${FLATBUFFERS_SRC_DIR}/encryption.cpp
 )
@@ -243,6 +246,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_get_storage_buffer\", \"_flatsql_get_storage_size\", \
                 \"_flatsql_set_encryption_key\", \"_flatsql_is_encrypted\", \
                 \"_flatsql_encrypt_buffer\", \"_flatsql_decrypt_buffer\", \
+                \"_flatsql_ingest_one_encrypted\", \
                 \"_flatsql_set_hmac_verification\", \"_flatsql_is_hmac_enabled\", \
                 \"_flatsql_compute_hmac\", \"_flatsql_verify_hmac\" \
             ]' \
@@ -348,6 +352,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
                 \"_flatsql_get_storage_buffer\", \"_flatsql_get_storage_size\", \
                 \"_flatsql_set_encryption_key\", \"_flatsql_is_encrypted\", \
                 \"_flatsql_encrypt_buffer\", \"_flatsql_decrypt_buffer\", \
+                \"_flatsql_ingest_one_encrypted\", \
                 \"_flatsql_set_hmac_verification\", \"_flatsql_is_hmac_enabled\", \
                 \"_flatsql_compute_hmac\", \"_flatsql_verify_hmac\" \
             ]' \
@@ -623,6 +628,10 @@ else()
         target_link_libraries(flatsql_lib PUBLIC OpenSSL::Crypto)
         target_include_directories(flatsql_lib PUBLIC ${OPENSSL_INCLUDE_DIR})
         target_compile_definitions(flatsql_lib PRIVATE FLATSQL_HAVE_OPENSSL=1)
+        # HKDF-SHA256 and AES-256-CTR from OpenSSL: the backend FlatBuffers
+        # itself builds with (FLATBUFFERS_USE_OPENSSL).
+        set_source_files_properties(${FLATBUFFERS_SRC_DIR}/encryption.cpp
+            PROPERTIES COMPILE_DEFINITIONS FLATBUFFERS_USE_OPENSSL=1)
     endif()
 
     # Native CLI executable (with stdin piping support)
@@ -882,6 +891,18 @@ else()
     add_executable(flatsql_arena_limit_test test/arena_limit_test.cpp)
     target_link_libraries(flatsql_arena_limit_test PRIVATE flatsql_lib)
     add_test(NAME FlatSQLArenaLimitTest COMMAND flatsql_arena_limit_test)
+    # Database-key record encryption (field-encryption format 3). The schema
+    # compiler serializes the test's binary schemas; a build with OpenSSL must
+    # have record encryption.
+    add_executable(flatsql_db_key_encryption_test test/db_key_encryption_test.cpp
+        ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
+        ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
+        ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
+        ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp)
+    target_link_libraries(flatsql_db_key_encryption_test PRIVATE flatsql_lib)
+    target_compile_definitions(flatsql_db_key_encryption_test PRIVATE
+        FLATSQL_EXPECT_RECORD_ENCRYPTION=$<BOOL:${OpenSSL_FOUND}>)
+    add_test(NAME FlatSQLDbKeyEncryptionTest COMMAND flatsql_db_key_encryption_test)
     add_test(NAME FlatSQLVfsTest COMMAND flatsql_vfs_test)
     add_test(NAME FlatSQLStatePersistenceTest COMMAND flatsql_state_persistence_test)
     add_test(NAME FlatSQLDiskPersistenceTest COMMAND flatsql_disk_persistence_test)

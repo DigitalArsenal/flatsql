@@ -6,56 +6,120 @@
 
 namespace flatsql {
 
-// Decrypt a column value in-place using the FlatBuffer field-level encryption scheme
-static void decryptColumnValue(Value& value,
-                                const flatbuffers::EncryptionContext& ctx,
-                                uint16_t fieldId) {
-    if (auto* s = std::get_if<std::string>(&value)) {
-        if (!s->empty()) {
-            flatbuffers::DecryptString(
-                reinterpret_cast<uint8_t*>(s->data()),
-                s->size(), ctx, fieldId);
-        }
-    } else if (auto* i64 = std::get_if<int64_t>(&value)) {
-        flatbuffers::DecryptScalar(
-            reinterpret_cast<uint8_t*>(i64), sizeof(int64_t), ctx, fieldId);
-    } else if (auto* i32 = std::get_if<int32_t>(&value)) {
-        flatbuffers::DecryptScalar(
-            reinterpret_cast<uint8_t*>(i32), sizeof(int32_t), ctx, fieldId);
-    } else if (auto* d = std::get_if<double>(&value)) {
-        flatbuffers::DecryptScalar(
-            reinterpret_cast<uint8_t*>(d), sizeof(double), ctx, fieldId);
-    } else if (auto* f = std::get_if<float>(&value)) {
-        flatbuffers::DecryptScalar(
-            reinterpret_cast<uint8_t*>(f), sizeof(float), ctx, fieldId);
-    } else if (auto* u64 = std::get_if<uint64_t>(&value)) {
-        flatbuffers::DecryptScalar(
-            reinterpret_cast<uint8_t*>(u64), sizeof(uint64_t), ctx, fieldId);
-    } else if (auto* u32 = std::get_if<uint32_t>(&value)) {
-        flatbuffers::DecryptScalar(
-            reinterpret_cast<uint8_t*>(u32), sizeof(uint32_t), ctx, fieldId);
-    } else if (auto* i16 = std::get_if<int16_t>(&value)) {
-        flatbuffers::DecryptScalar(
-            reinterpret_cast<uint8_t*>(i16), sizeof(int16_t), ctx, fieldId);
-    } else if (auto* u16 = std::get_if<uint16_t>(&value)) {
-        flatbuffers::DecryptScalar(
-            reinterpret_cast<uint8_t*>(u16), sizeof(uint16_t), ctx, fieldId);
-    } else if (auto* i8 = std::get_if<int8_t>(&value)) {
-        flatbuffers::DecryptScalar(
-            reinterpret_cast<uint8_t*>(i8), sizeof(int8_t), ctx, fieldId);
-    } else if (auto* u8val = std::get_if<uint8_t>(&value)) {
-        flatbuffers::DecryptScalar(
-            reinterpret_cast<uint8_t*>(u8val), sizeof(uint8_t), ctx, fieldId);
-    } else if (auto* blob = std::get_if<std::vector<uint8_t>>(&value)) {
-        if (!blob->empty()) {
-            uint8_t key[flatbuffers::kEncryptionKeySize];
-            uint8_t iv[flatbuffers::kEncryptionIVSize];
-            ctx.DeriveFieldKey(fieldId, key);
-            ctx.DeriveFieldIV(fieldId, iv);
-            flatbuffers::DecryptBytes(blob->data(), blob->size(), key, iv);
-        }
+namespace {
+
+size_t scalarWidth(ValueType type) {
+    switch (type) {
+        case ValueType::Bool:
+        case ValueType::Int8:
+        case ValueType::UInt8:   return 1;
+        case ValueType::Int16:
+        case ValueType::UInt16:  return 2;
+        case ValueType::Int32:
+        case ValueType::UInt32:
+        case ValueType::Float32: return 4;
+        case ValueType::Int64:
+        case ValueType::UInt64:
+        case ValueType::Float64: return 8;
+        default:                 return 0;
     }
 }
+
+// The [start, start + length) bytes a column's value occupies in one record,
+// found the way the generic extractor finds them: the root table's vtable
+// slot `fieldId`, then the scalar in place or the string/vector it refers to.
+// False when the field is absent or does not fit in the record.
+bool columnInstance(const uint8_t* data, size_t size, const ColumnDef& column,
+                    uint64_t* start, uint64_t* length) {
+    using flatbuffers::ReadScalar;
+    if (size < sizeof(uint32_t)) return false;
+    const uint64_t root = ReadScalar<uint32_t>(data);
+    if (root > size || size - root < sizeof(int32_t)) return false;
+    const int64_t vtable = static_cast<int64_t>(root) - ReadScalar<int32_t>(data + root);
+    if (vtable < 0 || static_cast<uint64_t>(vtable) > size ||
+        size - static_cast<uint64_t>(vtable) < 2 * sizeof(uint16_t)) {
+        return false;
+    }
+    const uint64_t vt = static_cast<uint64_t>(vtable);
+    const uint16_t vtableSize = ReadScalar<uint16_t>(data + vt);
+    const uint64_t slot = 4 + 2 * static_cast<uint64_t>(column.fieldId);
+    if (slot + sizeof(uint16_t) > vtableSize || vt + vtableSize > size) return false;
+    const uint16_t fieldOffset = ReadScalar<uint16_t>(data + vt + slot);
+    if (fieldOffset == 0) return false;
+    const uint64_t loc = root + fieldOffset;
+
+    if (const size_t width = scalarWidth(column.type)) {
+        if (loc > size || size - loc < width) return false;
+        *start = loc;
+        *length = width;
+        return true;
+    }
+    if (column.type != ValueType::String && column.type != ValueType::Bytes) {
+        return false;  // opaque (a table, struct or non-byte vector): read as NULL
+    }
+    if (loc > size || size - loc < sizeof(uint32_t)) return false;
+    const uint64_t target = loc + ReadScalar<uint32_t>(data + loc);
+    if (target > size || size - target < sizeof(uint32_t)) return false;
+    const uint64_t count = ReadScalar<uint32_t>(data + target);  // bytes: 1-byte elements
+    if (count > size - target - sizeof(uint32_t)) return false;
+    *start = target + sizeof(uint32_t);
+    *length = count;
+    return true;
+}
+
+// Decrypts, in `record` (a copy of one stored record, without its size
+// prefix), the (encrypted) columns of the table under FlatBuffers field
+// encryption format 3 (flatbuffers/encryption.h): the record's key is
+// DeriveBufferKey(record index) and each instance's IV is
+// FieldInstanceIV(offset of its first byte in the record). The record index
+// is the record's sequence (rowid). An instance two columns share (a shared
+// string) is decrypted once, as format 3 encrypted it once. A column that is
+// absent, or does not fit in the record, is left alone: it reads as NULL.
+bool decryptRecordColumns(std::vector<uint8_t>& record, const TableDef& table,
+                          const flatbuffers::EncryptionContext& ctx,
+                          uint64_t sequence, std::string* error) {
+    if (sequence == 0 || sequence > UINT32_MAX) {
+        *error = "record " + std::to_string(sequence) +
+                 " has no field-encryption record index (records 1 to 4294967295 have one)";
+        return false;
+    }
+    uint8_t key[flatbuffers::kEncryptionKeySize];
+    bool derived = false;
+    std::vector<uint64_t> done;
+    for (const auto& column : table.columns) {
+        if (!column.encrypted) continue;
+        uint64_t start = 0;
+        uint64_t length = 0;
+        if (!columnInstance(record.data(), record.size(), column, &start, &length) ||
+            length == 0 || std::find(done.begin(), done.end(), start) != done.end()) {
+            continue;
+        }
+        done.push_back(start);
+        if (!derived) {
+            ctx.DeriveBufferKey(static_cast<uint32_t>(sequence), key);
+            derived = true;
+        }
+        uint8_t iv[flatbuffers::kEncryptionIVSize];
+        flatbuffers::FieldInstanceIV(static_cast<uint32_t>(start), iv);
+        flatbuffers::DecryptBytes(record.data() + start, static_cast<size_t>(length), key, iv);
+    }
+    if (derived) {
+        volatile uint8_t* wipe = key;
+        for (size_t i = 0; i < sizeof(key); i++) wipe[i] = 0;
+    }
+    return true;
+}
+
+// The key a table's records are decrypted with: the database's record key
+// when the table has (encrypted) columns, else none.
+const flatbuffers::EncryptionContext* recordKeyOf(const FlatBufferVTab* vtab) {
+    if (!vtab->hasEncryptedColumns || !vtab->createInfo || !vtab->createInfo->recordKey) {
+        return nullptr;
+    }
+    return vtab->createInfo->recordKey->ctx;
+}
+
+}  // namespace
 
 // Static module instance
 sqlite3_module FlatBufferVTabModule::module_ = {
@@ -180,7 +244,10 @@ int FlatBufferVTabModule::xConnect(sqlite3* db, void* pAux, int argc, const char
     vtab->indexes = info->indexes;
     vtab->tombstones = info->tombstones;
     vtab->sourceRecordInfos = info->sourceRecordInfos;
-    vtab->encryptionCtx = info->encryptionCtx;
+    vtab->createInfo = info;
+    vtab->hasEncryptedColumns = std::any_of(
+        tableDef.columns.begin(), tableDef.columns.end(),
+        [](const ColumnDef& col) { return col.encrypted; });
     vtab->stats = info->stats;
     vtab->sourceColumnIndex = static_cast<int>(tableDef.columns.size());  // _source is first virtual column
 
@@ -832,10 +899,12 @@ void FlatBufferVTabModule::setResultFromValue(sqlite3_context* ctx, const Value&
 int FlatBufferVTabModule::xColumn(sqlite3_vtab_cursor* pCursor, sqlite3_context* ctx, int N) {
     FlatBufferCursor* cursor = static_cast<FlatBufferCursor*>(pCursor);
 
+    // (encrypted) columns are read from a decrypted copy of the record
+    const flatbuffers::EncryptionContext* recordKey = recordKeyOf(cursor->vtab);
+
     // Fast path: regular column with fast extractor (most common case)
-    // Skip fast path when encryption is active - must go through cache for decryption
     if (N >= 0 && N < cursor->numRealColumns && cursor->currentData
-        && cursor->cachedFastExtractor && !cursor->vtab->encryptionCtx) {
+        && cursor->cachedFastExtractor && !recordKey) {
         if (cursor->cachedFastExtractor(cursor->currentData, cursor->currentLength, N, ctx)) {
             return SQLITE_OK;
         }
@@ -879,20 +948,20 @@ int FlatBufferVTabModule::xColumn(sqlite3_vtab_cursor* pCursor, sqlite3_context*
     }
 
     if (!cursor->cacheValid) {
-        for (int i = 0; i < numRealColumns; i++) {
-            cursor->columnCache[i] = vtab->extractor(cursor->currentData, cursor->currentLength,
-                                                      vtab->tableDef->columns[i].name);
-        }
-
-        // Decrypt encrypted columns if encryption context is present
-        if (vtab->encryptionCtx) {
-            for (int i = 0; i < numRealColumns; i++) {
-                if (vtab->tableDef->columns[i].encrypted) {
-                    decryptColumnValue(cursor->columnCache[i],
-                                       *vtab->encryptionCtx,
-                                       vtab->tableDef->columns[i].fieldId);
-                }
+        const uint8_t* data = cursor->currentData;
+        if (recordKey) {
+            cursor->plainRecord.assign(data, data + cursor->currentLength);
+            std::string error;
+            if (!decryptRecordColumns(cursor->plainRecord, *vtab->tableDef, *recordKey,
+                                      cursor->currentSequence, &error)) {
+                sqlite3_result_error(ctx, error.c_str(), static_cast<int>(error.size()));
+                return SQLITE_ERROR;
             }
+            data = cursor->plainRecord.data();
+        }
+        for (int i = 0; i < numRealColumns; i++) {
+            cursor->columnCache[i] = vtab->extractor(data, cursor->currentLength,
+                                                      vtab->tableDef->columns[i].name);
         }
 
         cursor->cacheValid = true;

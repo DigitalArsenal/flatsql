@@ -741,6 +741,18 @@ bool requireReadyHandle(void* handle) {
     g_lastError.clear();
     return true;
 }
+
+// A record index from JS: a whole number, range-checked by the database.
+bool recordIndexFromNumber(double value, uint64_t* out) {
+    if (!(value >= 0) || value > 9007199254740991.0 ||
+        value != static_cast<double>(static_cast<uint64_t>(value))) {
+        g_lastError = "the record index must be a whole number (the record's sequence)";
+        return false;
+    }
+    *out = static_cast<uint64_t>(value);
+    return true;
+}
+
 std::string g_cacheKeyBuffer;
 std::vector<uint8_t> g_exportBuffer;
 std::shared_ptr<const std::vector<uint8_t>> g_responseArtifactStream;
@@ -1919,17 +1931,32 @@ double flatsql_get_storage_size(void* handle) {
 }
 
 // ==================== Encryption API ====================
+//
+// Field-encryption format 3 (FlatSQLDatabase, database.h): a record's index
+// is its sequence. Every call answers errors through flatsql_get_error and
+// never throws (the no-exceptions artifact turns a throw into a trap).
 
+// storedFormat: 0 when the database holds no records in a table with
+// (encrypted) columns, else their field-encryption format (3).
 EMSCRIPTEN_KEEPALIVE
-int flatsql_set_encryption_key(void* handle, const uint8_t* key, int keySize) {
-    try {
-        auto* db = static_cast<FlatSQLDatabase*>(handle);
-        db->setEncryptionKey(key, static_cast<size_t>(keySize));
-        return 1;
-    } catch (const std::exception& e) {
-        g_lastError = e.what();
+int flatsql_set_encryption_key(void* handle, const uint8_t* key, int keySize, int storedFormat) {
+    if (!handle) {
+        g_lastError = "Invalid database handle";
         return 0;
     }
+    if (keySize < 0 || storedFormat < 0 || storedFormat > 255) {
+        g_lastError = keySize < 0 ? "the encryption key must be 32 bytes"
+                                  : "unknown field-encryption format " + std::to_string(storedFormat);
+        return 0;
+    }
+    auto* db = static_cast<FlatSQLDatabase*>(handle);
+    std::string error;
+    if (!db->setEncryptionKey(key, static_cast<size_t>(keySize),
+                              static_cast<uint8_t>(storedFormat), &error)) {
+        g_lastError = error;
+        return 0;
+    }
+    return 1;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -1938,40 +1965,61 @@ int flatsql_is_encrypted(void* handle) {
     return db->isEncrypted() ? 1 : 0;
 }
 
+// Encrypts the record in place as the record with index recordIndex.
 EMSCRIPTEN_KEEPALIVE
 int flatsql_encrypt_buffer(void* handle, uint8_t* buffer, int bufferSize,
-                            const uint8_t* schema, int schemaSize) {
-    auto* db = static_cast<FlatSQLDatabase*>(handle);
-    auto* ctx = db->getEncryptionContext();
-    if (!ctx) {
-        g_lastError = "No encryption key set";
+                            const uint8_t* schema, int schemaSize, double recordIndex) {
+    uint64_t index = 0;
+    if (!handle || bufferSize < 0 || schemaSize < 0) {
+        g_lastError = handle ? "Invalid buffer" : "Invalid database handle";
         return 0;
     }
-    auto result = flatbuffers::EncryptBuffer(buffer, static_cast<size_t>(bufferSize),
-                                              schema, static_cast<size_t>(schemaSize), *ctx);
-    if (!result.ok()) {
-        g_lastError = result.message;
+    if (!recordIndexFromNumber(recordIndex, &index)) return 0;
+    std::string error;
+    if (!static_cast<FlatSQLDatabase*>(handle)->encryptRecord(
+            buffer, static_cast<size_t>(bufferSize), schema, static_cast<size_t>(schemaSize),
+            index, &error)) {
+        g_lastError = error;
         return 0;
     }
     return 1;
 }
 
+// Decrypts the record in place as the record with index recordIndex.
 EMSCRIPTEN_KEEPALIVE
 int flatsql_decrypt_buffer(void* handle, uint8_t* buffer, int bufferSize,
-                            const uint8_t* schema, int schemaSize) {
-    auto* db = static_cast<FlatSQLDatabase*>(handle);
-    auto* ctx = db->getEncryptionContext();
-    if (!ctx) {
-        g_lastError = "No encryption key set";
+                            const uint8_t* schema, int schemaSize, double recordIndex) {
+    uint64_t index = 0;
+    if (!handle || bufferSize < 0 || schemaSize < 0) {
+        g_lastError = handle ? "Invalid buffer" : "Invalid database handle";
         return 0;
     }
-    auto result = flatbuffers::DecryptBuffer(buffer, static_cast<size_t>(bufferSize),
-                                              schema, static_cast<size_t>(schemaSize), *ctx);
-    if (!result.ok()) {
-        g_lastError = result.message;
+    if (!recordIndexFromNumber(recordIndex, &index)) return 0;
+    std::string error;
+    if (!static_cast<FlatSQLDatabase*>(handle)->decryptRecord(
+            buffer, static_cast<size_t>(bufferSize), schema, static_cast<size_t>(schemaSize),
+            index, &error)) {
+        g_lastError = error;
         return 0;
     }
     return 1;
+}
+
+// Encrypts a plaintext record under the sequence it gets and ingests it.
+// source: NULL or "" for none. Returns the sequence, or -1.
+EMSCRIPTEN_KEEPALIVE
+double flatsql_ingest_one_encrypted(void* handle, const uint8_t* data, size_t length,
+                                    const uint8_t* schema, size_t schemaSize,
+                                    const char* source) {
+    if (!requireReadyHandle(handle)) return -1;
+    std::string error;
+    const uint64_t seq = static_cast<FlatSQLDatabase*>(handle)->ingestOneEncrypted(
+        data, length, schema, schemaSize, source ? source : "", &error);
+    if (seq == FlatSQLDatabase::kIngestRefused) {
+        g_lastError = error;
+        return -1;
+    }
+    return static_cast<double>(seq);
 }
 
 // ==================== HMAC Authentication API ====================

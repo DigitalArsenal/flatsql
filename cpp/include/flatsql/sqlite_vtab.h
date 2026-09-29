@@ -16,6 +16,17 @@ namespace flatsql {
 class FlatBufferVTab;
 class FlatBufferCursor;
 
+/**
+ * A database's record key (FlatSQLDatabase::setEncryptionKey). The database
+ * owns it at a stable address and a table reads it at query time, so a key set
+ * or replaced after the table was registered is the key the table uses.
+ */
+struct RecordKey {
+    const flatbuffers::EncryptionContext* ctx = nullptr;
+};
+
+struct VTabCreateInfo;
+
 // Field extractor function type - extracts field values from raw FlatBuffer
 using FieldExtractor = std::function<Value(const uint8_t* data, size_t length, const std::string& fieldName)>;
 
@@ -79,8 +90,13 @@ struct FlatBufferVTab : public sqlite3_vtab {
     // When set, uses these instead of store->getRecordInfoVector(fileId)
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos = nullptr;
 
-    // Encryption context for field-level decryption (not owned, may be nullptr)
-    const flatbuffers::EncryptionContext* encryptionCtx = nullptr;
+    // The registration this table was created from (not owned). The record
+    // key is read through it (VTabCreateInfo::recordKey).
+    const VTabCreateInfo* createInfo = nullptr;
+
+    // True when a column of this table is (encrypted): its records are read
+    // from a decrypted copy while the database has a key.
+    bool hasEncryptedColumns = false;
 
     // Per-connection scan counters (not owned, may be nullptr)
     VTabScanStats* stats = nullptr;
@@ -129,6 +145,10 @@ struct FlatBufferCursor : public sqlite3_vtab_cursor {
     // Column value cache - avoids re-extracting values for same row
     std::vector<Value> columnCache;
     bool cacheValid;
+
+    // The current record with its (encrypted) columns decrypted, when the
+    // table has any and the database has a key (valid with cacheValid)
+    std::vector<uint8_t> plainRecord;
 
     // Cached column count to avoid size() calls
     int numRealColumns;
@@ -196,8 +216,8 @@ struct VTabCreateInfo {
     // Source-specific record infos (for multi-source routing)
     // When set, uses these instead of store->getRecordInfoVector(fileId)
     const std::vector<StreamingFlatBufferStore::FileRecordInfo>* sourceRecordInfos = nullptr;
-    // Encryption context for field-level decryption (not owned)
-    const flatbuffers::EncryptionContext* encryptionCtx = nullptr;
+    // The database's record key (not owned, may be nullptr)
+    const RecordKey* recordKey = nullptr;
     // Per-connection scan counters (not owned)
     VTabScanStats* stats = nullptr;
 };

@@ -2,6 +2,7 @@
 #include "flatsql/query_cache.h"
 #include <flatbuffers/flatbuffers.h>
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <locale>
@@ -254,9 +255,11 @@ bool recordSearchText(const TableDef& table, const uint8_t* data, size_t length,
 TableStore::TableStore(const TableDef& tableDef, StreamingFlatBufferStore& storage, sqlite3* indexDb)
     : tableDef_(tableDef), storage_(storage), indexDb_(indexDb) {
 
-    // Create indexes for indexed columns using SQLite's optimized B-tree
+    // Create indexes for indexed columns using SQLite's optimized B-tree.
+    // An (encrypted) column is not indexed: its stored bytes are ciphertext
+    // under a key of their own record, which no plaintext predicate matches.
     for (const auto& col : tableDef_.columns) {
-        if (col.indexed || col.primaryKey) {
+        if ((col.indexed || col.primaryKey) && !col.encrypted) {
             indexes_[col.name] = std::make_unique<SqliteIndex>(
                 indexDb_, tableDef_.name, col.name, col.type);
         }
@@ -273,7 +276,7 @@ void TableStore::createSpatialIndexes() {
     // Collect spatial columns marked with attribute
     std::vector<size_t> spatialCols;
     for (size_t i = 0; i < tableDef_.columns.size(); i++) {
-        if (tableDef_.columns[i].spatial) {
+        if (tableDef_.columns[i].spatial && !tableDef_.columns[i].encrypted) {
             spatialCols.push_back(i);
         }
     }
@@ -292,6 +295,7 @@ void TableStore::createSpatialIndexes() {
     if (spatialIndexes_.empty()) {
         auto findCol = [&](const std::vector<std::string>& names) -> std::string {
             for (const auto& col : tableDef_.columns) {
+                if (col.encrypted) continue;  // ciphertext is not a coordinate
                 std::string lower = col.name;
                 for (auto& c : lower) c = std::tolower(c);
                 for (const auto& n : names) {
@@ -630,16 +634,31 @@ void FlatSQLDatabase::setArenaLimit(size_t bytes) {
 uint64_t FlatSQLDatabase::ingestOne(const uint8_t* flatbuffer, size_t length) {
     std::unique_lock lock(*accessMutex_);
     requireReadyUnlocked();
+    return ingestOneUnlocked(flatbuffer, length, nullptr);
+}
+
+uint64_t FlatSQLDatabase::ingestOneUnlocked(const uint8_t* flatbuffer, size_t length,
+                                            const std::string* source) {
     if (!storage_->canAppend(SIZE_PREFIX_LENGTH + length)) {
         return kIngestRefused;
     }
     invalidateQueryResultCacheUnlocked();
     IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
-    return storage_->ingestFlatBuffer(flatbuffer, length,
-        [this](std::string_view fileId, const uint8_t* data, size_t len,
+    if (!source) {
+        return storage_->ingestFlatBuffer(flatbuffer, length,
+            [this](std::string_view fileId, const uint8_t* data, size_t len,
+                   uint64_t seq, uint64_t offset) {
+                onIngest(fileId, data, len, seq, offset);
+            }, profile);
+    }
+    const uint64_t begin = storage_->getWriteOffset();
+    const uint64_t seq = storage_->ingestFlatBuffer(flatbuffer, length,
+        [this, source](std::string_view fileId, const uint8_t* data, size_t len,
                uint64_t seq, uint64_t offset) {
-            onIngest(fileId, data, len, seq, offset);
+            onIngestWithSource(fileId, data, len, seq, offset, *source);
         }, profile);
+    recordSourceRangeUnlocked(*source, begin, storage_->getWriteOffset());
+    return seq;
 }
 
 void FlatSQLDatabase::loadAndRebuild(const uint8_t* data, size_t length) {
@@ -723,13 +742,10 @@ bool FlatSQLDatabase::updateSQLiteTableNoThrow(const std::string& tableName,
         return false;
     }
 
-    // Propagate encryption context to the registered source
-    if (encryptionCtx_) {
-        auto* sourceInfo = sqliteEngine_->getSource(tableName);
-        if (sourceInfo) {
-            sourceInfo->encryptionCtx = encryptionCtx_.get();
-            sourceInfo->vtabInfo.encryptionCtx = encryptionCtx_.get();
-        }
+    // The table reads the record key through the database's holder at query
+    // time, so a key set after this registration still reaches it.
+    if (auto* sourceInfo = sqliteEngine_->getSource(tableName)) {
+        sourceInfo->vtabInfo.recordKey = recordKey_.get();
     }
 
     sqliteRegisteredTables_.insert(tableName);
@@ -1667,19 +1683,7 @@ uint64_t FlatSQLDatabase::ingestOneWithSource(const uint8_t* flatbuffer, size_t 
                                                const std::string& source) {
     std::unique_lock lock(*accessMutex_);
     requireReadyUnlocked();
-    if (!storage_->canAppend(SIZE_PREFIX_LENGTH + length)) {
-        return kIngestRefused;
-    }
-    invalidateQueryResultCacheUnlocked();
-    IngestProfile* profile = ingestProfileEnabled_ ? &ingestProfile_ : nullptr;
-    const uint64_t begin = storage_->getWriteOffset();
-    const uint64_t seq = storage_->ingestFlatBuffer(flatbuffer, length,
-        [this, &source](std::string_view fileId, const uint8_t* data, size_t len,
-               uint64_t seq, uint64_t offset) {
-            onIngestWithSource(fileId, data, len, seq, offset, source);
-        }, profile);
-    recordSourceRangeUnlocked(source, begin, storage_->getWriteOffset());
-    return seq;
+    return ingestOneUnlocked(flatbuffer, length, &source);
 }
 
 // Legacy multi-source API (external storage)
@@ -1735,19 +1739,285 @@ void FlatSQLDatabase::clearTombstones(const std::string& tableName) {
 
 // ==================== Encryption ====================
 
-void FlatSQLDatabase::setEncryptionKey(const uint8_t* key, size_t keySize) {
+namespace {
+
+// HKDF-SHA256(key 00 01 .. 1f, no salt, "flatbuffers-buffer-v3" || BE32(1)),
+// 32 bytes (RFC 5869; node:crypto hkdfSync gives the same).
+constexpr uint8_t kBufferKeyVector[32] = {
+    0xf0, 0x33, 0x7d, 0x19, 0x4c, 0x59, 0x63, 0xe2, 0x8a, 0xd4, 0xb2, 0xf4,
+    0x7c, 0x75, 0x51, 0x9a, 0x73, 0xbc, 0xcb, 0x9e, 0x6d, 0x75, 0x64, 0xa1,
+    0xd6, 0x6e, 0x4a, 0x9d, 0x5e, 0x64, 0xee, 0x01};
+
+const char* const kNoRecordEncryption =
+    "this build cannot encrypt (encrypted) columns: its FlatBuffers crypto backend does "
+    "not derive keys with HKDF-SHA256 (format 3 needs it; build with OpenSSL, see README "
+    "\"Database-key encryption\")";
+
+const char* const kFormat2Refused =
+    "field-encryption format 2 (records encrypted by flatsql 3.2.0 or earlier, all under "
+    "the field keys of record 0) is not supported; migrate the database to format 3 "
+    "(README \"Database-key encryption\")";
+
+bool hasEncryptedColumn(const TableDef& table) {
+    for (const auto& col : table.columns) {
+        if (col.encrypted) return true;
+    }
+    return false;
+}
+
+// The binary schema's root table must mark (encrypted) exactly the fields the
+// database schema does, field id by field id, or the fields encrypted are not
+// the columns SQL decrypts. A .bfbs serialized without builtin attributes
+// marks none.
+bool checkBinarySchema(const TableDef& table, const uint8_t* schema, size_t schemaSize,
+                       std::string* error) {
+    if (!schema || schemaSize == 0) {
+        *error = "the schema is not a valid binary schema (.bfbs)";
+        return false;
+    }
+    flatbuffers::Verifier verifier(schema, schemaSize);
+    if (!reflection::VerifySchemaBuffer(verifier)) {
+        *error = "the schema is not a valid binary schema (.bfbs)";
+        return false;
+    }
+    const reflection::Object* root = reflection::GetSchema(schema)->root_table();
+    if (!root || !root->fields()) {
+        *error = "the binary schema has no root_type";
+        return false;
+    }
+    const auto* fields = root->fields();
+    for (const auto& column : table.columns) {
+        const reflection::Field* field = nullptr;
+        for (const auto* candidate : *fields) {
+            if (candidate && candidate->id() == column.fieldId) {
+                field = candidate;
+                break;
+            }
+        }
+        if (!field) {
+            if (column.encrypted) {
+                *error = "column " + column.name + " is (encrypted), but the binary schema's "
+                         "root table has no field " + std::to_string(column.fieldId);
+                return false;
+            }
+            continue;
+        }
+        if (!field->name() || field->name()->str() != column.name) {
+            *error = "field " + std::to_string(column.fieldId) + " of the binary schema's root "
+                     "table is not column " + column.name + ": the schemas differ";
+            return false;
+        }
+        if (flatbuffers::IsFieldEncrypted(field) != column.encrypted) {
+            *error = column.encrypted
+                ? "column " + column.name + " is (encrypted), but the binary schema does not "
+                  "mark it: serialize the .bfbs with builtin attributes (flatc --bfbs-builtins)"
+                : "the binary schema marks field " + column.name +
+                  " (encrypted), the database schema does not";
+            return false;
+        }
+    }
+    for (const auto* field : *fields) {
+        if (!field || !flatbuffers::IsFieldEncrypted(field)) continue;
+        bool known = false;
+        for (const auto& column : table.columns) {
+            if (column.fieldId == field->id() && column.encrypted) known = true;
+        }
+        if (!known) {
+            *error = "the binary schema marks field " +
+                     (field->name() ? field->name()->str() : std::to_string(field->id())) +
+                     " (encrypted), the database schema does not";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool checkRecordIndex(uint64_t recordIndex, std::string* error) {
+    if (recordIndex == 0) {
+        *error = "record index 0: a record's index is its sequence (rowid), numbered from 1. " +
+                 std::string(kFormat2Refused);
+        return false;
+    }
+    if (recordIndex > UINT32_MAX) {
+        *error = "record index " + std::to_string(recordIndex) +
+                 ": field-encryption format 3 numbers records 1 to 4294967295";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool FlatSQLDatabase::recordEncryptionAvailable() noexcept {
+    static const bool available = [] {
+        uint8_t key[flatbuffers::kEncryptionKeySize];
+        for (size_t i = 0; i < sizeof(key); i++) key[i] = static_cast<uint8_t>(i);
+        flatbuffers::EncryptionContext ctx(key, sizeof(key));
+        uint8_t derived[flatbuffers::kEncryptionKeySize];
+        ctx.DeriveBufferKey(1, derived);
+        return std::memcmp(derived, kBufferKeyVector, sizeof(derived)) == 0;
+    }();
+    return available;
+}
+
+bool FlatSQLDatabase::setEncryptionKey(const uint8_t* key, size_t keySize,
+                                       uint8_t storedFormat, std::string* error) noexcept {
+    const auto fail = [&](std::string text) {
+        if (error) *error = std::move(text);
+        return false;
+    };
+    if (!key || keySize != flatbuffers::kEncryptionKeySize) {
+        return fail("the encryption key must be 32 bytes");
+    }
+    if (storedFormat == flatbuffers::kFieldEncryptionV2) return fail(kFormat2Refused);
+    if (storedFormat != kRecordFormatUndeclared &&
+        storedFormat != flatbuffers::kFieldEncryptionV3) {
+        return fail("unknown field-encryption format " + std::to_string(storedFormat));
+    }
+
     std::unique_lock lock(*accessMutex_);
-    encryptionCtx_ = std::make_unique<flatbuffers::EncryptionContext>(key, keySize);
+    if (hasEncryptedFields()) {
+        if (!recordEncryptionAvailable()) return fail(kNoRecordEncryption);
+        if (storedFormat == kRecordFormatUndeclared) {
+            uint64_t stored = 0;
+            for (const auto& [name, table] : tables_) {
+                if (hasEncryptedColumn(table->getTableDef())) stored += table->getRecordCount();
+            }
+            if (stored > 0) {
+                return fail("this database holds " + std::to_string(stored) +
+                            " records in tables with (encrypted) columns: declare their "
+                            "field-encryption format (3 for records written by "
+                            "ingestOneEncrypted or encryptRecord). " + kFormat2Refused);
+            }
+        }
+    }
+    auto next = std::make_unique<flatbuffers::EncryptionContext>(key, keySize);
+    recordKey_->ctx = next.get();
+    encryptionCtx_ = std::move(next);
     invalidateQueryResultCacheUnlocked();
+    return true;
+}
+
+void FlatSQLDatabase::setEncryptionKey(const uint8_t* key, size_t keySize) {
+    std::string error;
+    if (!setEncryptionKey(key, keySize, kRecordFormatUndeclared, &error)) {
+        throw std::runtime_error(error);
+    }
 }
 
 bool FlatSQLDatabase::hasEncryptedFields() const {
     for (const auto& table : schema_.tables) {
-        for (const auto& col : table.columns) {
-            if (col.encrypted) return true;
-        }
+        if (hasEncryptedColumn(table)) return true;
     }
     return false;
+}
+
+const TableStore* FlatSQLDatabase::tableForRecordUnlocked(const uint8_t* record, size_t length,
+                                                          const std::string& source) const {
+    if (!record || length < FILE_IDENTIFIER_OFFSET + FILE_IDENTIFIER_LENGTH) return nullptr;
+    const std::string fileId = StreamingFlatBufferStore::extractFileId(record, length);
+    const auto& routes = source.empty() ? fileIdToTable_ : sourceFileIdToTable_;
+    const auto route = routes.find(source.empty() ? fileId : source + ":" + fileId);
+    if (route == routes.end()) return nullptr;
+    const auto table = tables_.find(route->second);
+    return table == tables_.end() ? nullptr : table->second.get();
+}
+
+bool FlatSQLDatabase::cipherRecordUnlocked(uint8_t* record, size_t length,
+                                           const uint8_t* schema, size_t schemaSize,
+                                           uint64_t recordIndex, bool encrypt,
+                                           std::string* error) const {
+    if (!encryptionCtx_) {
+        *error = "No encryption key set";
+        return false;
+    }
+    if (!recordEncryptionAvailable()) {
+        *error = kNoRecordEncryption;
+        return false;
+    }
+    if (!checkRecordIndex(recordIndex, error)) return false;
+    const TableStore* table = tableForRecordUnlocked(record, length, "");
+    if (!table) {
+        *error = "the record's file identifier is not registered to a table";
+        return false;
+    }
+    if (!checkBinarySchema(table->getTableDef(), schema, schemaSize, error)) return false;
+    const auto result = encrypt
+        ? flatbuffers::EncryptBuffer(record, length, schema, schemaSize, *encryptionCtx_,
+                                     static_cast<uint32_t>(recordIndex),
+                                     flatbuffers::kFieldEncryptionV3)
+        : flatbuffers::DecryptBuffer(record, length, schema, schemaSize, *encryptionCtx_,
+                                     static_cast<uint32_t>(recordIndex),
+                                     flatbuffers::kFieldEncryptionV3);
+    if (!result.ok()) {
+        *error = result.message;
+        return false;
+    }
+    return true;
+}
+
+bool FlatSQLDatabase::encryptRecord(uint8_t* record, size_t length,
+                                    const uint8_t* schema, size_t schemaSize,
+                                    uint64_t recordIndex, std::string* error) const noexcept {
+    std::shared_lock lock(*accessMutex_);
+    std::string message;
+    if (cipherRecordUnlocked(record, length, schema, schemaSize, recordIndex, true, &message)) {
+        return true;
+    }
+    if (error) *error = std::move(message);
+    return false;
+}
+
+bool FlatSQLDatabase::decryptRecord(uint8_t* record, size_t length,
+                                    const uint8_t* schema, size_t schemaSize,
+                                    uint64_t recordIndex, std::string* error) const noexcept {
+    std::shared_lock lock(*accessMutex_);
+    std::string message;
+    if (cipherRecordUnlocked(record, length, schema, schemaSize, recordIndex, false, &message)) {
+        return true;
+    }
+    if (error) *error = std::move(message);
+    return false;
+}
+
+uint64_t FlatSQLDatabase::ingestOneEncrypted(const uint8_t* flatbuffer, size_t length,
+                                             const uint8_t* schema, size_t schemaSize,
+                                             const std::string& source, std::string* error) {
+    std::unique_lock lock(*accessMutex_);
+    std::string message;
+    const auto fail = [&](std::string text) {
+        if (error) *error = std::move(text);
+        return kIngestRefused;
+    };
+    if (reindexUnavailable_) return fail("state: reindex incomplete");
+    if (!storage_->canAppend(SIZE_PREFIX_LENGTH + length)) {
+        return fail("arena capacity exhausted");
+    }
+    if (!source.empty() &&
+        std::find(registeredSources_.begin(), registeredSources_.end(), source) ==
+            registeredSources_.end()) {
+        return fail("Source not registered: " + source);
+    }
+    if (!tableForRecordUnlocked(flatbuffer, length, source)) {
+        return fail("the record's file identifier is not registered to a table" +
+                    (source.empty() ? std::string() : " of source " + source));
+    }
+    // The sequence this record gets is its record index: both are decided
+    // here, under the lock, so no other record can take either.
+    const uint64_t sequence = storage_->nextSequence();
+    std::vector<uint8_t> record(flatbuffer, flatbuffer + length);
+    if (!cipherRecordUnlocked(record.data(), record.size(), schema, schemaSize, sequence,
+                              true, &message)) {
+        return fail(std::move(message));
+    }
+    const uint64_t assigned =
+        ingestOneUnlocked(record.data(), record.size(), source.empty() ? nullptr : &source);
+    if (assigned == kIngestRefused) return fail("arena capacity exhausted");
+    if (assigned != sequence) {
+        return fail("record " + std::to_string(assigned) + " was encrypted as record " +
+                    std::to_string(sequence));
+    }
+    return sequence;
 }
 
 // ==================== HMAC Authentication ====================

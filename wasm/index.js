@@ -367,11 +367,12 @@ export async function initFlatSQL(moduleFactoryOrOptions) {
         getStorageBuffer: Module.cwrap('flatsql_get_storage_buffer', 'number', ['number']),
         getStorageSize: Module.cwrap('flatsql_get_storage_size', 'number', ['number']),
 
-        // Encryption
-        setEncryptionKey: Module.cwrap('flatsql_set_encryption_key', 'number', ['number', 'number', 'number']),
+        // Encryption (field-encryption format 3; the record index is the sequence)
+        setEncryptionKey: Module.cwrap('flatsql_set_encryption_key', 'number', ['number', 'number', 'number', 'number']),
         isEncrypted: Module.cwrap('flatsql_is_encrypted', 'number', ['number']),
-        encryptBuffer: Module.cwrap('flatsql_encrypt_buffer', 'number', ['number', 'number', 'number', 'number', 'number']),
-        decryptBuffer: Module.cwrap('flatsql_decrypt_buffer', 'number', ['number', 'number', 'number', 'number', 'number']),
+        encryptBuffer: Module.cwrap('flatsql_encrypt_buffer', 'number', ['number', 'number', 'number', 'number', 'number', 'number']),
+        decryptBuffer: Module.cwrap('flatsql_decrypt_buffer', 'number', ['number', 'number', 'number', 'number', 'number', 'number']),
+        ingestOneEncrypted: Module.cwrap('flatsql_ingest_one_encrypted', 'number', ['number', 'number', 'number', 'number', 'number', 'string']),
 
         // HMAC Authentication
         setHMACVerification: Module.cwrap('flatsql_set_hmac_verification', 'number', ['number', 'number']),
@@ -422,6 +423,15 @@ function blobToArray(bytes) {
 
 function setHeapBytes(data, ptr) {
     Module.HEAPU8.set(data, wasmPointerToByteOffset(ptr));
+}
+
+// A record index is the record's sequence (rowid): 1 to 4294967295.
+function requireRecordIndex(method, recordIndex) {
+    if (!Number.isInteger(recordIndex) || recordIndex < 1 || recordIndex > 0xFFFFFFFF) {
+        throw new TypeError(
+            `${method}: recordIndex must be the record's sequence, an integer from 1 to 4294967295 ` +
+            '(field-encryption format 2, without a record index, is not supported)');
+    }
 }
 
 function withHeapBytes(data, callback) {
@@ -1131,16 +1141,26 @@ export class FlatSQLDatabase {
     }
 
     // ==================== Encryption API ====================
+    //
+    // The (encrypted) fields of a record are encrypted under FlatBuffers field
+    // encryption format 3: each record under its own key, with its sequence
+    // (rowid) as the record index, so no two records share a key stream.
 
     /**
-     * Set the encryption key for field-level FlatBuffer decryption.
+     * Set the database key. SQL decrypts the (encrypted) columns with it.
      * @param {Uint8Array} key - 32-byte AES-256 key
+     * @param {{format?: number}} [options] - format: the field-encryption format
+     *   of the records the database already holds in tables with (encrypted)
+     *   columns. Required (3) when it holds any. Format 2 (records encrypted by
+     *   flatsql 3.2.0 or earlier) is refused: see README "Database-key encryption".
      */
-    setEncryptionKey(key) {
-        const ptr = Module._malloc(key.length);
-        setHeapBytes(key, ptr);
-        const result = api.setEncryptionKey(this._handle, ptr, key.length);
-        Module._free(ptr);
+    setEncryptionKey(key, options = {}) {
+        const format = options && options.format !== undefined ? options.format : 0;
+        if (!Number.isInteger(format) || format < 0 || format > 255) {
+            throw new TypeError('setEncryptionKey: options.format must be 3');
+        }
+        const result = withHeapBytes(key, (ptr) =>
+            api.setEncryptionKey(this._handle, ptr, key.length, format));
         if (!result) throw new Error(api.getError());
     }
 
@@ -1153,41 +1173,60 @@ export class FlatSQLDatabase {
     }
 
     /**
-     * Encrypt a FlatBuffer in-place using the database's encryption key.
-     * @param {Uint8Array} buffer - FlatBuffer data
-     * @param {Uint8Array} schema - Binary schema (.bfbs)
+     * Encrypt the (encrypted) fields of a FlatBuffer as the record with index
+     * `recordIndex`: the sequence it has, or gets, in this database. To write
+     * encrypted records use ingestOneEncrypted, which assigns and uses the
+     * sequence together.
+     * @param {Uint8Array} buffer - FlatBuffer data (no size prefix)
+     * @param {Uint8Array} schema - Binary schema (.bfbs) with builtin attributes (flatc --bfbs-builtins)
+     * @param {number} recordIndex - The record's sequence (1 to 4294967295)
      * @returns {Uint8Array} Encrypted buffer (copy)
      */
-    encryptBuffer(buffer, schema) {
-        const bufPtr = Module._malloc(buffer.length);
-        setHeapBytes(buffer, bufPtr);
-        const schemaPtr = Module._malloc(schema.length);
-        setHeapBytes(schema, schemaPtr);
-        const result = api.encryptBuffer(this._handle, bufPtr, buffer.length, schemaPtr, schema.length);
-        const encrypted = copyHeapBytes(bufPtr, buffer.length);
-        Module._free(bufPtr);
-        Module._free(schemaPtr);
-        if (!result) throw new Error(api.getError());
-        return encrypted;
+    encryptBuffer(buffer, schema, recordIndex) {
+        requireRecordIndex('encryptBuffer', recordIndex);
+        return this._cipherBuffer(api.encryptBuffer, buffer, schema, recordIndex);
     }
 
     /**
-     * Decrypt a FlatBuffer in-place using the database's encryption key.
-     * @param {Uint8Array} buffer - Encrypted FlatBuffer data
-     * @param {Uint8Array} schema - Binary schema (.bfbs)
+     * Decrypt the (encrypted) fields of a stored FlatBuffer.
+     * @param {Uint8Array} buffer - Encrypted FlatBuffer data (no size prefix)
+     * @param {Uint8Array} schema - Binary schema (.bfbs) with builtin attributes (flatc --bfbs-builtins)
+     * @param {number} recordIndex - The record's sequence (1 to 4294967295)
      * @returns {Uint8Array} Decrypted buffer (copy)
      */
-    decryptBuffer(buffer, schema) {
+    decryptBuffer(buffer, schema, recordIndex) {
+        requireRecordIndex('decryptBuffer', recordIndex);
+        return this._cipherBuffer(api.decryptBuffer, buffer, schema, recordIndex);
+    }
+
+    _cipherBuffer(cipher, buffer, schema, recordIndex) {
         const bufPtr = Module._malloc(buffer.length);
-        setHeapBytes(buffer, bufPtr);
         const schemaPtr = Module._malloc(schema.length);
-        setHeapBytes(schema, schemaPtr);
-        const result = api.decryptBuffer(this._handle, bufPtr, buffer.length, schemaPtr, schema.length);
-        const decrypted = copyHeapBytes(bufPtr, buffer.length);
-        Module._free(bufPtr);
-        Module._free(schemaPtr);
-        if (!result) throw new Error(api.getError());
-        return decrypted;
+        try {
+            setHeapBytes(buffer, bufPtr);
+            setHeapBytes(schema, schemaPtr);
+            const result = cipher(this._handle, bufPtr, buffer.length, schemaPtr, schema.length, recordIndex);
+            if (!result) throw new Error(api.getError());
+            return copyHeapBytes(bufPtr, buffer.length);
+        } finally {
+            Module._free(bufPtr);
+            Module._free(schemaPtr);
+        }
+    }
+
+    /**
+     * Encrypt a plaintext FlatBuffer under the sequence it gets and ingest it.
+     * @param {Uint8Array} data - FlatBuffer data (no size prefix)
+     * @param {Uint8Array} schema - Binary schema (.bfbs) with builtin attributes (flatc --bfbs-builtins)
+     * @param {string|null} [source] - Source name, as for ingestOne
+     * @returns {number} The record's sequence
+     */
+    ingestOneEncrypted(data, schema, source = null) {
+        const result = withHeapBytes(data, (dataPtr) =>
+            withHeapBytes(schema, (schemaPtr) =>
+                api.ingestOneEncrypted(this._handle, dataPtr, data.length, schemaPtr, schema.length, source)));
+        if (result < 0) throw new Error(api.getError());
+        return result;
     }
 
     // ==================== HMAC Authentication API ====================

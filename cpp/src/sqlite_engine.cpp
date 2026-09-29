@@ -1652,6 +1652,15 @@ const SourceInfo* SQLiteEngine::getSource(const std::string& sourceName) const {
 static int fastPathHits = 0;
 static int fastPathFullScanHits = 0;
 
+// A table with (encrypted) columns is read through its virtual table, which
+// decrypts them (sqlite_vtab.cpp). The fast paths below extract stored bytes.
+static bool hasEncryptedColumn(const TableDef* table) {
+    for (const auto& col : table->columns) {
+        if (col.encrypted) return true;
+    }
+    return false;
+}
+
 // Debug counters exposed for testing
 int getFastPathHits() { return fastPathHits; }
 int getFastPathFullScanHits() { return fastPathFullScanHits; }
@@ -1705,7 +1714,8 @@ bool SQLiteEngine::tryFastPath(const std::string& sql, const std::vector<Value>&
     // Full scan fast path
     if (parsed->isFullScan && params.empty()) {
         auto* source = findSourceCaseInsensitive(parsed->tableName);
-        if (source && source->store && source->tableDef && source->extractor) {
+        if (source && source->store && source->tableDef && source->extractor &&
+            !hasEncryptedColumn(source->tableDef)) {
             fastPathFullScanHits++;
 
             // Build column names
@@ -1787,7 +1797,8 @@ bool SQLiteEngine::tryFastPath(const std::string& sql, const std::vector<Value>&
     }
 
     auto* source = findSourceCaseInsensitive(parsed->tableName);
-    if (!source || !source->store || !source->tableDef) {
+    if (!source || !source->store || !source->tableDef ||
+        hasEncryptedColumn(source->tableDef)) {
         return false;
     }
 

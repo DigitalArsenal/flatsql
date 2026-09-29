@@ -557,14 +557,48 @@ public:
     void clearTombstones(const std::string& tableName);
 
     // ==================== Encryption API ====================
+    //
+    // The (encrypted) fields of a record are encrypted under FlatBuffers field
+    // encryption format 3 (flatbuffers/encryption.h, kFieldEncryptionV3): the
+    // record gets its own buffer key, DeriveBufferKey(record index), and each
+    // encrypted instance its own IV, FieldInstanceIV(position), so no two
+    // records and no two instances share a key stream. The record index is
+    // the record's sequence (its rowid). Records are numbered 1, 2, 3, ... in
+    // stream order, so the stream stores the index: replaying the stream into
+    // an empty database gives every record the index it was encrypted with.
+    // SQL reads an (encrypted) column from a decrypted copy of the record
+    // (sqlite_vtab.cpp); those columns are never indexed.
+    //
+    // Format 2 (flatsql 3.2.0 and earlier: every record under the field keys
+    // of record 0) is refused. README "Database-key encryption" has the
+    // migration.
+
+    // Field-encryption format of the records a database holds, declared to
+    // setEncryptionKey: undeclared (the database holds no records in a table
+    // with (encrypted) columns), or kFieldEncryptionV3.
+    static constexpr uint8_t kRecordFormatUndeclared = 0;
 
     /**
-     * Set the encryption key for field-level FlatBuffer decryption.
-     * Fields marked with (encrypted) in the schema will be transparently
-     * decrypted when read through SQL queries.
+     * Set the database key. Fields marked (encrypted) in the schema are
+     * decrypted when read through SQL, and encryptRecord/ingestOneEncrypted
+     * encrypt them.
      *
-     * @param key     32-byte AES-256 key
-     * @param keySize Must be 32
+     * A database whose tables have (encrypted) columns needs a FlatBuffers
+     * crypto backend that derives keys with HKDF-SHA256
+     * (recordEncryptionAvailable), and when it already holds records in
+     * those tables it needs their format declared: storedFormat 3. Format 2
+     * is refused. Never throws: false with *error set.
+     *
+     * @param key          32-byte AES-256 key
+     * @param keySize      Must be 32
+     * @param storedFormat kRecordFormatUndeclared or 3
+     */
+    bool setEncryptionKey(const uint8_t* key, size_t keySize, uint8_t storedFormat,
+                          std::string* error) noexcept;
+
+    /**
+     * setEncryptionKey(key, keySize, kRecordFormatUndeclared, &error), with
+     * the error thrown as std::runtime_error.
      */
     void setEncryptionKey(const uint8_t* key, size_t keySize);
 
@@ -584,6 +618,42 @@ public:
      * Check if any table has encrypted fields.
      */
     bool hasEncryptedFields() const;
+
+    /**
+     * True when this build's FlatBuffers crypto backend derives format-3
+     * buffer keys with HKDF-SHA256 (a known-answer check). The fallback
+     * backend (no OpenSSL or Crypto++) does not: its derivation has 256
+     * outputs, so records would share key streams. Without it a database
+     * with (encrypted) columns refuses a key.
+     */
+    static bool recordEncryptionAvailable() noexcept;
+
+    /**
+     * Encrypt (or decrypt) the (encrypted) fields of one record in place,
+     * format 3, as the record with index `recordIndex` (its sequence, 1 to
+     * 4294967295). The record (no size prefix) must route to a table of this
+     * database by its file identifier, and `schema` is that table's binary
+     * schema (.bfbs) serialized with builtin attributes (flatc
+     * --bfbs-builtins), marking the same fields (encrypted) as the database
+     * schema. Never throws: false with *error set, the record unchanged.
+     */
+    bool encryptRecord(uint8_t* record, size_t length,
+                       const uint8_t* schema, size_t schemaSize,
+                       uint64_t recordIndex, std::string* error) const noexcept;
+    bool decryptRecord(uint8_t* record, size_t length,
+                       const uint8_t* schema, size_t schemaSize,
+                       uint64_t recordIndex, std::string* error) const noexcept;
+
+    /**
+     * Encrypt one plaintext record (no size prefix) under the sequence it gets
+     * and ingest it: the way to write encrypted records, since the index is
+     * assigned and used under one lock. `source` routes it as
+     * ingestOneWithSource does ("" for none). Returns the sequence, or
+     * kIngestRefused with *error set (nothing appended).
+     */
+    uint64_t ingestOneEncrypted(const uint8_t* flatbuffer, size_t length,
+                                const uint8_t* schema, size_t schemaSize,
+                                const std::string& source, std::string* error);
 
     // ==================== HMAC Authentication ====================
 
@@ -752,8 +822,23 @@ private:
     size_t rawStreamCacheMaxEntries_ = 64;
     size_t rawStreamCacheMaxTotalBytes_ = 256 * 1024 * 1024;
 
-    // Encryption
+    // Encryption. recordKey_ is the holder the tables read the key through
+    // (sqlite_vtab.h RecordKey); it lives as long as the database.
     std::unique_ptr<flatbuffers::EncryptionContext> encryptionCtx_;
+    std::unique_ptr<RecordKey> recordKey_ = std::make_unique<RecordKey>();
+
+    // The table a record routes to by its file identifier (and source, when
+    // not empty), or nullptr.
+    const TableStore* tableForRecordUnlocked(const uint8_t* record, size_t length,
+                                             const std::string& source) const;
+    // encryptRecord/decryptRecord without the lock.
+    bool cipherRecordUnlocked(uint8_t* record, size_t length,
+                              const uint8_t* schema, size_t schemaSize,
+                              uint64_t recordIndex, bool encrypt,
+                              std::string* error) const;
+    // ingestOne/ingestOneWithSource without the lock (source: nullptr for none).
+    uint64_t ingestOneUnlocked(const uint8_t* flatbuffer, size_t length,
+                               const std::string* source);
 
     // HMAC verification
     bool hmacEnabled_ = false;

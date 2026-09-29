@@ -296,14 +296,21 @@ export interface FlatSQLDatabase {
   destroy(): void;
 
   // ==================== Encryption ====================
+  //
+  // The (encrypted) fields of a record are encrypted under FlatBuffers field
+  // encryption format 3: each record under its own key, with its sequence
+  // (rowid) as the record index, so no two records share a key stream.
 
   /**
-   * Set the encryption key for field-level FlatBuffer decryption.
-   * Fields marked with (encrypted) in the schema will be transparently
+   * Set the database key. Fields marked with (encrypted) in the schema are
    * decrypted when read through SQL queries.
    * @param key 32-byte AES-256 key
+   * @param options.format The field-encryption format of the records the
+   *   database already holds in tables with (encrypted) columns: required (3)
+   *   when it holds any. Format 2 (records encrypted by flatsql 3.2.0 or
+   *   earlier) is refused: see README "Database-key encryption".
    */
-  setEncryptionKey(key: Uint8Array): void;
+  setEncryptionKey(key: Uint8Array, options?: { format?: 3 }): void;
 
   /**
    * Check if encryption is enabled
@@ -311,20 +318,33 @@ export interface FlatSQLDatabase {
   isEncrypted(): boolean;
 
   /**
-   * Encrypt a FlatBuffer using the database's encryption key
-   * @param buffer FlatBuffer data
-   * @param schema Binary schema (.bfbs)
+   * Encrypt the (encrypted) fields of a FlatBuffer as the record with index
+   * `recordIndex`, the sequence it has or gets in this database. To write
+   * encrypted records use ingestOneEncrypted.
+   * @param buffer FlatBuffer data (no size prefix)
+   * @param schema Binary schema (.bfbs) with builtin attributes (flatc --bfbs-builtins)
+   * @param recordIndex The record's sequence (1 to 4294967295)
    * @returns Encrypted buffer copy
    */
-  encryptBuffer(buffer: Uint8Array, schema: Uint8Array): Uint8Array;
+  encryptBuffer(buffer: Uint8Array, schema: Uint8Array, recordIndex: number): Uint8Array;
 
   /**
-   * Decrypt a FlatBuffer using the database's encryption key
-   * @param buffer Encrypted FlatBuffer data
-   * @param schema Binary schema (.bfbs)
+   * Decrypt the (encrypted) fields of a stored FlatBuffer
+   * @param buffer Encrypted FlatBuffer data (no size prefix)
+   * @param schema Binary schema (.bfbs) with builtin attributes (flatc --bfbs-builtins)
+   * @param recordIndex The record's sequence (1 to 4294967295)
    * @returns Decrypted buffer copy
    */
-  decryptBuffer(buffer: Uint8Array, schema: Uint8Array): Uint8Array;
+  decryptBuffer(buffer: Uint8Array, schema: Uint8Array, recordIndex: number): Uint8Array;
+
+  /**
+   * Encrypt a plaintext FlatBuffer under the sequence it gets and ingest it
+   * @param data FlatBuffer data (no size prefix)
+   * @param schema Binary schema (.bfbs) with builtin attributes (flatc --bfbs-builtins)
+   * @param source Source name, as for ingestOne
+   * @returns The record's sequence
+   */
+  ingestOneEncrypted(data: Uint8Array, schema: Uint8Array, source?: string | null): number;
 
   // ==================== HMAC Authentication ====================
 
