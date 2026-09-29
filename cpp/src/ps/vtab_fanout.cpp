@@ -21,6 +21,11 @@ namespace ps {
 
 namespace {
 
+// §37 gap 5: a gseq-ordered tag page collects the tags' records when the
+// lane counters give at most this many (and fewer than an eighth of the
+// type's arrivals); otherwise it reads arrivals and checks each row.
+constexpr uint64_t kCollectMax = 262144;
+
 // ---- k-way merge ------------------------------------------------------------
 class Merger : public RowSource {
 public:
@@ -170,9 +175,9 @@ private:
 class ArrivalRows : public RowSource {
 public:
     ArrivalRows(ReaderLane* lane, StmtCtx* stmt, TypeSnap* ts, uint64_t lo, uint64_t hi, bool desc, const TagMatch& tags,
-                std::vector<uint32_t> allowed, uint64_t offset = 0)
+                std::vector<uint32_t> allowed, uint64_t offset = 0, std::shared_ptr<StmtShared> shared = nullptr)
         : lane_(lane), stmt_(stmt), ts_(ts), lo_(lo), hi_(hi), desc_(desc), tags_(tags), allowed_(std::move(allowed)),
-          offset_(offset) {}
+          offset_(offset), shared_(std::move(shared)) {}
 
     int32_t next(CurRow* out) override {
         LaneStore& st = lane_->store();
@@ -369,6 +374,8 @@ public:
             f.bound = std::min(snap->pseqHi(), ts_->labeledThrough(c.first));
             f.tags = tags_;
             f.knownLive = knownLive;
+            f.shared = shared_;
+            f.copies = ts_;
             rc = f.accept(c.second, out);
             if (rc < 0) return rc;
             if (rc == 0) continue;
@@ -391,6 +398,7 @@ private:
     TagMatch tags_;
     std::vector<uint32_t> allowed_;  // sorted; empty = every partition
     uint64_t offset_ = 0;
+    std::shared_ptr<StmtShared> shared_;
     std::vector<std::pair<uint32_t, uint64_t>> cands_;
     bool started_ = false;
     uint64_t begin_ = 0, end_ = 0, pos_ = 0, bufPos_ = 0;
@@ -404,8 +412,9 @@ private:
 class CidRowsType : public RowSource {
 public:
     CidRowsType(ReaderLane* lane, StmtCtx* stmt, TypeSnap* ts, const uint8_t cid[kCidLen], const TagMatch& tags,
-                uint64_t floor, std::vector<uint32_t> allowed)
-        : lane_(lane), stmt_(stmt), ts_(ts), tags_(tags), floor_(floor), allowed_(std::move(allowed)) {
+                uint64_t floor, std::vector<uint32_t> allowed, std::shared_ptr<StmtShared> shared = nullptr)
+        : lane_(lane), stmt_(stmt), ts_(ts), tags_(tags), floor_(floor), allowed_(std::move(allowed)),
+          shared_(std::move(shared)) {
         std::memcpy(cid_, cid, kCidLen);
     }
     int32_t next(CurRow* out) override {
@@ -431,6 +440,8 @@ public:
             f.snap = snap;
             f.bound = std::min(snap->pseqHi(), ts_->labeledThrough(c.pid));
             f.tags = tags_;
+            f.shared = shared_;
+            f.copies = ts_;
             rc = f.accept(c.pseq, out);
             if (rc < 0) return rc;
             if (rc == 0) continue;
@@ -449,7 +460,489 @@ private:
     TagMatch tags_;
     uint64_t floor_;
     std::vector<uint32_t> allowed_;
+    std::shared_ptr<StmtShared> shared_;
     bool done_ = false;
+};
+
+// ---- §37 gap 1: text CID order from the cid catalog (A17) ---------------------
+// The catalog is keyed by the A17 sort key, whose byte order is the text
+// order of the CIDs: one ordered pass over its entries gives the type's live
+// CIDs in text order. Each key's entries resolve per copy (the latest type
+// commit wins, DEAD over the rest at equal tcs); the live FIRST or PROMOTED
+// copy, if any, is the record. Rows an OFFSET skips are counted from the
+// catalog alone: no row, frame or posting of theirs is read.
+class CatalogOrderRows : public RowSource {
+public:
+    CatalogOrderRows(ReaderLane* lane, StmtCtx* stmt, TypeSnap* ts, std::shared_ptr<StmtShared> sh, const TagMatch& tags,
+                     uint64_t floor, uint64_t offset, bool desc, bool restrict)
+        : lane_(lane), stmt_(stmt), ts_(ts), sh_(std::move(sh)), tags_(tags), floor_(floor), offset_(offset),
+          desc_(desc), restrict_(restrict) {}
+
+    int32_t next(CurRow* out) override {
+        LaneStore& st = lane_->store();
+        if (!started_) {
+            started_ = true;
+            scan_ = st.scanType(*ts_, kIxTypeCid, nullptr, 0, nullptr, 0, desc_);
+            if (scan_.err()) return scan_.err();
+        }
+        for (;;) {
+            if (!scan_.valid()) return scan_.err();
+            const int32_t prc = pollEvery(&st, &poll_);
+            if (prc < 0) return prc;
+            key_.assign(reinterpret_cast<const char*>(scan_.key()), scan_.klen());
+            copies_.clear();
+            do {
+                if (scan_.vlen() >= 29) {
+                    const uint8_t* v = scan_.val();
+                    Copy c{getBE32(v), getBE64(v + 4), getBE64(v + 12), v[20], getBE64(v + 21)};
+                    bool merged = false;
+                    for (Copy& e : copies_) {
+                        if (e.pid != c.pid || e.pseq != c.pseq) continue;
+                        if (c.tcs > e.tcs || (c.tcs == e.tcs && rank(c.label) >= rank(e.label))) e = c;
+                        merged = true;
+                        break;
+                    }
+                    if (!merged) copies_.push_back(c);
+                }
+                scan_.next();
+            } while (scan_.valid() && scan_.klen() == key_.size() &&
+                     std::memcmp(scan_.key(), key_.data(), key_.size()) == 0);
+            if (scan_.err()) return scan_.err();
+            const Copy* first = nullptr;
+            for (const Copy& c : copies_)
+                if (c.label == kLblFirst || c.label == kLblPromoted) first = &c;
+            if (!first) continue;
+            if (restrict_ && !sh_->allowed(first->pid)) continue;
+            if (first->gseq < floor_) continue;
+            if (offset_) {
+                offset_--;
+                if (st.stats()) st.stats()->indexEntries++;
+                continue;
+            }
+            PartSnap* snap = nullptr;
+            int32_t rc = lane_->partForType(stmt_, first->pid, ts_->fid, &snap);
+            if (rc < 0) return rc;
+            RowFilter f;
+            f.store = &st;
+            f.stmt = stmt_;
+            f.snap = snap;
+            f.type = ts_;
+            f.bound = std::min(snap->pseqHi(), ts_->labeledThrough(first->pid));
+            f.tags = tags_;
+            f.knownLive = true;  // the catalog's labels are the type snapshot's liveness
+            f.shared = sh_;
+            rc = f.accept(first->pseq, out);
+            if (rc < 0) return rc;
+            if (rc == 0) continue;
+            out->gseq = first->gseq;
+            out->key = key_;
+            return 1;
+        }
+    }
+
+private:
+    struct Copy {
+        uint32_t pid;
+        uint64_t pseq;
+        uint64_t tcs;
+        uint8_t label;
+        uint64_t gseq;
+    };
+    static int rank(uint8_t l) { return l == kLblDead ? 9 : int(l); }
+    ReaderLane* lane_;
+    StmtCtx* stmt_;
+    TypeSnap* ts_;
+    std::shared_ptr<StmtShared> sh_;
+    TagMatch tags_;
+    uint64_t floor_;
+    uint64_t offset_;
+    bool desc_, restrict_;
+    bool started_ = false;
+    PostingScan scan_;
+    std::string key_;
+    std::vector<Copy> copies_;
+    uint32_t poll_ = 0;
+};
+
+// ---- §37 gap 2: per-object point profiles on OBJECT_EPOCH (A18) --------------
+// Postings count per kind in a snapshot (L0 sections and runs).
+int32_t kindCount(LaneStore& st, const PartSnap& s, uint16_t kind, uint64_t* n) {
+    *n = 0;
+    if (s.empty) return 0;
+    int32_t rc = 0;
+    const SectionList* list = st.sections(s, kind, &rc);
+    if (!list) return rc;
+    for (const auto& sec : *list)
+        if (sec) *n += sec->offs.size();
+    if (!s.manifest) return 0;
+    for (const ManifestSegRef& m : s.manifest->segs)
+        for (const SegRunRef& rr : m.runs) {
+            FileKey fk;
+            auto run = st.run(s.pid, m.seg, rr.gen, rr.fileLen, &fk, &rc);
+            if (!run) return rc;
+            *n += run->kindEntries(kind);
+        }
+    return 0;
+}
+
+// The snapshot without the sealed segments whose rows' epochs all lie
+// outside [lo, hi] ms (the manifest's zone map). OBJECT_EPOCH postings are
+// written with their own rows, so such a segment's runs hold none in range.
+PartSnap* zonePruned(StmtShared* sh, PartSnap* s, int64_t lo, int64_t hi) {
+    if (!s->manifest) return s;
+    bool any = false;
+    for (const ManifestSegRef& m : s->manifest->segs)
+        if (m.sealed && m.minEpoch <= m.maxEpoch && (m.maxEpoch < lo || m.minEpoch > hi)) any = true;
+    if (!any) return s;
+    std::unique_ptr<PartSnap> c(new PartSnap(*s));
+    auto m = std::make_shared<Manifest>(*s->manifest);
+    m->segs.erase(std::remove_if(m->segs.begin(), m->segs.end(),
+                                 [&](const ManifestSegRef& g) {
+                                     return g.sealed && g.minEpoch <= g.maxEpoch && (g.maxEpoch < lo || g.minEpoch > hi);
+                                 }),
+                  m->segs.end());
+    c->manifest = m;
+    sh->owned.push_back(std::move(c));
+    return sh->owned.back().get();
+}
+
+// The object key's text: the escaped bytes before the (00 01) terminator,
+// unescaped; a u64 key (8 bytes, first byte 0: object columns hold u64
+// values below 2^56 and strings never start with NUL) in decimal.
+std::string objectText(const std::string& prefix, bool u64) {
+    std::string raw;
+    for (size_t i = 0; i < prefix.size(); i++) {
+        const uint8_t b = uint8_t(prefix[i]);
+        if (b == 0 && i + 1 < prefix.size()) {
+            if (uint8_t(prefix[i + 1]) == 0xff) {
+                raw.push_back('\0');
+                i++;
+                continue;
+            }
+            break;  // 00 01: the terminator
+        }
+        raw.push_back(char(b));
+    }
+    if (u64 && raw.size() == 8 && raw[0] == '\0')
+        return std::to_string(getBE64(reinterpret_cast<const uint8_t*>(raw.data())));
+    return raw;
+}
+
+struct ObjSide {
+    bool has = false;
+    int64_t sec = 0;
+    std::vector<CurRow> rows;
+};
+
+// One partition's objects in key order, each summarized by its best live
+// candidates on either side of the target second.
+class PartObjects {
+public:
+    RowFilter f;
+    PartSnap* scanSnap = nullptr;
+    uint8_t kind = kPointAsof;
+    int64_t T = 0, elo = INT64_MIN, ehi = INT64_MAX;
+    bool have = false;
+    std::string okey;
+    ObjSide b, a;
+
+    int32_t advance(LaneStore& st, uint32_t* poll) {
+        have = false;
+        if (!started_) {
+            started_ = true;
+            scan_ = st.scan(*scanSnap, kIxObjectEpoch, nullptr, 0, nullptr, 0, false);
+            if (scan_.err()) return scan_.err();
+        }
+        while (scan_.valid()) {
+            const int32_t prc = pollEvery(&st, poll);
+            if (prc < 0) return prc;
+            if (scan_.klen() < 10) {
+                scan_.next();
+                continue;
+            }
+            okey.assign(reinterpret_cast<const char*>(scan_.key()), scan_.klen() - 8);
+            ents_.clear();
+            do {
+                const int64_t ms = decI64(scan_.key() + scan_.klen() - 8);
+                if (ms >= elo && ms <= ehi && scan_.vlen() >= 8) ents_.push_back({ms, getBE64(scan_.val())});
+                scan_.next();
+            } while (scan_.valid() && scan_.klen() == okey.size() + 8 &&
+                     std::memcmp(scan_.key(), okey.data(), okey.size()) == 0);
+            if (scan_.err()) return scan_.err();
+            const int32_t rc = summarize(st);
+            if (rc < 0) return rc;
+            if (b.has || a.has) {
+                have = true;
+                return 0;
+            }
+        }
+        return scan_.err();
+    }
+
+private:
+    // Accepts the candidates of one second, [i, j) in ents_.
+    int32_t acceptGroup(size_t i, size_t j, ObjSide* side) {
+        side->rows.clear();
+        for (size_t k = i; k < j; k++) {
+            CurRow r;
+            const int32_t rc = f.accept(ents_[k].second, &r);
+            if (rc < 0) return rc;
+            if (rc == 1) side->rows.push_back(std::move(r));
+        }
+        return 0;
+    }
+    int32_t summarize(LaneStore&) {
+        b = ObjSide();
+        a = ObjSide();
+        const size_t n = ents_.size();
+        if (!n) return 0;
+        // First entry whose second is >= T (entries ascend by ms).
+        size_t split = 0;
+        while (split < n && epochSecFloor(ents_[split].first) < T) split++;
+        if (kind == kPointAsof || kind == kPointNearest) {
+            // Seconds <= T: [0, upto) with upto past every entry at second T.
+            size_t upto = split;
+            while (upto < n && epochSecFloor(ents_[upto].first) == T) upto++;
+            size_t j = upto;
+            while (j > 0) {
+                const int64_t sec = epochSecFloor(ents_[j - 1].first);
+                size_t i = j - 1;
+                while (i > 0 && epochSecFloor(ents_[i - 1].first) == sec) i--;
+                const int32_t rc = acceptGroup(i, j, &b);
+                if (rc < 0) return rc;
+                if (!b.rows.empty()) {
+                    b.has = true;
+                    b.sec = sec;
+                    break;
+                }
+                j = i;
+            }
+        }
+        if (kind == kPointForward || kind == kPointNearest) {
+            // Nearest: the other side only while it can still win (a tie
+            // goes to the earlier side).
+            if (kind == kPointNearest && b.has && b.sec == T) return 0;
+            size_t i = split;
+            while (i < n) {
+                const int64_t sec = epochSecFloor(ents_[i].first);
+                if (kind == kPointNearest && b.has && sec - T >= T - b.sec) break;
+                size_t j = i + 1;
+                while (j < n && epochSecFloor(ents_[j].first) == sec) j++;
+                const int32_t rc = acceptGroup(i, j, &a);
+                if (rc < 0) return rc;
+                if (!a.rows.empty()) {
+                    a.has = true;
+                    a.sec = sec;
+                    break;
+                }
+                i = j;
+            }
+        }
+        return 0;
+    }
+    bool started_ = false;
+    PostingScan scan_;
+    std::vector<std::pair<int64_t, uint64_t>> ents_;
+};
+
+// Rows of a partition that have no object key (each its own entity): the
+// EPOCH index over the range, their frames extracted. Only for partitions
+// whose OBJECT_EPOCH postings are fewer than their CID postings.
+class ObjectlessRows : public RowSource {
+public:
+    ObjectlessRows(const RowFilter& f, std::shared_ptr<const TypeInfo> ti, int64_t lo, int64_t hi)
+        : f_(f), ti_(std::move(ti)), lo_(lo), hi_(hi) {}
+    int32_t next(CurRow* out) override {
+        LaneStore& st = *f_.store;
+        if (!started_) {
+            started_ = true;
+            uint8_t l[8], h[8];
+            encI64(l, lo_);
+            const bool hasHi = hi_ != INT64_MAX;
+            if (hasHi) encI64(h, hi_ + 1);
+            scan_ = st.scan(*f_.snap, kIxEpoch, l, 8, hasHi ? h : nullptr, hasHi ? 8 : 0, false);
+            if (scan_.err()) return scan_.err();
+        } else if (scan_.valid()) {
+            scan_.next();
+        }
+        for (; scan_.valid(); scan_.next()) {
+            const int32_t prc = pollEvery(&st, &poll_);
+            if (prc < 0) return prc;
+            const int32_t rc = f_.accept(getBE64(scan_.val()), out);
+            if (rc < 0) return rc;
+            if (rc == 0 || (out->row.flags & kRowSealed)) continue;
+            frame_.resize(out->row.len);
+            const int32_t frc = st.readFrame(*out->snap, out->row, frame_.data());
+            if (frc < 0) return frc;
+            if (hasObjectKey(*ti_, frame_)) continue;  // it has one: OBJECT_EPOCH lists it
+            out->hasObject = true;
+            out->objectNull = true;
+            out->key.clear();
+            return 1;
+        }
+        return scan_.err();
+    }
+    // Does the stored frame name an object key (the type's extraction)?
+    static bool hasObjectKey(const TypeInfo& t, const std::vector<uint8_t>& frame) {
+        if (!t.cfg || frame.size() < 8) return false;
+        Extracted ex;
+        uint8_t scratch[2048];
+        t.cfg->extract(frame.data(), frame.size(), &ex, scratch, sizeof(scratch));
+        return ex.objectCol >= 0 && ex.cols[ex.objectCol].present;
+    }
+
+private:
+    RowFilter f_;
+    std::shared_ptr<const TypeInfo> ti_;
+    int64_t lo_, hi_;
+    bool started_ = false;
+    PostingScan scan_;
+    std::vector<uint8_t> frame_;
+    uint32_t poll_ = 0;
+};
+
+// The per-object point plan: every partition's object streams merged by
+// object key; per object the best second over all partitions (as_of: the
+// latest <= T; forward: the earliest >= T; nearest: the closer, the earlier
+// on a tie) and every live row at that second. Objectless rows follow.
+class ObjectPointRows : public RowSource {
+public:
+    ObjectPointRows(std::vector<std::unique_ptr<PartObjects>> parts, std::unique_ptr<RowSource> objectless,
+                    uint8_t kind, int64_t T, bool u64, LaneStore* st)
+        : parts_(std::move(parts)), objectless_(std::move(objectless)), kind_(kind), T_(T), u64_(u64), st_(st) {}
+    int32_t next(CurRow* out) override {
+        if (!started_) {
+            started_ = true;
+            for (auto& p : parts_) {
+                const int32_t rc = p->advance(*st_, &poll_);
+                if (rc < 0) return rc;
+            }
+        }
+        for (;;) {
+            if (at_ < pending_.size()) {
+                *out = std::move(pending_[at_++]);
+                return 1;
+            }
+            pending_.clear();
+            at_ = 0;
+            // The smallest object key among the streams.
+            const std::string* min = nullptr;
+            for (auto& p : parts_)
+                if (p->have && (!min || p->okey < *min)) min = &p->okey;
+            if (!min) break;
+            const std::string key = *min;
+            std::vector<PartObjects*> grp;
+            for (auto& p : parts_)
+                if (p->have && p->okey == key) grp.push_back(p.get());
+            bool hb = false, ha = false;
+            int64_t B = INT64_MIN, A = INT64_MAX;
+            for (PartObjects* p : grp) {
+                if (p->b.has) {
+                    hb = true;
+                    B = std::max(B, p->b.sec);
+                }
+                if (p->a.has) {
+                    ha = true;
+                    A = std::min(A, p->a.sec);
+                }
+            }
+            bool useB;
+            if (kind_ == kPointAsof) useB = true;
+            else if (kind_ == kPointForward) useB = false;
+            else useB = hb && (!ha || T_ - B <= A - T_);
+            const std::string text = objectText(key, u64_);
+            for (PartObjects* p : grp) {
+                ObjSide& side = useB ? p->b : p->a;
+                if (!side.has || side.sec != (useB ? B : A)) continue;
+                for (CurRow& r : side.rows) {
+                    r.hasObject = true;
+                    r.objectNull = false;
+                    r.object = text;
+                    r.key = key;
+                    pending_.push_back(std::move(r));
+                }
+            }
+            for (PartObjects* p : grp) {
+                const int32_t rc = p->advance(*st_, &poll_);
+                if (rc < 0) return rc;
+            }
+        }
+        return objectless_ ? objectless_->next(out) : 0;
+    }
+
+private:
+    std::vector<std::unique_ptr<PartObjects>> parts_;
+    std::unique_ptr<RowSource> objectless_;
+    uint8_t kind_;
+    int64_t T_;
+    bool u64_;
+    LaneStore* st_;
+    bool started_ = false;
+    std::vector<CurRow> pending_;
+    size_t at_ = 0;
+    uint32_t poll_ = 0;
+};
+
+// ---- §37 gap 5: a gseq-ordered page over rare tags --------------------------
+// The tag postings' records (every copy's instances, REPEAT hits standing for
+// their record) collected with their gseqs, sorted, emitted in gseq order.
+class CollectedRows : public RowSource {
+public:
+    CollectedRows(ReaderLane* lane, StmtCtx* stmt, TypeSnap* ts, std::unique_ptr<RowSource> src, uint64_t lo,
+                  uint64_t hi, bool desc)
+        : lane_(lane), stmt_(stmt), ts_(ts), src_(std::move(src)), lo_(lo), hi_(hi), desc_(desc) {}
+    int32_t next(CurRow* out) override {
+        LaneStore& st = lane_->store();
+        if (!collected_) {
+            collected_ = true;
+            CurRow r;
+            for (;;) {
+                const int32_t rc = src_->next(&r);
+                if (rc < 0) return rc;
+                if (rc == 0) break;
+                if (r.gseq < lo_ || r.gseq > hi_) continue;
+                ents_.push_back({r.gseq, r.pid, r.row.pseq});
+            }
+            src_.reset();
+            std::sort(ents_.begin(), ents_.end(), [&](const Ent& a, const Ent& b) {
+                return desc_ ? a.gseq > b.gseq : a.gseq < b.gseq;
+            });
+            ents_.erase(std::unique(ents_.begin(), ents_.end(), [](const Ent& a, const Ent& b) { return a.gseq == b.gseq; }),
+                        ents_.end());
+        }
+        while (at_ < ents_.size()) {
+            const Ent e = ents_[at_++];
+            PartSnap* snap = nullptr;
+            int32_t rc = lane_->partForType(stmt_, e.pid, ts_->fid, &snap);
+            if (rc < 0) return rc;
+            rc = st.readRow(*snap, e.pseq, &out->row);
+            if (rc < 0) return rc;
+            out->pid = e.pid;
+            out->snap = snap;
+            out->gseq = e.gseq;
+            out->key.clear();
+            out->hasObject = false;
+            out->objectNull = false;
+            return 1;
+        }
+        return 0;
+    }
+
+private:
+    struct Ent {
+        uint64_t gseq;
+        uint32_t pid;
+        uint64_t pseq;
+    };
+    ReaderLane* lane_;
+    StmtCtx* stmt_;
+    TypeSnap* ts_;
+    std::unique_ptr<RowSource> src_;
+    uint64_t lo_, hi_;
+    bool desc_;
+    bool collected_ = false;
+    std::vector<Ent> ents_;
+    size_t at_ = 0;
 };
 
 // A source filter on arrivals-ordered or catalog rows reuses RowFilter.
@@ -641,6 +1134,18 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
         rc = windowFloor(lane, stmt, ts, lane->hotWindow(vt->typeName), &floor);
         if (rc < 0) return rc;
     }
+    // §37: per-statement pruning state, and whether any record has copies in
+    // several partitions (tag conditions then look at every copy).
+    auto sh = std::make_shared<StmtShared>();
+    sh->lane = lane;
+    sh->fid = fid;
+    if (!partLevel) {
+        sh->pids = pids;
+        if (tags.any) {
+            rc = typeHasRepeats(&st, *ts, &sh->repeats);
+            if (rc < 0) return rc;
+        }
+    }
     // Per-partition filter.
     auto filterFor = [&](uint32_t pid, RowFilter* f) -> int32_t {
         PartSnap* snap = nullptr;
@@ -655,6 +1160,41 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
         // Instance scans (source, tag) check the conditions on each posting's
         // instance; other plans on any live instance of the record.
         f->tags = tags;
+        f->shared = sh;
+        return 0;
+    };
+    // Tag-driven sub-cursors over every partition: the most selective key
+    // the conditions name (batch, then source, provider, peer).
+    auto tagDriven = [&](bool wantGseq, std::vector<std::unique_ptr<RowSource>>* out) -> int32_t {
+        uint16_t kind;
+        std::string lo, hi;
+        if (tags.hasBatch) {
+            kind = kIxTagBatch;
+            lo = capKeyStr(tags.batch);
+        } else if (tags.hasSource) {
+            kind = kIxSourceEpoch;
+            const std::string cap = capKeyStr(tags.source);
+            lo = strI64Key(cap, INT64_MIN);
+            hi = strPrefixEnd(cap);
+        } else if (tags.hasProvider) {
+            kind = kIxTagProvider;
+            lo = capKeyStr(tags.provider);
+        } else {
+            kind = kIxTagPeer;
+            lo = capKeyStr(tags.peer);
+        }
+        if (hi.empty()) {
+            hi = lo;
+            hi.push_back('\0');
+        }
+        for (uint32_t pid : pids) {
+            RowFilter f;
+            const int32_t r2 = filterFor(pid, &f);
+            if (r2 < 0) return r2;
+            if (f.snap->empty) continue;
+            f.wantGseq = wantGseq;
+            out->push_back(makePostingRows(f, kind, lo, true, hi, true, false, true));
+        }
         return 0;
     };
     std::vector<std::unique_ptr<RowSource>> subs;
@@ -673,7 +1213,7 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
                 return 0;
             }
             out->reset(new CidRowsType(lane, stmt, ts, cid, tags, floor,
-                                       p.aProducer >= 0 ? pids : std::vector<uint32_t>()));
+                                       p.aProducer >= 0 ? pids : std::vector<uint32_t>(), sh));
             return 0;
         }
         case kAccGseq:
@@ -698,7 +1238,112 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
                 int64_t v;
                 if (argInt(arg(p.aOffset), &v) && v > 0) offset = uint64_t(v);
             }
-            out->reset(new ArrivalRows(lane, stmt, ts, eff, uhi, p.desc, tags, allowed, offset));
+            if (p.gseqTags && tags.any) {
+                // §37 gap 5: arrivals with a per-row tag check, unless the
+                // lane counters say the tags match few records: then their
+                // postings are collected and sorted by gseq (bounded by that
+                // count, not by the type).
+                uint64_t est = 0;
+                bool counted = true;
+                for (uint32_t pid : pids) {
+                    PartSnap* snap = nullptr;
+                    rc = lane->partForType(stmt, pid, fid, &snap);
+                    if (rc < 0) return rc;
+                    if (snap->empty) continue;
+                    std::vector<LaneCounter> lc;
+                    std::vector<LaneStore::LaneTuple> tu;
+                    if (st.laneCounters(*snap, &lc) < 0 || st.laneTuples(*snap, &tu) < 0) {
+                        counted = false;
+                        break;
+                    }
+                    for (const LaneCounter& c : lc) {
+                        if (c.count <= 0) continue;
+                        for (const auto& t : tu) {
+                            if (t.id != c.laneId) continue;
+                            if ((!tags.hasProvider || t.provider == tags.provider) &&
+                                (!tags.hasSource || t.source == tags.source) &&
+                                (!tags.hasBatch || t.batch == tags.batch) && (!tags.hasPeer || t.peer == tags.peer))
+                                est += uint64_t(c.count);
+                            break;
+                        }
+                    }
+                }
+                const uint64_t total = ts->arrivalsTotal();
+                if (counted && est <= kCollectMax && est * 8 < total) {
+                    rc = tagDriven(true, &subs);
+                    if (rc < 0) return rc;
+                    out->reset(new CollectedRows(lane, stmt, ts, makeConcat(std::move(subs)), eff, uhi, p.desc));
+                    return 0;
+                }
+            }
+            out->reset(new ArrivalRows(lane, stmt, ts, eff, uhi, p.desc, tags, allowed, offset, sh));
+            return 0;
+        }
+        case kAccCidOrder: {
+            if (partLevel) {
+                RowFilter f;
+                rc = filterFor(vt->pid, &f);
+                if (rc < 0) return rc;
+                *out = makePostingRows(f, kIxCid, std::string(), false, std::string(), false, p.desc, false);
+                return 0;
+            }
+            uint64_t offset = 0;
+            if (p.aOffset >= 0) {
+                int64_t v;
+                if (argInt(arg(p.aOffset), &v) && v > 0) offset = uint64_t(v);
+            }
+            if (p.aProducer >= 0 && pids.empty()) {
+                out->reset(new Concat({}));
+                return 0;
+            }
+            out->reset(new CatalogOrderRows(lane, stmt, ts, sh, tags, floor, offset, p.desc, p.aProducer >= 0));
+            return 0;
+        }
+        case kAccObjPoint: {
+            int64_t lo, hi;
+            if (!rangeOf(p, argv, &lo, &hi)) {
+                out->reset(new Concat({}));
+                return 0;
+            }
+            int64_t T = 0;
+            if (p.aPoint < 0 || !argInt(arg(p.aPoint), &T)) {
+                out->reset(new Concat({}));
+                return 0;
+            }
+            // The epochs a candidate can have: [lo, hi] and the profile's side.
+            int64_t zlo = lo, zhi = hi;
+            const int64_t tlo = T <= INT64_MIN / 1000 + 1 ? INT64_MIN : T * 1000;
+            const int64_t thi = T >= INT64_MAX / 1000 - 1 ? INT64_MAX : (T + 1) * 1000 - 1;
+            if (p.pointKind == kPointAsof) zhi = std::min(zhi, thi);
+            if (p.pointKind == kPointForward) zlo = std::max(zlo, tlo);
+            std::vector<std::unique_ptr<PartObjects>> parts;
+            std::vector<std::unique_ptr<RowSource>> objectless;
+            for (uint32_t pid : pids) {
+                RowFilter f;
+                rc = filterFor(pid, &f);
+                if (rc < 0) return rc;
+                if (f.snap->empty || zlo > zhi) continue;
+                std::unique_ptr<PartObjects> po(new PartObjects());
+                po->f = f;
+                po->scanSnap = zonePruned(sh.get(), f.snap, zlo, zhi);
+                po->kind = p.pointKind;
+                po->T = T;
+                po->elo = lo;
+                po->ehi = hi;
+                parts.push_back(std::move(po));
+                if (vt->hasObjectRule) {
+                    uint64_t nObj = 0, nCid = 0;
+                    rc = kindCount(st, *f.snap, kIxObjectEpoch, &nObj);
+                    if (rc < 0) return rc;
+                    rc = kindCount(st, *f.snap, kIxCid, &nCid);
+                    if (rc < 0) return rc;
+                    if (nObj >= nCid) continue;
+                }
+                objectless.push_back(std::unique_ptr<RowSource>(new ObjectlessRows(f, vt->type, zlo, zhi)));
+            }
+            out->reset(new ObjectPointRows(std::move(parts),
+                                           objectless.empty() ? nullptr : makeConcat(std::move(objectless)),
+                                           p.pointKind, T, vt->objectU64, &st));
             return 0;
         }
         case kAccEpoch: {

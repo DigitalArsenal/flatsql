@@ -40,6 +40,14 @@ enum MetaCol : int {
     kMcKind,
     kMcRowid,
     kMcPid,
+    // Query-gap additions (docs/PARTITION-STORE.md §37). _object is the
+    // record's OBJECT_EPOCH key as text (a u64 key in decimal); _asof,
+    // _forward and _nearest are inputs: an EQ constraint (epoch seconds)
+    // selects the per-object point plan (kAccObjPoint).
+    kMcObject,
+    kMcAsof,
+    kMcForward,
+    kMcNearest,
     kMcCount
 };
 extern const char* const kMetaColNames[kMcCount];
@@ -57,7 +65,12 @@ enum Access : uint8_t {
     kAccSource,     // SOURCE_EPOCH: source EQ, optional _epoch range
     kAccTag,        // TAG_PROVIDER / TAG_BATCH / TAG_PEER EQ
     kAccCurrent,    // <TYPE>_current
+    kAccCidOrder,   // ORDER BY _cid: type level the cid catalog, partition level CID postings (A17)
+    kAccObjPoint,   // _asof / _forward / _nearest: per-object point plan on OBJECT_EPOCH (A18)
 };
+
+// kAccObjPoint profiles (Plan::pointKind).
+enum PointKind : uint8_t { kPointNone = 0, kPointAsof = 1, kPointForward = 2, kPointNearest = 3 };
 
 struct Plan {
     uint8_t access = kAccFull;
@@ -78,6 +91,16 @@ struct Plan {
     // re-check), argv indexes: _provider, _batch, _peer_id, _source_name,
     // _source ('<TYPE>@<name>'). See TagMatch.
     int8_t aTag[5] = {-1, -1, -1, -1, -1};
+    // §37 additions.
+    uint8_t pointKind = kPointNone;  // kAccObjPoint: the profile
+    int8_t aPoint = -1;              // kAccObjPoint: argv index of the target (epoch seconds)
+    int8_t aOffsetSeen = -1;         // OFFSET the vtab reads but SQLite applies (row budget)
+    // Type level, ORDER BY _gseq with tag conditions: arrivals order, the
+    // tags checked per row, or (chosen at xFilter from the lane counters) the
+    // tag postings collected and sorted by gseq.
+    bool gseqTags = false;
+    // Sandbox (A18): the plan reads the newest-N arrivals window.
+    bool sandboxWindow = false;
     std::string encode() const;
     bool decode(const char* s);
 };
@@ -120,6 +143,10 @@ struct RecVtab : sqlite3_vtab {
     std::vector<uint8_t> colIsEnum;
     std::vector<uint8_t> colIsU64;
     bool hasSupersede = false;
+    // The type's OBJECT_EPOCH rule ("object <n>[,<n>...]"): whether one of
+    // its columns is a u64 key (the key bytes are then 8 big-endian bytes).
+    bool hasObjectRule = false;
+    bool objectU64 = false;
 };
 
 // One output row candidate.
@@ -129,6 +156,11 @@ struct CurRow {
     RecRow row{};
     uint64_t gseq = 0;          // type level: the cid's gseq (0: unknown)
     std::string key;            // merge key (posting key bytes)
+    // kAccObjPoint: the object key the row was chosen for (text), when known
+    // from the posting. hasObject false: _object is read from the frame.
+    bool hasObject = false;
+    bool objectNull = false;    // the record has no object key
+    std::string object;
 };
 
 // A stream of rows in a defined order (keys comparable across streams of
@@ -140,22 +172,71 @@ public:
     virtual int32_t next(CurRow* out) = 0;
 };
 
+// Per-statement state shared by a plan's row filters (§37): snapshots
+// restricted to the segments that can hold pseq-keyed postings, and whether
+// the type has REPEAT copies at all.
+struct StmtShared {
+    ReaderLane* lane = nullptr;
+    const uint8_t* fid = nullptr;
+    // Type level: the type snapshot lists REPEAT postings (a CID may have
+    // live copies in several partitions; tag conditions then look at all).
+    bool repeats = false;
+    // Partitions the plan reads (sorted); copies elsewhere are not visible.
+    std::vector<uint32_t> pids;
+    struct Pruned {
+        const PartSnap* base;
+        size_t first;
+        std::unique_ptr<PartSnap> snap;
+    };
+    std::vector<Pruned> pruned;
+    std::vector<std::unique_ptr<PartSnap>> owned;  // other restricted copies (epoch zones)
+    // The snapshot `s` without the segments that end at or before `pseq`: a
+    // TAG_OF, DEAD or TAG_DEAD posting keyed by pseq is written by its
+    // instance or killer, never before its target (segment runs hold only
+    // their own batches' postings). Bucketed: at most ~16 variants per
+    // partition and statement.
+    PartSnap* prunedFor(PartSnap* s, uint64_t pseq);
+    bool allowed(uint32_t pid) const { return pids.empty() || std::binary_search(pids.begin(), pids.end(), pid); }
+};
+
 // Shared row filters (partition or type level).
 struct RowFilter {
     LaneStore* store = nullptr;
     StmtCtx* stmt = nullptr;
     PartSnap* snap = nullptr;
     TypeSnap* type = nullptr;     // type level: labels (FIRST only) and gseq
+    // Type level without label checks (arrivals and catalog rows, whose
+    // copy is already known FIRST): tag conditions still see every copy.
+    TypeSnap* copies = nullptr;
     uint64_t bound = 0;           // visibility: pseq_hi or V_p
     uint64_t gseqFloor = 0;       // sandbox window (A18): skip gseq < floor
     TagMatch tags;                // post-filter: a live tag instance matching every condition
     bool knownLive = false;       // liveness already established (arrivals joins)
+    bool wantGseq = false;        // type level: always resolve the row's gseq (sorted plans)
+    std::shared_ptr<StmtShared> shared;  // pruning and REPEAT state (may be null)
     // Applies visibility, liveness, labels, tags; reads the PUT row.
     // Returns 1 (keep, *row filled), 0 (skip), < 0 error.
     int32_t accept(uint64_t pseq, CurRow* out);
-    // Does PUT `put` have a live tag instance matching `m`?
+    // Does PUT `put` have a live tag instance matching `m` in this
+    // partition (its own tag or a RETAG)?
     int32_t hasLiveTag(uint64_t put, const TagMatch& m, bool* yes);
+    // Type level (§37, gap 4): does any live copy of the record (FIRST or
+    // REPEAT, any partition of the plan) have a live instance matching `m`?
+    // `row` is the FIRST copy's PUT row in this partition.
+    int32_t anyCopyTag(const RecRow& row, const TagMatch& m, bool* yes);
+    // A tag or source posting matched an instance of the PUT `put` in this
+    // partition (the conditions hold on it). Type level: when that PUT is a
+    // live REPEAT copy, the record's FIRST row is emitted instead, by exactly
+    // one of its matching copies (§37). Returns 1/0/< 0 as accept().
+    int32_t acceptInstance(uint64_t put, const TagMatch& m, CurRow* out);
 };
+
+// Does a PUT row's own tag instance match `m` and live at `bound`? (`s`
+// holds the row; `deadSnap` answers TAG_DEAD, possibly pruned.)
+int32_t ownTagMatches(LaneStore* st, const PartSnap& s, const PartSnap& deadSnap, const RecRow& r, const TagMatch& m,
+                      uint64_t bound, bool* yes, std::vector<uint8_t>* scratch);
+// Does the type snapshot list REPEAT postings (in its L0 blocks or runs)?
+int32_t typeHasRepeats(LaneStore* st, const TypeSnap& t, bool* yes);
 
 // The plan's tag conditions (and an alias table's source) from its
 // arguments. false: they contradict each other, no row can match.

@@ -96,11 +96,13 @@ PS_TEST(lane_partition_and_type_queries) {
     r = inter.q("SELECT _cid, _epoch FROM OMM WHERE _source = 'OMM@srcB' ORDER BY _epoch DESC LIMIT 5");
     CHECK_EQ(r.status, 0);
     CHECK_EQ(r.rows.size(), size_t(5));
-    // Alias vtab: the FIRST copies of srcB are records 200..299.
+    // Alias vtab: records with a live srcB instance on any live copy
+    // (PARTITION-STORE.md §37): 200..299 (FIRST in peerB) and 100..199
+    // (FIRST in peerA, REPEAT copies in peerB).
     r = bulk.q("SELECT count(*) FROM \"OMM@srcB\"");
     CHECK_EQ(r.status, 0);
     REQUIRE(r.rows.size() == 1);
-    CHECK_EQ(r.i(0, 0), 100);
+    CHECK_EQ(r.i(0, 0), 200);
     // Meta: counters from heads.
     r = inter.q("SELECT pid, live_count, total_count FROM flatsql_partitions ORDER BY pid");
     CHECK_EQ(r.status, 0);
@@ -361,25 +363,25 @@ PS_TEST(lane_tag_conditions_match_any_instance_A2) {
     REQUIRE(waitTypeVisible(s.fs.get(), s.root, ommType().fid, {gp, gp2}, 10000000000ull));
     // Every instance of every copy is live: RETAG rows were written.
     CHECK_EQ(s.e->stats().retags, uint64_t(100));
-    auto firstPid = [&](int i) { return i < 300 ? gp : gp2; };
     struct Cond {
         const char* provider = nullptr;
         const char* source = nullptr;
         const char* batch = nullptr;
         const char* peer = nullptr;
     };
+    // Type level (§37): every live copy's instances count (the record held by
+    // gp and gp2 matches on either); partition level: that partition's.
     auto oracle = [&](uint32_t pid, bool typeLevel, const Cond& c) {
         std::set<std::string> out;
         for (int i = 0; i < 350; i++) {
-            const uint32_t at = typeLevel ? firstPid(i) : pid;
-            auto it = inst[at].find(i);
-            if (it == inst[at].end()) continue;
-            for (const Tag& t : it->second)
-                if ((!c.provider || t.provider == c.provider) && (!c.source || t.source == c.source) &&
-                    (!c.batch || t.batch == c.batch) && (!c.peer || t.peer == c.peer)) {
-                    out.insert(cidTextOf(recs[size_t(i)]));
-                    break;
-                }
+            for (uint32_t at : typeLevel ? std::vector<uint32_t>{gp, gp2} : std::vector<uint32_t>{pid}) {
+                auto it = inst[at].find(i);
+                if (it == inst[at].end()) continue;
+                for (const Tag& t : it->second)
+                    if ((!c.provider || t.provider == c.provider) && (!c.source || t.source == c.source) &&
+                        (!c.batch || t.batch == c.batch) && (!c.peer || t.peer == c.peer))
+                        out.insert(cidTextOf(recs[size_t(i)]));
+            }
         }
         return out;
     };
@@ -449,7 +451,7 @@ PS_TEST(lane_tag_conditions_match_any_instance_A2) {
     r = bulk.q("SELECT count(*) FROM OMM WHERE _cid = ? AND _batch = 'b2'", {Param::text(cidTextOf(recs[150]))});
     CHECK_EQ(r.i(0, 0), 1);
     r = bulk.q("SELECT count(*) FROM OMM WHERE _cid = ? AND _batch = 'b3'", {Param::text(cidTextOf(recs[260]))});
-    CHECK_EQ(r.i(0, 0), 0);  // b3 tags only the REPEAT copy in gp2
+    CHECK_EQ(r.i(0, 0), 1);  // b3 tags only the REPEAT copy in gp2: every copy counts (§37)
     // The projection still shows the PUT's own tag.
     r = bulk.q("SELECT _provider, _batch FROM OMM WHERE _cid = ?", {Param::text(cidTextOf(recs[150]))});
     REQUIRE(r.rows.size() == 1);

@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <unordered_set>
 
 #include "flatsql/ps/flatsql_attr_generated.h"
 #include "flatsql/ps/platform.h"
@@ -20,33 +21,42 @@ namespace ps {
 const char* const kMetaColNames[kMcCount] = {
     "_pseq",     "_cid",       "_cid_bin", "_epoch",  "_arrival", "_gseq",   "_producer",
     "_source",   "_source_name", "_provider", "_batch", "_peer_id", "_signature", "_data",
-    "_offset",   "_len",       "_kind",    "_rowid",  "_pid"};
+    "_offset",   "_len",       "_kind",    "_rowid",  "_pid",     "_object", "_asof",
+    "_forward",  "_nearest"};
 
 static const char* kMetaColTypes[kMcCount] = {"INTEGER", "TEXT",    "BLOB",    "INTEGER", "INTEGER",
                                                "INTEGER", "TEXT",    "TEXT",    "TEXT",    "TEXT",
                                                "TEXT",    "BLOB",    "BLOB",    "BLOB",    "INTEGER",
-                                               "INTEGER", "INTEGER", "INTEGER", "INTEGER"};
+                                               "INTEGER", "INTEGER", "INTEGER", "INTEGER", "TEXT",
+                                               "INTEGER", "INTEGER", "INTEGER"};
 
 // ---------------------------------------------------------------------------
 // Plans
 // ---------------------------------------------------------------------------
 std::string Plan::encode() const {
-    char buf[200];
-    snprintf(buf, sizeof(buf), "%c:%u:%u:%u:%u:%d:%d:%d:%u:%u:%d:%d:%u:%d:%d:%u:%d:%d:%d:%d:%d", bounded ? 'B' : 'U',
-             unsigned(access), unsigned(desc), unsigned(tagKind), unsigned(col), int(aKey), int(aLo), int(aHi),
-             unsigned(loOp), unsigned(hiOp), int(aProducer), int(aSource), unsigned(sourceFull), int(aLimit),
-             int(aOffset), unsigned(orderConsumed), int(aTag[0]), int(aTag[1]), int(aTag[2]), int(aTag[3]),
-             int(aTag[4]));
+    char buf[240];
+    snprintf(buf, sizeof(buf), "%c:%u:%u:%u:%u:%d:%d:%d:%u:%u:%d:%d:%u:%d:%d:%u:%d:%d:%d:%d:%d:%u:%d:%d:%u:%u",
+             bounded ? 'B' : 'U', unsigned(access), unsigned(desc), unsigned(tagKind), unsigned(col), int(aKey),
+             int(aLo), int(aHi), unsigned(loOp), unsigned(hiOp), int(aProducer), int(aSource), unsigned(sourceFull),
+             int(aLimit), int(aOffset), unsigned(orderConsumed), int(aTag[0]), int(aTag[1]), int(aTag[2]),
+             int(aTag[3]), int(aTag[4]), unsigned(pointKind), int(aPoint), int(aOffsetSeen), unsigned(gseqTags),
+             unsigned(sandboxWindow));
     return buf;
 }
 
 bool Plan::decode(const char* s) {
     if (!s || (s[0] != 'B' && s[0] != 'U')) return false;
-    unsigned acc, d, tk, c, lop, hop, sf, oc;
-    int k, lo, hi, pr, so, li, of, t0, t1, t2, t3, t4;
-    if (sscanf(s + 1, ":%u:%u:%u:%u:%d:%d:%d:%u:%u:%d:%d:%u:%d:%d:%u:%d:%d:%d:%d:%d", &acc, &d, &tk, &c, &k, &lo,
-               &hi, &lop, &hop, &pr, &so, &sf, &li, &of, &oc, &t0, &t1, &t2, &t3, &t4) != 20)
+    unsigned acc, d, tk, c, lop, hop, sf, oc, pk, gt, sw;
+    int k, lo, hi, pr, so, li, of, t0, t1, t2, t3, t4, ap, aos;
+    if (sscanf(s + 1, ":%u:%u:%u:%u:%d:%d:%d:%u:%u:%d:%d:%u:%d:%d:%u:%d:%d:%d:%d:%d:%u:%d:%d:%u:%u", &acc, &d, &tk,
+               &c, &k, &lo, &hi, &lop, &hop, &pr, &so, &sf, &li, &of, &oc, &t0, &t1, &t2, &t3, &t4, &pk, &ap, &aos,
+               &gt, &sw) != 25)
         return false;
+    pointKind = uint8_t(pk);
+    aPoint = int8_t(ap);
+    aOffsetSeen = int8_t(aos);
+    gseqTags = gt != 0;
+    sandboxWindow = sw != 0;
     aTag[0] = int8_t(t0);
     aTag[1] = int8_t(t1);
     aTag[2] = int8_t(t2);
@@ -87,30 +97,104 @@ bool TagMatch::matches(const TagView& t) const {
            (!hasSource || eqBytes(source, t.source, t.sourceLen));
 }
 
-int32_t RowFilter::hasLiveTag(uint64_t put, const TagMatch& m, bool* yes) {
+// ---- §37: pruned snapshots, REPEAT state, tags on every copy -------------------
+PartSnap* StmtShared::prunedFor(PartSnap* s, uint64_t pseq) {
+    if (!s || !s->manifest || s->manifest->segs.size() < 4) return s;
+    const auto& segs = s->manifest->segs;
+    // Segments are in pseq order: the first one that can hold a posting
+    // keyed by pseq (open, never used, or ending after it).
+    size_t a = 0, b = segs.size();
+    while (a < b) {
+        const size_t mid = (a + b) / 2;
+        const ManifestSegRef& m = segs[mid];
+        const bool keep = !m.sealed || m.firstPseq == 0 || m.endPseq > pseq;
+        if (keep) b = mid;
+        else a = mid + 1;
+    }
+    const size_t step = std::max<size_t>(1, segs.size() / 16);
+    const size_t first = a / step * step;
+    if (first == 0) return s;
+    for (auto& p : pruned)
+        if (p.base == s && p.first == first) return p.snap.get();
+    std::unique_ptr<PartSnap> c(new PartSnap(*s));
+    auto m = std::make_shared<Manifest>(*s->manifest);
+    m->segs.erase(m->segs.begin(), m->segs.begin() + std::ptrdiff_t(first));
+    c->manifest = m;
+    Pruned pr;
+    pr.base = s;
+    pr.first = first;
+    pr.snap = std::move(c);
+    pruned.push_back(std::move(pr));
+    return pruned.back().snap.get();
+}
+
+int32_t typeHasRepeats(LaneStore* st, const TypeSnap& t, bool* yes) {
     *yes = false;
+    if (t.empty) return 0;
+    int32_t rc = 0;
+    const SectionList* list = st->sections(t, kIxTypeRepeat, &rc);
+    if (!list) return rc;
+    for (const auto& sec : *list)
+        if (sec && !sec->offs.empty()) {
+            *yes = true;
+            return 0;
+        }
+    for (const SegRunRef& rr : t.runs) {
+        FileKey fk;
+        auto run = st->typeRun(t.fid, rr.gen, rr.fileLen, &fk, &rc);
+        if (!run) return rc;
+        if (run->kindEntries(kIxTypeRepeat) > 0) {
+            *yes = true;
+            return 0;
+        }
+    }
+    return 0;
+}
+
+int32_t ownTagMatches(LaneStore* st, const PartSnap& s, const PartSnap& deadSnap, const RecRow& r, const TagMatch& m,
+                      uint64_t bound, bool* yes, std::vector<uint8_t>* scratch) {
+    *yes = false;
+    if (!(r.flags & kRowHasAttr) || r.attrLen == 0) return 0;
+    int32_t rc = st->readAttr(s, r, scratch);
+    if (rc < 0) return rc;
+    AttrView av;
+    if (!parseAttr(scratch->data(), scratch->size(), &av) || !m.matches(av.tag)) return 0;
+    bool dead = false;
+    rc = st->isTagDead(deadSnap, r.pseq, bound, &dead);
+    if (rc < 0) return rc;
+    *yes = !dead;
+    return 0;
+}
+
+namespace {
+// A live tag instance of PUT `put` in snapshot `s` (its own tag or a RETAG)
+// matching `m` at `bound`. TAG_OF and TAG_DEAD postings keyed by `put` are
+// read from the segments that can hold them only.
+int32_t liveTagIn(LaneStore* st, StmtShared* sh, PartSnap* s, uint64_t put, uint64_t bound, const TagMatch& m,
+                  bool* yes, std::vector<uint8_t>* attr) {
+    *yes = false;
+    PartSnap* ps = sh ? sh->prunedFor(s, put) : s;
     uint8_t lo[8], hi[8];
     putBE64(lo, put);
     putBE64(hi, put + 1);
     std::vector<uint64_t> insts;
-    PostingScan ps = store->scan(*snap, kIxTagOf, lo, 8, hi, 8, false);
-    if (ps.err()) return ps.err();
-    for (; ps.valid(); ps.next()) insts.push_back(getBE64(ps.val()));
-    if (ps.err()) return ps.err();
-    std::vector<uint8_t> attr;
+    PostingScan sc = st->scan(*ps, kIxTagOf, lo, 8, hi, 8, false);
+    if (sc.err()) return sc.err();
+    for (; sc.valid(); sc.next()) insts.push_back(getBE64(sc.val()));
+    if (sc.err()) return sc.err();
     for (uint64_t inst : insts) {
         if (inst > bound) continue;
         bool dead = false;
-        int32_t rc = store->isTagDead(*snap, inst, bound, &dead);
+        int32_t rc = st->isTagDead(*ps, inst, bound, &dead);
         if (rc < 0) return rc;
         if (dead) continue;
         RecRow ir;
-        rc = store->readRow(*snap, inst, &ir);
+        rc = st->readRow(*s, inst, &ir);
         if (rc < 0) return rc;
-        rc = store->readAttr(*snap, ir, &attr);
+        rc = st->readAttr(*s, ir, attr);
         if (rc < 0) return rc;
         AttrView av;
-        if (!parseAttr(attr.data(), attr.size(), &av)) continue;
+        if (!parseAttr(attr->data(), attr->size(), &av)) continue;
         if (m.matches(av.tag)) {
             *yes = true;
             return 0;
@@ -119,9 +203,82 @@ int32_t RowFilter::hasLiveTag(uint64_t put, const TagMatch& m, bool* yes) {
     return 0;
 }
 
+struct CopyRef {
+    PartSnap* snap = nullptr;
+    uint64_t pseq = 0;
+    uint64_t bound = 0;
+    RecRow row{};
+};
+
+// The live copies of a record other than (pid, pseq), with their snapshots
+// (type-level visibility), in (pid, pseq) order.
+int32_t otherCopies(LaneStore* st, StmtShared* sh, StmtCtx* stmt, TypeSnap* ts, const uint8_t cid[kCidLen], uint32_t pid,
+                    uint64_t pseq, std::vector<CopyRef>* out) {
+    out->clear();
+    std::vector<CatalogCopy> copies;
+    int32_t rc = st->catalog(*ts, cid, &copies);
+    if (rc < 0) return rc;
+    std::sort(copies.begin(), copies.end(), [](const CatalogCopy& a, const CatalogCopy& b) {
+        return a.pid != b.pid ? a.pid < b.pid : a.pseq < b.pseq;
+    });
+    for (const CatalogCopy& c : copies) {
+        if (c.label == kLblDead) continue;
+        if (c.pid == pid && c.pseq == pseq) continue;
+        PartSnap* q = nullptr;
+        rc = sh->lane->partForType(stmt, c.pid, ts->fid, &q);
+        if (rc < 0) return rc;
+        CopyRef r;
+        r.snap = q;
+        r.pseq = c.pseq;
+        r.bound = std::min(q->pseqHi(), ts->labeledThrough(c.pid));
+        if (c.pseq == 0 || c.pseq > r.bound) continue;
+        rc = st->readRow(*q, c.pseq, &r.row);
+        if (rc < 0) return rc;
+        if (r.row.kind != kRowPut) continue;
+        out->push_back(r);
+    }
+    return 0;
+}
+}  // namespace
+
+int32_t RowFilter::hasLiveTag(uint64_t put, const TagMatch& m, bool* yes) {
+    std::vector<uint8_t> attr;
+    return liveTagIn(store, shared.get(), snap, put, bound, m, yes, &attr);
+}
+
+int32_t RowFilter::anyCopyTag(const RecRow& row, const TagMatch& m, bool* yes) {
+    *yes = false;
+    std::vector<uint8_t> attr;
+    PartSnap* ds = shared ? shared->prunedFor(snap, row.pseq) : snap;
+    // The copy's own tag first (the common case: one read of its attribute).
+    int32_t rc = ownTagMatches(store, *snap, *ds, row, m, bound, yes, &attr);
+    if (rc < 0 || *yes) return rc;
+    std::vector<CopyRef> others;
+    TypeSnap* ts = type ? type : copies;
+    if (ts && shared && shared->repeats && shared->lane) {
+        rc = otherCopies(store, shared.get(), stmt, ts, row.cid, snap->pid, row.pseq, &others);
+        if (rc < 0) return rc;
+        for (CopyRef& c : others) {
+            PartSnap* cds = shared->prunedFor(c.snap, c.pseq);
+            rc = ownTagMatches(store, *c.snap, *cds, c.row, m, c.bound, yes, &attr);
+            if (rc < 0 || *yes) return rc;
+        }
+    }
+    // RETAG instances: this copy's, then every other copy's.
+    rc = liveTagIn(store, shared.get(), snap, row.pseq, bound, m, yes, &attr);
+    if (rc < 0 || *yes) return rc;
+    for (CopyRef& c : others) {
+        rc = liveTagIn(store, shared.get(), c.snap, c.pseq, c.bound, m, yes, &attr);
+        if (rc < 0 || *yes) return rc;
+    }
+    return 0;
+}
+
 int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
     if (pseq == 0 || pseq > bound) return 0;
     out->gseq = 0;
+    out->hasObject = false;
+    out->objectNull = false;
     if (type) {
         // Every labeled PUT is FIRST or REPEAT, and a REPEAT label always
         // leaves a REPEAT posting (bloom-tested): without one the row is
@@ -131,7 +288,7 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
         bool repeat = false;
         int32_t rc = store->everRepeat(*type, snap->pid, pseq, &repeat);
         if (rc < 0) return rc;
-        if (repeat || gseqFloor) {
+        if (repeat || gseqFloor || wantGseq) {
             uint8_t label = 0;
             uint64_t gseq = 0;
             bool found = false;
@@ -145,7 +302,8 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
     int32_t rc;
     if (!knownLive) {
         bool dead = false;
-        rc = store->isDead(*snap, pseq, bound, &dead);
+        PartSnap* ds = shared ? shared->prunedFor(snap, pseq) : snap;
+        rc = store->isDead(*ds, pseq, bound, &dead);
         if (rc < 0) return rc;
         if (dead) return 0;
     }
@@ -154,13 +312,102 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
     if (out->row.kind != kRowPut) return 0;
     if (tags.any) {
         bool yes = false;
-        rc = hasLiveTag(pseq, tags, &yes);
+        // Type level (§37): any live copy of the record; partition level:
+        // this partition's instances.
+        rc = (type || copies) ? anyCopyTag(out->row, tags, &yes) : hasLiveTag(pseq, tags, &yes);
         if (rc < 0) return rc;
         if (!yes) return 0;
     }
     out->pid = snap->pid;
     out->snap = snap;
     return 1;
+}
+
+int32_t RowFilter::acceptInstance(uint64_t put, const TagMatch& m, CurRow* out) {
+    const int32_t rc0 = accept(put, out);
+    if (rc0 != 0 || !type || !shared || !shared->repeats || !shared->lane) return rc0;
+    // Rejected at type level. A live REPEAT copy whose instance matched
+    // stands for its record: the record's FIRST row is emitted by the first
+    // matching copy in (FIRST, then REPEATs by (pid, pseq)) order, among the
+    // partitions the plan reads, so each record comes once.
+    if (put == 0 || put > bound) return 0;
+    uint8_t label = 0;
+    uint64_t gseq = 0;
+    bool found = false;
+    int32_t rc = store->labelOf(*type, snap->pid, put, &label, &gseq, &found);
+    if (rc < 0) return rc;
+    if (!found || label != kLblRepeat) return 0;
+    bool dead = false;
+    rc = store->isDead(*shared->prunedFor(snap, put), put, bound, &dead);
+    if (rc < 0) return rc;
+    if (dead) return 0;
+    RecRow r;
+    rc = store->readRow(*snap, put, &r);
+    if (rc < 0) return rc;
+    if (r.kind != kRowPut) return 0;
+    std::vector<CatalogCopy> copies;
+    rc = store->catalog(*type, r.cid, &copies);
+    if (rc < 0) return rc;
+    const CatalogCopy* first = nullptr;
+    for (const CatalogCopy& c : copies)
+        if (c.label == kLblFirst || c.label == kLblPromoted) first = &c;
+    if (!first || !shared->allowed(first->pid)) return 0;
+    std::vector<uint8_t> attr;
+    PartSnap* fs = nullptr;
+    rc = shared->lane->partForType(stmt, first->pid, type->fid, &fs);
+    if (rc < 0) return rc;
+    const uint64_t fb = std::min(fs->pseqHi(), type->labeledThrough(first->pid));
+    if (first->pseq == 0 || first->pseq > fb) return 0;
+    // The FIRST copy matches on its own: its partition's scan emits it.
+    RecRow fr;
+    rc = store->readRow(*fs, first->pseq, &fr);
+    if (rc < 0) return rc;
+    bool yes = false;
+    rc = ownTagMatches(store, *fs, *shared->prunedFor(fs, first->pseq), fr, m, fb, &yes, &attr);
+    if (rc < 0) return rc;
+    if (!yes) {
+        rc = liveTagIn(store, shared.get(), fs, first->pseq, fb, m, &yes, &attr);
+        if (rc < 0) return rc;
+    }
+    if (yes) return 0;
+    // An earlier REPEAT copy that matches emits it.
+    std::vector<CatalogCopy> reps;
+    for (const CatalogCopy& c : copies)
+        if (c.label == kLblRepeat && shared->allowed(c.pid) &&
+            (c.pid < snap->pid || (c.pid == snap->pid && c.pseq < put)))
+            reps.push_back(c);
+    std::sort(reps.begin(), reps.end(), [](const CatalogCopy& a, const CatalogCopy& b) {
+        return a.pid != b.pid ? a.pid < b.pid : a.pseq < b.pseq;
+    });
+    for (const CatalogCopy& c : reps) {
+        PartSnap* q = nullptr;
+        rc = shared->lane->partForType(stmt, c.pid, type->fid, &q);
+        if (rc < 0) return rc;
+        const uint64_t qb = std::min(q->pseqHi(), type->labeledThrough(c.pid));
+        if (c.pseq == 0 || c.pseq > qb) continue;
+        RecRow qr;
+        rc = store->readRow(*q, c.pseq, &qr);
+        if (rc < 0) return rc;
+        if (qr.kind != kRowPut) continue;
+        bool qd = false;
+        rc = store->isDead(*shared->prunedFor(q, c.pseq), c.pseq, qb, &qd);
+        if (rc < 0) return rc;
+        if (qd) continue;
+        rc = ownTagMatches(store, *q, *shared->prunedFor(q, c.pseq), qr, m, qb, &yes, &attr);
+        if (rc < 0) return rc;
+        if (!yes) {
+            rc = liveTagIn(store, shared.get(), q, c.pseq, qb, m, &yes, &attr);
+            if (rc < 0) return rc;
+        }
+        if (yes) return 0;
+    }
+    // This copy is the record's first match: emit the FIRST row.
+    RowFilter f1 = *this;
+    f1.snap = fs;
+    f1.bound = fb;
+    f1.tags = TagMatch();
+    f1.knownLive = false;
+    return f1.accept(first->pseq, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -210,12 +457,14 @@ public:
             if (keyCmp(scan_.key(), scan_.klen(), reinterpret_cast<const uint8_t*>(lastKey_.data()), lastKey_.size()) != 0) {
                 lastKey_.assign(reinterpret_cast<const char*>(scan_.key()), scan_.klen());
                 emitted_.clear();
+                emittedSet_.clear();
             }
             if (instances_) {
                 // The value is a tag instance (the PUT itself or a RETAG).
                 if (pseq == 0 || pseq > f_.bound) continue;
                 bool dead = false;
-                int32_t rc = f_.store->isTagDead(*f_.snap, pseq, f_.bound, &dead);
+                PartSnap* ds = f_.shared ? f_.shared->prunedFor(f_.snap, pseq) : f_.snap;
+                int32_t rc = f_.store->isTagDead(*ds, pseq, f_.bound, &dead);
                 if (rc < 0) return rc;
                 if (dead) continue;
                 RecRow ir;
@@ -230,11 +479,24 @@ public:
                 }
                 if (ir.kind == kRowRetag) pseq = ir.targetPseq;
             }
-            if (std::find(emitted_.begin(), emitted_.end(), pseq) != emitted_.end()) continue;
-            const int32_t rc = f_.accept(pseq, out);
+            // Many entries can share one key (a source's records at one epoch
+            // second): past a few, a hash set keeps the check O(1).
+            if (emittedSet_.empty() ? std::find(emitted_.begin(), emitted_.end(), pseq) != emitted_.end()
+                                    : emittedSet_.count(pseq) != 0)
+                continue;
+            // Type level (§37): a REPEAT copy's instance stands for its record.
+            const int32_t rc = instances_ && inst_.any ? f_.acceptInstance(pseq, inst_, out) : f_.accept(pseq, out);
             if (rc < 0) return rc;
             if (rc == 0) continue;
-            emitted_.push_back(pseq);
+            if (!emittedSet_.empty()) {
+                emittedSet_.insert(pseq);
+            } else {
+                emitted_.push_back(pseq);
+                if (emitted_.size() > 32) {
+                    emittedSet_.insert(emitted_.begin(), emitted_.end());
+                    emitted_.clear();
+                }
+            }
             out->key.assign(reinterpret_cast<const char*>(scan_.key()), scan_.klen());
             return 1;
         }
@@ -253,6 +515,7 @@ private:
     PostingScan scan_;
     std::string lastKey_;
     std::vector<uint64_t> emitted_;
+    std::unordered_set<uint64_t> emittedSet_;
     uint32_t poll_ = 0;
 };
 
@@ -395,6 +658,8 @@ void mapColumns(RecVtab* vt) {
     if (!t.cfg) return;
     vt->hasSupersede = t.cfg->hasSupersede();
     const std::string& rules = t.cfg->rules();
+    std::vector<int> objectCols;
+    std::vector<int> u64Cols;
     size_t at = 0;
     while (at < rules.size()) {
         size_t nl = rules.find('\n', at);
@@ -403,6 +668,28 @@ void mapColumns(RecVtab* vt) {
         at = nl + 1;
         const size_t hash = line.find('#');
         if (hash != std::string::npos) line = line.substr(0, hash);
+        {
+            char ow[16], list[200];
+            if (sscanf(line.c_str(), "%15s %199s", ow, list) == 2 && std::strcmp(ow, "object") == 0) {
+                vt->hasObjectRule = true;
+                const char* p = list;
+                while (*p) {
+                    char* end = nullptr;
+                    const long n = std::strtol(p, &end, 10);
+                    if (end == p) break;
+                    objectCols.push_back(int(n));
+                    p = *end == ',' ? end + 1 : end;
+                }
+                continue;
+            }
+            unsigned cn;
+            char kindAlts[400];
+            if (sscanf(line.c_str(), "%15s %u %399s", ow, &cn, kindAlts) == 3 && std::strcmp(ow, "col") == 0) {
+                // Any alternative a u64 key (the first present alternative
+                // decides the bytes; a u64 one gives 8 big-endian bytes).
+                if (std::strstr(kindAlts, "u64pos:")) u64Cols.push_back(int(cn));
+            }
+        }
         char word[16], alts[400];
         unsigned n;
         if (sscanf(line.c_str(), "%15s %u %399s", word, &n, alts) != 3 || std::strcmp(word, "col") != 0) continue;
@@ -420,6 +707,8 @@ void mapColumns(RecVtab* vt) {
             vt->colIsU64[i] = kind == "u64pos";
         }
     }
+    for (int oc : objectCols)
+        if (std::find(u64Cols.begin(), u64Cols.end(), oc) != u64Cols.end()) vt->objectU64 = true;
 }
 
 int recConnect(sqlite3* db, void* aux, int argc, const char* const* argv, sqlite3_vtab** out, char** err) {
@@ -516,6 +805,12 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
     int tagEq[3] = {-1, -1, -1};
     int colEq = -1, colIdx = -1;
     int limitC = -1, offsetC = -1;
+    // §37: the per-object point inputs, and what the point plan can evaluate
+    // before it chooses (epoch range, tags, producer); anything else would be
+    // applied by SQLite after the choice, which is not the same query.
+    int pointEq[3] = {-1, -1, -1};
+    int nPoint = 0, epochLoN = 0, epochHiN = 0, nonGseq = 0;
+    bool pointBlocked = false;
     for (int i = 0; i < info->nConstraint; i++) {
         const auto& c = info->aConstraint[i];
         if (!c.usable) continue;
@@ -530,7 +825,11 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         }
         const int m = c.iColumn < 0 ? kMcRowid : meta(c.iColumn);
         const bool eq = op == SQLITE_INDEX_CONSTRAINT_EQ;
+        // Constraints other than a type-level gseq range: an OFFSET the vtab
+        // owns must skip exactly the rows SQLite would have kept.
+        if (!(typeLevel && (m == kMcGseq || m == kMcRowid) && (eq || isRangeOp(op)))) nonGseq++;
         if (m < 0) {
+            pointBlocked = true;
             if (eq && c.iColumn >= 0 && c.iColumn < int(vt->colIndex.size()) && vt->colIndex[c.iColumn] >= 0 &&
                 !vt->colIsEnum[c.iColumn] && colEq < 0) {
                 colEq = i;
@@ -538,6 +837,23 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
             }
             continue;
         }
+        if (m == kMcAsof || m == kMcForward || m == kMcNearest) {
+            if (eq) {
+                pointEq[m - kMcAsof] = i;
+                nPoint++;
+            } else {
+                pointBlocked = true;
+            }
+            continue;
+        }
+        if (!(m == kMcEpoch && isRangeOp(op)) && m != kMcProducer && m != kMcSource && m != kMcSourceName &&
+            m != kMcProvider && m != kMcBatch && m != kMcPeerId)
+            pointBlocked = true;
+        if (m == kMcEpoch && isRangeOp(op)) (isLower(op) ? epochLoN : epochHiN)++;
+        if ((m == kMcProducer || m == kMcSource || m == kMcSourceName || m == kMcProvider || m == kMcBatch ||
+             m == kMcPeerId) &&
+            !eq)
+            pointBlocked = true;
         const bool rowidIsPseq = !typeLevel;
         if (m == kMcPseq || (m == kMcRowid && rowidIsPseq)) {
             if (typeLevel) continue;
@@ -567,8 +883,18 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         }
     }
     // ORDER BY shape.
-    enum { kOrdNone, kOrdEpochDesc, kOrdEpochAsc, kOrdGseqAsc, kOrdGseqDesc, kOrdPseqAsc, kOrdPseqDesc, kOrdOther } ord =
-        kOrdNone;
+    enum {
+        kOrdNone,
+        kOrdEpochDesc,
+        kOrdEpochAsc,
+        kOrdGseqAsc,
+        kOrdGseqDesc,
+        kOrdPseqAsc,
+        kOrdPseqDesc,
+        kOrdCidAsc,
+        kOrdCidDesc,
+        kOrdOther
+    } ord = kOrdNone;
     if (info->nOrderBy >= 1) {
         const auto& o = info->aOrderBy[0];
         const int m = o.iColumn < 0 ? kMcRowid : meta(o.iColumn);
@@ -580,6 +906,8 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
             ord = o.desc ? kOrdGseqDesc : kOrdGseqAsc;
         else if (info->nOrderBy == 1 && (m == kMcPseq || (m == kMcRowid && !typeLevel)))
             ord = o.desc ? kOrdPseqDesc : kOrdPseqAsc;
+        else if (info->nOrderBy == 1 && m == kMcCid)
+            ord = o.desc ? kOrdCidDesc : kOrdCidAsc;
         else
             ord = kOrdOther;
         if (ord == kOrdEpochAsc && second) ord = kOrdOther;  // (epoch ASC, cid ...) is not an index order
@@ -595,10 +923,39 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
     auto isIn = [&](int ci) { return ci >= 0 && sqlite3_vtab_in(info, ci, -1); };
     const bool alias = vt->kind == kVkAlias;
     const bool current = vt->kind == kVkCurrent;
+    const bool anyTag = tagEq[0] >= 0 || tagEq[1] >= 0 || tagEq[2] >= 0 || sourceEq >= 0 || sourceNameEq >= 0 || alias;
+    // A18: untrusted SQL reads <TYPE> as its newest N arrivals. Every
+    // type-level plan but a point lookup reads that window from the arrivals
+    // tail (at most N entries), whatever index the statement names.
+    StmtCtx* sc = vt->lane ? vt->lane->current() : nullptr;
+    const bool sandbox = sc && sc->sandbox() && typeLevel && !current;
+    const bool point = nPoint > 0 && !current && !sandbox;
     double cost = 1e12;
     double rows = 1e9;
     bool anyIn = false;
-    if (current) {
+    if (point) {
+        if (nPoint > 1 || pointBlocked || epochLoN > 1 || epochHiN > 1 || epochEq >= 0) return SQLITE_CONSTRAINT;
+        p.access = kAccObjPoint;
+        const int k = pointEq[0] >= 0 ? 0 : pointEq[1] >= 0 ? 1 : 2;
+        p.pointKind = uint8_t(k == 0 ? kPointAsof : k == 1 ? kPointForward : kPointNearest);
+        use(pointEq[k], &p.aPoint);
+        info->aConstraintUsage[pointEq[k]].omit = 1;
+        if (isIn(pointEq[k])) return SQLITE_CONSTRAINT;
+        // The epoch range is applied before the per-object choice; SQLite's
+        // re-check of it is then a no-op.
+        if (epochLo >= 0) {
+            use(epochLo, &p.aLo);
+            p.loOp = uint8_t(info->aConstraint[epochLo].op);
+        }
+        if (epochHi >= 0) {
+            use(epochHi, &p.aHi);
+            p.hiOp = uint8_t(info->aConstraint[epochHi].op);
+        }
+        p.orderConsumed = ord == kOrdNone;
+        p.bounded = false;
+        cost = 1e6;
+        rows = 1e5;
+    } else if (current) {
         p.access = kAccCurrent;
         p.bounded = false;
     } else if (cidEq >= 0) {
@@ -631,7 +988,7 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         cost = 20;
         rows = 1;
         p.orderConsumed = !anyIn;
-    } else if (colEq >= 0) {
+    } else if (colEq >= 0 && !sandbox) {
         p.access = kAccCol;
         p.col = uint16_t(colIdx);
         use(colEq, &p.aKey);
@@ -639,6 +996,28 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         p.bounded = true;
         cost = 50;
         rows = 10;
+    } else if (sandbox || (typeLevel && anyTag && (ord == kOrdGseqAsc || ord == kOrdGseqDesc) &&
+                           (limitC >= 0 || (gseqLo >= 0 && gseqHi >= 0)))) {
+        // Arrivals (gseq) order. §37 gap 5: a gseq-ordered page with tag
+        // conditions reads arrivals and checks each row's tags (or, when the
+        // lane counters say the tags are rare, collects and sorts their
+        // postings) instead of sorting every match of the tag index.
+        p.access = kAccGseq;
+        p.sandboxWindow = sandbox;
+        p.gseqTags = !sandbox && anyTag;
+        if (gseqLo >= 0) {
+            use(gseqLo, &p.aLo);
+            p.loOp = uint8_t(info->aConstraint[gseqLo].op);
+        }
+        if (gseqHi >= 0) {
+            use(gseqHi, &p.aHi);
+            p.hiOp = uint8_t(info->aConstraint[gseqHi].op);
+        }
+        p.desc = ord == kOrdGseqDesc;
+        p.orderConsumed = ord == kOrdGseqAsc || ord == kOrdGseqDesc || ord == kOrdNone;
+        p.bounded = (gseqLo >= 0 && gseqHi >= 0) || (limitC >= 0 && p.orderConsumed);
+        cost = p.bounded ? 300 : 1e7;
+        rows = p.bounded ? 1000 : 1e7;
     } else if (!alias && (tagEq[0] >= 0 || tagEq[1] >= 0 || tagEq[2] >= 0) && sourceEq < 0 && sourceNameEq < 0) {
         p.access = kAccTag;
         const int k = tagEq[1] >= 0 ? 1 : tagEq[0] >= 0 ? 0 : 2;
@@ -680,6 +1059,17 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         p.bounded = closed || limitC >= 0 || !alias;
         cost = closed ? 200 : 2000;
         rows = 1000;
+    } else if ((ord == kOrdCidAsc || ord == kOrdCidDesc) && gseqLo < 0 && gseqHi < 0 && pseqLo < 0 && pseqHi < 0 &&
+               epochLo < 0 && epochHi < 0 && epochEq < 0) {
+        // A17: text CID order from the index whose keys sort as the text
+        // does: the type's cid catalog (one pass over its entries, no row
+        // read for rows skipped by OFFSET), a partition's CID postings.
+        p.access = kAccCidOrder;
+        p.desc = ord == kOrdCidDesc;
+        p.orderConsumed = true;
+        p.bounded = limitC >= 0;
+        cost = p.bounded ? 500 : 1e8;
+        rows = p.bounded ? 1000 : 1e8;
     } else if (typeLevel && (gseqLo >= 0 || gseqHi >= 0 || ord == kOrdGseqAsc || ord == kOrdGseqDesc)) {
         p.access = kAccGseq;
         if (gseqLo >= 0) {
@@ -749,9 +1139,10 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
     }
     // Tag conditions (A2, ANY-row semantics): the vtab evaluates every one
     // itself, on the tag instance a posting names or, for other plans, on
-    // any live instance of the record (RowFilter::hasLiveTag). SQLite must
-    // not re-check them against the projected columns, which show only the
-    // PUT's own tag: that dropped every record matched through a RETAG.
+    // any live instance of the record (RowFilter::hasLiveTag; at type level
+    // on every live copy, §37). SQLite must not re-check them against the
+    // projected columns, which show only the PUT's own tag: that dropped
+    // every record matched through a RETAG.
     // <TYPE>_current groups first and filters after, as SQL says: its tag
     // conditions stay SQLite's.
     bool tagIn = false;
@@ -766,7 +1157,10 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
             info->aConstraintUsage[tagC[k]].omit = 1;
         }
     }
-    if (tagIn) p.orderConsumed = false;  // one xFilter per IN value
+    if (tagIn) {
+        p.orderConsumed = false;  // one xFilter per IN value
+        if (point) return SQLITE_CONSTRAINT;
+    }
     if (alias && p.access != kAccSource) p.aSource = 0;  // the alias source post-filters (see xFilter)
     if (producerEq >= 0 && typeLevel) use(producerEq, &p.aProducer);
     if (limitC >= 0 && p.orderConsumed) {
@@ -779,19 +1173,23 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         }
     } else if (limitC >= 0 && !p.orderConsumed) {
         // The LIMIT applies after SQLite's sort: the scan itself is not bounded.
-        if (p.access == kAccFull || p.access == kAccEpoch || p.access == kAccGseq || p.access == kAccPseq) {
+        if (p.access == kAccFull || p.access == kAccEpoch || p.access == kAccGseq || p.access == kAccPseq ||
+            p.access == kAccCidOrder) {
             const bool closed = p.aLo >= 0 && p.aHi >= 0;
             p.bounded = closed;
         }
     }
     // OFFSET pushdown (T2 #7): arrivals order skips live entries by fence
-    // counts. Only where every row the scan finds is emitted (no post
-    // filters), so the vtab can own the OFFSET (SQLite then skips none).
-    if (offsetC >= 0 && typeLevel && !alias && !current && p.orderConsumed &&
-        (p.access == kAccGseq || p.access == kAccFull) && producerEq < 0 && sourceEq < 0 && sourceNameEq < 0 &&
-        tagEq[0] < 0 && tagEq[1] < 0 && tagEq[2] < 0 && cidEq < 0 && colEq < 0) {
+    // counts, CID order skips catalog entries without reading their rows.
+    // Only where every row the scan finds is emitted (no post filters), so
+    // the vtab can own the OFFSET (SQLite then skips none).
+    if (offsetC >= 0 && typeLevel && !alias && !current && p.orderConsumed && nonGseq == 0 &&
+        (p.access == kAccGseq || p.access == kAccFull || p.access == kAccCidOrder)) {
         use(offsetC, &p.aOffset);
         info->aConstraintUsage[offsetC].omit = 1;
+    } else if (offsetC >= 0 && p.gseqTags && p.orderConsumed) {
+        // Seen, not owned: a sorted collection keeps LIMIT + OFFSET rows.
+        use(offsetC, &p.aOffsetSeen);
     }
     info->orderByConsumed = p.orderConsumed && info->nOrderBy > 0 ? 1 : 0;
     info->estimatedCost = cost;
@@ -820,7 +1218,29 @@ struct RecCursor : sqlite3_vtab_cursor {
     bool gseqDone = false;
     int64_t gseqVal = -1;
     std::string aliasSource;
+    int64_t pointArg = 0;        // kAccObjPoint: the target (epoch seconds)
 };
+
+// _object from the stored frame (plans that do not read OBJECT_EPOCH): the
+// type's extraction, the first present object column, a u64 key in decimal.
+// false: no object key (or a sealed frame, whose plaintext is not stored).
+bool objectFromFrame(const TypeInfo& t, const RecRow& r, const std::vector<uint8_t>& frame, std::string* out) {
+    if (!t.cfg || (r.flags & kRowSealed) || frame.size() < 8) return false;
+    Extracted ex;
+    uint8_t scratch[2048];
+    t.cfg->extract(frame.data(), frame.size(), &ex, scratch, sizeof(scratch));
+    if (ex.objectCol < 0) return false;
+    const ColValue& cv = ex.cols[ex.objectCol];
+    if (!cv.present) return false;
+    if (cv.isU64) {
+        *out = std::to_string(cv.u);
+    } else {
+        uint8_t capped[kMaxKeyLen];
+        const size_t n = capKey(capped, cv.s, cv.n);
+        out->assign(reinterpret_cast<const char*>(capped), n);
+    }
+    return true;
+}
 
 int recOpen(sqlite3_vtab* v, sqlite3_vtab_cursor** out) {
     RecCursor* c = new RecCursor();
@@ -890,6 +1310,8 @@ int recFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
     c->eof = true;
     if (!c->stmt) return fail(c, kRsSqlError, "no statement context");
     if (!c->plan.decode(idxStr)) return fail(c, kRsSqlError, "bad plan");
+    if (c->plan.access == kAccObjPoint && c->plan.aPoint > 0 && c->plan.aPoint <= argc)
+        c->pointArg = sqlite3_value_int64(argv[c->plan.aPoint - 1]);
     int32_t rc = buildSources(c, argv, argc);
     if (rc == kRsSnapshotGone && !c->stmt->rowEmitted) {
         // §8.8: a file named by the snapshot vanished before any row was
@@ -1077,6 +1499,29 @@ int recColumn(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int i) {
             if (rc < 0) return fail(c, rc, "frame read failed");
             if (c->frame.size() < 4) sqlite3_result_zeroblob(ctx, 0);
             else sqlite3_result_blob(ctx, c->frame.data() + 4, int(c->frame.size() - 4), SQLITE_TRANSIENT);
+            break;
+        }
+        case kMcObject: {
+            if (c->cur.hasObject) {
+                if (c->cur.objectNull) sqlite3_result_null(ctx);
+                else sqlite3_result_text(ctx, c->cur.object.data(), int(c->cur.object.size()), SQLITE_TRANSIENT);
+                break;
+            }
+            const int32_t rc = loadFrame(c);
+            if (rc < 0) return fail(c, rc, "frame read failed");
+            std::string o;
+            if (objectFromFrame(*vt->type, r, c->frame, &o)) sqlite3_result_text(ctx, o.data(), int(o.size()), SQLITE_TRANSIENT);
+            else sqlite3_result_null(ctx);
+            break;
+        }
+        case kMcAsof:
+        case kMcForward:
+        case kMcNearest: {
+            // Inputs: the plan's target on the column the statement named.
+            const int m = i - vt->nSchemaCols;
+            const uint8_t want = m == kMcAsof ? kPointAsof : m == kMcForward ? kPointForward : kPointNearest;
+            if (c->plan.access == kAccObjPoint && c->plan.pointKind == want) sqlite3_result_int64(ctx, c->pointArg);
+            else sqlite3_result_null(ctx);
             break;
         }
         case kMcOffset: sqlite3_result_int64(ctx, r.off); break;
