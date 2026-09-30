@@ -12,7 +12,9 @@ met on Linux. Part V (§37) bounds a reader instance's memory. Part VI (§38)
 records the memory-safety and race work: the ps-wasm trap, the sanitizers and
 the first disk-full emergency. Part VII (§39) closes the query gaps T6 found
 on the host-02 fixture and accepts records stored with their own size
-prefix. The design is
+prefix. Part VIII (§40) makes a partition's bookkeeping O(1) or O(log S) per
+commit (the terabyte audit's B4) and adds manifest version 3 (M3). The
+design is
 the stack's `docs/architecture/flatsql-partition-store.md` (§22 overrides
 §0–§21; §22.4 holds the owner rulings). This file records what was built, how
 to run it, the measured acceptance, and every place the build departs from the
@@ -650,11 +652,11 @@ and idle-lane sub-cursors (§21 deviation 1).
 
 | Path | Contents |
 |---|---|
-| `ps/compaction.h`, `src/ps/compaction.cpp` | Manifest version 2, the compacted rows format, retire items; the compaction pipeline (plan, build, SWAP, apply, abort). |
-| `src/ps/reclaim.cpp` | The per-partition file ledger (`disk_bytes`), the RETIRE and UNLINKED records, reader-gated unlinking, meta-segment retirement (A9), open-time cleanup; the same for the type logs (meta log rotation and retirement, retired catalog runs and manifests, the type ledger). |
-| `ps/quota.h`, `src/ps/quota.cpp` | The quota planner, the space emergency, the ballast. |
+| `ps/compaction.h`, `src/ps/compaction.cpp` | Manifest versions 2 and 3 (§40), the compacted rows format, retire items; the compaction pipeline (plan, build, SWAP, apply, abort). |
+| `src/ps/reclaim.cpp` | The per-partition file ledger (`disk_bytes`; a hash table, §40), segment lookups by binary search, the RETIRE and UNLINKED records and the RETIRE valve, reader-gated unlinking, meta-segment retirement (A9), open-time cleanup; the same for the type logs (meta log rotation and retirement, retired catalog runs and manifests, the type ledger). |
+| `ps/quota.h`, `src/ps/quota.cpp` | The quota planner, the space emergency, the ballast; the planner's per-segment summary and the compaction candidate index, kept from a change feed (§40). |
 | `src/ps/sources-t3.cmake` | Registers the T3 sources and tests on the targets `cpp/CMakeLists.txt` defines. |
-| `cpp/test/ps/{compaction,orphan,quota}_test.cpp` | T3 tests. `checkPartitionDir` and `checkTypeDir` (fixtures) walk a partition's or a type's directory against the files its head and manifest name. |
+| `cpp/test/ps/{compaction,orphan,quota,bookkeeping_scale}_test.cpp` | T3 tests (the last: §40). `checkPartitionDir` and `checkTypeDir` (fixtures) walk a partition's or a type's directory against the files its head and manifest name. |
 
 ## 24. Compaction (§11, A11, minor 1)
 
@@ -697,7 +699,9 @@ in the manifest; rows' `seg` is rewritten); after a restart, when the
 partition's dead share is over the ratio and the per-segment counts are
 unknown, the oldest
 segment not yet surveyed (a build that would save under 10% is abandoned and
-its count remembered). `Engine::swapSegment` requests one (targeted, or the
+its count remembered). The owner keeps these candidates in an index updated
+from a change feed; a look does not walk the segments (§40).
+`Engine::swapSegment` requests one (targeted, or the
 oldest-generation compactable segment).
 
 Kill bound and readers. A type-level reader's visibility is `V_p =
@@ -737,10 +741,12 @@ appended.
   133 files in 0.31 s at a 0.3 s grace). BUSY (a handle is open) skips to
   later items and retries after 50 ms; idle
   reader lanes close cached handles after 5 s. The next batch carries
-  `UNLINKED` and the shrunken set; `disk_bytes` drops then. A set past 2,048
-  items unlinks its oldest regardless of the gate (a statement older than
-  hours of retirements gets the retryable SNAPSHOT_GONE instead of a writer
-  waiting on it).
+  `UNLINKED` and the shrunken set; `disk_bytes` drops then. The set rides one
+  ctl record of one batch, so it is held under a soft cap (2,048 items as the
+  record encodes them, less with a large lane table): past it the oldest go at
+  once, regardless of the gate and the grace (deviation 37). A statement older
+  than them gets the retryable SNAPSHOT_GONE; an open handle still makes the
+  unlink BUSY.
 - **Open** unlinks every file of the persisted set (a file a surviving reader
   instance still holds stays retired), the outputs of an INTENT_COMPACT
   without SWAP, and r/a files a first merge created without MERGE_DONE, then
@@ -1841,3 +1847,234 @@ segments per partition, R type catalog runs):
   (arrivals mode), or the tags' matching instances (collected mode, at most
   262,144).
 - Size-prefixed records: nothing (a 4-byte comparison per record).
+
+# Part VIII: writer bookkeeping at scale
+
+## 40. Per-partition bookkeeping at scale (TB audit B4, M3)
+
+The terabyte audit (stack `docs/architecture/flatsql-ps-terabyte.md`, B4)
+found a partition's bookkeeping growing as O(S²) in its segment count S. A
+single dominant partition (the GP archive import, a hot-split partition)
+reaches S = 1,000 at about 170 GB and S = 6,000 at about 1 TB. With 128 KiB
+seals, the rate fell from 116,829 rec/s at S = 235 to 465 rec/s at
+S = 5,188. Commit rounds reached a p99 of 100.7 ms and maintenance steps
+100.7 ms. The causes:
+
+- The ledger (§26) was a vector searched linearly.
+- `partitionPublishSummary` made three ledger scans per sealed segment on
+  every commit that carried a MERGE_DONE, SEAL, SWAP, RETIRE or UNLINKED.
+- The compaction look walked every segment every 50 ms, with the same three
+  scans and an L0 scan per segment.
+- Segment lookups were linear.
+- Open rebuilt the ledger in O(S²).
+- A MERGE_DONE and a SWAP recomputed the accelerator bytes by walking every
+  run.
+- A split partition re-signed its run set on every commit by walking every
+  run, and its helpers matched their previous view run by run in O(runs²).
+
+What the owner keeps now (`PartitionLedger`, `ps/quota.h`):
+
+- **The ledger** is an open-addressing table keyed by `(letter, seg, gen)`,
+  with the same matching rules as before: manifests by generation, `d r a m`
+  by segment, the rest by both. The byte total changes with every set and
+  drop. A lookup, change or drop costs O(1).
+- **A change feed.** A ledger change to a segment's files, a new entry, a
+  kill count, a survey and every input of a SWAP name the segments
+  concerned. The planner's summary and the compaction candidate index update
+  only those segments. The summary does this on the commits that publish
+  it, the index on each look. Open rebuilds both in one walk.
+- **The compaction candidate index** applies §24's rules unchanged:
+  - segments past the dead ratio, ordered by share (largest first, lowest
+    id among equals);
+  - starts of adjacent small pairs, where the first run of small segments
+    begins at the lowest pair and grows within the coalescing limits;
+  - segments not surveyed since a restart.
+  A look costs O(log S), plus the output's neighbours.
+- **Segment lookups** binary-search the ascending entry list. Entries are
+  created in order, and a pseq search steps over entries that hold no rows
+  yet. Open walks the unmerged sealed segments alongside the entries.
+- **Accelerator bytes** change by the runs a MERGE_DONE or SWAP adds and
+  removes.
+- **The split run set** is signed by the manifest generation, since every
+  change to it commits a new one. A republish for new L0 blocks shares the
+  run list instead of copying it. Helpers find reusable runs by
+  `(seg, gen)`.
+
+Stage-1 helpers (§32) no longer race the owner or producers (ThreadSanitizer):
+- A slot's `pos`, `len` and `kind` are relaxed atomics. The owner may take a
+  CLAIMED slot and republish it for the next ordinal while the helper still
+  reads them.
+- A helper copies an entry with `ringReadShared` (relaxed 8-byte word
+  loads), never through a pointer into the ring. After a steal, the owner may
+  consume and release the entry, and a producer may rewrite its bytes while
+  the helper copies.
+- `ringWrite` stores relaxed words and edge bytes, which natively cost what
+  plain stores do; the wasm hosts write slabs themselves.
+- In both cases the helper's CLAIMED to WRITING step fails and its result is
+  dropped, as before. What it parsed is its own copy.
+- Slabs must be whole 8-byte words.
+
+Deviations:
+
+37. **The RETIRE set is held under what one batch carries** (A12 said: past
+    2,048 items, the oldest go regardless of the gate once a grace has
+    passed). The set rides one ctl record, whose length is a u16, inside the
+    batch's 64 KiB ctl buffer, alongside UNLINKED (up to 1,024 items) and the
+    lane table. A set that does not fit refuses every batch of the
+    partition. A busy partition retires a manifest and folded runs per
+    merge, and a coalescing SWAP retires a dozen files per input, so within
+    the 60 s grace its set outgrew a batch. Ingest then stopped for the rest
+    of the grace. The audit harness showed 843 rec/s for 50,000 records at a
+    time, about every minute. The valve counts the set as its record
+    encodes it (consecutive manifest generations collapse). The soft cap is
+    2,048 items, or less when a large lane table leaves less room. Past it,
+    the oldest items are unlinked at once, without waiting for the reader
+    gate or the grace:
+    - A statement older than those items gets the retryable SNAPSHOT_GONE.
+    - A file held open is BUSY and waits as before.
+    - A meta segment still waits for a durable head (A9).
+    - Crash safety never depended on the grace. The batch that retired a
+      file is durable before its retirement counts, and open replays that
+      batch.
+    - While a compaction in flight pins the newest items and the set is past
+      halfway from the soft cap to the hard cap, merges wait. Merges are the
+      steady source of retirements, so the SWAP or abort can land first.
+38. **Manifest version 3 (M3)** carries the segment count as a u32 in the
+    header's last word (the u16 then reads 0xFFFF). It is written only when
+    a partition's list outgrows the u16, so an engine that predates it still
+    reads every store it can represent, and refuses a version 3 manifest
+    instead of misreading it. Every version now decodes strictly: the
+    records must end exactly at the CRC trailer. Before, a version 2
+    manifest over 65,535 segments wrapped its count, passed the CRC and lost
+    the rest.
+
+Measured on the Mac (Darwin 25.3.0, arm64, 28 hardware threads, shared) with
+the in-memory fault host. One partition, 128 KiB seals, coalescing off (so S
+is the seal count), 400 B pad records, lockStats on:
+`bookkeeping_scale_S5k`. The base column is 0df6ef4 (its writer is
+14a3075's) with the same test. Each row is the 50,000-record window that ends
+at that S.
+
+| | S = 235, base | S = 235 | S = 5,188, base | S = 5,188 |
+|---|---|---|---|---|
+| commit round p99 | 0.328 ms | 0.229 ms | 100.7 ms | 0.115 ms |
+| maintenance step p99 | 0.082 ms | 0.049 ms | 100.7 ms | 0.328 ms |
+| summary refresh p99 (per commit that publishes it) | | 0.016 ms | | 0.004 ms |
+| candidate look p99 | | 0.033 ms | | 0.012 ms |
+| open (half, full: S = 2,594, 5,188) | | | 45.7 ms, 170 ms | 4.0 ms, 4.5 ms |
+| rec/s | 116,829 | 99,796 | 465 | 5,386 |
+
+Load was 39–60 for the base run and 22–30 for the new one. The same test on
+this change over d566293, at load 26–37: commit p99 0.393 → 0.229 ms,
+maintenance p99 0.066 → 0.786 ms, summary refresh 0.012 → 0.020 ms,
+candidate look 0.049 → 0.016 ms, open 6.0 ms at S = 5,188, rate 77,556 →
+3,363 rec/s.
+
+Over the same 200,000 records (S = 0 to 940), the process used 5.9–6.9 s of
+CPU against 9.2–10.3 s on 14a3075 (six alternating runs). Near S = 235 the new
+build's wall rate was lower than base's by about 7% in alternating runs
+(82,405 against 94,237 rec/s, load 30–37), while at S ≈ 11 the two were equal.
+With shorter commit rounds, the writer commits smaller batches (about 940
+commits per 50,000 records against 700) and waits idle for the test's single
+producer. The time is lost in the handshake, not in work.
+
+On ext4, in Docker's Linux VM on the same Mac, the audit's harness
+(`tb_segments_scaling`: fsync on, one partition, 128 KiB seals, 550,000
+records) was bound by the VM's shared virtual disk. Other lanes' containers
+were using it too, so both builds ran near 500 rec/s at S = 235:
+
+| build | S = 235 | S = 1,886 | S = 2,594 | reopen at S = 2,594 | whole run |
+|---|---|---|---|---|---|
+| 14a3075 | 475 rec/s | 211 rec/s | 356 rec/s | 21.0 s | 31.3 min |
+| this build | 522 rec/s | 795 rec/s | 781 rec/s | 3.6 s | 19.0 min |
+
+`bookkeeping_scale_S5k` itself on the same ext4 volume (`--dir`) is disk
+bound: commit rounds wait on fsync (p99 336 ms at S = 235, 470 ms at
+S = 5,188). The bookkeeping in them stays flat, though: the summary refresh
+p99 is 0.041 → 0.033 ms and the candidate look p99 0.066 → 0.029 ms, and
+open at S = 5,188 takes 134 ms. With `--dir` the test reports commit and
+maintenance p99 without gating them.
+
+The rate that remains decays with S because of B5: every record's CID dedupe
+probes the bloom of every L1 run of every segment (`committedPostings`,
+`partition_log.cpp`). `sample` at S ≈ 4,900 puts 94% of the writer's samples
+in `cidState` and about 1% in the paths this section changed: maintenance,
+commit rounds and reclamation together account for 184 of 12,272 samples.
+Per-partition levelled lookup indexes (B5) are the terabyte design's.
+
+What still costs O(S), and where it belongs:
+- A merge snapshots every segment into the manifest it rewrites (M3's delta
+  or two-level manifest). The maintenance p99 above (0.05 → 0.33 ms) is
+  that.
+- A SWAP writes a whole manifest and rebuilds the entry list.
+- A split partition's helpers reopen every run file per run set (B2's
+  handle LRU).
+
+Tests (`cpp/test/ps/bookkeeping_scale_test.cpp`):
+- `book_manifest_v3_codec`: exact round trips at 0, 1, 65,535, 65,536 and
+  70,001 segments; a wrapped v2 count, a stray byte, a bad v3 header and
+  version 4 refused; version 1 read.
+- `book_retire_valve_keeps_ingest_flowing`: 60,000 records at the default
+  60 s grace. 16,767 files retired, 14,299 unlinked by the valve, the
+  encoded set peaked at 2,113, 0 batches refused. With the valve off, the
+  same test refused 4,397 batches and one 5,000-record chunk took 59.5 s.
+- The valve test also reports the writer's memory, and none of it grows
+  with records. From 25,000 to 60,000 records:
+  - slab pool: 3.9 → 4.1 MB;
+  - ledger: 2,271 → 2,398 files (67 → 69 KB);
+  - RETIRE set: 2,145 → 2,217 items (160 KB);
+  - segment list: 54 → 68 entries (12 → 15 KB).
+  The process does grow: 1.47 GB at 25,000 records and 3.55 GB at 60,000
+  (3.4 GiB of wasm's 4 GiB). That is the in-memory test host, which keeps
+  every file it ever wrote (7,212 files, 1.45 GB; then 17,281 files,
+  3.52 GB) so that data calls need no lock. The rest of the heap
+  (13 → 25 MiB) grows by the host's 231 B per file. On wasm the test runs
+  25,000 records.
+- `book_equivalence_all_commit_kinds`: runs with `gBookCheck`, which checks
+  every ledger operation against the linear ledger it replaced, and every
+  segment lookup, summary refresh, candidate pick and split run-set
+  signature against a walk. A mismatch aborts. The run covers seals,
+  merges, SWAPs (dead-ratio, coalescing, requested, quota evictions),
+  RETIRE and UNLINKED, meta-segment retirement, a hot split, a clean
+  reopen and a kill -9.
+- `book_crash_every_op` (every 37th mutating call) and `_full` (every one:
+  9,416 crash points over seals, merges, SWAPs, retirement, unlinking and
+  A9, all five crash modes, 0 failures): after each reopen, the rebuilt
+  ledger names exactly the files on disk at `disk_bytes`, counters equal a
+  recount, and the engine carries on under `gBookCheck`.
+- `book_check_fast_suite` (slow): every fast test again with `gBookCheck`
+  (88 of 88 passed).
+- `bookkeeping_scale_S5k` (slow): the table above. It gates commit and
+  maintenance p99 under 10 ms at S ≥ 5,000, and the summary refresh and
+  candidate look within 2× (+50 µs) of their S = 235 cost. On the base
+  commit it fails both p99 gates.
+
+Sanitizers, on this build over d566293 (macOS, clang):
+- ThreadSanitizer reports nothing on eleven tests: the four book tests,
+  `quota_arrival_order_heads_spared_T3_3`,
+  `compaction_cat_supersede_plateau_T3_2`,
+  `orphan_crash_points_during_compaction_T3_4`, and the four fast hot-split
+  tests.
+- AddressSanitizer with UBSan reports nothing on the book tests,
+  `compaction_removes_dead_rows_keeps_live`,
+  `quota_arrival_order_heads_spared_T3_3`, the orphan harness,
+  `hot_split_equals_unsplit_reference_T3_5` and `crash_faults_T1_1`. It had
+  found one defect in this section, fixed: `std::min` bound a reference to a
+  packed counter.
+- The stage-1 race, before and after, on Docker linux/arm64 with gcc 13 and
+  on macOS:
+  - 14a3075 reports it in 3 of 5 hot-split runs (`hot_split_throughput_T3_5`,
+    and `hot_split_rebalance_stalled_helpers_A26` at 12 s, twice);
+  - this change reports it in none of 6 runs.
+  - A two-thread program (`ringWrite` against a helper's read of the same
+    bytes) shows it on Linux with a plain reader, and still shows it with
+    atomic loads against a plain `memcpy` write. It is silent only once both
+    sides are atomic.
+- Under ASan the equivalence test needs more than its default 60 s to settle
+  (it passes with `--eq-settle-s=600`).
+
+Mutations the checks caught:
+- a missing kill touch;
+- a SWAP input not touched;
+- a ledger update dropped;
+- the valve off.
