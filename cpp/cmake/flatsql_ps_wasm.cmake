@@ -105,6 +105,7 @@ list(APPEND FLATSQL_PS_WASM_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/ps_test_main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/ps_fixtures.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/reader_fixtures.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/tb_corpus.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test/io_fault.cpp
 )
 add_library(flatsql_ps_wasm_testutil STATIC

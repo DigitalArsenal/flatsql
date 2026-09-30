@@ -881,6 +881,9 @@ else()
 
     # T3 compaction/quota/split sources register themselves here.
     include(${CMAKE_CURRENT_SOURCE_DIR}/src/ps/sources-t3.cmake OPTIONAL)
+    # Terabyte harness (slow tests: unit gates, engine, count-scaled and
+    # metadata-only tiers).
+    include(${CMAKE_CURRENT_SOURCE_DIR}/test/ps/tb_sources.cmake)
 
     add_executable(flatsql_full_text_search_test tests/full_text_search_test.cpp)
     target_link_libraries(flatsql_full_text_search_test PRIVATE flatsql_lib)
