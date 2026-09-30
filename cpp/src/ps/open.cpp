@@ -18,6 +18,55 @@ namespace {
 
 constexpr int32_t kOpenRW = FLATSQL_IO_READ | FLATSQL_IO_WRITE;
 
+// The store markers (A5). A fresh store is created in this order: the registry
+// files, MIGRATED (when the host marks fresh stores migrated), then STORE.
+// STORE is the commit point. Until it exists the store reads as absent and the
+// next open creates it again (a MIGRATED from the cut-short attempt is
+// replaced). Once it exists, every other file does. The one torn state STORE
+// itself can be left in (created but not yet written: a kill between the two
+// calls, or its unsynced bytes lost with power) is finished at the next open
+// from MIGRATED, which is complete by then; nothing is registered yet, so no
+// data is at stake. A host therefore sees no store or a MIGRATED store after a
+// crash at any instruction. The I/O ABI has no rename, which is why the order
+// carries the atomicity.
+
+bool readMigratedFile(IoCtx* io, const PathBuf& mp, MigratedFile* m) {
+    FileRef f;
+    if (io->open(mp.c_str(), mp.len, FLATSQL_IO_READ, FileClass::Store, &f) != 0) return false;
+    const bool ok = io->read(f, m, sizeof(*m), 0) == int64_t(sizeof(*m)) && m->magic == kMagicMigrated &&
+                    m->crc == crc32c(m, offsetof(MigratedFile, crc));
+    io->close(&f);
+    return ok;
+}
+
+// No registry frames: nothing was ever registered, so no record exists.
+bool registryEmpty(IoCtx* io, const std::string& root) {
+    PathBuf rp;
+    pathStore(&rp, root.c_str(), "registry.fsl");
+    FileRef rf;
+    bool empty = true;
+    if (io->open(rp.c_str(), rp.len, FLATSQL_IO_READ, FileClass::Registry, &rf) == 0) {
+        empty = io->size(rf) == 0;
+        io->close(&rf);
+    }
+    return empty;
+}
+
+// Writes a marker file whole and syncs it. `replace` rewrites an existing
+// (torn) file in place; otherwise the file must not exist.
+int32_t writeMarkerFile(IoCtx* io, const PathBuf& p, const void* bytes, size_t n, bool replace) {
+    FileRef f;
+    int32_t flags = kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS;
+    if (!replace) flags |= FLATSQL_IO_EXCL;
+    int32_t rc = io->open(p.c_str(), p.len, flags, FileClass::Store, &f);
+    if (rc < 0) return rc;
+    rc = io->write(f, bytes, n, 0);
+    if (rc >= 0 && replace) rc = io->truncate(f, n);
+    if (rc >= 0) rc = io->sync(f);
+    io->close(&f);
+    return rc;
+}
+
 int32_t readHeadSlots(IoCtx* io, const FileRef& f, uint16_t kind, std::vector<uint8_t>* best) {
     int bestSlot = -1;
     uint64_t bestGen = 0;
@@ -389,6 +438,8 @@ int32_t Engine::openStore(std::string* err) {
     pathStore(&mp, cfg_.root.c_str(), "MIGRATED");
     StoreFile sf{};
     bool fresh = false;
+    bool finished = false;
+    bool registryOpen = false;
     FileRef f;
     int32_t rc = io->open(sp.c_str(), sp.len, FLATSQL_IO_READ, FileClass::Store, &f);
     if (rc == 0) {
@@ -397,24 +448,41 @@ int32_t Engine::openStore(std::string* err) {
         const bool valid = n == int64_t(sizeof(sf)) && sf.magic == kMagicStore && sf.format == kFormat &&
                            sf.crc == crc32c(&sf, offsetof(StoreFile, crc));
         if (!valid) {
-            // A torn STORE can only come from a crash while creating a fresh
-            // store (it is written once, before anything else). With no
-            // registry frames it is recreated; otherwise refuse.
-            PathBuf rp;
-            pathStore(&rp, cfg_.root.c_str(), "registry.fsl");
-            FileRef rf;
-            bool empty = true;
-            if (io->open(rp.c_str(), rp.len, FLATSQL_IO_READ, FileClass::Registry, &rf) == 0) {
-                empty = io->size(rf) == 0;
-                io->close(&rf);
-            }
-            if (!empty || !cfg_.create) {
+            // STORE is written last and once, so a torn STORE is a creation a
+            // crash cut short, provided nothing was ever registered. With
+            // registry frames it is damage: refuse.
+            if (!registryEmpty(io, cfg_.root)) {
                 if (err) *err = "STORE is corrupt";
                 return FLATSQL_IO_ERR_IO;
             }
-            io->unlink(sp.c_str(), sp.len, false);
-            io->unlink(mp.c_str(), mp.len, false);
-            fresh = true;
+            MigratedFile m{};
+            if (readMigratedFile(io, mp, &m)) {
+                // MIGRATED is complete, so the crash fell inside STORE's own
+                // write: finish it from MIGRATED, exactly as the creation
+                // would have. No data exists, so this needs no create
+                // permission.
+                sf = StoreFile{};
+                sf.magic = kMagicStore;
+                sf.format = kFormat;
+                std::memcpy(sf.uuid, m.uuid, 16);
+                sf.createdMs = m.migratedMs;
+                sf.gseqFloor = 1;
+                sf.migratedFrom = 0;
+                sf.crc = crc32c(&sf, offsetof(StoreFile, crc));
+                rc = writeMarkerFile(io, sp, &sf, sizeof(sf), true);
+                if (rc < 0) {
+                    if (err) *err = "cannot write STORE";
+                    return rc;
+                }
+                finished = true;
+            } else if (cfg_.create) {
+                io->unlink(sp.c_str(), sp.len, false);
+                io->unlink(mp.c_str(), mp.len, false);
+                fresh = true;
+            } else {
+                if (err) *err = "STORE is corrupt";
+                return FLATSQL_IO_ERR_IO;
+            }
         }
     } else if (rc == FLATSQL_IO_ERR_NOENT) {
         if (!cfg_.create) {
@@ -438,20 +506,11 @@ int32_t Engine::openStore(std::string* err) {
         sf.gseqFloor = 1;
         sf.migratedFrom = 0;
         sf.crc = crc32c(&sf, offsetof(StoreFile, crc));
-        rc = io->open(sp.c_str(), sp.len,
-                      kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_EXCL | FLATSQL_IO_CREATE_PARENTS,
-                      FileClass::Store, &f);
-        if (rc < 0) {
-            if (err) *err = "cannot create STORE";
-            return rc;
-        }
-        rc = io->write(f, &sf, sizeof(sf), 0);
-        if (rc >= 0) rc = io->sync(f);
-        io->close(&f);
-        if (rc < 0) {
-            if (err) *err = "cannot write STORE";
-            return rc;
-        }
+        // The creation order (see readMigratedFile): the registry files,
+        // MIGRATED, STORE.
+        rc = registry_.open(io, cfg_.root, true, err);
+        if (rc < 0) return rc;
+        registryOpen = true;
         if (cfg_.freshMarksMigrated) {
             MigratedFile m{};
             m.magic = kMagicMigrated;
@@ -459,35 +518,32 @@ int32_t Engine::openStore(std::string* err) {
             std::memcpy(m.uuid, sf.uuid, 16);
             m.migratedMs = sf.createdMs;
             m.crc = crc32c(&m, offsetof(MigratedFile, crc));
-            rc = io->open(mp.c_str(), mp.len,
-                          kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_EXCL | FLATSQL_IO_CREATE_PARENTS,
-                          FileClass::Store, &f);
-            if (rc >= 0) rc = io->write(f, &m, sizeof(m), 0);
-            if (rc >= 0) rc = io->sync(f);
-            io->close(&f);
+            // A MIGRATED left by an attempt that never wrote STORE names
+            // another uuid: replace it.
+            io->unlink(mp.c_str(), mp.len, true);
+            rc = writeMarkerFile(io, mp, &m, sizeof(m), false);
             if (rc < 0) {
                 if (err) *err = "cannot write MIGRATED";
                 return rc;
             }
         }
+        rc = writeMarkerFile(io, sp, &sf, sizeof(sf), false);
+        if (rc < 0) {
+            if (err) *err = "cannot write STORE";
+            return rc;
+        }
     }
     if (cfg_.requireMigrated) {
         MigratedFile m{};
-        rc = io->open(mp.c_str(), mp.len, FLATSQL_IO_READ, FileClass::Store, &f);
-        bool ok = false;
-        if (rc == 0) {
-            ok = io->read(f, &m, sizeof(m), 0) == int64_t(sizeof(m)) && m.magic == kMagicMigrated &&
-                 m.crc == crc32c(&m, offsetof(MigratedFile, crc)) &&
-                 std::memcmp(m.uuid, sf.uuid, 16) == 0;
-            io->close(&f);
-        }
+        const bool ok = readMigratedFile(io, mp, &m) && std::memcmp(m.uuid, sf.uuid, 16) == 0;
         if (!ok) {
             if (err) *err = "store is not MIGRATED (format 2 refuses to start)";
             return FLATSQL_IO_ERR_ACCESS;
         }
     }
     gseqNext_.store(sf.gseqFloor ? sf.gseqFloor : 1);
-    return registry_.open(io, cfg_.root, cfg_.create || fresh, err);
+    if (registryOpen) return 0;
+    return registry_.open(io, cfg_.root, cfg_.create || fresh || finished, err);
 }
 
 int32_t Engine::loadTypeConfig(const TypeEntry& te, std::string* err) {

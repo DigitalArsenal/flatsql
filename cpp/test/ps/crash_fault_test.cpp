@@ -654,3 +654,72 @@ PS_TEST(crash_faults_T1_1) {
 PS_SLOW_TEST(crash_faults_T1_1_full) {
     runTrials(int(argInt("crash-trials", 10000)), 64, 256, uint64_t(argInt("crash-seed", 1000)));
 }
+
+// A5: creating a fresh store is crash-safe at every mutating I/O call. A clean
+// fresh open is replayed with the host frozen at each of its mutating calls in
+// turn (the registry files, MIGRATED, STORE, then the rest of the open), under
+// every crash mode. The store is then reopened the way SDN's format2.Open
+// decides: with create while STORE is absent, without it once STORE exists
+// (SDN reads a present STORE as a MIGRATED store). Every reopen must succeed,
+// take a registration and an acked record, and reopen again clean. Before A5's
+// creation order the engine wrote STORE first, and a kill between its create
+// and its write, or between STORE and MIGRATED, left a store no open accepted.
+PS_TEST(crash_fresh_store_creation_every_io_call_A5) {
+    uint64_t total = 0;
+    {
+        Store s(true, 1, true);
+        REQUIRE(s.open() == 0);
+        total = s.fs->mutatingOps();
+        s.close();
+    }
+    REQUIRE(total >= 6);
+    const auto attr = buildRecordAttr("x", "prov", "src", "b1");
+    uint64_t trials = 0, storePresent = 0, finished = 0;
+    for (uint64_t n = 1; n <= total; n++) {
+        for (int mode = 0; mode < FaultFs::kModeCount; mode++) {
+            Store s(true, 1, true);
+            s.fs->armCrashAtOp(n);
+            std::string err;
+            (void)s.open(&err);
+            s.crash(FaultFs::CrashMode(mode), n * 131 + uint64_t(mode));
+            const std::string store = s.root + "/fsql2/STORE";
+            const bool present = s.fs->exists(store);
+            const bool torn = present && s.fs->contents(store).size() != sizeof(StoreFile);
+            s.cfg.create = !present;
+            err.clear();
+            const int32_t rc = s.open(&err);
+            if (rc != 0) {
+                std::fprintf(stderr, "  FAIL crash at mutating call %llu/%llu (mode %d, STORE %s): reopen %d: %s\n",
+                             (unsigned long long)n, (unsigned long long)total, mode,
+                             present ? (torn ? "torn" : "whole") : "absent", rc, err.c_str());
+                pst::gFailures++;
+                continue;
+            }
+            trials++;
+            storePresent += present ? 1 : 0;
+            finished += torn ? 1 : 0;
+            CHECK_EQ(s.fs->contents(store).size(), sizeof(StoreFile));
+            s.registerTypes({&ommType()});
+            const uint32_t pid = s.partition("creator", ommType());
+            REQUIRE(pid != 0);
+            {
+                Producer prod(s.e.get(), pid);
+                const uint64_t rseq = send(s.e.get(), prod, ommRecord(uint32_t(n), "C", "2026-09-30T00:00:00Z", 1.0),
+                                           attr, int64_t(n));
+                REQUIRE(rseq != 0);
+                CHECK_EQ(prod.waitAcked(rseq, 30000000000ull), 0);
+            }
+            s.close();
+            s.cfg.create = false;
+            err.clear();
+            CHECK_EQ(s.open(&err), 0);
+            s.close();
+        }
+    }
+    report("creation_crash_points", double(total), "calls");
+    report("creation_crash_reopens", double(trials), "trials");
+    report("creation_crash_store_present", double(storePresent), "trials");
+    report("creation_crash_store_finished", double(finished), "trials");
+    // The torn-STORE state was actually produced and finished at least once.
+    CHECK(finished > 0);
+}
