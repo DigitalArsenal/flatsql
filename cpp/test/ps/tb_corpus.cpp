@@ -709,7 +709,18 @@ double windowPercentileMs(const HistSnap& a, const HistSnap& b, double q) {
 void HistWindow::take(const LockHist& h) {
     prev_ = std::move(cur_);
     cur_ = snap(h);
-    if (prev_.b.empty()) prev_ = cur_;
+    if (prev_.b.empty()) {
+        prev_ = cur_;
+        return;
+    }
+    // A bucket that went down is a new histogram (the engine was reopened):
+    // the window starts from zero, not from the old engine's counts.
+    for (size_t i = 0; i < cur_.b.size() && i < prev_.b.size(); i++)
+        if (cur_.b[i] < prev_.b[i]) {
+            prev_.b.assign(cur_.b.size(), 0);
+            prev_.count = 0;
+            break;
+        }
 }
 
 double HistWindow::sumNs() const {

@@ -836,8 +836,9 @@ PS_SLOW_TEST(tb_engine_tier) {
     tb::HistWindow maint, commit;
     maint.take(env.e->maintHist());
     commit.take(env.e->commitHist());
+    // --tb-step-gb=0: no steps until the stop (one step row, one reopen).
     const uint64_t stepBytes = uint64_t(k.stepGB * double(kGB));
-    uint64_t nextStep = stepBytes;
+    uint64_t nextStep = stepBytes ? stepBytes : UINT64_MAX;
     uint32_t step = 0;
     uint64_t lastRecs = 0, lastBytes = 0, lastT = monoNs(), lastMerges = 0, lastSeals = 0, stepRecs = 0,
              stepT = monoNs();
@@ -1017,7 +1018,7 @@ PS_SLOW_TEST(tb_engine_tier) {
             step++;
             stepRecs = recs;
             stepT = now;
-            while (nextStep <= disk) nextStep += stepBytes;
+            while (stepBytes && nextStep <= disk) nextStep += stepBytes;
         }
         if (!stopWhy.empty()) break;
     }

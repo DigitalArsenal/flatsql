@@ -180,6 +180,13 @@ def main():
         for k, v in r.items():
             if v is not None and v < 0:
                 r[k] = None
+        # Harness builds before 2026-09-30 measured the first window after a
+        # reopen against the old engine's histogram (counts near 2^64): drop
+        # that sample's histogram columns.
+        if (r.get('maint_n') or 0) > 1e15 or (r.get('commit_n') or 0) > 1e15:
+            for k in list(r):
+                if k.startswith(('maint_', 'commit_')):
+                    r[k] = None
         if 'dom_ok' in r and not r['dom_ok']:
             for k in r:
                 if k.startswith('dom_') and k not in ('dom_ok', 'dom_accel_est'):
