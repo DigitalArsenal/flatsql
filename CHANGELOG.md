@@ -35,7 +35,7 @@
 - The terabyte harness (audit §4): unit gates, engine tiers and a metadata-only 10 TB tier as
   slow tests (`cpp/test/ps/tb_*`, `scripts/tb`).
 - `wasm/flatsql-ps-threads.wasm` sha256
-  `652408345379d97b9225b726ece3d40e3e44f19d644a2f9c11e68fa59bc19a41` (2,484,768 bytes); the other
+  `787adbcccf52a9e9fe2767d6679b6f2d94a4ead41985bf2a7bb0855f821abc72` (2,484,927 bytes); the other
   artifacts are 3.4.0's.
 
 ## 3.4.0

@@ -194,6 +194,16 @@ int32_t StmtShared::readFrame(LaneStore* st, const PartSnap& s, const RecRow& r,
     return 0;
 }
 
+bool StmtShared::typeRepeats(LaneStore* st) {
+    if (!repeatsKnown) {
+        repeatsKnown = true;
+        repeats = true;  // unknown (no snapshot, or an error): look copies up
+        bool yes = true;
+        if (typeSnap && typeHasRepeats(st, *typeSnap, &yes) >= 0) repeats = yes;
+    }
+    return repeats;
+}
+
 bool StmtShared::mayHave(LaneStore* st, const PartSnap& s, uint16_t kind) {
     for (const KindHas& k : kinds_)
         if (k.snap == &s && k.kind == kind) return k.has;
@@ -569,7 +579,7 @@ int32_t RowFilter::anyCopyTag(const RecRow& row, const TagMatch& m, bool* yes) {
     if (rc < 0 || *yes) return rc;
     std::vector<CopyRef> others;
     TypeSnap* ts = type ? type : copies;
-    if (ts && shared && shared->repeats && shared->lane) {
+    if (ts && shared && shared->lane && shared->typeRepeats(store)) {
         rc = otherCopies(store, shared.get(), stmt, ts, row.cid, snap->pid, row.pseq, &others);
         if (rc < 0) return rc;
         for (CopyRef& c : others) {
@@ -605,7 +615,7 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
         // promoted since (A14).
         bool repeat = false;
         // A type without REPEAT postings has no REPEAT copy to look up.
-        int32_t rc = shared && shared->repeatsKnown && !shared->repeats ? 0 : store->everRepeat(*type, snap->pid, pseq, &repeat);
+        int32_t rc = shared && !shared->typeRepeats(store) ? 0 : store->everRepeat(*type, snap->pid, pseq, &repeat);
         if (rc < 0) return rc;
         if (repeat || gseqFloor || wantGseq) {
             uint8_t label = 0;
@@ -644,7 +654,7 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
 
 int32_t RowFilter::acceptInstance(uint64_t put, const TagMatch& m, CurRow* out) {
     const int32_t rc0 = accept(put, out);
-    if (rc0 != 0 || !type || !shared || !shared->repeats || !shared->lane) return rc0;
+    if (rc0 != 0 || !type || !shared || !shared->lane || !shared->typeRepeats(store)) return rc0;
     // Rejected at type level. A live REPEAT copy whose instance matched
     // stands for its record: the record's FIRST row is emitted by the first
     // matching copy in (FIRST, then REPEATs by (pid, pseq)) order, among the

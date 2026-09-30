@@ -182,6 +182,10 @@ struct StmtShared {
     // live copies in several partitions; tag conditions then look at all).
     bool repeats = false;
     bool repeatsKnown = false;    // `repeats` was computed (type level)
+    TypeSnap* typeSnap = nullptr; // the type snapshot `repeats` is computed from (lazily)
+    // Whether the type has REPEAT postings, computed on first use: a point
+    // lookup never needs it (it reads no tag and no label).
+    bool typeRepeats(LaneStore* st);
     // Partitions the plan reads (sorted); copies elsewhere are not visible.
     std::vector<uint32_t> pids;
     struct Pruned {
