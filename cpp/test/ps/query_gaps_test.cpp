@@ -1,5 +1,5 @@
 // Format-2 query gaps found by T6's fixture comparisons (PARTITION-STORE.md
-// §38): text CID order from the cid catalog, per-object point profiles on
+// §39): text CID order from the cid catalog, per-object point profiles on
 // OBJECT_EPOCH, the sandbox window read from arrivals, tag conditions on
 // every live copy, and gseq-ordered tag pages. Each plan is held to a
 // reference computed from what the test sent.
@@ -476,7 +476,7 @@ PS_TEST(query_gaps_type_tags_every_copy_and_gseq_pages_A2) {
     w.s.close();
 }
 
-// §38: a record stored with its own size prefix (a FinishSizePrefixed buffer
+// §39: a record stored with its own size prefix (a FinishSizePrefixed buffer
 // kept as is: dataset-publication PNMs, the local EPM) is accepted, keyed and
 // projected like the same record without it; its stored bytes and CID are
 // the record's own.

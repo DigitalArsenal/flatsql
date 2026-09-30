@@ -564,7 +564,7 @@ int32_t TypeConfig::checkFrame(const uint8_t* frame, size_t len) const {
     if (len < 12 || len - 4 > maxFrame_) return kRejFrameSize;
     if (getU32(frame) != len - 4) return kRejFrameSize;
     // The record is a bare FlatBuffer, or one stored with its own size
-    // prefix (frameRootOffset, §38).
+    // prefix (frameRootOffset, §39).
     const size_t root = frameRootOffset(frame, len, fid_);
     if (std::memcmp(frame + root + 4, fid_, 4) != 0) return kRejFid;
     if ((flags_ & kVerifyBfbs) && schema_) {
@@ -719,7 +719,7 @@ void TypeConfig::extract(const uint8_t* frame, size_t len, Extracted* out, uint8
                          size_t scratchLen) const {
     *out = Extracted();
     if (!schema_ || len < 12) return;
-    // The FlatBuffer after the frame's size prefix (and the record's own, §38).
+    // The FlatBuffer after the frame's size prefix (and the record's own, §39).
     const uint8_t* root = frame + frameRootOffset(frame, len, fid_);
     size_t used = 0;
     auto take = [&](size_t n) -> uint8_t* {

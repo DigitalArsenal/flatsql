@@ -180,7 +180,7 @@ private:
 };
 
 // Where the FlatBuffer starts in a frame [u32 size][record] of a type with
-// file identifier `fid` (PARTITION-STORE.md §38). A record is a bare
+// file identifier `fid` (PARTITION-STORE.md §39). A record is a bare
 // FlatBuffer (identifier at frame offset 8: the root at 4), or a buffer that
 // carries its own size prefix and is stored as is (FinishSizePrefixed:
 // dataset-publication PNMs, the local EPM): its u32 at frame offset 4 is

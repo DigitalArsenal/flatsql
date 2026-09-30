@@ -97,7 +97,7 @@ bool TagMatch::matches(const TagView& t) const {
            (!hasSource || eqBytes(source, t.source, t.sourceLen));
 }
 
-// ---- §38: pruned snapshots, REPEAT state, tags on every copy -------------------
+// ---- §39: pruned snapshots, REPEAT state, tags on every copy -------------------
 bool laneMatches(const TagMatch& m, const LaneStore::LaneTuple& t);
 PartSnap* StmtShared::prunedFor(PartSnap* s, uint64_t pseq) {
     if (!s || !s->manifest || s->manifest->segs.size() < 4) return s;
@@ -631,7 +631,7 @@ int32_t RowFilter::accept(uint64_t pseq, CurRow* out) {
     if (out->row.kind != kRowPut) return 0;
     if (tags.any) {
         bool yes = false;
-        // Type level (§38): any live copy of the record; partition level:
+        // Type level (§39): any live copy of the record; partition level:
         // this partition's instances.
         rc = (type || copies) ? anyCopyTag(out->row, tags, &yes) : hasLiveTag(pseq, tags, &yes);
         if (rc < 0) return rc;
@@ -813,7 +813,7 @@ public:
             if (emittedSet_.empty() ? std::find(emitted_.begin(), emitted_.end(), pseq) != emitted_.end()
                                     : emittedSet_.count(pseq) != 0)
                 continue;
-            // Type level (§38): a REPEAT copy's instance stands for its record.
+            // Type level (§39): a REPEAT copy's instance stands for its record.
             const int32_t rc = instances_ && inst_.any ? f_.acceptInstance(pseq, inst_, out) : f_.accept(pseq, out);
             if (rc < 0) return rc;
             if (rc == 0) continue;
@@ -1134,7 +1134,7 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
     int tagEq[3] = {-1, -1, -1};
     int colEq = -1, colIdx = -1;
     int limitC = -1, offsetC = -1;
-    // §38: the per-object point inputs, and what the point plan can evaluate
+    // §39: the per-object point inputs, and what the point plan can evaluate
     // before it chooses (epoch range, tags, producer); anything else would be
     // applied by SQLite after the choice, which is not the same query.
     int pointEq[3] = {-1, -1, -1};
@@ -1327,7 +1327,7 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         rows = 10;
     } else if (sandbox || (typeLevel && anyTag && (ord == kOrdGseqAsc || ord == kOrdGseqDesc) &&
                            (limitC >= 0 || (gseqLo >= 0 && gseqHi >= 0)))) {
-        // Arrivals (gseq) order. §38 gap 5: a gseq-ordered page with tag
+        // Arrivals (gseq) order. §39 gap 5: a gseq-ordered page with tag
         // conditions reads arrivals and checks each row's tags (or, when the
         // lane counters say the tags are rare, collects and sorts their
         // postings) instead of sorting every match of the tag index.
@@ -1469,7 +1469,7 @@ int recBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
     // Tag conditions (A2, ANY-row semantics): the vtab evaluates every one
     // itself, on the tag instance a posting names or, for other plans, on
     // any live instance of the record (RowFilter::hasLiveTag; at type level
-    // on every live copy, §38). SQLite must not re-check them against the
+    // on every live copy, §39). SQLite must not re-check them against the
     // projected columns, which show only the PUT's own tag: that dropped
     // every record matched through a RETAG.
     // <TYPE>_current groups first and filters after, as SQL says: its tag
@@ -1954,7 +1954,7 @@ int32_t buildSources(RecCursor* c, sqlite3_value** argv, int argc) {
             } else if (p.aHi >= 0) {
                 return 0;
             }
-            // Pseq order: rows and frames read ahead (§38).
+            // Pseq order: rows and frames read ahead (§39).
             f.shared = std::make_shared<StmtShared>();
             f.shared->lane = lane;
             f.readAhead = !p.desc;

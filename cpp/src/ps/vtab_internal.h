@@ -40,7 +40,7 @@ enum MetaCol : int {
     kMcKind,
     kMcRowid,
     kMcPid,
-    // Query-gap additions (docs/PARTITION-STORE.md §38). _object is the
+    // Query-gap additions (docs/PARTITION-STORE.md §39). _object is the
     // record's OBJECT_EPOCH key as text (a u64 key in decimal); _asof,
     // _forward and _nearest are inputs: an EQ constraint (epoch seconds)
     // selects the per-object point plan (kAccObjPoint).
@@ -91,7 +91,7 @@ struct Plan {
     // re-check), argv indexes: _provider, _batch, _peer_id, _source_name,
     // _source ('<TYPE>@<name>'). See TagMatch.
     int8_t aTag[5] = {-1, -1, -1, -1, -1};
-    // §38 additions.
+    // §39 additions.
     uint8_t pointKind = kPointNone;  // kAccObjPoint: the profile
     int8_t aPoint = -1;              // kAccObjPoint: argv index of the target (epoch seconds)
     int8_t aOffsetSeen = -1;         // OFFSET the vtab reads but SQLite applies (row budget)
@@ -172,7 +172,7 @@ public:
     virtual int32_t next(CurRow* out) = 0;
 };
 
-// Per-statement state shared by a plan's row filters (§38): snapshots
+// Per-statement state shared by a plan's row filters (§39): snapshots
 // restricted to the segments that can hold pseq-keyed postings, and whether
 // the type has REPEAT copies at all.
 struct StmtShared {
@@ -291,14 +291,14 @@ struct RowFilter {
     // Does PUT `put` have a live tag instance matching `m` in this
     // partition (its own tag or a RETAG)?
     int32_t hasLiveTag(uint64_t put, const TagMatch& m, bool* yes);
-    // Type level (§38, gap 4): does any live copy of the record (FIRST or
+    // Type level (§39, gap 4): does any live copy of the record (FIRST or
     // REPEAT, any partition of the plan) have a live instance matching `m`?
     // `row` is the FIRST copy's PUT row in this partition.
     int32_t anyCopyTag(const RecRow& row, const TagMatch& m, bool* yes);
     // A tag or source posting matched an instance of the PUT `put` in this
     // partition (the conditions hold on it). Type level: when that PUT is a
     // live REPEAT copy, the record's FIRST row is emitted instead, by exactly
-    // one of its matching copies (§38). Returns 1/0/< 0 as accept().
+    // one of its matching copies (§39). Returns 1/0/< 0 as accept().
     int32_t acceptInstance(uint64_t put, const TagMatch& m, CurRow* out);
 };
 

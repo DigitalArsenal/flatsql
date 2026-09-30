@@ -97,7 +97,7 @@ PS_TEST(lane_partition_and_type_queries) {
     CHECK_EQ(r.status, 0);
     CHECK_EQ(r.rows.size(), size_t(5));
     // Alias vtab: records with a live srcB instance on any live copy
-    // (PARTITION-STORE.md §38): 200..299 (FIRST in peerB) and 100..199
+    // (PARTITION-STORE.md §39): 200..299 (FIRST in peerB) and 100..199
     // (FIRST in peerA, REPEAT copies in peerB).
     r = bulk.q("SELECT count(*) FROM \"OMM@srcB\"");
     CHECK_EQ(r.status, 0);
@@ -369,7 +369,7 @@ PS_TEST(lane_tag_conditions_match_any_instance_A2) {
         const char* batch = nullptr;
         const char* peer = nullptr;
     };
-    // Type level (§38): every live copy's instances count (the record held by
+    // Type level (§39): every live copy's instances count (the record held by
     // gp and gp2 matches on either); partition level: that partition's.
     auto oracle = [&](uint32_t pid, bool typeLevel, const Cond& c) {
         std::set<std::string> out;
@@ -451,7 +451,7 @@ PS_TEST(lane_tag_conditions_match_any_instance_A2) {
     r = bulk.q("SELECT count(*) FROM OMM WHERE _cid = ? AND _batch = 'b2'", {Param::text(cidTextOf(recs[150]))});
     CHECK_EQ(r.i(0, 0), 1);
     r = bulk.q("SELECT count(*) FROM OMM WHERE _cid = ? AND _batch = 'b3'", {Param::text(cidTextOf(recs[260]))});
-    CHECK_EQ(r.i(0, 0), 1);  // b3 tags only the REPEAT copy in gp2: every copy counts (§38)
+    CHECK_EQ(r.i(0, 0), 1);  // b3 tags only the REPEAT copy in gp2: every copy counts (§39)
     // The projection still shows the PUT's own tag.
     r = bulk.q("SELECT _provider, _batch FROM OMM WHERE _cid = ?", {Param::text(cidTextOf(recs[150]))});
     REQUIRE(r.rows.size() == 1);
