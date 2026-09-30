@@ -1,5 +1,34 @@
 # Changelog
 
+## 3.6.0
+
+- Store format level 3 (TB03, docs/PARTITION-STORE.md §41): a partition no longer stops
+  committing past 1,170 live lanes. A batch writes only the lanes it changed (56 B for a
+  one-lane batch at 66 lanes or at 5,000, where level 2 wrote 3,760 B at 66 and never acked
+  past 1,170). Past 32 live lanes the head names a paged lane checkpoint `lk-<gen>.fsl` and a
+  replay offset; checkpoints are cut by cadence (writer TLV 32, default 128 batches with lane
+  deltas, 512 in all), before a meta segment they replay from retires, and after the crossing,
+  under a crash protocol (write and sync, a durable head names it, then RETIRE the one it
+  replaced; no cut while that RETIRE waits). Replay, readers, open and checkpoints fold lane
+  tables by one rule; a lane at count 0 starts afresh when it comes back.
+- Format levels (`format_level.h`, kFormatMax 3): STORE.format is the store's level. An open
+  raises it to writeFormat (writer TLV 31, default kFormatMax) once the registry is non-empty,
+  through STORE.tmp and an in-place rewrite; a fresh store is created at it. Older engines
+  refuse a raised store without creating a file (3.5.1: "STORE is corrupt"); a host pinned at
+  2 keeps its level; a raise that finds no room for STORE.tmp waits for the next open; a torn
+  STORE is finished from STORE.tmp. Manifest version 3 is written from level 3. Writer stats
+  entries 36-40: the store's level, kFormatMax, the level this open raised STORE from, lane
+  checkpoints cut and their bytes (41 entries).
+- Live-only candidate caps (N2): supersede, licence, control, CID and tag-instance lookups no
+  longer let dead postings crowd out the live row (a CAT key superseded 20 times kept 12 live
+  versions). A supersede walks the key's sources newest first and stops at its newest live
+  row: a PUT of a key with 800 dead versions costs 2.3x a new key's, not 12.8x.
+- A batch that minted lanes and failed rolls `nextLaneId` back to its first minted id; a
+  LaneRef head in a store below level 3 quarantines the partition instead of failing the open;
+  readers apply the writer's STORE rules.
+- `wasm/flatsql-ps-threads.wasm` is rebuilt from this source (Linux wasi-sdk 30), sha256
+  `87ea0c727eb3c0b889a2d3fb41f8dac631ec2af07f521fe9526556d094d2e119`.
+
 ## 3.5.1
 
 - A fresh partition store survives a crash at any I/O call of its creation (A5). `openStore`
