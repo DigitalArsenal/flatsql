@@ -562,7 +562,7 @@ void runHalfDead(int parts, int perPart, uint64_t minPreSwap, uint64_t maxSecond
     // Latency during compaction: the whole period SWAPs ran in.
     const double ackDuring = ack.p99(), laneDuring = lane.p99();
     const double commitDuring = histP99Since(s.e->commitHist(), commit0), maintDuring = histP99Since(s.e->maintHist(), maint0);
-    const size_t ackSamples = ack.ms.size(), laneSamples = lane.ms.size();
+    const size_t ackSamples = ack.size(), laneSamples = lane.size();
     stop = true;
     producer.join();
     asker.join();

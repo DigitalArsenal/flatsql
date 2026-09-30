@@ -458,6 +458,8 @@ bool isDead(Ctx& c, uint64_t pseq) {
 
 // A tag instance retired by TAG_TOMB (A2). Staged entries use the high bit.
 constexpr uint64_t kTagDeadBit = 1ull << 63;
+// L0 directory slots ring entries leave to mailbox kills and TOMB_RANGE steps.
+constexpr uint32_t kL0ControlSlots = 4;
 bool isTagDead(Ctx& c, uint64_t inst) {
     if (stagedDeadGet(*c.sc, inst | kTagDeadBit, nullptr)) return true;
     uint8_t k[8];
@@ -1951,7 +1953,9 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
         if (p->forceLaneCkpt) sc->forceLaneCkpt = true;
     }
     // Rows need a slot in the head's L0 directory: at its cap, mailbox kills
-    // and TOMB_RANGE steps wait for the merge, as ring entries do.
+    // and TOMB_RANGE steps wait for the merge. Ring entries stop
+    // kL0ControlSlots earlier, so an eviction's first steps never wait for a
+    // merge (in a space emergency a merge may have no room to write).
     const bool dirRoom = p->nL0 < kMaxL0Dir - 1;
     // Type-level kills from the mailbox (A14). They leave the queue when the
     // batch publishes; a discarded batch retries them.
@@ -1996,7 +2000,7 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
     const bool noSpace = e->spaceEmergency();
     while (!noSpace && !st->sealAfter && !c.err && pos + sizeof(EntryHeader) <= tail) {
         if (st->dBytes >= cfg.commitBytes || frames0 >= frameCap) break;
-        if (p->nL0 >= kMaxL0Dir - 1) {  // wait for a merge (type labeling lags)
+        if (p->nL0 >= kMaxL0Dir - 1 - kL0ControlSlots) {  // wait for a merge (type labeling lags)
             e->cL0Full.fetch_add(1, std::memory_order_relaxed);
             break;
         }
@@ -2505,12 +2509,7 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         }
         const bool lockStats = e->config().lockStats;
         const uint64_t l0 = lockStats ? monoNs() : 0;
-        p->pubLock.writeBegin();
-        p->pub.commitSeq = p->commitSeq;
-        p->pub.pseqHi = p->pseqHi;
-        p->pub.nL0 = p->nL0;
-        std::memcpy(p->pub.l0, p->l0, sizeof(L0DirEntry) * p->nL0);
-        p->pubLock.writeEnd();
+        publishPartition(p->pubLock, p->pub, p->commitSeq, p->pseqHi, p->nL0, p->l0);
         if (lockStats) e->seqlockHist().record(monoNs() - l0);
         p->durablePseqHi.store(p->pseqHi, std::memory_order_release);
         p->durableCommitSeq.store(p->commitSeq, std::memory_order_release);

@@ -8,7 +8,9 @@ fan-out merge, admission and results. Part III (§23–§30) is T3: compaction,
 reclamation, meta-segment retirement, disk accounting and quota. Part IV
 (§31–§35) is T3b: store-migrate gseqs, the entry-size setting, hot-partition
 splitting and arrivals compaction; §36 records the quota eviction race T3 #3
-met on Linux. Part V (§37) bounds a reader instance's memory. The design is
+met on Linux. Part V (§37) bounds a reader instance's memory. Part VI (§38)
+records the memory-safety and race work: the ps-wasm trap, the sanitizers and
+the first disk-full emergency. The design is
 the stack's `docs/architecture/flatsql-partition-store.md` (§22 overrides
 §0–§21; §22.4 holds the owner rulings). This file records what was built, how
 to run it, the measured acceptance, and every place the build departs from the
@@ -1459,11 +1461,11 @@ harness's arrivals check ran on a second reader instance the reader gate did
 not cover, so a statement could lose a file to reclamation and end
 SNAPSHOT_GONE (on 2f6d86e too: seed 9003, trial 48); the gate now covers both.
 
-Open: `quota_disk_full_resumes_without_operator_T3_6` can stay in its first
+`quota_disk_full_resumes_without_operator_T3_6` could stay in its first
 emergency past the test's minute on a loaded box (one episode, three
-segments evicted, the ballast never back). It predates this change: on
+segments evicted, the ballast never back). It predated this change: on
 linux/amd64 Debug at a host load near 40, 4 of 100 runs on 2f6d86e and 1 of
-100 here; under ThreadSanitizer, 3 of 6 and 1 of 10.
+100 here; under ThreadSanitizer, 3 of 6 and 1 of 10. Root cause and fix: §38.
 
 # Part V: reader memory
 
@@ -1574,3 +1576,102 @@ held across statements by the reader beyond the budgets above):
 | writer: `L1Run::load` (`index_l1.cpp:168`) | every run's fences and all its blooms, held by `SegRun::run` for each warm partition's segments and each type's catalog runs | 1% of each run plus 1.25 B per entry | grows with the store: a terabyte store holds gigabytes in the writer instance; needs the reader's paging |
 | writer: `SegmentInfo::cdir` (`compaction.cpp:382`) | a compacted segment's presence directory, kept once loaded | 0.13 B per record | grows with the store |
 | writer: `Partition::segs`, `summary`, the file ledger | per segment | a few hundred bytes per segment | grows with segments |
+
+# Part VI: memory safety and races
+
+## 38. The ps-wasm trap, the sanitizers, the first emergency
+
+Task flatsql-ps-memory-safety-races-20260929. Machines: the owner's Mac
+Studio (Darwin 25.3.0, arm64, 28 hardware threads) shared with other lanes
+(1-minute load 17–95 during these runs), and linux/arm64 in Docker Desktop on
+it (gcc 13 and clang 18, `--cpus 4` with `stress-ng` on one CPU unless noted).
+
+**The ps-wasm trap is V8's shared-memory grow race, not an engine overrun**
+(PARTITION-STORE-WASM.md §4.3). CI's trap was a `memory.fill` right after an
+`operator new` on the type-merge helper, into memory another thread had just
+grown; V8 bounds-checks it against the thread's stale view of the memory's
+size. The wasm test main and `createPsNodeInstance` now grow the heap to the
+memory's maximum before any guest thread starts, and the Node host reports
+any growth after threads start. Natively, under ASan and UBSan, T2_1 found no
+memory error (loops below). UBSan found two defects:
+- A misaligned `uint64_t` reference: `Counters` is packed (on-disk).
+  `Partition::counters` is now 8-aligned.
+- Null-pointer arithmetic in `EntryIter::next` (index_l0.cpp). That fix
+  lands with flatsql-format2-query-gaps.
+
+Under WasmEdge the same runs exposed a WasmEdge 0.16.4 AOT defect: atomic
+wait and notify dropped the memarg offset. SDN's static runtime carries the
+fix, patch `04-atomic-memarg-offset` (SDN 74db37e14). `sleepNs` passes its
+address through a volatile, so its wait carries no memarg offset.
+`memory_safety_sleep_and_notify_at_folded_offsets` fails on a runtime without
+the fix.
+
+**ThreadSanitizer.** The whole default suite runs TSAN-clean (Docker, gcc 13
+`-fsanitize=thread`, `--cpus 6`) apart from the stage-1 races below. Each
+race found:
+
+| Where | What | Verdict, change |
+|---|---|---|
+| partition_log.cpp:2509 (`partitionPublish`) against type_owner.cpp:671 (`typeStage`) | The owner publishes a partition's commitSeq, pseqHi and L0 directory inside its seqlock; the type owner copies them and retries on a moved sequence. | Benign by design (a seqlock), but a plain copy on both sides is a data race in C++. Both sides now copy 8-byte words with relaxed atomic accesses (`publishPartition`, `readPublishedPartition`, writer.h). The sequence counter's fences order them. `PublishedPart::l0` is 8-aligned. `memory_safety_seqlock_publication_consistent`: readers racing a publishing owner only ever copy out whole states. |
+| writer_pool.cpp:230 (`SyncPool::runAll`) against `helpOne` | A pool thread reads a slot's `jobs` pointer while the writer publishes its next round; that stale pointer's claim then fails. | Benign by design. The pointer is `std::atomic` (relaxed); the round's `n` (release/acquire) orders the jobs. `memory_safety_sync_pool_rounds_run_each_job_once`: 6 writers × 400 rounds, each job runs exactly once with its own result, and the pool threads help. |
+| lane_arena.cpp:415 (`mxAlloc`) | Every lane's connection allocates SQLite's static mutexes again, which rewrote their shared wrappers. | Real (same values, rewritten under readers). The wrapper is filled once (`std::call_once`). |
+| lane.cpp:930 (`oldestActiveStart`) against `~ReaderInstance` | `Engine::setReaderGate` returned while a writer thread could still be inside the previous gate function, and the caller then destroyed the reader instance it reads. | Real: a use-after-free window. `setReaderGate` now clears the gate, waits for the gate calls in flight (a counter), then installs the new pair. |
+| merge.cpp:732 against open_test.cpp:296; reader_concurrency_test.cpp:216; compaction_test.cpp:565 | Tests read the owner's `nL0` from the main thread, or a latency series without its lock. | Test races. The tests read the published directory and take the lock. |
+| stage1.cpp:322 against stage1.cpp:499 (prep slots); ring.cpp:125 (a helper copies an entry the owner has consumed) | The owner republishes a slot it stole from a helper while the helper still reads it. | Benign by design (the helper's result is discarded by a failing CAS), and memory-safe (the copy stays inside the slab pool). Atomic slot fields and a racy-copy ring read belong to flatsql-ps-partition-bookkeeping-linear. |
+
+**T3 #6: the first emergency could stall for good** (§36). Traced under
+TSAN:
+- The eviction wave's partition had a full L0 directory (47 blocks) from
+  ingest before the emergency, so its TOMB_RANGE needed a merge first.
+- Meanwhile the room the ballast gave back was spent by maintenance outside
+  the eviction: the other partition's merges, and a compaction nobody
+  requested. Its build failed NOSPACE and started over with a new intent
+  batch in the meta log about ten times a second. Usage crept 8,960 B/s until
+  the device was exactly full.
+- From then on no batch committed. The wave's merge could not write outputs
+  and no TOMB step could stage, for the rest of the minute.
+
+36. **In a space emergency, maintenance leaves the ballast's room to the
+    eviction** (A13 assumes the ballast holds one segment's tombstones, and
+    says nothing of what else may spend it). Only a partition with eviction
+    work waiting merges (TOMB_RANGE steps, type-level kills, a requested
+    compaction: `partitionWantsMerge`). A compaction the planner did not
+    request does not start (`Writer::maintenance`); one in flight finishes.
+    Ring entries stop `kL0ControlSlots` (4) L0 slots before the directory's
+    cap, which mailbox kills and TOMB_RANGE steps may use, so a wave's first
+    steps never wait for a merge.
+
+Measured, in Docker:
+- **Before:** under TSAN, 4 of 12 runs, and 1 of 7 traced ones, stayed in
+  the first emergency until the test's limit (70 s).
+- **After:** 50 of 50 TSAN runs recovered (whole test 19–43 s), and 340 of
+  340 Debug runs (gcc `-O0`, 8–10 s each). The test also passes natively on
+  the Mac and under the Node host.
+
+**Loops** (Docker runs had a CPU hog on one of their CPUs; the Mac ran at
+load 17–95):
+
+| Item | Loop | Runs | Result |
+|---|---|---|---|
+| The trap | T2_1 under the Node host, heap grown to the maximum (Mac) | 500 | 0 traps. No run grew memory after a thread started. One run ended in a Node 25.4.0 SIGILL inside V8's JIT code (a host crash, not a guest trap). |
+| The trap | T2_1, native, ASan + UBSan | 488 before the T3 #6 change, then more on these sources | 0 ASan errors. UBSan reports only index_l0.cpp:319. |
+| The trap | T2_1 memio, WasmEdge 0.16.4 AOT with patch 04, no pre-grow (Mac) | 140 | 0 traps, 0 hangs. 2 failed: the memio command keeps every file in guest memory, and one run ran out of the 4 GiB address space (passing runs end near 2.7 GiB after about 500,000 records). The other run's output was not kept. |
+| Seqlock, sync pool | `memory_safety_s*` under TSAN | 520 | 0 warnings, 0 failures |
+| All races | The default suite under TSAN | 1 | Clean except the stage-1 races above. `arrivals_paging_while_writers_produce_T2_6` misses its 60 s label wait under TSAN, exactly as on 14a3075. `reader_point_memory_plateaus_under_commits` misses its idle-round bound under TSAN (0.155 MiB against 64 KiB). Both pass natively and under the Node host. |
+| T3 #6 | TSAN; Debug | 50; 340 | 0 stalls |
+
+**Writer memory that grows with the store.** §37's table lists the writer's
+per-store structures. Measured here with 200,000 OMM records in one partition
+at the defaults:
+- A warm partition's L1 accelerators (`SegmentInfo::runs`, loaded for every
+  segment by `partitionWarm`, merge.cpp:172) hold 6.0 B per record of the
+  partition's history. A partition written without a pause never cools
+  (`idleCloseMs`).
+- A type's catalog accelerators (`TypeOwner::runs`, loaded by `typeWarm`,
+  type_owner.cpp:580) hold 3.45 B per record of the type. A type owner never
+  cools.
+- Every registered partition keeps a 5,952-byte `Partition` (writer.h:505)
+  plus its ring descriptor, active or not.
+
+At 10^9 records (a terabyte of OMM-sized records) the catalog alone is
+3.4 GB in one writer instance, over the wasm32 limit.

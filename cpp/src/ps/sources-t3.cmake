@@ -17,5 +17,6 @@ if(TARGET flatsql_ps_test)
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/quota_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/hot_split_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/reader_memory_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/memory_safety_test.cpp
     )
 endif()

@@ -143,17 +143,35 @@ void report(const char* key, double value, const char* unit) {
 
 int main(int argc, char** argv) {
 #if defined(__wasm__)
-    // Grow the heap once, on this thread, before any guest thread starts:
-    // V8 refreshes each thread's view of a shared memory's size lazily, so a
-    // thread touching memory another thread has just grown can fault. The
-    // allocator keeps the freed block (wasm memory never shrinks).
+    // Grow the heap to the memory's maximum, on this thread, before any guest
+    // thread starts, so that memory never grows while threads run. V8 (Node,
+    // browsers) bounds-checks memory.fill/copy and atomics against each
+    // thread's cached memory size, which another thread's memory.grow updates
+    // only at this thread's next stack check: a thread filling a block carved
+    // from memory another thread has just grown traps (the ps-wasm trap in
+    // writeTypeMergeOutputs, docs/PARTITION-STORE-WASM.md §1). A partial
+    // pre-grow only moves that. dlmalloc keeps the freed blocks (wasm memory
+    // never shrinks) and grows at most 2 GiB per call, hence the steps. The
+    // heap stops 16 MiB short of 4 GiB: a segment ending at 2^32 would wrap
+    // the allocator's pointer arithmetic. PS_WASM_HEAP_MB caps the growth.
     {
         const char* mb = std::getenv("PS_WASM_HEAP_MB");
-        const size_t bytes = size_t(mb ? std::atol(mb) : 1536) << 20;
-        if (bytes) {
-            void* volatile p = std::malloc(bytes);  // volatile: not elided
-            std::free(p);
+        const size_t cap = mb ? size_t(std::atol(mb)) << 20 : SIZE_MAX;
+        const uint64_t limit = (uint64_t(1) << 32) - (uint64_t(16) << 20);
+        void* volatile held[64];  // volatile: the allocations are not elided
+        int n = 0;
+        size_t got = 0;
+        for (size_t step = size_t(1) << 30; step >= (size_t(1) << 20) && n < 64;) {
+            const uint64_t mem = uint64_t(__builtin_wasm_memory_size(0)) << 16;
+            void* p = step <= cap - got && mem + step + (1u << 20) <= limit ? std::malloc(step) : nullptr;
+            if (!p) {
+                step >>= 1;
+                continue;
+            }
+            held[n++] = p;
+            got += step;
         }
+        for (int i = 0; i < n; i++) std::free(held[i]);
     }
 #endif
     for (int i = 1; i < argc; i++) pst::gArgs.push_back(argv[i]);

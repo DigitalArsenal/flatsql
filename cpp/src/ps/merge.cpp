@@ -295,6 +295,13 @@ bool partitionWantsMerge(const Engine* e, const Partition* p) {
     // T3: a built compaction waits for no merge in flight to SWAP; new merges
     // wait for it (one commit round).
     if (p->compactPhase == kCompactBuilt || p->compactPhase == kCompactSwapQueued) return false;
+    // A13: in a space emergency the room the ballast gave back belongs to the
+    // eviction. Only a partition with eviction work waiting (TOMB_RANGE steps,
+    // type-level kills, a requested compaction) merges, to free L0 directory
+    // slots for its tombstones; any other merge would spend that room on
+    // outputs (T3 #6 stalled for good when it did: the wave's partition could
+    // then neither merge nor stage a step).
+    if (e->spaceEmergency() && p->ranges.empty() && p->kills.empty() && p->swaps.empty()) return false;
     const L0DirEntry& first = p->l0[0];
     const uint64_t firstLast = first.firstPseq + first.nRows - 1;
     if (firstLast > p->labeledThrough.load(std::memory_order_acquire)) return false;

@@ -662,14 +662,7 @@ bool typeStage(Writer* w, TypeOwner* t, StageScratch* sc, Arena* frames, Arena* 
         if (hi <= lt) continue;
         // Published batch directory of the partition (seqlock).
         PublishedPart pub;
-        uint32_t s;
-        do {
-            s = p->pubLock.readBegin();
-            pub.commitSeq = p->pub.commitSeq;
-            pub.pseqHi = p->pub.pseqHi;
-            pub.nL0 = p->pub.nL0;
-            std::memcpy(pub.l0, p->pub.l0, sizeof(L0DirEntry) * (pub.nL0 <= kMaxL0Dir ? pub.nL0 : 0));
-        } while (p->pubLock.readRetry(s));
+        readPublishedPartition(p->pubLock, p->pub, &pub);
         const uint64_t upTo = std::min(hi, pub.pseqHi);
         uint64_t through = lt;
         for (uint32_t b = 0; b < pub.nL0 && done < budget && !c.err; b++) {

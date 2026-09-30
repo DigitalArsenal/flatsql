@@ -18,11 +18,20 @@
 
 #include "flatsql/ps/lane_arena.h"
 #include "flatsql/ps/platform.h"
+#include "flatsql/ps/writer.h"
 #include "ps/reader_fixtures.h"
 
 using namespace pst;
 
 namespace {
+// A partition's unmerged L0 blocks as its owner last published them (the
+// owner's own nL0 is writer-thread state: reading it here was a data race).
+uint32_t publishedL0(const flatsql::ps::Partition* p) {
+    flatsql::ps::PublishedPart pub;
+    flatsql::ps::readPublishedPartition(p->pubLock, p->pub, &pub);
+    return pub.nL0;
+}
+
 double pct(std::vector<double> v, double q) {
     if (v.empty()) return 0;
     std::sort(v.begin(), v.end());
@@ -213,12 +222,12 @@ void runConcurrency(uint64_t seconds, uint32_t parts, uint32_t lanes) {
         report(key, pct(c, 0.99), "ms");
     };
     uint64_t l0Total = 0;
-    for (uint32_t pid : pids) l0Total += s.e->partition(pid)->nL0;
+    for (uint32_t pid : pids) l0Total += publishedL0(s.e->partition(pid));
     report("unmerged_l0_blocks_per_partition", double(l0Total) / double(pids.size()), "blocks");
     quietRun("unmerged");
     sleepNs(uint64_t(argInt("settle_ms", 3000)) * 1000000ull);
     l0Total = 0;
-    for (uint32_t pid : pids) l0Total += s.e->partition(pid)->nL0;
+    for (uint32_t pid : pids) l0Total += publishedL0(s.e->partition(pid));
     report("settled_l0_blocks_per_partition", double(l0Total) / double(pids.size()), "blocks");
     quietRun("settled");
     unsigned hw = 0;

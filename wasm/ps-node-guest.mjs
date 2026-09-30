@@ -144,6 +144,23 @@ if (mode === "pool") {
         reply(ptr);
       } else if (msg.op === "read") {
         reply(mem().slice(msg.ptr, msg.ptr + msg.len));
+      } else if (msg.op === "growHeap") {
+        // The heap to msg.limitBytes of memory before any guest thread starts
+        // (ps-node-host.mjs heapLimitBytes): allocate in steps from 1 GiB
+        // down to 1 MiB until each fails, then free them all. The guest
+        // allocator keeps the freed blocks; wasm memory never shrinks.
+        const { flatsql_ps_alloc: alloc, flatsql_ps_free: free } = instance.exports;
+        const held = [];
+        for (let step = 2 ** 30; step >= 2 ** 20 && held.length < 64; ) {
+          const p = memory.buffer.byteLength + step + 2 ** 20 <= msg.limitBytes ? alloc(step) : 0;
+          if (!p) {
+            step /= 2;
+            continue;
+          }
+          held.push(p);
+        }
+        for (const p of held) free(p);
+        reply(memory.buffer.byteLength);
       } else {
         throw new Error(`unknown op ${msg.op}`);
       }

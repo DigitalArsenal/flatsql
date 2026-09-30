@@ -404,6 +404,11 @@ struct WrappedMutex {
     int id;
 };
 WrappedMutex gStatic[kMutexIds];
+// A static mutex's wrapper is filled once. Every lane's connection allocates
+// the static mutexes again (sqlite3MutexAlloc, e.g. from sqlite3_vfs_find), and
+// rewriting a wrapper that other lanes are entering was a data race, even
+// with the same values (ThreadSanitizer).
+std::once_flag gStaticOnce[kMutexIds];
 
 int mxInit() { return gDefaultMutex.xMutexInit(); }
 int mxEnd() { return gDefaultMutex.xMutexEnd(); }
@@ -412,8 +417,10 @@ sqlite3_mutex* mxAlloc(int id) {
     sqlite3_mutex* real = gDefaultMutex.xMutexAlloc(id);
     if (!real) return nullptr;
     if (id >= 2 && id < kMutexIds) {
-        gStatic[id].real = real;
-        gStatic[id].id = id;
+        std::call_once(gStaticOnce[id], [real, id] {
+            gStatic[id].real = real;
+            gStatic[id].id = id;
+        });
         return reinterpret_cast<sqlite3_mutex*>(&gStatic[id]);
     }
     WrappedMutex* w = static_cast<WrappedMutex*>(std::malloc(sizeof(WrappedMutex)));

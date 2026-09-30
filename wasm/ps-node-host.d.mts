@@ -11,6 +11,8 @@ export interface PsThreadReport {
   workerThreads: number;
   distinctWorkerThreadIds: number;
   memoryBytes: number;
+  /** Bytes the memory grew after the first guest thread ran (V8: a trap hazard). */
+  memoryGrownWhileThreadsRan: number;
 }
 
 export interface PsMount {
@@ -39,6 +41,13 @@ export interface PsHostOptions {
   deterministic?: { randomSeed?: bigint };
   initialPages?: number;
   maximumPages?: number;
+  /**
+   * createPsNodeInstance grows the guest heap to the memory's maximum before
+   * any guest thread starts (V8 can trap a thread touching memory another
+   * thread has just grown). false: no pre-grow. heapBytes caps the growth.
+   */
+  growHeap?: boolean;
+  heapBytes?: number;
   maxHandles?: number;
   instanceId?: number;
 }

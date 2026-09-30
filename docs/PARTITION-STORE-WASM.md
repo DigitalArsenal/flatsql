@@ -26,11 +26,26 @@ departure from the design.
 
 - Create `env.memory` shared, with a maximum no larger than the import's
   (browser writer 256 MiB, reader 128 MiB, design §5.5).
-- Grow the heap before `flatsql_ps_start` when threads will allocate (alloc
-  then free a large block through `flatsql_ps_alloc`/`flatsql_ps_free`): V8
-  (Node 20–25, and browsers) refreshes each thread's view of a shared memory's
-  size lazily, so a thread touching memory another thread has just grown can
-  trap. WasmEdge is not affected.
+- **V8 hosts (Node, browsers): grow the heap to the memory's maximum before
+  `flatsql_ps_start`, so it never grows while guest threads run.** Allocate
+  through `flatsql_ps_alloc` in steps from 1 GiB down to 1 MiB until each
+  fails, then free them all (the allocator keeps the blocks; wasm memory never
+  shrinks; the guest allocator grows at most 2 GiB per call). V8 bounds-checks
+  `memory.fill`/`memory.copy` and atomics against each thread's cached view of
+  a shared memory's size, and another thread's `memory.grow` updates that view
+  only at this thread's next stack check. A thread that fills a block carved
+  from memory another thread has just grown then traps "memory access out of
+  bounds" (§4.3). A partial pre-grow only moves the failure: the 1,536 MiB the
+  test main used to grow was passed at 1,651 MiB in CI. Stop 16 MiB short of
+  4 GiB with a 4 GiB maximum: a heap segment ending at 2^32 wraps the
+  allocator's pointer arithmetic. `createPsNodeInstance` does this
+  (`growHeap: false` opts out, `heapBytes` caps it), and the Node host reports
+  `memoryGrownWhileThreadsRan` for every guest and warns when it is not 0.
+- **WasmEdge hosts do not pre-grow** (and SDN recycles reader instances on
+  their page count). WasmEdge keeps one page count shared by every thread's
+  instance and grows in place in a fixed reservation, so a grow is visible to
+  every thread at once. WasmEdge 0.16.4's AOT compiler must carry SDN's
+  `04-atomic-memarg-offset` patch (§4.3).
 - Give every guest thread a distinct `tid` below 2^29 (wasi-libc keeps it in
   mutex words).
 
@@ -93,8 +108,8 @@ budget fails the crash instead of making it partial.
 Added tests (`PS_SLOW_TEST`, run only when named): `parity_canonical_dump`,
 `parity_deterministic_bytes` (`cpp/test/ps/parity_test.cpp`) and
 `host_crash_ingest` / `host_crash_verify` (`host_crash_test.cpp`). The wasm
-test main grows the heap by 1,536 MiB before any thread starts
-(`PS_WASM_HEAP_MB`).
+test main grows the heap to the memory's maximum before any thread starts
+(§1; `PS_WASM_HEAP_MB` caps it).
 
 ```
 npm run build:wasm:ps-tests                        # artifact + test commands
@@ -162,6 +177,67 @@ journal. A negative control (half a data segment cut off) fails the verifier.
   crash run, trial 317), and the type owner never merged its L0 directory
   when `mergeL0Blocks` exceeded the directory cap, so labeling, partition
   merges and acks stopped (`dac8d89`).
+
+### 4.3 The shared-memory grow race (V8) and AOT wait/notify (WasmEdge)
+
+**V8.** CI ps-wasm run 36603876540 (attempt 1) trapped "memory access out of
+bounds" in `writeTypeMergeOutputs` on the type-merge helper thread during
+`readers_under_saturating_writers_T2_1`, with memory at 1,651 MiB, past the
+test main's 1,536 MiB pre-grow. A Docker build with the Linux wasi-sdk 30 at
+the CI checkout path reproduces the CI test command exactly (its function
+indices match the trace, and its `flatsql-ps-threads.wasm` is the committed
+artifact's sha256). The trap offset `0x18d31a` is a `memory.fill`: the
+zero-fill of `blocks[i].resize(de.l0Len)` right after its `operator new`.
+Each thread's instance caches the memory size, and V8 bounds-checks
+`memory.fill`/`memory.copy` and atomics against that cache. Another thread's
+`memory.grow` updates the cache only at this thread's next stack check, so a
+block the allocator carves from memory another thread has just grown fails
+that check. Plain loads and stores are checked by guard pages and never trap.
+Measured on the Mac, Node 25.4.0, load 35–65:
+
+| Heap before threads start | T2_1 runs | Traps |
+|---|---|---|
+| none (`PS_WASM_HEAP_MB=0`) | 31 | 8, every one a `memory.fill`/`memory.copy` right after an allocation (vector push_back, string copy, the resize above) |
+| 2,000 MiB (past the test's peak) | 30 | 0 |
+| the memory's maximum (§1, now the default) | 500 | 0, and 0 runs grew memory after a thread started (1 run ended in a Node 25.4.0 SIGILL inside V8's JIT code, a host crash) |
+
+Natively the same test under ASan+UBSan (Docker linux/arm64, 4 CPUs, a CPU
+hog) found no memory error in 488 runs: the engine never overran.
+
+**WasmEdge, the SDN host.** Every thread's instance imports one shared
+`MemoryInstance`. On 64-bit hosts it is reserved in full up front (12 GiB,
+`lib/system/allocator.cpp`) and `memory.grow` maps pages in place, so the
+base never moves. The page count is one field that `memory.fill`/`copy`/
+`init` and atomic wait/notify check live, and plain loads and stores are
+checked by guard pages. The SDN C host I/O resolves every guest pointer per
+call (`WasmEdge_MemoryInstanceGetPointer`), and the Go accessor re-reads the
+page count on a miss. A grow is visible to every thread when the growing
+thread's `memory.grow` returns, and the guest allocator's lock orders it
+before any other thread can allocate from it. Measured: the same T2_1 with
+no pre-grow on the patched WasmEdge 0.16.4, AOT, had 0 traps in 26 completed
+runs.
+
+**WasmEdge AOT wait/notify.** Those WasmEdge runs also hung at teardown: 4 of
+30 with no pre-grow, 5 of 30 with a 1,536 MiB pre-grow. WasmEdge 0.16.4's AOT
+compiler passed `memory.atomic.notify` and `memory.atomic.wait32/64` the bare
+address operand and dropped the instruction's memarg offset; the interpreter
+adds it. wasi-libc addresses its thread-list lock as `i32.const 0;
+memory.atomic.notify offset=<lock>`, so those wakeups went to address 0 and
+thread exit and join hung. A plain spawn/join guest with no flatsql code, 50
+rounds of 16 threads, hung 11 of 20 runs AOT, 0 of 30 interpreted and 0 of 20
+under V8. `sleepNs` (a timed wait on a stack local whose frame offset the
+compiler folds into the memarg) compared another stack word and returned at
+once: 100 × 10 ms took 0.000 s AOT and 1.159 s interpreted. SDN's static
+WasmEdge carries patch `04-atomic-memarg-offset` from SDN `74db37e14`, and
+its substrate self-test checks it (tag `sdn3`, so threaded AOT artifacts
+recompile). With the patch, the plain guest ran 40 of 40, and T2_1 AOT ran
+140 times with no hang. Two of those runs failed. One ran out of the 4 GiB
+address space: the memio command keeps every file in guest memory, and
+passing runs end near 2.7 GiB. The other run's output was not kept.
+`memory_safety_sleep_and_notify_at_folded_offsets` passes. Without it, that test fails (20 of 20 folded-offset wakeups lost).
+`sleepNs` now passes its address through a volatile, so its wait has a zero
+memarg offset and sleeps even on an unpatched runtime. The artifact still has
+4 folded wait/notify sites, all in wasi-libc's thread code.
 
 ## 5. Design deviations
 

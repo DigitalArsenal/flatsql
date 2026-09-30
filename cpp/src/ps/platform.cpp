@@ -68,8 +68,14 @@ void sleepNs(uint64_t ns) {
     // the browser and Node pool hosts do not provide.
     if (ns == 0) return;
     int32_t never = 0;
+    // The address reaches memory.atomic.wait32 through a volatile, so it is
+    // the operand and the memarg offset is 0. WasmEdge 0.16.4's AOT compiler
+    // drops a nonzero memarg offset from atomic wait/notify: with the local's
+    // frame offset folded into the instruction, the wait compared another
+    // stack word, returned at once, and every sleep was a busy spin.
+    int32_t* volatile addr = &never;
     const int64_t t = ns > uint64_t(INT64_MAX) ? INT64_MAX : int64_t(ns);
-    __builtin_wasm_memory_atomic_wait32(&never, 0, t);
+    __builtin_wasm_memory_atomic_wait32(addr, 0, t);
 #else
     struct timespec ts;
     ts.tv_sec = time_t(ns / 1000000000ull);

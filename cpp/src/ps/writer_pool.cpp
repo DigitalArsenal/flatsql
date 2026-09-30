@@ -201,7 +201,7 @@ bool SyncPool::helpOne(Slot& s) {
         const uint32_t idx = uint32_t(c);
         const uint32_t n = s.n.load(std::memory_order_acquire);
         if (idx >= n) return false;
-        SyncJob* jobs = s.jobs;
+        SyncJob* jobs = s.jobs.load(std::memory_order_relaxed);
         if (!s.claim.compare_exchange_weak(c, c + 1, std::memory_order_acq_rel)) continue;
         SyncJob& job = jobs[idx];
         const int saved = tHotPathDepth;
@@ -227,7 +227,7 @@ void SyncPool::runAll(uint32_t writer, SyncJob* jobs, size_t n) {
     s.n.store(0, std::memory_order_release);
     const uint64_t gen = (s.claim.load(std::memory_order_relaxed) >> 32) + 1;
     s.claim.store(gen << 32, std::memory_order_release);
-    s.jobs = jobs;
+    s.jobs.store(jobs, std::memory_order_relaxed);
     s.remaining.store(uint32_t(n), std::memory_order_release);
     s.n.store(uint32_t(n), std::memory_order_release);
     work_.fetch_add(1, std::memory_order_release);
@@ -781,12 +781,19 @@ void Writer::maintenance() {
     const int64_t nowMsV = eng_->nowMs();
     const uint64_t nowNsV = monoNs();
     const size_t n = owned_.size();
+    // A13: in a space emergency a compaction the quota planner did not request
+    // does not start (one in flight finishes). Its outputs would spend the
+    // ballast's room, and a build that fails NOSPACE starts over with a new
+    // intent in the meta log each time: T3 #6 filled the device that way and
+    // stayed in its first emergency for good. Merges are gated likewise
+    // (partitionWantsMerge).
+    const bool emergency = eng_->spaceEmergency();
     // Merge pipeline steps (bounded: a few output builds per iteration).
     int outputs = 0;
     for (size_t k = 0; k < n && outputs < 4; k++) {
         Partition* p = owned_[(maintRr_ + k) % n];
         int32_t rc = partitionMergeStep(this, p);
-        if (rc >= 0) {
+        if (rc >= 0 && (!emergency || p->compactPhase != kCompactIdle || !p->swaps.empty())) {
             const int32_t crc = partitionCompactStep(this, p);
             rc = crc < 0 ? crc : rc + crc;
         }
@@ -944,19 +951,31 @@ void Engine::stopCompactThreads() {
     compactThreads_.clear();
 }
 
+// Returns once no gate call can still use the previous (fn, ctx): the caller
+// may then destroy what ctx points at (a reader instance going away). A gate
+// call that started before the swap finishes first (they are short: a scan of
+// the lanes' announce words); one that starts after sees the new pair.
 void Engine::setReaderGate(uint64_t (*fn)(void*), void* ctx) {
-    readerGateCtx_.store(ctx, std::memory_order_release);
-    readerGate_.store(fn, std::memory_order_release);
+    std::lock_guard<std::mutex> g(readerGateMu_);
+    readerGate_.store(nullptr, std::memory_order_seq_cst);
+    while (readerGateCalls_.load(std::memory_order_seq_cst) != 0) cpuRelax();
+    readerGateCtx_.store(ctx, std::memory_order_seq_cst);
+    readerGate_.store(fn, std::memory_order_seq_cst);
 }
 
 uint64_t Engine::readerGateNs() const {
-    uint64_t (*fn)(void*) = readerGate_.load(std::memory_order_acquire);
-    if (!fn) {
-        if (!hostGateSet_.load(std::memory_order_acquire)) return UINT64_MAX;
-        const uint64_t v = hostGate_.load(std::memory_order_acquire);
-        return v == UINT64_MAX ? monoNs() : v;
+    readerGateCalls_.fetch_add(1, std::memory_order_seq_cst);
+    uint64_t (*fn)(void*) = readerGate_.load(std::memory_order_seq_cst);
+    uint64_t v;
+    if (fn) {
+        v = fn(readerGateCtx_.load(std::memory_order_seq_cst));
+    } else if (!hostGateSet_.load(std::memory_order_acquire)) {
+        readerGateCalls_.fetch_sub(1, std::memory_order_seq_cst);
+        return UINT64_MAX;
+    } else {
+        v = hostGate_.load(std::memory_order_acquire);
     }
-    const uint64_t v = fn(readerGateCtx_.load(std::memory_order_acquire));
+    readerGateCalls_.fetch_sub(1, std::memory_order_seq_cst);
     // Nothing running: every retirement so far is past the gate.
     return v == UINT64_MAX ? monoNs() : v;
 }

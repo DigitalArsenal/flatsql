@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "flatsql/ps/platform.h"
+#include "flatsql/ps/writer.h"
 #include "ps/reader_fixtures.h"
 
 using namespace pst;
@@ -293,7 +294,13 @@ PS_TEST(open_lane_checkpoint_pointer_survives_merge_after_open) {
     s.close();
     s.cfg.mergeL0Blocks = 2;  // the next open merges at once: MERGE_DONE carries no lane deltas
     REQUIRE(s.open() == 0);
-    for (int i = 0; i < 6000 && s.e->partition(pid)->nL0 > 1; i++) sleepNs(10000000);
+    // The published directory: the owner's nL0 is writer-thread state.
+    auto published = [&] {
+        flatsql::ps::PublishedPart pub;
+        flatsql::ps::readPublishedPartition(s.e->partition(pid)->pubLock, s.e->partition(pid)->pub, &pub);
+        return pub.nL0;
+    };
+    for (int i = 0; i < 6000 && published() > 1; i++) sleepNs(10000000);
     s.close();
     REQUIRE(s.open() == 0);
     s.close();

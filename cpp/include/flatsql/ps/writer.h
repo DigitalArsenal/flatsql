@@ -14,7 +14,9 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -305,13 +307,37 @@ struct Lane {
     bool inHead = false;
 };
 
-// Partition state published to the type owner (seqlock, same instance).
+// Partition state published to the type owner (seqlock, same instance):
+// partitionPublish() writes it, readPublishedPart() copies it out.
 struct PublishedPart {
     uint64_t commitSeq = 0;
     uint64_t pseqHi = 0;
     uint32_t nL0 = 0;
-    L0DirEntry l0[kMaxL0Dir];
+    alignas(8) L0DirEntry l0[kMaxL0Dir];  // L0DirEntry is packed: word-aligned here for seqlockCopy
 };
+static_assert(sizeof(PublishedPart) % 8 == 0 && alignof(PublishedPart) == 8, "PublishedPart is copied in words");
+
+// A seqlock reader copies the protected bytes while the owner may be writing
+// them, then retries when the sequence moved. A plain copy there is a data
+// race (undefined in C++, and ThreadSanitizer reports it), so the shared side
+// is read and written in 8-byte words with relaxed atomic accesses; the
+// sequence counter's fences order them. The shared words are 8-aligned and
+// `bytes` is a multiple of 8; the private side may have any alignment.
+inline void seqlockStoreWords(uint64_t* shared, const void* from, size_t bytes) {
+    const uint8_t* s = static_cast<const uint8_t*>(from);
+    for (size_t i = 0; i < bytes / 8; i++) {
+        uint64_t v;
+        std::memcpy(&v, s + i * 8, 8);
+        __atomic_store_n(shared + i, v, __ATOMIC_RELAXED);
+    }
+}
+inline void seqlockLoadWords(void* to, const uint64_t* shared, size_t bytes) {
+    uint8_t* d = static_cast<uint8_t*>(to);
+    for (size_t i = 0; i < bytes / 8; i++) {
+        const uint64_t v = __atomic_load_n(shared + i, __ATOMIC_RELAXED);
+        std::memcpy(d + i * 8, &v, 8);
+    }
+}
 
 class SeqLock {
 public:
@@ -333,6 +359,31 @@ public:
 private:
     std::atomic<uint32_t> seq_{0};
 };
+
+// The PublishedPart words: commitSeq, pseqHi, {nL0, pad}, then the directory.
+constexpr size_t kPublishedHeadBytes = 24;
+static_assert(offsetof(PublishedPart, l0) == kPublishedHeadBytes, "PublishedPart layout");
+
+// Owner: publishes a partition's committed state inside its seqlock.
+inline void publishPartition(SeqLock& lock, PublishedPart& pub, uint64_t commitSeq, uint64_t pseqHi, uint32_t nL0,
+                             const L0DirEntry* l0) {
+    const uint64_t head[3] = {commitSeq, pseqHi, uint64_t(nL0)};  // nL0 is the low half (little-endian)
+    lock.writeBegin();
+    seqlockStoreWords(reinterpret_cast<uint64_t*>(&pub), head, kPublishedHeadBytes);
+    seqlockStoreWords(reinterpret_cast<uint64_t*>(pub.l0), l0, sizeof(L0DirEntry) * nL0);
+    lock.writeEnd();
+}
+
+// Any thread: a consistent copy of what the owner last published.
+inline void readPublishedPartition(const SeqLock& lock, const PublishedPart& pub, PublishedPart* out) {
+    uint32_t s;
+    do {
+        s = lock.readBegin();
+        seqlockLoadWords(out, reinterpret_cast<const uint64_t*>(&pub), kPublishedHeadBytes);
+        const uint32_t n = out->nL0 <= kMaxL0Dir ? out->nL0 : 0;  // torn: retried below
+        seqlockLoadWords(out->l0, reinterpret_cast<const uint64_t*>(pub.l0), sizeof(L0DirEntry) * n);
+    } while (lock.readRetry(s));
+}
 
 struct ReconcileState {
     bool active = false;
@@ -476,7 +527,7 @@ struct Partition {
     uint32_t manifestGen = 0;
     uint32_t nextGen = 1;
     uint32_t incarnation = 0;        // of the last committed batch
-    Counters counters{};
+    alignas(8) Counters counters{};  // Counters is packed (on-disk): aligned here for its u64 fields
     uint32_t nextLaneId = 1;
     uint64_t headGen = 0;
     uint64_t metaSinceCkpt = 0;
@@ -766,7 +817,10 @@ private:
         std::atomic<uint64_t> claim{0};     // (generation << 32) | next index
         std::atomic<uint32_t> n{0};
         std::atomic<uint32_t> remaining{0};
-        SyncJob* jobs = nullptr;
+        // A helper may read this while the writer publishes its next round (a
+        // stale pointer whose claim then fails): atomic, relaxed. The round's
+        // `n` (release/acquire) orders the jobs themselves.
+        std::atomic<SyncJob*> jobs{nullptr};
     };
     bool helpOne(Slot& s);
     Slot slots_[kMaxWriters];
@@ -1010,7 +1064,8 @@ public:
     // A12 reader gate: the oldest start (monoNs) of any running reader
     // statement, UINT64_MAX when none. Files a SWAP or MERGE_DONE retired at t
     // are unlinked only once it is past t, checked twice a grace apart. Not
-    // set: no reader shares the store (unit tests).
+    // set: no reader shares the store (unit tests). Returns once no gate call
+    // can still use the previous pair (its ctx may then be destroyed).
     void setReaderGate(uint64_t (*fn)(void*), void* ctx);
     // The same gate as a value the host refreshes (C ABI flatsql_ps_reader_gate:
     // the reader instances are other wasm instances). UINT64_MAX: none running.
@@ -1198,6 +1253,10 @@ private:
     std::shared_ptr<QuotaState> quota_;
     LockHist evictHist_;
     std::atomic<void*> readerGateCtx_{nullptr};
+    // Gate calls in flight (readerGateNs): setReaderGate waits for them, so
+    // the context it replaces is never used after it returns.
+    mutable std::atomic<uint32_t> readerGateCalls_{0};
+    std::mutex readerGateMu_;           // serializes setReaderGate
     std::mutex helperMu_;               // maintenance queue (never on a record path)
     std::condition_variable helperCv_;
     std::deque<std::function<void(IoCtx*)>> helperJobs_;

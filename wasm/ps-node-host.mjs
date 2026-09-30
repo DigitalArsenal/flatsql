@@ -165,7 +165,27 @@ function createMemory(bytes, options) {
   }
   const initial = Math.max(limits.initial, options.initialPages ?? 0);
   const maximum = Math.min(limits.maximum ?? 65536, options.maximumPages ?? 65536);
-  return new WebAssembly.Memory({ initial, maximum, shared: true });
+  const memory = new WebAssembly.Memory({ initial, maximum, shared: true });
+  MAXIMUM_BYTES.set(memory, maximum * 65536);
+  return memory;
+}
+
+// The byte size each memory may grow to (createMemory).
+const MAXIMUM_BYTES = new WeakMap();
+
+// V8 bounds-checks memory.fill/copy and atomics against each thread's cached
+// view of a shared memory's size, and another thread's memory.grow updates
+// that view only at this thread's next stack check. A guest thread that
+// fills a block carved from memory another thread has just grown traps
+// ("memory access out of bounds"). So the heap grows to the memory's maximum
+// before any guest thread starts, and never grows after (a partial pre-grow
+// only moves the failure). The heap stops 16 MiB short of 4 GiB: a segment
+// ending at 2^32 would wrap the guest allocator's pointer arithmetic.
+// WasmEdge (the SDN host) keeps one shared size and is not affected.
+function heapLimitBytes(memory, options) {
+  const max = MAXIMUM_BYTES.get(memory) ?? memory.buffer.byteLength;
+  const cap = options.heapBytes ?? Infinity;
+  return Math.min(max, 2 ** 32 - 16 * 2 ** 20, memory.buffer.byteLength + cap);
 }
 
 /**
@@ -185,6 +205,9 @@ class Supervisor {
     this.listeners = new Set();
     this.stopped = false;
     this.poolErrors = [];
+    // Memory size when the first guest thread was seen running (tick): any
+    // growth after it is the precondition of the V8 stale-view trap above.
+    this.memoryAtFirstThread = 0;
     const warm = Math.min(options.warmThreads ?? 16, this.cap);
     for (let i = 0; i < warm; i += 1) this.startPoolWorker();
     this.timer = setInterval(() => this.tick(), 2);
@@ -208,6 +231,9 @@ class Supervisor {
     if (this.stopped) return;
     const want = Atomics.exchange(this.pool, POOL_WANT, 0);
     for (let i = 0; i < want; i += 1) this.startPoolWorker();
+    if (!this.memoryAtFirstThread && Atomics.load(this.pool, POOL_SPAWNED) > 0) {
+      this.memoryAtFirstThread = this.memory.buffer.byteLength;
+    }
     for (const listener of this.listeners) listener();
   }
 
@@ -242,6 +268,11 @@ class Supervisor {
       workerThreads: Atomics.load(c, CONTROL_STARTED),
       distinctWorkerThreadIds: tids.size,
       memoryBytes: this.memory.buffer.byteLength,
+      // Bytes the memory grew after the first guest thread ran (sampled every
+      // 2 ms). Under V8 that growth can trap a thread (heapLimitBytes).
+      memoryGrownWhileThreadsRan: this.memoryAtFirstThread
+        ? Math.max(0, this.memory.buffer.byteLength - this.memoryAtFirstThread)
+        : 0,
     };
   }
 
@@ -372,6 +403,14 @@ export async function createPsNodeInstance(wasm, options = {}) {
       reject(error);
     });
   });
+  // Before any guest thread: the heap to the memory's maximum (heapLimitBytes).
+  if (options.growHeap !== false) {
+    await new Promise((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, { resolve, reject });
+      worker.postMessage({ op: "growHeap", limitBytes: heapLimitBytes(memory, options), id });
+    });
+  }
   const rpc = (msg) => {
     if (failure) return Promise.reject(failure);
     const id = nextId++;
@@ -427,5 +466,11 @@ if (invokedDirectly) {
       `${t.spawnsDeclined ? `, ${t.spawnsDeclined} spawns declined` : ""}; memory ${(t.memoryBytes / 2 ** 20).toFixed(0)} MiB; ` +
       `${(r.elapsedMs / 1000).toFixed(1)} s\n`,
   );
+  if (t.memoryGrownWhileThreadsRan) {
+    process.stderr.write(
+      `ps-node-host: WARNING memory grew ${(t.memoryGrownWhileThreadsRan / 2 ** 20).toFixed(0)} MiB while guest ` +
+        `threads ran (V8 can trap a thread on memory another thread grew; grow the heap before threads start)\n`,
+    );
+  }
   process.exit(r.exitCode);
 }
