@@ -1208,7 +1208,9 @@ int32_t LaneStore::loadType(const uint8_t fid[4], TypeSnap* out) {
         FileKey fileKey = tk('F', fid);
         rc = io_.get(fileKey, &f);
         if (rc < 0) return rc == FLATSQL_IO_ERR_NOENT ? kRsCorrupt : rc;
-        auto v = std::make_shared<std::vector<ArrivalFence>>(h.gSeg);
+        // By value: make_shared forwards a reference, and h is packed
+        // (a misaligned uint32_t reference is undefined; UBSan).
+        auto v = std::make_shared<std::vector<ArrivalFence>>(size_t(h.gSeg));
         if (io_.read(f, v->data(), size_t(h.gSeg) * sizeof(ArrivalFence), 0) !=
             int64_t(size_t(h.gSeg) * sizeof(ArrivalFence)))
             return FLATSQL_IO_ERR_IO;
