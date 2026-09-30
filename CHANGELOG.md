@@ -1,5 +1,28 @@
 # Changelog
 
+## 3.5.1
+
+- A fresh partition store survives a crash at any I/O call of its creation (A5). `openStore`
+  used to write STORE first and in place, then MIGRATED, then the registry files; a kill
+  between STORE's create and its write, before MIGRATED, or before the registry left a store no
+  open accepted ("STORE is corrupt", "store is not MIGRATED", "registry: open registry.fsl
+  failed"). SDN's format-2 kill -9 test hit it whenever its first kill landed in the creation.
+  The I/O ABI has no rename, so the order carries the atomicity: the registry files, then
+  MIGRATED (replacing one left by an attempt that never wrote STORE), then STORE, the commit
+  point. STORE's one torn state (created, not yet written, or its unsynced bytes lost with
+  power) sits beside a whole MIGRATED and an empty registry, and open finishes it from
+  MIGRATED; a torn STORE beside registry frames is still refused. `crash_fault_test`
+  `crash_fresh_store_creation_every_io_call_A5` freezes a fresh open at each of its mutating
+  calls under every crash mode and reopens as SDN's `format2.Open` decides.
+- Per-partition bookkeeping is O(1)/O(log S) per commit (B4, docs/PARTITION-STORE.md §40): the
+  segment ledger is a hashed table with a change feed, segments are found by binary search, and
+  a compaction candidate index replaces the per-commit walks. At S = 5,188 commit rounds p99
+  100.7 ms -> 0.12-0.66 ms and 465 -> 2,300-5,400 rec/s. The RETIRE set is held under what one
+  batch carries (the valve), and manifest version 3 carries a u32 segment count past 65,535
+  (M3).
+- `wasm/flatsql-ps-threads.wasm` is rebuilt from this source (Linux wasi-sdk 30), sha256
+  `3a215da45a53f3a7016257429c392720e728caf850d3a1213dc501bfb5844359`.
+
 ## 3.5.0
 
 - Partition store query gaps (docs/PARTITION-STORE.md §39), found by T6's comparisons with
