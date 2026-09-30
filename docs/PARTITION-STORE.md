@@ -10,7 +10,9 @@ reclamation, meta-segment retirement, disk accounting and quota. Part IV
 splitting and arrivals compaction; §36 records the quota eviction race T3 #3
 met on Linux. Part V (§37) bounds a reader instance's memory. Part VI (§38)
 records the memory-safety and race work: the ps-wasm trap, the sanitizers and
-the first disk-full emergency. The design is
+the first disk-full emergency. Part VII (§39) closes the query gaps T6 found
+on the host-02 fixture and accepts records stored with their own size
+prefix. The design is
 the stack's `docs/architecture/flatsql-partition-store.md` (§22 overrides
 §0–§21; §22.4 holds the owner rulings). This file records what was built, how
 to run it, the measured acceptance, and every place the build departs from the
@@ -1675,3 +1677,167 @@ at the defaults:
 
 At 10^9 records (a terabyte of OMM-sized records) the catalog alone is
 3.4 GB in one writer instance, over the wasm32 limit.
+
+# Part VII: query gaps
+
+## 39. Query gaps found on the host-02 fixture (T6)
+
+T6 compared format 2 with format 1 on a host-02-sized migrated store (4.36 M
+records: OMM 1.70 M in one partition, MPE 1.69 M, CAT 141 k, IQC 419 k held by
+two producers). Five read shapes were slower than format 1, and store-migrate
+refused one record shape. Each is now an engine plan or check, held to a
+reference by `cpp/test/ps/query_gaps_test.cpp` (`query_gaps_*`) and to format 1
+by SDN's fixture comparison.
+
+**Text CID order (A17).** `ORDER BY _cid [DESC]` with no other index
+condition is its own plan (`kAccCidOrder`). At type level it reads the cid
+catalog (`kIxTypeCid`), whose keys are the A17 sort key: one ordered pass
+gives the live CIDs in text order. A key's entries resolve per copy (the
+latest type commit wins; DEAD over the rest at an equal tcs, as `catalog()`
+does); the live FIRST or PROMOTED copy is the record, and only its row is
+read. An `OFFSET` with no other condition is pushed down and counted from
+catalog entries alone: no row, frame or posting of a skipped record is read.
+At partition level the plan reads the partition's CID postings. With other
+conditions the plan still gives the order; the conditions are checked per
+row.
+
+**Per-object point profiles (A18).** Hidden input columns `_asof`,
+`_forward` and `_nearest` (epoch seconds, `=` only) select `kAccObjPoint`.
+Per object key it returns every live type-level row at the object's best
+second: `_asof` the latest second at or before T, `_forward` the earliest at
+or after, `_nearest` the closer of the two with a tie to the earlier. The
+plan reads the `OBJECT_EPOCH` postings `(object key, epoch)` of every
+partition, restricted by the manifests' epoch zone maps to the segments that
+can hold a candidate, merges the partitions by object key, and reads rows only
+for the candidates of each object's best seconds (from the closest outward,
+until one is live). Tag conditions and one `_epoch` range are applied before
+the choice; any other condition is refused (`SQLITE_CONSTRAINT`: SQLite would
+apply it after the choice, which is another query). `_object` projects the
+key: a u64 key in decimal, otherwise the (capped) string, NULL for a record
+without one. Records without an object key are read only from partitions whose
+`OBJECT_EPOCH` postings are fewer than their CID postings (the EPOCH index,
+their frames); each is its own entity. For OMM (NORAD, then OBJECT_ID) and MPE
+(ENTITY_ID) the object key is the legacy entity key, so SDN ranks the
+candidates exactly as format 1 did.
+
+**The sandbox window (A18).** Untrusted SQL reads `<TYPE>`, `<TYPE>@<source>`
+and every other type-level shape except a CID or gseq lookup from the arrivals
+tail: the newest N entries (`hotWindow`, dead entries included), the
+statement's conditions applied per row. An alias or source statement no longer
+walks every posting of its source; its work is bounded by N whatever the
+store's size.
+
+**Tag conditions on every copy (A2).** Type-level tag conditions (`_provider`,
+`_source_name`, `_batch`, `_peer_id`, `_source`, and the alias source) match a
+record when a live instance of any live copy (FIRST or REPEAT, any partition
+the plan reads) meets all of them, as the legacy tag table held every
+producer's tags per record. This extends §31.1 and T2 deviation 8.
+Row-driven plans check the FIRST copy's own tag first, then the other copies'
+own tags (listed by the cid catalog, only when the type has REPEAT postings),
+then RETAG instances. Posting-driven plans (tag, source, collected pages) let
+a live REPEAT copy's instance stand for its record: the record's FIRST row is
+emitted by the first matching copy in (FIRST, then REPEATs by pid, pseq)
+order, so each record comes once. `<TYPE>@<source>` is `<TYPE>` with that
+condition. The checks cost little per row: an instance's tuple is its lane's
+(`RecRow.laneId`, the partition's lane table read once per statement), a copy
+whose pseq is above the highest `max_pseq` of the lanes that meet the
+conditions cannot match (its RETAGs come after it), TAG_OF lookups read only
+the segments that can hold them and resume in the block the previous row's
+lookup read, and DEAD / TAG_DEAD lookups are skipped for a snapshot that holds
+no posting of the kind.
+
+**Gseq-ordered tag pages (A16).** At type level, `ORDER BY _gseq` with tag
+conditions and a LIMIT (or a closed gseq range) is served in arrivals order
+with each row's tags checked, unless the lane counters say the tags are rare
+(at most 262,144 matching instances and under an eighth of the type's
+arrivals): then the tags' postings are collected (the most selective of batch,
+source, provider, peer), sorted by gseq and emitted in order. A datasync page
+by source no longer sorts every match of the source.
+
+**Records stored with their own size prefix.** A record that carries its own
+size prefix (a `FinishSizePrefixed` buffer stored as is: SDN's
+dataset-publication PNMs and the local EPM) was refused with `kRejFid` (its
+identifier sits at frame offset 12), so store-migrate rejected 131 records of a
+dev node and refused to activate. `frameRootOffset()` (`extract.h`) finds the
+FlatBuffer after both prefixes (the record's u32 equals `len - 8` and the
+identifier is at 12) for the frame check, the verifier (at the record's own
+alignment origin), key extraction and column projection. The stored bytes and
+the CID (over the record, prefix included) are unchanged.
+
+**Reads ahead.** Rows met in ascending pseq order (arrivals order, epoch and
+tag postings, pseq scans) are read 32 at a time, and a frame read covers the
+frames of the rows read ahead in its segment (up to 256 KiB).
+`rowsExamined` still counts the rows a statement uses.
+
+**Measured** through SDN's storage API on the fixture (`TestZZBench`-style
+calls, each query twice in a fresh process: the first call pays the
+instance's warm-up and the page cache; format 1 is the same store before
+migration). Mac Studio (M3 Ultra, 28 cores), shared with other lanes, load
+47–55. Format 2 "before" is T6's run on the same fixture.
+
+| Gap | Query | Format 1 (call 1 / 2) | Format 2 before | Format 2 after (call 1 / 2) |
+|---|---|---|---|---|
+| 1 | OMM CID order, LIMIT 500 OFFSET 1000 | 730 ms / 26 ms | 9.9–28.4 s | 2.65 s / 3.6 ms |
+| 1 | CAT CID order, LIMIT 200 OFFSET 60000 | 2.39 s / 67 ms | 430–537 ms | 589 ms / 11 ms |
+| 1 | IQC CID order, LIMIT 1000 OFFSET 100000 | 3.90 s / 153 ms | 5.0–5.5 s | 4.14 s / 35 ms |
+| 2 | OMM `nearest` (32,015 objects) | 99 s / 22.7 s | 56–79 s | 10.6 s / 2.3 s |
+| 2 | OMM `as_of`, one source | 36 s / 19.5 s | 9.7–13.1 s | 3.9 s / 4.2 s |
+| 2 | OMM `forward` | 14.6 s / 19.5 s | 8.4–82 s | 6.8 s / 6.1 s |
+| 2 | MPE `nearest`, 2 h delta | 50 s / 17.6 s | 29–35 s | 7.1 s / 6.1 s |
+| 3 | sandbox `SELECT _data FROM "CAT@celestrak-satcat"` (N = 10,000) | 4.4 / 3.9 ms¹ | `timeout` (work budget) | 55 / 11 ms |
+| 3 | `"CAT@celestrak-satcat-csv"` | 1.3 / 1.3 ms¹ | `timeout` | 3.2 / 4.5 ms |
+| 3 | `"IQC@IQEngine"` | 14.8 / 13.3 ms¹ | `timeout` | 67 / 32 ms |
+| 3 | `"MPE@celestrak-gp"` | 3.2 / 4.3 ms¹ | `timeout` | 68 / 7.3 ms |
+| 4 | IQC source window, LIMIT 1000 (two producers) | 12.7 s / 2.0 s | 111–121 ms (per partition, merged in SDN) | 183 / 30 ms (one statement) |
+| 5 | IQC datasync by source, 5 pages of 500 | 133 s / 190 s | about 3.8 s a page | 58 / 32 ms (all 5) |
+
+¹ Format 1's hot window is an in-memory copy of the newest N records, filled
+by a hydration (17 s to 5.5 min on this fixture) and held in the arena whose
+growth is what format 2 replaces. Format 2 reads the window from disk: the
+engine's own cost for the CAT query is 2.4 ms natively (the rest is the wasm
+instance, the result ring and SDN's copy). Gap 3's acceptance (the statement
+answers within the work budget, bounded by N) is met; parity with the
+in-memory copy is not.
+
+The first call of a fresh process pays the instance's warm-up and reads the
+cid catalog's blocks into the page cache (2.65 s for OMM against 730 ms for
+format 1's index); every later call is faster than format 1.
+`TestFormat2DaemonReadsEqualTheLegacyFixture` (SDN) passes with every section
+(windows, A17 exports, A16 syncs, epoch profiles, A18 relations) equal to
+format 1 on this fixture.
+
+**store-migrate with size-prefixed records.** A copy of a dev node's store
+(9.2 GB control database, 163 PNMs in 37 partitions, 1 EPM): 0 copies
+rejected (131 before), partitions (58) and lanes (58) equal, 9 of 10 CID
+sequences equal. The tenth (IQC) differs because that store's index holds
+about 1.06 M IQC rows no producer table holds (orphans the legacy verifier's
+sequence includes; filed for SDN). `TestStoreMigrateActivatesWithSizePrefixedRecords`
+(SDN): a store with 12 PNMs in two partitions and an EPM migrates with 0
+rejects and 0 mismatches, activates, and serves the same bytes.
+
+**What these cost at 1 TB** (per statement; P partitions of the type, S
+segments per partition, R type catalog runs):
+
+- CID order: `(offset + limit) x copies per CID` catalog entries of about
+  72 B (about 56 per 4 KiB block) plus one row read per emitted record. The
+  skip is linear in the offset, as format 1's b-tree OFFSET is. Per-block live
+  counts in the catalog's fences would make it logarithmic, but a CID's copies
+  die in later type commits than their FIRST labels, so the type owner would
+  have to post a CID-keyed marker when a CID's last copy dies (outside this
+  change: `type_owner.cpp`).
+- Point profiles: the `OBJECT_EPOCH` postings (about 30 B each) of the
+  segments whose epoch zone can hold a candidate: for `_forward` near the
+  present, the newest segments; for `_asof` and `_nearest`, the segments
+  before (or around) T. No payload is read to rank; rows are read for about one
+  to two candidates per object. Enumerating the objects stays linear in the
+  postings of those segments: a per-partition object directory would make it
+  proportional to the objects.
+- Sandbox window: at most N arrivals entries (24 B) and N rows, whatever the
+  store's size.
+- Tag conditions: per row an O(1) lane check, and a TAG_OF lookup only for a
+  copy that a matching lane can still reach; a catalog lookup (R bloom-gated
+  runs) only in a type with REPEAT copies.
+- Gseq tag pages: LIMIT / selectivity arrival entries and rows per page
+  (arrivals mode), or the tags' matching instances (collected mode, at most
+  262,144).
+- Size-prefixed records: nothing (a 4-byte comparison per record).

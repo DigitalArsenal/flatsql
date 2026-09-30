@@ -1,5 +1,43 @@
 # Changelog
 
+## 3.5.0
+
+- Partition store query gaps (docs/PARTITION-STORE.md §39), found by T6's comparisons with
+  format 1 on a host-02-sized store:
+  - `ORDER BY _cid` reads the type's cid catalog in text order (A17); an `OFFSET` is counted
+    from catalog entries without reading rows. OMM LIMIT 500 OFFSET 1000 through SDN: 3.6 ms
+    (9.9 s before; format 1 26 ms).
+  - Per-object point profiles: hidden input columns `_asof`, `_forward`, `_nearest` (epoch
+    seconds) return each object's live rows at its best second from `OBJECT_EPOCH` keys, and
+    `_object` projects the object key. OMM nearest over 32,015 objects: 2.3 s (56 s before;
+    format 1 22.7 s).
+  - Untrusted SQL reads every type-level shape but a CID or gseq lookup from the newest-N
+    arrivals window (A18): `SELECT _data FROM "CAT@celestrak-satcat"` answers in 11 ms instead
+    of exceeding the work budget.
+  - Type-level tag conditions match a live instance of any live copy (FIRST or REPEAT, any
+    partition), each record once; `<TYPE>@<source>` follows.
+  - `ORDER BY _gseq` with tag conditions pages in arrivals order, or through the tags'
+    collected postings when the lane counters say they are rare. IQC datasync by source: 5
+    pages in 32 ms (about 3.8 s a page before).
+  - Rows and frames read ahead in pseq order; tag checks from lane tuples and lane `max_pseq`;
+    DEAD / TAG_DEAD lookups skipped for snapshots without such postings.
+- Records stored with their own size prefix (a `FinishSizePrefixed` buffer kept as is: SDN's
+  dataset-publication PNMs, the local EPM) are accepted: `frameRootOffset()` finds the
+  FlatBuffer after both prefixes for the frame check, the verifier, extraction and column
+  projection. Before, they were refused with -102 (`kRejFid`) and store-migrate could not
+  activate a store holding them. Stored bytes and CIDs are unchanged.
+- Memory safety and races (§38, 668f0e6): the ps-wasm trap was V8's shared-memory grow race
+  (the Node host and the wasm test main grow the heap before threads start); TSAN-clean
+  partition publication and sync pool; the reader gate waits for calls in flight; a space
+  emergency spends the ballast only on eviction work.
+- UBSan: `EntryIter::next` compares distances (no offset on a null pointer), no `memcpy` with
+  a null pointer for 0 bytes, packed counters and head fields read by value.
+- The terabyte harness (audit §4): unit gates, engine tiers and a metadata-only 10 TB tier as
+  slow tests (`cpp/test/ps/tb_*`, `scripts/tb`).
+- `wasm/flatsql-ps-threads.wasm` sha256
+  `652408345379d97b9225b726ece3d40e3e44f19d644a2f9c11e68fa59bc19a41` (2,484,768 bytes); the other
+  artifacts are 3.4.0's.
+
 ## 3.4.0
 
 - Format-1 arena compaction (docs/STORAGE-DURABILITY.md §6.4.2): `compactArena` /
