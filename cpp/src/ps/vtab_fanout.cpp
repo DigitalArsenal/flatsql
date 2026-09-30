@@ -21,7 +21,7 @@ namespace ps {
 
 namespace {
 
-// §37 gap 5: a gseq-ordered tag page collects the tags' records when the
+// §38 gap 5: a gseq-ordered tag page collects the tags' records when the
 // lane counters give at most this many (and fewer than an eighth of the
 // type's arrivals); otherwise it reads arrivals and checks each row.
 constexpr uint64_t kCollectMax = 262144;
@@ -465,7 +465,7 @@ private:
     bool done_ = false;
 };
 
-// ---- §37 gap 1: text CID order from the cid catalog (A17) ---------------------
+// ---- §38 gap 1: text CID order from the cid catalog (A17) ---------------------
 // The catalog is keyed by the A17 sort key, whose byte order is the text
 // order of the CIDs: one ordered pass over its entries gives the type's live
 // CIDs in text order. Each key's entries resolve per copy (the latest type
@@ -565,7 +565,7 @@ private:
     uint32_t poll_ = 0;
 };
 
-// ---- §37 gap 2: per-object point profiles on OBJECT_EPOCH (A18) --------------
+// ---- §38 gap 2: per-object point profiles on OBJECT_EPOCH (A18) --------------
 // Postings count per kind in a snapshot (L0 sections and runs).
 int32_t kindCount(LaneStore& st, const PartSnap& s, uint16_t kind, uint64_t* n) {
     *n = 0;
@@ -884,7 +884,7 @@ private:
     uint32_t poll_ = 0;
 };
 
-// ---- §37 gap 5: a gseq-ordered page over rare tags --------------------------
+// ---- §38 gap 5: a gseq-ordered page over rare tags --------------------------
 // The tag postings' records (every copy's instances, REPEAT hits standing for
 // their record) collected with their gseqs, sorted, emitted in gseq order.
 class CollectedRows : public RowSource {
@@ -1135,7 +1135,7 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
         rc = windowFloor(lane, stmt, ts, lane->hotWindow(vt->typeName), &floor);
         if (rc < 0) return rc;
     }
-    // §37: per-statement pruning state, and whether any record has copies in
+    // §38: per-statement pruning state, and whether any record has copies in
     // several partitions (tag conditions then look at every copy).
     auto sh = std::make_shared<StmtShared>();
     sh->lane = lane;
@@ -1240,7 +1240,7 @@ int32_t buildTypeSources(ReaderLane* lane, StmtCtx* stmt, RecVtab* vt, const Pla
                 if (argInt(arg(p.aOffset), &v) && v > 0) offset = uint64_t(v);
             }
             if (p.gseqTags && tags.any) {
-                // §37 gap 5: arrivals with a per-row tag check, unless the
+                // §38 gap 5: arrivals with a per-row tag check, unless the
                 // lane counters say the tags match few records: then their
                 // postings are collected and sorted by gseq (bounded by that
                 // count, not by the type).

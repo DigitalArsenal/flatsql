@@ -1,5 +1,5 @@
 // Format-2 query gaps found by T6's fixture comparisons (PARTITION-STORE.md
-// §37): text CID order from the cid catalog, per-object point profiles on
+// §38): text CID order from the cid catalog, per-object point profiles on
 // OBJECT_EPOCH, the sandbox window read from arrivals, tag conditions on
 // every live copy, and gseq-ordered tag pages. Each plan is held to a
 // reference computed from what the test sent.

@@ -589,8 +589,11 @@ bool pickCandidate(const Engine* e, const Partition* p, uint32_t* seg, uint32_t*
     // partition as a whole is past the ratio, survey the oldest compactable
     // segment not surveyed since warm (the build abandons it when it would
     // save under 10%).
+    // Copies, not references: the counters live in a packed struct (a
+    // reference to a misaligned uint64_t is undefined; UBSan).
     const uint64_t total = p->counters.totalBytes;
-    if (total && double(total - std::min(total, p->counters.liveBytes)) >= cfg.compactDeadRatio * double(total)) {
+    const uint64_t live = p->counters.liveBytes;
+    if (total && double(total - std::min(total, live)) >= cfg.compactDeadRatio * double(total)) {
         for (const auto& s : p->segs) {
             if (!compactable(p, s) || s.empty || s.deadRows) continue;  // deadRows set: known (surveyed)
             *seg = s.seg;
