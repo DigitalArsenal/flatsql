@@ -147,6 +147,16 @@ bool StageScratch::init(const EngineConfig& cfg) {
     tcidBuckets = callocArray<int32_t>(kCidBuckets);
     tcopies = callocArray<TCopy>(kTCopyCap);
     gather.reserve(4096);
+    supCands.reserve(256);
+    cidCands.reserve(256);
+    instCands.reserve(256);
+    liveInst.reserve(1024);
+    postingGroup.reserve(256);
+    deltaVec.assign(1024, LaneDelta{});
+    deltaSlotOf.assign(1024, 0);
+    deltaSlots.assign(4096, 0);
+    deltas = deltaVec.data();
+    nDeltas = 0;
     arrivals = callocArray<ArrivalEntry>(kArrivalCap);
     trows = callocArray<RecRow>(kTRowCap);
     if (!tcids || !tcidBuckets || !tcopies || !arrivals || !trows) return false;
@@ -200,6 +210,7 @@ void StageScratch::resetPartition() {
         nDead = 0;
     }
     nInst = 0;
+    for (uint32_t i = 0; i < nDeltas; i++) deltaSlots[deltaSlotOf[i]] = 0;
     nDeltas = 0;
     ctlBytes = 0;
     nCtl = 0;
@@ -207,6 +218,46 @@ void StageScratch::resetPartition() {
     firstNewLaneIndex = 0;
     retireAt = UINT32_MAX;
     forceLaneCkpt = false;
+}
+
+LaneDelta* StageScratch::deltaFind(uint32_t laneId, bool create) {
+    size_t mask = deltaSlots.size() - 1;
+    size_t i = size_t(hash64(&laneId, 4)) & mask;
+    for (;;) {
+        const uint32_t s = deltaSlots[i];
+        if (!s) break;
+        if (deltaVec[s - 1].laneId == laneId) return &deltaVec[s - 1];
+        i = (i + 1) & mask;
+    }
+    if (!create) return nullptr;
+    if (nDeltas == deltaVec.size() || size_t(nDeltas + 1) * 2 > deltaSlots.size()) {
+        // More lanes than the table holds: grow it (rare; not the record path).
+        const int saved = tHotPathDepth;
+        tHotPathDepth = 0;
+        deltaVec.resize(deltaVec.size() * 2);
+        deltaSlotOf.resize(deltaVec.size());
+        deltaSlots.assign(deltaSlots.size() * 2, 0);
+        mask = deltaSlots.size() - 1;
+        for (uint32_t k = 0; k < nDeltas; k++) {
+            size_t j = size_t(hash64(&deltaVec[k].laneId, 4)) & mask;
+            while (deltaSlots[j]) j = (j + 1) & mask;
+            deltaSlots[j] = k + 1;
+            deltaSlotOf[k] = uint32_t(j);
+        }
+        deltas = deltaVec.data();
+        tHotPathDepth = saved;
+        i = size_t(hash64(&laneId, 4)) & mask;
+        while (deltaSlots[i]) i = (i + 1) & mask;
+    }
+    LaneDelta& d = deltaVec[nDeltas];
+    std::memset(&d, 0, sizeof(d));
+    d.laneId = laneId;
+    d.firstSeen = INT64_MAX;
+    d.updated = INT64_MIN;
+    deltaSlots[i] = nDeltas + 1;
+    deltaSlotOf[nDeltas] = uint32_t(i);
+    nDeltas++;
+    return &d;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +277,18 @@ struct Ctx {
 };
 
 inline void be8(uint8_t* out, uint64_t v) { putBE64(out, v); }
+
+// N2: candidate lists grow outside the hot-path count (a key with that many
+// postings is rare; the capacity is kept for the writer's next lookup).
+inline void pushCand(std::vector<uint64_t>& v, uint64_t x) {
+    if (v.size() == v.capacity()) {
+        const int saved = tHotPathDepth;
+        tHotPathDepth = 0;
+        v.reserve(v.capacity() ? v.capacity() * 2 : 64);
+        tHotPathDepth = saved;
+    }
+    v.push_back(x);
+}
 
 bool addPosting(Ctx& c, uint16_t kind, const uint8_t* key, size_t klen, const uint8_t* val,
                 uint8_t vlen) {
@@ -329,6 +392,75 @@ int32_t scanL0Section(Ctx& c, const L0Accel& a, const L0Accel::Kind& k, F&& visi
     return 0;
 }
 
+// The postings of (kind, key) in one unmerged L0 block (bloom-gated).
+// visit(val) -> continue?; *stop is set when a visit declines.
+template <typename F>
+int32_t l0BlockPostings(Ctx& c, const L0Accel& a, uint16_t kind, const uint8_t* key, size_t klen, uint64_t h,
+                        F& visit, bool* stop) {
+    const L0Accel::Kind* k = a.find(kind);
+    if (!k || k->n == 0) return 0;
+    if (k->bloom && !bloomTestHash(k->bloom, k->bloomBytes, h)) return 0;
+    if (k->entries) {
+        // In memory (T3b): binary search over fixed-size entries, else a scan.
+        const size_t es = 2 + klen + k->vlen;
+        const uint8_t* base = k->entries;
+        size_t lo = 0, hi = k->n;
+        if (uint64_t(k->n) * es == k->entriesBytes) {
+            while (lo < hi) {
+                const size_t mid = (lo + hi) / 2;
+                const uint8_t* e = base + mid * es;
+                if (keyCmp(e + 2, getU16(e), key, klen) < 0) lo = mid + 1;
+                else hi = mid;
+            }
+            for (size_t j = lo; j < k->n && !*stop; j++) {
+                const uint8_t* e = base + j * es;
+                if (keyCmp(e + 2, getU16(e), key, klen) != 0) break;
+                if (!visit(e + 2 + klen)) *stop = true;
+            }
+        } else {
+            EntryIter it;
+            it.p = base;
+            it.end = base + k->entriesBytes;
+            it.vlen = k->vlen;
+            const uint8_t *ek, *ev;
+            uint16_t el;
+            while (!*stop && it.next(&ek, &el, &ev)) {
+                const int cmp = keyCmp(ek, el, key, klen);
+                if (cmp < 0) continue;
+                if (cmp > 0) break;
+                if (!visit(ev)) *stop = true;
+            }
+        }
+        return 0;
+    }
+    return scanL0Section(c, a, *k, [&](const uint8_t* ek, uint16_t el, const uint8_t* ev) {
+        const int cmp = keyCmp(ek, el, key, klen);
+        if (cmp < 0) return true;
+        if (cmp > 0) return false;
+        if (!visit(ev)) {
+            *stop = true;
+            return false;
+        }
+        return true;
+    });
+}
+
+// The postings of (kind, key) in one segment's L1 runs (bloom-gated).
+template <typename F>
+int32_t segRunPostings(Ctx& c, SegmentInfo& si, uint16_t kind, const uint8_t* key, size_t klen, uint64_t h, F& visit,
+                       bool* stop) {
+    for (auto& run : si.runs) {
+        if (*stop) break;
+        if (!run.run || !run.run->mayContainHash(kind, h)) continue;
+        const int64_t rc = run.run->lookup(c.io, run.file, kind, key, klen, c.w->lookupScratch(),
+                                           [&](const uint8_t*, uint16_t, const uint8_t* ev) {
+                                               if (!*stop && !visit(ev)) *stop = true;
+                                           });
+        if (rc < 0) return int32_t(rc);
+    }
+    return 0;
+}
+
 // Visits every committed posting value for (kind, key): unmerged L0 blocks
 // (bloom-gated) and L1 runs (bloom-gated). visit(val) -> continue?
 template <typename F>
@@ -341,65 +473,74 @@ int32_t committedPostings(Ctx& c, uint16_t kind, const uint8_t* key, size_t klen
         const L0Accel& a = p->acc[i];
         // T3b: blocks a stage-1 hint already searched (every row <= through).
         if (coveredThrough && a.nRows && a.firstPseq + a.nRows - 1 <= coveredThrough) continue;
-        const L0Accel::Kind* k = a.find(kind);
-        if (!k || k->n == 0) continue;
-        if (k->bloom && !bloomTestHash(k->bloom, k->bloomBytes, h)) continue;
-        if (k->entries) {
-            // In memory (T3b): binary search over fixed-size entries, else a scan.
-            const size_t es = 2 + klen + k->vlen;
-            const uint8_t* base = k->entries;
-            size_t lo = 0, hi = k->n;
-            if (uint64_t(k->n) * es == k->entriesBytes) {
-                while (lo < hi) {
-                    const size_t mid = (lo + hi) / 2;
-                    const uint8_t* e = base + mid * es;
-                    if (keyCmp(e + 2, getU16(e), key, klen) < 0) lo = mid + 1;
-                    else hi = mid;
-                }
-                for (size_t j = lo; j < k->n && !stop; j++) {
-                    const uint8_t* e = base + j * es;
-                    if (keyCmp(e + 2, getU16(e), key, klen) != 0) break;
-                    if (!visit(e + 2 + klen)) stop = true;
-                }
-            } else {
-                EntryIter it;
-                it.p = base;
-                it.end = base + k->entriesBytes;
-                it.vlen = k->vlen;
-                const uint8_t *ek, *ev;
-                uint16_t el;
-                while (!stop && it.next(&ek, &el, &ev)) {
-                    const int cmp = keyCmp(ek, el, key, klen);
-                    if (cmp < 0) continue;
-                    if (cmp > 0) break;
-                    if (!visit(ev)) stop = true;
-                }
-            }
-            continue;
-        }
-        const int32_t rc = scanL0Section(c, a, *k, [&](const uint8_t* ek, uint16_t el, const uint8_t* ev) {
-            const int cmp = keyCmp(ek, el, key, klen);
-            if (cmp < 0) return true;
-            if (cmp > 0) return false;
-            if (!visit(ev)) {
-                stop = true;
-                return false;
-            }
-            return true;
-        });
+        const int32_t rc = l0BlockPostings(c, a, kind, key, klen, h, visit, &stop);
         if (rc < 0) return rc;
     }
     for (auto& si : p->segs) {
         if (stop || !runs) break;
-        for (auto& run : si.runs) {
-            if (stop) break;
-            if (!run.run || !run.run->mayContainHash(kind, h)) continue;
-            const int64_t rc = run.run->lookup(c.io, run.file, kind, key, klen, c.w->lookupScratch(),
-                                               [&](const uint8_t*, uint16_t, const uint8_t* ev) {
-                                                   if (!stop && !visit(ev)) stop = true;
-                                               });
-            if (rc < 0) return int32_t(rc);
-        }
+        const int32_t rc = segRunPostings(c, si, kind, key, klen, h, visit, &stop);
+        if (rc < 0) return rc;
+    }
+    return 0;
+}
+
+// N2: visits the committed postings of (kind, key) newest first, as pseqs (a
+// posting's value is the BE64 pseq of the row that posted it). The unmerged
+// L0 blocks (one batch's rows each) and each segment's L1 runs (its merged
+// rows) hold disjoint pseq ranges, ascending in the L0 directory and in the
+// segment list, all runs below every L0 block; so the sources are taken in
+// reverse, and each one's postings sorted descending, and a walk that stops
+// at the newest live row reads no older source. Should the ranges not be in
+// that order, every posting is gathered and sorted instead. visit(pseq) ->
+// continue?
+template <typename F>
+int32_t committedPseqsNewestFirst(Ctx& c, uint16_t kind, const uint8_t* key, size_t klen, F&& visit) {
+    Partition* p = c.p;
+    std::vector<uint64_t>& g = c.sc->postingGroup;
+    auto collect = [&](const uint8_t* v) {
+        pushCand(g, getBE64(v));
+        return true;
+    };
+    auto walk = [&]() {
+        std::sort(g.begin(), g.end(), [](uint64_t a, uint64_t b) { return a > b; });
+        g.erase(std::unique(g.begin(), g.end()), g.end());
+        for (uint64_t ps : g)
+            if (!visit(ps)) return false;
+        return true;
+    };
+    const uint64_t h = bloomHash(key, klen);
+    bool ordered = true;
+    uint64_t below = UINT64_MAX;  // every pseq of the sources walked so far is at least this
+    for (uint32_t i = p->nL0; i-- > 0 && ordered;) {
+        ordered = p->acc[i].firstPseq + p->acc[i].nRows <= below;
+        below = p->acc[i].firstPseq;
+    }
+    for (size_t j = p->segs.size(); j-- > 0 && ordered;) {
+        const SegmentInfo& si = p->segs[j];
+        if (si.runs.empty()) continue;
+        ordered = si.mergedEnd <= below && si.firstPseq <= si.mergedEnd;
+        below = si.firstPseq;
+    }
+    bool stop = false;
+    if (!ordered) {
+        g.clear();
+        const int32_t rc = committedPostings(c, kind, key, klen, collect);
+        if (rc < 0) return rc;
+        walk();
+        return 0;
+    }
+    for (uint32_t i = p->nL0; i-- > 0;) {
+        g.clear();
+        const int32_t rc = l0BlockPostings(c, p->acc[i], kind, key, klen, h, collect, &stop);
+        if (rc < 0) return rc;
+        if (!walk()) return 0;
+    }
+    for (size_t j = p->segs.size(); j-- > 0;) {
+        if (p->segs[j].runs.empty()) continue;
+        g.clear();
+        const int32_t rc = segRunPostings(c, p->segs[j], kind, key, klen, h, collect, &stop);
+        if (rc < 0) return rc;
+        if (!walk()) return 0;
     }
     return 0;
 }
@@ -514,17 +655,19 @@ StageScratch::Cid* cidState(Ctx& c, const uint8_t key[kCidKeyLen], const PrepRes
     // (T3b) holds the CID's postings in the L1 runs of the current run set;
     // then only the unmerged L0 blocks are searched here.
     uint64_t best = 0;
-    uint64_t cands[64];
-    uint32_t nc = 0;
+    // N2: every candidate, not the first 64 (a CID put, killed and put again
+    // keeps every copy's posting until compaction drops the dead ones).
+    std::vector<uint64_t>& cands = sc.cidCands;
+    cands.clear();
     const bool hinted = pr && pr->hintOk && c.p->prep && pr->hintVersion == c.p->prep->runVersion;
     if (hinted) {
-        for (uint32_t i = 0; i < pr->hintN; i++) cands[nc++] = pr->hint[i];
+        for (uint32_t i = 0; i < pr->hintN; i++) pushCand(cands, pr->hint[i]);
         c.p->prep->hinted.fetch_add(1, std::memory_order_relaxed);
     }
     const int32_t rc = committedPostings(
         c, kIxCid, key, kCidKeyLen,
         [&](const uint8_t* v) {
-            if (nc < 64) cands[nc++] = getBE64(v);
+            pushCand(cands, getBE64(v));
             return true;
         },
         !hinted, pr ? &pr->cidBloom : nullptr, hinted ? pr->hintThrough : 0);
@@ -532,7 +675,8 @@ StageScratch::Cid* cidState(Ctx& c, const uint8_t key[kCidKeyLen], const PrepRes
         c.err = rc;
         return nullptr;
     }
-    std::sort(cands, cands + nc);
+    std::sort(cands.begin(), cands.end());
+    const uint32_t nc = uint32_t(cands.size());
     uint32_t putLen = 0;
     for (int i = int(nc) - 1; i >= 0; i--) {
         if (isDead(c, cands[i])) continue;
@@ -583,17 +727,20 @@ bool instanceLive(Ctx& c, uint64_t put, uint64_t h, const TagView& tag) {
     uint8_t key[16];
     be8(key, put);
     be8(key + 8, h);
-    uint64_t cands[64];
-    uint32_t nc = 0;
+    // N2: every instance posted for this tuple, newest first (retags and
+    // TAG_TOMBs of one tuple can post more than a fixed cap held).
+    std::vector<uint64_t>& cands = sc.instCands;
+    cands.clear();
     const int32_t rc = committedPostings(c, kIxTagOf, key, 16, [&](const uint8_t* v) {
-        if (nc < 64) cands[nc++] = getBE64(v);
+        pushCand(cands, getBE64(v));
         return true;
     });
     if (rc < 0) {
         c.err = rc;
         return false;
     }
-    for (uint32_t i = 0; i < nc; i++) {
+    std::sort(cands.begin(), cands.end(), [](uint64_t a, uint64_t b) { return a > b; });
+    for (size_t i = 0; i < cands.size(); i++) {
         if (isTagDead(c, cands[i])) continue;
         RecRow r;
         if (readRow(c, cands[i], &r) < 0 || r.kind == kRowVoid) continue;
@@ -610,17 +757,20 @@ int32_t forEachLiveInstance(Ctx& c, uint64_t put, F&& visit) {
     StageScratch& sc = *c.sc;
     uint8_t prefix[8];
     be8(prefix, put);
-    uint64_t found[256];
-    uint32_t nf = 0;
+    // N2: every instance (a record fetched in 300 batches has 300 live
+    // instances; a cap of 256 left the rest live after a kill).
+    std::vector<uint64_t>& found = sc.liveInst;
+    found.clear();
     for (uint32_t i = 0; i < sc.nInst; i++)
-        if (sc.instPut[i] == put && nf < 256) found[nf++] = sc.instPseq[i];
+        if (sc.instPut[i] == put) pushCand(found, sc.instPseq[i]);
     const int32_t rc = committedPrefix(c, kIxTagOf, prefix, 8,
                                        [&](const uint8_t*, uint16_t, const uint8_t* v) {
-                                           if (nf < 256) found[nf++] = getBE64(v);
+                                           pushCand(found, getBE64(v));
                                        });
     if (rc < 0) return rc;
-    std::sort(found, found + nf);
-    nf = uint32_t(std::unique(found, found + nf) - found);
+    std::sort(found.begin(), found.end());
+    found.erase(std::unique(found.begin(), found.end()), found.end());
+    const uint32_t nf = uint32_t(found.size());
     for (uint32_t i = 0; i < nf; i++) {
         if (isTagDead(c, found[i])) continue;
         if (c.err) return c.err;
@@ -669,6 +819,7 @@ int32_t laneFor(Ctx& c, const TagView& t, uint32_t* laneIndex, const uint64_t* h
     p->lanes.push_back(std::move(l));
     const uint32_t idx = uint32_t(p->lanes.size() - 1);
     p->laneByHash.emplace(h, idx);
+    laneIndexAdd(p, idx);
     tHotPathDepth = saved;
     uint8_t* f = sc.laneFrames + sc.laneFrameBytes;
     putU32(f, uint32_t(body));
@@ -691,18 +842,7 @@ int32_t laneFor(Ctx& c, const TagView& t, uint32_t* laneIndex, const uint64_t* h
     return 0;
 }
 
-LaneDelta* laneDelta(Ctx& c, uint32_t laneId) {
-    StageScratch& sc = *c.sc;
-    for (uint32_t i = 0; i < sc.nDeltas; i++)
-        if (sc.deltas[i].laneId == laneId) return &sc.deltas[i];
-    if (sc.nDeltas >= 256) return nullptr;
-    LaneDelta& d = sc.deltas[sc.nDeltas++];
-    std::memset(&d, 0, sizeof(d));
-    d.laneId = laneId;
-    d.firstSeen = INT64_MAX;
-    d.updated = INT64_MIN;
-    return &d;
-}
+LaneDelta* laneDelta(Ctx& c, uint32_t laneId) { return c.sc->deltaFind(laneId, true); }
 
 void applyLaneDelta(Ctx& c, uint32_t laneId, int64_t dCount, int64_t dBytes, uint64_t pseq,
                     int64_t whenMs) {
@@ -966,6 +1106,56 @@ namespace {
 
 enum StepResult { kConsumed, kStop, kRejected };
 
+// N2: the live rows posted under (kind, key), newest first, this batch's
+// staged postings included: no fixed cap on the postings read, so dead
+// versions never crowd a live one out. The walk ends at the first live row
+// of kind `stopAt` (0: of any kind), or at `cap` rows.
+//
+// That end keeps the walk short. Every PUT kills the live PUTs of its
+// supersede keys whose CID differs, every control record every live row of
+// its key, and every licence the live licences of its key, and a CID is
+// stored once per partition (a live CID dedupes). So a key holds at most one
+// live row of each kind, and a live control record is older than any live
+// PUT beside it. The newest live row is then the only one a PUT or a licence
+// supersedes, and a control record's walk ends at the live control record,
+// the oldest live row. The walk goes newest first through the postings'
+// sources (committedPseqsNewestFirst), so dead versions behind the end are
+// never read: a hot key's PUT reads its newest version, not every version
+// compaction has not dropped yet. Fills `out` (and `rows`, when given);
+// returns the count, or -1 on an I/O error (c.err set).
+int32_t newestLive(Ctx& c, uint16_t kind, const uint8_t* key, size_t kl, uint8_t stopAt, uint64_t* out,
+                   RecRow* rows, uint32_t cap) {
+    StageScratch& sc = *c.sc;
+    uint32_t n = 0;
+    bool done = false;
+    auto check = [&](uint64_t ps) {  // -> continue?
+        const bool dead = isDead(c, ps);
+        if (c.err) return false;
+        if (dead) return true;
+        RecRow r;
+        if (readRow(c, ps, &r) < 0 || r.kind == kRowVoid) return true;  // VOID: compacted away (dead)
+        if (rows) rows[n] = r;
+        out[n++] = ps;
+        done = !stopAt || r.kind == stopAt || n >= cap;
+        return !done;
+    };
+    // This batch's staged postings are the newest rows.
+    std::vector<uint64_t>& cand = sc.supCands;
+    cand.clear();
+    for (uint32_t i = 0; i < sc.nEntries; i++) {
+        const StagedEntry& e = sc.entries[i];
+        if (e.kind == kind && keyCmp(e.key, e.klen, key, kl) == 0) pushCand(cand, getBE64(e.val));
+    }
+    std::sort(cand.begin(), cand.end(), [](uint64_t a, uint64_t b) { return a > b; });
+    for (uint64_t ps : cand)
+        if (!check(ps)) break;
+    if (!done && !c.err) {
+        const int32_t rc = committedPseqsNewestFirst(c, kind, key, kl, check);
+        if (rc < 0) c.err = rc;
+    }
+    return c.err ? -1 : int32_t(n);
+}
+
 StepResult stageRecord(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* rejectCode) {
     Partition* p = c.p;
     StageScratch& sc = *c.sc;
@@ -1201,36 +1391,19 @@ StepResult stageRecord(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* reje
         const uint8_t* keys[2] = {stored, idKey};
         const size_t lens[2] = {storedLen2, idKeyLen};
         const int nk = keyCmp(stored, storedLen2, idKey, idKeyLen) == 0 ? 1 : 2;
+        // N2: per key, the newest live row (newestLive: a key holds at most
+        // one live row of each kind, and a live control record has no live
+        // row older than it). A PUT whose CID differs is superseded.
         for (int ki = 0; ki < nk; ki++) {
-            // staged supersede postings (this batch)
-            for (uint32_t i = 0; i < sc.nEntries; i++) {
-                const StagedEntry& e = sc.entries[i];
-                if (e.kind != kIxSupersede || keyCmp(e.key, e.klen, keys[ki], lens[ki]) != 0) continue;
-                const uint64_t ps = getBE64(e.val);
-                if (!stagedDeadGet(sc, ps, nullptr) && nKilled < 8) killed[nKilled++] = ps;
-            }
-            const int32_t prc = committedPostings(c, kIxSupersede, keys[ki], lens[ki], [&](const uint8_t* v) {
-                const uint64_t ps = getBE64(v);
-                if (nKilled < 8) killed[nKilled++] = ps;
-                return true;
-            });
-            if (prc < 0) {
-                c.err = prc;
-                return kStop;
-            }
-        }
-        // Keep live copies whose cid differs.
-        uint32_t w2 = 0;
-        std::sort(killed, killed + nKilled);
-        nKilled = uint32_t(std::unique(killed, killed + nKilled) - killed);
-        for (uint32_t i = 0; i < nKilled; i++) {
-            if (isDead(c, killed[i])) continue;
+            uint64_t live = 0;
             RecRow kr;
-            if (readRow(c, killed[i], &kr) < 0) continue;
-            if (kr.kind != kRowPut || std::memcmp(kr.cid, cid, kCidLen) == 0) continue;
-            killed[w2++] = killed[i];
+            const int32_t nl = newestLive(c, kIxSupersede, keys[ki], lens[ki], 0, &live, &kr, 1);
+            if (nl < 0) return kStop;
+            if (nl == 0 || kr.kind != kRowPut || std::memcmp(kr.cid, cid, kCidLen) == 0) continue;
+            if (nKilled && killed[0] == live) continue;  // both keys name it
+            killed[nKilled++] = live;
         }
-        nKilled = w2;
+        std::sort(killed, killed + nKilled);
         if (c.err) return kStop;
     }
     uint32_t laneIdx = 0;
@@ -1376,20 +1549,9 @@ StepResult stageLicence(Ctx& c, const EntryHeader& h, uint64_t pos, int32_t* rej
     const size_t lkl = capKey(lk, av.licenceKey, av.licenceKeyLen);
     // A newer licence for the same (provider, source, batch) supersedes.
     uint64_t prev[8];
-    uint32_t np = 0;
-    for (uint32_t i = 0; i < sc.nEntries; i++) {
-        const StagedEntry& e = sc.entries[i];
-        if (e.kind == kIxLicence && keyCmp(e.key, e.klen, lk, lkl) == 0 && np < 8)
-            prev[np++] = getBE64(e.val);
-    }
-    const int32_t prc = committedPostings(c, kIxLicence, lk, lkl, [&](const uint8_t* v) {
-        if (np < 8) prev[np++] = getBE64(v);
-        return true;
-    });
-    if (prc < 0) {
-        c.err = prc;
-        return kStop;
-    }
+    const int32_t npl = newestLive(c, kIxLicence, lk, lkl, 0, prev, nullptr, 8);  // N2: the live one
+    if (npl < 0) return kStop;
+    const uint32_t np = uint32_t(npl);
     uint8_t* fdst = static_cast<uint8_t*>(c.frames->alloc(h.frameLen, 1));
     if (!fdst) return kStop;
     ringRead(p->ring, c.e->pool(), attrPos + h.attrLen, fdst, h.frameLen);
@@ -1442,20 +1604,9 @@ StepResult stageCtl(Ctx& c, const EntryHeader& h, uint64_t pos, uint64_t txnId, 
     uint8_t key[kMaxKeyLen];
     const size_t kl = capKey(key, av.supersedeKey, av.supersedeKeyLen);
     uint64_t prev[8];
-    uint32_t np = 0;
-    for (uint32_t i = 0; i < sc.nEntries; i++) {
-        const StagedEntry& e = sc.entries[i];
-        if (e.kind == kIxSupersede && keyCmp(e.key, e.klen, key, kl) == 0 && np < 8)
-            prev[np++] = getBE64(e.val);
-    }
-    const int32_t prc = committedPostings(c, kIxSupersede, key, kl, [&](const uint8_t* v) {
-        if (np < 8) prev[np++] = getBE64(v);
-        return true;
-    });
-    if (prc < 0) {
-        c.err = prc;
-        return kStop;
-    }
+    const int32_t npl = newestLive(c, kIxSupersede, key, kl, kRowCtl, prev, nullptr, 8);  // N2: to the live control record
+    if (npl < 0) return kStop;
+    const uint32_t np = uint32_t(npl);
     const bool del = (h.flags & 0x0010) != 0;
     for (uint32_t i = 0; i < np; i++)
         if (!stageKill(c, prev[i], kRowCtlTomb)) return kStop;
@@ -1508,9 +1659,7 @@ bool reconcileStep(Ctx& c) {
             continue;
         }
         const uint64_t put = ir.kind == kRowPut ? inst : ir.targetPseq;
-        const Lane* lane = nullptr;
-        for (const auto& l : p->lanes)
-            if (l.id == ir.laneId) lane = &l;
+        const Lane* lane = laneById(p, ir.laneId);
         const bool keep = lane && lane->batch.size() == rs.keep.size() &&
                           std::memcmp(lane->batch.data(), rs.keep.data(), rs.keep.size()) == 0;
         if (!keep && lane) {
@@ -1646,15 +1795,76 @@ static bool finalizeBatch(Ctx& c, Arena* batches) {
         addCtl(c, kCtlSeal, body, sizeof(body));
     }
     if (sc.nRows == 0 && sc.nCtl == 0 && sc.laneFrameBytes == 0) return true;  // ack-only
-    // More than 32 live lanes: the batch carries the full lane table so a
-    // head can point at it (the head holds 32 inline).
     uint32_t laneCkptAt = UINT32_MAX;
-    if (sc.nDeltas || sc.forceLaneCkpt) {
+    if (c.e->laneCkptLevel()) {
+        // Level 3 (TB03): the batch carries only the lanes it changed (its
+        // lane-delta section). The whole table is written once, by the batch
+        // that takes the partition past 32 live lanes (the base the head's
+        // LaneRef names until the first checkpoint), and in inline mode by
+        // A9's retirement batch (at most 32 lanes). Staging kept the table
+        // within kLaneCrossMaxLanes (kLaneInlineStageDeltas).
+        if (p->laneMode == kLaneModeRef) {
+            sc.forceLaneCkpt = false;
+        } else if (sc.nDeltas || sc.forceLaneCkpt) {
+            int64_t live = int64_t(p->laneLive);
+            for (uint32_t i = 0; i < sc.nDeltas; i++) {
+                const LaneDelta& d = sc.deltas[i];
+                const Lane* l = laneById(p, d.laneId);
+                const int64_t c0 = l ? l->c.count : 0;
+                const int64_t c1 = c0 + d.dCount;
+                live += (c0 == 0 && c1 != 0) - (c0 != 0 && c1 == 0);
+            }
+            if (live > int64_t(kMaxInlineLanes) || sc.forceLaneCkpt) {
+                const size_t need = 4 + size_t(live) * sizeof(LaneCounter);
+                if (live > int64_t(kLaneCrossMaxLanes) || sc.ctlBytes + 4 + need > sizeof(sc.ctl)) {
+                    c.err = FLATSQL_IO_ERR_GENERIC;  // staging bounds this (cannot happen)
+                    return false;
+                }
+                laneCkptAt = sc.ctlBytes + 4;
+                putU16(sc.ctl + sc.ctlBytes, kCtlLaneCkpt);
+                putU16(sc.ctl + sc.ctlBytes + 2, uint16_t(need));
+                uint8_t* q = sc.ctl + sc.ctlBytes + 4;
+                putU32(q, uint32_t(live));
+                q += 4;
+                uint32_t written = 0;
+                for (const auto& l : p->lanes) {
+                    LaneCounter lc = l.c;
+                    if (const LaneDelta* d = sc.deltaFind(l.id, false)) laneApplyDelta(&lc, *d);
+                    if (lc.count == 0 || written == uint32_t(live)) continue;
+                    lc.laneId = l.id;
+                    std::memcpy(q, &lc, sizeof(lc));
+                    q += sizeof(lc);
+                    written++;
+                }
+                for (uint32_t i = 0; i < sc.nDeltas && written < uint32_t(live); i++) {
+                    // A lane the table does not hold yet (publish adds it).
+                    if (laneById(p, sc.deltas[i].laneId)) continue;
+                    LaneCounter lc{};
+                    lc.laneId = sc.deltas[i].laneId;
+                    laneApplyDelta(&lc, sc.deltas[i]);
+                    if (lc.count == 0) continue;
+                    std::memcpy(q, &lc, sizeof(lc));
+                    q += sizeof(lc);
+                    written++;
+                }
+                if (written != uint32_t(live)) {
+                    c.err = FLATSQL_IO_ERR_GENERIC;  // the table and the live count disagree
+                    return false;
+                }
+                sc.ctlBytes += uint32_t(4 + need);
+                sc.nCtl++;
+                st.laneCross = live > int64_t(kMaxInlineLanes);
+            }
+        }
+    } else if (sc.nDeltas || sc.forceLaneCkpt) {
+        // Level 2: more than 32 live lanes, the batch carries the full lane
+        // table so a head can point at it (the head holds 32 inline).
+        // Refused past one u16 ctl record, 1,170 lanes (the level-3 lane
+        // checkpoints lift that).
         uint32_t live = 0;
         for (const auto& l : p->lanes) {
             int64_t cnt = l.c.count;
-            for (uint32_t i = 0; i < sc.nDeltas; i++)
-                if (sc.deltas[i].laneId == l.id) cnt += sc.deltas[i].dCount;
+            if (const LaneDelta* d = sc.deltaFind(l.id, false)) cnt += d->dCount;
             if (cnt != 0) live++;
         }
         // A9: a retiring meta segment's batch re-emits the whole table.
@@ -1667,18 +1877,9 @@ static bool finalizeBatch(Ctx& c, Arena* batches) {
                 uint8_t* q = sc.ctl + sc.ctlBytes + 4;
                 putU32(q, live);
                 q += 4;
-                const int64_t now = c.e->nowMs();
                 for (const auto& l : p->lanes) {
                     LaneCounter lc = l.c;
-                    for (uint32_t i = 0; i < sc.nDeltas; i++) {
-                        const LaneDelta& d = sc.deltas[i];
-                        if (d.laneId != l.id) continue;
-                        lc.count += d.dCount;
-                        lc.bytes += d.dBytes;
-                        if (d.maxPseq > lc.maxPseq) lc.maxPseq = d.maxPseq;
-                        if (d.dCount > 0 && (lc.firstSeen == 0 || d.firstSeen < lc.firstSeen)) lc.firstSeen = d.firstSeen;
-                        lc.updated = d.updated > lc.updated ? d.updated : now;
-                    }
+                    if (const LaneDelta* d = sc.deltaFind(l.id, false)) laneApplyDelta(&lc, *d);
                     if (lc.count == 0) continue;
                     lc.laneId = l.id;
                     std::memcpy(q, &lc, sizeof(lc));
@@ -1920,8 +2121,11 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
             for (const auto& it : p->retiring)
                 if (it.letter == 'm' && it.seg + 1 > h.firstLiveMSeg) h.firstLiveMSeg = it.seg + 1;
             h.nextGen = p->nextGen;
-            // Room for the lane table finalize may add (A9 forces one).
-            const size_t laneRoom = 64 + (p->lanes.size() + 1) * sizeof(LaneCounter);
+            // Room for the lane records finalize may add: at level 2 the
+            // whole table (A9 forces one); at level 3 a crossing's table in
+            // inline mode, or the LANE_REF below (TB03: RETIRE reserves only
+            // what this batch's finalize adds).
+            const size_t laneRoom = partitionLaneCtlRoom(p);
             const size_t used = sc->ctlBytes + 4 + laneRoom;
             const size_t cap = used < sizeof(sc->ctl) ? std::min<size_t>(sizeof(sc->ctl) - used, 65535) : 0;
             const int saved = tHotPathDepth;
@@ -1945,6 +2149,14 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
             }
         }
         if (p->forceLaneCkpt) sc->forceLaneCkpt = true;
+        // TB03: a batch that carries RETIRE also carries the LaneRef in force,
+        // so a torn-head rebuild from a later meta segment folds the lane
+        // table from it (the RETIRE may name what older refs read).
+        if (st->retireSet && e->laneCkptLevel() && p->laneMode == kLaneModeRef) {
+            LaneRef r = p->laneRef;
+            r.nLive = p->laneLive;
+            addCtl(c, kCtlLaneRef, &r, uint16_t(sizeof(r)));
+        }
     }
     // Rows need a slot in the head's L0 directory: at its cap, mailbox kills
     // and TOMB_RANGE steps wait for the merge. Ring entries stop
@@ -1992,8 +2204,13 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
     // A13: in a space emergency record entries wait (zero credits; nothing
     // is acked); kills, TOMB_RANGE and maintenance records still commit.
     const bool noSpace = e->spaceEmergency();
+    // TB03: in inline mode at level 3 a batch changes at most
+    // kLaneInlineStageDeltas lanes (plus what its last entry adds), so the
+    // table a crossing batch writes fits the room RETIRE left for it.
+    const bool laneInlineCap = e->laneCkptLevel() && p->laneMode != kLaneModeRef;
     while (!noSpace && !st->sealAfter && !c.err && pos + sizeof(EntryHeader) <= tail) {
         if (st->dBytes >= cfg.commitBytes || frames0 >= frameCap) break;
+        if (laneInlineCap && sc->nDeltas >= kLaneInlineStageDeltas) break;
         if (p->nL0 >= kMaxL0Dir - 1 - kL0ControlSlots) {  // wait for a merge (type labeling lags)
             e->cL0Full.fetch_add(1, std::memory_order_relaxed);
             break;
@@ -2214,13 +2431,25 @@ void encodePartitionHead(const Partition* p, uint8_t* slot, uint32_t* used, bool
     h.intentAOff = p->intentAOff;
     h.intentThrough = p->intentThrough;
     // Lanes with a non-zero count go inline; past 32, the head points at the
-    // last LANE_CKPT ctl record (written by the commit that overflowed).
-    uint32_t nLanes = 0;
-    for (const auto& l : p->lanes)
-        if (l.c.count != 0) nLanes++;
+    // last LANE_CKPT ctl record (level 2, written by the commit that
+    // overflowed) or names a LaneRef (level 3, TB03).
     size_t off = sizeof(h);
     std::memcpy(slot + off, p->l0, sizeof(L0DirEntry) * p->nL0);
     off += sizeof(L0DirEntry) * p->nL0;
+    if (p->laneMode == kLaneModeRef) {
+        h.nLanes = kLanesRef;
+        LaneRef r = p->laneRef;
+        r.nLive = p->laneLive;
+        std::memcpy(slot + off, &r, sizeof(r));
+        off += sizeof(r);
+        std::memcpy(slot, &h, sizeof(h));
+        *used = uint32_t(off + 4);
+        sealHeadSlot(slot, *used);
+        return;
+    }
+    uint32_t nLanes = 0;
+    for (const auto& l : p->lanes)
+        if (l.c.count != 0) nLanes++;
     if (nLanes <= kMaxInlineLanes) {
         h.nLanes = uint16_t(nLanes);
         for (const auto& l : p->lanes) {
@@ -2400,19 +2629,25 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
             p->lanesOverflowSeg = st->mSeg;
             p->lanesOverflowOff = st->laneCkptOff;
         }
-        const int64_t now = e->nowMs();
+        // Lane counters: O(1) per changed lane (TB03), the same rule the
+        // replay, the readers and the checkpoints apply (laneApplyDelta).
         for (uint32_t i = 0; i < st->nDeltas; i++) {
             const LaneDelta& d = st->deltas[i];
-            for (auto& l : p->lanes) {
-                if (l.id != d.laneId) continue;
-                l.c.count += d.dCount;
-                l.c.bytes += d.dBytes;
-                if (d.maxPseq > l.c.maxPseq) l.c.maxPseq = d.maxPseq;
-                if (d.dCount > 0 && (l.c.firstSeen == 0 || d.firstSeen < l.c.firstSeen))
-                    l.c.firstSeen = d.firstSeen;
-                l.c.updated = d.updated > l.c.updated ? d.updated : now;
-                break;
+            Lane* l = laneById(p, d.laneId);
+            if (!l) {
+                const int saved = tHotPathDepth;
+                tHotPathDepth = 0;
+                p->lanes.emplace_back();
+                p->lanes.back().id = d.laneId;
+                p->lanes.back().c.laneId = d.laneId;
+                laneIndexAdd(p, uint32_t(p->lanes.size() - 1));
+                tHotPathDepth = saved;
+                l = &p->lanes.back();
             }
+            const bool was = l->c.count != 0;
+            laneApplyDelta(&l->c, d);
+            const bool is = l->c.count != 0;
+            if (was != is) p->laneLive += is ? 1 : uint32_t(-1);
         }
         if (nRows) {
             const uint32_t idx = p->nL0;
@@ -2483,6 +2718,27 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
             p->sealPending = false;
             e->cSeals.fetch_add(1, std::memory_order_relaxed);
         }
+        // TB03 (level 3): the batch that took the partition past 32 live
+        // lanes wrote the table once; from here the head names a LaneRef
+        // whose base is that LANE_CKPT and whose deltas replay from the next
+        // batch (a position normalized past a SEAL). A checkpoint follows.
+        if (st->laneCross && p->laneMode != kLaneModeRef) {
+            LaneRef r{};
+            r.baseSeg = st->mSeg;
+            r.baseOff = st->laneCkptOff;
+            r.replaySeg = p->mSeg;
+            r.replayOff = p->mEnd;
+            r.mintedThrough = p->nextLaneId ? p->nextLaneId - 1 : 0;
+            r.nLive = p->laneLive;
+            p->laneRef = r;
+            p->laneMode = kLaneModeRef;
+            p->laneCutWanted = true;
+            p->laneRefNamedNs = monoNs();
+            p->forceLaneCkpt = false;
+        } else if (p->laneMode == kLaneModeRef) {
+            p->laneRef.batches++;
+            if (st->nDeltas) p->laneRef.deltaBatches++;
+        }
         const bool lockStats = e->config().lockStats;
         const uint64_t l0 = lockStats ? monoNs() : 0;
         publishPartition(p->pubLock, p->pub, p->commitSeq, p->pseqHi, p->nL0, p->l0);
@@ -2532,6 +2788,10 @@ void partitionRollback(Writer* w, Partition* p, Staged* st) {
     // Lanes interned by the failed batch are forgotten (their l.fsl frames
     // were not durable).
     if (st->laneFrameBytes && st->firstNewLaneIndex < p->lanes.size()) {
+        // The batch minted its lanes from nextLaneId in order, so the first
+        // one's id is what nextLaneId was before it (the table is not sorted
+        // by id: lanes the head knew but l.fsl lost sit before them, merge.cpp).
+        p->nextLaneId = p->lanes[st->firstNewLaneIndex].id;
         // Rebuild the hash index without the dropped lanes.
         p->lanes.resize(st->firstNewLaneIndex);
         p->laneByHash.clear();
@@ -2551,7 +2811,7 @@ void partitionRollback(Writer* w, Partition* p, Staged* st) {
             t.pubkeyLen = l.pubkey.size();
             p->laneByHash.emplace(laneHash(t), i);
         }
-        p->nextLaneId = p->lanes.empty() ? 1 : p->lanes.back().id + 1;
+        laneIndexRebuild(p);
     }
     // A RECONCILE step that did not commit restarts from its entry (idempotent).
     if (p->rec.active || st->reconcileDone) p->rec = ReconcileState();

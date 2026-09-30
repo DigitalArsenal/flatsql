@@ -129,6 +129,20 @@ int32_t partitionLoadLanes(Writer* w, Partition* p) {
     }
     p->lExtent = off;
     if (maxId + 1 > p->nextLaneId) p->nextLaneId = maxId + 1;
+    // TB03: lanes the head or the replay knew that l.fsl lost (a torn tail)
+    // keep their counters: a checkpoint or a crossing table never drops a
+    // live lane. Their tuples are gone, so staging never finds them again.
+    laneIndexRebuild(p);
+    for (const auto& kv : known) {
+        if (kv.second.count == 0 || laneById(p, kv.first)) continue;
+        Lane l;
+        l.id = kv.first;
+        l.c = kv.second;
+        l.c.laneId = kv.first;
+        p->lanes.push_back(std::move(l));
+        laneIndexAdd(p, uint32_t(p->lanes.size() - 1));
+    }
+    laneIndexRebuild(p);
     p->lanesLoaded = true;
     return 0;
 }
@@ -381,6 +395,7 @@ int32_t planMerge(Writer* w, Partition* p) {
     }
     m.segFirstPseq = si->firstPseq;
     m.gen = p->nextGen++;
+    m.manifestVer = w->engine()->laneCkptLevel() ? kManifestVerWide : 0;  // TB03: v3 from level 3
     m.rOff = (m.firstPseq - si->firstPseq) * sizeof(RecRow);
     m.aOff = si->aLen;
     m.minEpoch = si->minEpoch;
@@ -438,12 +453,13 @@ int32_t planMerge(Writer* w, Partition* p) {
 }
 
 std::vector<uint8_t> encodeSnapManifest(uint32_t pid, uint32_t gen, uint32_t prevGen,
-                                        const std::vector<ManifestSegDesc>& snap) {
+                                        const std::vector<ManifestSegDesc>& snap, uint16_t minVer = 0) {
     ManifestDesc md;
     md.gen = gen;
     md.pid = pid;
     md.prevGen = prevGen;
     md.segs = snap;
+    md.minVer = minVer;
     return encodeManifest(md);
 }
 
@@ -548,7 +564,7 @@ int32_t writeMergeOutputs(IoCtx* io, const char* root, uint32_t pid, MergePlan& 
             mr.fileLen = m.run.fileLen;
             sn.runs.push_back(mr);
         }
-        const std::vector<uint8_t> man = encodeSnapManifest(pid, m.gen, m.prevManifestGen, m.snap);
+        const std::vector<uint8_t> man = encodeSnapManifest(pid, m.gen, m.prevManifestGen, m.snap, m.manifestVer);
         m.mfLen = man.size();
         PathBuf mp;
         pathPartitionManifest(&mp, root, pid, m.gen);
@@ -639,6 +655,9 @@ void partitionMergeAbort(Writer* w, Partition* p) {
 int32_t partitionMergeStep(Writer* w, Partition* p) {
     Engine* e = w->engine();
     if (p->quarantined) return 0;
+    // TB03: lane checkpoints (cut, install, retire) ride the same step.
+    const int32_t lrc = partitionLaneStep(w, p);
+    if (lrc < 0) return lrc;
     // A queued SWAP owns the manifest until it publishes.
     if (p->compactPhase == kCompactSwapQueued && p->mergePhase == kMergeIdle) return 0;
     if (p->mergePhase == kMergeIdle) {

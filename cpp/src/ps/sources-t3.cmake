@@ -9,6 +9,7 @@ target_sources(flatsql_ps PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ps/quota.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ps/stage1.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ps/hot_split.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ps/lane_ckpt.cpp
 )
 if(TARGET flatsql_ps_test)
     target_sources(flatsql_ps_test PRIVATE
@@ -20,5 +21,6 @@ if(TARGET flatsql_ps_test)
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/memory_safety_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/query_gaps_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/bookkeeping_scale_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/ps/lane_cap_test.cpp
     )
 endif()

@@ -142,6 +142,19 @@ int32_t flatsql_ps_set_quota(double bytes);
  *  19 max entry bytes u64: the largest ring entry (header, RecordAttr and
  *     frame; default 1 MiB + 4 KiB). The per-writer arena grows to hold two
  *     such entries. Frames larger than a segment (A27 jumbo) are not built.
+ *  TB03 (format levels, PARTITION-STORE.md §41):
+ *  31 write format u32: the level stores are written at (0, the default:
+ *     this engine's kFormatMax, 3). STORE.format ratchets to it at open once
+ *     the registry is non-empty (on a device with no room for the 64-byte
+ *     STORE.tmp the store opens at its level and the next open retries); a
+ *     fresh store is created at it. An engine refuses a store above its
+ *     kFormatMax without creating any file. A host pinned lower keeps its
+ *     level: a STORE.tmp above it that a crashed ratchet left is removed.
+ *  32 lane checkpoint batches u32: a partition past 32 live lanes cuts a
+ *     paged lane checkpoint once a lane-table fold would walk this many
+ *     batches with lane deltas (default 128) or 4x as many batches in all,
+ *     when a meta segment it replays from is to retire, and once it crosses
+ *     32.
  *
  * Writer stats (flatsql_ps_stats), u64 each in this order: commits, sync
  * rounds, iterations with a commit, rows appended, dedupe hits, retags,
@@ -153,8 +166,12 @@ int32_t flatsql_ps_set_quota(double bytes);
  * §31), hot splits, merges back, stage-1 results prepared, used, stolen,
  * wasted, dedupe lookups a hint shortened, stagings stopped at a full L0
  * directory (hot split, §32), arrivals segments rewritten, arrival entries
- * dropped (arrivals compaction, §33). Hosts read the length the first call
- * returns: entries are only ever appended. */
+ * dropped (arrivals compaction, §33), the store's format level, this
+ * engine's kFormatMax, the level this open raised STORE from (0: none; 1:
+ * STORE was torn by a ratchet this open finished, its old level unknown),
+ * lane checkpoints cut, lane checkpoint bytes written (TB03, §41).
+ * Hosts read the length the first call returns: entries are only ever
+ * appended. */
 
 #ifdef __cplusplus
 }

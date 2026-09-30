@@ -840,14 +840,20 @@ PS_TEST(writer_capi_tlv19_max_entry_and_stats) {
     std::memcpy(&got, reinterpret_cast<const uint8_t*>(ring) + L.offMaxEntry, 8);
     CHECK_EQ(got, maxEntry);
     const int32_t n = flatsql_ps_stats(nullptr, 0);
-    CHECK_EQ(n, int32_t(36 * 8));
+    CHECK_EQ(n, int32_t(41 * 8));
     std::vector<uint8_t> st(size_t(n > 0 ? n : 0));
     CHECK_EQ(flatsql_ps_stats(st.data(), n), n);
-    if (n == 36 * 8) {
+    if (n == 41 * 8) {
         CHECK_EQ(getU64(st.data() + 24 * 8), uint64_t(0));  // migrated gseqs used
         CHECK_EQ(getU64(st.data() + 25 * 8), uint64_t(0));  // migrated gseq fallbacks
         CHECK_EQ(getU64(st.data() + 26 * 8), uint64_t(0));  // hot splits
         CHECK_EQ(getU64(st.data() + 35 * 8), uint64_t(0));  // arrival entries dropped
+        // TB03: a fresh store at this engine's level; no ratchet; no lane checkpoint.
+        CHECK_EQ(getU64(st.data() + 36 * 8), uint64_t(kFormatMax));  // store format
+        CHECK_EQ(getU64(st.data() + 37 * 8), uint64_t(kFormatMax));  // engine kFormatMax
+        CHECK_EQ(getU64(st.data() + 38 * 8), uint64_t(0));           // ratcheted from
+        CHECK_EQ(getU64(st.data() + 39 * 8), uint64_t(0));           // lane checkpoints cut
+        CHECK_EQ(getU64(st.data() + 40 * 8), uint64_t(0));           // lane checkpoint bytes
     }
     CHECK_EQ(flatsql_ps_stop(5000), 0);
     std::filesystem::remove_all(dir);

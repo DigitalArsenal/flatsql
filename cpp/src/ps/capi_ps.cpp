@@ -96,6 +96,8 @@ int32_t flatsql_ps_init(int32_t role, const uint8_t* cfg, int32_t cfgLen) {
             case 17: c.compactThreads = u32(); break;
             case 18: c.commitJournal = len && v[0]; break;
             case 19: c.maxEntryBytes = u64(); break;
+            case 31: c.writeFormat = u32(); break;       // TB03 format levels
+            case 32: c.laneCkptBatches = u32(); break;   // TB03 lane checkpoints
             default: break;
         }
         off += 6 + int32_t(len);
@@ -261,7 +263,12 @@ int32_t flatsql_ps_stats(uint8_t* out, int32_t len) {
                           s.poolSlabsPeak, s.poolCommittedBytes, s.committedBytes,
                           s.migratedGseqs, s.migratedGseqFallbacks, s.splits, s.unsplits,
                           s.prepPrepared, s.prepUsed, s.prepStolen, s.prepWasted, s.prepHinted,
-                          s.l0FullStalls, s.arrivalSegsCompacted, s.arrivalEntriesDropped};
+                          s.l0FullStalls, s.arrivalSegsCompacted, s.arrivalEntriesDropped,
+                          // TB03: the store's level, this engine's kFormatMax, the
+                          // level a ratchet at this open started from (0: none),
+                          // lane checkpoints cut and their bytes.
+                          uint64_t(e->storeFormat()), uint64_t(e->formatMax()), uint64_t(e->ratchetedFrom()),
+                          e->cLaneCuts.load(), e->cLaneCutBytes.load()};
     const int32_t n = int32_t(sizeof(v));
     if (!out || len < n) return n;
     for (size_t i = 0; i < sizeof(v) / 8; i++) putU64(out + i * 8, v[i]);

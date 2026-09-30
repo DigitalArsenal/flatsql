@@ -122,6 +122,8 @@ struct PartView {
     PartitionHeadFixed head{};
     std::vector<RecRow> rows;           // pseq 1..pseqHi, index = pseq - 1
     std::vector<LaneCounter> lanes;
+    bool lanesRef = false;              // TB03: the head names a LaneRef (lanes = its fold)
+    LaneRef laneRef{};
     std::map<uint32_t, uint64_t> segFirst;
     std::map<uint32_t, uint32_t> segCgen;   // T3: compacted segments' generation
     std::string err;

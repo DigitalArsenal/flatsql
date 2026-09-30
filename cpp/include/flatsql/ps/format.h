@@ -10,12 +10,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
+
+#include "flatsql/ps/format_level.h"
 
 namespace flatsql {
 namespace ps {
 
 static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "format 2 is little-endian");
 
+// HeadPrefix.format and MIGRATED's format. STORE.format is the store's level
+// (format_level.h: kFormatMin..kFormatMax), which ratchets.
 constexpr uint16_t kFormat = 2;
 
 // ---- magics ---------------------------------------------------------------
@@ -145,8 +150,11 @@ enum CtlKind : uint16_t {
     kCtlTxnEnd = 8,        // {txn_id u64}
     kCtlIntentMerge = 9,   // A11 {seg, gen, r_off, a_off, through, first_pseq}
     kCtlUnlinked = 10,     // A12
-    kCtlLaneCkpt = 11,     // full lane counter table (overflow past 32 inline)
+    kCtlLaneCkpt = 11,     // full lane counter table (overflow past 32 inline); level 3:
+                           // written once, by the batch that takes a partition past 32
     kCtlQuarantine = 12,
+    kCtlLaneRef = 13,      // level 3: the LaneRef in force, in every batch carrying RETIRE
+                           // (a torn-head rebuild from a later meta segment folds from it)
     // Bodies of kCtlIntentCompact, kCtlSwap, kCtlRetire and kCtlUnlinked: ps/compaction.h.
 };
 
@@ -295,6 +303,51 @@ struct LaneDelta {
     int64_t updated;
 };
 static_assert(sizeof(LaneDelta) == 48, "LaneDelta is 48 bytes");
+
+// Level 3 (TB03, PARTITION-STORE.md §41): past 32 live lanes a partition head
+// says nLanes = kLanesRef and carries this reference where inline lanes would
+// sit (after the L0 directory). The lane table is the base, then the lane
+// deltas of every batch from (replaySeg, replayOff) up to the head's
+// (mSeg, mEnd). The base is lk-<lkGen>.fsl; with lkGen 0, the LANE_CKPT body
+// at (baseSeg, baseOff) of the batch that crossed 32 (baseOff 0: empty).
+constexpr uint16_t kLanesRef = 0xfffe;
+struct LaneRef {
+    uint32_t lkGen;
+    uint32_t baseSeg;
+    uint64_t baseOff;
+    uint32_t replaySeg;
+    uint32_t mintedThrough;  // highest lane id minted when the base was cut
+    uint64_t replayOff;
+    uint32_t nLive;          // lanes with a non-zero count as of the head
+    uint32_t deltaBatches;   // batches with lane deltas since the replay offset
+    uint32_t batches;        // batches since the replay offset
+    uint32_t rsv;
+};
+static_assert(sizeof(LaneRef) == 48, "LaneRef is 48 bytes");
+
+// lk-<gen:06x>.fsl: the paged lane checkpoint. Page 0 is the header; lanes
+// sorted by id follow in 4 KiB pages of up to kLanesPerPage counters, each
+// page [u32 n][u32 crc32c of its counters][n x LaneCounter][zero pad].
+// Count-0 lanes are dropped when it is cut.
+constexpr uint32_t kMagicLaneCkpt = 0x4b4c5346;  // "FSLK"
+constexpr uint32_t kLanePageBytes = 4096;
+constexpr uint32_t kLanesPerPage = (kLanePageBytes - 8) / 56;  // 73
+struct LaneCkptHeader {
+    uint32_t magic;
+    uint16_t ver;
+    uint16_t flags;
+    uint32_t pid;
+    uint32_t gen;
+    uint32_t nLanes;
+    uint32_t nPages;         // counter pages after the header page
+    uint32_t mintedThrough;
+    uint32_t replaySeg;      // the batch position the checkpoint was cut at
+    uint64_t replayOff;
+    uint64_t rsv[2];
+    uint32_t rsv2;
+    uint32_t crc;            // CRC32C of the bytes before it
+};
+static_assert(sizeof(LaneCkptHeader) == 64, "LaneCkptHeader is 64 bytes");
 
 struct PartitionHeadFixed {
     HeadPrefix p;
@@ -607,6 +660,44 @@ void pathTypeConfig(PathBuf* out, const char* root, const uint8_t fid[4], uint64
 void pathJournal(PathBuf* out, const char* root, uint32_t writer, int file);
 void pathPartitionDir(PathBuf* out, const char* root, uint32_t pid);
 void pathTypeDir(PathBuf* out, const char* root, const uint8_t fid[4]);
+// Level 3: the paged lane checkpoint lk-<gen:06x>.fsl (lane_ckpt.cpp).
+void pathPartitionLaneCkpt(PathBuf* out, const char* root, uint32_t pid, uint32_t gen);
+
+// ---- lane tables (level 3, lane_ckpt.cpp) -------------------------------------
+// The writer's open, its checkpoint helper, reader lanes and the test
+// inspector fold a partition's lane table the same way: the base a LaneRef
+// names, then the lane deltas of every batch from its replay offset up to a
+// head's (mSeg, mEnd). Reads go through this interface (each side keeps its
+// own handles). Returns bytes read or a negative status (NOENT for a file
+// that is gone: a reader's snapshot then retries).
+class LaneFileReader {
+public:
+    virtual ~LaneFileReader() = default;
+    virtual int64_t readMeta(uint32_t seg, void* dst, size_t len, uint64_t off) = 0;
+    virtual int64_t readCkpt(uint32_t gen, void* dst, size_t len, uint64_t off) = 0;
+};
+// Applies one delta to a counter exactly as a commit does.
+void laneApplyDelta(LaneCounter* c, const LaneDelta& d);
+// Encodes a checkpoint: `lanes` sorted by id, count-0 ones already dropped.
+void laneCkptEncode(uint32_t pid, uint32_t gen, uint32_t mintedThrough, uint32_t replaySeg, uint64_t replayOff,
+                    const LaneCounter* lanes, size_t n, std::vector<uint8_t>* out);
+// Reads the base a LaneRef names, sorted by lane id. The checkpoint must name
+// `pid`, `gen` and the ref's replay offset (a stale or foreign file is refused).
+int32_t laneLoadBase(LaneFileReader* rd, uint32_t pid, const LaneRef& ref, std::vector<LaneCounter>* out);
+// Folds a LaneRef into the table as of the head position (endSeg, endOff):
+// the base, then the deltas of every batch from the replay offset on. Batches
+// are walked by their headers (a SEAL batch moves to segment + 1, offset 0)
+// and checked (magic, length, segment, trailer, commit chain); a walk that
+// does not land exactly on the end position is corrupt. Count-0 lanes are
+// kept (a caller that cuts a checkpoint drops them). `batches` and
+// `deltaBatches` (may be null) count the batches walked.
+int32_t laneFold(LaneFileReader* rd, uint32_t pid, const LaneRef& ref, uint32_t endSeg, uint64_t endOff,
+                 std::vector<LaneCounter>* out, uint32_t* batches = nullptr, uint32_t* deltaBatches = nullptr);
+// Segment floor of a LaneRef: meta segments below it hold nothing the ref
+// replays or reads (its replay segment, and a LANE_CKPT base's segment).
+inline uint32_t laneRefFloorSeg(const LaneRef& r) {
+    return (r.lkGen == 0 && r.baseOff && r.baseSeg < r.replaySeg) ? r.baseSeg : r.replaySeg;
+}
 
 inline uint32_t fidU32(const uint8_t fid[4]) { return getU32(fid); }
 

@@ -521,7 +521,47 @@ PartView Inspector::partition(uint32_t pid) {
         }
     // Lanes.
     const uint8_t* lp = slot + sizeof(PartitionHeadFixed) + size_t(hd.nL0) * sizeof(L0DirEntry);
-    if (hd.nLanes != 0xffff) {
+    if (hd.nLanes == kLanesRef) {
+        // TB03 (level 3): the head's LaneRef, folded up to the head with the
+        // engine's own fold (its base, then the batches since the replay
+        // offset), with count-0 lanes left out as the other forms leave them.
+        LaneRef ref;
+        std::memcpy(&ref, lp, sizeof(ref));
+        v.laneRef = ref;
+        v.lanesRef = true;
+        struct Rd final : LaneFileReader {
+            IoCtx& io;
+            const std::string& root;
+            uint32_t pid;
+            Rd(IoCtx& i, const std::string& r, uint32_t p) : io(i), root(r), pid(p) {}
+            int64_t readAt(const PathBuf& pb, FileClass cls, void* dst, size_t len, uint64_t off) {
+                FileRef f;
+                const int32_t rc = io.open(pb.c_str(), pb.len, FLATSQL_IO_READ, cls, &f);
+                if (rc < 0) return rc;
+                const int64_t n = io.read(f, dst, len, off);
+                io.close(&f);
+                return n;
+            }
+            int64_t readMeta(uint32_t seg, void* dst, size_t len, uint64_t off) override {
+                PathBuf pb;
+                pathPartitionSeg(&pb, root.c_str(), pid, 'm', seg, "fsl");
+                return readAt(pb, FileClass::Meta, dst, len, off);
+            }
+            int64_t readCkpt(uint32_t gen, void* dst, size_t len, uint64_t off) override {
+                PathBuf pb;
+                pathPartitionLaneCkpt(&pb, root.c_str(), pid, gen);
+                return readAt(pb, FileClass::Lanes, dst, len, off);
+            }
+        } rd(ctx_, root_, pid);
+        std::vector<LaneCounter> lc;
+        const int32_t rc = laneFold(&rd, pid, ref, hd.mSeg, hd.mEnd, &lc);
+        if (rc < 0) {
+            v.err = "lane fold failed (" + std::to_string(rc) + ")";
+            return v;
+        }
+        for (const auto& c : lc)
+            if (c.count != 0) v.lanes.push_back(c);
+    } else if (hd.nLanes != 0xffff) {
         for (uint16_t i = 0; i < hd.nLanes; i++) {
             LaneCounter c;
             std::memcpy(&c, lp + size_t(i) * sizeof(c), sizeof(c));
@@ -767,6 +807,11 @@ DirCheck checkPartitionDir(Io* io, FaultFs* fs, const std::string& root, uint32_
     pathPartition(&pb, root.c_str(), pid, "h.fsh");
     // A partition registered durably whose first head never was has none.
     (hd.p.magic == kMagicHead ? required : optional).insert(std::string(pb.c_str(), pb.len));
+    if (v.lanesRef && v.laneRef.lkGen) {
+        // TB03: the lane checkpoint the head names.
+        pathPartitionLaneCkpt(&pb, root.c_str(), pid, v.laneRef.lkGen);
+        required.insert(std::string(pb.c_str(), pb.len));
+    }
     pathPartition(&pb, root.c_str(), pid, "l.fsl");
     optional.insert(std::string(pb.c_str(), pb.len));
     if (hd.p.magic == kMagicHead) {

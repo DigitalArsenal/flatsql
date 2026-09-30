@@ -45,6 +45,7 @@ void filePath(const std::string& root, const FileKey& k, PathBuf* out) {
                 case 'R': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/registry.fsl", r); break;
                 case 'H': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/registry.fsh", r); break;
                 case 'S': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/STORE", r); break;
+                case 'T': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/STORE.tmp", r); break;
                 case 'M': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/MIGRATED", r); break;
                 default: n = -1;
             }
@@ -58,6 +59,7 @@ void filePath(const std::string& root, const FileKey& k, PathBuf* out) {
                     n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/p/%08x/x-%06x-%04x.fsx", r, k.id, k.seg, k.gen);
                     break;
                 case 'f': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/p/%08x/mf-%06x.fsm", r, k.id, k.gen); break;
+                case 'k': n = snprintf(out->buf, sizeof(out->buf), "%s/fsql2/p/%08x/lk-%06x.fsl", r, k.id, k.gen); break;
                 case 'd':
                 case 'r':
                 case 'a': {
@@ -106,7 +108,8 @@ FileClass fileClassOf(const FileKey& k) {
             case 'a': return FileClass::Attrs;
             case 'x': return FileClass::Index;
             case 'f': return FileClass::Manifest;
-            case 'l': return FileClass::Lanes;
+            case 'l':
+            case 'k': return FileClass::Lanes;
         }
         return FileClass::Store;
     }
@@ -727,9 +730,20 @@ int32_t LaneStore::open() {
     int32_t rc = io_.get(sk('S'), &f);
     if (rc < 0) return rc;
     StoreFile sf{};
-    if (io_.read(f, &sf, sizeof(sf), 0) != int64_t(sizeof(sf)) || sf.magic != kMagicStore ||
-        sf.format != kFormat || sf.crc != crc32c(&sf, offsetof(StoreFile, crc)))
-        return kRsCorrupt;
+    // TB03: any level this engine opens (format_level.h), with the writer's
+    // rules (open.cpp openStore): an intact STORE decides alone, and a level
+    // above kFormatMax is refused; only a STORE torn by a ratchet the writer
+    // has not finished yet reads through STORE.tmp, whose level must be one
+    // this engine opens too.
+    auto intact = [](const StoreFile& x) {
+        return x.magic == kMagicStore && x.crc == crc32c(&x, offsetof(StoreFile, crc));
+    };
+    if (io_.read(f, &sf, sizeof(sf), 0) != int64_t(sizeof(sf)) || !intact(sf)) {
+        FileRef tf;
+        if (io_.get(sk('T'), &tf) < 0 || io_.read(tf, &sf, sizeof(sf), 0) != int64_t(sizeof(sf)) || !intact(sf))
+            return kRsCorrupt;
+    }
+    if (!formatAccepted(sf.format)) return kRsCorrupt;
     rc = io_.get(sk('M'), &f);
     if (rc == FLATSQL_IO_ERR_NOENT) return kRsNotMigrated;
     if (rc < 0) return rc;
@@ -986,7 +1000,11 @@ int32_t LaneStore::loadPart(uint32_t pid, PartSnap* out, bool withManifest) {
     out->l0.resize(h.nL0);
     if (h.nL0) std::memcpy(out->l0.data(), slot.data() + off, size_t(h.nL0) * sizeof(L0DirEntry));
     off += size_t(h.nL0) * sizeof(L0DirEntry);
-    if (h.nLanes == 0xffff) {
+    if (h.nLanes == kLanesRef) {
+        if (off + sizeof(LaneRef) + 4 > slot.size()) return kRsCorrupt;
+        out->lanesRef = true;
+        std::memcpy(&out->laneRef, slot.data() + off, sizeof(LaneRef));
+    } else if (h.nLanes == 0xffff) {
         out->lanesOverflow = true;
     } else {
         if (off + size_t(h.nLanes) * sizeof(LaneCounter) + 4 > slot.size()) return kRsCorrupt;
@@ -1002,9 +1020,43 @@ int32_t LaneStore::loadPart(uint32_t pid, PartSnap* out, bool withManifest) {
     return 0;
 }
 
+namespace {
+// TB03: a reader lane's files for lane folds (m-<seg>, lk-<gen>).
+class LaneIoFoldReader final : public LaneFileReader {
+public:
+    LaneIoFoldReader(LaneIo& io, uint32_t pid) : io_(io), pid_(pid) {}
+    int64_t readMeta(uint32_t seg, void* dst, size_t len, uint64_t off) override {
+        return read(pk('m', pid_, seg), dst, len, off);
+    }
+    int64_t readCkpt(uint32_t gen, void* dst, size_t len, uint64_t off) override {
+        return read(pk('k', pid_, 0, gen), dst, len, off);
+    }
+
+private:
+    int64_t read(const FileKey& k, void* dst, size_t len, uint64_t off) {
+        FileRef f;
+        const int32_t rc = io_.get(k, &f);
+        if (rc < 0) return rc;
+        return io_.read(f, dst, len, off);
+    }
+    LaneIo& io_;
+    uint32_t pid_;
+};
+}  // namespace
+
 int32_t LaneStore::laneCounters(const PartSnap& s, std::vector<LaneCounter>* out) {
     out->clear();
     if (s.empty) return 0;
+    if (s.lanesRef) {
+        LaneIoFoldReader rd(io_, s.pid);
+        const int32_t rc = laneFold(&rd, s.pid, s.laneRef, s.head.mSeg, s.head.mEnd, out);
+        if (rc == FLATSQL_IO_ERR_NOENT) return kRsSnapshotGone;  // retired since the snapshot: retry
+        if (rc < 0) return rc == FLATSQL_IO_ERR_IO ? kRsCorrupt : rc;
+        // Count-0 lanes leave, as the inline table and LANE_CKPT leave them.
+        out->erase(std::remove_if(out->begin(), out->end(), [](const LaneCounter& c) { return c.count == 0; }),
+                   out->end());
+        return 0;
+    }
     if (!s.lanesOverflow) {
         *out = s.lanes;
         return 0;

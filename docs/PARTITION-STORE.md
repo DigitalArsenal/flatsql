@@ -13,7 +13,9 @@ records the memory-safety and race work: the ps-wasm trap, the sanitizers and
 the first disk-full emergency. Part VII (§39) closes the query gaps T6 found
 on the host-02 fixture and accepts records stored with their own size
 prefix. Part VIII (§40) makes a partition's bookkeeping O(1) or O(log S) per
-commit (the terabyte audit's B4) and adds manifest version 3 (M3). The
+commit (the terabyte audit's B4) and adds manifest version 3 (M3). Part IX
+(§41) is TB03: format levels with a ratchet, and paged lane checkpoints that
+lift the 1,170-lane cap (level 3). The
 design is
 the stack's `docs/architecture/flatsql-partition-store.md` (§22 overrides
 §0–§21; §22.4 holds the owner rulings). This file records what was built, how
@@ -47,6 +49,7 @@ The wasm artifact is T4; SDN and browser integration are T6/T10.
 ```
 <root>/fsql2/
   STORE  MIGRATED  registry.fsl  registry.fsh
+  STORE.tmp                          only while a format ratchet runs (§41)
   j/<writer:02x>-{a,b}.fsj           commit journal (only with commitJournal)
   p/<pid:08x>/
     h.fsh                             head, A/B 4 KiB slots
@@ -55,7 +58,8 @@ The wasm artifact is T4; SDN and browser integration are T6/T10.
     r-<seg>.fsr  a-<seg>.fsa          dense rows / attributes (merged ranges)
     x-<seg>-<gen:04x>.fsx             L1 runs
     mf-<gen:06x>.fsm                  segment manifest
-    l.fsl                             lane table
+    l.fsl                             lane table (tuples)
+    lk-<gen:06x>.fsl                  level 3: paged lane checkpoint (§41)
   t/<fid hex8>/
     h.fsh  m-<seg>.fsl                type head and log (A10 batches)
     g-<seg:06x>.fsg                   arrivals, 24 B entries (A15 segments)
@@ -103,7 +107,9 @@ mutation.
 
 ## 4. Open and recovery
 
-1. `STORE` and `MIGRATED` (refused without the marker).
+1. `STORE` and `MIGRATED` (refused without the marker). A level above the
+   engine's `kFormatMax` is refused before any file is touched; a lower one
+   ratchets once the registry is non-empty (§41).
 2. Registry: frames scanned past the head, truncated at the first bad CRC;
    incarnation = max seen + 1, recorded durably before any batch.
 3. Journal replay (A8): both files of every writer id from 0 until the first
@@ -114,6 +120,8 @@ mutation.
    if replayed), fence index validation, fsync before adoption.
 5. Partitions: head slot, tail batches across SEAL continuations (same rules),
    fsync `d`/`m`, A11 intent cleanup (`UNLINK_IF_UNUSED`), DURABLE_CKPT head.
+   At level 3 a head that names a LaneRef folds the lane table from it, and
+   open removes a lane checkpoint no durable head names (§41).
 6. Type heads for adopted type tails, written after the partitions are
    attached (their inline labels come from them).
 
@@ -752,8 +760,9 @@ appended.
   without SWAP, and r/a files a first merge created without MERGE_DONE, then
   writes a durable head.
 - **Meta segments (A9).** A sealed `m-<seg>` whose batches are all merged is
-  retired by a batch that also re-emits the full lane table (LANE_CKPT) and the
-  RETIRE set, whose header carries the manifest generation, `merged_through`,
+  retired by a batch that also re-emits the full lane table (LANE_CKPT; at
+  level 3 past 32 lanes, a lane checkpoint must cover the segment first, §41)
+  and the RETIRE set, whose header carries the manifest generation, `merged_through`,
   `first_live_m_seg` and `next_gen`; `first_live_m_seg` advances when that
   batch commits. A rebuild of a head whose both slots are torn probes for the
   first existing meta segment and replays from its first batch.
@@ -2078,3 +2087,294 @@ Mutations the checks caught:
 - a SWAP input not touched;
 - a ledger update dropped;
 - the valve off.
+
+# Part IX: format levels and lane checkpoints
+
+## 41. Lanes past 1,170 and format levels (TB03)
+
+The terabyte design (stack `docs/architecture/flatsql-ps-terabyte.md` §2.9 K0,
+§3, §10 TB03) found that a partition stops committing past 1,170 live lanes.
+Past 32, every batch that changed a lane carried the whole live table (56 B a
+lane) in one LANE_CKPT ctl record. A u16 bounds that record, so a table past
+(65,535 − 4) / 56 = 1,170 lanes refused the batch, and every retry refused it
+too. SDN mints a lane per fetch, so a 3-hourly source whose history stays
+live crosses the cap in about 146 days. Below the cap each such batch still
+rewrote about 65 KB near 1,170 lanes. The RETIRE encoder also reserved room
+for every lane ever loaded.
+
+Measured before the change on 2026-09-30:
+- host-02's legacy store (read-only, `sdn_record_source_summary`): the
+  largest partition is MPE.fbs, celestrak-gp, at 66 live lanes. That is 5.6%
+  of the cap. It grows about 4.3 lanes a day, so it would reach 1,170 in
+  about 257 days. The next largest are RFB.fbs at 11 and OMM.fbs at 3.
+- The host-02 fixture migrated with SDN's store-migrate (4,364,873 records):
+  OMM has 53 lanes, MPE 52, CAT 2 and IQC 1.
+
+### Format levels
+
+`cpp/include/flatsql/ps/format_level.h` holds `kFormatMin` 2, `kFormatMax`
+3 and `kLevelLaneCkpt` 3. `STORE.format` is the store's level.
+`HeadPrefix.format` and MIGRATED stay 2, because SDN's Go head reader checks
+them.
+
+- **Accepted levels.** An engine opens `kFormatMin ≤ format ≤ kFormatMax`.
+  A valid STORE above that is refused ("STORE format N is newer than this
+  engine") before any file is created or written. So is a torn STORE whose
+  STORE.tmp (below) is above it. An intact STORE the engine opens is never
+  refused because of a higher STORE.tmp: that ratchet never reached step 2,
+  so nothing of its level exists, and the leftover is removed. Readers apply
+  the same rules: an intact STORE decides alone, and only a torn one reads
+  through STORE.tmp.
+- **writeFormat** (writer TLV 31, `EngineConfig::writeFormat`; 0 is
+  `kFormatMax`). A fresh store is created at it. At open, STORE ratchets up
+  to it, but only once `registry.fsl` is non-empty: an empty store can still
+  be recreated by an older engine. Nothing of a level is written before the
+  ratchet to it is durable. A host can pin a lower level for a staged
+  rollout, and a pinned host keeps its level: a STORE.tmp above the pin is
+  removed, not finished. A store never ratchets down.
+- **A full device.** When STORE.tmp cannot be created, written or synced
+  (step 1), the ratchet does not start: the leftover is removed, the store
+  opens at its level exactly as the level-2 open would, and the next open
+  tries again. A ratcheting engine on a full disk therefore never keeps a
+  host down that the older engine would start.
+- **The ratchet.** The I/O ABI has no rename (deviation 39), so the ratchet
+  takes three steps:
+  1. STORE.tmp (the new STORE) is written whole and synced; its directory
+     entry is durable from creation.
+  2. STORE is rewritten in place (64 bytes, one sector) and synced.
+  3. STORE.tmp is unlinked.
+
+  A STORE.tmp is this store's when every field but the format equals
+  STORE's. STORE is written once, and only the ratchet rewrites it, changing
+  only its format, so a STORE.tmp an older engine left beside the store it
+  went on writing still describes that store. An open finishes the ratchet
+  from STORE.tmp when STORE is torn (STORE.tmp is the one valid record), or
+  when STORE is intact and the open writes that level. Otherwise STORE.tmp is
+  removed and STORE stands. Level-3 files exist only after step 2.
+
+  The released 3.5.1 engine reads STORE only, run natively on each crash
+  state:
+
+  | State | 3.5.1 | Files |
+  |---|---|---|
+  | STORE 2, STORE.tmp 3 (step 1 done) | opens, writes level-2 data | changed |
+  | STORE torn, STORE.tmp 3 (inside step 2) | "STORE is corrupt" | unchanged |
+  | STORE 3, STORE.tmp 3 (step 2 done) | "STORE is corrupt" | unchanged |
+  | STORE 3 (finished) | "STORE is corrupt" | unchanged |
+
+  A level-3 open afterwards recovered all four at level 3, with the lanes
+  3.5.1's own reopen reports. In the first state, 3.5.1 writes level-2 data
+  into a level-2 store, which level 3 reads and converts.
+- **Rollback.** The ratchet is durable before the open reads a partition,
+  so a first level-3 open that then fails for another reason (a tail scan,
+  a manifest) also leaves the store at level 3, which 3.5.1 refuses. Rolling
+  back after the first start restores a snapshot of the store taken before
+  it, or re-syncs. SDN forwards TLV 31 as `SDN_F2_WRITE_FORMAT` for a host
+  held at level 2.
+- **Stats** (appended, entries 36–40): the store's level, `kFormatMax`, the
+  level this open raised STORE from (0: none; 1: STORE was torn inside a
+  ratchet this open finished, so its old level is unknown), lane
+  checkpoints cut, and their bytes.
+
+At level 3, manifest version 3 is the written version. Below level 3, v3 is
+written only past 65,535 segments (§40, deviation 38).
+
+### Lanes at level 3
+
+- **A batch carries only the lanes it changed.** That is its lane-delta
+  section: one 48 B LaneDelta per changed lane, counted by a u32 (deviation
+  40: this section is the design's `LANE_PAGE`, so no new ctl kind was
+  needed). The per-batch delta table is now indexed by lane id and has no
+  cap. It was 256, so a kill of a record with more than 256 tag instances
+  failed its batch for good.
+- **Up to 32 live lanes**, the head holds the table inline, as at level 2.
+- **The batch that takes a partition past 32** writes the table once as a
+  LANE_CKPT. In inline mode, staging stops before an entry once the batch
+  holds 64 lane deltas. An entry makes at most one lane live (a PUT or a
+  re-tag), so that table holds at most the live lanes plus 65, 97 lanes.
+- **From that batch on, the head names a LaneRef** (`nLanes` 0xFFFE,
+  48 bytes after the L0 directory): a base plus the batch position its
+  deltas replay from. The base is `lk-<gen>.fsl`, or the crossing
+  LANE_CKPT. The table is the base, plus the deltas of every batch from the
+  replay offset up to the head's `(mSeg, mEnd)`. Batches are walked by
+  their headers, and a SEAL moves to segment + 1.
+- **`lk-<gen:06x>.fsl`** is a 4 KiB header page (pid, gen, lane count,
+  `mintedThrough`, the cut position, CRC). Then come pages of up to 73
+  counters sorted by lane id, each page with a CRC. Count-0 lanes are
+  dropped. There is no size cap.
+- **Cuts.** A checkpoint is cut:
+  - after the crossing;
+  - when A9 wants to retire a meta segment at or above the ref's floor (its
+    replay segment, and a LANE_CKPT base's segment);
+  - once a fold would walk `laneCkptBatches` batches with lane deltas
+    (writer TLV 32, default 128), or four times that many batches in all.
+    A fold reads every batch it walks, and every `flatsql_lanes` statement
+    and every open folds, so this bounds their work. Batches without lane
+    deltas count a quarter, so the RETIRE and UNLINKED batches a cut itself
+    causes never make the next cut due.
+
+  The owner copies its live counters at a batch boundary (O(live lanes),
+  once per cut), and a maintenance helper writes and syncs the file
+  (deviation 41). The encoded file counts in the writer's committed memory
+  until it is written.
+- **Crash protocol**, as built:
+  1. The helper writes `lk-<g>` and syncs it. One cut is in flight per
+     partition, so g is always the ref's gen + 1.
+  2. The owner installs the ref and writes a DURABLE_CKPT head naming it.
+  3. Only once a durable head names it does a RETIRE list `lk-<g−1>`
+     (letter `L`), and A9 retire a meta segment below the new floor.
+  4. Open unlinks `lk-<gen + 1>`, a checkpoint no durable head names. An
+     `lk-<gen − 1>` whose RETIRE never committed goes after the open's
+     durable head.
+
+  No cut starts while a RETIRE that lists a replaced checkpoint has not
+  committed. Until it commits only the head names what open cleans up, so
+  the files on disk stay within `lk-<gen − 1>` to `lk-<gen + 1>`. Without
+  that wait, meta writes failing ENOSPC let the next cut install and a crash
+  left `lk-<gen − 2>` named by nothing, for good. Open also probes
+  `lk-<gen − 2>`.
+- **Torn heads.** Every batch that carries a RETIRE also carries the LaneRef
+  in force (ctl kind 13, LANE_REF). A torn-head rebuild from a later meta
+  segment folds the table from the last one.
+- **The RETIRE valve** reserves only what the batch's finalize step adds:
+  the LANE_REF in ref mode; in inline mode the table a crossing can write,
+  the live lanes plus 65; and the whole table at level 2, as before. With 32
+  or fewer live lanes the soft cap stays at 2,048 items, as at level 2.
+- **Readers** fold the same way (`LaneStore::laneCounters`) up to their
+  snapshot's head. A file retired since then answers SNAPSHOT_GONE.
+- **A level-2 head at a level-3 open.** A head that names a LANE_CKPT
+  becomes a LaneRef with that record as its base and the head position as
+  its replay offset. This holds because level 2 wrote a LANE_CKPT with every
+  batch that changed a lane past 32. A first checkpoint follows.
+- **In memory**, lanes are found by id through an index. It was a linear
+  search per delta at publish, replay and RECONCILE. Replay, readers and
+  checkpoints apply a delta by one rule (`laneApplyDelta`). A lane at count
+  0 carries no history: checkpoints and head tables drop it, so a delta that
+  makes it live again starts its counters afresh (`first_seen`, `max_pseq`,
+  `updated`). The writer's memory, a fold from any base and a replay then
+  agree whether or not a checkpoint dropped the lane. Before, a lane revived
+  after a checkpoint dropped it read its old `first_seen` until the next cut
+  and the new one after it, with no write in between.
+- **A failed batch that minted lanes** rolls `nextLaneId` back to the first
+  id it minted. The table is not in id order when l.fsl lost frames the
+  head still counts, and the old rule, the last lane's id + 1, could fall
+  below a live id.
+- **A LaneRef head in a store below level 3** (a partial snapshot restore)
+  quarantines that partition. It used to fail the whole open.
+
+### Live-only candidate caps (N2)
+
+Staging gathered at most a fixed number of postings per lookup and then
+dropped the dead ones. A key with more dead postings than the cap hid its
+live row:
+
+| Lookup | Old cap |
+|---|---|
+| supersede candidates | 8 |
+| CID candidates | 64 |
+| tag instances of one tuple | 64 |
+| live instances of a PUT | 256 |
+| licence and control supersedes | 8 |
+
+Only live rows count now. A key holds at most one live row of each kind:
+every PUT kills the live PUTs of its supersede keys whose CID differs, every
+control record every live row of its key, every licence the live licences
+of its key, and a CID is stored once per partition. A live control record
+is also older than any live PUT beside it. So a supersede or licence lookup
+ends at the key's newest live row, and a control record's at the live
+control record.
+
+The walk goes newest first through the postings' sources. The unmerged L0
+blocks and each segment's L1 runs hold disjoint, ascending pseq ranges,
+with every run below every block, so the sources are read from the newest,
+each one's postings sorted descending, and the walk stops at the end
+without reading older sources. Should the ranges not be in that order, all
+postings are gathered and sorted instead. A PUT of a hot key reads its
+newest version, not every dead version compaction has not dropped yet.
+CID and tag-instance lookups gather every posting and stop at the first
+live one. The lists grow outside the hot-path count.
+
+### Tests
+
+The tests are in `cpp/test/ps/lane_cap_test.cpp`. The Mac is an M3 Ultra
+with 28 cores, APFS, and the in-memory fault host, shared with other lanes
+(1-minute load 9–20 during the runs). Every crash sweep and trial checks,
+after each reopen, the lane table on disk against a recount from rows
+(count and bytes), and against the engine's own table in every counter
+field, for every live lane.
+
+| Test | Result |
+|---|---|
+| `lanecap_5000_live_lanes` | 5,000 lanes, then 500 re-tags into new lanes and 200 kills, all acked. The engine, `flatsql_lanes`, the on-disk fold and a recount from rows all agree (5,272 lanes); again after a reopen and 100 more lanes |
+| `lanecap_crash_trials_full` | 1,000 trials, 2 writers, helper-written checkpoints, file and journal mode, 114 s. Each crash lands after at least 5,000 live lanes: 160 left an unnamed checkpoint and 362 a replaced one pending. After every reopen the table equals a recount from rows and the engine's table, and no `lk` orphan is left. 0 failures |
+| `lanecap_ckpt_crash_every_op_full` | A crash at each of 2,912 mutating I/O calls of a workload that crosses 32 lanes, cuts 30 checkpoints, seals, and retires meta segments and replaced checkpoints. All five crash modes. Before open: 965 crashes left an unnamed checkpoint and 1,241 a replaced one pending. After open: lanes equal a recount and the engine's table, and the directory holds exactly the checkpoint the head names. 0 failures |
+| `lanecap_2000_lanes_retire_bearing` | 2,000 lanes with seals, merges, a coalescing SWAP, 97 files retired, 5 meta segments retired, 8 checkpoints: 0 batches refused, every lane correct |
+| `lanecap_batch_lane_bytes_proportional` | A batch that changes one lane writes 56 B of lane records at level 3, with 66 live lanes (host-02's largest partition) or 5,000. At level 2 the same batch writes 3,760 B at 66 lanes and 61,664 B at 1,100. At level 2, 1,180 lanes never ack |
+| `lanecap_no_cut_while_lk_retire_pending` | Meta writes fail ENOSPC for 300 steps: no cut starts while a RETIRE naming a replaced checkpoint waits (355 steps waited), and a crash then leaves exactly the named checkpoint after open. With the wait removed, 82 steps had a cut in flight |
+| `lanecap_install_head_nospace` | The head write naming a newly installed checkpoint fails ENOSPC (40 installs), then a crash in each of the five modes at four points after: every reopen agrees with the recount and the engine and keeps only the named checkpoint. 0 failures of 20 trials. Removing the replaced checkpoint's wait for a durable head is not caught here: this workload's checkpoint heads follow in the same step, and every RETIRE batch also carries the LaneRef in force |
+| `lanecap_fold_walk_bounded` | 1,500 one-lane batches on 100 lanes at the default cadence: a fold walks at most 128 batches (13 checkpoints); `flatsql_lanes` 0.3–1.0 ms |
+| `lanecap_revived_lane_counters_stable` | A lane killed to 0, dropped by a checkpoint and written again reads the same `first_seen` (the revival's) before the next cut, after it and after a reopen. Without the restart rule it flipped at the cut |
+| `lanecap_rollback_keeps_lane_ids_unique` | l.fsl loses 6 frames (the table is out of id order), a batch that minted a lane fails ENOSPC and retries: every lane id unique, the new lane's id past every live one. The old rule fails it |
+| `tb_supersede_candidate_cap`, `_autocompact` | 1 live version; 381 of 381 live. The old cap gives 12, and 392 of 381 |
+| `tb_supersede_hot_key_cost` | A CAT key with 400 versions among 19 static objects each, default compaction: its PUT costs 1.8x a new key's (618 vs 340 µs p50); 2.3x at 800 versions. Checking every dead version (the review's measurement: 12.8x at 800) fails it at 7.3x. What remains is the kill's TAG_OF prefix scan across every run, the same as 3.5.1's (TB12's prefix bloom) |
+| `lanecap_kill_record_with_300_instances` | A kill takes all 300 instances and lanes in one batch |
+| `lanecap_cid_candidates_past_64` | The 80th copy of a CID dedupes |
+| `lanecap_torn_heads_rebuild_from_lane_ref` | Both head slots torn: the table is rebuilt from LANE_REF |
+| `format_older_engine_refuses_ratcheted_store` | An engine built with `kFormatMax` 2 refuses a level-3 store, and this engine refuses a level-4 STORE; neither creates or changes a file |
+| `format_empty_registry_never_ratchets` | Opened three times, the empty level-2 store stays at 2; with a registration, the next open ratchets to 3 |
+| `format_ratchet_crash_every_io_call` | A crash at each of the ratcheting open's 13 mutating calls, in all five modes (65 trials). An engine built with `kFormatMax` 2 (this code with `testFormatMax` 2, not the released 3.5.1: see the table above) then opened the store 31 times and refused it 34 times, creating nothing when it refused. This engine then opens at level 3 with every record |
+| `format_ratchet_leftover_tmp_rules` | A STORE.tmp at 3 beside an intact STORE at 2: removed by a host pinned at 2 and by an engine whose `kFormatMax` is 2, which open at 2; finished by this engine (stats entry 38 says 2). One that differs from STORE in more than the format: removed. Beside a torn STORE: refused by the `kFormatMax`-2 engine with no file changed, finished by this one even pinned (entry 38 says 1) |
+| `format_ratchet_waits_on_a_full_device` | No room for STORE.tmp: the store opens at 2, as the level-2 open does, and the next open with room raises it |
+| `format_reader_store_rules` | A reader refuses a STORE at 4 beside a STORE.tmp at 3, reads a torn STORE through a STORE.tmp at 3, and refuses one through a STORE.tmp at 4 |
+| `format_fresh_store_at_write_format`, `format_manifest_v3_from_level_3`, `format_manifest_v3_on_swap` | Fresh stores at writeFormat. Manifests v3 from level 3 and v2 at level 2, from a merge and from a compaction SWAP |
+
+Mutations the checks catch: the old supersede cap (12 live, and 392 of
+381); checking every dead version (7.3x); no orphan cleanup at open; a cut
+while a replaced checkpoint's RETIRE waits; no restart of a revived lane;
+the old rollback rule; the old STORE.tmp rules in the writer and in
+readers; a ratchet that fails the open on a full device; the old cadence
+default.
+
+The native suite (118 fast tests), `crash_faults_T1_1_full` (10,000
+trials), `orphan_crash_points_during_compaction_T3_4_full` (2,501 trials),
+`fanout_randomized_vs_bruteforce_T2_2_full` (T2 #2) and
+`book_crash_every_op_full` (9,389 crash points) pass, 0 failures. In wasm32
+(wasi-sdk 30, the Node host, `scripts/ps-wasm-suite.mjs`) all 118 fast
+tests and `crash_faults_T1_1` with 1,000 trials pass. ThreadSanitizer
+reports nothing on the threaded `lanecap_` and `format_` tests, the
+supersede autocompaction test and the SWAP manifest test.
+
+Deviations:
+
+39. **The ratchet uses STORE.tmp and an in-place rewrite** (the design says
+    an atomic rename). The host I/O contract has seven imports and no
+    rename, and adding one would change every host. The three steps above
+    leave the old STORE, the new one, or a torn one that STORE.tmp repairs.
+    An engine that predates levels never misreads a ratcheted store. SDN
+    reads a torn STORE through STORE.tmp too (its `Migrated` and the update
+    guard), so neither the daemon's start nor the Apply/Rollback guard
+    stops short of the engine's repair.
+40. **No LANE_PAGE ctl kind.** The batch's lane-delta section already holds
+    exactly the changed lanes, and a u32 counts it.
+41. **The owner cuts the checkpoint from its in-memory table** (the design:
+    a helper streams the previous checkpoint plus the deltas since). The
+    writer holds every lane's counters until TB15b removes them. The copy
+    costs O(live lanes) once per cut (the review measured 0.055 ms at 5,000
+    lanes, 1.5 ms at 100,000 and 14 ms at 1,000,000), and the helper still
+    writes and syncs the file; the encoded bytes count in the writer's
+    committed memory until then. The copy equals a fold of the checkpoint
+    it replaces plus the deltas since because a lane at count 0 restarts
+    (above). TB15b switches the source when the writer stops holding the
+    table, before a partition can hold 10^5 lanes.
+
+Not built here:
+- A reader cache of folded tables. A reader folds at most 128 batches with
+  lane deltas (512 in all) per partition per `flatsql_lanes` statement.
+- `flatsql_lanes` still matches lanes to tuples in O(lanes²)
+  (`vtab_meta.cpp` `fillLanes`, the fan-out estimate): 15 ms per statement
+  at 5,000 lanes, 0.1 ms at 100. That is TB15a's (pushdown and a hash from
+  lane id to tuple); today's largest partition holds 66 lanes.
+- The LANE kind, the lane LRU and `flatsql_lanes` pushdown (TB15a, TB15b).
+- A kill's TAG_OF prefix scan still reads every run of the partition (the
+  cost left in `tb_supersede_hot_key_cost`); TB12's prefix bloom removes
+  it.

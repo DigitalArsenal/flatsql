@@ -521,7 +521,7 @@ constexpr size_t kBatchAddsItems = 512;  // one SWAP's or MERGE_DONE's additions
 constexpr size_t kRetireSoftItems = 2048;
 
 size_t retireSetHardCap(const Partition* p) {
-    const size_t laneRoom = 64 + (p->lanes.size() + 1) * sizeof(LaneCounter);  // as staging reserves it
+    const size_t laneRoom = partitionLaneCtlRoom(p);  // as staging reserves it (TB03: level-aware)
     const size_t fixed = kUnlinkedMaxBytes + kOtherCtlBytes + laneRoom + 4 + sizeof(RetireSetHeader);
     const size_t room = fixed < kCtlBufBytes ? (kCtlBufBytes - fixed) / sizeof(RetireItem) : 0;
     return std::min(room, (size_t(65535) - sizeof(RetireSetHeader)) / sizeof(RetireItem));
@@ -683,12 +683,21 @@ int32_t partitionRetireMetaStep(Writer* w, Partition* p) {
     for (uint32_t i = 0; i < p->nL0; i++)
         if (p->l0[i].mSeg <= s) return 0;  // unmerged batches still live in it
     if (p->mergePhase != kMergeIdle && p->mplan.seg <= s) return 0;
+    // TB03 (level 3, ref mode): the lane deltas in m-<s> must be folded into
+    // a checkpoint a durable head names first; until then ask for a cut.
+    if (!partitionLaneMetaMayRetire(p, s)) {
+        p->laneCutWanted = true;
+        return 0;
+    }
     const int saved = tHotPathDepth;
     tHotPathDepth = 0;
     if (SegmentInfo* si = segFind(p, s)) w->io().close(&si->m);
     const uint64_t size = ledgerSize(p, 'm', s, 0);
     p->retiring.push_back(retireItem('m', s, 0, size));
-    p->forceLaneCkpt = true;  // the lane table moves to a live segment with it
+    // The lane table moves to a live segment with it: at level 2 (and in
+    // inline mode) the batch re-emits it; in ref mode (TB03) the checkpoint
+    // the head names already covers m-<s> (checked above).
+    if (p->laneMode != kLaneModeRef) p->forceLaneCkpt = true;
     p->retireDirty = true;
     tHotPathDepth = saved;
     e->cMetaRetired.fetch_add(1, std::memory_order_relaxed);

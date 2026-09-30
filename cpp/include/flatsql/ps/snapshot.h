@@ -247,6 +247,8 @@ struct PartSnap {
     std::vector<L0DirEntry> l0;
     std::vector<LaneCounter> lanes;  // inline lanes (overflow: laneCounters())
     bool lanesOverflow = false;
+    bool lanesRef = false;           // TB03 (level 3): the head names a LaneRef
+    LaneRef laneRef{};
     std::shared_ptr<const Manifest> manifest;
     uint64_t visible = 0;            // row visibility bound (pseq_hi or V_p)
     // L0 sections resolved once per statement, per kind (index = l0 index;
@@ -547,7 +549,9 @@ public:
         std::string provider, source, batch, peer, pubkey;
     };
     int32_t laneTuples(const PartSnap& s, std::vector<LaneTuple>* out);
-    // Lane counters of a snapshot (inline, or the head's LANE_CKPT record).
+    // Lane counters of a snapshot (inline, the head's LANE_CKPT record, or
+    // TB03's LaneRef folded up to the head: its base, then the lane deltas of
+    // the batches since the replay offset).
     int32_t laneCounters(const PartSnap& s, std::vector<LaneCounter>* out);
 
     // Statement boundary: accounting target, handle pinning, work guard.

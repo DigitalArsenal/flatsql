@@ -102,10 +102,14 @@ struct ManifestDesc {
     uint32_t pid = 0;
     uint32_t prevGen = 0;
     std::vector<ManifestSegDesc> segs;  // ascending seg
+    // Encoding only: the lowest version to write. TB03: from store level 3,
+    // version 3 is the written version (terabyte design §3); below it,
+    // version 3 only past 65,535 segments.
+    uint16_t minVer = 0;
 };
 
-// Encodes version 2, or version 3 past 65,535 segments (magic, CRC trailer:
-// [u32 crc][u32 pad]).
+// Encodes version 2, or version 3 past 65,535 segments or when minVer asks
+// for it (magic, CRC trailer: [u32 crc][u32 pad]).
 std::vector<uint8_t> encodeManifest(const ManifestDesc& m);
 // Decodes version 1, 2 or 3; false on a bad magic, version, bound, CRC, or
 // any byte between the last segment record and the trailer.

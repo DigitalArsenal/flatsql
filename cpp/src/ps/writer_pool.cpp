@@ -1387,7 +1387,8 @@ EngineStats Engine::stats() const {
         const Partition* p = parts_[pid].load(std::memory_order_acquire);
         if (!p) continue;
         desc += sizeof(Partition) + ringDescBytes(p->ring->nSlots) +
-                uint64_t(p->laneCount.load(std::memory_order_relaxed)) * sizeof(Lane);
+                uint64_t(p->laneCount.load(std::memory_order_relaxed)) * sizeof(Lane) +
+                p->laneCutBytes.load(std::memory_order_relaxed);
         acc += p->accelBytes.load(std::memory_order_relaxed);
     }
     s.descriptorBytes = desc;

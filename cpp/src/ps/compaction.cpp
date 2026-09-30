@@ -47,7 +47,7 @@ std::vector<uint8_t> encodeManifest(const ManifestDesc& m) {
     ManifestHeader h{};
     h.magic = kMagicManifest;
     // M3: a count the u16 cannot hold goes in version 3's u32.
-    const bool wide = m.segs.size() > 0xFFFF;
+    const bool wide = m.segs.size() > 0xFFFF || m.minVer >= kManifestVerWide;
     h.ver = wide ? kManifestVerWide : kManifestVer;
     h.nSegs = wide ? uint16_t(0xFFFF) : uint16_t(m.segs.size());
     h.nSegs32 = wide ? uint32_t(m.segs.size()) : 0;
@@ -271,6 +271,7 @@ void retirePath(PathBuf* out, const char* root, uint32_t pid, const RetireItem& 
         case 'A': pathPartitionCompact(out, root, pid, it.seg, it.gen, "fsa"); break;
         case 'x': pathPartitionRun(out, root, pid, it.seg, it.gen); break;
         case 'f': pathPartitionManifest(out, root, pid, it.gen); break;
+        case 'L': pathPartitionLaneCkpt(out, root, pid, it.gen); break;  // TB03 lane checkpoint
         default: out->buf[0] = 0; out->len = 0; break;
     }
 }
@@ -1195,6 +1196,7 @@ int32_t queueSwap(Writer* w, Partition* p) {
         if (!s.firstPseq && s.runs.empty()) continue;  // m-only placeholder
         md.segs.push_back(segDesc(s));
     }
+    if (w->engine()->laneCkptLevel()) md.minVer = kManifestVerWide;  // TB03: v3 written from level 3
     const std::vector<uint8_t> man = encodeManifest(md);
     PathBuf mp;
     pathPartitionManifest(&mp, root, p->pid, c.gen);

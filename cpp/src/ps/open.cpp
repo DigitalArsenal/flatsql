@@ -117,6 +117,10 @@ struct TailReplay {
     bool anchor = false;
     // T3 (A12): the outstanding RETIRE set as replayed.
     std::vector<RetireItem> retired;
+    // TB03 (level 3): a LANE_CKPT of this batch became the lane base; its
+    // replay position is set once the batch's SEAL (if any) is known.
+    bool laneBasePending = false;
+    bool laneRefSeen = false;  // a LANE_REF was replayed (a rebuild folds from it)
 };
 
 // Applies one validated batch to the in-memory partition state.
@@ -159,24 +163,22 @@ static void applyBatch(Partition* p, const uint8_t* b, uint64_t mOff, TailReplay
     for (uint32_t i = 0; i < nd; i++) {
         LaneDelta d;
         std::memcpy(&d, b + off + 4 + size_t(i) * sizeof(LaneDelta), sizeof(d));
-        Lane* lane = nullptr;
-        for (auto& l : p->lanes)
-            if (l.id == d.laneId) lane = &l;
+        Lane* lane = laneById(p, d.laneId);
         if (!lane) {
             p->lanes.emplace_back();
             lane = &p->lanes.back();
             lane->id = d.laneId;
             lane->c.laneId = d.laneId;
+            laneIndexAdd(p, uint32_t(p->lanes.size() - 1));
         }
-        lane->c.count += d.dCount;
-        lane->c.bytes += d.dBytes;
-        if (d.maxPseq > lane->c.maxPseq) lane->c.maxPseq = d.maxPseq;
-        if (d.dCount > 0 && (lane->c.firstSeen == 0 || d.firstSeen < lane->c.firstSeen))
-            lane->c.firstSeen = d.firstSeen;
-        if (d.updated > lane->c.updated) lane->c.updated = d.updated;
+        laneApplyDelta(&lane->c, d);
         if (d.laneId >= p->nextLaneId) p->nextLaneId = d.laneId + 1;
     }
     off += pad8(4 + size_t(nd) * sizeof(LaneDelta));
+    if (p->laneMode == kLaneModeRef) {
+        p->laneRef.batches++;
+        if (nd) p->laneRef.deltaBatches++;
+    }
     const uint32_t nc = getU32(b + off);
     size_t q = off + 4;
     for (uint32_t i = 0; i < nc; i++) {
@@ -200,16 +202,37 @@ static void applyBatch(Partition* p, const uint8_t* b, uint64_t mOff, TailReplay
             for (uint32_t k = 0; k < n; k++) {
                 LaneCounter c;
                 std::memcpy(&c, body + 4 + size_t(k) * sizeof(LaneCounter), sizeof(c));
-                Lane* lane = nullptr;
-                for (auto& l : p->lanes)
-                    if (l.id == c.laneId) lane = &l;
+                Lane* lane = laneById(p, c.laneId);
                 if (!lane) {
                     p->lanes.emplace_back();
                     lane = &p->lanes.back();
                     lane->id = c.laneId;
+                    laneIndexAdd(p, uint32_t(p->lanes.size() - 1));
                 }
                 lane->c = c;
             }
+            // TB03 (level 3): past 32 lanes (the crossing batch), or a table
+            // written below level 3 while the head names a ref, it is the
+            // lane base from here; deltas replay from the next batch.
+            if (p->laneCkpt && (n > kMaxInlineLanes || p->laneMode == kLaneModeRef)) {
+                LaneRef r{};
+                r.baseSeg = p->mSeg;
+                r.baseOff = mOff + q + 4;
+                r.mintedThrough = p->nextLaneId ? p->nextLaneId - 1 : 0;
+                p->laneRef = r;
+                p->laneMode = kLaneModeRef;
+                p->laneCutWanted = true;
+                tr->laneBasePending = true;
+            }
+        }
+        if (kind == kCtlLaneRef && p->laneCkpt && len >= sizeof(LaneRef)) {
+            // TB03: the ref in force when this RETIRE batch was staged (a
+            // RETIRE may name what the head's older ref reads).
+            LaneRef r;
+            std::memcpy(&r, b + q + 4, sizeof(r));
+            p->laneRef = r;
+            p->laneMode = kLaneModeRef;
+            tr->laneRefSeen = true;
         }
         q += 4 + len;
     }
@@ -332,6 +355,12 @@ static int32_t replayPartitionTail(Engine* e, IoCtx* io, Partition* p, uint32_t 
             applyCtls(p, ctls, &sealed, tr);
             tr->adopted++;
             off += h.batchLen;
+            if (tr->laneBasePending) {
+                // The replay position after this batch (past a SEAL: the next segment).
+                tr->laneBasePending = false;
+                p->laneRef.replaySeg = sealed ? p->nextSeg : p->mSeg;
+                p->laneRef.replayOff = sealed ? 0 : off;
+            }
             if (sealed) break;
         }
         io->close(&mf);
@@ -431,21 +460,122 @@ int32_t Engine::open(const EngineConfig& cfgIn, std::unique_ptr<Engine>* out, st
     return 0;
 }
 
+// TB03 (A-TB2): the level ratchet. The I/O ABI has no rename, so STORE is
+// raised through STORE.tmp: (1) STORE.tmp is written whole and synced (its
+// directory entry is durable from creation); (2) STORE is rewritten in place
+// (64 bytes, one sector) and synced; (3) STORE.tmp is unlinked. No artifact of
+// the new level is written before step 2 is durable. An open that finds a
+// STORE.tmp of the same store (openStore) finishes the ratchet from it when
+// STORE is torn, or when STORE is intact and the open writes that level;
+// otherwise it removes it. STORE is written once and only the ratchet
+// rewrites it, changing only its format, so finishing from a STORE.tmp an
+// older engine left beside the store it went on writing is safe (openStore
+// checks that every other field agrees). An engine that predates levels reads
+// STORE only: it opens the old STORE (and ignores STORE.tmp), or refuses the
+// new one ("STORE is corrupt") and a torn one, creating nothing.
+//
+// Returns 0 when STORE holds the new level; 1 when the ratchet did not start
+// because step 1 failed (no room for STORE.tmp on a full device, say): the
+// leftover is removed and the store opens at its level, and the next open
+// tries again; < 0 when step 2 failed (the next open finishes from STORE.tmp).
+int32_t Engine::ratchetStore(const StoreFile& sf, uint16_t to, std::string* err) {
+    IoCtx* io = openIo_;
+    PathBuf sp, tp;
+    pathStore(&sp, cfg_.root.c_str(), "STORE");
+    pathStore(&tp, cfg_.root.c_str(), "STORE.tmp");
+    StoreFile nf = sf;
+    nf.format = to;
+    nf.crc = crc32c(&nf, offsetof(StoreFile, crc));
+    int32_t rc = io->unlink(tp.c_str(), tp.len, true);
+    if (rc >= 0 || rc == FLATSQL_IO_ERR_NOENT) rc = writeMarkerFile(io, tp, &nf, sizeof(nf), false);
+    if (rc < 0) {
+        io->unlink(tp.c_str(), tp.len, true);  // step 1 did not finish: not now
+        return 1;
+    }
+    rc = writeMarkerFile(io, sp, &nf, sizeof(nf), true);
+    if (rc < 0) {
+        if (err) *err = "STORE format ratchet failed";
+        return rc;
+    }
+    io->unlink(tp.c_str(), tp.len, true);  // a leftover is removed at the next open
+    return 0;
+}
+
+// STORE.tmp names this store: every field but the format (and the CRC) is
+// STORE's, as the ratchet writes it.
+static bool sameStoreBarFormat(StoreFile a, StoreFile b) {
+    a.format = b.format = 0;
+    a.crc = b.crc = 0;
+    a.pad = b.pad = 0;
+    return std::memcmp(&a, &b, sizeof(a)) == 0;
+}
+
 int32_t Engine::openStore(std::string* err) {
     IoCtx* io = openIo_;
-    PathBuf sp, mp;
+    PathBuf sp, mp, tp;
     pathStore(&sp, cfg_.root.c_str(), "STORE");
     pathStore(&mp, cfg_.root.c_str(), "MIGRATED");
+    pathStore(&tp, cfg_.root.c_str(), "STORE.tmp");
+    const uint16_t fmax = formatMax();
+    const uint16_t wf = effectiveWriteFormat(cfg_.writeFormat, fmax);
     StoreFile sf{};
     bool fresh = false;
     bool finished = false;
     bool registryOpen = false;
     FileRef f;
+    // TB03: a ratchet a crash cut short (see ratchetStore). Read first; a
+    // refusal below writes nothing.
+    StoreFile tmp{};
+    bool haveTmp = false, tmpValid = false;
+    if (io->open(tp.c_str(), tp.len, FLATSQL_IO_READ, FileClass::Store, &f) == 0) {
+        haveTmp = true;
+        tmpValid = io->read(f, &tmp, sizeof(tmp), 0) == int64_t(sizeof(tmp)) && tmp.magic == kMagicStore &&
+                   tmp.crc == crc32c(&tmp, offsetof(StoreFile, crc));
+        io->close(&f);
+    }
     int32_t rc = io->open(sp.c_str(), sp.len, FLATSQL_IO_READ, FileClass::Store, &f);
     if (rc == 0) {
         const int64_t n = io->read(f, &sf, sizeof(sf), 0);
         io->close(&f);
-        const bool valid = n == int64_t(sizeof(sf)) && sf.magic == kMagicStore && sf.format == kFormat &&
+        const bool crcOk = n == int64_t(sizeof(sf)) && sf.magic == kMagicStore &&
+                           sf.crc == crc32c(&sf, offsetof(StoreFile, crc));
+        // STORE.tmp is ours when it names this store; with STORE torn it is
+        // the one valid record left (a crash inside the ratchet's step 2).
+        const bool tmpOurs = tmpValid && (!crcOk || sameStoreBarFormat(tmp, sf));
+        // A level above this engine's is refused before any file is touched
+        // (terabyte design §3; A-TB2): STORE's own, or, with STORE torn, the
+        // level of the ratchet that tore it. An intact STORE this engine
+        // opens is never refused for a STORE.tmp above it: that ratchet never
+        // reached step 2, so nothing of its level exists (it is removed below).
+        const uint16_t above = crcOk ? (sf.format > fmax ? sf.format : 0) : (tmpOurs && tmp.format > fmax ? tmp.format : 0);
+        if (above) {
+            if (err) {
+                char msg[160];
+                std::snprintf(msg, sizeof(msg), "STORE format %u is newer than this engine (it opens formats %u to %u)",
+                              unsigned(above), unsigned(kFormatMin), unsigned(fmax));
+                *err = msg;
+            }
+            return FLATSQL_IO_ERR_ACCESS;
+        }
+        if (haveTmp) {
+            // A ratchet whose step 1 was durable. With STORE torn, STORE.tmp
+            // is finished (it is all there is). With STORE intact it is
+            // finished only up to the level this open writes: a host pinned
+            // lower (writeFormat, O5) keeps its level and its rollback.
+            const bool finish = tmpOurs && formatAccepted(tmp.format, fmax) &&
+                                (!crcOk || (tmp.format > sf.format && tmp.format <= wf));
+            if (finish) {
+                rc = writeMarkerFile(io, sp, &tmp, sizeof(tmp), true);
+                if (rc < 0) {
+                    if (err) *err = "cannot finish the STORE format ratchet";
+                    return rc;
+                }
+                ratchetedFrom_ = crcOk ? sf.format : kRatchetFromTorn;
+                sf = tmp;
+            }
+            io->unlink(tp.c_str(), tp.len, true);  // finished, not ours, or not this open's level
+        }
+        const bool valid = n == int64_t(sizeof(sf)) && sf.magic == kMagicStore && formatAccepted(sf.format, fmax) &&
                            sf.crc == crc32c(&sf, offsetof(StoreFile, crc));
         if (!valid) {
             // STORE is written last and once, so a torn STORE is a creation a
@@ -463,7 +593,7 @@ int32_t Engine::openStore(std::string* err) {
                 // permission.
                 sf = StoreFile{};
                 sf.magic = kMagicStore;
-                sf.format = kFormat;
+                sf.format = wf;  // TB03: the level a fresh store is created at
                 std::memcpy(sf.uuid, m.uuid, 16);
                 sf.createdMs = m.migratedMs;
                 sf.gseqFloor = 1;
@@ -497,7 +627,7 @@ int32_t Engine::openStore(std::string* err) {
     if (fresh) {
         sf = StoreFile{};
         sf.magic = kMagicStore;
-        sf.format = kFormat;
+        sf.format = wf;  // TB03: a fresh store is created at writeFormat
         const uint64_t a = hash64(cfg_.root.data(), cfg_.root.size(), uint64_t(nowMs()));
         const uint64_t b = hash64(&a, 8, monoNs());
         std::memcpy(sf.uuid, &a, 8);
@@ -540,6 +670,17 @@ int32_t Engine::openStore(std::string* err) {
             if (err) *err = "store is not MIGRATED (format 2 refuses to start)";
             return FLATSQL_IO_ERR_ACCESS;
         }
+    }
+    storeFormat_ = sf.format;
+    // TB03: the ratchet, only once the registry is non-empty (an empty store
+    // may still be recreated by an older engine, open.cpp above in theirs).
+    if (!fresh && !finished && sf.format < wf && !registryEmpty(io, cfg_.root)) {
+        rc = ratchetStore(sf, wf, err);
+        if (rc < 0) return rc;
+        if (rc == 0) {
+            ratchetedFrom_ = sf.format;
+            storeFormat_ = wf;
+        }  // rc 1: STORE.tmp found no room; the store opens at its level
     }
     gseqNext_.store(sf.gseqFloor ? sf.gseqFloor : 1);
     if (registryOpen) return 0;
@@ -958,6 +1099,7 @@ Partition* Engine::makePartition(const PartitionEntry& e, uint8_t writer) {
     p->ownerWriter.store(writer);
     p->ring->ownerWordV.store(ownerWord(1, writer, kOwnOwned));
     p->segOpenedMs = nowMs();
+    p->laneCkpt = storeFormat_ >= kLevelLaneCkpt;  // TB03: level 3 lane tables
     Partition* raw = p.get();
     if (partStore_.size() <= e.pid) partStore_.resize(e.pid + 1);
     partStore_[e.pid] = std::move(p);
@@ -987,6 +1129,7 @@ int32_t Engine::openPartitions(std::string* err) {
             io->close(&hf);
         }
         uint32_t incFloor = 0;
+        bool laneConverted = false;  // TB03: a level-2 lane table became a LaneRef
         if (!head.empty()) {
             PartitionHeadFixed h;
             std::memcpy(&h, head.data(), sizeof(h));
@@ -1022,7 +1165,36 @@ int32_t Engine::openPartitions(std::string* err) {
             size_t off = sizeof(h);
             std::memcpy(p->l0, head.data() + off, sizeof(L0DirEntry) * p->nL0);
             off += sizeof(L0DirEntry) * h.nL0;
-            if (h.nLanes != 0xffff) {
+            if (h.nLanes == kLanesRef) {
+                // TB03 (level 3): the head names a lane base and a replay
+                // offset; the table is folded from them up to the head.
+                LaneRef r{};
+                // A ref in a store below level 3 (a partial snapshot restore
+                // rolled STORE back), or a head too short for one, is this
+                // partition's damage, like a ref that does not fold.
+                const bool refOk = p->laneCkpt && off + sizeof(LaneRef) + 4 <= head.size();
+                if (refOk) std::memcpy(&r, head.data() + off, sizeof(r));
+                p->laneMode = kLaneModeRef;
+                p->laneRef = r;
+                IoLaneFileReader rd(io, cfg_.root.c_str(), p->pid);
+                std::vector<LaneCounter> lc;
+                uint32_t nb = 0, nd = 0;
+                const int32_t frc = refOk ? laneFold(&rd, p->pid, r, h.mSeg, h.mEnd, &lc, &nb, &nd) : FLATSQL_IO_ERR_IO;
+                if (frc < 0) {
+                    // §15: one partition's lane table never fails the store.
+                    p->quarantined = true;
+                    p->ring->state.store(kRingQuarantined);
+                } else {
+                    for (const auto& c : lc) {
+                        Lane l;
+                        l.id = c.laneId;
+                        l.c = c;
+                        p->lanes.push_back(std::move(l));
+                    }
+                    p->laneRef.batches = nb;
+                    p->laneRef.deltaBatches = nd;
+                }
+            } else if (h.nLanes != 0xffff) {
                 for (uint16_t i = 0; i < h.nLanes; i++) {
                     Lane l;
                     std::memcpy(&l.c, head.data() + off + size_t(i) * sizeof(LaneCounter), sizeof(LaneCounter));
@@ -1055,7 +1227,27 @@ int32_t Engine::openPartitions(std::string* err) {
                     }
                     io->close(&mf);
                 }
+                if (p->laneCkpt) {
+                    // TB03: a level-2 head at a level-3 open. Its LANE_CKPT
+                    // holds every delta up to the head (level 2 wrote one
+                    // with every batch that changed a lane past 32), so it
+                    // is the lane base and the head position the replay
+                    // offset. A checkpoint follows; the open head names it.
+                    LaneRef r{};
+                    r.baseSeg = h.lanesOverflowSeg;
+                    r.baseOff = h.lanesOverflowOff;
+                    r.replaySeg = h.mSeg;
+                    r.replayOff = h.mEnd;
+                    r.mintedThrough = p->nextLaneId ? p->nextLaneId - 1 : 0;
+                    p->laneRef = r;
+                    p->laneMode = kLaneModeRef;
+                    p->laneCutWanted = true;
+                    laneConverted = true;
+                } else {
+                    p->laneMode = kLaneModeLegacy;
+                }
             }
+            laneIndexRebuild(p);
         }
         TailReplay tr;
         bool adoptedHead = false;
@@ -1110,6 +1302,82 @@ int32_t Engine::openPartitions(std::string* err) {
         if (rc < 0) {
             if (err) *err = "partition tail scan failed";
             return rc;
+        }
+        // TB03 (level 3): lanes after the replay.
+        bool laneHeadDue = laneConverted;
+        uint32_t staleLk[2] = {0, 0};
+        laneIndexRebuild(p);  // the index and the live count, after the replay
+        if (p->laneCkpt && !p->quarantined) {
+            if (tr.anchor && p->laneMode == kLaneModeRef) {
+                // A torn-head rebuild summed deltas from the first live meta
+                // segment only: the table is the latest ref's fold.
+                IoLaneFileReader rd(io, cfg_.root.c_str(), p->pid);
+                std::vector<LaneCounter> lc;
+                uint32_t nb = 0, nd = 0;
+                if (laneFold(&rd, p->pid, p->laneRef, p->mSeg, p->mEnd, &lc, &nb, &nd) < 0) {
+                    p->quarantined = true;
+                    p->ring->state.store(kRingQuarantined);
+                } else {
+                    p->lanes.clear();
+                    for (const auto& c : lc) {
+                        Lane l;
+                        l.id = c.laneId;
+                        l.c = c;
+                        p->lanes.push_back(std::move(l));
+                    }
+                    p->laneRef.batches = nb;
+                    p->laneRef.deltaBatches = nd;
+                }
+            }
+            laneIndexRebuild(p);
+            if (p->laneMode != kLaneModeRef && p->laneLive > kMaxInlineLanes) {
+                // Past 32 with no base in the log (cannot happen at level 3:
+                // the crossing batch wrote one): cut a checkpoint now.
+                std::vector<LaneCounter> live;
+                for (const auto& l : p->lanes) {
+                    if (l.c.count == 0) continue;
+                    LaneCounter c = l.c;
+                    c.laneId = l.id;
+                    live.push_back(c);
+                }
+                std::sort(live.begin(), live.end(),
+                          [](const LaneCounter& a, const LaneCounter& b) { return a.laneId < b.laneId; });
+                std::vector<uint8_t> bytes;
+                const uint32_t minted = p->nextLaneId ? p->nextLaneId - 1 : 0;
+                laneCkptEncode(p->pid, 1, minted, p->mSeg, p->mEnd, live.data(), live.size(), &bytes);
+                rc = laneCkptWriteFile(io, cfg_.root.c_str(), p->pid, 1, bytes);
+                if (rc < 0) {
+                    if (err) *err = "lane checkpoint write failed";
+                    return rc;
+                }
+                LaneRef r{};
+                r.lkGen = 1;
+                r.replaySeg = p->mSeg;
+                r.replayOff = p->mEnd;
+                r.mintedThrough = minted;
+                p->laneRef = r;
+                p->laneMode = kLaneModeRef;
+                laneHeadDue = true;
+            }
+            if (p->laneMode == kLaneModeRef) {
+                // Step 4 of the crash protocol: a checkpoint no durable head
+                // named is an orphan (its deltas are still in meta).
+                PathBuf kp;
+                pathPartitionLaneCkpt(&kp, cfg_.root.c_str(), p->pid, p->laneRef.lkGen + 1);
+                if (io->probe(kp.c_str(), kp.len) == 0) io->unlink(kp.c_str(), kp.len, true);
+                // The ones it replaced, when their RETIRE never committed:
+                // they go once the head written below names the newer one.
+                // Only lk-<gen - 1> can be left (a cut waits until the RETIRE
+                // of the one before commits, lane_ckpt.cpp); lk-<gen - 2> is
+                // probed as well, one stat as a guard on that wait.
+                for (uint32_t back = 1; back <= 2 && back < p->laneRef.lkGen; back++) {
+                    pathPartitionLaneCkpt(&kp, cfg_.root.c_str(), p->pid, p->laneRef.lkGen - back);
+                    if (io->probe(kp.c_str(), kp.len) == 0) {
+                        staleLk[back - 1] = p->laneRef.lkGen - back;
+                        laneHeadDue = true;
+                    }
+                }
+            }
         }
         if (tr.adopted) {
             // A4: fsync d and m before adopting, then a durable checkpoint head.
@@ -1174,7 +1442,7 @@ int32_t Engine::openPartitions(std::string* err) {
         // T3: compaction outputs of an INTENT_COMPACT without SWAP (A11), and
         // every file of the persisted RETIRE set (A12), are unlinked; a
         // durable head then stops naming either.
-        bool rewriteHead = adoptedHead;
+        bool rewriteHead = adoptedHead || laneHeadDue;
         if (p->cIntentGen) {
             unlinkCompactOutputs(io, cfg_.root.c_str(), p->pid, p->cIntentSeg, p->cIntentGen);
             p->cIntentGen = 0;
@@ -1200,6 +1468,18 @@ int32_t Engine::openPartitions(std::string* err) {
             if (err) *err = "partition manifest unreadable";
             return rc;
         }
+        if (p->laneMode == kLaneModeRef && p->laneRef.lkGen) {
+            // TB03: the checkpoint the head names counts in disk bytes (§13).
+            PathBuf kp;
+            pathPartitionLaneCkpt(&kp, cfg_.root.c_str(), p->pid, p->laneRef.lkGen);
+            FileRef kf;
+            if (io->open(kp.c_str(), kp.len, FLATSQL_IO_READ, FileClass::Lanes, &kf) == 0) {
+                const int64_t n = io->size(kf);
+                io->close(&kf);
+                if (n > 0) ledgerSet(p, retireItem('L', 0, p->laneRef.lkGen, uint64_t(n)));
+            }
+            partitionPublishDisk(p);
+        }
         if (rewriteHead && !p->quarantined) {
             FileRef h;
             rc = io->open(hp.c_str(), hp.len, kOpenRW | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS, FileClass::Head,
@@ -1221,6 +1501,14 @@ int32_t Engine::openPartitions(std::string* err) {
                 return rc;
             }
         }
+        for (uint32_t g : staleLk) {
+            if (!g || p->quarantined) continue;
+            // The head just synced names lk-<gen>: the ones before name nothing.
+            PathBuf kp;
+            pathPartitionLaneCkpt(&kp, cfg_.root.c_str(), p->pid, g);
+            io->unlink(kp.c_str(), kp.len, true);
+        }
+        p->laneRefNamedNs = 0;  // the head read or written by this open names the ref
         p->firstLiveMSegPub.store(p->firstLiveMSeg);
         p->lastDurableHeadNs = monoNs();
         p->pub.commitSeq = p->commitSeq;

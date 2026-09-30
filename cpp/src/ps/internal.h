@@ -126,14 +126,28 @@ struct StageScratch {
     // more entries than live copies. Grows (outside the hot-path count) only
     // for such a cid.
     std::vector<TCopy> gather;
+    // N2 (TB03): every committed candidate of one lookup, gathered before any
+    // is checked, so dead ones never crowd live ones out of a fixed cap. Grow
+    // (outside the hot-path count) only for a key with that many postings.
+    std::vector<uint64_t> supCands, cidCands, instCands, liveInst;
+    std::vector<uint64_t> postingGroup;  // one source's postings, newest-first walks
     ArrivalEntry* arrivals = nullptr;
     uint32_t nArrivals = 0;
     static constexpr uint32_t kArrivalCap = 65536;
     RecRow* trows = nullptr;          // partition rows read by the type owner
     static constexpr uint32_t kTRowCap = 4096;
 
-    LaneDelta deltas[256];
+    // Lane deltas of the batch, one per lane it changed, in first-touch order
+    // (the batch's lane-delta section), indexed by lane id (open addressing,
+    // slot = index + 1). No cap: a batch that touches more lanes than the
+    // table holds grows it outside the hot-path count (a kill of a record
+    // with thousands of tag instances, a TOMB_RANGE step over many lanes).
+    std::vector<LaneDelta> deltaVec;
+    std::vector<uint32_t> deltaSlots;    // power of two
+    std::vector<uint32_t> deltaSlotOf;   // slot of deltaVec[i] (reset clears only these)
+    LaneDelta* deltas = nullptr;         // deltaVec.data()
     uint32_t nDeltas = 0;
+    LaneDelta* deltaFind(uint32_t laneId, bool create);
     uint8_t ctl[65536];
     uint32_t ctlBytes = 0;
     uint32_t nCtl = 0;
@@ -176,6 +190,7 @@ struct Staged {
     uint32_t firstNewLaneIndex = 0;
     bool sealAfter = false;       // this batch carries SEAL; switch segment after
     uint64_t laneCkptOff = 0;     // absolute m offset of a LANE_CKPT body (0 = none)
+    bool laneCross = false;       // TB03: this batch takes the partition past 32 live lanes
     bool reconcileDone = false;
     bool consumedPendingCtl = false;  // INTENT_MERGE (and friends) ride this batch
     bool mergeDone = false;           // MERGE_DONE rides this batch
@@ -238,6 +253,47 @@ struct StagedType {
     std::atomic<int32_t>* tickets[64];
     uint32_t nTickets = 0;
 };
+
+// ---- TB03 lane tables (lane_ckpt.cpp; level 3, PARTITION-STORE.md §41) -----
+// Inline mode at level 3: staging stops before an entry once the batch holds
+// this many lane deltas, so the table a crossing batch writes (the live lanes
+// at its start, at most 32, plus at most one per entry staged) stays within
+// the room RETIRE leaves for it (partitionLaneCtlRoom), at most 97 lanes. At
+// 64 a partition with 32 or fewer live lanes keeps level 2's soft RETIRE cap
+// (2,048 items); at 160 the reserve cost it about 150 items.
+constexpr uint32_t kLaneInlineStageDeltas = 64;
+constexpr uint32_t kLaneCrossMaxLanes = 256;
+// Reads m-<seg> and lk-<gen> through an IoCtx (open, the writer's helpers).
+class IoLaneFileReader final : public LaneFileReader {
+public:
+    IoLaneFileReader(IoCtx* io, const char* root, uint32_t pid) : io_(io), root_(root), pid_(pid) {}
+    ~IoLaneFileReader() override;
+    int64_t readMeta(uint32_t seg, void* dst, size_t len, uint64_t off) override;
+    int64_t readCkpt(uint32_t gen, void* dst, size_t len, uint64_t off) override;
+
+private:
+    IoCtx* io_;
+    const char* root_;
+    uint32_t pid_;
+    FileRef meta_, ckpt_;
+    uint32_t metaSeg_ = 0, ckptGen_ = 0;
+};
+// Writes lk-<gen> whole and syncs it (its directory entry is durable from
+// creation). An existing file of that name is unlinked first.
+int32_t laneCkptWriteFile(IoCtx* io, const char* root, uint32_t pid, uint32_t gen, const std::vector<uint8_t>& bytes);
+// Partition::lanes by id, through Partition::laneSlot. laneIndexAdd after
+// appending one lane; laneIndexRebuild after any other change (it also
+// recounts laneLive).
+Lane* laneById(Partition* p, uint32_t id);
+void laneIndexAdd(Partition* p, uint32_t idx);
+void laneIndexRebuild(Partition* p);
+// Ctl bytes a batch's finalize may add for lanes (RETIRE leaves them free).
+size_t partitionLaneCtlRoom(const Partition* p);
+// A9 at level 3: may m-<seg> retire? Only below the ref's floor, and only
+// once a durable head names the ref.
+bool partitionLaneMetaMayRetire(const Partition* p, uint32_t seg);
+// Maintenance: installs, names, retires and starts lane checkpoints.
+int32_t partitionLaneStep(Writer* w, Partition* p);
 
 // ---- partition log (partition_log.cpp) -----------------------------------
 int32_t partitionWarm(Writer* w, Partition* p);

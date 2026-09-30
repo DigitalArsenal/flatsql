@@ -140,6 +140,19 @@ struct EngineConfig {
     // standing in for a SIGSTOPped helper.
     uint64_t testPrepStallNs = 0;
     uint32_t testPrepStallEvery = 0;
+    // TB03 format levels (format_level.h). writeFormat: the level stores are
+    // written at (0: kFormatMax); STORE ratchets to it at open once the
+    // registry is non-empty, and a fresh store is created at it. A host pins
+    // it lower for a staged rollout (terabyte design O5).
+    uint32_t writeFormat = 0;
+    // Level 3 (PARTITION-STORE.md §41): a partition past 32 live lanes cuts a
+    // lane checkpoint (lk-<gen>.fsl) once a fold of its lane table would walk
+    // this many batches with lane deltas or 4x as many batches in all, when a
+    // meta segment it replays from is to retire, and after it crosses. Readers
+    // fold on every flatsql_lanes statement, so this bounds their work.
+    uint32_t laneCkptBatches = 128;
+    // Tests: behave as an engine whose kFormatMax is this (0: kFormatMax).
+    uint32_t testFormatMax = 0;
     Io* io = nullptr;               // default: the seven imports
     int64_t (*clockMs)(void*) = nullptr;  // injectable wall clock
     void* clockCtx = nullptr;
@@ -409,6 +422,29 @@ enum MergePhase : uint8_t {
     kMergeOutputsWritten,  // outputs written (unsynced); DONE rides the next batch
 };
 
+// TB03 (level 3): how a partition's head carries its lane table.
+enum LaneMode : uint8_t {
+    kLaneModeInline = 0,  // up to 32 live lanes inline in the head
+    kLaneModeLegacy = 1,  // level 2: the head points at the last LANE_CKPT
+    kLaneModeRef = 2,     // level 3: the head names a LaneRef (checkpoint + replay offset)
+};
+
+// A lane checkpoint in flight (one per partition): the owner cut the table at
+// a batch position; a maintenance helper writes and syncs lk-<gen>.fsl.
+struct LaneCut {
+    uint32_t gen = 0;
+    uint32_t cutSeg = 0;
+    uint64_t cutOff = 0;
+    uint32_t minted = 0;
+    uint32_t nLive = 0;
+    uint32_t deltaBatches = 0;  // the ref's counters when it was cut
+    uint32_t batches = 0;
+    uint32_t ownerEpoch = 0;
+    uint64_t fileBytes = 0;
+    std::vector<uint8_t> bytes;
+    std::atomic<int32_t> result{0};  // helper: 0 running, 1 done, < 0 error
+};
+
 struct MergePlan {
     uint32_t seg = 0;
     uint32_t gen = 0;
@@ -434,6 +470,7 @@ struct MergePlan {
     std::vector<L0DirEntry> batches;      // the merged batches (copy)
     std::vector<MergeRunInput> foldRuns;  // folded runs (immutable while in flight)
     std::vector<ManifestSegDesc> snap;    // manifest input
+    uint16_t manifestVer = 0;             // TB03: at level 3 the written version is 3 (0: by segment count)
     std::vector<RetireItem> retire;       // T3: what MERGE_DONE retires (folded runs, old manifest)
     FileRef r, a, mf;
     SegRun run;                 // the new L1 run, accelerators preloaded
@@ -580,6 +617,17 @@ struct Partition {
     uint64_t lastDurableHeadNs = 0;      // write time of the last DURABLE_CKPT head synced (A9)
     uint64_t pendingDurableHeadNs = 0;   // write time of the last DURABLE_CKPT head written
     bool forceLaneCkpt = false;          // A9: re-emit the lane table before retiring its m
+    // TB03 (level 3, lane_ckpt.cpp).
+    bool laneCkpt = false;               // the store is at level >= 3 (set when the partition is made)
+    uint8_t laneMode = kLaneModeInline;
+    LaneRef laneRef{};                   // kLaneModeRef: what the next head names
+    uint32_t laneLive = 0;               // lanes with a non-zero count
+    std::vector<uint32_t> laneSlot;      // lane id -> index in `lanes` + 1 (0: absent)
+    std::unique_ptr<LaneCut> laneCut;    // the checkpoint in flight
+    bool laneCutWanted = false;          // cut one at the next maintenance step
+    uint64_t laneCutRetryNs = 0;         // a failed cut is retried after this
+    uint64_t laneRefNamedNs = 0;         // write time of the first head naming laneRef (0: named durably at open)
+    std::vector<uint32_t> lkRetire;      // lk gens to retire once a durable head names the newer base
     uint64_t lastCompactCheckNs = 0;
     uint64_t mergeRetryNs = 0;           // T3: a merge that failed (NOSPACE) is retried after this
     // T3 quota: sealed segments as last published (planner input).
@@ -589,6 +637,7 @@ struct Partition {
     // Memory accounting published for stats() (owner writes, anyone reads).
     std::atomic<uint64_t> accelBytes{0};
     std::atomic<uint32_t> laneCount{0};
+    std::atomic<uint64_t> laneCutBytes{0};  // TB03: a lane checkpoint's bytes held until its helper writes them
     uint64_t jCkptTag = 0;           // A8: (writer << 32 | checkpoint epoch) that tracks it
     uint32_t jCkptIdx = 0;           // its entry in that writer's list
     uint8_t mergePhase = kMergeIdle;
@@ -856,6 +905,9 @@ public:
     uint64_t partitionBatches() const { return batches_.load(std::memory_order_relaxed); }
     uint8_t* lookupScratch() { return lookupScratch_.data(); }
     const std::vector<Partition*>& ownedPartitions() const { return owned_; }
+    // TB03: a DURABLE_CKPT head written from maintenance is synced with this
+    // iteration's jobs (A9's lastDurableHeadNs follows it).
+    void queueHeadSync(Partition* p);
 
 private:
     friend class Engine;
@@ -1114,6 +1166,15 @@ public:
 
     EngineStats stats() const;
     const EngineConfig& config() const { return cfg_; }
+    // TB03 format levels: the store's level as opened (after any ratchet), the
+    // engine's kFormatMax (a test may lower it), and the level a ratchet at
+    // this open started from (0: none).
+    uint16_t storeFormat() const { return storeFormat_; }
+    uint16_t formatMax() const {
+        return cfg_.testFormatMax && cfg_.testFormatMax < kFormatMax ? uint16_t(cfg_.testFormatMax) : kFormatMax;
+    }
+    uint16_t ratchetedFrom() const { return ratchetedFrom_; }
+    bool laneCkptLevel() const { return storeFormat_ >= kLevelLaneCkpt; }
     IoStats& openStats() { return openIoStats_; }
     void totalIo(IoStats* out) const;
     SlabPool& pool() { return pool_; }
@@ -1149,6 +1210,7 @@ public:
     std::atomic<uint64_t> cCompactions{0}, cCompactAborts{0}, cCompactBytesIn{0}, cCompactBytesOut{0},
         cRetired{0}, cUnlinked{0}, cUnlinkBusy{0}, cMetaRetired{0}, cCompactInFlight{0}, cCatalogDropped{0};
     std::atomic<uint64_t> cMigratedGseq{0}, cMigratedGseqFallback{0};
+    std::atomic<uint64_t> cLaneCuts{0}, cLaneCutBytes{0};  // TB03 lane checkpoints written
     std::atomic<uint64_t> cSplits{0}, cUnsplits{0}, cPrepStalls{0}, cL0Full{0};
     std::atomic<uint64_t> cArrSegsCompacted{0}, cArrDropped{0};
     uint64_t framesParsedAtOpen = 0;
@@ -1270,6 +1332,9 @@ private:
     std::mutex hotMu_;
     std::atomic<uint64_t> prepClaims_{0};   // test stall counter
     uint32_t incarnation_ = 0;
+    uint16_t storeFormat_ = kFormat;   // TB03: STORE.format as opened
+    uint16_t ratchetedFrom_ = 0;
+    int32_t ratchetStore(const StoreFile& sf, uint16_t to, std::string* err);  // open.cpp
     std::atomic<bool> stop_{false};
     bool started_ = false;
     bool closed_ = false;
