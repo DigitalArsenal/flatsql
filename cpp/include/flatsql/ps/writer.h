@@ -564,7 +564,7 @@ struct Partition {
     std::shared_ptr<CompactPlan> cplan;
     uint32_t cIntentSeg = 0, cIntentGen = 0;  // durable intent (head)
     // T3 disk accounting and reclamation (reclaim.cpp).
-    std::vector<RetireItem> ledger;      // stable named files (retired ones until unlinked)
+    PartitionLedger ledger;              // stable named files (retired ones until unlinked), B4 index
     uint64_t ledgerBytes = 0;
     uint64_t hExtent = 0;                // h.fsh size
     uint64_t lDisk = 0;                  // l.fsl size (>= lExtent: a torn tail is overwritten)

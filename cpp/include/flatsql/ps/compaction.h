@@ -24,7 +24,15 @@ namespace flatsql {
 namespace ps {
 
 // ---- manifest ------------------------------------------------------------------
+// Version 2 counts segments in a u16; version 3 (M3) carries the count as a
+// u32 in the header's last word (the u16 then reads 0xFFFF) and is written
+// only when a partition's segment list outgrows the u16, so engines that
+// predate it keep reading every store they can represent. Every version
+// decodes strictly: the segment records must end exactly at the CRC trailer
+// (a v2 manifest over 65,535 segments, whose count wrapped, is refused
+// instead of losing segments under a valid CRC).
 constexpr uint16_t kManifestVer = 2;
+constexpr uint16_t kManifestVerWide = 3;
 enum ManifestSegFlag : uint32_t {
     kMsegSealed = 1,
     kMsegEmpty = 2,   // compacted with no surviving row: no c-* files, no run
@@ -34,11 +42,11 @@ enum ManifestSegFlag : uint32_t {
 struct ManifestHeader {
     uint32_t magic;
     uint16_t ver;
-    uint16_t nSegs;
+    uint16_t nSegs;        // versions 1 and 2 (0xFFFF in version 3)
     uint32_t gen;
     uint32_t pid;
     uint32_t prevGen;      // the manifest this one replaced (0: none)
-    uint32_t pad;
+    uint32_t nSegs32;      // version 3: the segment count (0 before)
 };
 static_assert(sizeof(ManifestHeader) == 24, "ManifestHeader layout");
 
@@ -96,9 +104,11 @@ struct ManifestDesc {
     std::vector<ManifestSegDesc> segs;  // ascending seg
 };
 
-// Encodes version 2 (magic, CRC trailer: [u32 crc][u32 pad]).
+// Encodes version 2, or version 3 past 65,535 segments (magic, CRC trailer:
+// [u32 crc][u32 pad]).
 std::vector<uint8_t> encodeManifest(const ManifestDesc& m);
-// Decodes version 1 or 2; false on a bad magic, version, bound or CRC.
+// Decodes version 1, 2 or 3; false on a bad magic, version, bound, CRC, or
+// any byte between the last segment record and the trailer.
 bool decodeManifest(const uint8_t* buf, size_t len, ManifestDesc* out);
 
 // ---- compacted rows (c-<seg>-<gen>.fsr) ---------------------------------------------

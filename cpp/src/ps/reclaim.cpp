@@ -23,6 +23,9 @@
 // the active segment (both ride the retiring batch), and unlinked only after
 // a DURABLE_CKPT head names a later first_live_m_seg.
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 
 #include "internal.h"
 
@@ -30,48 +33,370 @@ namespace flatsql {
 namespace ps {
 
 // ---------------------------------------------------------------------------
-// Ledger
+// Ledger (B4): an open-addressing table keyed by (letter, seg, gen), so every
+// lookup, change and drop is O(1) whatever the partition's segment count.
 // ---------------------------------------------------------------------------
 namespace {
 constexpr uint64_t kBusyRetryNs = 50000000ull;  // 50 ms
 
+// The key a retire letter is matched by: manifests by generation, the
+// segment-named files (d r a m) by segment, the rest by both.
+inline void normKey(uint8_t letter, uint32_t* seg, uint32_t* gen) {
+    if (letter == 'f') *seg = 0;
+    else if (letter == 'd' || letter == 'r' || letter == 'a' || letter == 'm') *gen = 0;
+}
+
+inline uint64_t keyHash(uint8_t letter, uint32_t seg, uint32_t gen) {
+    uint64_t x = (uint64_t(seg) << 32 | gen) ^ (uint64_t(letter) * 0x9e3779b97f4a7c15ull);
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ull;
+    x ^= x >> 33;
+    return x;
+}
+
+// Files whose size counts toward a segment's summary bytes and candidate state.
+inline bool segLetter(uint8_t letter) {
+    return letter == 'd' || letter == 'r' || letter == 'a' || letter == 'D' || letter == 'R' || letter == 'A' ||
+           letter == 'x';
+}
+
+// The matching rule of the linear ledger the table replaced (gBookCheck's
+// shadow applies it unchanged).
 bool ledgerMatch(const RetireItem& a, char letter, uint32_t seg, uint32_t gen) {
     if (a.letter != uint8_t(letter)) return false;
     if (letter == 'f') return a.gen == gen;
     if (letter == 'd' || letter == 'r' || letter == 'a' || letter == 'm') return a.seg == seg;
     return a.seg == seg && a.gen == gen;
 }
+
+[[noreturn]] void ledgerMismatch(const char* what, uint8_t letter, uint32_t seg, uint32_t gen) {
+    std::fprintf(stderr, "flatsql ps bookkeeping check failed: ledger %s ('%c', seg %u, gen %u)\n", what,
+                 letter ? char(letter) : '?', seg, gen);
+    std::abort();
+}
 }  // namespace
 
-void ledgerSet(Partition* p, const RetireItem& it) {
-    for (auto& e : p->ledger) {
-        if (ledgerMatch(e, char(it.letter), it.seg, it.gen)) {
-            p->ledgerBytes += uint64_t(it.size) - uint64_t(e.size);
-            e.size = it.size;
-            return;
-        }
+std::atomic<int> gBookCheck{0};
+
+void PartitionLedger::clear() {
+    slots_.clear();
+    slots_.shrink_to_fit();
+    n_ = 0;
+    shadow_.clear();
+    shadowOn_ = gBookCheck.load(std::memory_order_relaxed) != 0;
+    touchAll();
+}
+
+size_t PartitionLedger::slotOf(uint8_t letter, uint32_t seg, uint32_t gen) const {
+    const size_t mask = slots_.size() - 1;
+    size_t i = size_t(keyHash(letter, seg, gen)) & mask;
+    while (slots_[i].letter != 0) {
+        const RetireItem& e = slots_[i];
+        if (e.letter == letter && e.seg == seg && e.gen == gen) return i;
+        i = (i + 1) & mask;
     }
+    return i;  // the empty slot the key would take
+}
+
+void PartitionLedger::grow() {
+    std::vector<RetireItem> old;
+    old.swap(slots_);
+    slots_.assign(old.empty() ? 16 : old.size() * 2, RetireItem{});
+    for (const RetireItem& e : old)
+        if (e.letter) slots_[slotOf(e.letter, e.seg, e.gen)] = e;
+}
+
+uint64_t PartitionLedger::set(const RetireItem& it, bool* existed) {
+    // An empty ledger has an empty shadow: checking starts here too.
+    if (!shadowOn_ && n_ == 0 && gBookCheck.load(std::memory_order_relaxed)) shadowOn_ = true;
+    RetireItem k = it;
+    normKey(k.letter, &k.seg, &k.gen);
+    if ((n_ + 1) * 10 > slots_.size() * 7) grow();  // load factor 0.7
+    const size_t i = slotOf(k.letter, k.seg, k.gen);
+    RetireItem& e = slots_[i];
+    uint64_t prev = 0;
+    bool had = false;
+    if (e.letter) {
+        prev = e.size;
+        had = true;
+        e.size = k.size;
+    } else {
+        e = k;
+        n_++;
+    }
+    if (existed) *existed = had;
+    if (shadowOn_) {
+        // The linear ledger's ledgerSet, then the answers compared.
+        bool found = false;
+        uint64_t sprev = 0;
+        for (auto& x : shadow_)
+            if (ledgerMatch(x, char(it.letter), it.seg, it.gen)) {
+                sprev = x.size;
+                x.size = it.size;
+                found = true;
+                break;
+            }
+        if (!found) shadow_.push_back(it);
+        if (found != had || sprev != prev || shadow_.size() != n_) ledgerMismatch("set", it.letter, it.seg, it.gen);
+    }
+    return prev;
+}
+
+bool PartitionLedger::drop(char letter, uint32_t seg, uint32_t gen, uint64_t* size) {
+    if (shadowOn_) {
+        // The linear ledger's ledgerDrop, compared with the table's answer.
+        bool found = false;
+        uint64_t ssize = 0;
+        for (size_t j = 0; j < shadow_.size(); j++)
+            if (ledgerMatch(shadow_[j], letter, seg, gen)) {
+                ssize = shadow_[j].size;
+                shadow_[j] = shadow_.back();
+                shadow_.pop_back();
+                found = true;
+                break;
+            }
+        uint64_t tsize = 0;
+        const bool had = dropTable(letter, seg, gen, &tsize);
+        if (found != had || ssize != tsize || shadow_.size() != n_) ledgerMismatch("drop", uint8_t(letter), seg, gen);
+        if (had && size) *size = tsize;
+        return had;
+    }
+    return dropTable(letter, seg, gen, size);
+}
+
+bool PartitionLedger::dropTable(char letter, uint32_t seg, uint32_t gen, uint64_t* size) {
+    const uint8_t l = uint8_t(letter);
+    normKey(l, &seg, &gen);
+    if (!n_) return false;
+    size_t i = slotOf(l, seg, gen);
+    if (!slots_[i].letter) return false;
+    if (size) *size = slots_[i].size;
+    // Backward-shift deletion: no tombstones, probe chains stay short.
+    const size_t mask = slots_.size() - 1;
+    for (size_t j = i;;) {
+        j = (j + 1) & mask;
+        if (!slots_[j].letter) break;
+        const size_t home = size_t(keyHash(slots_[j].letter, slots_[j].seg, slots_[j].gen)) & mask;
+        const bool stays = i <= j ? (i < home && home <= j) : (i < home || home <= j);
+        if (stays) continue;
+        slots_[i] = slots_[j];
+        i = j;
+    }
+    slots_[i] = RetireItem{};
+    n_--;
+    return true;
+}
+
+uint64_t PartitionLedger::size(char letter, uint32_t seg, uint32_t gen) const {
+    uint64_t v = 0;
+    if (n_) {
+        uint8_t l = uint8_t(letter);
+        uint32_t s2 = seg, g2 = gen;
+        normKey(l, &s2, &g2);
+        const RetireItem& e = slots_[slotOf(l, s2, g2)];
+        v = e.letter ? e.size : 0;
+    }
+    if (shadowOn_) {
+        uint64_t ref = 0;
+        for (const auto& x : shadow_)
+            if (ledgerMatch(x, letter, seg, gen)) {
+                ref = x.size;
+                break;
+            }
+        if (ref != v) ledgerMismatch("size", uint8_t(letter), seg, gen);
+    }
+    return v;
+}
+
+uint64_t PartitionLedger::memoryBytes() const {
+    return slots_.capacity() * sizeof(RetireItem) + (sumDirty.capacity() + candDirty.capacity()) * 4 +
+           cand.size() * 48 + (deadQ.size() + pairStarts.size() + survey.size()) * 48;
+}
+
+void PartitionLedger::touch(uint32_t seg) {
+    // Past kFeedCap pending changes (a feed nobody drains, e.g. with
+    // automatic compaction off) the consumer rebuilds in one walk instead.
+    constexpr size_t kFeedCap = 65536;
+    if (!sumAll) {
+        if (sumDirty.size() < kFeedCap) sumDirty.push_back(seg);
+        else sumAll = true, sumDirty.clear();
+    }
+    if (!candAll) {
+        if (candDirty.size() < kFeedCap) candDirty.push_back(seg);
+        else candAll = true, candDirty.clear();
+    }
+}
+
+uint64_t PartitionLedger::bytesWalk() const {
+    uint64_t b = 0;
+    for (const RetireItem& e : slots_)
+        if (e.letter) b += e.size;
+    return b;
+}
+
+void PartitionLedger::touchAll() {
+    sumAll = candAll = true;
+    sumDirty.clear();
+    candDirty.clear();
+}
+
+void ledgerSet(Partition* p, const RetireItem& it) {
     const int saved = tHotPathDepth;
     tHotPathDepth = 0;  // a maintenance event (merge, seal, SWAP), never per record
-    p->ledger.push_back(it);
+    const uint64_t prev = p->ledger.set(it, nullptr);
+    if (segLetter(it.letter)) p->ledger.touch(it.seg);
     tHotPathDepth = saved;
-    p->ledgerBytes += it.size;
+    p->ledgerBytes += uint64_t(it.size) - prev;
 }
 
 void ledgerDrop(Partition* p, char letter, uint32_t seg, uint32_t gen) {
-    for (size_t i = 0; i < p->ledger.size(); i++) {
-        if (!ledgerMatch(p->ledger[i], letter, seg, gen)) continue;
-        p->ledgerBytes -= p->ledger[i].size;
-        p->ledger[i] = p->ledger.back();
-        p->ledger.pop_back();
-        return;
+    uint64_t size = 0;
+    if (!p->ledger.drop(letter, seg, gen, &size)) return;
+    p->ledgerBytes -= size;
+    if (segLetter(uint8_t(letter))) {
+        const int saved = tHotPathDepth;
+        tHotPathDepth = 0;
+        p->ledger.touch(seg);
+        tHotPathDepth = saved;
     }
 }
 
 uint64_t ledgerSize(const Partition* p, char letter, uint32_t seg, uint32_t gen) {
-    for (const auto& e : p->ledger)
-        if (ledgerMatch(e, letter, seg, gen)) return e.size;
-    return 0;
+    return p->ledger.size(letter, seg, gen);
+}
+
+// ---------------------------------------------------------------------------
+// Segment lookup (B4): Partition::segs ascends by segment id, so an entry is
+// found by binary search. Entries without merged rows yet (firstPseq 0: m
+// placeholders, dead-count holders) sit among the others; a pseq search
+// steps over them.
+// ---------------------------------------------------------------------------
+namespace {
+template <typename P>
+auto segLowerBound(P* p, uint32_t seg) -> decltype(p->segs.begin()) {
+    return std::lower_bound(p->segs.begin(), p->segs.end(), seg,
+                            [](const SegmentInfo& s, uint32_t v) { return s.seg < v; });
+}
+
+template <typename P, typename S>
+S* segCoveringT(P* p, uint32_t seg) {
+    auto it = std::upper_bound(p->segs.begin(), p->segs.end(), seg,
+                               [](uint32_t v, const SegmentInfo& s) { return v < s.seg; });
+    if (it == p->segs.begin()) return nullptr;
+    --it;
+    const uint32_t last = it->lastSeg ? it->lastSeg : it->seg;
+    return seg <= last ? &*it : nullptr;
+}
+
+[[noreturn]] void bookMismatch(const char* what, uint32_t pid, uint64_t key) {
+    std::fprintf(stderr, "flatsql ps bookkeeping check failed: %s (pid %u, key %llu)\n", what, pid,
+                 (unsigned long long)key);
+    std::abort();
+}
+}  // namespace
+
+SegmentInfo* segFind(Partition* p, uint32_t seg) {
+    auto it = segLowerBound(p, seg);
+    SegmentInfo* r = it != p->segs.end() && it->seg == seg ? &*it : nullptr;
+    if (gBookCheck.load(std::memory_order_relaxed)) {
+        SegmentInfo* ref = nullptr;
+        for (auto& s : p->segs)
+            if (s.seg == seg) {
+                ref = &s;
+                break;
+            }
+        for (size_t i = 1; i < p->segs.size(); i++)
+            if (p->segs[i - 1].seg >= p->segs[i].seg) bookMismatch("segs not ascending", p->pid, p->segs[i].seg);
+        if (ref != r) bookMismatch("segFind", p->pid, seg);
+    }
+    return r;
+}
+
+const SegmentInfo* segFind(const Partition* p, uint32_t seg) {
+    return segFind(const_cast<Partition*>(p), seg);
+}
+
+SegmentInfo* segCovering(Partition* p, uint32_t seg) {
+    SegmentInfo* r = segCoveringT<Partition, SegmentInfo>(p, seg);
+    if (gBookCheck.load(std::memory_order_relaxed)) {
+        SegmentInfo* ref = nullptr;
+        for (auto& s : p->segs)
+            if (s.seg <= seg && seg <= (s.lastSeg ? s.lastSeg : s.seg)) {
+                ref = &s;
+                break;
+            }
+        if (ref != r) bookMismatch("segCovering", p->pid, seg);
+    }
+    return r;
+}
+
+const SegmentInfo* segCovering(const Partition* p, uint32_t seg) {
+    return segCovering(const_cast<Partition*>(p), seg);
+}
+
+SegmentInfo* segForPseq(Partition* p, uint64_t pseq) {
+    // The last entry with merged rows starting at or before pseq: firstPseq
+    // ascends with the segment id over entries that have one.
+    SegmentInfo* r = nullptr;
+    size_t lo = 0, hi = p->segs.size();  // candidates in [lo, hi)
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        size_t m = mid;
+        while (m > lo && !p->segs[m].firstPseq) m--;  // step over entries without rows
+        const SegmentInfo& s = p->segs[m];
+        if (!s.firstPseq) {  // nothing with rows in [lo, mid]
+            lo = mid + 1;
+            continue;
+        }
+        if (s.firstPseq <= pseq) {
+            r = &p->segs[m];
+            lo = mid + 1;
+        } else {
+            hi = m;
+        }
+    }
+    if (r && !(pseq >= r->firstPseq && pseq < r->mergedEnd)) {
+        // An entry sharing its first pseq with an earlier one holds no merged
+        // rows: the earlier one may.
+        SegmentInfo* q = nullptr;
+        for (size_t i = size_t(r - p->segs.data()); i-- > 0;) {
+            if (!p->segs[i].firstPseq) continue;
+            if (p->segs[i].firstPseq == r->firstPseq) q = &p->segs[i];
+            break;
+        }
+        r = q && pseq < q->mergedEnd ? q : nullptr;
+    }
+    if (gBookCheck.load(std::memory_order_relaxed)) {
+        SegmentInfo* ref = nullptr;
+        for (auto& s : p->segs)
+            if (pseq >= s.firstPseq && pseq < s.mergedEnd) {
+                ref = &s;
+                break;
+            }
+        if (ref != r) bookMismatch("segForPseq", p->pid, pseq);
+    }
+    return r;
+}
+
+SegmentInfo* segInsert(Partition* p, uint32_t seg) {
+    auto it = segLowerBound(p, seg);
+    if (it != p->segs.end() && it->seg == seg) return &*it;
+    const int saved = tHotPathDepth;
+    tHotPathDepth = 0;  // a new segment entry: a maintenance event
+    it = p->segs.emplace(it);
+    it->seg = seg;
+    p->ledger.touch(seg);
+    tHotPathDepth = saved;
+    return &*it;
+}
+
+void bookTouch(Partition* p, uint32_t seg) {
+    const int saved = tHotPathDepth;
+    tHotPathDepth = 0;
+    p->ledger.touch(seg);
+    tHotPathDepth = saved;
 }
 
 uint64_t partitionDiskBytes(const Partition* p) {
@@ -159,6 +484,7 @@ void partitionRetireCommitted(Partition* p, const std::vector<RetireItem>& items
         r.it = it;
         r.retireNs = nowNs;
         p->retired.push_back(r);
+        p->ledger.retiredBytes += it.size;
     }
 }
 
@@ -172,35 +498,99 @@ void partitionUnlinkedCommitted(Partition* p, uint32_t n) {
 }
 
 // ---------------------------------------------------------------------------
+// The RETIRE valve (A12)
+//
+// The whole outstanding set rides ONE ctl record of the batch that changes it
+// (u16 length) in the batch's 64 KiB ctl buffer, beside an UNLINKED record and
+// the lane table the batch may re-emit. A set that does not fit fails every
+// batch of the partition (partition_log.cpp) until it shrinks, and waiting
+// for the grace to shrink it stalled ingest for the whole grace whenever
+// retirements outpaced it (a busy partition retires a manifest and folded
+// runs per merge, a coalescing SWAP a dozen files per input). So the set is
+// held under a soft cap well inside what a batch carries: past it the oldest
+// items go without waiting for the reader gate or the grace (a statement
+// older than them gets the retryable SNAPSHOT_GONE; an open handle still
+// makes the unlink BUSY). Crash safety never needed the grace: the batch that
+// retired a file is durable before its retirement counts, and open replays it.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr size_t kCtlBufBytes = 65536;  // StageScratch::ctl
+constexpr size_t kUnlinkedMaxBytes = 4 + sizeof(RetireSetHeader) + 1024 * sizeof(RetireItem);
+constexpr size_t kOtherCtlBytes = 1024;  // INTENT, MERGE_DONE, SWAP, SEAL records of the same batch
+constexpr size_t kBatchAddsItems = 512;  // one SWAP's or MERGE_DONE's additions, with room to spare
+constexpr size_t kRetireSoftItems = 2048;
+
+size_t retireSetHardCap(const Partition* p) {
+    const size_t laneRoom = 64 + (p->lanes.size() + 1) * sizeof(LaneCounter);  // as staging reserves it
+    const size_t fixed = kUnlinkedMaxBytes + kOtherCtlBytes + laneRoom + 4 + sizeof(RetireSetHeader);
+    const size_t room = fixed < kCtlBufBytes ? (kCtlBufBytes - fixed) / sizeof(RetireItem) : 0;
+    return std::min(room, (size_t(65535) - sizeof(RetireSetHeader)) / sizeof(RetireItem));
+}
+}  // namespace
+
+size_t retireSetEncodedItems(const Partition* p) {
+    // Consecutive manifest generations collapse into one item (retireSetEncode):
+    // counted here in retirement order, which sorting can only merge further.
+    size_t n = p->retiring.size();
+    bool haveF = false;
+    uint32_t lastF = 0;
+    for (const auto& r : p->retired) {
+        if (r.it.letter != 'f') {
+            n++;
+            continue;
+        }
+        if (!haveF || r.it.gen != lastF + 1) n++;
+        haveF = true;
+        lastF = r.it.gen;
+    }
+    return n;
+}
+
+size_t retireSetSoftCap(const Partition* p) {
+    const size_t hard = retireSetHardCap(p);
+    return hard > kBatchAddsItems ? std::min(kRetireSoftItems, hard - kBatchAddsItems) : 0;
+}
+
+void bookRetireOverflow(Partition* p) { p->ledger.retireOverflows++; }
+
+// ---------------------------------------------------------------------------
 // Unlinking (maintenance)
 // ---------------------------------------------------------------------------
 int32_t partitionReclaimStep(Writer* w, Partition* p) {
-    if (p->retired.empty() || p->quarantined) return 0;
+    if (p->retired.empty() || p->quarantined) {
+        p->ledger.retireHold = false;
+        return 0;
+    }
     Engine* e = w->engine();
     const EngineConfig& cfg = e->config();
     const uint64_t now = monoNs();
     const uint64_t gate = e->readerGateNs();
     const uint64_t jsafe = cfg.commitJournal ? e->journalSafeNs() : UINT64_MAX;
     const uint64_t grace = cfg.reclaimGraceMs * 1000000ull;
-    // A set grown past what one batch can carry (a reader statement older
-    // than hours of retirements): the oldest go regardless of the gate; such
-    // a statement gets the retryable SNAPSHOT_GONE instead of the writer
-    // ever waiting on it.
-    const bool valve = p->retired.size() > 2048;
+    // The valve: the oldest items past the soft cap go now (see above).
+    const size_t enc = retireSetEncodedItems(p);
+    const size_t soft = retireSetSoftCap(p);
+    if (enc > p->ledger.retireEncPeak) p->ledger.retireEncPeak = enc;
+    size_t shed = enc > soft ? enc - soft : 0;
+    bool pinned = false;
     const uint64_t pin = partitionCompactPinNs(p);
     const int saved = tHotPathDepth;
     tHotPathDepth = 0;
     uint32_t done = 0;
     size_t i = 0;
     int32_t out = 0;
-    while (i < p->retired.size() && done < cfg.reclaimBatch) {
+    const size_t n0 = p->retired.size();
+    // Unlinked items leave the set in one compaction pass after the loop
+    // (an erase per item moved the whole set each time).
+    std::vector<uint8_t> gone;
+    while (i < n0 && done < cfg.reclaimBatch) {
         RetiredFile& r = p->retired[i];
         if (r.retireNs == kRetirePendingNs) break;  // no head has stopped naming it yet (FIFO)
         if (now < r.retryNs) {
             i++;
             continue;
         }
-        const bool forced = valve && p->retired.size() - i > 2048 && now - r.retireNs >= grace;
+        const bool forced = shed > 0;
         if (!forced) {
             if (gate <= r.retireNs) break;  // FIFO: later items retired later
             // The first passing check of every item past the gate is taken
@@ -220,12 +610,14 @@ int32_t partitionReclaimStep(Writer* w, Partition* p) {
             i++;
             continue;
         }
-        if (r.retireNs >= pin) break;  // a compaction in flight may read it
+        if (r.retireNs >= pin) {  // a compaction in flight may read it
+            pinned = forced;
+            break;
+        }
         if (jsafe <= r.retireNs) break;
         // The owner's own read handles go first (UNLINK_IF_UNUSED).
         if (r.it.letter == 'm') {
-            for (auto& s : p->segs)
-                if (s.seg == r.it.seg) w->io().close(&s.m);
+            if (SegmentInfo* si = segFind(p, r.it.seg)) w->io().close(&si->m);
         }
         PathBuf path;
         retirePath(&path, w->eng_root(), p->pid, r.it);
@@ -244,9 +636,30 @@ int32_t partitionReclaimStep(Writer* w, Partition* p) {
             break;
         }
         p->unlinked.push_back(r.it);
-        p->retired.erase(p->retired.begin() + long(i));
+        if (gone.empty()) gone.assign(n0, 0);
+        gone[i] = 1;
+        p->ledger.retiredBytes -= std::min<uint64_t>(p->ledger.retiredBytes, r.it.size);
         e->cUnlinked.fetch_add(1, std::memory_order_relaxed);
+        if (forced) {
+            shed--;
+            p->ledger.retireForced++;
+        }
         done++;
+        i++;
+    }
+    // A compaction in flight pins what was retired after it was planned: if
+    // the set still grows toward what a batch carries, merges (the steady
+    // source of retirements) wait until the SWAP or abort releases the pin.
+    // Records keep flowing into L0 meanwhile, as when a merge is slow.
+    const size_t left = enc > done ? enc - done : 0;
+    const bool hold = pinned && left > soft + (retireSetHardCap(p) - std::min(soft, retireSetHardCap(p))) / 2;
+    if (hold && !p->ledger.retireHold) p->ledger.retireHolds++;
+    p->ledger.retireHold = hold;
+    if (done) {
+        size_t k = 0;
+        for (size_t j = 0; j < n0; j++)
+            if (!gone[j]) p->retired[k++] = p->retired[j];
+        p->retired.resize(k);
     }
     tHotPathDepth = saved;
     if (done) {
@@ -272,8 +685,7 @@ int32_t partitionRetireMetaStep(Writer* w, Partition* p) {
     if (p->mergePhase != kMergeIdle && p->mplan.seg <= s) return 0;
     const int saved = tHotPathDepth;
     tHotPathDepth = 0;
-    for (auto& si : p->segs)
-        if (si.seg == s) w->io().close(&si.m);
+    if (SegmentInfo* si = segFind(p, s)) w->io().close(&si->m);
     const uint64_t size = ledgerSize(p, 'm', s, 0);
     p->retiring.push_back(retireItem('m', s, 0, size));
     p->forceLaneCkpt = true;  // the lane table moves to a live segment with it
@@ -587,6 +999,7 @@ int32_t partitionOpenReclaim(IoCtx* io, const char* root, Partition* p, const st
                              uint32_t* unlinked) {
     *unlinked = 0;
     p->retired.clear();
+    p->ledger.retiredBytes = 0;
     for (const auto& it : items) {
         PathBuf path;
         retirePath(&path, root, p->pid, it);
@@ -607,6 +1020,7 @@ int32_t partitionOpenReclaim(IoCtx* io, const char* root, Partition* p, const st
             }
             r.retireNs = monoNs();
             p->retired.push_back(r);
+            p->ledger.retiredBytes += r.it.size;
         } else if (rc != FLATSQL_IO_ERR_NOENT) {
             return rc;
         }
@@ -616,6 +1030,8 @@ int32_t partitionOpenReclaim(IoCtx* io, const char* root, Partition* p, const st
 }
 
 int32_t partitionOpenLedger(IoCtx* io, const char* root, Partition* p) {
+    // O(S) in segments: every ledger change is O(1) and the unmerged sealed
+    // segments are found by one walk alongside the (ascending) entries.
     p->ledger.clear();
     p->ledgerBytes = 0;
     PathBuf path;
@@ -679,13 +1095,10 @@ int32_t partitionOpenLedger(IoCtx* io, const char* root, Partition* p) {
         }
     }
     // Sealed segments not merged yet (no manifest entry): their d files.
+    size_t k = 0;
     for (uint32_t s = p->firstLiveMSeg; s < p->dSeg; s++) {
-        bool known = false;
-        for (const auto& si : p->segs) {
-            const uint32_t last = si.lastSeg ? si.lastSeg : si.seg;
-            if (s >= si.seg && s <= last) known = true;
-        }
-        if (known) continue;
+        while (k < p->segs.size() && (p->segs[k].lastSeg ? p->segs[k].lastSeg : p->segs[k].seg) < s) k++;
+        if (k < p->segs.size() && p->segs[k].seg <= s) continue;  // merged (covered by an entry)
         pathPartitionSeg(&path, root, p->pid, 'd', s, "fsd");
         n = statFile(io, path, FileClass::Data);
         if (n >= 0) ledgerSet(p, retireItem('d', s, 0, uint64_t(n)));

@@ -46,8 +46,11 @@ std::vector<uint8_t> encodeManifest(const ManifestDesc& m) {
     std::vector<uint8_t> out(sizeof(ManifestHeader));
     ManifestHeader h{};
     h.magic = kMagicManifest;
-    h.ver = kManifestVer;
-    h.nSegs = uint16_t(m.segs.size());
+    // M3: a count the u16 cannot hold goes in version 3's u32.
+    const bool wide = m.segs.size() > 0xFFFF;
+    h.ver = wide ? kManifestVerWide : kManifestVer;
+    h.nSegs = wide ? uint16_t(0xFFFF) : uint16_t(m.segs.size());
+    h.nSegs32 = wide ? uint32_t(m.segs.size()) : 0;
     h.gen = m.gen;
     h.pid = m.pid;
     h.prevGen = m.prevGen;
@@ -92,12 +95,21 @@ bool decodeManifest(const uint8_t* buf, size_t len, ManifestDesc* out) {
     if (crc32c(buf, body) != getU32(buf + body)) return false;
     ManifestHeader h;
     std::memcpy(&h, buf, sizeof(h));
-    if (h.magic != kMagicManifest || (h.ver != 1 && h.ver != 2)) return false;
+    if (h.magic != kMagicManifest || h.ver < 1 || h.ver > kManifestVerWide) return false;
+    uint32_t nSegs = h.nSegs;
+    if (h.ver == kManifestVerWide) {
+        if (h.nSegs != 0xFFFF) return false;
+        nSegs = h.nSegs32;
+    }
+    // Every segment record is at least a v1 record: a count the body cannot
+    // hold is refused before anything is allocated for it.
+    if (uint64_t(nSegs) * sizeof(ManifestSegV1) > body - sizeof(h)) return false;
     out->gen = h.gen;
     out->pid = h.pid;
     out->prevGen = h.ver >= 2 ? h.prevGen : 0;
+    out->segs.reserve(nSegs);
     size_t off = sizeof(h);
-    for (uint16_t i = 0; i < h.nSegs; i++) {
+    for (uint32_t i = 0; i < nSegs; i++) {
         ManifestSegDesc d;
         uint32_t nRuns = 0;
         if (h.ver == 1) {
@@ -151,6 +163,10 @@ bool decodeManifest(const uint8_t* buf, size_t len, ManifestDesc* out) {
         }
         out->segs.push_back(std::move(d));
     }
+    // M3: the records end exactly at the trailer. Bytes left over are
+    // segments the count does not name (a wrapped v2 u16): never dropped
+    // silently.
+    if (off != body) return false;
     std::sort(out->segs.begin(), out->segs.end(),
               [](const ManifestSegDesc& a, const ManifestSegDesc& b) { return a.seg < b.seg; });
     return true;
@@ -470,12 +486,8 @@ bool planOwns(const CompactPlan& c) {
 }
 
 // The segment holding original segment `seg`: itself, or the coalesced
-// output [s.seg, s.lastSeg] it went into.
-const SegmentInfo* findSegCovering(const Partition* p, uint32_t seg) {
-    for (const auto& s : p->segs)
-        if (s.seg <= seg && seg <= (s.lastSeg ? s.lastSeg : s.seg)) return &s;
-    return nullptr;
-}
+// output [s.seg, s.lastSeg] it went into (B4: O(log S)).
+const SegmentInfo* findSegCovering(const Partition* p, uint32_t seg) { return segCovering(p, seg); }
 
 bool hasPendingL0(const Partition* p, const SegmentInfo& s) {
     const uint32_t last = s.lastSeg ? s.lastSeg : s.seg;
@@ -502,107 +514,9 @@ uint64_t inputDiskBytes(const Partition* p, const SegmentInfo& s) {
     return b;
 }
 
-// Chooses inputs. Returns false when nothing qualifies.
-bool pickCandidate(const Engine* e, const Partition* p, uint32_t* seg, uint32_t* segEnd) {
-    const EngineConfig& cfg = e->config();
-    // 1. The sealed segment with the largest known dead share >= the ratio.
-    const SegmentInfo* best = nullptr;
-    double bestShare = 0;
-    for (const auto& s : p->segs) {
-        if (!compactable(p, s) || s.empty) continue;
-        const uint64_t data = s.dLen ? s.dLen : 1;
-        const double share = double(s.deadBytes) / double(data);
-        if (share >= cfg.compactDeadRatio && share > bestShare) {
-            best = &s;
-            bestShare = share;
-        }
-    }
-    if (best) {
-        // Neighbors past the ratio too join the same output, within the
-        // coalescing limits: updates spread over a partition bring its
-        // segments to the ratio together, and one compaction per segment
-        // would leave the rest of the wave on disk meanwhile.
-        auto qualifies = [&](const SegmentInfo& s) {
-            if (!compactable(p, s) || s.empty) return false;
-            const uint64_t data = s.dLen ? s.dLen : 1;
-            return double(s.deadBytes) / double(data) >= cfg.compactDeadRatio;
-        };
-        size_t lo = size_t(best - p->segs.data()), hi = lo;
-        uint64_t bytes = inputDiskBytes(p, *best);
-        for (bool grown = true; grown;) {
-            grown = false;
-            if (hi - lo + 1 < cfg.compactMaxInputs && hi + 1 < p->segs.size()) {
-                const SegmentInfo& n = p->segs[hi + 1];
-                const uint64_t nb = inputDiskBytes(p, n);
-                if (n.firstPseq == p->segs[hi].endPseq && qualifies(n) && bytes + nb <= cfg.compactMaxOutputBytes) {
-                    hi++;
-                    bytes += nb;
-                    grown = true;
-                }
-            }
-            if (hi - lo + 1 < cfg.compactMaxInputs && lo > 0) {
-                const SegmentInfo& n = p->segs[lo - 1];
-                const uint64_t nb = inputDiskBytes(p, n);
-                if (p->segs[lo].firstPseq == n.endPseq && qualifies(n) && bytes + nb <= cfg.compactMaxOutputBytes) {
-                    lo--;
-                    bytes += nb;
-                    grown = true;
-                }
-            }
-        }
-        *seg = p->segs[lo].seg;
-        *segEnd = p->segs[hi].lastSeg ? p->segs[hi].lastSeg : p->segs[hi].seg;
-        return true;
-    }
-    // 2. Adjacent small sealed segments coalesce (§11: "under 8 MiB each").
-    const SegmentInfo* runStart = nullptr;
-    const SegmentInfo* runEnd = nullptr;
-    uint32_t n = 0;
-    uint64_t bytes = 0, prevEnd = 0;
-    for (const auto& s : p->segs) {
-        const uint64_t sz = inputDiskBytes(p, s);
-        const bool small = compactable(p, s) && sz < cfg.compactSmallBytes;
-        if (small && runStart && s.firstPseq == prevEnd && n < cfg.compactMaxInputs &&
-            bytes + sz <= cfg.compactMaxOutputBytes) {
-            runEnd = &s;
-            n++;
-            bytes += sz;
-        } else if (small) {
-            if (runStart && n >= 2) break;
-            runStart = runEnd = &s;
-            n = 1;
-            bytes = sz;
-        } else {
-            if (runStart && n >= 2) break;
-            runStart = runEnd = nullptr;
-            n = 0;
-            bytes = 0;
-        }
-        prevEnd = s.endPseq;
-    }
-    if (runStart && n >= 2) {
-        *seg = runStart->seg;
-        *segEnd = runEnd->lastSeg ? runEnd->lastSeg : runEnd->seg;
-        return true;
-    }
-    // 3. After a restart the per-segment dead counts are unknown: when the
-    // partition as a whole is past the ratio, survey the oldest compactable
-    // segment not surveyed since warm (the build abandons it when it would
-    // save under 10%).
-    // Copies, not references: the counters live in a packed struct (a
-    // reference to a misaligned uint64_t is undefined; UBSan).
-    const uint64_t total = p->counters.totalBytes;
-    const uint64_t live = p->counters.liveBytes;
-    if (total && double(total - std::min(total, live)) >= cfg.compactDeadRatio * double(total)) {
-        for (const auto& s : p->segs) {
-            if (!compactable(p, s) || s.empty || s.deadRows) continue;  // deadRows set: known (surveyed)
-            *seg = s.seg;
-            *segEnd = s.lastSeg ? s.lastSeg : s.seg;
-            return true;
-        }
-    }
-    return false;
-}
+// Candidates (§11 selection rules): bookPickCandidate (quota.cpp) keeps them
+// in an index fed by the partition's changes (B4), instead of walking every
+// segment every look.
 
 void compactDone(SwapResult* r, int32_t status) {
     if (!r) return;
@@ -1376,7 +1290,7 @@ int32_t partitionCompactStep(Writer* w, Partition* p) {
                     if (t && t->lastSeg > segEnd) segEnd = t->lastSeg;
                     have = s != nullptr;
                 } else {
-                    have = !req && pickCandidate(e, p, &seg, &segEnd);
+                    have = !req && bookPickCandidate(e, p, &seg, &segEnd);
                     if (!have && req) {
                         // Requested without a target: the oldest-generation
                         // compactable segment (the T2 seam's rule).
@@ -1430,11 +1344,16 @@ int32_t partitionCompactStep(Writer* w, Partition* p) {
             if (res < 0 || p->cplan->ownerEpoch != p->ownerEpoch) {
                 if (res == kCompactNotWorth) {
                     // A survey: remember what it found so it is not retried.
-                    for (auto& s : p->segs) {
+                    // B4: the entries from the plan's first input on only.
+                    auto it = std::lower_bound(p->segs.begin(), p->segs.end(), p->cplan->seg,
+                                               [](const SegmentInfo& a, uint32_t v) { return a.seg < v; });
+                    for (; it != p->segs.end() && it->seg <= p->cplan->segEnd; ++it) {
+                        SegmentInfo& s = *it;
                         const uint32_t last = s.lastSeg ? s.lastSeg : s.seg;
-                        if (s.seg >= p->cplan->seg && last <= p->cplan->segEnd) {
+                        if (last <= p->cplan->segEnd) {
                             s.deadRows = p->cplan->putsDropped + 1;
                             s.deadBytes = p->cplan->deadFrameBytes;
+                            bookTouch(p, s.seg);  // B4: compaction candidates
                         }
                     }
                 }
@@ -1521,6 +1440,10 @@ void partitionCompactApply(Writer* w, Partition* p) {
     out.deadRows = 1;  // known: freshly compacted
     if (!c.empty) out.runs.push_back(std::move(c.run));
     c.run = SegRun();
+    // B4: accelerator bytes move by the inputs' runs and the output's (no
+    // walk of every run), and the change feed names the inputs, so the
+    // summary and the candidate index update those entries only.
+    int64_t accel = int64_t(out.runs.empty() || !out.runs[0].run ? 0 : out.runs[0].run->memoryBytes());
     std::vector<SegmentInfo> next;
     next.reserve(p->segs.size());
     bool placed = false;
@@ -1530,9 +1453,13 @@ void partitionCompactApply(Writer* w, Partition* p) {
             w->io().close(&s.r);
             w->io().close(&s.a);
             w->io().close(&s.d);
-            for (auto& r : s.runs) w->io().close(&r.file);
+            for (auto& r : s.runs) {
+                w->io().close(&r.file);
+                if (r.run) accel -= int64_t(r.run->memoryBytes());
+            }
             // m handles of retired meta segments are closed by A9.
             if (s.m.valid()) w->io().close(&s.m);
+            bookTouch(p, s.seg);
             if (!placed) next.push_back(std::move(out));
             placed = true;
             continue;
@@ -1578,7 +1505,8 @@ void partitionCompactApply(Writer* w, Partition* p) {
     }
     p->cplan.reset();
     p->lastCompactCheckNs = 0;  // the next candidate is looked for at once
-    partitionAccount(p);
+    p->accelBytes.store(uint64_t(std::max<int64_t>(0, int64_t(p->accelBytes.load(std::memory_order_relaxed)) + accel)),
+                        std::memory_order_relaxed);
     tHotPathDepth = saved;
 }
 

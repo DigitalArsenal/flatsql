@@ -92,9 +92,13 @@ inline size_t prepResultBytes(const PrepResult& r) { return offsetof(PrepResult,
 
 struct alignas(64) PrepSlot {
     std::atomic<uint64_t> state{0};
-    uint64_t pos = 0;        // ring position (owner, published with FREE)
-    uint32_t len = 0;        // entryLen
-    uint16_t kind = 0;
+    // Published with FREE (relaxed; the state word's release/acquire orders
+    // them). Atomic because the owner may take a CLAIMED slot and republish
+    // it for ordinal k + kPrepSlots while the helper still reads them; the
+    // helper's CLAIMED -> WRITING step then fails and its result is dropped.
+    std::atomic<uint64_t> pos{0};   // ring position
+    std::atomic<uint32_t> len{0};   // entryLen
+    std::atomic<uint16_t> kind{0};
     PrepResult r;
 };
 
@@ -116,7 +120,9 @@ struct PrepL0Pub {
 };
 struct PrepRunSet {
     uint64_t version = 0;              // of the L1 run set (bumps on every change)
-    std::vector<PrepRunDesc> runs;
+    // Shared by every set published at the same run version (B4: a new L0
+    // block republishes the set without copying the run list).
+    std::shared_ptr<const std::vector<PrepRunDesc>> runs;
     std::vector<PrepL0Pub> l0;         // every unmerged L0 block when published
     uint64_t l0Through = 0;            // highest pseq those blocks cover (0: none covered)
 };

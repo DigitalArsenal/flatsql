@@ -27,7 +27,8 @@ SlabPool::~SlabPool() {
 }
 
 bool SlabPool::init(uint64_t bytes, uint32_t slabBytes) {
-    if (slabBytes == 0 || bytes < slabBytes) return false;
+    // Slabs are whole 8-byte words (ringReadShared loads words within one).
+    if (slabBytes == 0 || (slabBytes & 7) || bytes < slabBytes) return false;
     slabBytes_ = slabBytes;
     nSlabs_ = uint32_t(bytes / slabBytes);
     bytes_ = uint64_t(nSlabs_) * slabBytes;
@@ -129,15 +130,51 @@ void ringRead(const RingDesc* r, const SlabPool& pool, uint64_t pos, void* dst, 
     }
 }
 
+void ringReadShared(const RingDesc* r, const SlabPool& pool, uint64_t pos, void* dst, size_t len) {
+    // Slabs are 8-aligned and a multiple of 8 bytes, so the aligned words
+    // covering [off, off + n) stay inside the slab.
+    const uint32_t S = r->slabBytes;
+    uint8_t* out = static_cast<uint8_t*>(dst);
+    while (len) {
+        const uint64_t page = pos / S;
+        const uint32_t off = uint32_t(pos % S);
+        const size_t n = (S - off) < len ? (S - off) : len;
+        const uint8_t* base = pagePtr(r, pool, page);
+        const uint32_t first = off & ~7u;
+        const uint32_t end = off + uint32_t(n);
+        for (uint32_t w = first; w < end; w += 8) {
+            const uint64_t v = __atomic_load_n(reinterpret_cast<const uint64_t*>(base + w), __ATOMIC_RELAXED);
+            const uint32_t a = w < off ? off : w;
+            const uint32_t b = w + 8 < end ? w + 8 : end;
+            std::memcpy(out + (a - off), reinterpret_cast<const uint8_t*>(&v) + (a - w), b - a);
+        }
+        out += n;
+        pos += n;
+        len -= n;
+    }
+}
+
 void ringWrite(RingDesc* r, const SlabPool& pool, uint64_t pos, const void* src, size_t len) {
+    // Relaxed atomic stores (8-byte words, single bytes at the edges): a
+    // stage-1 helper may still be copying bytes of a released entry that a
+    // producer now rewrites (ringReadShared). They cost what plain stores do;
+    // publication stays ordered by the tail's release.
     const uint32_t S = r->slabBytes;
     const uint8_t* in = static_cast<const uint8_t*>(src);
     while (len) {
         const uint64_t page = pos / S;
         const uint32_t off = uint32_t(pos % S);
         const size_t n = (S - off) < len ? (S - off) : len;
-        std::memcpy(pagePtr(r, pool, page) + off, in, n);
-        in += n;
+        uint8_t* base = pagePtr(r, pool, page);
+        uint32_t a = off;
+        const uint32_t end = off + uint32_t(n);
+        for (; a < end && (a & 7); a++) __atomic_store_n(base + a, *in++, __ATOMIC_RELAXED);
+        for (; a + 8 <= end; a += 8, in += 8) {
+            uint64_t v;
+            std::memcpy(&v, in, 8);
+            __atomic_store_n(reinterpret_cast<uint64_t*>(base + a), v, __ATOMIC_RELAXED);
+        }
+        for (; a < end; a++) __atomic_store_n(base + a, *in++, __ATOMIC_RELAXED);
         pos += n;
         len -= n;
     }

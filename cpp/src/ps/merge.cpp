@@ -21,18 +21,9 @@ int32_t openSeg(Writer* w, Partition* p, char letter, uint32_t seg, int32_t flag
     return w->io().open(path.c_str(), path.len, flags, cls, out);
 }
 
+// B4: O(log S) lookup and in-order insert (ps/quota.h).
 SegmentInfo* segInfo(Partition* p, uint32_t seg, bool create) {
-    for (auto& s : p->segs)
-        if (s.seg == seg) return &s;
-    if (!create) return nullptr;
-    p->segs.emplace_back();
-    SegmentInfo& si = p->segs.back();
-    si.seg = seg;
-    std::sort(p->segs.begin(), p->segs.end(),
-              [](const SegmentInfo& a, const SegmentInfo& b) { return a.seg < b.seg; });
-    for (auto& s : p->segs)
-        if (s.seg == seg) return &s;
-    return nullptr;
+    return create ? segInsert(p, seg) : segFind(p, seg);
 }
 
 
@@ -167,6 +158,7 @@ int32_t partitionWarm(Writer* w, Partition* p) {
                     segFromDesc(d, &si);
                     p->segs.push_back(std::move(si));
                 }
+                p->ledger.touchAll();  // B4: entries loaded outside open's walk
             }
             w->io().close(&f);
         }
@@ -292,6 +284,8 @@ void removePendingCtl(Partition* p, uint16_t kind) {
 
 bool partitionWantsMerge(const Engine* e, const Partition* p) {
     if (p->nL0 == 0 || p->quarantined) return false;
+    // B4: the RETIRE set is pinned near what a batch carries (reclaim.cpp).
+    if (p->ledger.retireHold) return false;
     // T3: a built compaction waits for no merge in flight to SWAP; new merges
     // wait for it (one commit round).
     if (p->compactPhase == kCompactBuilt || p->compactPhase == kCompactSwapQueued) return false;
@@ -617,11 +611,10 @@ void partitionMergeAbort(Writer* w, Partition* p) {
             PathBuf rp, ap;
             pathPartitionSeg(&rp, w->eng_root(), p->pid, 'r', m.seg, "fsr");
             pathPartitionSeg(&ap, w->eng_root(), p->pid, 'a', m.seg, "fsa");
-            for (auto& s2 : p->segs)
-                if (s2.seg == m.seg) {
-                    w->io().close(&s2.r);
-                    w->io().close(&s2.a);
-                }
+            if (SegmentInfo* s2 = segFind(p, m.seg)) {  // B4: O(log S)
+                w->io().close(&s2->r);
+                w->io().close(&s2->a);
+            }
             w->io().close(&p->rA);
             w->io().close(&p->aA);
             w->io().unlink(rp.c_str(), rp.len, true);
@@ -700,9 +693,7 @@ int32_t partitionMergeStep(Writer* w, Partition* p) {
 // merged L0 blocks and their accelerators. Allocation-free.
 void partitionMergeApply(Writer* w, Partition* p) {
     MergePlan& m = p->mplan;
-    SegmentInfo* si = nullptr;
-    for (auto& s2 : p->segs)
-        if (s2.seg == m.seg) si = &s2;
+    SegmentInfo* si = segFind(p, m.seg);
     if (!si) return;
     si->mergedEnd = m.through + 1;
     si->rLen = m.rLen;
@@ -717,7 +708,11 @@ void partitionMergeApply(Writer* w, Partition* p) {
     ledgerSet(p, retireItem('a', m.seg, 0, m.aLen));
     ledgerSet(p, retireItem('x', m.seg, m.gen, m.run.fileLen));
     ledgerSet(p, retireItem('f', 0, m.gen, m.mfLen));
+    // B4: accelerator bytes move by the folded runs and the new one (a walk
+    // of every run per MERGE_DONE was O(S)).
+    int64_t accel = m.run.run ? int64_t(m.run.run->memoryBytes()) : 0;
     for (uint32_t i = 0; i < m.fold && !si->runs.empty(); i++) {
+        if (si->runs.back().run) accel -= int64_t(si->runs.back().run->memoryBytes());
         w->io().close(&si->runs.back().file);
         si->runs.pop_back();
     }
@@ -746,7 +741,9 @@ void partitionMergeApply(Writer* w, Partition* p) {
         p->chain.freeAll(w->engine()->pool());
     }
     p->mergePhase = kMergeIdle;
-    partitionAccount(p);
+    p->accelBytes.store(uint64_t(std::max<int64_t>(0, int64_t(p->accelBytes.load(std::memory_order_relaxed)) + accel)),
+                        std::memory_order_relaxed);
+    p->laneCount.store(uint32_t(p->lanes.size()), std::memory_order_relaxed);
     w->engine()->cMerges.fetch_add(1, std::memory_order_relaxed);
 }
 

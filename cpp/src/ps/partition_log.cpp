@@ -299,13 +299,15 @@ FileRef* segHandle(Ctx& c, uint32_t seg, char letter);
 // (key, klen, val). Chunked, so any section size works.
 template <typename F>
 int32_t scanL0Section(Ctx& c, const L0Accel& a, const L0Accel::Kind& k, F&& visit) {
-    FileRef* f = mHandleFor(c, a.mSeg);
-    if (!f) return FLATSQL_IO_ERR_IO;
     uint64_t off = 0;
     const uint64_t total = k.entriesBytes;
     uint8_t* buf = c.sc->section;
     const uint64_t cap = c.sc->capSection;
     while (off < total) {
+        // Looked up per chunk: a visit may add a segment entry, and entries
+        // are kept in order (B4), so a pointer into them does not survive it.
+        FileRef* f = mHandleFor(c, a.mSeg);
+        if (!f) return FLATSQL_IO_ERR_IO;
         const uint64_t want = std::min<uint64_t>(cap, total - off);
         const int64_t n = c.io->read(*f, buf, size_t(want), k.entriesOff + off);
         if (n != int64_t(want)) return n < 0 ? int32_t(n) : FLATSQL_IO_ERR_IO;
@@ -872,11 +874,7 @@ bool postTagPostings(Ctx& c, const TagView& t, uint64_t pseq, int64_t epochMs) {
 // Row and handle access (also used by merge and the type owner)
 // ---------------------------------------------------------------------------
 namespace {
-SegmentInfo* findSeg(Partition* p, uint32_t seg) {
-    for (auto& s : p->segs)
-        if (s.seg == seg) return &s;
-    return nullptr;
-}
+SegmentInfo* findSeg(Partition* p, uint32_t seg) { return segFind(p, seg); }  // B4: O(log S)
 
 FileRef* openSegFile(Writer* w, Partition* p, SegmentInfo* si, char letter) {
     FileRef* f = letter == 'r' ? &si->r : letter == 'a' ? &si->a : letter == 'd' ? &si->d : &si->m;
@@ -893,12 +891,7 @@ FileRef* openSegFile(Writer* w, Partition* p, SegmentInfo* si, char letter) {
 
 FileRef* mHandleFor(Ctx& c, uint32_t mSeg) {
     if (mSeg == c.p->mSeg && c.p->m.valid()) return &c.p->m;
-    SegmentInfo* si = findSeg(c.p, mSeg);
-    if (!si) {
-        c.p->segs.emplace_back();
-        si = &c.p->segs.back();
-        si->seg = mSeg;
-    }
+    SegmentInfo* si = segInsert(c.p, mSeg);  // in order (B4: lookups by binary search)
     return openSegFile(c.w, c.p, si, 'm');
 }
 
@@ -925,8 +918,9 @@ int32_t partitionReadRow(Writer* w, Partition* p, uint64_t pseq, RecRow* out) {
         }
         return FLATSQL_IO_ERR_NOENT;
     }
-    for (auto& si : p->segs) {
-        if (pseq >= si.firstPseq && pseq < si.mergedEnd) {
+    if (SegmentInfo* sp = segForPseq(p, pseq)) {  // B4: O(log S)
+        SegmentInfo& si = *sp;
+        {
             uint64_t off = (pseq - si.firstPseq) * sizeof(RecRow);
             if (si.cgen) {
                 // Compacted (T3): a pseq the directory lacks was removed.
@@ -1803,11 +1797,10 @@ void tombRangeStep(Ctx& c) {
         } else if (tr.seg == p->dSeg) {
             tr.next = p->segFirstPseq;  // the active segment, as of now
             tr.end = p->pseqHi + 1;
-        } else {
-            for (const auto& si : p->segs) {
-                if (si.seg != tr.seg || !si.sealed) continue;
-                tr.next = si.firstPseq;
-                tr.end = si.endPseq;
+        } else if (const SegmentInfo* si = segFind(p, tr.seg)) {
+            if (si->sealed) {
+                tr.next = si->firstPseq;
+                tr.end = si->endPseq;
             }
         }
     }
@@ -1938,6 +1931,7 @@ bool partitionStage(Writer* w, Partition* p, StageScratch* sc, Arena* frames, Ar
                                    : 0;
             tHotPathDepth = saved;
             if (!len) {
+                bookRetireOverflow(p);  // B4: counted; the valve keeps the set under a batch
                 c.err = FLATSQL_IO_ERR_GENERIC;  // the set outgrew a batch: reclaim shrinks it first
             } else {
                 putU16(sc->ctl + sc->ctlBytes, kCtlRetire);
@@ -2395,26 +2389,12 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         }
         // Compaction trigger (§11): dead frame bytes per segment.
         for (uint32_t i = 0; i < st->nDeadSeg; i++) {
-            SegmentInfo* dsi = nullptr;
-            for (auto& s2 : p->segs) {
-                const uint32_t last = s2.lastSeg ? s2.lastSeg : s2.seg;
-                if (st->deadSeg[i] >= s2.seg && st->deadSeg[i] <= last) dsi = &s2;
-            }
-            if (!dsi) {
-                const int saved = tHotPathDepth;
-                tHotPathDepth = 0;
-                p->segs.emplace_back();
-                p->segs.back().seg = st->deadSeg[i];
-                std::sort(p->segs.begin(), p->segs.end(),
-                          [](const SegmentInfo& a, const SegmentInfo& b) { return a.seg < b.seg; });
-                tHotPathDepth = saved;
-                for (auto& s2 : p->segs)
-                    if (s2.seg == st->deadSeg[i]) dsi = &s2;
-            }
-            if (dsi) {
-                dsi->deadBytes += st->deadSegBytes[i];
-                dsi->deadRows++;
-            }
+            // B4: O(log S) per dead segment (was a walk of every segment).
+            SegmentInfo* dsi = segCovering(p, st->deadSeg[i]);
+            if (!dsi) dsi = segInsert(p, st->deadSeg[i]);
+            dsi->deadBytes += st->deadSegBytes[i];
+            dsi->deadRows++;
+            bookTouch(p, dsi->seg);  // compaction candidates (§11)
         }
         if (st->laneCkptOff) {
             p->lanesOverflowSeg = st->mSeg;
@@ -2464,13 +2444,9 @@ void partitionPublish(Writer* w, Partition* p, Staged* st) {
         if (st->sealAfter) {
             // Switch the active segment (minor 3: segment numbers come from
             // the durable batch).
-            SegmentInfo* si = nullptr;
-            for (auto& s : p->segs)
-                if (s.seg == p->dSeg) si = &s;
+            SegmentInfo* si = segFind(p, p->dSeg);  // B4: O(log S)
             if (!si) {
-                p->segs.emplace_back();
-                si = &p->segs.back();
-                si->seg = p->dSeg;
+                si = segInsert(p, p->dSeg);
                 si->firstPseq = p->segFirstPseq;
                 si->mergedEnd = p->segFirstPseq;
             }

@@ -168,6 +168,11 @@ inline uint64_t pageTag(uint64_t page, uint32_t slab) { return ((page + 1) << 32
 
 // Copy len bytes of the ring stream starting at pos into dst (straddles pages).
 void ringRead(const RingDesc* r, const SlabPool& pool, uint64_t pos, void* dst, size_t len);
+// ringRead for a reader that does not own the entry (a stage-1 helper): the
+// bytes may be released and rewritten while it copies, so they are loaded as
+// relaxed atomic 8-byte words (within the slab) and copied out of those. The
+// result may be garbage; it is never undefined behaviour.
+void ringReadShared(const RingDesc* r, const SlabPool& pool, uint64_t pos, void* dst, size_t len);
 void ringWrite(RingDesc* r, const SlabPool& pool, uint64_t pos, const void* src, size_t len);
 // Pointer to pos when [pos, pos+len) lies inside one page, else nullptr.
 const uint8_t* ringContiguous(const RingDesc* r, const SlabPool& pool, uint64_t pos, size_t len);

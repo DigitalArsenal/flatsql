@@ -7,6 +7,10 @@
 // computed in the helper writer's staging scratch.
 #include <algorithm>
 
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
+
 #include "internal.h"
 
 namespace flatsql {
@@ -102,8 +106,12 @@ void prepCompute(Engine* e, Partition* p, StageScratch* sc, uint64_t pos, uint32
     out->hintN = 0;
     const TypeConfig* cfg = p->type ? p->type->cfg.get() : nullptr;
     if (!cfg || entryLen < sizeof(EntryHeader)) return;
+    // A helper reads entries the owner may consume, and a producer then
+    // overwrite, while it reads (after a steal: its result is dropped). Every
+    // read is a copy by atomic word loads (ringReadShared), never a pointer
+    // into the ring: what it parses is its own bytes, garbage or not.
     EntryHeader h;
-    ringRead(p->ring, e->pool(), pos, &h, sizeof(h));
+    ringReadShared(p->ring, e->pool(), pos, &h, sizeof(h));
     if (h.entryLen != entryLen || h.kind != kEntRecord) return;
     const bool sealed = h.flags & kEntSealed;
     const uint64_t attrPos = pos + sizeof(EntryHeader);
@@ -112,19 +120,16 @@ void prepCompute(Engine* e, Partition* p, StageScratch* sc, uint64_t pos, uint32
     if (sizeof(EntryHeader) + uint64_t(h.attrLen) + h.frameLen + (sealed ? 4 : 0) > h.entryLen) return;
     if (sealed) {
         uint8_t b[4];
-        ringRead(p->ring, e->pool(), framePos + h.frameLen, b, 4);
+        ringReadShared(p->ring, e->pool(), framePos + h.frameLen, b, 4);
         sealedLen = getU32(b);
         if (sizeof(EntryHeader) + uint64_t(h.attrLen) + h.frameLen + 4 + sealedLen > h.entryLen) return;
     }
     if (h.frameLen < 4 || h.frameLen > sc->capPlain || h.attrLen > 65536 ||
         pad8(h.frameLen) + h.attrLen + 8 > sc->capPlain)
         return;
-    // Plaintext frame, contiguous; the attribute after it in scratch.
-    const uint8_t* plain = ringContiguous(p->ring, e->pool(), framePos, h.frameLen);
-    if (!plain) {
-        ringRead(p->ring, e->pool(), framePos, sc->plain, h.frameLen);
-        plain = sc->plain;
-    }
+    // Plaintext frame in scratch; the attribute after it.
+    ringReadShared(p->ring, e->pool(), framePos, sc->plain, h.frameLen);
+    const uint8_t* plain = sc->plain;
     out->valid = 1;
     int32_t rc = cfg->checkFrame(plain, h.frameLen);
     if (rc) {
@@ -148,12 +153,8 @@ void prepCompute(Engine* e, Partition* p, StageScratch* sc, uint64_t pos, uint32
         out->rowFlags |= kRowCidVerified;
     }
     if (h.attrLen) {
-        const uint8_t* attr = ringContiguous(p->ring, e->pool(), attrPos, h.attrLen);
-        if (!attr) {
-            uint8_t* dst = sc->plain + (plain == sc->plain ? pad8(h.frameLen) : 0);
-            ringRead(p->ring, e->pool(), attrPos, dst, h.attrLen);
-            attr = dst;
-        }
+        uint8_t* attr = sc->plain + pad8(h.frameLen);
+        ringReadShared(p->ring, e->pool(), attrPos, attr, h.attrLen);
         AttrView av;
         if (!parseAttr(attr, h.attrLen, &av)) {
             out->reject = kRejAttr;
@@ -232,7 +233,7 @@ void prepCompute(Engine* e, Partition* p, StageScratch* sc, uint64_t pos, uint32
         uint8_t buf[4096];
         while (left) {
             const size_t n = size_t(std::min<uint64_t>(left, sizeof(buf)));
-            ringRead(p->ring, e->pool(), at, buf, n);
+            ringReadShared(p->ring, e->pool(), at, buf, n);
             crc = crc32c(crc, buf, n);
             at += n;
             left -= n;
@@ -247,15 +248,28 @@ void prepCompute(Engine* e, Partition* p, StageScratch* sc, uint64_t pos, uint32
 
 void prepPublishRuns(Writer* w, Partition* p) {
     PrepWindow& pw = *p->prep;
-    uint64_t sig = 0x72756e73ull;
-    uint32_t n = 0;
-    for (const auto& si : p->segs)
-        for (const auto& run : si.runs) {
-            uint64_t v[3] = {si.seg, run.gen, run.fileLen};
-            sig = hash64(v, sizeof(v), sig);
-            n++;
+    // B4: the run set changes only with the manifest (a MERGE_DONE or a SWAP
+    // commits a new generation with it), so its generation signs the set; a
+    // walk of every run on every commit of a split partition was O(S).
+    const uint64_t gen = p->manifestGen;
+    const uint64_t sig = hash64(&gen, sizeof(gen), 0x72756e73ull);
+    if (gBookCheck.load(std::memory_order_relaxed)) {
+        uint64_t walk = 0x72756e73ull;
+        for (const auto& si : p->segs)
+            for (const auto& run : si.runs) {
+                uint64_t v[3] = {si.seg, run.gen, run.fileLen};
+                walk = hash64(v, sizeof(v), walk);
+            }
+        PartitionLedger& L = p->ledger;
+        if (L.prepSeen && L.prepGen == p->manifestGen && L.prepWalkSig != walk) {
+            std::fprintf(stderr, "flatsql ps bookkeeping check failed: run set changed at manifest %u (pid %u)\n",
+                         p->manifestGen, p->pid);
+            std::abort();
         }
-    sig = hash64(&n, sizeof(n), sig);
+        L.prepSeen = true;
+        L.prepGen = p->manifestGen;
+        L.prepWalkSig = walk;
+    }
     uint64_t l0v[3] = {p->nL0, p->nL0 ? p->l0[0].firstPseq : 0,
                        p->nL0 ? p->l0[p->nL0 - 1].firstPseq + p->l0[p->nL0 - 1].nRows : 0};
     const uint64_t l0Sig = hash64(l0v, sizeof(l0v), 0x6c30);
@@ -289,15 +303,24 @@ void prepPublishRuns(Writer* w, Partition* p) {
     }
     if (all && p->nL0) rs->l0Through = p->l0[p->nL0 - 1].firstPseq + p->l0[p->nL0 - 1].nRows - 1;
     else rs->l0.clear();
-    rs->runs.reserve(n);
-    for (const auto& si : p->segs)
-        for (const auto& run : si.runs) {
-            PrepRunDesc d;
-            d.seg = si.seg;
-            d.gen = run.gen;
-            d.fileLen = run.fileLen;
-            rs->runs.push_back(d);
-        }
+    const std::shared_ptr<const PrepRunSet> prev = std::atomic_load(&pw.runSet);
+    if (prev && sig == pw.runSig) {
+        rs->runs = prev->runs;  // same manifest: the same runs (no copy)
+    } else {
+        size_t n = 0;
+        for (const auto& si : p->segs) n += si.runs.size();  // once per manifest generation
+        auto v = std::make_shared<std::vector<PrepRunDesc>>();
+        v->reserve(n);
+        for (const auto& si : p->segs)
+            for (const auto& run : si.runs) {
+                PrepRunDesc d;
+                d.seg = si.seg;
+                d.gen = run.gen;
+                d.fileLen = run.fileLen;
+                v->push_back(d);
+            }
+        rs->runs = std::move(v);
+    }
     std::atomic_store(&pw.runSet, std::shared_ptr<const PrepRunSet>(std::move(rs)));
     tHotPathDepth = saved;
     pw.runSig = sig;
@@ -319,9 +342,9 @@ void prepPublish(Writer* w, Partition* p) {
         // The slot's previous ordinal (ord - kPrepSlots) is taken, so no
         // helper can be writing it (the owner never takes a WRITING entry).
         PrepSlot& s = pw.slots[ord % kPrepSlots];
-        s.pos = pos;
-        s.len = h.entryLen;
-        s.kind = h.kind;
+        s.pos.store(pos, std::memory_order_relaxed);
+        s.len.store(h.entryLen, std::memory_order_relaxed);
+        s.kind.store(h.kind, std::memory_order_relaxed);
         s.state.store(prepWord(ord, kPrepFree), std::memory_order_release);
         pos += h.entryLen;
         ord++;
@@ -379,7 +402,7 @@ bool takeOne(Writer* w, Partition* p, bool wantResult) {
             }
         }
         pw.takeOrd = k + 1;
-        pw.takePos = s.pos + s.len;
+        pw.takePos = s.pos.load(std::memory_order_relaxed) + s.len.load(std::memory_order_relaxed);
     }
     // Helpers skip what the owner already passed.
     uint64_t c = pw.claim.load(std::memory_order_relaxed);
@@ -396,7 +419,7 @@ const PrepResult* prepTake(Writer* w, Partition* p, uint64_t pos) {
     const bool ready = takeOne(w, p, true);
     if (pw.takeOrd != k + 1) return nullptr;  // not published (cannot happen for a staged entry)
     PrepSlot& s = pw.slots[k % kPrepSlots];
-    if (!ready || s.pos != pos || !s.r.valid) return nullptr;
+    if (!ready || s.pos.load(std::memory_order_relaxed) != pos || !s.r.valid) return nullptr;
     pw.used.fetch_add(1, std::memory_order_relaxed);
     return &s.r;
 }
@@ -432,24 +455,27 @@ std::shared_ptr<const PrepHelperView> helperRuns(Engine* e, Partition* p) {
     nv->version = rs->version;
     nv->io = e->helperIo();
     IoCtx* io = nv->io;
-    for (const PrepRunDesc& d : rs->runs) {
+    // B4: the previous view's runs by (seg, gen), so reuse is found in O(1)
+    // per run (a scan of the old view per run was O(runs^2) per run set).
+    std::unordered_map<uint64_t, const PrepHelperRun*> old;
+    if (hv) {
+        old.reserve(hv->runs.size());
+        for (const PrepHelperRun& o : hv->runs) old.emplace(uint64_t(o.seg) << 32 | o.gen, &o);
+    }
+    for (const PrepRunDesc& d : *rs->runs) {
         PrepHelperRun hr;
         hr.seg = d.seg;
         hr.gen = d.gen;
         hr.fileLen = d.fileLen;
         bool reused = false;
-        if (hv) {
-            for (const PrepHelperRun& o : hv->runs) {
-                if (o.seg == d.seg && o.gen == d.gen && o.fileLen == d.fileLen) {
-                    // Share the accelerator, own a handle (the old view closes its own).
-                    hr.run = o.run;
-                    PathBuf rp;
-                    pathPartitionRun(&rp, e->root().c_str(), p->pid, d.seg, d.gen);
-                    if (io->open(rp.c_str(), rp.len, FLATSQL_IO_READ, FileClass::Index, &hr.file) < 0) return nullptr;
-                    reused = true;
-                    break;
-                }
-            }
+        auto it = old.find(uint64_t(d.seg) << 32 | d.gen);
+        if (it != old.end() && it->second->fileLen == d.fileLen) {
+            // Share the accelerator, own a handle (the old view closes its own).
+            hr.run = it->second->run;
+            PathBuf rp;
+            pathPartitionRun(&rp, e->root().c_str(), p->pid, d.seg, d.gen);
+            if (io->open(rp.c_str(), rp.len, FLATSQL_IO_READ, FileClass::Index, &hr.file) < 0) return nullptr;
+            reused = true;
         }
         if (!reused) {
             PathBuf rp;
@@ -496,9 +522,9 @@ uint32_t Engine::prepHelp(Writer* w, uint32_t budget) {
             uint64_t expect = prepWord(k, kPrepFree);
             if (!s.state.compare_exchange_strong(expect, prepWord(k, kPrepClaimed), std::memory_order_acq_rel))
                 continue;  // the owner took it
-            const uint64_t pos = s.pos;
-            const uint32_t len = s.len;
-            const uint16_t kind = s.kind;
+            const uint64_t pos = s.pos.load(std::memory_order_relaxed);
+            const uint32_t len = s.len.load(std::memory_order_relaxed);
+            const uint16_t kind = s.kind.load(std::memory_order_relaxed);
             if (cfg_.testPrepStallNs && cfg_.testPrepStallEvery &&
                 prepClaims_.fetch_add(1, std::memory_order_relaxed) % cfg_.testPrepStallEvery == 0) {
                 cPrepStalls.fetch_add(1, std::memory_order_relaxed);

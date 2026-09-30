@@ -1,6 +1,8 @@
 // FlatSQL partition store: the quota planner, the space emergency and the
 // ballast (design §13, A13, owner decision §22.4-3; see ps/quota.h).
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <set>
 #include <tuple>
 
@@ -40,7 +42,7 @@ struct QuotaState {
 };
 
 // ---------------------------------------------------------------------------
-// Published inputs
+// Published inputs (B4: incremental; see PartitionLedger in ps/quota.h)
 // ---------------------------------------------------------------------------
 uint64_t segmentDiskBytes(const Partition* p, const SegmentInfo& s) {
     uint64_t b = 0;
@@ -53,34 +55,425 @@ uint64_t segmentDiskBytes(const Partition* p, const SegmentInfo& s) {
     return b;
 }
 
-void partitionPublishSummary(Partition* p) {
-    const int saved = tHotPathDepth;
-    tHotPathDepth = 0;  // a maintenance event (seal, merge, SWAP)
+namespace {
+bool summarized(const SegmentInfo& s) { return s.sealed && s.firstPseq && s.endPseq > s.firstPseq; }
+
+SegSummary summaryOf(const Partition* p, const SegmentInfo& s) {
+    SegSummary x;
+    x.pid = p->pid;
+    x.seg = s.seg;
+    x.lastSeg = s.lastSeg ? s.lastSeg : s.seg;
+    x.cgen = s.cgen;
+    x.minArrival = s.minArrival;
+    x.maxArrival = s.maxArrival;
+    x.firstPseq = s.firstPseq;
+    x.endPseq = s.endPseq;
+    x.bytes = segmentDiskBytes(p, s);
+    x.empty = s.empty;
+    return x;
+}
+
+std::vector<SegSummary> summaryWalk(const Partition* p) {
     std::vector<SegSummary> v;
     v.reserve(p->segs.size());
-    for (const auto& s : p->segs) {
-        if (!s.sealed || !s.firstPseq || s.endPseq <= s.firstPseq) continue;
-        SegSummary x;
-        x.pid = p->pid;
-        x.seg = s.seg;
-        x.lastSeg = s.lastSeg ? s.lastSeg : s.seg;
-        x.cgen = s.cgen;
-        x.minArrival = s.minArrival;
-        x.maxArrival = s.maxArrival;
-        x.firstPseq = s.firstPseq;
-        x.endPseq = s.endPseq;
-        x.bytes = segmentDiskBytes(p, s);
-        x.empty = s.empty;
-        v.push_back(x);
-    }
-    uint64_t retired = 0;
-    for (const auto& r : p->retired) retired += r.it.size;
-    {
+    for (const auto& s : p->segs)
+        if (summarized(s)) v.push_back(summaryOf(p, s));
+    return v;
+}
+
+bool sameSummary(const SegSummary& a, const SegSummary& b) {
+    return a.pid == b.pid && a.seg == b.seg && a.lastSeg == b.lastSeg && a.cgen == b.cgen &&
+           a.minArrival == b.minArrival && a.maxArrival == b.maxArrival && a.firstPseq == b.firstPseq &&
+           a.endPseq == b.endPseq && a.bytes == b.bytes && a.empty == b.empty;
+}
+
+[[noreturn]] void bookFail(const char* what, uint32_t pid, uint64_t key) {
+    std::fprintf(stderr, "flatsql ps bookkeeping check failed: %s (pid %u, key %llu)\n", what, pid,
+                 (unsigned long long)key);
+    std::abort();
+}
+
+size_t summaryPos(const std::vector<SegSummary>& v, uint32_t seg) {
+    return size_t(std::lower_bound(v.begin(), v.end(), seg,
+                                   [](const SegSummary& x, uint32_t k) { return x.seg < k; }) -
+                  v.begin());
+}
+}  // namespace
+
+std::atomic<int> gBookTime{0};
+LockHist& bookSummaryHist() {
+    static LockHist h;
+    return h;
+}
+LockHist& bookPickHist() {
+    static LockHist h;
+    return h;
+}
+
+// The planner's view of the partition's sealed segments. Only segments the
+// change feed names are recomputed (O(changed x log S) per commit); open
+// rebuilds it in one walk.
+void partitionPublishSummary(Partition* p) {
+    const uint64_t t0 = gBookTime.load(std::memory_order_relaxed) ? monoNs() : 0;
+    const int saved = tHotPathDepth;
+    tHotPathDepth = 0;  // a maintenance event (seal, merge, SWAP)
+    PartitionLedger& L = p->ledger;
+    if (L.sumAll) {
+        std::vector<SegSummary> v = summaryWalk(p);
+        {
+            std::lock_guard<std::mutex> g(p->sumMu);
+            p->summary.swap(v);
+        }
+        L.sumAll = false;
+        L.sumDirty.clear();
+    } else if (!L.sumDirty.empty()) {
+        std::vector<uint32_t>& d = L.sumDirty;
+        std::sort(d.begin(), d.end());
+        d.erase(std::unique(d.begin(), d.end()), d.end());
+        struct Up {
+            uint32_t seg;
+            uint32_t coverEnd;  // a coalesced output replaces entries up to here
+            bool present;
+            SegSummary x;
+        };
+        std::vector<Up> ups;
+        ups.reserve(d.size());
+        for (const uint32_t seg : d) {
+            Up u;
+            u.seg = seg;
+            const SegmentInfo* s = segFind(p, seg);
+            u.present = s && summarized(*s);
+            u.coverEnd = s && s->lastSeg > seg ? s->lastSeg : seg;
+            if (u.present) u.x = summaryOf(p, *s);
+            ups.push_back(u);
+        }
         std::lock_guard<std::mutex> g(p->sumMu);
-        p->summary.swap(v);
+        std::vector<SegSummary>& v = p->summary;
+        for (const Up& u : ups) {
+            size_t i = summaryPos(v, u.seg);
+            const bool have = i < v.size() && v[i].seg == u.seg;
+            if (u.coverEnd > u.seg) {
+                const size_t a = have ? i + 1 : i;
+                size_t b = a;
+                while (b < v.size() && v[b].seg <= u.coverEnd) b++;
+                if (b > a) v.erase(v.begin() + long(a), v.begin() + long(b));
+            }
+            if (u.present) {
+                if (have) v[i] = u.x;
+                else v.insert(v.begin() + long(i), u.x);
+            } else if (have) {
+                v.erase(v.begin() + long(i));
+            }
+        }
+        d.clear();
     }
-    p->retiredBytesPub.store(retired, std::memory_order_relaxed);
+    p->retiredBytesPub.store(L.retiredBytes, std::memory_order_relaxed);
+    if (gBookCheck.load(std::memory_order_relaxed)) {
+        const std::vector<SegSummary> ref = summaryWalk(p);
+        uint64_t retired = 0;
+        for (const auto& r : p->retired) retired += r.it.size;
+        if (retired != L.retiredBytes) bookFail("retired bytes", p->pid, retired);
+        if (L.bytesWalk() != p->ledgerBytes) bookFail("ledger bytes", p->pid, p->ledgerBytes);
+        uint64_t accel = 0;
+        for (const auto& si : p->segs)
+            for (const auto& r : si.runs)
+                if (r.run) accel += r.run->memoryBytes();
+        if (accel != p->accelBytes.load(std::memory_order_relaxed)) bookFail("accelerator bytes", p->pid, accel);
+        std::lock_guard<std::mutex> g(p->sumMu);
+        if (ref.size() != p->summary.size()) bookFail("summary size", p->pid, ref.size());
+        for (size_t i = 0; i < ref.size(); i++)
+            if (!sameSummary(ref[i], p->summary[i])) bookFail("summary entry", p->pid, ref[i].seg);
+    }
     tHotPathDepth = saved;
+    if (t0) bookSummaryHist().record(monoNs() - t0);
+}
+
+// ---------------------------------------------------------------------------
+// Compaction candidates (B4): compaction.cpp's selection rules over an index
+// kept from the change feed, instead of a walk of every segment every look.
+// ---------------------------------------------------------------------------
+namespace {
+bool hasPendingL0B(const Partition* p, const SegmentInfo& s) {
+    const uint32_t last = s.lastSeg ? s.lastSeg : s.seg;
+    for (uint32_t i = 0; i < p->nL0; i++)
+        if (p->l0[i].mSeg >= s.seg && p->l0[i].mSeg <= last) return true;
+    return false;
+}
+
+// A sealed, fully merged segment with no L0 block left: compactable.
+bool compactableB(const Partition* p, const SegmentInfo& s) {
+    return s.sealed && s.endPseq > s.firstPseq && s.firstPseq && s.mergedEnd == s.endPseq &&
+           (s.empty || s.cgen || !s.runs.empty()) && !hasPendingL0B(p, s);
+}
+
+double deadShare(const SegmentInfo& s) {
+    const uint64_t data = s.dLen ? s.dLen : 1;
+    return double(s.deadBytes) / double(data);
+}
+
+bool deadQualifies(const Partition* p, const SegmentInfo& s, double ratio) {
+    return compactableB(p, s) && !s.empty && deadShare(s) >= ratio;
+}
+
+bool smallSeg(const Partition* p, const SegmentInfo& s, uint64_t smallBytes, uint64_t* sz) {
+    *sz = segmentDiskBytes(p, s);
+    return compactableB(p, s) && *sz < smallBytes;
+}
+
+// The candidate state of entry i, and the sets updated to it.
+void candUpdate(Partition* p, size_t i) {
+    PartitionLedger& L = p->ledger;
+    const SegmentInfo& s = p->segs[i];
+    PartitionLedger::Cand c;
+    const bool comp = compactableB(p, s);
+    c.share = deadShare(s);
+    // Step 1's best needs a share above 0 too (the walk started from 0), while
+    // its neighbours join at the ratio alone (deadQualifies).
+    c.dead = comp && !s.empty && c.share >= L.ratio && c.share > 0;
+    c.survey = comp && !s.empty && !s.deadRows;
+    uint64_t sz = 0, sz2 = 0;
+    if (L.maxInputs >= 2 && i + 1 < p->segs.size() && smallSeg(p, s, L.smallBytes, &sz)) {
+        const SegmentInfo& n = p->segs[i + 1];
+        c.pair = n.firstPseq == s.endPseq && smallSeg(p, n, L.smallBytes, &sz2) && sz + sz2 <= L.maxOutBytes;
+    }
+    auto it = L.cand.find(s.seg);
+    if (it != L.cand.end()) {
+        const PartitionLedger::Cand& o = it->second;
+        if (o.dead && (!c.dead || o.share != c.share)) L.deadQ.erase(std::make_pair(-o.share, s.seg));
+        if (o.pair && !c.pair) L.pairStarts.erase(s.seg);
+        if (o.survey && !c.survey) L.survey.erase(s.seg);
+        if (c.dead && (!o.dead || o.share != c.share)) L.deadQ.insert(std::make_pair(-c.share, s.seg));
+        if (c.pair && !o.pair) L.pairStarts.insert(s.seg);
+        if (c.survey && !o.survey) L.survey.insert(s.seg);
+        if (!c.dead && !c.pair && !c.survey) L.cand.erase(it);
+        else it->second = c;
+        return;
+    }
+    if (!c.dead && !c.pair && !c.survey) return;
+    if (c.dead) L.deadQ.insert(std::make_pair(-c.share, s.seg));
+    if (c.pair) L.pairStarts.insert(s.seg);
+    if (c.survey) L.survey.insert(s.seg);
+    L.cand.emplace(s.seg, c);
+}
+
+void candRemove(PartitionLedger& L, uint32_t seg) {
+    auto it = L.cand.find(seg);
+    if (it == L.cand.end()) return;
+    if (it->second.dead) L.deadQ.erase(std::make_pair(-it->second.share, seg));
+    if (it->second.pair) L.pairStarts.erase(seg);
+    if (it->second.survey) L.survey.erase(seg);
+    L.cand.erase(it);
+}
+
+void candRefresh(const EngineConfig& cfg, Partition* p) {
+    PartitionLedger& L = p->ledger;
+    if (L.ratio != cfg.compactDeadRatio || L.smallBytes != cfg.compactSmallBytes ||
+        L.maxOutBytes != cfg.compactMaxOutputBytes || L.maxInputs != cfg.compactMaxInputs) {
+        L.ratio = cfg.compactDeadRatio;
+        L.smallBytes = cfg.compactSmallBytes;
+        L.maxOutBytes = cfg.compactMaxOutputBytes;
+        L.maxInputs = cfg.compactMaxInputs;
+        L.candAll = true;
+    }
+    if (L.candAll) {
+        L.cand.clear();
+        L.deadQ.clear();
+        L.pairStarts.clear();
+        L.survey.clear();
+        for (size_t i = 0; i < p->segs.size(); i++) candUpdate(p, i);
+        L.candAll = false;
+        L.candDirty.clear();
+        return;
+    }
+    if (L.candDirty.empty()) return;
+    std::vector<uint32_t>& d = L.candDirty;
+    std::sort(d.begin(), d.end());
+    d.erase(std::unique(d.begin(), d.end()), d.end());
+    for (const uint32_t seg : d) {
+        const size_t i = size_t(std::lower_bound(p->segs.begin(), p->segs.end(), seg,
+                                                 [](const SegmentInfo& s, uint32_t v) { return s.seg < v; }) -
+                                p->segs.begin());
+        if (i < p->segs.size() && p->segs[i].seg == seg) candUpdate(p, i);
+        else candRemove(L, seg);
+        // The entry before it pairs with whatever follows it now.
+        if (i > 0) candUpdate(p, i - 1);
+    }
+    d.clear();
+}
+
+// compaction.cpp's pickCandidate before B4, kept as the reference the tests
+// check the index against (gBookCheck).
+bool pickCandidateWalk(const EngineConfig& cfg, const Partition* p, uint32_t* seg, uint32_t* segEnd) {
+    const SegmentInfo* best = nullptr;
+    double bestShare = 0;
+    for (const auto& s : p->segs) {
+        if (!compactableB(p, s) || s.empty) continue;
+        const double share = deadShare(s);
+        if (share >= cfg.compactDeadRatio && share > bestShare) {
+            best = &s;
+            bestShare = share;
+        }
+    }
+    if (best) {
+        auto qualifies = [&](const SegmentInfo& s) { return deadQualifies(p, s, cfg.compactDeadRatio); };
+        size_t lo = size_t(best - p->segs.data()), hi = lo;
+        uint64_t bytes = segmentDiskBytes(p, *best);
+        for (bool grown = true; grown;) {
+            grown = false;
+            if (hi - lo + 1 < cfg.compactMaxInputs && hi + 1 < p->segs.size()) {
+                const SegmentInfo& n = p->segs[hi + 1];
+                const uint64_t nb = segmentDiskBytes(p, n);
+                if (n.firstPseq == p->segs[hi].endPseq && qualifies(n) && bytes + nb <= cfg.compactMaxOutputBytes) {
+                    hi++;
+                    bytes += nb;
+                    grown = true;
+                }
+            }
+            if (hi - lo + 1 < cfg.compactMaxInputs && lo > 0) {
+                const SegmentInfo& n = p->segs[lo - 1];
+                const uint64_t nb = segmentDiskBytes(p, n);
+                if (p->segs[lo].firstPseq == n.endPseq && qualifies(n) && bytes + nb <= cfg.compactMaxOutputBytes) {
+                    lo--;
+                    bytes += nb;
+                    grown = true;
+                }
+            }
+        }
+        *seg = p->segs[lo].seg;
+        *segEnd = p->segs[hi].lastSeg ? p->segs[hi].lastSeg : p->segs[hi].seg;
+        return true;
+    }
+    const SegmentInfo* runStart = nullptr;
+    const SegmentInfo* runEnd = nullptr;
+    uint32_t n = 0;
+    uint64_t bytes = 0, prevEnd = 0;
+    for (const auto& s : p->segs) {
+        uint64_t sz = 0;
+        const bool small = smallSeg(p, s, cfg.compactSmallBytes, &sz);
+        if (small && runStart && s.firstPseq == prevEnd && n < cfg.compactMaxInputs &&
+            bytes + sz <= cfg.compactMaxOutputBytes) {
+            runEnd = &s;
+            n++;
+            bytes += sz;
+        } else if (small) {
+            if (runStart && n >= 2) break;
+            runStart = runEnd = &s;
+            n = 1;
+            bytes = sz;
+        } else {
+            if (runStart && n >= 2) break;
+            runStart = runEnd = nullptr;
+            n = 0;
+            bytes = 0;
+        }
+        prevEnd = s.endPseq;
+    }
+    if (runStart && n >= 2) {
+        *seg = runStart->seg;
+        *segEnd = runEnd->lastSeg ? runEnd->lastSeg : runEnd->seg;
+        return true;
+    }
+    // By value: the counters are packed, and std::min binds references.
+    const uint64_t total = p->counters.totalBytes, live = p->counters.liveBytes;
+    if (total && double(total - std::min(total, live)) >= cfg.compactDeadRatio * double(total)) {
+        for (const auto& s : p->segs) {
+            if (!compactableB(p, s) || s.empty || s.deadRows) continue;
+            *seg = s.seg;
+            *segEnd = s.lastSeg ? s.lastSeg : s.seg;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool pickFromIndex(const EngineConfig& cfg, Partition* p, uint32_t* seg, uint32_t* segEnd) {
+    PartitionLedger& L = p->ledger;
+    auto indexOf = [&](uint32_t sg) {
+        return size_t(std::lower_bound(p->segs.begin(), p->segs.end(), sg,
+                                       [](const SegmentInfo& s, uint32_t v) { return s.seg < v; }) -
+                      p->segs.begin());
+    };
+    // 1. The sealed segment with the largest dead share past the ratio (the
+    // lowest id among equals), grown by qualifying neighbours.
+    if (!L.deadQ.empty()) {
+        const size_t b = indexOf(L.deadQ.begin()->second);
+        auto qualifies = [&](const SegmentInfo& s) { return deadQualifies(p, s, cfg.compactDeadRatio); };
+        size_t lo = b, hi = b;
+        uint64_t bytes = segmentDiskBytes(p, p->segs[b]);
+        for (bool grown = true; grown;) {
+            grown = false;
+            if (hi - lo + 1 < cfg.compactMaxInputs && hi + 1 < p->segs.size()) {
+                const SegmentInfo& n = p->segs[hi + 1];
+                const uint64_t nb = segmentDiskBytes(p, n);
+                if (n.firstPseq == p->segs[hi].endPseq && qualifies(n) && bytes + nb <= cfg.compactMaxOutputBytes) {
+                    hi++;
+                    bytes += nb;
+                    grown = true;
+                }
+            }
+            if (hi - lo + 1 < cfg.compactMaxInputs && lo > 0) {
+                const SegmentInfo& n = p->segs[lo - 1];
+                const uint64_t nb = segmentDiskBytes(p, n);
+                if (p->segs[lo].firstPseq == n.endPseq && qualifies(n) && bytes + nb <= cfg.compactMaxOutputBytes) {
+                    lo--;
+                    bytes += nb;
+                    grown = true;
+                }
+            }
+        }
+        *seg = p->segs[lo].seg;
+        *segEnd = p->segs[hi].lastSeg ? p->segs[hi].lastSeg : p->segs[hi].seg;
+        return true;
+    }
+    // 2. The first run of adjacent small segments, from the first pair start.
+    if (!L.pairStarts.empty()) {
+        size_t i = indexOf(*L.pairStarts.begin());
+        uint64_t bytes = 0;
+        (void)smallSeg(p, p->segs[i], cfg.compactSmallBytes, &bytes);
+        uint32_t n = 1;
+        size_t end = i;
+        for (size_t j = i + 1; j < p->segs.size(); j++) {
+            uint64_t sz = 0;
+            if (!smallSeg(p, p->segs[j], cfg.compactSmallBytes, &sz) || p->segs[j].firstPseq != p->segs[j - 1].endPseq ||
+                n >= cfg.compactMaxInputs || bytes + sz > cfg.compactMaxOutputBytes)
+                break;
+            end = j;
+            n++;
+            bytes += sz;
+        }
+        *seg = p->segs[i].seg;
+        *segEnd = p->segs[end].lastSeg ? p->segs[end].lastSeg : p->segs[end].seg;
+        return true;
+    }
+    // 3. After a restart: the oldest segment not surveyed, when the partition
+    // as a whole is past the ratio.
+    const uint64_t total = p->counters.totalBytes, live = p->counters.liveBytes;  // by value (packed)
+    if (!L.survey.empty() && total &&
+        double(total - std::min(total, live)) >= cfg.compactDeadRatio * double(total)) {
+        const SegmentInfo& s = p->segs[indexOf(*L.survey.begin())];
+        *seg = s.seg;
+        *segEnd = s.lastSeg ? s.lastSeg : s.seg;
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
+bool bookPickCandidate(const Engine* e, Partition* p, uint32_t* seg, uint32_t* segEnd) {
+    const uint64_t t0 = gBookTime.load(std::memory_order_relaxed) ? monoNs() : 0;
+    const EngineConfig& cfg = e->config();
+    const int saved = tHotPathDepth;
+    tHotPathDepth = 0;  // maintenance (a look every 50 ms at most)
+    candRefresh(cfg, p);
+    const bool have = pickFromIndex(cfg, p, seg, segEnd);
+    if (gBookCheck.load(std::memory_order_relaxed)) {
+        uint32_t s2 = 0, e2 = 0;
+        const bool have2 = pickCandidateWalk(cfg, p, &s2, &e2);
+        if (have != have2 || (have && (s2 != *seg || e2 != *segEnd))) bookFail("compaction candidate", p->pid, s2);
+    }
+    tHotPathDepth = saved;
+    if (t0) bookPickHist().record(monoNs() - t0);
+    return have;
 }
 
 // ---------------------------------------------------------------------------
