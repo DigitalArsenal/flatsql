@@ -22,8 +22,10 @@
 // Workload (audit §4): --tb-types types (the real ones plus variants under
 // other file identifiers), --tb-partitions producers spread by the type mix,
 // OMM, CAT and IQC each with more than 128 of them once P >= 1,000, Zipf skew
-// inside a type, and one dominant OMM partition taking --tb-dominant-pct of
-// the bytes (a GP-archive-style import). Churn: supersedes on types with a
+// inside a type, and one dominant OMM partition held to --tb-dominant-pct of
+// the bytes (a GP-archive-style import: its own generator keeps
+// --tb-dominant-inflight fetches in flight; dominant_share reports what it
+// actually got, which falls short when its merges cannot keep up). Churn: supersedes on types with a
 // supersede rule (--tb-supersede-pct of their records reuse the previous
 // clone's identity), type-level deletes (--tb-tomb-pct), retags
 // (--tb-retag-pct), and a new batch id for every fetch of a partition
@@ -84,7 +86,8 @@ constexpr uint64_t kGB = 1000000000ull;
 
 struct Knobs {
     std::string dir, csv, mode, corpus, typesDir, mix;
-    uint32_t writers, genThreads, partitions, types, fetch, touch, sampleS, readEvery, readReps, handleCap, objects;
+    uint32_t writers, genThreads, partitions, types, fetch, touch, sampleS, readEvery, readReps, handleCap, objects,
+        domInflight;
     double zipf, dominantPct, supersedePct, tombPct, retagPct, maxUsedPct, stepGB, maxGB, minFreeGB;
     uint64_t maxRecords, maxSeconds, ackTimeoutS;
     bool reopen, crashReopen, keep, reads;
@@ -107,7 +110,8 @@ Knobs readKnobs() {
     k.partitions = uint32_t(argInt("tb-partitions", 10000));
     k.types = uint32_t(argInt("tb-types", 30));
     k.fetch = uint32_t(argInt("tb-fetch", 1024));
-    k.touch = uint32_t(argInt("tb-touch", 16));  // records written to every partition first (0: none)
+    k.touch = uint32_t(argInt("tb-touch", 16));
+    k.domInflight = uint32_t(argInt("tb-dominant-inflight", 8));  // the dominant's fetches in flight  // records written to every partition first (0: none)
     k.sampleS = uint32_t(argInt("tb-sample-s", 10));
     k.readEvery = uint32_t(argInt("tb-read-every-s", 10));
     k.readReps = uint32_t(argInt("tb-read-reps", 5));
@@ -210,7 +214,7 @@ struct Env {
     std::condition_variable pauseCv;
     // counters
     std::atomic<uint64_t> recs{0}, frameBytes{0}, fetches{0}, ackTimeouts{0}, enqueueFails{0}, retags{0},
-        tombs{0}, supersedes{0}, domBytes{0}, domLastFetchUs{0};
+        tombs{0}, supersedes{0}, domBytes{0}, domLastFetchUs{0}, domFetches{0}, domFetchUs{0}, domHeldUs{0};
     // Fetch latency (first enqueue to ack), this sample window, ms.
     std::mutex fetchMu;
     std::vector<double> fetchMs;
@@ -439,9 +443,18 @@ void generator(Env& env, uint32_t id, std::vector<uint32_t> mine) {
         return tickets.back().get();
     };
     // One fetch: `count` records to p under a new batch id, then its ack.
-    auto fetch = [&](Part& p, uint32_t count) {
+    // One fetch: `count` records to p under a new batch id (send), then its
+    // ack (complete). A regular partition has one fetch in flight; the
+    // dominant one pipelines up to --tb-dominant-inflight (a bulk import).
+    struct Sent {
+        Part* p = nullptr;
+        uint64_t last = 0, bytes = 0, n = 0, f0 = 0;
+    };
+    auto send = [&](Part& p, uint32_t count) -> Sent {
+        Sent out;
+        out.p = &p;
         if (!p.prod) p.prod.reset(new Producer(env.e.get(), p.pid));
-        if (p.prod->ringDesc()->state.load() == kRingQuarantined) return;
+        if (p.prod->ringDesc()->state.load() == kRingQuarantined) return out;
         p.batchNo++;
         const tb::TbType& ty = env.types[p.type];
         const uint32_t baseIdx = ty.base >= 0 ? uint32_t(ty.base) : p.type;
@@ -476,7 +489,7 @@ void generator(Env& env, uint32_t id, std::vector<uint32_t> mine) {
                 if (p.prod->ringDesc()->state.load() == kRingQuarantined)
                     env.event("partition " + std::to_string(p.pid) + " quarantined (enqueue " + std::to_string(rc) +
                               ")");
-                return;
+                break;
             }
             last = rseq;
             n++;
@@ -497,10 +510,19 @@ void generator(Env& env, uint32_t id, std::vector<uint32_t> mine) {
                 if (env.e->deleteCid(ty.fid, cid, t) == 0) env.tombs.fetch_add(1);
             }
         }
+        out.last = last;
+        out.bytes = bytes;
+        out.n = n;
+        out.f0 = f0;
+        return out;
+    };
+    auto complete = [&](const Sent& f) {
+        Part& p = *f.p;
+        const uint64_t last = f.last, bytes = f.bytes, n = f.n, f0 = f.f0;
         if (!last) return;
         if (p.prod->waitAcked(last, k.ackTimeoutS * kSec) != 0) {
             if (env.ackTimeouts.fetch_add(1) < 20)
-                env.event("ack timeout: partition " + std::to_string(p.pid) + " (" + ty.name + ", " +
+                env.event("ack timeout: partition " + std::to_string(p.pid) + " (" + env.types[p.type].name + ", " +
                           (p.dominant ? "dominant" : "regular") + ") after " + std::to_string(k.ackTimeoutS) + " s");
             return;
         }
@@ -511,13 +533,18 @@ void generator(Env& env, uint32_t id, std::vector<uint32_t> mine) {
         if (p.dominant) {
             env.domBytes.fetch_add(bytes);
             env.domLastFetchUs.store(uint64_t(fms * 1000));
+            env.domFetches.fetch_add(1);
+            env.domFetchUs.fetch_add(uint64_t(fms * 1000));
         }
         {
             std::lock_guard<std::mutex> g(env.fetchMu);
             env.fetchMs.push_back(fms);
         }
     };
+    auto fetch = [&](Part& p, uint32_t count) { complete(send(p, count)); };
+    std::deque<Sent> inflight;  // the dominant partition's pipelined fetches
     auto pauseHere = [&] {
+        for (; !inflight.empty(); inflight.pop_front()) complete(inflight.front());
         for (uint32_t j : mine) env.parts[j].prod.reset();
         std::unique_lock<std::mutex> lk(env.pauseMu);
         env.paused.fetch_add(1);
@@ -549,6 +576,7 @@ void generator(Env& env, uint32_t id, std::vector<uint32_t> mine) {
             const uint64_t all = env.frameBytes.load() + 1;
             if (double(env.domBytes.load()) > k.dominantPct / 100.0 * double(all) && env.recs.load() > 20000) {
                 sleepNs(2000000);
+                env.domHeldUs.fetch_add(2000);
                 continue;
             }
         }
@@ -556,8 +584,17 @@ void generator(Env& env, uint32_t id, std::vector<uint32_t> mine) {
             sleepNs(10000000);
             continue;
         }
-        fetch(p, k.fetch);
+        if (p.dominant) {
+            inflight.push_back(send(p, k.fetch));
+            while (inflight.size() >= std::max(1u, k.domInflight)) {
+                complete(inflight.front());
+                inflight.pop_front();
+            }
+        } else {
+            fetch(p, k.fetch);
+        }
     }
+    for (; !inflight.empty(); inflight.pop_front()) complete(inflight.front());
     for (uint32_t j : mine) env.parts[j].prod.reset();
     // Tickets must outlive the deletes they track.
     for (auto& t : tickets)
@@ -768,7 +805,8 @@ PS_SLOW_TEST(tb_engine_tier) {
         "heap_bytes", "rss_bytes", "wasm_pages", "committed_bytes", "accel_bytes", "descriptor_bytes",
         "pool_committed_bytes", "handles_open", "handles_hw", "handles_refused", "reader_handles_hw", "fds",
         "partitions", "partitions_written", "segs_max", "segs_total", "dominant_share", "merges", "seals", "seals_s",
-        "merges_s", "fetch_p50_ms", "fetch_p99_ms", "dominant_fetch_ms",
+        "merges_s", "fetch_p50_ms", "fetch_p99_ms", "dominant_fetch_ms", "dominant_fetches", "dominant_fetch_s_total",
+        "dominant_held_s_total",
         "compactions", "type_commits", "l0_full_stalls", "maint_p99_ms", "maint_p999_ms", "maint_n",
         "commit_p99_ms", "commit_p999_ms", "commit_n", "maint_ms_per_merge", "label_lag_rows_max",
         "label_lag_rows_sum", "quarantined", "rejects", "dedupe_hits", "tombs", "retags", "supersedes",
@@ -892,7 +930,8 @@ PS_SLOW_TEST(tb_engine_tier) {
                      double(segsMax), double(segsTotal),
                      bytes ? double(env.domBytes.load()) / double(bytes) : 0, double(st.merges), double(st.seals),
                      double(dSeals) / dt, double(dMerges) / dt, tb::pct(fl, 0.5), tb::pct(fl, 0.99),
-                     double(env.domLastFetchUs.load()) / 1000,
+                     double(env.domLastFetchUs.load()) / 1000, double(env.domFetches.load()),
+                     double(env.domFetchUs.load()) / 1e6, double(env.domHeldUs.load()) / 1e6,
                      double(st.compactions), double(st.typeCommits), double(st.l0FullStalls),
                      double(maint.percentileNs(0.99)) / 1e6, double(maint.percentileNs(0.999)) / 1e6,
                      double(maint.count()), double(commit.percentileNs(0.99)) / 1e6,
