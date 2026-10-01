@@ -6,6 +6,7 @@
 // a crash between a file's creation and its schema (journal replay).
 #include <cstring>
 #include <fstream>
+#include <random>
 #include <set>
 #include <thread>
 
@@ -459,4 +460,33 @@ P4_TEST(t_reader_object_key_in_bound) {
     CursorRun cr = cursorRun("CAT", 10000, P4_ORDER_SEQ_DESC, &ceq, 1);
     CHECK(cr.status == P4_OK && cr.seqs.size() == 1 && cr.keys[0] == 1009, "CAT COL0 = 1009");
     closeEngine();
+}
+
+// The CID key bijection (A17): digest -> key -> digest and text, for random
+// digests, and key order = text order.
+P4_TEST(t_cid_key_roundtrip) {
+    std::mt19937_64 rng(7);
+    std::string prevText;
+    std::vector<uint8_t> prevKey;
+    int bad = 0, order = 0;
+    for (int i = 0; i < 200000; i++) {
+        uint8_t d[32], k[32], d2[32];
+        for (int j = 0; j < 32; j += 8) {
+            const uint64_t v = rng();
+            std::memcpy(d + j, &v, 8);
+        }
+        fp::cidKeyFromDigest(d, k);
+        fp::cidDigestFromKey(k, d2);
+        char t1[60], t2[60];
+        fp::cidTextFromDigest(d, t1);
+        fp::cidTextFromKey(k, t2);
+        if (std::memcmp(d, d2, 32) != 0 || std::strcmp(t1, t2) != 0) bad++;
+        const std::string text(t1);
+        const std::vector<uint8_t> key(k, k + 32);
+        if (i && ((text < prevText) != (key < prevKey))) order++;
+        prevText = text;
+        prevKey = key;
+    }
+    CHECK_EQ(bad, 0, "round trips");
+    CHECK_EQ(order, 0, "memcmp order of keys = text order");
 }

@@ -321,7 +321,9 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
     // early must not read as missing rows, and a fix must not rewrite the
     // index from a partial read.
     Conn* c = nullptr;
+    std::string where;  // the file being read (diagnostics)
     auto fail = [&](int src) -> int32_t {
+        why((std::string("verify failed (") + (c ? sqlite3_errmsg(c->db) : "open") + ")").c_str(), where, src, 0);
         if (c) delete c;
         if (fix) x->exec("ROLLBACK");
         return statusOfSqlite(src == SQLITE_OK || src == SQLITE_ROW || src == SQLITE_DONE ? SQLITE_ERROR : src);
@@ -344,6 +346,7 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
     }
     for (File* f : files) {
         c = nullptr;
+        where = f->path;
         {
             const int orc = openConn(f->path, OpenKind::Maint, 4096, 0, &c, nullptr);
             if (orc != SQLITE_OK) {

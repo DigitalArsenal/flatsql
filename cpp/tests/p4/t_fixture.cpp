@@ -468,3 +468,92 @@ P4_SLOW_TEST(g2_fixture) {
     if (argInt("keep", 0) == 0) removeTree(root.substr(0, root.size() - 6));
 }
 #endif
+
+// The A18 shapes (benchset R17) through the reader API on a loaded store, as
+// the SQL surface runs them: the type's newest N, a source, the bytes. The
+// first run after the open is cold for the engine (a fresh cp -c clone is
+// cold for the OS too).
+//   flatsql_p4_test --test=a18_probe --store=<dir with fsql4> [--reps=5]
+#if !defined(__wasm__)
+namespace flatsql {
+namespace p4 {
+P4Engine* currentEngine();
+}
+}  // namespace flatsql
+P4_SLOW_TEST(a18_probe) {
+    const std::string store = argStr("store", "");
+    if (store.empty()) {
+        std::printf("  skipped: --store\n");
+        return;
+    }
+    EngineOpts o;
+    o.createMode = 0;
+    REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
+    if (argInt("rebuild1", 0)) {
+        // Partition secondary indexes a newer engine adds (CREATE INDEX IF NOT EXISTS).
+        TlvW r1;
+        r1.u32(63, 1);
+        CHECK_EQ(call(P4_OPC_REBUILD, r1.b, CallOpts{0, 0, 0, 0, 0, 0, false, 3600000}).status, P4_OK, "REBUILD 1");
+        closeEngine(600000);
+        return;
+    }
+    struct Shape {
+        const char* type;
+        const char* source;
+        uint64_t bound;
+        int64_t norad;  // COL0 equality, or -1
+    };
+    const Shape shapes[] = {{"OMM", "celestrak-gp", 400000, 25544},
+                            {"IQC", "IQEngine", 10000, -1},
+                            {"CAT", "celestrak-satcat", 10000, -1},
+                            {"CAT", "celestrak-satcat-csv", 10000, -1},
+                            {"MPE", "celestrak-gp", 10000, -1}};
+    const int reps = int(argInt("reps", 5));
+    const std::string only = argStr("only", "");
+    for (const Shape& sh : shapes) {
+        if (!only.empty() && only != std::string(sh.type) + "@" + sh.source) continue;
+        std::vector<double> ms;
+        uint64_t rows = 0, examined = 0, bytes = 0;
+        for (int rep = 0; rep <= reps; rep++) {
+            P4Lane lane;
+            lane.e = fp::currentEngine();
+            P4ScanSpec spec{};
+            spec.type = sh.type;
+            spec.lane.source = sh.source;
+            spec.order = P4_ORDER_SEQ_DESC;
+            spec.hydrate = 1;
+            spec.bound = sh.bound;
+            P4Value v{1, sh.norad, 0, nullptr, 0};
+            P4Pred p{P4_F_COL0, P4_OP_EQ, 1, &v};
+            if (sh.norad >= 0) {
+                spec.preds = &p;
+                spec.nPreds = 1;
+            }
+            const uint64_t t0 = flatsql::ps::monoNs();
+            P4Cursor* c = nullptr;
+            int32_t rc = p4_cursor_open(&lane, &spec, &c);
+            P4Row row;
+            uint64_t n = 0, b = 0;
+            int32_t k = 0;
+            while (rc == P4_OK && (k = p4_cursor_next(c, &row)) == 1) {
+                n++;
+                b += row.dataLen;
+            }
+            if (c) p4_cursor_close(c);
+            ms.push_back(double(flatsql::ps::monoNs() - t0) / 1e6);
+            CHECK(rc == P4_OK && k == 0, std::string("cursor ") + sh.type);
+            uint64_t rb = 0;
+            p4_lane_counters(&lane, &examined, &rb);
+            rows = n;
+            bytes = b;
+        }
+        std::vector<double> warm(ms.begin() + 1, ms.end());
+        std::sort(warm.begin(), warm.end());
+        std::printf("  %s@%s%s: %llu frames (%llu B), examined %llu; cold %.2f ms, warm p50 %.2f max %.2f ms (load %.1f)\n",
+                    sh.type, sh.source, sh.norad >= 0 ? " NORAD=25544" : "", (unsigned long long)rows,
+                    (unsigned long long)bytes, (unsigned long long)examined, ms[0],
+                    warm.empty() ? 0.0 : warm[warm.size() / 2], warm.empty() ? 0.0 : warm.back(), loadAvg());
+    }
+    closeEngine();
+}
+#endif

@@ -134,8 +134,8 @@ struct Row {
     int kType = 0;
     int64_t kInt = 0;
     std::string kText;
-    std::string peer, sig, data, fcols;
-    bool sealed = false, hasData = false;
+    std::string peer, sig, data, fcols;  // peer: empty when it is the file's (filePeer)
+    bool sealed = false, hasData = false, filePeer = false;
     int fi = -1;  // FRef index
     std::vector<TagInst> tags;
     int sel = -1;  // the matched tag (index into tags)
@@ -219,6 +219,7 @@ public:
     int32_t next(Row** out);
     int64_t vis() const { return vis_; }
     const FRef& file(int i) const { return files_[size_t(i)]; }
+    const std::string& peerOf(const Row& r) const { return r.filePeer ? files_[size_t(r.fi)].peer : r.peer; }
     const Spec* spec() const { return sp_.get(); }
     Type* type() const { return t_; }
     LaneDef* laneDef(uint32_t id) {
@@ -244,6 +245,8 @@ private:
     int32_t fetchSeq(int fi);
     int32_t fetchW(int fi);
     int32_t loadRows(Conn* c, int fi, const std::vector<int64_t>& seqs, std::deque<Row>* out);
+    void rowFrom(sqlite3_stmt* q, int col0, int fi, bool needData, Row* row);
+    bool needData() const;
     int32_t loadTags(Conn* c, int fi, std::deque<Row>& rows);
     bool laneMatch(const TagInst& ti);
     bool rowMatches(Row& r);
@@ -436,7 +439,8 @@ int32_t Scan::open() {
             int rc = 0;
             Conn* c = e_->rpool.acquire(paths[i], OpenKind::Reader, &rc, nullptr);
             if (!c) return statusOfSqlite(rc);
-            sqlite3_stmt* q = c->sql("SELECT seq FROM r WHERE seq<=?1 ORDER BY seq DESC LIMIT 4096");
+            sqlite3_stmt* q = c->sql("SELECT seq FROM r INDEXED BY r_s WHERE seq<=?1 ORDER BY seq DESC LIMIT 4096");
+            if (!q) q = c->sql("SELECT seq FROM r WHERE seq<=?1 ORDER BY seq DESC LIMIT 4096");  // before REBUILD 1
             int r = SQLITE_DONE;
             if (q) {
                 sqlite3_bind_int64(q, 1, h.at);
@@ -739,7 +743,7 @@ int32_t Scan::cols(const Row& r, ps::Extracted* x, uint8_t* scratch, size_t n) {
 
 bool Scan::rowMatches(Row& r) {
     if (s_.hasCid && std::memcmp(r.key, s_.cidKey, 32) != 0) return false;
-    if (s_.hasPeer && r.peer != s_.peer) return false;
+    if (s_.hasPeer && peerOf(r) != s_.peer) return false;
     if (s_.eNotNull && !r.hasE) return false;
     if (s_.eNull && r.hasE) return false;
     if (fts_ && !ftsSeqs_.count(r.seq)) return false;
@@ -803,10 +807,49 @@ bool Scan::rowMatches(Row& r) {
 }
 
 // Rows by seq (ascending), in the connection's read transaction.
+// A row from columns (cid, e, k, ts, x, length(d), p, f, d) starting at col0.
+void Scan::rowFrom(sqlite3_stmt* q, int col0, int fi, bool needData, Row* row) {
+    row->fi = fi;
+    std::memcpy(row->key, sqlite3_column_blob(q, col0), 32);
+    row->hasE = sqlite3_column_type(q, col0 + 1) != SQLITE_NULL;
+    row->e = sqlite3_column_int64(q, col0 + 1);
+    const int kt = sqlite3_column_type(q, col0 + 2);
+    if (kt == SQLITE_INTEGER) {
+        row->kType = 1;
+        row->kInt = sqlite3_column_int64(q, col0 + 2);
+    } else if (kt == SQLITE_TEXT) {
+        row->kType = 3;
+        row->kText.assign(reinterpret_cast<const char*>(sqlite3_column_text(q, col0 + 2)),
+                          size_t(sqlite3_column_bytes(q, col0 + 2)));
+    }
+    row->ts = sqlite3_column_int64(q, col0 + 3);
+    row->w = row->hasE ? row->e : row->ts;
+    if (sqlite3_column_type(q, col0 + 4) != SQLITE_NULL)
+        row->sig.assign(static_cast<const char*>(sqlite3_column_blob(q, col0 + 4)), size_t(sqlite3_column_bytes(q, col0 + 4)));
+    row->len = sqlite3_column_int64(q, col0 + 5);
+    if (sqlite3_column_type(q, col0 + 6) != SQLITE_NULL)
+        row->peer.assign(reinterpret_cast<const char*>(sqlite3_column_text(q, col0 + 6)), size_t(sqlite3_column_bytes(q, col0 + 6)));
+    else
+        row->filePeer = true;  // the partition's peer (C-2), read from the FRef when needed
+    row->sealed = sqlite3_column_type(q, col0 + 7) != SQLITE_NULL;
+    if (row->sealed)
+        row->fcols.assign(static_cast<const char*>(sqlite3_column_blob(q, col0 + 7)), size_t(sqlite3_column_bytes(q, col0 + 7)));
+    if (needData && sqlite3_column_type(q, col0 + 8) != SQLITE_NULL) {
+        row->data.assign(static_cast<const char*>(sqlite3_column_blob(q, col0 + 8)), size_t(sqlite3_column_bytes(q, col0 + 8)));
+        row->hasData = true;
+    }
+    L_->bytesRead += uint64_t(row->len) + 64;
+}
+
+bool Scan::needData() const {
+    bool need = s_.hydrate || s_.preds.size();
+    for (auto& p : s_.preds) need = need || p.field >= P4_F_COL0;
+    return need;
+}
+
 int32_t Scan::loadRows(Conn* c, int fi, const std::vector<int64_t>& seqs, std::deque<Row>* out) {
-    bool needData = s_.hydrate || s_.preds.size();
-    for (auto& p : s_.preds) needData = needData || p.field >= P4_F_COL0;
-    sqlite3_stmt* q = c->get(needData ? S_R_ROW : S_R_GET);
+    const bool nd = needData();
+    sqlite3_stmt* q = c->get(nd ? S_R_ROW : S_R_GET);
     if (!q) return P4_E_INTERNAL;
     for (int64_t sq : seqs) {
         sqlite3_bind_int64(q, 1, sq);
@@ -814,35 +857,7 @@ int32_t Scan::loadRows(Conn* c, int fi, const std::vector<int64_t>& seqs, std::d
         if (r == SQLITE_ROW && sqlite3_column_bytes(q, 0) == 32) {
             Row row;
             row.seq = sq;
-            row.fi = fi;
-            std::memcpy(row.key, sqlite3_column_blob(q, 0), 32);
-            row.hasE = sqlite3_column_type(q, 1) != SQLITE_NULL;
-            row.e = sqlite3_column_int64(q, 1);
-            const int kt = sqlite3_column_type(q, 2);
-            if (kt == SQLITE_INTEGER) {
-                row.kType = 1;
-                row.kInt = sqlite3_column_int64(q, 2);
-            } else if (kt == SQLITE_TEXT) {
-                row.kType = 3;
-                row.kText.assign(reinterpret_cast<const char*>(sqlite3_column_text(q, 2)), size_t(sqlite3_column_bytes(q, 2)));
-            }
-            row.ts = sqlite3_column_int64(q, 3);
-            row.w = row.hasE ? row.e : row.ts;
-            if (sqlite3_column_type(q, 4) != SQLITE_NULL)
-                row.sig.assign(static_cast<const char*>(sqlite3_column_blob(q, 4)), size_t(sqlite3_column_bytes(q, 4)));
-            row.len = sqlite3_column_int64(q, 5);
-            if (sqlite3_column_type(q, 6) != SQLITE_NULL)
-                row.peer.assign(reinterpret_cast<const char*>(sqlite3_column_text(q, 6)), size_t(sqlite3_column_bytes(q, 6)));
-            else
-                row.peer = files_[size_t(fi)].peer;
-            row.sealed = sqlite3_column_type(q, 7) != SQLITE_NULL;
-            if (row.sealed)
-                row.fcols.assign(static_cast<const char*>(sqlite3_column_blob(q, 7)), size_t(sqlite3_column_bytes(q, 7)));
-            if (needData && sqlite3_column_type(q, 8) != SQLITE_NULL) {
-                row.data.assign(static_cast<const char*>(sqlite3_column_blob(q, 8)), size_t(sqlite3_column_bytes(q, 8)));
-                row.hasData = true;
-            }
-            L_->bytesRead += uint64_t(row.len) + 64;
+            rowFrom(q, 0, fi, nd, &row);
             out->push_back(std::move(row));
         } else if (r != SQLITE_ROW && r != SQLITE_DONE) {
             sqlite3_reset(q);
@@ -953,12 +968,99 @@ int32_t Scan::fetchSeq(int fi) {
             sqlite3_bind_int64(q, 3, hi_);
         }
         sqlite3_bind_int64(q, 4, page * 2);
+    } else if (s_.lane && fr.laneN * 4 < fr.n * 3) {
+        // A source filter that leaves out a quarter or more here (and is not
+        // selective enough for rl): the page's seqs from r_s, their tags,
+        // then the rows of the matching seqs only.
+        q = c->sql(desc ? "SELECT seq FROM r INDEXED BY r_s WHERE seq<?1 AND seq>?2 ORDER BY seq DESC LIMIT ?3"
+                        : "SELECT seq FROM r INDEXED BY r_s WHERE seq>?1 AND seq<=?2 ORDER BY seq LIMIT ?3");
+        if (!q)
+            q = c->sql(desc ? "SELECT seq FROM r WHERE seq<?1 AND seq>?2 ORDER BY seq DESC LIMIT ?3"
+                            : "SELECT seq FROM r WHERE seq>?1 AND seq<=?2 ORDER BY seq LIMIT ?3");
+        std::deque<Row> probe;
+        if (!q) status = P4_E_INTERNAL;
+        else {
+            sqlite3_bind_int64(q, 1, fc.resumeSeq);
+            sqlite3_bind_int64(q, 2, desc ? lo_ : hi_);
+            sqlite3_bind_int64(q, 3, page);
+            int r;
+            while ((r = sqlite3_step(q)) == SQLITE_ROW) {
+                Row pr;
+                pr.seq = sqlite3_column_int64(q, 0);
+                pr.fi = fi;
+                fc.resumeSeq = pr.seq;
+                probe.push_back(std::move(pr));
+            }
+            sqlite3_reset(q);
+            if (r != SQLITE_DONE) status = statusOfSqlite(r);
+        }
+        if (status == P4_OK && probe.empty()) fc.done = true;
+        if (status == P4_OK) status = loadTags(c, fi, probe);
+        std::vector<int64_t> keep;
+        std::unordered_map<int64_t, std::vector<TagInst>> tagsOf;
+        for (auto& pr : probe) {
+            bool any = false;
+            for (const TagInst& ti : pr.tags) any = any || laneMatch(ti);
+            if (!any) {
+                L_->rowsExamined++;  // the kept rows are counted by next()
+                continue;
+            }
+            keep.push_back(pr.seq);
+            tagsOf[pr.seq] = std::move(pr.tags);
+        }
+        if (status == P4_OK && !keep.empty()) {
+            std::sort(keep.begin(), keep.end());
+            std::deque<Row> rows;
+            status = loadRows(c, fi, keep, &rows);
+            if (status == P4_OK) {
+                for (auto& rw : rows) rw.tags = std::move(tagsOf[rw.seq]);
+                if (desc) std::reverse(rows.begin(), rows.end());
+                for (auto& rw : rows) fc.rows.push_back(std::move(rw));
+            }
+        }
+        c->exec("COMMIT");
+        e_->rpool.release(c);
+        fr.f->users.fetch_sub(1);
+        if (status != P4_OK) e_->bump(kStReadErrors);
+        return status;
     } else {
-        q = c->sql(desc ? "SELECT seq FROM r WHERE seq<?1 AND seq>?2 ORDER BY seq DESC LIMIT ?3"
-                        : "SELECT seq FROM r WHERE seq>?1 AND seq<=?2 ORDER BY seq LIMIT ?3");
-        sqlite3_bind_int64(q, 1, fc.resumeSeq);
-        sqlite3_bind_int64(q, 2, desc ? lo_ : hi_);
-        sqlite3_bind_int64(q, 3, page);
+        // One range read returns the page's rows (no per-seq lookups).
+        const bool nd = needData();
+        static const char* kSql[2][2] = {
+            {"SELECT seq, cid, e, k, ts, x, length(d), p, f, NULL FROM r WHERE seq>?1 AND seq<=?2 ORDER BY seq LIMIT ?3",
+             "SELECT seq, cid, e, k, ts, x, length(d), p, f, d FROM r WHERE seq>?1 AND seq<=?2 ORDER BY seq LIMIT ?3"},
+            {"SELECT seq, cid, e, k, ts, x, length(d), p, f, NULL FROM r WHERE seq<?1 AND seq>?2 ORDER BY seq DESC LIMIT ?3",
+             "SELECT seq, cid, e, k, ts, x, length(d), p, f, d FROM r WHERE seq<?1 AND seq>?2 ORDER BY seq DESC LIMIT ?3"}};
+        q = c->sql(kSql[desc ? 1 : 0][nd ? 1 : 0]);
+        if (!q) status = P4_E_INTERNAL;
+        else {
+            sqlite3_bind_int64(q, 1, fc.resumeSeq);
+            sqlite3_bind_int64(q, 2, desc ? lo_ : hi_);
+            sqlite3_bind_int64(q, 3, page);
+            std::deque<Row> rows;
+            int r;
+            int got = 0;
+            while ((r = sqlite3_step(q)) == SQLITE_ROW) {
+                got++;
+                if (sqlite3_column_bytes(q, 1) != 32) continue;
+                Row row;
+                row.seq = sqlite3_column_int64(q, 0);
+                rowFrom(q, 1, fi, nd, &row);
+                fc.resumeSeq = row.seq;
+                rows.push_back(std::move(row));
+            }
+            sqlite3_reset(q);
+            if (r != SQLITE_DONE) status = statusOfSqlite(r);
+            if (status == P4_OK && got == 0) fc.done = true;
+            if (status == P4_OK) status = loadTags(c, fi, rows);
+            if (status == P4_OK)
+                for (auto& rw : rows) fc.rows.push_back(std::move(rw));
+        }
+        c->exec("COMMIT");
+        e_->rpool.release(c);
+        fr.f->users.fetch_sub(1);
+        if (status != P4_OK) e_->bump(kStReadErrors);
+        return status;
     }
     int r;
     int64_t lastSeen = fc.resumeSeq;
@@ -1536,7 +1638,7 @@ void writeRec(Out& o, Scan& sc, const Row& r, const std::string* entityKey, bool
     cidTextFromKey(r.key, cid);
     enc.text(cid, kCidText);
     putText(enc, fr.producer);
-    putText(enc, r.peer);
+    putText(enc, sc.peerOf(r));
     enc.i64(r.ts);
     if (r.hasE) enc.i64(r.e); else enc.null();
     if (entityKey) putText(enc, *entityKey);
@@ -2654,7 +2756,7 @@ int32_t p4_cursor_next(P4Cursor* c, P4Row* row) {
     row->cid = c->cid;
     const auto& fr = c->scan->file(r->fi);
     row->producer = fr.producer.c_str();
-    row->peer = r->peer.c_str();
+    row->peer = c->scan->peerOf(*r).c_str();
     row->sig = r->sig.empty() ? nullptr : reinterpret_cast<const uint8_t*>(r->sig.data());
     row->sigLen = uint32_t(r->sig.size());
     row->data = r->hasData ? reinterpret_cast<const uint8_t*>(r->data.data()) : nullptr;

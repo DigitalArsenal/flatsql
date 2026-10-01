@@ -37,7 +37,8 @@ to run it, and what was measured.
 ncopy), `src` and `lane` (a lane is format 1's tag key, C-3, with its
 counters), `r(seq PK, cid, e, k, ts, p, f, s, x, d, w, wd)` with `w` =
 `coalesce(e, ts)`, tag instances `rl(sid, seq, lane, at, u)` WITHOUT ROWID,
-and for object types `ent(k, n, fw, lw)`. Indexes: `r_w(w DESC)`,
+and for object types `ent(k, n, fw, lw)`. Indexes: `r_w(w DESC)`, `r_s(seq)`
+(the seqs alone: the A18 cut walks it, not the records' pages; 12 B a row),
 `rl_seq(seq)`, `r_dk(wd, k, w)` (epoch and object), `r_k(k, w)` (object, no
 epoch), `r_en(cid) WHERE e IS NULL` (epoch rule). There is no CID index in a
 file: CID lookups go through the type index. Writers open with
@@ -177,6 +178,6 @@ Mac Studio (28 threads, shared; the load is the 1-minute average):
 
 | | |
 |---|---|
-| G2 fixture | 4,364,873 copies of 3,945,845 records (OMM, MPE, CAT, IQC) loaded in 101 s (43k copies/s, load 15-23); REBUILD 1 in 10 s; **783.2 B per copy** (gate < 800; format 1 2,366, format 2 1,742 in the design's table); 0 differences against format 1 in GET bytes/seq/ts/peer, TAGS, SCAN order, WINDOW and INDEX_PAGE per type; REBUILD 8 clean. |
+| G2 fixture | 4,364,873 copies of 3,945,845 records (OMM, MPE, CAT, IQC) loaded in 101 s (43k copies/s, load 15-23; 193 s at load 39-44); REBUILD 1 in 10 s; **795.5 B per copy** with `r_s` (783.2 without it; gate < 800; format 1 2,366, format 2 1,742); 0 differences against format 1 in GET bytes/seq/ts/peer, TAGS, SCAN order, WINDOW and INDEX_PAGE per type; REBUILD 8 clean. |
 | Group commit | One-record calls with 1,024 in flight: 512-record groups, 392 WAL B/record against 315 for 4,096-record calls (gate 2x). |
 | Kill loop | native 400 of 400 rounds at load 11-38 with drops and supersede; the 1,000-round runs are recorded in the release notes. |

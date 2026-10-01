@@ -38,8 +38,11 @@ const char* kFileSchema =
 
 int32_t fileCreateIndexes(Type* t, Conn* c) {
     std::shared_ptr<const Spec> sp = t->spec();
+    // r_s: the seqs alone (12 B a row at the fixture), so the A18 bound's cut
+    // (the type's N-th newest seq) walks an index, not the records' pages.
     std::string ddl =
         "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC);"
+        "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
         "CREATE INDEX IF NOT EXISTS rl_seq ON rl(seq);";
     if (sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_dk ON r(wd, k, w) WHERE k IS NOT NULL;";
     if (sp->hasObject && !sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_k ON r(k, w) WHERE k IS NOT NULL;";
