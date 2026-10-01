@@ -154,6 +154,7 @@ set(FLATSQL_HEADERS
 # (docs/PARTITION-STORE-WASM.md). That toolchain builds only those targets.
 if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/flatsql_ps_wasm.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/flatsql_p4_wasm.cmake)
     return()
 endif()
 

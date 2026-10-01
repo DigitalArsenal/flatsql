@@ -53,6 +53,9 @@ double loadAvg() {
     double l[3] = {0, 0, 0};
 #if !defined(__wasm__)
     if (getloadavg(l, 3) < 1) return -1;
+#else
+    (void)l;
+    return -1;
 #endif
     return l[0];
 }
@@ -389,7 +392,12 @@ std::vector<uint8_t> encodePut(const Batch& b) {
 std::string scratchDir(const std::string& name) {
     const std::string base = argStr("dir", std::string("/private/tmp/claude-501/-Users-tj-software-spacedatanetwork-stack/"
                                                           "fceff73f-656a-45b9-b7ad-9f96ac195cfa/scratchpad/p4test"));
+#if defined(__wasm__)
+    static unsigned n = 0;
+    const std::string d = base + "/" + name + "-" + std::to_string(flatsql::ps::monoNs() % 1000000) + "-" + std::to_string(++n);
+#else
     const std::string d = base + "/" + name + "-" + std::to_string(getpid());
+#endif
     removeTree(d);
     std::filesystem::create_directories(d);
     return d;
@@ -606,17 +614,25 @@ bool Result::null(size_t row, const std::string& c) const {
 }  // namespace p4t
 
 int main(int argc, char** argv) {
+#if defined(__wasm__)
+    // Grow the heap before any engine thread runs (a host may refresh a shared
+    // memory's size lazily per thread): allocate and free one large block.
+    if (void* p = std::malloc(size_t(1536) << 20)) std::free(p);
+#endif
     for (int i = 1; i < argc; i++) p4t::gArgs.push_back(argv[i]);
     const std::string filter = p4t::argStr("test", "");
     const bool slow = p4t::argInt("slow", 0) != 0;
     for (const auto& a : p4t::gArgs)
         if (a == "--list") {
-            for (const auto& t : p4t::registry()) std::printf("%s%s\n", t.name, t.slow ? " slow" : "");
+            for (const auto& t : p4t::registry()) std::printf("%s %s\n", t.name, t.slow ? "slow" : "fast");
             return 0;
         }
     int ran = 0;
+    bool exact = false;
+    for (const auto& t : p4t::registry()) exact = exact || filter == t.name;
     for (const auto& t : p4t::registry()) {
-        if (!filter.empty() && std::string(t.name).find(filter) == std::string::npos) continue;
+        if (!filter.empty() && (exact ? filter != t.name : std::string(t.name).find(filter) == std::string::npos)) continue;
+        if (!filter.empty() && !exact && t.slow && !slow) continue;
         if (filter.empty() && t.slow && !slow) continue;
         const int before = p4t::gFailures;
         const auto t0 = std::chrono::steady_clock::now();

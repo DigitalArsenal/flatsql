@@ -250,20 +250,12 @@ int32_t journalReplay(Type* t, std::string* err) {
                 sqlite3_reset(s);
             }
         }
-        // Other holders in the index and the pending layer (counters).
+        // Other holders: the pending layer over the index (a pending delete hides its row).
         int others = 0;
         {
-            sqlite3_stmt* s = idx->sql("SELECT pid FROM c WHERE tb=?1 AND cid=?2");
-            if (s) {
-                sqlite3_bind_int64(s, 1, x.tb);
-                sqlite3_bind_blob(s, 2, x.k, 32, SQLITE_STATIC);
-                while (sqlite3_step(s) == SQLITE_ROW)
-                    if (uint32_t(sqlite3_column_int64(s, 0)) != x.pid) others++;
-                sqlite3_reset(s);
-            }
-            t->pend.each(x.tb, x.k, [&](const CEnt& ce) {
-                if (ce.pid != x.pid && ce.st == 1) others++;
-            });
+            std::vector<Holder> hs;
+            holdersWith(t, idx, x.tb, x.k, &hs, true);
+            for (auto& h : hs) others += h.pid != x.pid;
         }
         if (x.op == J_C) {
             if (!present) continue;  // its file never committed

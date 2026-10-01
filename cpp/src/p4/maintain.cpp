@@ -3,6 +3,8 @@
 // evicted writer connections (a close may checkpoint), unlinking retired
 // files, QUOTA_GC and REBUILD, and the background FTS index.
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 
 #include "flatsql/record_search.h"
@@ -144,7 +146,8 @@ int64_t diskBytes(const std::string& path) {
 }
 }  // namespace
 
-int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* filesDropped, int64_t* recordsDropped, int64_t* bytesFreed) {
+int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* filesDropped, int64_t* recordsDropped, int64_t* bytesFreed,
+                bool enforce) {
     *filesDropped = *recordsDropped = *bytesFreed = 0;
     if (e->cfg.quotaMode != 1) return P4_E_UNSUPPORTED;
     std::vector<Type*> types;
@@ -175,18 +178,21 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* filesDropped, int64_t* re
             total += diskBytes(t->pIdx) + diskBytes(t->pJnl) + diskBytes(t->pFts);
         }
         if (uint64_t(total) <= maxBytes) {
-            for (Type* t : types) {
-                std::lock_guard<std::mutex> g(t->mu);
-                t->overQuota = false;
-            }
+            if (enforce)
+                for (Type* t : types) {
+                    std::lock_guard<std::mutex> g(t->mu);
+                    t->overQuota = false;
+                }
             return P4_OK;
         }
         if (!oldestType) {
-            // Nothing droppable but the current month: writes refuse, reads continue.
-            for (Type* t : types) {
-                std::lock_guard<std::mutex> g(t->mu);
-                t->overQuota = true;
-            }
+            // Nothing droppable but the current month: under the configured
+            // quota, writes refuse (P4_E_NOSPACE) while reads continue.
+            if (enforce)
+                for (Type* t : types) {
+                    std::lock_guard<std::mutex> g(t->mu);
+                    t->overQuota = true;
+                }
             return P4_OK;
         }
         Type* t = oldestType;
@@ -274,6 +280,15 @@ namespace {
 struct Verify {
     int64_t entries = 0, mismatches = 0;
 };
+// REBUILD verify's findings, one line each, in native debug runs only.
+void why(const char* what, const std::string& path, int64_t a, int64_t b) {
+#if !defined(__wasm__)
+    static const bool on = std::getenv("P4_VERIFY_DEBUG") != nullptr;
+    if (on) std::fprintf(stderr, "verify: %s %s (%lld vs %lld)\n", what, path.c_str(), (long long)a, (long long)b);
+#else
+    (void)what; (void)path; (void)a; (void)b;
+#endif
+}
 
 // Compares (and with fix, rewrites) the type index's c, file and lanecnt rows
 // against the partition files, and obj against the files' ent rows.
@@ -335,7 +350,10 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
                 sqlite3_bind_int64(q, 3, pid);
                 const bool ok = sqlite3_step(q) == SQLITE_ROW && sqlite3_column_int64(q, 0) == seq;
                 sqlite3_reset(q);
-                if (!ok) v->mismatches++;
+                if (!ok) {
+                    v->mismatches++;
+                    why("c entry", f->path, seq, 0);
+                }
             }
         }
         if (s) sqlite3_reset(s);
@@ -348,7 +366,11 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
             fbytes = f->bytes;
             mem = f->lanes;
         }
-        if (fn != n || fbytes != bytes) v->mismatches++;
+        if (fn != n || fbytes != bytes) {
+            v->mismatches++;
+            why("file counters n", f->path, fn, n);
+            why("file counters bytes", f->path, fbytes, bytes);
+        }
         // Lane rows against the tag instances, and the in-memory counters.
         std::map<uint32_t, std::pair<int64_t, int64_t>> real;
         s = c->sql("SELECT rl.lane, count(*), sum(length(r.d)) FROM rl JOIN r ON r.seq=rl.seq GROUP BY rl.lane");
@@ -357,10 +379,17 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
         if (s) sqlite3_reset(s);
         for (auto& kv : real) {
             auto it = mem.find(kv.first);
-            if (it == mem.end() || it->second.n != kv.second.first || it->second.bytes != kv.second.second) v->mismatches++;
+            if (it == mem.end() || it->second.n != kv.second.first || it->second.bytes != kv.second.second) {
+                v->mismatches++;
+                why("lane n", f->path, it == mem.end() ? -1 : it->second.n, kv.second.first);
+                why("lane bytes", f->path, it == mem.end() ? -1 : it->second.bytes, kv.second.second);
+            }
         }
         for (auto& kv : mem)
-            if (!real.count(kv.first)) v->mismatches++;
+            if (!real.count(kv.first)) {
+                v->mismatches++;
+                why("lane in memory only", f->path, kv.first, kv.second.n);
+            }
         if (fix) {
             std::lock_guard<std::mutex> g(t->mu);
             f->n = n;
@@ -393,13 +422,19 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
                                 sqlite3_column_int64(o, 1) == sqlite3_column_int64(q, 2) &&
                                 sqlite3_column_int64(o, 2) == sqlite3_column_int64(q, 3);
                 sqlite3_reset(o);
-                if (!ok) v->mismatches++;
+                if (!ok) {
+                    v->mismatches++;
+                    why("obj", f->path, 0, 0);
+                }
             }
             if (q) sqlite3_reset(q);
         }
         delete c;
     }
-    if (!fix && cRows != fileRows) v->mismatches += std::max<int64_t>(cRows - fileRows, fileRows - cRows);
+    if (!fix && cRows != fileRows) {
+        v->mismatches += std::max<int64_t>(cRows - fileRows, fileRows - cRows);
+        why("c rows vs file rows", t->name, cRows, fileRows);
+    }
     if (fix) {
         x->exec("COMMIT");
         {
@@ -571,7 +606,7 @@ void runMaintSlot(Engine* e, uint32_t slot) {
             return;
         }
         int64_t files = 0, records = 0, bytes = 0;
-        const int32_t rc = maxBytes ? quotaGc(e, maxBytes, &files, &records, &bytes) : P4_OK;
+        const int32_t rc = maxBytes ? quotaGc(e, maxBytes, &files, &records, &bytes, false) : P4_OK;
         if (rc == P4_OK) {
             out.enc.beginRow();
             out.enc.i64(files);
@@ -674,7 +709,7 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
             const uint64_t q = e->quota.load();
             if (q) {
                 int64_t a, bb, c;
-                quotaGc(e, q, &a, &bb, &c);
+                quotaGc(e, q, &a, &bb, &c, true);
             }
             const uint64_t heap = uint64_t(sqlite3_memory_used());
             uint64_t peak = e->heapPeak.load();

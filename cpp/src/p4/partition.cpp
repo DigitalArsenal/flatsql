@@ -140,6 +140,7 @@ Conn* writerPin(Engine* e, File* f, int32_t* rc, std::string* err) {
     const int r = openConn(f->path, OpenKind::Writer, e->cfg.writerCacheKiB, sp->pageSize, &c, err);
     if (r != SQLITE_OK) {
         *rc = statusOfSqlite(r);
+        if (err) *err = f->path + ": " + *err + " (" + std::to_string(r) + ")";
         return nullptr;
     }
     sqlite3_wal_hook(c->db, walHook, e);
@@ -390,6 +391,7 @@ private:
     uint64_t flushEpoch_ = 0;
     std::vector<uint32_t> newLanes_, newSrcs_;
     bool partNew_ = false;
+    std::string lastErr_;
 };
 
 bool Group::parseCall(Call& c) {
@@ -961,7 +963,10 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     int32_t status = P4_OK;
     std::string err;
     Conn* c = writerPin(e_, f, &status, &err);
-    if (!c) return status;
+    if (!c) {
+        lastErr_ = "writer open: " + err;
+        return status;
+    }
     FileOut o;
     {
         std::lock_guard<std::mutex> g(t_->mu);
@@ -1210,7 +1215,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     }
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) {
-        const std::string msg = sqlite3_errmsg(c->db);
+        lastErr_ = std::string(sqlite3_errmsg(c->db)) + " (" + std::to_string(rc) + ")";
         c->exec("ROLLBACK");
         writerUnpin(e_, f);
         if ((rc & 0xff) == SQLITE_CORRUPT || (rc & 0xff) == SQLITE_NOTADB) {
@@ -1494,13 +1499,7 @@ void Group::run(std::vector<WriteTask*>& tasks) {
             }
             writerUnpin(e_, r.file);
         }
-        for (auto& kv : dels_)
-            for (Del& d : kv.second) {
-                std::vector<Holder> hs;
-                if (holdersOf(&L_, t_, d.tb, d.key, &hs) == P4_OK)
-                    for (auto& h : hs) d.others += h.pid != p_->pid;
-                e_->bump(kStCatSuperseded);
-            }
+        for (auto& kv : dels_) e_->bump(kStCatSuperseded, kv.second.size());
     }
     bool ok = true;
     for (Call& c : calls_) ok = ok && c.status == P4_OK;
@@ -1560,11 +1559,24 @@ void Group::run(std::vector<WriteTask*>& tasks) {
                 for (size_t gi : c.recs)
                     if (recs_[gi].file == f && c.status == P4_OK) {
                         c.status = rc;
-                        c.err = "partition file commit failed";
+                        c.err = "partition file commit failed: " + lastErr_;
                     }
         }
     }
-    publish(okFiles, failedFiles);
+    {
+        // A retired row's last-copy decision is atomic with the publish (dmu).
+        std::lock_guard<std::mutex> dg(t_->dmu);
+        for (auto& kv : dels_) {
+            if (!okFiles.count(kv.first)) continue;
+            for (Del& d : kv.second) {
+                std::vector<Holder> hs;
+                d.others = 0;
+                if (holdersOf(&L_, t_, d.tb, d.key, &hs) == P4_OK)
+                    for (auto& h : hs) d.others += h.pid != p_->pid;
+            }
+        }
+        publish(okFiles, failedFiles);
+    }
     respond();
     bool kick;
     {

@@ -60,7 +60,9 @@
 #if !defined(__wasm__) || defined(__wasm_atomics__)
 #define FLATSQL_VFS_THREADS 1
 #include <mutex>
+#if !defined(__wasm__)
 #include <time.h>
+#endif
 #else
 #define FLATSQL_VFS_THREADS 0
 #endif
@@ -685,10 +687,20 @@ int fsSleep(sqlite3_vfs*, int microseconds) {
     // Several connections to one path (format 4) can meet a held lock; the
     // busy handler and WAL retries sleep here. One connection never does.
     if (microseconds > 0) {
+#if defined(__wasm__)
+        // memory.atomic.wait32 on a word that never changes: a timed sleep
+        // without a WASI import. The address reaches the wait through a
+        // volatile so the memarg offset is 0 (WasmEdge 0.16.4's AOT compiler
+        // drops a nonzero offset, turning the wait into a spin).
+        int32_t never = 0;
+        int32_t* volatile addr = &never;
+        __builtin_wasm_memory_atomic_wait32(addr, 0, int64_t(microseconds) * 1000);
+#else
         struct timespec ts;
         ts.tv_sec = microseconds / 1000000;
         ts.tv_nsec = static_cast<long>(microseconds % 1000000) * 1000;
         nanosleep(&ts, nullptr);
+#endif
     }
 #endif
     // The single-threaded lanes have one connection and nothing to wait for,

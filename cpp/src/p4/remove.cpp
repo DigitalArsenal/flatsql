@@ -36,7 +36,8 @@ int32_t journalRows(Type* t, const std::vector<std::array<int64_t, 6>>& rows, co
         if (!q) { rc = SQLITE_ERROR; break; }
         sqlite3_bind_int(q, 1, int(r[0]));
         sqlite3_bind_int64(q, 2, r[1]);
-        if (i < keys.size()) sqlite3_bind_blob(q, 3, keys[i].data(), 32, SQLITE_STATIC); else sqlite3_bind_null(q, 3);
+        if (i < keys.size() && r[0] != J_FILE && r[0] != J_DROP) sqlite3_bind_blob(q, 3, keys[i].data(), 32, SQLITE_STATIC);
+        else sqlite3_bind_null(q, 3);
         sqlite3_bind_null(q, 4);
         sqlite3_bind_int64(q, 5, r[2]);
         sqlite3_bind_int64(q, 6, r[3]);
@@ -112,8 +113,9 @@ int32_t removeFromFile(Engine* e, Part* p, File* f, const std::vector<Inst>& ins
         sqlite3_reset(s);
     }
     gone.erase(std::remove_if(gone.begin(), gone.end(), [](const Gone& g) { return g.seq == 0; }), gone.end());
-    std::vector<std::array<int64_t, 6>> jrows;
-    std::vector<std::array<uint8_t, 32>> jkeys;
+    // The file itself (replay recounts it from its rows), then each row's intent.
+    std::vector<std::array<int64_t, 6>> jrows = {{J_FILE, f->tb, int64_t(p->pid), 0, f->gen, 0}};
+    std::vector<std::array<uint8_t, 32>> jkeys(1);
     for (Gone& g : gone) {
         jrows.push_back({J_DEL, f->tb, int64_t(p->pid), g.seq, 0, g.len});
         std::array<uint8_t, 32> k;
@@ -121,17 +123,6 @@ int32_t removeFromFile(Engine* e, Part* p, File* f, const std::vector<Inst>& ins
         jkeys.push_back(k);
     }
     writerUnpin(e, f);
-    {
-        P4Lane L;
-        L.e = e;
-        for (Gone& g : gone) {
-            std::vector<Holder> hs;
-            if (holdersOf(&L, t, f->tb, g.key, &hs) == P4_OK)
-                for (auto& h : hs) g.others += h.pid != p->pid;
-        }
-        for (auto& kv : L.idx) delete kv.second;
-        L.idx.clear();
-    }
     int64_t jfirst = 0;
     status = journalRows(t, jrows, jkeys, &jfirst);
     if (status != P4_OK) {
@@ -244,6 +235,19 @@ int32_t removeFromFile(Engine* e, Part* p, File* f, const std::vector<Inst>& ins
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) c->exec("ROLLBACK");
     writerUnpin(e, f);
+    // Whether a gone row was a CID's last copy is decided atomically with the
+    // publish, against every other writer's published removals (dmu).
+    std::lock_guard<std::mutex> dg(t->dmu);
+    if (rc == SQLITE_OK) {
+        P4Lane L;
+        L.e = e;
+        for (Gone& g : gone) {
+            std::vector<Holder> hs;
+            g.others = 0;
+            if (holdersOf(&L, t, f->tb, g.key, &hs) == P4_OK)
+                for (auto& h : hs) g.others += h.pid != p->pid;
+        }
+    }
     {
         std::lock_guard<std::mutex> g(t->mu);
         jinflightDone(t, jfirst);
