@@ -361,7 +361,16 @@ P4_TEST(t_abi_reads) {
     CHECK_EQ(call(P4_OPC_SCAN, nt.b).status, P4_E_NOTYPE, "NOTYPE");
     std::vector<uint8_t> junk = {1, 2, 3};
     CHECK_EQ(call(P4_OPC_SCAN, junk).status, P4_E_ARG, "malformed");
+#if __has_include("flatsql/p4sql/p4sql.h")
+    {
+        // The SQL surface is in the tree, so it is linked (never the defaults).
+        Result one = call(P4_OPC_SQL, TlvW().text(70, "SELECT 1").b);
+        CHECK_EQ(one.status, P4_OK, "SQL with the surface: " + one.err);
+        CHECK_EQ(one.rows.size(), size_t(1), "SELECT 1 is one row");
+    }
+#else
     CHECK_EQ(call(P4_OPC_SQL, TlvW().text(70, "SELECT 1").b).status, P4_E_UNSUPPORTED, "SQL without the surface");
+#endif
     // REBUILD verify: 0 mismatches.
     TlvW rb;
     rb.u32(63, 8);

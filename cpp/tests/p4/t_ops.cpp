@@ -4,6 +4,9 @@
 #include <cstring>
 #include <filesystem>
 #include <thread>
+#if !defined(__wasm__)
+#include <sys/resource.h>
+#endif
 
 #include "internal.h"
 #include "p4/p4_test.h"
@@ -312,7 +315,7 @@ P4_TEST(t_rebuild) {
     TlvW r1;
     r1.u32(63, 1).text(1, "MIG");
     CHECK_EQ(call(P4_OPC_REBUILD, r1.b).status, P4_OK, "REBUILD 1");
-    CHECK(hasIndex("r_w") && hasIndex("rl_seq"), "indexes built");
+    CHECK(hasIndex("r_w") && hasIndex("rl_sid"), "indexes built");
     closeEngine();
 }
 
@@ -369,6 +372,18 @@ P4_TEST(t_budget) {
     REQUIRE(st.size() >= size_t(fp::kStCount), "stats");
     report(("t_budget.heap_peak_" + std::to_string(nTypes) + "_types").c_str(), double(st[fp::kStHeapPeak]) / 1048576.0, "MiB");
     report("t_budget.reader_conns", double(st[fp::kStReaderConns]), "connections");
+#if !defined(__wasm__)
+    {
+        struct rusage ru;
+        getrusage(RUSAGE_SELF, &ru);
+#if defined(__APPLE__)
+        report("t_budget.max_rss", double(ru.ru_maxrss) / 1048576.0, "MiB");  // bytes on macOS
+#else
+        report("t_budget.max_rss", double(ru.ru_maxrss) / 1024.0, "MiB");     // KiB on Linux
+#endif
+    }
+#endif
+    // C-30: the heap is the SQL surface's allocator count (0 without it).
     CHECK(st[fp::kStHeapPeak] <= (640ull << 20), "inside the hard heap (640 MiB)");
     closeEngine();
 }

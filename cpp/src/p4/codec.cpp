@@ -82,24 +82,69 @@ int b32v(char c) {
     return -1;
 }
 // The 58 five-bit groups of the 36-byte CID (the last padded with two zero bits).
+// MSB-first bit streams through a 64-bit accumulator (the CID text is 58
+// five-bit groups of the 36 binary bytes; 290 bits, the last 2 zero).
 void groupsOf(const uint8_t d[32], uint8_t g[58]) {
-    uint8_t b[36];
+    uint8_t b[37];
     std::memcpy(b, kCidPrefix, 4);
     std::memcpy(b + 4, d, 32);
+    b[36] = 0;
+    uint64_t acc = 0;
+    int nb = 0;
+    size_t at = 0;
     for (int i = 0; i < 58; i++) {
-        int bit = 5 * i, v = 0;
-        for (int j = 0; j < 5; j++, bit++) v = v << 1 | (bit < 288 ? (b[bit >> 3] >> (7 - (bit & 7))) & 1 : 0);
-        g[i] = uint8_t(v);
+        while (nb < 5) {
+            acc = acc << 8 | b[at++];
+            nb += 8;
+        }
+        nb -= 5;
+        g[i] = uint8_t((acc >> nb) & 31);
     }
 }
 void digestOfGroups(const uint8_t g[58], uint8_t d[32]) {
-    uint8_t b[37] = {0};
-    for (int i = 0; i < 58; i++)
-        for (int j = 0; j < 5; j++) {
-            const int bit = 5 * i + j;
-            if (bit < 288 && ((g[i] >> (4 - j)) & 1)) b[bit >> 3] |= uint8_t(1 << (7 - (bit & 7)));
+    uint8_t b[37];
+    uint64_t acc = 0;
+    int nb = 0;
+    size_t at = 0;
+    for (int i = 0; i < 58; i++) {
+        acc = acc << 5 | g[i];
+        nb += 5;
+        while (nb >= 8 && at < sizeof b) {
+            nb -= 8;
+            b[at++] = uint8_t(acc >> nb);
         }
+    }
     std::memcpy(d, b + 4, 32);
+}
+// The groups of the CID prefix that a key does not carry (g0..g5, g6's high bits).
+const uint8_t* prefixGroups() {
+    static const struct P {
+        uint8_t g[58];
+        P() {
+            const uint8_t zero[32] = {0};
+            groupsOf(zero, g);
+        }
+    } p;
+    return p.g;
+}
+// A key's 58 groups, read straight from its bits (no digest in between).
+void groupsFromKey(const uint8_t k[32], uint8_t g[58]) {
+    const uint8_t* pg = prefixGroups();
+    uint64_t acc = 0;
+    int nb = 0;
+    size_t at = 0;
+    auto get = [&](int w) {
+        while (nb < w) {
+            acc = acc << 8 | k[at++];
+            nb += 8;
+        }
+        nb -= w;
+        return int((acc >> nb) & ((1u << w) - 1));
+    };
+    for (int i = 0; i < 6; i++) g[i] = pg[i];
+    g[6] = uint8_t((pg[6] & ~7) | get(3));
+    for (int i = 7; i <= 56; i++) g[i] = uint8_t((get(5) - 6) & 31);
+    g[57] = uint8_t(((get(3) - 1) & 7) << 2);
 }
 }  // namespace
 
@@ -124,19 +169,8 @@ void cidKeyFromDigest(const uint8_t d[32], uint8_t k[32]) {
 }
 
 void cidDigestFromKey(const uint8_t k[32], uint8_t d[32]) {
-    uint8_t g[58], pg[58];
-    const uint8_t zero[32] = {0};
-    groupsOf(zero, pg);
-    int bit = 0;
-    auto get = [&](int w) {
-        int v = 0;
-        for (int j = 0; j < w; j++, bit++) v = v << 1 | ((k[bit >> 3] >> (7 - (bit & 7))) & 1);
-        return v;
-    };
-    for (int i = 0; i < 6; i++) g[i] = pg[i];
-    g[6] = uint8_t((pg[6] & ~7) | get(3));
-    for (int i = 7; i <= 56; i++) g[i] = uint8_t((get(5) - 6) & 31);
-    g[57] = uint8_t((((get(3)) - 1) & 7) << 2);
+    uint8_t g[58];
+    groupsFromKey(k, g);
     digestOfGroups(g, d);
 }
 
@@ -149,9 +183,11 @@ void cidTextFromDigest(const uint8_t d[32], char out[60]) {
 }
 
 void cidTextFromKey(const uint8_t k[32], char out[60]) {
-    uint8_t d[32];
-    cidDigestFromKey(k, d);
-    cidTextFromDigest(d, out);
+    uint8_t g[58];
+    groupsFromKey(k, g);
+    out[0] = 'b';
+    for (int i = 0; i < 58; i++) out[1 + i] = kB32[g[i]];
+    out[59] = 0;
 }
 
 bool cidDigestFromText(const char* s, size_t n, uint8_t d[32]) {
@@ -529,6 +565,11 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
     if (kind == OpenKind::Writer || kind == OpenKind::Index || kind == OpenKind::Journal) {
         std::snprintf(sql, sizeof sql, "PRAGMA page_size=%u", pageSize ? pageSize : 4096);
         sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+        // A new file's switch to WAL commits through a rollback journal;
+        // EXTRA makes SQLite delete that journal durably (with dsync=1 the VFS
+        // fsyncs the directory), so a power loss cannot bring it back as a
+        // hot journal over the WAL. The pragma below sets the steady level.
+        sqlite3_exec(db, "PRAGMA synchronous=EXTRA", nullptr, nullptr, nullptr);
         rc = sqlite3_exec(db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
         if (rc != SQLITE_OK) {
             if (err) *err = sqlite3_errmsg(db);
@@ -536,7 +577,10 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
             return rc;
         }
     }
-    const char* sync = kind == OpenKind::Index ? "NORMAL" : "FULL";
+    // FULL everywhere: a flush trims the journal right after its type-index
+    // commit, so that commit must be durable first (NORMAL lost acknowledged
+    // records to a power loss between the two: t_power_loss).
+    const char* sync = "FULL";
     std::snprintf(sql, sizeof sql,
                   "PRAGMA synchronous=%s; PRAGMA cache_size=-%u; PRAGMA mmap_size=0; PRAGMA temp_store=MEMORY;"
                   " PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=%lld",

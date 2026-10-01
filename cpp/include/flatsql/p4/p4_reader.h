@@ -67,6 +67,8 @@ int32_t   p4_sources(P4Lane* lane, const char* type, const char* const** out, ui
 int64_t   p4_visible_through(P4Engine* e, const char* type);
 uint64_t  p4_lane_heap_cap(P4Lane* lane);            /* v2, C-18: slot sandbox heap cap (tag 48, else default) */
 void      p4_lane_counters(P4Lane* lane, uint64_t* rowsExamined, uint64_t* bytesRead); /* v2, C-18: this op's cursor totals */
+void      p4_lane_set_error(P4Lane* lane, const char* msg, uint32_t n);  /* v3, C-19: the running slot's err (§3.4), truncated to 255 bytes */
+void      p4_lane_set_rows(P4Lane* lane, uint64_t rows);                 /* v8, C-29: the op's result rows (slot rowsOut, RB1E.rows) */
 #ifdef __cplusplus
 }
 #endif

@@ -32,16 +32,22 @@ const char* kFileSchema =
     " p TEXT, f BLOB, s INTEGER, x BLOB, d BLOB NOT NULL,"
     " w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL,"
     " wd INTEGER GENERATED ALWAYS AS (coalesce(e, ts) / 86400) VIRTUAL);"
+    // Tag instances keyed by seq first: a page's tags are one key range (no
+    // lookups); rl_sid(sid, seq) serves source-ordered scans and supersede.
     "CREATE TABLE IF NOT EXISTS rl(sid INTEGER NOT NULL, seq INTEGER NOT NULL, lane INTEGER NOT NULL,"
-    " at INTEGER NOT NULL, u TEXT, PRIMARY KEY(sid, seq, lane)) WITHOUT ROWID;";
+    " at INTEGER NOT NULL, u TEXT, PRIMARY KEY(seq, sid, lane)) WITHOUT ROWID;";
 }  // namespace
 
 int32_t fileCreateIndexes(Type* t, Conn* c) {
     std::shared_ptr<const Spec> sp = t->spec();
+    // r_s: the seqs alone (12 B a row at the fixture), so the A18 bound's cut
+    // (the type's N-th newest seq) walks an index, not the records' pages.
     std::string ddl =
         "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC);"
-        "CREATE INDEX IF NOT EXISTS rl_seq ON rl(seq);";
-    if (sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_dk ON r(wd, k, w) WHERE k IS NOT NULL;";
+        "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
+        "CREATE INDEX IF NOT EXISTS rl_sid ON rl(sid, seq);";
+    if (sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_dk ON r(wd, k, w) WHERE k IS NOT NULL;"
+                       "CREATE INDEX IF NOT EXISTS r_nk ON r(w) WHERE k IS NULL;";  // records without an object (EPOCH)
     if (sp->hasObject && !sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_k ON r(k, w) WHERE k IS NOT NULL;";
     if (sp->hasEpochRule) ddl += "CREATE INDEX IF NOT EXISTS r_en ON r(cid) WHERE e IS NULL;";
     ddl += "INSERT OR REPLACE INTO meta(k, v) VALUES('ix', 1);";
@@ -94,7 +100,9 @@ File* fileFor(Type* t, Part* p, int64_t tb, bool create) {
     int32_t gen = 0;
     for (auto& f : p->all)
         if (f->tb == tb && f->gen >= gen) gen = f->gen + 1;
-    // Never reuse a path (B9): skip every generation present on disk.
+    // Never reuse a path (B9): past every generation ever used (the gens
+    // table survives the files), and past any present on disk.
+    if (auto mg = p->maxGen.find(tb); mg != p->maxGen.end() && mg->second >= gen) gen = mg->second + 1;
     for (;;) {
         const std::string path = t->filePath(p->pid, tb, gen);
         if (!ioExists(path) && !ioExists(path + "-wal") && !ioExists(path + "-journal")) break;
@@ -105,6 +113,7 @@ File* fileFor(Type* t, Part* p, int64_t tb, bool create) {
     f->tb = tb;
     f->gen = gen;
     f->path = t->filePath(p->pid, tb, gen);
+    p->maxGen[tb] = gen;
     File* raw = f.get();
     if (it != p->files.end()) it->second->retired = true;
     p->files[tb] = raw;
@@ -353,7 +362,8 @@ std::string encodeCols(const ps::Extracted& x, uint32_t nCols) {
 
 class Group {
 public:
-    Group(Engine* e, uint32_t writer, Part* p) : e_(e), writer_(writer), p_(p), t_(p->type) {
+    Group(Engine* e, uint32_t writer, Part* p) : e_(e), p_(p), t_(p->type) {
+        (void)writer;
         L_.e = e;
         L_.thread = writer;
         L_.cls = P4_CLASS_WRITE;
@@ -377,7 +387,6 @@ private:
     void fail(int32_t status, const std::string& err);
 
     Engine* e_;
-    uint32_t writer_;
     Part* p_;
     Type* t_;
     std::shared_ptr<const Spec> sp_;
@@ -661,6 +670,15 @@ int32_t Group::probe() {
         for (const Holder& h : hs) {
             if (migrate) {
                 if (r.seqIn != h.seq) { r.reject = P4_REJ_SEQ; break; }
+                // C-22: the copy stores the holder's d and ts, as an ingest
+                // COPY (a holder still in flight: the call's own, same bytes).
+                const int32_t got = readHolder(h, r.tb, r);
+                if (got < 0) return got;
+                if (got == 1) {
+                    r.d = r.own.data();
+                    r.dLen = uint32_t(r.own.size());
+                    r.sealed = nullptr;
+                }
                 r.seq = h.seq;
                 r.action = P4_ACT_COPY;
                 r.write = true;
@@ -681,6 +699,20 @@ int32_t Group::probe() {
             }
         }
         if (r.reject || copied) continue;
+        if (migrate && sp_->identity && r.ident && !r.tagsIn.empty()) {
+            // A migrated record keeps its ingest identity (format 1's
+            // sdn_record_ingest_identity row) for later ingest-mode repeats.
+            for (auto& c : calls_)
+                for (size_t gi : c.recs)
+                    if (gi == ord[oi] && r.tagsIn[0].first < c.tags.size()) {
+                        const std::string b = c.tags[r.tagsIn[0].first].f6[0] + '\0' + c.tags[r.tagsIn[0].first].f6[1];
+                        uint8_t dg[32];
+                        ps::sha256(b.data(), b.size(), dg);
+                        r.identSrc = ld64(dg) & 0x7fffffffffffffffull;
+                        r.identNew = true;
+                        std::memcpy(r.identCid, r.key, 32);
+                    }
+        }
         // An ingest identity the lane already holds (IQC).
         if (sp_->identity && r.ident && !migrate) {
             const Call* call = nullptr;
@@ -936,6 +968,7 @@ int32_t Group::writeJournal() {
         for (Del& d : kv.second) addRow(J_DEL, d.tb, d.key, nullptr, p_->pid, d.seq, 0, nullptr, d.len);
     if (rc == SQLITE_OK) rc = j->exec("COMMIT");
     if (rc != SQLITE_OK) {
+        lastErr_ = std::string(sqlite3_errmsg(j->db)) + " (" + std::to_string(rc) + ")";
         j->exec("ROLLBACK");
         return statusOfSqlite(rc);
     }
@@ -953,7 +986,7 @@ int32_t Group::writeJournal() {
 
 
 struct FileOut {
-    int64_t n, bytes, ncopy, minseq, maxseq, minw, maxw, maxts, nnull, mints, mine, maxe;
+    int64_t n, bytes, ncopy, minseq, maxseq, minw, maxw, maxts, nnull, mints, mine, maxe, nk;
     std::map<uint32_t, LaneCount> lanes;  // touched lanes, their new counts
     std::vector<std::string> objKeys;
     bool empty = false;
@@ -971,7 +1004,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     {
         std::lock_guard<std::mutex> g(t_->mu);
         o.n = f->n; o.bytes = f->bytes; o.ncopy = f->ncopy; o.minseq = f->minseq; o.maxseq = f->maxseq;
-        o.minw = f->minw; o.maxw = f->maxw; o.maxts = f->maxts; o.nnull = f->nnull;
+        o.minw = f->minw; o.maxw = f->maxw; o.maxts = f->maxts; o.nnull = f->nnull; o.nk = f->nk;
         o.mints = f->mints; o.mine = f->mine; o.maxe = f->maxe;
     }
     auto laneCount = [&](uint32_t id) -> LaneCount& {
@@ -1035,6 +1068,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
             if (r.hasE && r.e < o.mine) o.mine = r.e;
             if (r.hasE && r.e > o.maxe) o.maxe = r.e;
             if (!r.hasE && sp_->hasEpochRule) o.nnull++;
+            if (!r.kType && sp_->ek) o.nk++;
             if (sp_->ek && r.kType) {
                 sqlite3_stmt* u = c->get(S_ENT_UP);
                 bindK(u, 1, r);
@@ -1215,7 +1249,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     }
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) {
-        lastErr_ = std::string(sqlite3_errmsg(c->db)) + " (" + std::to_string(rc) + ")";
+        lastErr_ = std::string(sqlite3_errmsg(c->db)) + " (" + std::to_string(rc) + ") " + f->path;
         c->exec("ROLLBACK");
         writerUnpin(e_, f);
         if ((rc & 0xff) == SQLITE_CORRUPT || (rc & 0xff) == SQLITE_NOTADB) {
@@ -1230,7 +1264,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     // Publish this file's counters.
     std::lock_guard<std::mutex> g(t_->mu);
     f->n = o.n; f->bytes = o.bytes; f->ncopy = o.ncopy; f->minseq = o.minseq; f->maxseq = o.maxseq;
-    f->minw = o.minw; f->maxw = o.maxw; f->maxts = o.maxts; f->nnull = o.nnull;
+    f->minw = o.minw; f->maxw = o.maxw; f->maxts = o.maxts; f->nnull = o.nnull; f->nk = o.nk;
     f->mints = o.mints; f->mine = o.mine; f->maxe = o.maxe;
     for (auto& kv : o.lanes) {
         if (kv.second.n <= 0) f->lanes.erase(kv.first);
@@ -1239,6 +1273,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     for (auto& k : o.objKeys) t_->touchedObj.insert(k);
     f->created = true;
     f->touched = true;
+    f->removed += int64_t(dels.size());
     noteTb(t_, f->tb);
     return P4_OK;
 }
@@ -1423,7 +1458,16 @@ void Group::run(std::vector<WriteTask*>& tasks) {
         respond();
         return;
     }
-    // Files: one per bucket month the group writes or retags in.
+    // Files: one per bucket month the group writes or retags in, claimed
+    // until the publish (a quota drop waits for the claims).
+    struct Claims {
+        Type* t;
+        std::vector<File*> files;
+        ~Claims() {
+            for (File* f : files) fileRelease(t, f);
+        }
+    } claims{t_, {}};
+    bool dropping = false;
     {
         std::lock_guard<std::mutex> g(t_->mu);
         for (Rec& r : recs_) {
@@ -1434,10 +1478,24 @@ void Group::run(std::vector<WriteTask*>& tasks) {
                 r.reject = P4_REJ_BAD_ENTRY;
                 continue;
             }
+            if (f->dropping) {
+                dropping = true;
+                break;
+            }
             if (calls_[0].mode == 1 && !f->created) f->indexed = false;
             r.file = f;
-            if (std::find(files_.begin(), files_.end(), f) == files_.end()) files_.push_back(f);
+            if (std::find(files_.begin(), files_.end(), f) == files_.end()) {
+                fileClaim(f);
+                claims.files.push_back(f);
+                files_.push_back(f);
+            }
         }
+    }
+    if (dropping) {
+        // A month being dropped: the calls retry after the drop (new generation).
+        fail(P4_E_BUSY, "a content month is being dropped (quota); retry");
+        respond();
+        return;
     }
     // Repeats inside the group that add tags write to their first record's file.
     for (Rec& r : recs_)
@@ -1517,7 +1575,7 @@ void Group::run(std::vector<WriteTask*>& tasks) {
     }
     rc = writeJournal();
     if (rc != P4_OK) {
-        fail(rc, "journal commit failed");
+        fail(rc, "journal commit failed: " + lastErr_);
         std::unordered_set<File*> none;
         publish(none, none);
         respond();

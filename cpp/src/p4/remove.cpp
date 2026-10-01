@@ -259,6 +259,7 @@ int32_t removeFromFile(Engine* e, Part* p, File* f, const std::vector<Inst>& ins
                 else f->lanes[kv.first] = kv.second;
             }
             f->touched = true;
+            f->removed += int64_t(gone.size());
             for (Gone& gg : gone) {
                 t->pend.kill(f->tb, gg.key, p->pid);
                 t->pend.put(gg.key, f->tb, p->pid, gg.seq, 2);
@@ -284,6 +285,11 @@ int32_t removeFromFile(Engine* e, Part* p, File* f, const std::vector<Inst>& ins
 }
 
 }  // namespace
+
+void fileRelease(Type* t, File* f) {
+    std::lock_guard<std::mutex> g(t->mu);
+    f->inflight--;
+}
 
 // A file with no row left is retired at once (readers skip it, writers make a
 // new generation) and unlinked by the maintenance thread once nothing uses it.
@@ -381,9 +387,16 @@ void supersedePart(Engine* e, Part* p, WriteTask* task) {
             if (!f->created || f->retired) continue;
             bool has = false;
             for (uint32_t id : drop) has = has || f->lanes.count(id);
-            if (has) files.push_back(f);
+            if (has && fileClaim(f)) files.push_back(f);  // a dropping file goes anyway
         }
     }
+    struct Claims {
+        Type* t;
+        std::vector<File*>& files;
+        ~Claims() {
+            for (File* f : files) fileRelease(t, f);
+        }
+    } claims{t, files};
     std::string in;
     for (uint32_t id : drop) in += (in.empty() ? "" : ",") + std::to_string(id);
     for (File* f : files) {
@@ -482,18 +495,30 @@ void deletePart(Engine* e, Part* p, WriteTask* task) {
     Shared* s = task->shared;
     Type* t = p->type;
     std::map<File*, std::vector<Gone>> byFile;
+    std::vector<File*> claimed;
     for (const auto& h : task->dels) {  // (tb, seq)
         File* f;
         {
             std::lock_guard<std::mutex> g(t->mu);
             auto it = p->files.find(h.first);
             f = it == p->files.end() || !it->second->created || it->second->retired ? nullptr : it->second;
+            if (f && !byFile.count(f)) {
+                if (!fileClaim(f)) f = nullptr;  // being dropped: the rows go with it
+                else claimed.push_back(f);
+            }
         }
         if (!f) continue;
         Gone g;
         g.seq = h.second;
         byFile[f].push_back(g);
     }
+    struct Claims {
+        Type* t;
+        std::vector<File*>& files;
+        ~Claims() {
+            for (File* f : files) fileRelease(t, f);
+        }
+    } claims{t, claimed};
     for (auto& kv : byFile) {
         bool emptied = false;
         const size_t want = kv.second.size();
@@ -508,6 +533,172 @@ void deletePart(Engine* e, Part* p, WriteTask* task) {
         if (emptied) retireFile(e, kv.first);
     }
     finishShared(e, s);
+}
+
+// ---- file rebuild (design §7) -------------------------------------------------------------------
+int32_t rebuildFile(Engine* e, File* f) {
+    Part* p = f->part;
+    Type* t = p->type;
+    std::lock_guard<std::mutex> fg(t->flushMu);
+    int32_t gen = 0;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        auto it = p->files.find(f->tb);
+        if (f->retired || !f->created || f->dropping || it == p->files.end() || it->second != f) return P4_OK;
+        f->dropping = true;  // claims are refused from here (writers answer P4_E_BUSY)
+        for (auto& x : p->all)
+            if (x->tb == f->tb) gen = std::max(gen, x->gen + 1);
+        if (auto mg = p->maxGen.find(f->tb); mg != p->maxGen.end()) gen = std::max(gen, mg->second + 1);
+    }
+    auto release = [&] {
+        std::lock_guard<std::mutex> g(t->mu);
+        f->dropping = false;
+    };
+    // Quiet: no claimed write and no writer pin.
+    bool quiet = false;
+    for (int i = 0; i < 30000 && !quiet; i++) {
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            quiet = f->inflight == 0;
+        }
+        if (quiet) {
+            std::lock_guard<std::mutex> g(e->wconnMu);
+            quiet = f->wPins == 0;
+        }
+        if (!quiet) ps::sleepNs(1000000);
+    }
+    if (!quiet) {
+        release();
+        return P4_E_BUSY;
+    }
+    while (ioExists(t->filePath(p->pid, f->tb, gen)) || ioExists(t->filePath(p->pid, f->tb, gen) + "-wal")) gen++;
+    const std::string np = t->filePath(p->pid, f->tb, gen);
+    // The generation is used from here (B9; a crash leaves a file the open sweeps).
+    {
+        sqlite3_stmt* s = t->idx->sql(
+            "INSERT INTO gens(pid, tb, gen) VALUES(?1,?2,?3) ON CONFLICT(pid, tb) DO UPDATE SET gen=max(gen, excluded.gen)");
+        int rc = s ? SQLITE_OK : SQLITE_ERROR;
+        if (s) {
+            sqlite3_bind_int64(s, 1, p->pid);
+            sqlite3_bind_int64(s, 2, f->tb);
+            sqlite3_bind_int64(s, 3, gen);
+            rc = sqlite3_step(s) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+            sqlite3_reset(s);
+        }
+        std::lock_guard<std::mutex> g(t->mu);
+        p->maxGen[f->tb] = gen;
+        if (rc != SQLITE_OK) {
+            f->dropping = false;
+            return P4_E_IO;
+        }
+    }
+    int32_t status = P4_OK;
+    {
+        Conn* c = nullptr;
+        int rc = openConn(f->path, OpenKind::Maint, 16384, 0, &c, nullptr);
+        if (rc == SQLITE_OK) {
+            sqlite3_stmt* s = c->sql("VACUUM INTO ?1");
+            if (!s) rc = SQLITE_ERROR;
+            else {
+                sqlite3_bind_text(s, 1, np.data(), int(np.size()), SQLITE_STATIC);
+                rc = sqlite3_step(s);
+                rc = rc == SQLITE_DONE ? SQLITE_OK : rc;
+                sqlite3_reset(s);
+            }
+            delete c;
+        }
+        // WAL mode, made durable (the journal-mode change syncs the file).
+        if (rc == SQLITE_OK) {
+            std::shared_ptr<const Spec> sp = t->spec();
+            Conn* w = nullptr;
+            rc = openConn(np, OpenKind::Writer, 1024, sp->pageSize, &w, nullptr);
+            if (rc == SQLITE_OK) rc = w->exec("PRAGMA wal_checkpoint(TRUNCATE)");
+            delete w;
+        }
+        if (rc != SQLITE_OK) status = statusOfSqlite(rc);
+    }
+    int64_t jfirst = 0;
+    if (status == P4_OK) {
+        // J_FILE (the new generation) before J_DROP (the old one): a replay
+        // makes the new file live first, so the drop never matches a live
+        // file and the index rows stay.
+        status = journalRows(t, {{J_FILE, f->tb, int64_t(p->pid), 0, gen, 0}, {J_DROP, f->tb, int64_t(p->pid), 0, f->gen, 0}},
+                             {}, &jfirst);
+    }
+    if (status != P4_OK) {
+        ioUnlink(np + "-wal");
+        ioUnlink(np);
+        release();
+        return status;
+    }
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        auto nf = std::make_unique<File>();
+        nf->part = p;
+        nf->tb = f->tb;
+        nf->gen = gen;
+        nf->path = np;
+        nf->n = f->n; nf->bytes = f->bytes; nf->ncopy = f->ncopy; nf->minseq = f->minseq; nf->maxseq = f->maxseq;
+        nf->minw = f->minw; nf->maxw = f->maxw; nf->maxts = f->maxts; nf->nnull = f->nnull; nf->nk = f->nk;
+        nf->mints = f->mints; nf->mine = f->mine; nf->maxe = f->maxe;
+        nf->lanes = f->lanes;
+        nf->indexed = f->indexed;
+        nf->created = true;
+        nf->touched = true;
+        p->files[f->tb] = nf.get();
+        p->all.push_back(std::move(nf));
+        f->retired = true;
+        f->touched = true;
+        f->dropping = false;
+        jinflightDone(t, jfirst);
+    }
+    {
+        std::lock_guard<std::mutex> g(e->maintMu);
+        MaintTask mt;
+        mt.kind = MaintTask::kUnlink;
+        mt.file = f;
+        e->maintQ.push_back(mt);
+    }
+    e->kickMaintenance();
+    e->bump(kStRebuilds);
+    return P4_OK;
+}
+
+void maybeRebuildFiles(Engine* e) {
+    std::vector<Type*> types;
+    {
+        std::lock_guard<std::mutex> g(e->typesMu);
+        for (auto& t : e->types) types.push_back(t.get());
+    }
+    for (Type* t : types) {
+        std::vector<File*> cand;
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            for (auto& p : t->parts)
+                for (auto& kv : p->files)
+                    if (kv.second->created && !kv.second->retired && kv.second->removed > 0) {
+                        kv.second->removed = 0;
+                        cand.push_back(kv.second);
+                    }
+        }
+        for (File* f : cand) {
+            Conn* c = nullptr;
+            if (openConn(f->path, OpenKind::Maint, 256, 0, &c, nullptr) != SQLITE_OK) continue;
+            int64_t freePages = 0, pages = 0, pageSize = 0;
+            sqlite3_stmt* s = c->sql("SELECT (SELECT freelist_count FROM pragma_freelist_count), (SELECT page_count FROM"
+                                     " pragma_page_count), (SELECT page_size FROM pragma_page_size)");
+            if (s && sqlite3_step(s) == SQLITE_ROW) {
+                freePages = sqlite3_column_int64(s, 0);
+                pages = sqlite3_column_int64(s, 1);
+                pageSize = sqlite3_column_int64(s, 2);
+            }
+            if (s) sqlite3_reset(s);
+            delete c;
+            if (pages > 0 && uint64_t(freePages * pageSize) >= e->cfg.rebuildMinBytes &&
+                uint64_t(freePages) * 1000 >= uint64_t(pages) * e->cfg.rebuildFreePermille)
+                rebuildFile(e, f);
+        }
+    }
 }
 
 }  // namespace p4

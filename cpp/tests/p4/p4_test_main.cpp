@@ -389,9 +389,19 @@ std::vector<uint8_t> encodePut(const Batch& b) {
 }
 
 // ---- engine ----------------------------------------------------------------------------------------
+// --dir, else $FLATSQL_P4_TEST_DIR, else <temp>/flatsql-p4test (the wasm
+// host maps its preopened directory; the suite runner passes --dir=/p4test).
 std::string scratchDir(const std::string& name) {
-    const std::string base = argStr("dir", std::string("/private/tmp/claude-501/-Users-tj-software-spacedatanetwork-stack/"
-                                                          "fceff73f-656a-45b9-b7ad-9f96ac195cfa/scratchpad/p4test"));
+    std::string base = argStr("dir", "");
+#if !defined(__wasm__)
+    if (base.empty() && std::getenv("FLATSQL_P4_TEST_DIR")) base = std::getenv("FLATSQL_P4_TEST_DIR");
+    if (base.empty()) {
+        std::error_code ec;
+        base = (std::filesystem::temp_directory_path(ec) / "flatsql-p4test").string();
+    }
+#else
+    if (base.empty()) base = "/p4test";
+#endif
 #if defined(__wasm__)
     static unsigned n = 0;
     const std::string d = base + "/" + name + "-" + std::to_string(flatsql::ps::monoNs() % 1000000) + "-" + std::to_string(++n);

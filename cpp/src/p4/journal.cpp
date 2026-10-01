@@ -40,12 +40,24 @@ const char* colText(sqlite3_stmt* s, int i) {
     const unsigned char* t = sqlite3_column_text(s, i);
     return t ? reinterpret_cast<const char*>(t) : "";
 }
+// Opening the file recovers its WAL first (a maintenance connection).
+bool fileHasSchema(const std::string& path) {
+    if (!ioExists(path)) return false;
+    Conn* c = nullptr;
+    if (openConn(path, OpenKind::Maint, 256, 0, &c, nullptr) != SQLITE_OK) return true;  // let the reader report it
+    sqlite3_stmt* s = c->sql("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='r'");
+    const bool has = s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_int64(s, 0) == 1;
+    if (s) sqlite3_reset(s);
+    delete c;
+    return has;
+}
 }  // namespace
 
 int32_t journalOpen(Type* t, std::string* err) {
     Conn* c = nullptr;
     int rc = openConn(t->pJnl, OpenKind::Journal, 1024, 4096, &c, err);
     if (rc != SQLITE_OK) return statusOfSqlite(rc);
+    sqlite3_wal_hook(c->db, walHook, t->e);  // its WAL is checkpointed by the maintenance thread
     rc = c->exec(kJournalSchema);
     if (rc != SQLITE_OK) {
         if (err) *err = sqlite3_errmsg(c->db);
@@ -54,6 +66,22 @@ int32_t journalOpen(Type* t, std::string* err) {
     }
     t->jdb = c;
     return P4_OK;
+}
+
+// Hands an emptied journal's free pages back: VACUUM when no entry is left
+// (cheap then, and it keeps sqlite_sequence, so ids never restart). A journal
+// with live entries keeps its high-water size; ingest reuses the pages.
+void journalReclaim(Type* t, int64_t keepPages) {
+    // jmu held by the caller.
+    sqlite3_stmt* s = t->jdb->sql("SELECT (SELECT count(*) FROM (SELECT 1 FROM j LIMIT 1)), (SELECT freelist_count FROM pragma_freelist_count)");
+    int64_t live = 1, freePages = 0;
+    if (s && sqlite3_step(s) == SQLITE_ROW) {
+        live = sqlite3_column_int64(s, 0);
+        freePages = sqlite3_column_int64(s, 1);
+    }
+    if (s) sqlite3_reset(s);
+    if (live || freePages <= keepPages) return;
+    t->jdb->exec("VACUUM");
 }
 
 int32_t journalReserve(Type* t, int64_t through) {
@@ -112,6 +140,10 @@ int32_t journalReplay(Type* t, std::string* err) {
 
     std::lock_guard<std::mutex> g(t->mu);
     // 1. Registry: partitions, sources, lanes, files.
+    // A file is created once its schema committed: a crash between the
+    // empty file (ioTouch) and the schema leaves a file without tables, which
+    // the writer completes (CREATE ... IF NOT EXISTS) instead of trusting.
+    std::unordered_set<File*> checked;
     for (const JE& x : rows) {
         if (x.op == J_PART) {
             const auto f = splitUnit(x.s, 2);
@@ -185,7 +217,10 @@ int32_t journalReplay(Type* t, std::string* err) {
                 p->all.push_back(std::move(nf));
             }
             if (f) {
-                f->created = ioExists(f->path);
+                if (!checked.count(f)) {
+                    checked.insert(f);
+                    f->created = fileHasSchema(f->path);
+                }
                 f->touched = true;
                 f->objRefresh = true;
                 noteTb(t, x.tb);
@@ -197,6 +232,13 @@ int32_t journalReplay(Type* t, std::string* err) {
             if (it != p->files.end() && it->second->gen == x.gen) {
                 it->second->retired = true;
                 p->files.erase(it);
+                // The drop's index rows, if the crash came before they went
+                // (the J_DROP is still here, so no flush has run past it).
+                const int32_t drc = dropIndexRows(t, x.pid, x.tb);
+                if (drc != P4_OK) {
+                    *err = "replay: completing a drop failed";
+                    return drc;
+                }
             }
         }
     }
@@ -303,14 +345,14 @@ int32_t journalReplay(Type* t, std::string* err) {
             any = true;
             Conn* c = connOf(f);
             if (!c) continue;
-            f->n = f->bytes = f->ncopy = f->nnull = f->maxts = 0;
+            f->n = f->bytes = f->ncopy = f->nnull = f->maxts = f->nk = 0;
             f->minseq = INT64_MAX;
             f->maxseq = 0;
             f->minw = INT64_MAX;
             f->maxw = INT64_MIN;
             sqlite3_stmt* s = c->sql(
                 "SELECT count(*), coalesce(sum(length(d)),0), min(seq), max(seq), min(w), max(w), coalesce(max(ts),0),"
-                " coalesce(sum(e IS NULL),0), min(ts), min(e), max(e) FROM r");
+                " coalesce(sum(e IS NULL),0), min(ts), min(e), max(e), coalesce(sum(k IS NULL),0) FROM r");
             if (s && sqlite3_step(s) == SQLITE_ROW) {
                 f->n = sqlite3_column_int64(s, 0);
                 f->bytes = sqlite3_column_int64(s, 1);
@@ -325,6 +367,7 @@ int32_t journalReplay(Type* t, std::string* err) {
                 f->mints = sqlite3_column_type(s, 8) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 8);
                 f->mine = sqlite3_column_type(s, 9) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 9);
                 f->maxe = sqlite3_column_type(s, 10) == SQLITE_NULL ? INT64_MIN : sqlite3_column_int64(s, 10);
+                f->nk = sqlite3_column_int64(s, 11);
             }
             if (s) sqlite3_reset(s);
             s = c->sql("SELECT v FROM meta WHERE k='ncopy'");

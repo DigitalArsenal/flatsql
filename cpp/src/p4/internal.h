@@ -218,13 +218,21 @@ struct File {
     // counters (Type::mu); the file's meta and lane rows are the durable copy
     int64_t n = 0, bytes = 0, ncopy = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN,
             maxts = 0, nnull = 0, mints = INT64_MAX, mine = INT64_MAX, maxe = INT64_MIN;
+    int64_t nk = 0;  // rows written without an object key (an upper bound between recounts; EPOCH reads them)
     std::map<uint32_t, LaneCount> lanes;  // live lanes (n > 0) by lane id
     bool created = false;      // exists on disk with its schema (readers skip it until then)
     bool retired = false;      // dropped or replaced: readers skip it, writers never use it again
     bool quarantined = false;  // corrupt: P4_E_CORRUPT for ops that need it
+    // A quota drop sets dropping, then waits for inflight (writes that claimed
+    // the file: groups until they publish, removals) to reach 0; a claim on a
+    // dropping file is refused (the call answers P4_E_BUSY). Type::mu.
+    bool dropping = false;
+    int inflight = 0;
+    int64_t removed = 0;       // rows removed since the last free-page check (file rebuild, §7)
     bool indexed = true;       // secondary indexes present (false between a migration's append and REBUILD 1)
     bool touched = false;      // changed since the last flush
     bool objRefresh = false;   // rewrite all of its obj rows at the next flush (journal replay)
+    bool objRefreshing = false;  // a running flush rewrites them (readers read ent instead)
     // writer connection (Engine::wconnMu)
     Conn* w = nullptr;
     int wPins = 0;
@@ -243,6 +251,7 @@ struct Part {
     uint32_t owner = 0;    // writer thread index
     std::map<int64_t, File*> files;          // live files by tb (Type::mu)
     std::vector<std::unique_ptr<File>> all;  // every File (live and retired; never freed while the engine runs)
+    std::map<int64_t, int32_t> maxGen;       // the highest generation ever used per tb (the gens table; Type::mu)
     int64_t n = 0, bytes = 0;
     bool journaled = false;  // its J_PART row is durable
     // backlog (WriterState::mu of the owner)
@@ -362,6 +371,7 @@ struct Type {
     PMap pend, flushing;
     std::unordered_map<std::string, IdentEnt> identPend, identFlushing;
     std::unordered_set<std::string> touchedObj;  // pid|tb|k whose obj rows to refresh
+    std::unordered_set<std::string> touchedObjFlushing;  // those a running flush writes (readers: maybe stale)
     int64_t lastFlushMs = 0;
     bool overQuota = false;
 
@@ -511,8 +521,10 @@ struct P4Engine {
     flatsql::p4::Markers markers;
     std::atomic<uint64_t> stat[flatsql::p4::kStCount];
     std::atomic<uint64_t> quota{0};
-    std::atomic<uint64_t> heapPeak{0};
     std::atomic<bool> stopping{false};
+    // A migration target (create mode 2) holds full-text indexing until
+    // activation: migrated rows keep format 1's seqs, below the watermark.
+    std::atomic<bool> ftsHold{false};
     std::atomic<uint32_t>* stopWord = nullptr;
 
     // types (typesMu; never removed while the engine runs)
@@ -580,6 +592,7 @@ struct P4Lane {
     uint64_t maxRows = 0, maxBytes = 0, maxResultRows = 0, maxResultBytes = 0, heapCap = 0;
     uint64_t rowsExamined = 0, bytesRead = 0, rowsOut = 0, outBytes = 0;
     int32_t trip = 0;  // a cap or cancel that tripped (sticky for the op)
+    std::string err;   // the op's error text (p4_lane_set_error, C-19)
     // per-thread caches
     std::vector<std::shared_ptr<const flatsql::p4::Spec>> specRefs;  // keep p4_types' pointers valid
     std::vector<std::string> typeNames;
@@ -609,6 +622,16 @@ uint64_t laneHash(const std::string* f6);
 enum JOp : int { J_PART = 1, J_LANE = 2, J_SRC = 3, J_FILE = 4, J_C = 5, J_IDENT = 6, J_DEL = 7, J_DROP = 8 };
 int32_t journalOpen(Type* t, std::string* err);
 // The journal's last-id high water and the durable seq reservation.
+// Claims a file for a write (Type::mu held): false when it is dropping or
+// retired. Every claim is released with fileRelease.
+inline bool fileClaim(File* f) {
+    if (f->dropping || f->retired) return false;
+    f->inflight++;
+    return true;
+}
+void fileRelease(Type* t, File* f);
+// VACUUMs an emptied journal holding more than keepPages free pages (jmu held).
+void journalReclaim(Type* t, int64_t keepPages);
 int32_t journalReserve(Type* t, int64_t through);  // jmu held by caller? no: takes jmu
 int32_t journalReplay(Type* t, std::string* err);  // at open, before any read (M8)
 
@@ -621,6 +644,8 @@ int32_t holdersWith(Type* t, Conn* idx, int64_t tb, const uint8_t* key, std::vec
 int32_t identHolder(P4Lane* L, Type* t, int64_t tb, uint64_t src, const uint8_t h[32], int64_t* seq,
                     uint8_t cid[32]);
 Conn* indexReader(P4Lane* L, Type* t, int32_t* rc);
+// Completes an interrupted drop of (pid, tb) in the type index (replay).
+int32_t dropIndexRows(Type* t, uint32_t pid, int64_t tb);
 int32_t typeIndexFlush(Type* t, bool force);  // maintenance thread
 int32_t typeIndexRebuild(Type* t, bool verifyOnly, int64_t* entries, int64_t* mismatches);
 void noteTb(Type* t, int64_t tb);  // mu held
@@ -636,6 +661,15 @@ void putGroup(P4Engine* e, uint32_t writer, Part* p, std::vector<WriteTask*>& ta
 void supersedePart(P4Engine* e, Part* p, WriteTask* task);
 void deletePart(P4Engine* e, Part* p, WriteTask* task);
 void finishShared(P4Engine* e, Shared* s);
+// File rebuild (design §7): VACUUM INTO the next generation, swapped in; the
+// old generation is unlinked when its last reader closes. Writes to the file
+// Tests compare the EPOCH object-directory answers with the scan's.
+extern std::atomic<bool> gEpochScanOnly;
+// answer P4_E_BUSY meanwhile. Any thread (it takes Type::flushMu).
+int32_t rebuildFile(P4Engine* e, File* f);
+// The maintenance pass: files with removals since the last check whose free
+// pages reach Config::rebuildFreePermille and rebuildMinBytes are rebuilt.
+void maybeRebuildFiles(P4Engine* e);
 int32_t retireFile(P4Engine* e, File* f);
 
 // ---- reader.cpp -----------------------------------------------------------------------------------
@@ -645,7 +679,7 @@ int32_t runRead(P4Lane* L, uint32_t op);  // ops 10-17 on a lane
 void maintenanceLoop(P4Engine* e, uint32_t thread);
 int32_t quotaGc(P4Engine* e, uint64_t maxBytes, int64_t* files, int64_t* records, int64_t* bytes, bool enforce);
 int32_t rebuildOp(P4Engine* e, Type* only, uint32_t what, std::vector<std::array<int64_t, 2>>* rows,
-                  std::vector<Type*>* rowTypes);
+                  std::vector<Type*>* rowTypes, std::string* firstBad = nullptr);
 int32_t ftsCatchUp(P4Engine* e, Type* t, bool all);
 int walHook(void* arg, sqlite3* db, const char* zDb, int nPages);
 

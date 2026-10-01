@@ -199,6 +199,52 @@ bool markersActivated(const Markers& m) {
            m.migratedFormat == 4;
 }
 
+// Retired generations left on disk by a crash between the drop (J_DROP) and
+// the unlink. Every path a type ever used is <month>.<gen>.db with gen at
+// most the gens table's maximum, so no directory listing is needed (the wasm
+// host has none). A path is removed only when no live file holds it.
+void sweepRetired(Type* t) {
+    for (auto& p : t->parts) {
+        // A live, empty file whose path is gone (its index row outlived it): it
+        // has no rows to lose, so it is uncreated again and the writer remakes it.
+        for (auto& kv : p->files) {
+            File* f = kv.second;
+            if (f->created && !f->retired && f->n == 0 && !ioExists(f->path)) f->created = false;
+        }
+        std::map<int64_t, int32_t> top = p->maxGen;
+        for (auto& f : p->all) {
+            int32_t& g = top[f->tb];
+            g = std::max(g, f->gen);
+        }
+        for (auto& kv : top) {
+            // The swept generations stay used (B9): a path is never reused, so
+            // no reader's or VFS node's state can meet a new file on it.
+            if (p->maxGen[kv.first] < kv.second) {
+                p->maxGen[kv.first] = kv.second;
+                sqlite3_stmt* s = t->idx->sql(
+                    "INSERT INTO gens(pid, tb, gen) VALUES(?1,?2,?3) ON CONFLICT(pid, tb) DO UPDATE SET gen=max(gen, excluded.gen)");
+                if (s) {
+                    sqlite3_bind_int64(s, 1, p->pid);
+                    sqlite3_bind_int64(s, 2, kv.first);
+                    sqlite3_bind_int64(s, 3, kv.second);
+                    sqlite3_step(s);
+                    sqlite3_reset(s);
+                }
+            }
+            for (int32_t g = 0; g <= kv.second; g++) {
+                auto live = p->files.find(kv.first);
+                if (live != p->files.end() && live->second->gen == g && !live->second->retired) continue;
+                const std::string path = t->filePath(p->pid, kv.first, g);
+                for (const char* sfx : {"-wal", "-journal", ""})
+                    if (ioExists(path + sfx)) {
+                        ioUnlink(path + sfx);
+                        t->e->bump(kStUnlinked);
+                    }
+            }
+        }
+    }
+}
+
 int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std::string* err) {
     t->e = e;
     t->name = sp->name;
@@ -214,7 +260,10 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
     if (rc != P4_OK) return rc;
     rc = journalOpen(t, err);
     if (rc != P4_OK) return rc;
-    return journalReplay(t, err);
+    rc = journalReplay(t, err);
+    if (rc != P4_OK) return rc;
+    sweepRetired(t);
+    return P4_OK;
 }
 }  // namespace
 
@@ -343,7 +392,12 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
             }
             break;
         case 2:
-            if (m.storePresent) { *err = "a migration target has no STORE yet"; return P4_E_FORMAT; }
+            // A valid STORE is an activated store. A torn STORE next to a
+            // valid MIGRATED is an activation in progress (C-22): reopened
+            // here, rewritten by flatsql_p4_activate.
+            if (m.storeValid) { *err = "a migration target has no valid STORE yet"; return P4_E_FORMAT; }
+            if (m.storePresent && !m.migratedValid) { *err = "a torn STORE without a valid MIGRATED"; return P4_E_FORMAT; }
+            e->ftsHold.store(true);
             break;
     }
     // Types: the catalog, then each type's spec, type index and journal tail.
@@ -431,6 +485,10 @@ int32_t engineActivate(Engine* e) {
     for (Type* t : types) {
         int32_t rc = typeIndexFlush(t, true);
         if (rc != P4_OK) return rc;
+        {
+            std::lock_guard<std::mutex> g(t->jmu);
+            journalReclaim(t, 0);
+        }
         std::vector<std::string> paths;
         {
             std::lock_guard<std::mutex> g(t->mu);
@@ -456,7 +514,9 @@ int32_t engineActivate(Engine* e) {
     else
         randomUuid(uuid);
     const bool rewriteMigrated = !(m.migratedValid && m.storePresent && !m.storeValid);
-    return writeMarkers(e, uuid, e->cfg.gseqFloor, 1, rewriteMigrated);
+    const int32_t rc = writeMarkers(e, uuid, e->cfg.gseqFloor, 1, rewriteMigrated);
+    if (rc == P4_OK) e->ftsHold.store(false);  // full text builds from seq 0 (§11 step 5)
+    return rc;
 }
 
 // ---- stats (§3.10) -------------------------------------------------------------------------
@@ -483,12 +543,10 @@ int32_t engineStats(Engine* e, uint8_t* out, int32_t cap) {
         v[kStWriterConns] = e->nWConn;
     }
     v[kStReaderConns] = e->rpool.open();
-    const uint64_t heap = uint64_t(sqlite3_memory_used()) + pending;
-    uint64_t peak = e->heapPeak.load();
-    while (heap > peak && !e->heapPeak.compare_exchange_weak(peak, heap)) {
-    }
-    v[kStHeap] = heap;
-    v[kStHeapPeak] = std::max<uint64_t>(e->heapPeak.load(), uint64_t(sqlite3_memory_highwater(0)));
+    // C-30: SQLite runs without memory statistics; the SQL surface's
+    // allocator counts (0 without the surface).
+    v[kStHeap] = p4sql_heap_used();
+    v[kStHeapPeak] = p4sql_heap_peak();
     v[kStPendingBytes] = pending;
     v[kStLiveFiles] = files;
     v[kStTypes] = types;

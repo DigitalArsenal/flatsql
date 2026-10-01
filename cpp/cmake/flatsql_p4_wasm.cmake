@@ -13,8 +13,8 @@
 #                         (the Node host runs it: wasm/ps-node-host.mjs).
 #
 # Sources are globbed: src/p4 (the engine), src/p4sql (the SQL surface; without
-# it the engine's weak defaults answer SQL with P4_E_UNSUPPORTED), tests/p4 and
-# tests/p4sql.
+# it src/p4/p4sql_weak.cpp answers SQL with P4_E_UNSUPPORTED, and it is left
+# out when the surface is there), tests/p4 and tests/p4sql.
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "WASI")
     message(FATAL_ERROR "flatsql_p4_wasm.cmake needs the WASI toolchain")
@@ -34,7 +34,9 @@ set(FLATSQL_P4_WASM_FLAGS
 
 # ---- SQLite 3.53.4, unmodified ------------------------------------------------
 # Multi-thread mode (a connection is used by one thread at a time), WAL, FTS5,
-# memory statistics (the engine's heap limits), temp storage in memory.
+# no memory statistics (C-30: the SQL surface's allocator counts and enforces
+# the hard heap; a global statistics mutex cost every lane), temp storage in
+# memory.
 # SQLITE_OS_OTHER: no unix VFS (it would import WASI file calls); the only VFS
 # is flatsql_io, registered as the default by src/p4/capi_wasm.cpp, which also
 # installs pthread mutexes (SQLITE_OS_OTHER compiles only no-op ones).
@@ -44,7 +46,7 @@ target_compile_options(sqlite3_p4_wasm PRIVATE ${FLATSQL_P4_WASM_FLAGS} -w)
 target_compile_definitions(sqlite3_p4_wasm PRIVATE
     SQLITE_THREADSAFE=2
     SQLITE_OS_OTHER=1
-    SQLITE_DEFAULT_MEMSTATUS=1
+    SQLITE_DEFAULT_MEMSTATUS=0
     SQLITE_TEMP_STORE=3
     SQLITE_OMIT_LOAD_EXTENSION=1
     SQLITE_OMIT_DEPRECATED=1
@@ -58,6 +60,10 @@ file(GLOB FLATSQL_P4_WASM_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/p4/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/p4sql/*.cpp")
 list(FILTER FLATSQL_P4_WASM_SOURCES EXCLUDE REGEX "/capi_wasm\\.cpp$")
+file(GLOB FLATSQL_P4SQL_WASM_PRESENT "${CMAKE_CURRENT_SOURCE_DIR}/src/p4sql/*.cpp")
+if(FLATSQL_P4SQL_WASM_PRESENT)
+    list(FILTER FLATSQL_P4_WASM_SOURCES EXCLUDE REGEX "/p4sql_weak\\.cpp$")
+endif()
 set(FLATSQL_P4_WASM_ENTRY "${CMAKE_CURRENT_SOURCE_DIR}/src/p4/capi_wasm.cpp")
 add_library(flatsql_p4_wasm OBJECT
     ${FLATSQL_P4_WASM_SOURCES}

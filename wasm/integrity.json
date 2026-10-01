@@ -4,20 +4,25 @@
   "sri": "sha384-PAY8EKMzvf5QkghYRLfSmTMOEc7rHYUQyMoV1w+uwGMq+HP3A73Ij/ZyI/KtKFXP",
   "size": 2246620,
   "files": {
+    "flatsql-p4-threads.wasm": {
+      "sha256": "86ff015d6e50270079150a88a88b55a335e8f6743732bd2ae0c6ebc476c676e9",
+      "sri": "sha384-CFreI5Bnhz8cBLL3VAz2fJnXNWYgHL6OYAUh7xxAaYET6QpIkludWg0Ow7iMZEwG",
+      "size": 2692641
+    },
     "flatsql-ps-threads.wasm": {
-      "sha256": "87ea0c727eb3c0b889a2d3fb41f8dac631ec2af07f521fe9526556d094d2e119",
-      "sri": "sha384-RUEUl560TtNBLtx6OauGyCwNdLJNbYfXPDEKVgV1M5au/stPrlxS+r9hlWxNprWI",
-      "size": 2629364
+      "sha256": "78bc552ecb875b6d8e99849264f47503c890be61db9ba84d18651a46ab3aa7ac",
+      "sri": "sha384-+iA0s0V6ZPLJ3H1G0+/9vYkU0ovOlI8fD+WkG0G3GoX46u3cJ3PWajJQVWbJYyrD",
+      "size": 2681124
     },
     "flatsql-wasi-noeh.wasm": {
-      "sha256": "8f11fd49ee2e6961b9c1c22dd891d5a6645d0faf481f815408c0f1f5d3a385ab",
-      "sri": "sha384-Y7JqN0TgofROVAG/jtJb623501xOW9G8BZ3QwKUUudEgmGM2f1R8tYitm872ATUg",
-      "size": 2154784
+      "sha256": "2d5da3b3b3ed4d1a210a9890dafa5cabf4c09491fd7aab39bef251f2e4b96364",
+      "sri": "sha384-n+xUOXispb0GMmB/Jf3/WnNKvHt9Ncig0u+4ylnAqy5vQvnForRTpkzP5opnS17v",
+      "size": 2239803
     },
     "flatsql-wasi.wasm": {
-      "sha256": "8e6a491141fa8334bcdb4fe2d3c848ea3fe7255b48fd6e9a1e012e873bca8c7a",
-      "sri": "sha384-vuSaOKS04thKQ51uvexi4JUNpW6Ptgs6yy6ONdffkjJIBVtULhvaXPY+4k7YFL6v",
-      "size": 2249367
+      "sha256": "d51d4ecc4a01e013d3ad75d0b42ec0fe964f69c9191bac4fa5ad121eabf906db",
+      "sri": "sha384-eK2OBf34oxoTzH9pQQCDPCoIaTQ0NOUqzlN2O0NUDi8nCCm2EJTLgd/eUAzZ4iJ0",
+      "size": 2334549
     },
     "flatsql.wasm": {
       "sha256": "eb61e4d65b90e3f5c5651a820b74f85fa200e3e46a0cbd9417fb82ed2db85bf8",
