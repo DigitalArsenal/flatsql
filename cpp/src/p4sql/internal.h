@@ -80,7 +80,7 @@ private:
 int32_t heapInstall();               // SQLITE_CONFIG_MALLOC; before sqlite3_initialize
 void arenaBind(LaneArena* a);         // the calling thread's arena (nullptr = the system allocator)
 LaneArena* arenaBound();
-void arenaRegister(LaneArena* a);     // so a pointer finds its arena from any thread
+bool arenaRegister(LaneArena* a);     // so a pointer finds its arena from any thread; false: no slot
 void arenaUnregister(LaneArena* a);
 
 // Runs an engine call on the system allocator: the engine's reader

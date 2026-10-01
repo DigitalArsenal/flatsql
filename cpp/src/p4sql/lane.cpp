@@ -38,21 +38,20 @@ LaneState* stateOf(P4Lane* lane) {
 namespace {
 
 // Binds the lane's arena (made at the first sandboxed statement) for one
-// sandboxed statement.
+// sandboxed statement. ok() false: no arena could be made, and the
+// statement is refused rather than run without its cap.
 class SandboxScope {
 public:
     SandboxScope(LaneState* ls, Stmt* st) : saved_(arenaBound()) {
         if (!st->sandbox) return;
         if (!ls->arena) {
             std::unique_ptr<LaneArena> a(new LaneArena());
-            if (a->init(size_t(kSandboxHeapCap))) {
-                arenaRegister(a.get());
-                ls->arena = a.release();
-            }
+            if (a->init(size_t(kSandboxHeapCap)) && arenaRegister(a.get())) ls->arena = a.release();
         }
-        // Without a region the statement runs on the system allocator: the
-        // engine's hard heap limit still bounds it.
-        if (!ls->arena) return;
+        if (!ls->arena) {
+            ok_ = false;
+            return;
+        }
         st->arena = ls->arena;
         st->arenaFailures = ls->arena->failures();
         arenaBind(ls->arena);
@@ -60,9 +59,11 @@ public:
     ~SandboxScope() { arenaBind(saved_); }
     SandboxScope(const SandboxScope&) = delete;
     SandboxScope& operator=(const SandboxScope&) = delete;
+    bool ok() const { return ok_; }
 
 private:
     LaneArena* saved_;
+    bool ok_ = true;
 };
 
 int progress(void* p) {
@@ -504,7 +505,10 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
         ls->cur = &st;
         sqlite3_stmt* s = nullptr;
         std::vector<rb1::Cell> params;
-        if (!rb1::decodeParams(req->params, req->paramsLen, &params)) {
+        if (!scope.ok()) {
+            status = P4_E_NOMEM;
+            msg = "sandbox heap unavailable";
+        } else if (!rb1::decodeParams(req->params, req->paramsLen, &params)) {
             status = P4_E_ARG;
             msg = "malformed parameters";
         }

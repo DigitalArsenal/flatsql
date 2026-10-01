@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <memory>
 
 #include "internal.h"
@@ -277,10 +278,11 @@ struct Sub {
 
 struct RelCursor : sqlite3_vtab_cursor {
     RelVtab* vt = nullptr;
-    // The specs' storage, stable for the cursors' lifetime.
-    std::vector<P4Value> vals;
+    // The specs' storage: deques keep every element in place while the
+    // specs point into them, for the cursors' lifetime.
+    std::deque<P4Value> vals;
     std::vector<P4Pred> preds;
-    std::vector<std::string> strs;
+    std::deque<std::string> strs;
     std::vector<P4ScanSpec> specs;   // one per sub
     std::vector<Sub> subs;
     bool merge = false;              // merge by seq (ordered plans), else one after another
@@ -589,9 +591,6 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
     if (want.empty()) return SQLITE_OK;
 
     // Spec storage: predicates point into vals, text into strs.
-    c->strs.reserve(pin.size() + want.size());
-    c->vals.reserve(pin.size());
-    c->preds.reserve(pin.size());
     for (PredIn& p : pin) {
         P4Value v = p.v;
         if (p.v.type == 3) {

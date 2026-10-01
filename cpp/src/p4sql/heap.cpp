@@ -333,13 +333,15 @@ thread_local LaneArena* tArena = nullptr;
 
 constexpr int kMaxArenas = 256;
 std::atomic<LaneArena*> gArenas[kMaxArenas];
-std::mutex gArenaRegMu;  // registration only (arena creation and destruction)
+std::atomic<int> gArenaSlots{0};   // slots ever used: every free scans only these
+std::mutex gArenaRegMu;            // registration only (arena creation and destruction)
 
 LaneArena* ownerOf(const void* p) {
     LaneArena* a = tArena;
     if (a && a->owns(p)) return a;
-    for (auto& s : gArenas) {
-        LaneArena* c = s.load(std::memory_order_acquire);
+    const int n = gArenaSlots.load(std::memory_order_acquire);
+    for (int i = 0; i < n; i++) {
+        LaneArena* c = gArenas[i].load(std::memory_order_acquire);
         if (c && c->owns(p)) return c;
     }
     return nullptr;
@@ -396,14 +398,18 @@ const sqlite3_mem_methods kMethods = {memMalloc, memFree, memRealloc, memSize, m
 
 }  // namespace
 
-void arenaRegister(LaneArena* a) {
+bool arenaRegister(LaneArena* a) {
     std::lock_guard<std::mutex> g(gArenaRegMu);
     for (auto& s : gArenas)
-        if (s.load() == a) return;
-    for (auto& s : gArenas) {
+        if (s.load() == a) return true;
+    for (int i = 0; i < kMaxArenas; i++) {
         LaneArena* expect = nullptr;
-        if (s.compare_exchange_strong(expect, a)) return;
+        if (gArenas[i].compare_exchange_strong(expect, a)) {
+            if (gArenaSlots.load() < i + 1) gArenaSlots.store(i + 1, std::memory_order_release);
+            return true;
+        }
     }
+    return false;
 }
 
 void arenaUnregister(LaneArena* a) {
