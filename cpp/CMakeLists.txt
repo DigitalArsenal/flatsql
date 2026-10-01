@@ -22,10 +22,19 @@ endif()
 
 message(STATUS "FlatBuffers include dir: ${FLATBUFFERS_INCLUDE_DIR}")
 
-# SQLite amalgamation (vendored)
+# SQLite amalgamation (vendored): the official 3.53.4 release, byte-identical
+# (sqlite-amalgamation-3530400.zip, SHA3-256 628a44cf... as sqlite.org lists
+# it). SQLite is never modified: only its public API, pragmas, sqlite3_wal_hook
+# and FlatSQL's own VFS. A mismatch fails the configure.
 set(SQLITE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/sqlite")
+set(FLATSQL_SQLITE_SHA256 "b1dd5d74ec7f29055a6684fa06fb3c2f6821c87dd38f9a458dfd2e8a1db28189")
 if(NOT EXISTS "${SQLITE_DIR}/sqlite3.c")
     message(FATAL_ERROR "SQLite amalgamation not found at ${SQLITE_DIR}")
+endif()
+file(SHA256 "${SQLITE_DIR}/sqlite3.c" FLATSQL_SQLITE_SHA256_FOUND)
+if(NOT FLATSQL_SQLITE_SHA256_FOUND STREQUAL FLATSQL_SQLITE_SHA256)
+    message(FATAL_ERROR "vendor/sqlite/sqlite3.c is not the SQLite 3.53.4 amalgamation "
+        "(sha256 ${FLATSQL_SQLITE_SHA256_FOUND}, expected ${FLATSQL_SQLITE_SHA256})")
 endif()
 
 # OpenSSL: the FlatBuffers crypto backend of native builds (below)
