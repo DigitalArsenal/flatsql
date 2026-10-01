@@ -755,8 +755,11 @@ P4_SLOW_TEST(g3_bench) {
             b.at = 1790700000;
             for (int i = at; i < records && i < at + per; i++) {
                 In in;
-                in.frame = buildFrame(real, {Field::str("OBJECT_NAME", "BENCH " + std::to_string(i)), Field::str("OBJECT_ID", "2026-001A"),
-                                             Field::u64("NORAD_CAT_ID", uint64_t(1 + i)), Field::str("EPOCH", isoTime(epoch0 + i % 7200)),
+                // GP-like: the same 32,015 objects again, each batch a new epoch.
+                const int obj = i % 32015, gp = i / 32015;
+                in.frame = buildFrame(real, {Field::str("OBJECT_NAME", "BENCH " + std::to_string(obj)), Field::str("OBJECT_ID", "2026-001A"),
+                                             Field::u64("NORAD_CAT_ID", uint64_t(1 + obj)),
+                                             Field::str("EPOCH", isoTime(epoch0 + int64_t(gp) * 43200 + obj % 7200)),
                                              Field::f64("MEAN_MOTION", 15.5 + double(i % 13) * 0.001),
                                              Field::f64("ECCENTRICITY", 0.0001), Field::f64("INCLINATION", 51.6)});
                 in.ts = 1790700000;
@@ -773,6 +776,15 @@ P4_SLOW_TEST(g3_bench) {
             std::printf("  calls (ms):");
             for (double x : lat) std::printf(" %.0f", x);
             std::printf("\n");
+        }
+        if (lat.size() >= 20) {
+            // Growth: the median call of the first and the last tenth.
+            const size_t k = lat.size() / 10;
+            std::vector<double> a(lat.begin(), lat.begin() + long(k)), z(lat.end() - long(k), lat.end());
+            std::sort(a.begin(), a.end());
+            std::sort(z.begin(), z.end());
+            report("w01.first_tenth_p50", a[a.size() / 2], "ms");
+            report("w01.last_tenth_p50", z[z.size() / 2], "ms");
         }
         std::sort(lat.begin(), lat.end());
         for (auto& kv : actions) std::printf("  action %lld reject %lld: %lld\n", (long long)(kv.first / 1000), (long long)(kv.first % 1000), (long long)kv.second);
