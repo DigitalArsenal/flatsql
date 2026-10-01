@@ -22,10 +22,19 @@ endif()
 
 message(STATUS "FlatBuffers include dir: ${FLATBUFFERS_INCLUDE_DIR}")
 
-# SQLite amalgamation (vendored)
+# SQLite amalgamation (vendored): the official 3.53.4 release, byte-identical
+# (sqlite-amalgamation-3530400.zip, SHA3-256 628a44cf... as sqlite.org lists
+# it). SQLite is never modified: only its public API, pragmas, sqlite3_wal_hook
+# and FlatSQL's own VFS. A mismatch fails the configure.
 set(SQLITE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/sqlite")
+set(FLATSQL_SQLITE_SHA256 "b1dd5d74ec7f29055a6684fa06fb3c2f6821c87dd38f9a458dfd2e8a1db28189")
 if(NOT EXISTS "${SQLITE_DIR}/sqlite3.c")
     message(FATAL_ERROR "SQLite amalgamation not found at ${SQLITE_DIR}")
+endif()
+file(SHA256 "${SQLITE_DIR}/sqlite3.c" FLATSQL_SQLITE_SHA256_FOUND)
+if(NOT FLATSQL_SQLITE_SHA256_FOUND STREQUAL FLATSQL_SQLITE_SHA256)
+    message(FATAL_ERROR "vendor/sqlite/sqlite3.c is not the SQLite 3.53.4 amalgamation "
+        "(sha256 ${FLATSQL_SQLITE_SHA256_FOUND}, expected ${FLATSQL_SQLITE_SHA256})")
 endif()
 
 # OpenSSL: the FlatBuffers crypto backend of native builds (below)
@@ -787,7 +796,7 @@ else()
         src/ps/index_l0.cpp
         src/ps/index_l1.cpp
         src/ps/ring.cpp
-        src/ps/extract.cpp
+        src/typecfg/extract.cpp
         src/ps/journal.cpp
         src/ps/registry.cpp
         src/ps/partition_log.cpp
@@ -884,6 +893,79 @@ else()
     # Terabyte harness (slow tests: unit gates, engine, count-scaled and
     # metadata-only tiers).
     include(${CMAKE_CURRENT_SOURCE_DIR}/test/ps/tb_sources.cmake)
+
+    # ---- store format 4 ("p4": one SQLite file per partition x content month) ----
+    # SQLite 3.53.4 unmodified: multi-thread mode, WAL, FTS5; files only through
+    # FlatSQL's own VFS (flatsql_io). The SQL surface (src/p4sql) is globbed in;
+    # without it the engine's weak defaults answer ops 30/31 with UNSUPPORTED.
+    add_library(sqlite3_p4 STATIC ${SQLITE_DIR}/sqlite3.c)
+    target_include_directories(sqlite3_p4 PUBLIC ${SQLITE_DIR})
+    target_compile_definitions(sqlite3_p4 PRIVATE
+        SQLITE_THREADSAFE=2
+        SQLITE_DEFAULT_MEMSTATUS=1
+        SQLITE_TEMP_STORE=3
+        SQLITE_OMIT_LOAD_EXTENSION=1
+        SQLITE_OMIT_DEPRECATED=1
+        SQLITE_OMIT_SHARED_CACHE=1
+        SQLITE_DQS=0
+        SQLITE_ENABLE_FTS5=1
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(sqlite3_p4 PRIVATE -w)
+    endif()
+    file(GLOB FLATSQL_P4_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/p4/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/p4sql/*.cpp")
+    list(FILTER FLATSQL_P4_SOURCES EXCLUDE REGEX "/capi_wasm\\.cpp$")
+    # The engine without host I/O: flatsql_p4 adds the native seven imports;
+    # the fault tests supply their own.
+    add_library(flatsql_p4_core OBJECT
+        ${FLATSQL_P4_SOURCES}
+        src/typecfg/extract.cpp
+        src/ps/platform.cpp
+        src/ps/result_block.cpp
+        src/flatsql_vfs.cpp
+        src/record_search.cpp
+        ${FLATBUFFERS_SRC_DIR}/reflection.cpp
+        ${FLATBUFFERS_SRC_DIR}/util.cpp
+        ${FLATBUFFERS_SRC_DIR}/options.cpp
+    )
+    target_include_directories(flatsql_p4_core PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+    )
+    target_link_libraries(flatsql_p4_core PUBLIC sqlite3_p4 Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(flatsql_p4_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+    add_library(flatsql_p4 STATIC $<TARGET_OBJECTS:flatsql_p4_core> src/flatsql_io_native.cpp)
+    target_include_directories(flatsql_p4 PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+    )
+    target_link_libraries(flatsql_p4 PUBLIC sqlite3_p4 Threads::Threads)
+    # Tests: cpp/tests/p4 (and the SQL surface's engine tests in cpp/tests/p4sql;
+    # its fake reader builds only its own fake target).
+    file(GLOB FLATSQL_P4_TEST_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/p4sql/*.cpp")
+    list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/fake_reader\\.cpp$")
+    list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/p4_fault_io\\.cpp$")
+    list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/tests/p4sql/.*fake.*\\.cpp$")
+    if(FLATSQL_P4_TEST_SOURCES)
+        add_executable(flatsql_p4_test ${FLATSQL_P4_TEST_SOURCES}
+            ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
+            ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
+            ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
+            ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp)
+        target_link_libraries(flatsql_p4_test PRIVATE flatsql_p4)
+        target_include_directories(flatsql_p4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src/p4)
+        target_compile_definitions(flatsql_p4_test PRIVATE
+            P4_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
+        add_test(NAME FlatSQLStoreFormat4Test COMMAND flatsql_p4_test)
+    endif()
 
     add_executable(flatsql_full_text_search_test tests/full_text_search_test.cpp)
     target_link_libraries(flatsql_full_text_search_test PRIVATE flatsql_lib)

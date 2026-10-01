@@ -60,7 +60,8 @@ target_compile_definitions(sqlite3_ps_wasm PRIVATE
 # entry glue: allocator exports, SQLite OS hooks, thread stacks) is each
 # executable's own source.
 file(GLOB FLATSQL_PS_WASM_SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/ps/*.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ps/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/typecfg/*.cpp")
 list(FILTER FLATSQL_PS_WASM_SOURCES EXCLUDE REGEX "/capi_wasm\\.cpp$")
 set(FLATSQL_PS_WASM_ENTRY "${CMAKE_CURRENT_SOURCE_DIR}/src/ps/capi_wasm.cpp")
 add_library(flatsql_ps_wasm OBJECT

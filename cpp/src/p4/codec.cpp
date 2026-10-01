@@ -1,0 +1,563 @@
+// Store format 4: byte codecs (TLV, CIDs, markers, config), host-file helpers
+// and the SQLite connection wrapper.
+#include "internal.h"
+
+#include <ctime>
+
+#include "flatsql/flatsql_io.h"
+
+namespace flatsql {
+namespace p4 {
+
+// ---- TLV ------------------------------------------------------------------------
+bool tlvParse(const uint8_t* p, size_t n, std::vector<Tlv>* out) {
+    out->clear();
+    size_t off = 0;
+    while (off < n) {
+        if (n - off < 6) return false;
+        const uint16_t tag = ld16(p + off);
+        const uint32_t len = ld32(p + off + 2);
+        if (n - off - 6 < len) return false;
+        out->push_back(Tlv{tag, len, p + off + 6});
+        off += 6 + size_t(len);
+    }
+    return true;
+}
+
+const Tlv* tlvFind(const std::vector<Tlv>& v, uint16_t tag) {
+    for (const Tlv& t : v)
+        if (t.tag == tag) return &t;
+    return nullptr;
+}
+
+bool tlvU8(const std::vector<Tlv>& v, uint16_t tag, uint8_t* out, bool* bad) {
+    const Tlv* t = tlvFind(v, tag);
+    if (!t) return false;
+    if (t->n != 1) { *bad = true; return false; }
+    *out = t->v[0];
+    return true;
+}
+bool tlvU32(const std::vector<Tlv>& v, uint16_t tag, uint32_t* out, bool* bad) {
+    const Tlv* t = tlvFind(v, tag);
+    if (!t) return false;
+    if (t->n != 4) { *bad = true; return false; }
+    *out = ld32(t->v);
+    return true;
+}
+bool tlvU64(const std::vector<Tlv>& v, uint16_t tag, uint64_t* out, bool* bad) {
+    const Tlv* t = tlvFind(v, tag);
+    if (!t) return false;
+    if (t->n != 8) { *bad = true; return false; }
+    *out = ld64(t->v);
+    return true;
+}
+bool tlvI64(const std::vector<Tlv>& v, uint16_t tag, int64_t* out, bool* bad) {
+    uint64_t u;
+    if (!tlvU64(v, tag, &u, bad)) return false;
+    *out = int64_t(u);
+    return true;
+}
+bool tlvText(const std::vector<Tlv>& v, uint16_t tag, std::string* out) {
+    const Tlv* t = tlvFind(v, tag);
+    if (!t) return false;
+    out->assign(reinterpret_cast<const char*>(t->v), t->n);
+    return true;
+}
+void tlvPut(std::vector<uint8_t>& out, uint16_t tag, const void* p, size_t n) {
+    const size_t at = out.size();
+    out.resize(at + 6 + n);
+    st16(out.data() + at, tag);
+    st32(out.data() + at + 2, uint32_t(n));
+    if (n) std::memcpy(out.data() + at + 6, p, n);
+}
+
+// ---- CIDs -------------------------------------------------------------------------
+namespace {
+const char kB32[] = "abcdefghijklmnopqrstuvwxyz234567";
+const uint8_t kCidPrefix[4] = {0x01, 0x55, 0x12, 0x20};
+
+int b32v(char c) {
+    if (c >= 'a' && c <= 'z') return c - 'a';
+    if (c >= '2' && c <= '7') return 26 + c - '2';
+    return -1;
+}
+// The 58 five-bit groups of the 36-byte CID (the last padded with two zero bits).
+void groupsOf(const uint8_t d[32], uint8_t g[58]) {
+    uint8_t b[36];
+    std::memcpy(b, kCidPrefix, 4);
+    std::memcpy(b + 4, d, 32);
+    for (int i = 0; i < 58; i++) {
+        int bit = 5 * i, v = 0;
+        for (int j = 0; j < 5; j++, bit++) v = v << 1 | (bit < 288 ? (b[bit >> 3] >> (7 - (bit & 7))) & 1 : 0);
+        g[i] = uint8_t(v);
+    }
+}
+void digestOfGroups(const uint8_t g[58], uint8_t d[32]) {
+    uint8_t b[37] = {0};
+    for (int i = 0; i < 58; i++)
+        for (int j = 0; j < 5; j++) {
+            const int bit = 5 * i + j;
+            if (bit < 288 && ((g[i] >> (4 - j)) & 1)) b[bit >> 3] |= uint8_t(1 << (7 - (bit & 7)));
+        }
+    std::memcpy(d, b + 4, 32);
+}
+}  // namespace
+
+bool cidBinValid(const uint8_t* cid36) { return std::memcmp(cid36, kCidPrefix, 4) == 0; }
+
+// key = [g6: 3 bits][rank(g7..g56): 5 bits each][rank3(g57): 3 bits]; rank(v)
+// = (v + 6) & 31 puts '2'..'7' (26..31) before 'a'..'z' (0..25), which is
+// ASCII order. g6 holds 3 digest bits (a..h, already ordered); g57 holds 3
+// digest bits << 2, whose letters sort with rank3 = ((g57 >> 2) + 1) & 7.
+void cidKeyFromDigest(const uint8_t d[32], uint8_t k[32]) {
+    uint8_t g[58];
+    groupsOf(d, g);
+    std::memset(k, 0, 32);
+    int bit = 0;
+    auto put = [&](int v, int w) {
+        for (int j = w - 1; j >= 0; j--, bit++)
+            if ((v >> j) & 1) k[bit >> 3] |= uint8_t(1 << (7 - (bit & 7)));
+    };
+    put(g[6] & 7, 3);
+    for (int i = 7; i <= 56; i++) put((g[i] + 6) & 31, 5);
+    put(((g[57] >> 2) + 1) & 7, 3);
+}
+
+void cidDigestFromKey(const uint8_t k[32], uint8_t d[32]) {
+    uint8_t g[58], pg[58];
+    const uint8_t zero[32] = {0};
+    groupsOf(zero, pg);
+    int bit = 0;
+    auto get = [&](int w) {
+        int v = 0;
+        for (int j = 0; j < w; j++, bit++) v = v << 1 | ((k[bit >> 3] >> (7 - (bit & 7))) & 1);
+        return v;
+    };
+    for (int i = 0; i < 6; i++) g[i] = pg[i];
+    g[6] = uint8_t((pg[6] & ~7) | get(3));
+    for (int i = 7; i <= 56; i++) g[i] = uint8_t((get(5) - 6) & 31);
+    g[57] = uint8_t((((get(3)) - 1) & 7) << 2);
+    digestOfGroups(g, d);
+}
+
+void cidTextFromDigest(const uint8_t d[32], char out[60]) {
+    uint8_t g[58];
+    groupsOf(d, g);
+    out[0] = 'b';
+    for (int i = 0; i < 58; i++) out[1 + i] = kB32[g[i]];
+    out[59] = 0;
+}
+
+void cidTextFromKey(const uint8_t k[32], char out[60]) {
+    uint8_t d[32];
+    cidDigestFromKey(k, d);
+    cidTextFromDigest(d, out);
+}
+
+bool cidDigestFromText(const char* s, size_t n, uint8_t d[32]) {
+    if (n != kCidText || s[0] != 'b') return false;
+    uint8_t g[58];
+    for (int i = 0; i < 58; i++) {
+        const int v = b32v(s[1 + i]);
+        if (v < 0) return false;
+        g[i] = uint8_t(v);
+    }
+    uint8_t b[37] = {0};
+    for (int i = 0; i < 58; i++)
+        for (int j = 0; j < 5; j++) {
+            const int bit = 5 * i + j;
+            if (bit < 288 && ((g[i] >> (4 - j)) & 1)) b[bit >> 3] |= uint8_t(1 << (7 - (bit & 7)));
+        }
+    if (std::memcmp(b, kCidPrefix, 4) != 0) return false;
+    std::memcpy(d, b + 4, 32);
+    return true;
+}
+
+// ---- time -----------------------------------------------------------------------------
+namespace {
+void civilFromDays(int64_t z, int* y, int* m, int* d) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = unsigned(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int64_t yy = int64_t(yoe) + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    *d = int(doy - (153 * mp + 2) / 5 + 1);
+    *m = int(mp < 10 ? mp + 3 : mp - 9);
+    *y = int(yy + (*m <= 2));
+}
+}  // namespace
+
+int64_t monthOfSec(int64_t sec) {
+    int y, m, d;
+    civilFromDays(floorDiv(sec, 86400), &y, &m, &d);
+    return int64_t(y) * 100 + m;
+}
+
+int64_t nowSec() { return floorDiv(wallMs(), 1000); }
+
+void dayText(int64_t sec, char out[11]) {
+    ps::formatEpochDay(sec, out);
+    out[10] = 0;
+}
+
+// ---- config -------------------------------------------------------------------------
+int32_t parseConfig(const uint8_t* p, size_t n, Config* c, std::string* err) {
+    std::vector<Tlv> v;
+    if (!tlvParse(p, n, &v)) { *err = "config: malformed TLV"; return P4_E_ARG; }
+    bool bad = false;
+    if (!tlvText(v, 1, &c->root) || c->root.empty() || c->root[0] != '/') {
+        *err = "config: tag 1 (root) must be an absolute path";
+        return P4_E_ARG;
+    }
+    while (c->root.size() > 1 && c->root.back() == '/') c->root.pop_back();
+    uint32_t u32;
+    uint64_t u64;
+    uint8_t u8;
+    if (tlvU8(v, 2, &u8, &bad)) c->createMode = u8;
+    auto setU32 = [&](uint16_t tag, uint32_t* dst) { if (tlvU32(v, tag, &u32, &bad) && u32) *dst = u32; };
+    auto setU64 = [&](uint16_t tag, uint64_t* dst) { if (tlvU64(v, tag, &u64, &bad) && u64) *dst = u64; };
+    setU32(13, &c->cores);
+    setU32(3, &c->writers);
+    setU32(4, &c->interactive);
+    setU32(5, &c->bulk);
+    setU32(6, &c->sandbox);
+    setU32(7, &c->writeSlots);
+    setU32(8, &c->readSlots);
+    setU32(9, &c->writeReqBytes);
+    setU32(10, &c->readReqBytes);
+    setU32(11, &c->ringBytes);
+    setU64(12, &c->gseqFloor);
+    setU64(20, &c->engineBytes);
+    setU32(21, &c->writerConns);
+    setU32(22, &c->writerCacheKiB);
+    setU32(23, &c->readerConns);
+    setU32(24, &c->readerCacheKiB);
+    setU64(25, &c->pendingBytes);
+    setU64(26, &c->softHeap);
+    setU64(27, &c->hardHeap);
+    setU32(28, &c->raStreams);
+    setU32(29, &c->raBytes);
+    setU32(30, &c->passivePages);
+    setU64(31, &c->restartBytes);
+    setU64(32, &c->walTotal);
+    setU64(33, &c->journalSizeLimit);
+    setU32(40, &c->groupRecords);
+    setU32(41, &c->groupMs);
+    setU32(42, &c->flushEntries);
+    setU32(43, &c->seqBlock);
+    setU32(44, &c->backlogCredit);
+    setU32(45, &c->rebuildFreePermille);
+    setU64(46, &c->rebuildMinBytes);
+    if (tlvU8(v, 47, &u8, &bad) && u8) c->quotaMode = u8;
+    setU64(48, &c->sandboxHeap);
+    setU64(49, &c->sandboxRows);
+    setU64(50, &c->sandboxBytes);
+    if (bad) { *err = "config: a typed tag has the wrong length"; return P4_E_ARG; }
+    if (c->createMode > 2) { *err = "config: create mode must be 0, 1 or 2"; return P4_E_ARG; }
+    if (c->quotaMode != 1 && c->quotaMode != 2) { *err = "config: quota mode must be 1 or 2"; return P4_E_ARG; }
+    if (c->writers == 0) {
+        const uint32_t w = c->cores > 1 ? c->cores - 1 : 1;
+        c->writers = w > 8 ? 8 : w;
+    }
+    auto pow2 = [](uint32_t x) { return x && !(x & (x - 1)); };
+    if (!pow2(c->ringBytes) || c->ringBytes < 4096) { *err = "config: ring bytes must be a power of two >= 4096"; return P4_E_ARG; }
+    if (c->writeReqBytes < (128u << 10)) { *err = "config: write request bytes below 128 KiB"; return P4_E_ARG; }
+    const uint32_t nThreads = c->writers + c->interactive + c->bulk + c->sandbox + 1;
+    if (nThreads > 64 || c->interactive == 0 || c->bulk == 0 || c->sandbox == 0) {
+        *err = "config: at most 64 service threads, and at least one lane per read class";
+        return P4_E_ARG;
+    }
+    if (c->writeSlots == 0 || c->readSlots == 0) { *err = "config: no slots"; return P4_E_ARG; }
+    if (c->seqBlock < 1024) c->seqBlock = 1024;
+    if (c->raStreams > 8) c->raStreams = 8;
+    if (c->hardHeap < c->softHeap) c->hardHeap = c->softHeap;
+    return P4_OK;
+}
+
+// ---- markers ----------------------------------------------------------------------------
+void encodeStore(uint8_t out[64], const uint8_t uuid[16], int64_t createdMs, uint64_t floor, uint32_t from) {
+    std::memset(out, 0, 64);
+    st32(out, 0x34515346u);  // "FSQ4"
+    st16(out + 4, 4);
+    st16(out + 6, 1);
+    std::memcpy(out + 8, uuid, 16);
+    st64(out + 24, uint64_t(createdMs));
+    st64(out + 32, floor);
+    st32(out + 40, from);
+    st32(out + 56, ps::crc32c(out, 56));
+}
+
+void encodeMigrated(uint8_t out[40], const uint8_t uuid[16], int64_t writtenMs) {
+    std::memset(out, 0, 40);
+    st32(out, 0x4D515346u);  // "FSQM"
+    st16(out + 4, 4);
+    std::memcpy(out + 8, uuid, 16);
+    st64(out + 24, uint64_t(writtenMs));
+    st32(out + 32, ps::crc32c(out, 32));
+}
+
+void decodeMarkers(const uint8_t* s, size_t sn, const uint8_t* m, size_t mn, Markers* k) {
+    if (s) {
+        k->storePresent = true;
+        if (sn == 64 && ld32(s) == 0x34515346u && ld32(s + 56) == ps::crc32c(s, 56)) {
+            k->storeValid = true;
+            k->format = ld16(s + 4);
+            k->layout = ld16(s + 6);
+            std::memcpy(k->uuid, s + 8, 16);
+            k->createdMs = int64_t(ld64(s + 24));
+            k->gseqFloor = ld64(s + 32);
+            k->migratedFrom = ld32(s + 40);
+        }
+    }
+    if (m) {
+        k->migratedPresent = true;
+        if (mn == 40 && ld32(m) == 0x4D515346u && ld32(m + 32) == ps::crc32c(m, 32)) {
+            k->migratedValid = true;
+            k->migratedFormat = ld16(m + 4);
+            std::memcpy(k->migratedUuid, m + 8, 16);
+            k->writtenMs = int64_t(ld64(m + 24));
+        }
+    }
+}
+
+// ---- host file helpers --------------------------------------------------------------------
+bool ioExists(const std::string& path) {
+    return flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_PROBE) >= 0;
+}
+
+int32_t ioReadAll(const std::string& path, std::vector<uint8_t>* out) {
+    out->clear();
+    const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_READ);
+    if (h < 0) return P4_E_IO;
+    const double sz = flatsql_io_size(h);
+    int32_t rc = P4_OK;
+    if (sz < 0 || sz > double(1u << 30)) {
+        rc = P4_E_IO;
+    } else {
+        out->resize(size_t(sz));
+        size_t got = 0;
+        while (got < out->size()) {
+            const int32_t n = flatsql_io_read(h, out->data() + got, int32_t(out->size() - got), double(got));
+            if (n <= 0) { rc = P4_E_IO; break; }
+            got += size_t(n);
+        }
+    }
+    flatsql_io_close(h);
+    return rc;
+}
+
+namespace {
+int32_t writeAt(int32_t h, const uint8_t* p, size_t n, double off) {
+    size_t done = 0;
+    while (done < n) {
+        const int32_t w = flatsql_io_write(h, p + done, int32_t(n - done), off + double(done));
+        if (w <= 0) return w == FLATSQL_IO_ERR_NOSPACE ? P4_E_NOSPACE : P4_E_IO;
+        done += size_t(w);
+    }
+    return P4_OK;
+}
+}  // namespace
+
+int32_t ioWriteNew(const std::string& path, const uint8_t* p, size_t n) {
+    const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()),
+                                      FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC |
+                                          FLATSQL_IO_CREATE_PARENTS);
+    if (h < 0) return h == FLATSQL_IO_ERR_NOSPACE ? P4_E_NOSPACE : P4_E_IO;
+    int32_t rc = writeAt(h, p, n, 0);
+    if (rc == P4_OK && flatsql_io_sync(h) < 0) rc = P4_E_IO;
+    flatsql_io_close(h);
+    return rc;
+}
+
+int32_t ioAppend(const std::string& path, const uint8_t* p, size_t n) {
+    const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()),
+                                      FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS);
+    if (h < 0) return h == FLATSQL_IO_ERR_NOSPACE ? P4_E_NOSPACE : P4_E_IO;
+    const double sz = flatsql_io_size(h);
+    int32_t rc = sz < 0 ? P4_E_IO : writeAt(h, p, n, sz);
+    if (rc == P4_OK && flatsql_io_sync(h) < 0) rc = P4_E_IO;
+    flatsql_io_close(h);
+    return rc;
+}
+
+int32_t ioTouch(const std::string& path) {
+    const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()),
+                                      FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS);
+    if (h < 0) return h == FLATSQL_IO_ERR_NOSPACE ? P4_E_NOSPACE : P4_E_IO;
+    flatsql_io_close(h);
+    return P4_OK;
+}
+
+int32_t ioUnlink(const std::string& path) {
+    const int32_t rc = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_UNLINK);
+    return rc >= 0 || rc == FLATSQL_IO_ERR_NOENT ? P4_OK : P4_E_IO;
+}
+
+int64_t ioSize(const std::string& path) {
+    const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_READ);
+    if (h < 0) return -1;
+    const double sz = flatsql_io_size(h);
+    flatsql_io_close(h);
+    return sz < 0 ? -1 : int64_t(sz);
+}
+
+// ---- SQLite connections ------------------------------------------------------------------
+const char* stmtSql(StmtId id) {
+    switch (id) {
+        case S_INS: return "INSERT INTO r(seq,cid,e,k,ts,p,f,s,x,d) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)";
+        case S_RL_INS: return "INSERT OR IGNORE INTO rl(sid,seq,lane,at,u) VALUES(?1,?2,?3,?4,?5)";
+        case S_RL_ONE: return "SELECT at, u FROM rl WHERE sid=?1 AND seq=?2 AND lane=?3";
+        case S_RL_URL: return "UPDATE rl SET u=?4 WHERE sid=?1 AND seq=?2 AND lane=?3";
+        case S_RL_OF: return "SELECT sid, lane, at, u FROM rl WHERE seq=?1";
+        case S_RL_DEL_SEQ: return "DELETE FROM rl WHERE seq=?1";
+        case S_R_DEL: return "DELETE FROM r WHERE seq=?1";
+        case S_R_ROW: return "SELECT cid, e, k, ts, x, length(d), p, f, d FROM r WHERE seq=?1";
+        case S_R_GET: return "SELECT cid, e, k, ts, x, length(d), p, f, NULL FROM r WHERE seq=?1";
+        case S_R_LEN: return "SELECT length(d), cid, e, k, w FROM r WHERE seq=?1";
+        case S_R_HOLDER: return "SELECT d, ts, cid FROM r WHERE seq=?1";
+        case S_ENT_UP:
+            return "INSERT INTO ent(k,n,fw,lw) VALUES(?1,1,?2,?2) ON CONFLICT(k) DO UPDATE SET n=n+1, "
+                   "fw=min(fw,excluded.fw), lw=max(lw,excluded.lw)";
+        case S_ENT_DEC: return "UPDATE ent SET n=n-1 WHERE k=?1";
+        case S_ENT_GONE: return "DELETE FROM ent WHERE k=?1 AND n<=0";
+        case S_ENT_ONE: return "SELECT n, fw, lw FROM ent WHERE k=?1";
+        case S_SUP_K: return "SELECT seq, cid, length(d), s, d, w, e FROM r WHERE k=?1 AND seq<>?2";
+        case S_LANE_UP:
+            return "INSERT OR REPLACE INTO lane(id,sid,batch,ckey,ppeer,pkey,url,url0,created,updated,maxat,n,bytes,"
+                   "minw,maxw,maxseq,maxts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)";
+        case S_LANE_GET: return "SELECT url0 FROM lane WHERE id=?1";
+        case S_LANE_DEL: return "DELETE FROM lane WHERE id=?1";
+        case S_SRC_INS: return "INSERT OR IGNORE INTO src(id,provider,source) VALUES(?1,?2,?3)";
+        case S_META_SET: return "INSERT OR REPLACE INTO meta(k,v) VALUES(?1,?2)";
+        case S_META_GET: return "SELECT v FROM meta WHERE k=?1";
+        case S_RL_SID_DESC: return "SELECT seq FROM rl WHERE sid=?1 AND seq<?2 AND seq>=?3 ORDER BY seq DESC";
+        case S_RL_SID_ASC: return "SELECT seq FROM rl WHERE sid=?1 AND seq>?2 AND seq<=?3 ORDER BY seq";
+        case S_C_GET: return "SELECT pid, seq FROM c WHERE tb=?1 AND cid=?2";
+        case S_C_INS: return "INSERT OR REPLACE INTO c(tb,cid,pid,seq) VALUES(?1,?2,?3,?4)";
+        case S_C_DEL: return "DELETE FROM c WHERE tb=?1 AND cid=?2 AND pid=?3";
+        case S_IDENT_GET: return "SELECT seq, cid FROM ident WHERE tb=?1 AND src=?2 AND h=?3";
+        case S_IDENT_INS: return "INSERT OR REPLACE INTO ident(tb,src,h,seq,cid) VALUES(?1,?2,?3,?4,?5)";
+        case S_IDENT_DEL: return "DELETE FROM ident WHERE tb=?1 AND src=?2 AND h=?3";
+        case S_J_INS: return "INSERT INTO j(op,tb,k,c,pid,seq,gen,s,v) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)";
+        case S_J_DEL: return "DELETE FROM j WHERE id<=?1";
+        case S_JM_SET: return "INSERT OR REPLACE INTO jm(k,v) VALUES(?1,?2)";
+        default: return nullptr;
+    }
+}
+
+Conn::~Conn() {
+    for (auto*& s : st)
+        if (s) sqlite3_finalize(s);
+    for (auto& kv : dyn) sqlite3_finalize(kv.second);
+    if (db) sqlite3_close_v2(db);
+}
+
+sqlite3_stmt* Conn::get(StmtId id) {
+    sqlite3_stmt* s = st[id];
+    if (!s) {
+        if (sqlite3_prepare_v3(db, stmtSql(id), -1, SQLITE_PREPARE_PERSISTENT, &s, nullptr) != SQLITE_OK) return nullptr;
+        st[id] = s;
+    } else {
+        sqlite3_reset(s);
+        sqlite3_clear_bindings(s);
+    }
+    return s;
+}
+
+sqlite3_stmt* Conn::sql(const std::string& text) {
+    auto it = dyn.find(text);
+    if (it != dyn.end()) {
+        sqlite3_reset(it->second);
+        sqlite3_clear_bindings(it->second);
+        return it->second;
+    }
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v3(db, text.c_str(), int(text.size()), SQLITE_PREPARE_PERSISTENT, &s, nullptr) != SQLITE_OK)
+        return nullptr;
+    if (dyn.size() >= 64) {
+        sqlite3_finalize(dyn.begin()->second);
+        dyn.erase(dyn.begin());
+    }
+    dyn.emplace(text, s);
+    return s;
+}
+
+int Conn::exec(const char* s) { return sqlite3_exec(db, s, nullptr, nullptr, nullptr); }
+
+int32_t statusOfSqlite(int rc) {
+    switch (rc & 0xff) {
+        case SQLITE_OK:
+        case SQLITE_ROW:
+        case SQLITE_DONE: return P4_OK;
+        case SQLITE_NOMEM: return P4_E_NOMEM;
+        case SQLITE_FULL: return P4_E_NOSPACE;
+        case SQLITE_CORRUPT:
+        case SQLITE_NOTADB: return P4_E_CORRUPT;
+        case SQLITE_BUSY:
+        case SQLITE_LOCKED: return P4_E_IO;  // never a miss (M9)
+        case SQLITE_INTERRUPT: return P4_E_CANCELLED;
+        case SQLITE_CANTOPEN:
+        case SQLITE_IOERR:
+        case SQLITE_PERM: return P4_E_IO;
+        default: return P4_E_INTERNAL;
+    }
+}
+
+int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t pageSize, Conn** out,
+             std::string* err) {
+    *out = nullptr;
+    const bool reader = kind == OpenKind::Reader;
+    std::string uri = "file:" + path + "?share=1";
+    if (reader) uri += "&ra=1";
+    if (kind == OpenKind::Writer || kind == OpenKind::Journal || kind == OpenKind::Index) uri += "&dsync=1";
+    sqlite3* db = nullptr;
+    const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX |
+                      (kind == OpenKind::Writer || kind == OpenKind::Index || kind == OpenKind::Journal
+                           ? SQLITE_OPEN_CREATE
+                           : 0);
+    int rc = sqlite3_open_v2(uri.c_str(), &db, flags, "flatsql_io");
+    if (rc != SQLITE_OK) {
+        if (err) *err = db ? sqlite3_errmsg(db) : "open failed";
+        sqlite3_close_v2(db);
+        return rc;
+    }
+    sqlite3_extended_result_codes(db, 1);
+    sqlite3_busy_timeout(db, kind == OpenKind::Reader ? 2000 : 30000);
+    char sql[512];
+    if (kind == OpenKind::Writer || kind == OpenKind::Index || kind == OpenKind::Journal) {
+        std::snprintf(sql, sizeof sql, "PRAGMA page_size=%u", pageSize ? pageSize : 4096);
+        sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+        rc = sqlite3_exec(db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
+        if (rc != SQLITE_OK) {
+            if (err) *err = sqlite3_errmsg(db);
+            sqlite3_close_v2(db);
+            return rc;
+        }
+    }
+    const char* sync = kind == OpenKind::Index ? "NORMAL" : "FULL";
+    std::snprintf(sql, sizeof sql,
+                  "PRAGMA synchronous=%s; PRAGMA cache_size=-%u; PRAGMA mmap_size=0; PRAGMA temp_store=MEMORY;"
+                  " PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=%lld",
+                  sync, cacheKiB ? cacheKiB : 512, (long long)(64ll << 20));
+    rc = sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+    if (rc == SQLITE_OK && reader) rc = sqlite3_exec(db, "PRAGMA query_only=1", nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+        if (err) *err = sqlite3_errmsg(db);
+        sqlite3_close_v2(db);
+        return rc;
+    }
+    Conn* c = new (std::nothrow) Conn();
+    if (!c) {
+        sqlite3_close_v2(db);
+        return SQLITE_NOMEM;
+    }
+    c->db = db;
+    c->path = path;
+    *out = c;
+    return SQLITE_OK;
+}
+
+}  // namespace p4
+}  // namespace flatsql

@@ -33,7 +33,7 @@ typedef struct P4ScanSpec {
     uint8_t hydrate;
     uint8_t rsv[2];
     uint64_t limit, offset;      /* 0 = none */
-    uint64_t bound;              /* A18 newest-N seqs (of the type, or of lane.source when set), applied first; 0 = none */
+    uint64_t bound;              /* A18 newest-N seqs OF THE TYPE, applied before every other filter incl. lane (v2, C-17); 0 = none */
 } P4ScanSpec;
 typedef struct P4Tag { const char *provider, *source, *sourceUrl, *batch, *contentKeyId, *producerPeer, *producerPubkey; int64_t at; } P4Tag;
 typedef struct P4Row {
@@ -50,7 +50,8 @@ typedef struct P4Row {
     const P4Tag* tag;            /* matched tag (§3.6), or NULL */
 } P4Row;                         /* every pointer valid until the next p4_cursor_next or p4_cursor_close */
 typedef struct P4TypeInfo { const char* name; const uint8_t* bfbs; uint32_t bfbsLen; uint8_t fid[4];
-                            uint64_t a18Bound; uint8_t epochProfile; uint8_t fullText; } P4TypeInfo;
+                            uint64_t a18Bound; uint8_t epochProfile; uint8_t fullText;
+                            const char* rules; uint32_t rulesLen; } P4TypeInfo;   /* rules: tag-4 text, verbatim (v2, C-16) */
 
 int32_t   p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out);  /* P4_OK or status */
 int32_t   p4_cursor_next(P4Cursor* c, P4Row* row);   /* 1 row, 0 end, < 0 status (P4_E_BUDGET, P4_E_CANCELLED, ...) */
@@ -64,6 +65,8 @@ void      p4_lane_set_sql_state(P4Lane* lane, void* state);
 int32_t   p4_types(P4Lane* lane, const P4TypeInfo** out, uint32_t* n);   /* registered types; valid until the lane's next call */
 int32_t   p4_sources(P4Lane* lane, const char* type, const char* const** out, uint32_t* n); /* sources with >= 1 live tag */
 int64_t   p4_visible_through(P4Engine* e, const char* type);
+uint64_t  p4_lane_heap_cap(P4Lane* lane);            /* v2, C-18: slot sandbox heap cap (tag 48, else default) */
+void      p4_lane_counters(P4Lane* lane, uint64_t* rowsExamined, uint64_t* bytesRead); /* v2, C-18: this op's cursor totals */
 #ifdef __cplusplus
 }
 #endif

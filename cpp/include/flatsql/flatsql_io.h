@@ -137,6 +137,22 @@ extern const char* const kFlatSqlVfsName;  /* "flatsql_io" */
  * throws. */
 int registerFlatSqlIoVfs(bool makeDefault);
 
+/* Connections opened with the URI parameter ra=1 read ahead sequentially:
+ * up to `streams` streams per connection (1..8, default 2), `bytes` per
+ * read-ahead (default 1 MiB). Applies to reads after the call. */
+void setFlatSqlIoReadahead(int streams, int bytes);
+
+/* Process-wide VFS counters. */
+struct FlatSqlIoVfsStats {
+    int64_t walIndexBytes;      /* heap WAL-index regions mapped now */
+    int64_t walIndexBytesPeak;
+    int64_t readaheadReads;     /* host reads issued by readahead */
+    int64_t readaheadHits;      /* SQLite reads served from readahead buffers */
+    int64_t readaheadBytes;
+    int64_t nodes;              /* paths with an open database file */
+};
+FlatSqlIoVfsStats flatSqlIoVfsStats();
+
 }  /* namespace flatsql */
 #endif /* __cplusplus */
 

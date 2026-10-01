@@ -4,7 +4,7 @@
 #include <random>
 
 #include "flatbuffers/reflection.h"
-#include "flatsql/ps/extract.h"
+#include "flatsql/typecfg/extract.h"
 #include "flatsql/ps/index.h"
 #include "flatsql/ps/platform.h"
 #include "ps/ps_test.h"

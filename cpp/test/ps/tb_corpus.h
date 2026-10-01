@@ -30,7 +30,7 @@
 #include <string>
 #include <vector>
 
-#include "flatsql/ps/extract.h"
+#include "flatsql/typecfg/extract.h"
 #include "flatsql/ps/io.h"
 #include "flatsql/ps/writer.h"
 #include "ps/ps_test.h"
