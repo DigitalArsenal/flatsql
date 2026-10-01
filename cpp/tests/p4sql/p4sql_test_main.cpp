@@ -205,6 +205,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "p4sql_global_init failed\n");
         return 2;
     }
+    if (p4sqlt::env("P4SQL_MEMSTATUS") == "0") sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0);
     sqlite3_initialize();
     int ran = 0, failedTests = 0;
     for (const p4sqlt::Test& t : p4sqlt::registry()) {

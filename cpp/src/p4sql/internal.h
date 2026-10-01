@@ -25,34 +25,75 @@ namespace flatsql {
 namespace p4sql {
 
 // ---------------------------------------------------------------------------
-// Per-lane heap (heap.cpp)
+// Per-lane arena (heap.cpp), copy-adapted from ps/lane_arena.h
 // ---------------------------------------------------------------------------
-// Every SQLite allocation made while a lane's heap is bound to the calling
-// thread is accounted to that lane; a limit (set for sandboxed statements)
-// fails the allocation (SQLITE_NOMEM) instead of taking memory the writers
-// need. Allocations of unbound threads (writers, the engine's own reader
-// connections) are unaccounted. A pointer records its owner, so it may be
-// freed from any thread.
-struct LaneHeap {
-    std::atomic<int64_t> used{0};
-    std::atomic<int64_t> limit{0};      // bytes this lane may hold; 0 = none
-    std::atomic<bool> tripped{false};   // an allocation failed against the limit
-};
-int32_t heapInstall();                  // SQLITE_CONFIG_MALLOC; before sqlite3_initialize
-void heapBind(LaneHeap* h);             // the calling thread's heap (nullptr = none)
-LaneHeap* heapBound();
+// A TLSF allocator over one fixed region, used only by its lane's thread.
+class LaneArena {
+public:
+    LaneArena() = default;
+    ~LaneArena();
+    LaneArena(const LaneArena&) = delete;
+    LaneArena& operator=(const LaneArena&) = delete;
 
-// Unbinds the lane heap for a call into the engine: the engine's reader
-// connections are shared by every lane and must not count against one.
+    // Reserves `bytes` (rounded to 64 KiB). Natively the region is an
+    // anonymous mapping: untouched pages cost no resident memory.
+    bool init(size_t bytes);
+    void* alloc(size_t n);
+    void free(void* p);
+    void* realloc(void* p, size_t n);
+    size_t usable(const void* p) const;
+    bool owns(const void* p) const {
+        return reinterpret_cast<uintptr_t>(p) >= base_ && reinterpret_cast<uintptr_t>(p) < end_;
+    }
+
+    size_t capacity() const { return cap_; }
+    size_t used() const { return used_; }
+    size_t highWater() const { return high_.load(std::memory_order_relaxed); }
+    uint64_t failures() const { return failures_.load(std::memory_order_relaxed); }
+    void resetHighWater() { high_.store(used_, std::memory_order_relaxed); }
+    // Self-check of every block and free list (tests).
+    bool check(std::string* why) const;
+
+private:
+    static constexpr int kSlLog2 = 4;
+    static constexpr int kSlCount = 1 << kSlLog2;
+    static constexpr int kFlShift = kSlLog2 + 4;  // small blocks: < 256 bytes, 16-byte classes
+    static constexpr int kFlCount = 40 - kFlShift + 1;
+    struct Block;
+    void insertFree(Block* b);
+    void removeFree(Block* b);
+    Block* findFree(size_t size);
+    static void mapping(size_t size, int* fl, int* sl);
+
+    uintptr_t base_ = 0;
+    uintptr_t end_ = 0;
+    size_t cap_ = 0;
+    size_t mapped_ = 0;
+    size_t used_ = 0;
+    std::atomic<size_t> high_{0};
+    std::atomic<uint64_t> failures_{0};
+    uint64_t flBitmap_ = 0;
+    uint32_t slBitmap_[kFlCount] = {};
+    Block* heads_[kFlCount][kSlCount] = {};
+};
+
+int32_t heapInstall();               // SQLITE_CONFIG_MALLOC; before sqlite3_initialize
+void arenaBind(LaneArena* a);         // the calling thread's arena (nullptr = the system allocator)
+LaneArena* arenaBound();
+void arenaRegister(LaneArena* a);     // so a pointer finds its arena from any thread
+void arenaUnregister(LaneArena* a);
+
+// Runs an engine call on the system allocator: the engine's reader
+// connections are shared by every lane and never live in a lane's arena.
 class EngineCall {
 public:
-    EngineCall() : saved_(heapBound()) { heapBind(nullptr); }
-    ~EngineCall() { heapBind(saved_); }
+    EngineCall() : saved_(arenaBound()) { arenaBind(nullptr); }
+    ~EngineCall() { arenaBind(saved_); }
     EngineCall(const EngineCall&) = delete;
     EngineCall& operator=(const EngineCall&) = delete;
 
 private:
-    LaneHeap* saved_;
+    LaneArena* saved_;
 };
 
 // Default cap of a sandboxed statement's lane heap (config tag 48's default;
@@ -115,6 +156,10 @@ struct Stmt {
     uint64_t rowsExamined = 0;        // rows taken from reader cursors
     uint64_t bytesRead = 0;           // hydrated record bytes
     uint64_t vmSteps = 0;
+    LaneArena* arena = nullptr;         // bound for a sandboxed statement
+    uint64_t arenaFailures = 0;         // the arena's failures when it was bound
+    // An allocation of this statement failed against the sandbox heap cap.
+    bool capTripped() const { return arena && arena->failures() > arenaFailures; }
     void raise(int32_t st, const std::string& msg) {
         if (status == 0) {
             status = st;
@@ -134,7 +179,7 @@ struct RelSpec {
 
 struct LaneState {
     P4Lane* lane = nullptr;
-    LaneHeap heap;
+    LaneArena* arena = nullptr;   // sandboxed statements' heap, made at the first one
     sqlite3* db = nullptr;
     std::map<std::string, TypeEntry> types;      // key: lower-case name
     std::map<std::string, RelSpec> relations;    // key: lower-case relation name

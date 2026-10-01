@@ -220,6 +220,16 @@ int32_t p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out) {
             c->lo = nVis - size_t(spec->bound);
         }
     }
+    // A seq range is a seek, not a scan (the bound is applied first).
+    const size_t afterIdx = size_t(std::upper_bound(recs.begin(), recs.end(), c->after,
+                                                    [](int64_t s, const Rec& r) { return s < r.seq; }) -
+                                   recs.begin());
+    const size_t throughIdx = size_t(std::upper_bound(recs.begin(), recs.end(), c->through,
+                                                      [](int64_t s, const Rec& r) { return s < r.seq; }) -
+                                     recs.begin());
+    c->lo = std::max(c->lo, afterIdx);
+    c->hi = std::min(c->hi, throughIdx);
+    if (c->hi < c->lo) c->hi = c->lo;
     c->pos = c->desc ? c->hi : c->lo;
     p4fake::OpenedSpec os;
     os.type = spec->type;

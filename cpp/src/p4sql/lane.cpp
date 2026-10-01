@@ -37,16 +37,32 @@ LaneState* stateOf(P4Lane* lane) {
 
 namespace {
 
-// Binds the lane's heap for the duration of a hook.
-class LaneScope {
+// Binds the lane's arena (made at the first sandboxed statement) for one
+// sandboxed statement.
+class SandboxScope {
 public:
-    explicit LaneScope(LaneState* ls) : saved_(heapBound()) { heapBind(&ls->heap); }
-    ~LaneScope() { heapBind(saved_); }
-    LaneScope(const LaneScope&) = delete;
-    LaneScope& operator=(const LaneScope&) = delete;
+    SandboxScope(LaneState* ls, Stmt* st) : saved_(arenaBound()) {
+        if (!st->sandbox) return;
+        if (!ls->arena) {
+            std::unique_ptr<LaneArena> a(new LaneArena());
+            if (a->init(size_t(kSandboxHeapCap))) {
+                arenaRegister(a.get());
+                ls->arena = a.release();
+            }
+        }
+        // Without a region the statement runs on the system allocator: the
+        // engine's hard heap limit still bounds it.
+        if (!ls->arena) return;
+        st->arena = ls->arena;
+        st->arenaFailures = ls->arena->failures();
+        arenaBind(ls->arena);
+    }
+    ~SandboxScope() { arenaBind(saved_); }
+    SandboxScope(const SandboxScope&) = delete;
+    SandboxScope& operator=(const SandboxScope&) = delete;
 
 private:
-    LaneHeap* saved_;
+    LaneArena* saved_;
 };
 
 int progress(void* p) {
@@ -101,11 +117,19 @@ int sandboxAuthorizer(void* user, int action, const char* a1, const char*, const
         case SQLITE_SELECT:
         case SQLITE_FUNCTION:
         case SQLITE_RECURSIVE: return SQLITE_OK;
-        case SQLITE_READ:
-            if (isRelation(ctx->ls, a1)) return SQLITE_OK;
+        case SQLITE_READ: {
+            // The lane's connection holds no table but the record relations:
+            // any other name read is a CTE or subquery (allowed), SQLite's own
+            // schema, a pragma function or a flatsql_* name (never public).
+            const char* t = a1 ? a1 : "";
+            if (isRelation(ctx->ls, t)) return SQLITE_OK;
+            if (std::strncmp(t, "sqlite_", 7) != 0 && std::strncmp(t, "pragma_", 7) != 0 &&
+                std::strncmp(t, "flatsql_", 8) != 0)
+                return SQLITE_OK;
             if (ctx->violation.empty())
-                ctx->violation = std::string("table \"") + (a1 ? a1 : "?") + "\" is outside the public query surface";
+                ctx->violation = std::string("table \"") + t + "\" is outside the public query surface";
             return SQLITE_DENY;
+        }
         default: break;
     }
     if (ctx->violation.empty())
@@ -126,9 +150,8 @@ bool missingTable(const char* msg, std::string* name) {
     return !n.empty();
 }
 
-int32_t nomemStatus(LaneState* ls, const Stmt& st) {
-    return st.sandbox && ls->heap.tripped.load(std::memory_order_relaxed) ? P4_E_BUDGET : P4_E_NOMEM;
-}
+// Out of memory: the sandbox heap cap, or the process.
+int32_t nomemStatus(const Stmt& st) { return st.capTripped() ? P4_E_BUDGET : P4_E_NOMEM; }
 
 const char* kHeapCapMessage = "heap cap: the statement exceeds the sandbox lane heap";
 
@@ -167,7 +190,7 @@ int32_t prepare(LaneState* ls, Stmt& st, const char* sql, size_t n, sqlite3_stmt
         const std::string err = sqlite3_errmsg(ls->db);
         if (s) sqlite3_finalize(s);
         if (rc == SQLITE_NOMEM) {
-            const int32_t status = nomemStatus(ls, st);
+            const int32_t status = nomemStatus(st);
             *msg = status == P4_E_BUDGET ? kHeapCapMessage : "out of memory";
             return status;
         }
@@ -368,7 +391,7 @@ int32_t run(LaneState* ls, Stmt& st, sqlite3_stmt* s, Out& out, std::string* msg
                 return st.status;
             }
             if (rc == SQLITE_NOMEM) {
-                const int32_t status = nomemStatus(ls, st);
+                const int32_t status = nomemStatus(st);
                 *msg = status == P4_E_BUDGET ? kHeapCapMessage : "out of memory";
                 return status;
             }
@@ -446,7 +469,6 @@ extern "C" int32_t p4sql_global_init(void) { return heapInstall(); }
 extern "C" int32_t p4sql_lane_init(P4Lane* lane) {
     std::unique_ptr<LaneState> ls(new LaneState());
     ls->lane = lane;
-    LaneScope scope(ls.get());
     const int rc = sqlite3_open_v2(":memory:", &ls->db,
                                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MEMORY | SQLITE_OPEN_NOMUTEX,
                                    nullptr);
@@ -472,37 +494,35 @@ extern "C" int32_t p4sql_lane_init(P4Lane* lane) {
 extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
     LaneState* ls = stateOf(lane);
     if (!ls || !req) return P4_E_INTERNAL;
-    LaneScope scope(ls);
     Stmt st;
     st.sandbox = (req->flags & P4_SLOT_SANDBOX) != 0;
     Out out(ls, (req->flags & P4_SLOT_RAW) != 0, req->maxResultRows, req->maxResultBytes);
-    ls->heap.tripped.store(false, std::memory_order_relaxed);
-    ls->heap.limit.store(st.sandbox ? ls->heap.used.load(std::memory_order_relaxed) + kSandboxHeapCap : 0,
-                         std::memory_order_relaxed);
-    ls->cur = &st;
     std::string msg;
     int32_t status = P4_OK;
-    sqlite3_stmt* s = nullptr;
-    std::vector<rb1::Cell> params;
-    if (!rb1::decodeParams(req->params, req->paramsLen, &params)) {
-        status = P4_E_ARG;
-        msg = "malformed parameters";
-    }
-    if (status == P4_OK) status = prepare(ls, st, req->sql ? req->sql : "", req->sql ? req->sqlLen : 0, &s, &msg);
-    if (status == P4_OK) status = bindParams(ls->db, s, params, &msg);
-    std::vector<std::string> names;
-    if (s) {
-        const int ncols = sqlite3_column_count(s);
-        for (int i = 0; i < ncols; i++) {
-            const char* n = sqlite3_column_name(s, i);
-            names.emplace_back(n ? n : "");
+    {
+        SandboxScope scope(ls, &st);
+        ls->cur = &st;
+        sqlite3_stmt* s = nullptr;
+        std::vector<rb1::Cell> params;
+        if (!rb1::decodeParams(req->params, req->paramsLen, &params)) {
+            status = P4_E_ARG;
+            msg = "malformed parameters";
         }
+        if (status == P4_OK) status = prepare(ls, st, req->sql ? req->sql : "", req->sql ? req->sqlLen : 0, &s, &msg);
+        if (status == P4_OK) status = bindParams(ls->db, s, params, &msg);
+        std::vector<std::string> names;
+        if (s) {
+            const int ncols = sqlite3_column_count(s);
+            for (int i = 0; i < ncols; i++) {
+                const char* n = sqlite3_column_name(s, i);
+                names.emplace_back(n ? n : "");
+            }
+        }
+        out.header(names);   // an op that fails before its first row still writes its header
+        if (status == P4_OK) status = run(ls, st, s, out, &msg);
+        if (s) sqlite3_finalize(s);   // releases the reader cursors and the statement's arena memory now
+        ls->cur = nullptr;
     }
-    out.header(names);   // an op that fails before its first row still writes its header
-    if (status == P4_OK) status = run(ls, st, s, out, &msg);
-    if (s) sqlite3_finalize(s);   // releases the reader cursors now
-    ls->cur = nullptr;
-    ls->heap.limit.store(0, std::memory_order_relaxed);
     const int32_t emitted = out.finish(status, st, &msg);
     ls->lastError = msg;
     return status != P4_OK ? status : emitted;
@@ -511,7 +531,6 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
 extern "C" int32_t p4sql_surface(P4Lane* lane) {
     LaneState* ls = stateOf(lane);
     if (!ls) return P4_E_INTERNAL;
-    LaneScope scope(ls);
     Stmt st;
     Out out(ls, false, 0, 0);
     out.header({"name", "kind", "source", "column", "placeholder", "bound"});
@@ -525,17 +544,19 @@ extern "C" int32_t p4sql_surface(P4Lane* lane) {
 extern "C" void p4sql_lane_free(P4Lane* lane) {
     LaneState* ls = stateOf(lane);
     if (!ls) return;
-    {
-        LaneScope scope(ls);
-        sqlite3_close_v2(ls->db);
-        ls->db = nullptr;
-    }
+    sqlite3_close_v2(ls->db);   // frees the connection's arena blocks too (found by address)
+    ls->db = nullptr;
     {
         EngineCall ec;
         p4_lane_set_sql_state(lane, nullptr);
     }
-    // Every allocation of the connection is freed with it. Should one still
-    // be counted, its header names this heap: the state is kept rather than
-    // left dangling (it is a few hundred bytes, once per lane).
-    if (ls->heap.used.load() == 0) delete ls;
+    if (ls->arena) {
+        // Every block is freed with the connection. Should one still be
+        // live, the region stays mapped (and findable) rather than dangle.
+        if (ls->arena->used() == 0) {
+            arenaUnregister(ls->arena);
+            delete ls->arena;
+        }
+    }
+    delete ls;
 }
