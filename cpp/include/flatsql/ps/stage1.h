@@ -30,7 +30,7 @@
 #include <mutex>
 #include <vector>
 
-#include "flatsql/ps/extract.h"
+#include "flatsql/typecfg/extract.h"
 #include "flatsql/ps/format.h"
 #include "flatsql/ps/index.h"
 #include "flatsql/ps/io.h"

@@ -25,8 +25,8 @@
 //
 // Nothing here allocates on the record path: extracted strings point into the
 // frame, the BFBS, or a caller-supplied scratch buffer.
-#ifndef FLATSQL_PS_EXTRACT_H
-#define FLATSQL_PS_EXTRACT_H
+#ifndef FLATSQL_TYPECFG_EXTRACT_H
+#define FLATSQL_TYPECFG_EXTRACT_H
 
 #include <cstddef>
 #include <cstdint>

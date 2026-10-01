@@ -1,6 +1,6 @@
 // FlatSQL partition store: per-type configuration and extraction (see
-// ps/extract.h). Go parity notes cite sdn-server/internal/storage.
-#include "flatsql/ps/extract.h"
+// typecfg/extract.h). Go parity notes cite sdn-server/internal/storage.
+#include "flatsql/typecfg/extract.h"
 
 #include <flatbuffers/flatbuffers.h>
 #include <flatbuffers/reflection.h>
