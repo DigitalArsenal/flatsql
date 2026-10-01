@@ -88,6 +88,42 @@ const PS_EXPORTS = [
 ];
 const PS_MAX_PAGES = 32768;
 
+/**
+ * Store format 4 (flatsql-p4-threads.wasm, docs/STORE-FORMAT-4.md): the same
+ * shape as the partition store with the flatsql_p4_* C ABI. Its WASI surface
+ * opens no file descriptor: clocks, sched_yield, proc_exit, stdio and preopen
+ * discovery from libc's start-up, and environ from libc++'s locale start-up
+ * (the FTS text extraction formats numbers through an imbued stream).
+ */
+const P4_WASI = [
+  'clock_time_get',
+  'environ_get',
+  'environ_sizes_get',
+  'fd_close',
+  'fd_prestat_dir_name',
+  'fd_prestat_get',
+  'fd_seek',
+  'fd_write',
+  'proc_exit',
+  'sched_yield',
+];
+const P4_EXPORTS = [
+  '_initialize',
+  'flatsql_p4_activate',
+  'flatsql_p4_alloc',
+  'flatsql_p4_free',
+  'flatsql_p4_init',
+  'flatsql_p4_layout',
+  'flatsql_p4_register_type',
+  'flatsql_p4_set_quota',
+  'flatsql_p4_start',
+  'flatsql_p4_stats',
+  'flatsql_p4_stop',
+  'flatsql_p4_wake',
+  'memory',
+  'wasi_thread_start',
+];
+
 /** Limits of the imported memory (WebAssembly.Module.imports omits them). */
 function importedMemory(bytes) {
   let at = 8;
@@ -137,7 +173,7 @@ function importedMemory(bytes) {
   return null;
 }
 
-function checkPsThreads(path) {
+function checkPsThreads(path, wasiList = PS_WASI, exportList = PS_EXPORTS, abi = 'flatsql_ps') {
   const bytes = new Uint8Array(readFileSync(path));
   const module = new WebAssembly.Module(bytes);
   const imports = WebAssembly.Module.imports(module);
@@ -148,8 +184,8 @@ function checkPsThreads(path) {
     pass('import modules: env, wasi, wasi_snapshot_preview1');
   }
   const wasi = imports.filter((i) => i.module === 'wasi_snapshot_preview1').map((i) => i.name).sort();
-  if (JSON.stringify(wasi) !== JSON.stringify(PS_WASI)) fail(`WASI import set changed: expected [${PS_WASI}], got [${wasi}]`);
-  else pass(`WASI preview1 surface is exactly [${PS_WASI}]`);
+  if (JSON.stringify(wasi) !== JSON.stringify(wasiList)) fail(`WASI import set changed: expected [${wasiList}], got [${wasi}]`);
+  else pass(`WASI preview1 surface is exactly [${wasiList}]`);
   const threads = imports.filter((i) => i.module === 'wasi');
   if (threads.length !== 1 || threads[0].name !== 'thread-spawn' || threads[0].kind !== 'function') {
     fail(`wasi module must import only thread-spawn; got [${threads.map((i) => i.name)}]`);
@@ -174,8 +210,8 @@ function checkPsThreads(path) {
   if (emscripten.length) fail(`emscripten imports present: ${emscripten.map((i) => i.name).join(', ')}`);
   else pass('0 emscripten imports');
   const exports = WebAssembly.Module.exports(module).map((e) => e.name).sort();
-  if (JSON.stringify(exports) !== JSON.stringify(PS_EXPORTS)) fail(`exports changed: expected [${PS_EXPORTS}], got [${exports}]`);
-  else pass('exports: the flatsql_ps C ABI, wasi_thread_start, _initialize, memory');
+  if (JSON.stringify(exports) !== JSON.stringify(exportList)) fail(`exports changed: expected [${exportList}], got [${exports}]`);
+  else pass(`exports: the ${abi} C ABI, wasi_thread_start, _initialize, memory`);
 }
 
 /**
@@ -184,6 +220,7 @@ function checkPsThreads(path) {
  */
 const TARGETS = [
   { file: 'flatsql-ps-threads.wasm', role: 'ps-threads', required: true },
+  { file: 'flatsql-p4-threads.wasm', role: 'p4-threads', required: true },
   { file: 'flatsql-wasi-noeh.wasm', role: 'engine', required: true },
   { file: 'flatsql-wasi.wasm', role: 'engine', required: true },
   { file: 'flatsql-sdn-node.wasm', role: 'module', required: false },
@@ -232,6 +269,10 @@ for (const target of TARGETS) {
   console.log(`\n${target.file} (${target.role})`);
   if (target.role === 'ps-threads') {
     checkPsThreads(path);
+    continue;
+  }
+  if (target.role === 'p4-threads') {
+    checkPsThreads(path, P4_WASI, P4_EXPORTS, 'flatsql_p4');
     continue;
   }
   const imports = importsOf(path);

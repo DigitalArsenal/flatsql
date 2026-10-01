@@ -656,7 +656,8 @@ void mailboxLayout(P4Engine* e, FlatsqlP4Layout* out);
 int32_t startThreads(P4Engine* e);
 // The slot's output: append bytes to its ring (waits for space; checks cancel).
 int32_t emitBytes(P4Lane* L, const uint8_t* p, size_t n);
-int32_t flushOut(P4Lane* L);  // L->out to the ring
+int32_t flushOut(P4Lane* L);    // L->out to the ring (honours cancel and the caps)
+int32_t flushFinal(P4Lane* L);  // the op's last bytes, whatever tripped
 void slotDone(P4Engine* e, uint32_t slot, int32_t status, const std::string& err, uint64_t rows);
 void slotDoneLane(P4Lane* L, int32_t status, const std::string& err);
 // A response with fixed columns and a status only (an op that failed before its first row).

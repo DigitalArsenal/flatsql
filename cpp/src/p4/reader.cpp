@@ -1290,6 +1290,11 @@ struct Out {
     P4Lane* L;
     ps::rb1::Encoder enc;
     explicit Out(P4Lane* l) : L(l), enc(&l->out) {}
+    // The header goes at once: a stream cut by a cap stays header, blocks, RB1E.
+    void header(const std::vector<std::string>& cols) {
+        enc.header(cols);
+        flushFinal(L);
+    }
     // After a row: ship whole blocks; the result-rows cap.
     int32_t rowDone() {
         L->rowsOut++;
@@ -1298,14 +1303,14 @@ struct Out {
         return L->trip;
     }
     void finish(int32_t status, const std::string& err) {
+        // Blocks still buffered when a cap or cancel tripped are dropped; the
+        // RB1E always goes.
+        if (L->trip) L->out.clear();
+        enc.flushBlock();
+        if (!L->trip) flushOut(L);
+        L->out.clear();
         enc.end(status, L->rowsOut, L->rowsExamined, L->bytesRead);
-        const int32_t trip = L->trip;
-        L->trip = 0;
-        const uint64_t lim = L->maxResultBytes;
-        L->maxResultBytes = 0;
-        flushOut(L);
-        L->maxResultBytes = lim;
-        (void)trip;
+        flushFinal(L);
         slotDoneLane(L, status, err);
     }
 };
@@ -1356,7 +1361,7 @@ int32_t typeOf(P4Lane* L, const std::string& name, Type** t) {
 // ---- ops ----------------------------------------------------------------------------------------------
 int32_t opScanLike(P4Lane* L, const std::vector<Tlv>& v, uint32_t op) {
     Out o(L);
-    o.enc.header(recCols());
+    o.header(recCols());
     Spec2 s;
     int32_t rc = decodeSpec(v, &s);
     Type* t = nullptr;
@@ -1393,7 +1398,7 @@ int32_t opScanLike(P4Lane* L, const std::vector<Tlv>& v, uint32_t op) {
 int32_t opGet(P4Lane* L, const std::vector<Tlv>& v) {
     Engine* e = L->e;
     Out o(L);
-    o.enc.header(recCols());
+    o.header(recCols());
     std::string name;
     tlvText(v, 1, &name);
     bool bad = false;
@@ -1521,7 +1526,7 @@ int32_t opGet(P4Lane* L, const std::vector<Tlv>& v) {
 int32_t opTags(P4Lane* L, const std::vector<Tlv>& v) {
     Engine* e = L->e;
     Out o(L);
-    o.enc.header({"cid", "seq", "producer", "provider", "source", "source_url", "batch", "content_key_id",
+    o.header({"cid", "seq", "producer", "provider", "source", "source_url", "batch", "content_key_id",
                   "producer_peer", "producer_pubkey", "at"});
     std::string name;
     tlvText(v, 1, &name);
@@ -1663,7 +1668,7 @@ int32_t opTags(P4Lane* L, const std::vector<Tlv>& v) {
 
 int32_t opHead(P4Lane* L, const std::vector<Tlv>& v) {
     Out o(L);
-    o.enc.header({"n", "bytes", "max_seq", "max_ts", "max_at", "through", "more"});
+    o.header({"n", "bytes", "max_seq", "max_ts", "max_at", "through", "more"});
     Spec2 s;
     int32_t rc = decodeSpec(v, &s);
     bool bad = false;
@@ -1786,7 +1791,7 @@ bool kIsCol0(const Spec& sp) {
 
 int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
     Out o(L);
-    o.enc.header({"c0", "epoch", "cid"});
+    o.header({"c0", "epoch", "cid"});
     Spec2 s;
     int32_t rc = decodeSpec(v, &s);
     Type* t = nullptr;
@@ -1921,9 +1926,9 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
     if (rc == P4_OK && (bad || profile < 1 || profile > 5)) rc = P4_E_ARG;
     Type* t = nullptr;
     if (rc == P4_OK) rc = typeOf(L, s.type, &t);
-    if (countOnly) o.enc.header({"n"});
-    else if (profile == 5) o.enc.header({"day", "n", "min_epoch", "max_epoch"});
-    else o.enc.header(recCols());
+    if (countOnly) o.header({"n"});
+    else if (profile == 5) o.header({"day", "n", "min_epoch", "max_epoch"});
+    else o.header(recCols());
     if (rc != P4_OK) {
         o.finish(rc, "bad request");
         return rc;
@@ -2115,11 +2120,11 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
         {"type", "files", "db_bytes", "wal_bytes", "journal_bytes", "index_bytes", "fts_bytes", "free_bytes"},
         {"type", "state", "through"}};
     if (bad || kind < 1 || kind > 5) {
-        o.enc.header({});
+        o.header({});
         o.finish(P4_E_ARG, "SUMMARY kind (tag 45) is 1-5");
         return P4_E_ARG;
     }
-    o.enc.header(cols[kind]);
+    o.header(cols[kind]);
     std::vector<Type*> types;
     {
         std::lock_guard<std::mutex> g(e->typesMu);

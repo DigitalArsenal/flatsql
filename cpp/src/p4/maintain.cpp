@@ -280,9 +280,14 @@ namespace {
 struct Verify {
     int64_t entries = 0, mismatches = 0;
 };
+// REBUILD verify's findings, one line each, in native debug runs only.
 void why(const char* what, const std::string& path, int64_t a, int64_t b) {
+#if !defined(__wasm__)
     static const bool on = std::getenv("P4_VERIFY_DEBUG") != nullptr;
     if (on) std::fprintf(stderr, "verify: %s %s (%lld vs %lld)\n", what, path.c_str(), (long long)a, (long long)b);
+#else
+    (void)what; (void)path; (void)a; (void)b;
+#endif
 }
 
 // Compares (and with fix, rewrites) the type index's c, file and lanecnt rows

@@ -5,9 +5,11 @@
 // _exits (or is killed with SIGKILL) without stopping; the parent reopens the
 // store and checks it. The kill loop's two halves (t_kill_run, t_kill_check)
 // are also separate tests, so the wasm build's host can drive the same loop.
+#include <unistd.h>
+#if !defined(__wasm__)
 #include <signal.h>
 #include <sys/wait.h>
-#include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -51,6 +53,7 @@ Batch pnmBatch(const std::string& peer, const std::string& batch, uint64_t from,
     return b;
 }
 
+#if !defined(__wasm__)
 // Runs fn in a child process that dies without stopping the engine.
 bool inChild(const std::function<void()>& fn) {
     std::fflush(stdout);
@@ -66,6 +69,7 @@ bool inChild(const std::function<void()>& fn) {
     waitpid(pid, &st, 0);
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
+#endif
 
 int64_t countRows(const std::string& path) {
     sqlite3* db = nullptr;
@@ -121,6 +125,7 @@ Result scanAfter(const std::string& type, int64_t after, uint64_t limit) {
 
 }  // namespace
 
+#if !defined(__wasm__)
 // B1 at the VFS: closing one connection must not delete the WAL under the
 // others; after a crash every committed row is there.
 P4_TEST(t_close) {
@@ -170,6 +175,8 @@ P4_TEST(t_close) {
     CHECK_EQ(n, int64_t(2000), "after the crash every committed row");
     CHECK(integrity(path) == "ok", "integrity");
 }
+
+#endif
 
 // B9: a dropped month's path is never reused; a late record for that month
 // lands in the next generation; old and new readers see it.
@@ -267,6 +274,7 @@ P4_TEST(t_gap) {
     closeEngine();
 }
 
+#if !defined(__wasm__)
 // B3: a crash between partition commits and the deferred type-index flush.
 P4_TEST(t_crash) {
     const std::string root = scratchDir("crash") + "/fsql4";
@@ -313,6 +321,8 @@ P4_TEST(t_crash) {
     if (v.rows.size() == 1) CHECK_EQ(v.i(0, "mismatches"), int64_t(0), "verify after the crash");
     closeEngine();
 }
+
+#endif
 
 // ---- the kill loop -------------------------------------------------------------------------------
 // t_kill_run ingests until killed (3 producers; every 5th call repeats the
@@ -402,6 +412,7 @@ bool killCheck(const std::string& root, std::string* why) {
     nextFresh += 1000;
     Result fresh = put(pnmBatch("producer0", "after", nextFresh + flatsql::ps::monoNs() % 1000000000ull * 1000, 100));
     bool above = fresh.status == P4_OK && fresh.rows.size() == 100;
+    if (fresh.status != P4_OK) std::fprintf(stderr, "  check: fresh PUT failed: %d %s\n", fresh.status, fresh.err.c_str());
     for (size_t i = 0; i < fresh.rows.size(); i++) above = above && fresh.i(i, "seq") > maxSeq;
     closeEngine();
     char buf[256];
@@ -421,6 +432,7 @@ P4_SLOW_TEST(t_kill_check) {
     CHECK(ok, why);
 }
 
+#if !defined(__wasm__)
 // The native loop: kill -9 an ingesting engine at a random point, check, repeat.
 P4_SLOW_TEST(t_kill) {
     const int rounds = int(argInt("rounds", 1000));
@@ -434,14 +446,21 @@ P4_SLOW_TEST(t_kill) {
             EngineOpts o;
             o.flushEntries = 5000;
             o.writers = 3;
-            if (openEngine(root, o) != P4_OK || registerType(pnm()) != P4_OK) _exit(2);
+            if (openEngine(root, o) != P4_OK || registerType(pnm()) != P4_OK) {
+                std::fprintf(stderr, "  child: open failed\n");
+                _exit(2);
+            }
             uint64_t id = uint64_t(round) * 100000000ull;
             for (int c = 0;; c++) {
                 Batch b = pnmBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), id, 500);
                 if (c % 5 == 4)
                     for (int i = 0; i < 500; i++) b.recs[size_t(i)].frame = pnmFrame(id - 1000 + uint64_t(i));
                 id += 500;
-                if (put(b).status != P4_OK) _exit(1);
+                Result pr = put(b);
+                if (pr.status != P4_OK) {
+                    std::fprintf(stderr, "  child: put failed: %d %s\n", pr.status, pr.err.c_str());
+                    _exit(1);
+                }
                 if (c % 13 == 12) {
                     TlvW s;
                     s.text(1, "PNM").text(11, "prov").text(12, "src").text(60, "b" + std::to_string(c / 7)).u8(61, 1);
@@ -466,3 +485,4 @@ P4_SLOW_TEST(t_kill) {
     CHECK_EQ(fail, 0, "every round");
     removeTree(root);
 }
+#endif

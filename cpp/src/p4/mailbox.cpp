@@ -234,11 +234,13 @@ int32_t ringWrite(Engine* e, uint32_t slot, uint32_t thread, const uint8_t* p, s
 
 int32_t emitBytes(P4Lane* L, const uint8_t* p, size_t n) {
     if (L->trip) return L->trip;
-    L->outBytes += n;
-    if (L->maxResultBytes && L->outBytes > L->maxResultBytes) {
+    // The result-bytes cap: the first chunk (it carries the RB1 header) always
+    // goes, so a capped stream stays header, blocks, RB1E.
+    if (L->maxResultBytes && L->outBytes > 0 && L->outBytes + n > L->maxResultBytes) {
         L->trip = P4_E_BUDGET;
         return P4_E_BUDGET;
     }
+    L->outBytes += n;
     const int32_t rc = ringWrite(L->e, L->slot, L->thread, p, n, true);
     if (rc != P4_OK) L->trip = rc;
     return rc;
@@ -247,6 +249,16 @@ int32_t emitBytes(P4Lane* L, const uint8_t* p, size_t n) {
 int32_t flushOut(P4Lane* L) {
     if (L->out.empty()) return L->trip;
     const int32_t rc = emitBytes(L, L->out.data(), L->out.size());
+    L->out.clear();
+    return rc;
+}
+
+// The op's last bytes (the RB1E, and the header of an op that never ran):
+// written whatever tripped, cancel and caps included.
+int32_t flushFinal(P4Lane* L) {
+    if (L->out.empty()) return P4_OK;
+    L->outBytes += L->out.size();
+    const int32_t rc = ringWrite(L->e, L->slot, L->thread, L->out.data(), L->out.size(), false);
     L->out.clear();
     return rc;
 }
@@ -274,17 +286,10 @@ void slotDoneLane(P4Lane* L, int32_t status, const std::string& err) {
 
 void respondEmpty(P4Lane* L, const std::vector<std::string>& cols, int32_t status, const std::string& err) {
     L->out.clear();
-    L->trip = 0;
     ps::rb1::Encoder enc(&L->out);
     enc.header(cols);
     enc.end(status, 0, L->rowsExamined, L->bytesRead);
-    const int32_t trip = L->trip;
-    L->trip = 0;
-    const uint64_t lim = L->maxResultBytes;
-    L->maxResultBytes = 0;
-    flushOut(L);
-    L->maxResultBytes = lim;
-    (void)trip;
+    flushFinal(L);
     slotDoneLane(L, status, err);
 }
 
@@ -553,7 +558,9 @@ void writerLoop(Engine* e, uint32_t wi) {
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
         bool did = false;
         uint32_t slot;
-        for (int k = 0; k < 64 && e->queues[0].pop(&slot); k++) {
+        // Route everything queued before taking a group: a group is then every
+        // call that arrived while the previous commit ran (group commit).
+        for (uint32_t k = 0; k < e->nSlots[0] && e->queues[0].pop(&slot); k++) {
             routeWrite(e, wi, slot, &L);
             did = true;
         }
@@ -655,7 +662,7 @@ void runSlot(P4Lane* L, uint32_t slot) {
             return;
         }
         if (status == P4_E_BUDGET) e->bump(kStSqlBudgetTrips);
-        flushOut(L);
+        flushFinal(L);
         slotDoneLane(L, status, status == P4_OK ? std::string() : std::string("SQL op failed"));
         return;
     }
