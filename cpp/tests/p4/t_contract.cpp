@@ -354,3 +354,109 @@ P4_TEST(t_replay_torn_create) {
     closeEngine();
 }
 #endif
+
+namespace {
+struct CursorRun {
+    int32_t status = P4_OK;
+    std::vector<int64_t> seqs;
+    std::vector<int64_t> keys;
+    uint64_t examined = 0;
+};
+// The reader API (p4_reader.h) on a lane of the test's own, as p4sql calls it.
+CursorRun cursorRun(const char* type, uint64_t bound, uint8_t order, const P4Pred* preds, uint32_t n) {
+    CursorRun out;
+    P4Lane lane;
+    lane.e = fp::currentEngine();
+    P4ScanSpec spec{};
+    spec.type = type;
+    spec.preds = preds;
+    spec.nPreds = n;
+    spec.order = order;
+    spec.bound = bound;
+    P4Cursor* c = nullptr;
+    out.status = p4_cursor_open(&lane, &spec, &c);
+    if (out.status != P4_OK) return out;
+    P4Row row;
+    int32_t k;
+    while ((k = p4_cursor_next(c, &row)) == 1) {
+        out.seqs.push_back(row.seq);
+        out.keys.push_back(row.keyType == 1 ? row.keyInt : -1);
+    }
+    if (k < 0) out.status = k;
+    p4_cursor_close(c);
+    uint64_t bytes = 0;
+    p4_lane_counters(&lane, &out.examined, &bytes);
+    return out;
+}
+}  // namespace
+
+// R17/R19: an object-column predicate inside the A18 bound reads its
+// objects' rows through the object index, not the window, with the same
+// answer as the rule (newest N of the type, then the predicate).
+P4_TEST(t_reader_object_key_in_bound) {
+    const std::string root = scratchDir("objkey") + "/fsql4";
+    REQUIRE(openEngine(root) == P4_OK, "open");
+    REQUIRE(registerType(ommType()) == P4_OK, "register OMM");
+    REQUIRE(registerType(catType()) == P4_OK, "register CAT");
+    Batch b;
+    b.type = "OMM";
+    b.peer = "12D3KooWGp";
+    b.tags.push_back(Tag{"celestrak", "celestrak-gp", "", "b1", "", "", ""});
+    b.at = 1790000000;
+    std::vector<uint32_t> noradOf;
+    for (int i = 0; i < 3000; i++) {
+        In in;
+        const uint32_t norad = uint32_t(100 + i % 50);
+        in.frame = ommFrame(norad, "1998-067A", isoTime(unixOf(2026, 9, 1) + int64_t(i / 50) * 7200 + i % 50));
+        in.ts = 1790000000;
+        noradOf.push_back(norad);
+        b.recs.push_back(std::move(in));
+    }
+    Result r = put(b);
+    REQUIRE(r.status == P4_OK && r.rows.size() == 3000, r.err);
+    std::vector<int64_t> seqOf;
+    for (size_t i = 0; i < r.rows.size(); i++) seqOf.push_back(r.i(i, "seq"));
+    std::vector<int64_t> sorted = seqOf;
+    std::sort(sorted.begin(), sorted.end());
+    const uint64_t bound = 1000;
+    const int64_t floor = sorted[sorted.size() - bound];
+    auto expect = [&](uint32_t lo, uint32_t hi) {
+        std::vector<int64_t> v;
+        for (size_t i = 0; i < seqOf.size(); i++)
+            if (seqOf[i] >= floor && noradOf[i] >= lo && noradOf[i] <= hi) v.push_back(seqOf[i]);
+        std::sort(v.rbegin(), v.rend());
+        return v;
+    };
+    P4Value v7{1, 107, 0, nullptr, 0};
+    P4Pred eq{P4_F_COL0, P4_OP_EQ, 1, &v7};
+    CursorRun a = cursorRun("OMM", bound, P4_ORDER_SEQ_DESC, &eq, 1);
+    CHECK_EQ(a.status, P4_OK, "eq");
+    CHECK(a.seqs == expect(107, 107), "COL0 = 107 inside the bound: " + std::to_string(a.seqs.size()) + " rows");
+    CHECK(a.examined <= 2 * a.seqs.size() + 2, "examined only the object's rows: " + std::to_string(a.examined));
+    P4Value range[2] = {{1, 105, 0, nullptr, 0}, {1, 109, 0, nullptr, 0}};
+    P4Pred btw{P4_F_COL0, P4_OP_BETWEEN, 2, range};
+    CursorRun bt = cursorRun("OMM", bound, P4_ORDER_SEQ_DESC, &btw, 1);
+    CHECK(bt.status == P4_OK && bt.seqs == expect(105, 109), "BETWEEN 105 AND 109: " + std::to_string(bt.seqs.size()));
+    CursorRun w = cursorRun("OMM", bound, P4_ORDER_W_DESC, &eq, 1);
+    CHECK_EQ(w.seqs.size(), expect(107, 107).size(), "W order: the same rows");
+    CursorRun none = cursorRun("OMM", 0, P4_ORDER_SEQ_ASC, &eq, 1);
+    CHECK_EQ(none.seqs.size(), size_t(60), "no bound: every row of the object");
+    // An object type without an epoch (r_k).
+    Batch cb;
+    cb.type = "CAT";
+    cb.peer = "12D3KooWSatcat";
+    cb.tags.push_back(Tag{"celestrak", "celestrak-satcat", "", "c1", "", "", ""});
+    cb.at = 1790000000;
+    for (int i = 0; i < 500; i++) {
+        In in;
+        in.frame = catFrame(uint32_t(1000 + i), "2000-001A", "OBJ " + std::to_string(i));
+        in.ts = 1790000000;
+        cb.recs.push_back(std::move(in));
+    }
+    REQUIRE(put(cb).status == P4_OK, "CAT");
+    P4Value c9{1, 1009, 0, nullptr, 0};
+    P4Pred ceq{P4_F_COL0, P4_OP_EQ, 1, &c9};
+    CursorRun cr = cursorRun("CAT", 10000, P4_ORDER_SEQ_DESC, &ceq, 1);
+    CHECK(cr.status == P4_OK && cr.seqs.size() == 1 && cr.keys[0] == 1009, "CAT COL0 = 1009");
+    closeEngine();
+}

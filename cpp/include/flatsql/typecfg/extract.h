@@ -123,6 +123,8 @@ public:
     bool hasBucketTime() const { return !epoch_.empty() || !bucket_.empty(); }
     bool verifies() const { return (flags_ & kVerifyBfbs) && schema_ != nullptr; }
     uint32_t nCols() const { return nCols_; }
+    // The object rule's first column (the object key is its value when present), or -1.
+    int firstObjectCol() const { return objectCols_.empty() ? -1 : objectCols_[0]; }
     // Readers (T2): the binary schema, for column projection.
     const reflection::Schema* schema() const { return schema_; }
     const std::vector<uint8_t>& bfbs() const { return bfbs_; }

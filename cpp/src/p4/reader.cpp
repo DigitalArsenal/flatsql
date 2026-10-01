@@ -235,7 +235,12 @@ private:
         bool started = false;
         bool done = false;
         bool opened = false;
+        size_t candPos = 0;     // object-key candidates taken so far
     };
+    int32_t collectCandidates();
+    int32_t fetchCandidates(int fi, bool wOrder);
+    bool kDriven_ = false;                    // rows come from object-key candidates
+    std::vector<std::vector<int64_t>> cand_;  // per file, ascending seqs
     int32_t fetchSeq(int fi);
     int32_t fetchW(int fi);
     int32_t loadRows(Conn* c, int fi, const std::vector<int64_t>& seqs, std::deque<Row>* out);
@@ -481,6 +486,206 @@ int32_t Scan::open() {
         else
             std::sort(order_.begin(), order_.end(), [&](int a, int b) { return files_[a].maxseq > files_[b].maxseq; });
     }
+    return collectCandidates();
+}
+
+// An equality, IN or range predicate on the object rule's first column (the
+// object key k, when that column is present) drives the scan through the
+// partition's object index instead of walking the window: ent gives each
+// object's w range, r_dk(wd, k, w) one seek per day (epoch types), r_k(k, w)
+// the rows (object types without an epoch). The candidates are rechecked by
+// rowMatches. A COL0 equality inside OMM's 400,000 bound reads its object's
+// rows, not the window (R17/R19).
+int32_t Scan::collectCandidates() {
+    if (s_.order == P4_ORDER_CID || files_.empty() || !sp_->hasObject) return P4_OK;
+    const int oc = sp_->tc.firstObjectCol();
+    if (oc < 0 || oc > 3) return P4_OK;
+    const Spec2::Pred* kp = nullptr;
+    for (const auto& p : s_.preds)
+        if (p.field == P4_F_COL0 + oc && !p.vals.empty() &&
+            (p.op == P4_OP_EQ || p.op == P4_OP_IN || p.op == P4_OP_BETWEEN || p.op == P4_OP_GE || p.op == P4_OP_GT ||
+             p.op == P4_OP_LE || p.op == P4_OP_LT)) {
+            kp = &p;
+            break;
+        }
+    if (!kp) return P4_OK;
+    for (const auto& v : kp->vals)
+        if (v.type != ps::rb1::kInt && v.type != ps::rb1::kText && v.type != ps::rb1::kReal) return P4_OK;
+    auto bindCell = [](sqlite3_stmt* q, int i, const ps::rb1::Cell& c) {
+        if (c.type == ps::rb1::kInt) sqlite3_bind_int64(q, i, c.i);
+        else if (c.type == ps::rb1::kReal) sqlite3_bind_double(q, i, c.d);
+        else sqlite3_bind_text(q, i, c.s.data(), int(c.s.size()), SQLITE_TRANSIENT);
+    };
+    const bool eq = kp->op == P4_OP_EQ || kp->op == P4_OP_IN;
+    const char* lo = kp->op == P4_OP_GT ? ">" : ">=";
+    const char* hi = kp->op == P4_OP_LT ? "<" : "<=";
+    const bool hasLo = kp->op == P4_OP_BETWEEN || kp->op == P4_OP_GE || kp->op == P4_OP_GT;
+    const bool hasHi = kp->op == P4_OP_BETWEEN || kp->op == P4_OP_LE || kp->op == P4_OP_LT;
+    const size_t kMaxSeeks = 50000, kMaxCand = 200000;
+    size_t seeks = 0, total = 0;
+    std::vector<std::vector<int64_t>> cand(files_.size());
+    for (size_t fi = 0; fi < files_.size(); fi++) {
+        FRef& fr = files_[fi];
+        bool indexed;
+        {
+            std::lock_guard<std::mutex> g(t_->mu);
+            indexed = fr.f->indexed;
+        }
+        if (!indexed) return P4_OK;  // a migration before REBUILD 1: the window walk
+        int rc = 0;
+        fr.f->users.fetch_add(1);
+        Conn* c = e_->rpool.acquire(fr.path, OpenKind::Reader, &rc, nullptr);
+        if (!c) {
+            fr.f->users.fetch_sub(1);
+            return statusOfSqlite(rc);
+        }
+        c->exec("BEGIN");
+        int32_t status = P4_OK;
+        bool giveUp = false;
+        std::vector<int64_t>& out = cand[fi];
+        auto collect = [&](sqlite3_stmt* q) {
+            int r;
+            while ((r = sqlite3_step(q)) == SQLITE_ROW) out.push_back(sqlite3_column_int64(q, 0));
+            sqlite3_reset(q);
+            if (r != SQLITE_DONE) status = statusOfSqlite(r);
+        };
+        if (sp_->ek) {
+            struct Obj {
+                sqlite3_value* k;
+                int64_t fw, lw;
+            };
+            std::vector<Obj> objs;
+            auto takeObjs = [&](sqlite3_stmt* q) {
+                int r;
+                while ((r = sqlite3_step(q)) == SQLITE_ROW)
+                    objs.push_back({sqlite3_value_dup(sqlite3_column_value(q, 0)), sqlite3_column_int64(q, 1),
+                                    sqlite3_column_int64(q, 2)});
+                sqlite3_reset(q);
+                if (r != SQLITE_DONE) status = statusOfSqlite(r);
+            };
+            if (eq) {
+                sqlite3_stmt* q = c->sql("SELECT k, fw, lw FROM ent WHERE k=?1 AND n>0");
+                if (!q) status = P4_E_INTERNAL;
+                for (size_t i = 0; status == P4_OK && i < kp->vals.size(); i++) {
+                    bindCell(q, 1, kp->vals[i]);
+                    takeObjs(q);
+                }
+            } else {
+                std::string sql = "SELECT k, fw, lw FROM ent WHERE n>0";
+                if (hasLo) sql += std::string(" AND k") + lo + "?1";
+                if (hasHi) sql += std::string(" AND k") + hi + "?2";
+                sqlite3_stmt* q = c->sql(sql.c_str());
+                if (!q) status = P4_E_INTERNAL;
+                else {
+                    if (hasLo) bindCell(q, 1, kp->vals[0]);
+                    if (hasHi) bindCell(q, 2, kp->vals[kp->op == P4_OP_BETWEEN ? 1 : 0]);
+                    takeObjs(q);
+                }
+            }
+            sqlite3_stmt* q = c->sql("SELECT seq FROM r INDEXED BY r_dk WHERE wd=?1 AND k=?2 AND seq>?3 AND seq<=?4");
+            if (!q && status == P4_OK) status = P4_E_INTERNAL;
+            for (const Obj& o : objs) {
+                if (status != P4_OK || giveUp) break;
+                for (int64_t d = o.fw / 86400; d <= o.lw / 86400 && status == P4_OK; d++) {
+                    if (++seeks > kMaxSeeks) {
+                        giveUp = true;
+                        break;
+                    }
+                    sqlite3_bind_int64(q, 1, d);
+                    sqlite3_bind_value(q, 2, o.k);
+                    sqlite3_bind_int64(q, 3, lo_);
+                    sqlite3_bind_int64(q, 4, hi_);
+                    collect(q);
+                }
+            }
+            for (Obj& o : objs) sqlite3_value_free(o.k);
+        } else {
+            std::string sql = "SELECT seq FROM r INDEXED BY r_k WHERE seq>?3 AND seq<=?4";
+            if (eq) sql += " AND k=?1";
+            else {
+                if (hasLo) sql += std::string(" AND k") + lo + "?1";
+                if (hasHi) sql += std::string(" AND k") + hi + "?2";
+                if (!hasLo) sql += " AND k IS NOT NULL";
+            }
+            sqlite3_stmt* q = c->sql(sql.c_str());
+            if (!q) status = P4_E_INTERNAL;
+            else if (eq) {
+                for (size_t i = 0; status == P4_OK && i < kp->vals.size(); i++) {
+                    bindCell(q, 1, kp->vals[i]);
+                    sqlite3_bind_int64(q, 3, lo_);
+                    sqlite3_bind_int64(q, 4, hi_);
+                    collect(q);
+                }
+            } else {
+                if (hasLo) bindCell(q, 1, kp->vals[0]);
+                if (hasHi) bindCell(q, 2, kp->vals[kp->op == P4_OP_BETWEEN ? 1 : 0]);
+                sqlite3_bind_int64(q, 3, lo_);
+                sqlite3_bind_int64(q, 4, hi_);
+                collect(q);
+            }
+        }
+        c->exec("COMMIT");
+        e_->rpool.release(c);
+        fr.f->users.fetch_sub(1);
+        if (status != P4_OK) return status;
+        if (giveUp) return P4_OK;  // too many objects x days: the window walk
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        total += out.size();
+        if (total > kMaxCand) return P4_OK;
+    }
+    cand_ = std::move(cand);
+    kDriven_ = true;
+    return P4_OK;
+}
+
+// A page of a file's candidates in the scan's order (W: all of them at once,
+// so a w group never spans pages).
+int32_t Scan::fetchCandidates(int fi, bool wOrder) {
+    FileCur& fc = cur_[size_t(fi)];
+    FRef& fr = files_[size_t(fi)];
+    const std::vector<int64_t>& all = cand_[size_t(fi)];
+    if (fc.done) return P4_OK;
+    if (fr.f->retired || fc.candPos >= all.size()) {
+        fc.done = true;
+        return P4_OK;
+    }
+    const bool desc = !wOrder && (s_.order == P4_ORDER_SEQ_DESC || (s_.bound && s_.order != P4_ORDER_SEQ_ASC));
+    const size_t page = wOrder ? all.size() : 256;
+    std::vector<int64_t> seqs;
+    for (size_t i = 0; i < page && fc.candPos < all.size(); i++, fc.candPos++)
+        seqs.push_back(desc ? all[all.size() - 1 - fc.candPos] : all[fc.candPos]);
+    if (fc.candPos >= all.size()) fc.done = true;
+    std::vector<int64_t> asc = seqs;
+    std::sort(asc.begin(), asc.end());
+    int rc = 0;
+    fr.f->users.fetch_add(1);
+    Conn* c = e_->rpool.acquire(fr.path, OpenKind::Reader, &rc, nullptr);
+    if (!c) {
+        fr.f->users.fetch_sub(1);
+        return statusOfSqlite(rc);
+    }
+    c->exec("BEGIN");
+    std::deque<Row> rows;
+    int32_t status = loadRows(c, fi, asc, &rows);
+    if (status == P4_OK) status = loadTags(c, fi, rows);
+    c->exec("COMMIT");
+    e_->rpool.release(c);
+    fr.f->users.fetch_sub(1);
+    if (status != P4_OK) return status;
+    if (wOrder) {
+        const bool wAsc = s_.wAsc;
+        std::vector<Row> v(std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
+        std::stable_sort(v.begin(), v.end(), [&](const Row& a, const Row& b) {
+            if (a.w != b.w) return wAsc ? a.w < b.w : a.w > b.w;
+            return a.seq < b.seq;
+        });
+        for (auto& rw : v)
+            if (rw.w >= s_.wLo && rw.w <= s_.wHi) fc.rows.push_back(std::move(rw));
+    } else {
+        if (desc) std::reverse(rows.begin(), rows.end());
+        for (auto& rw : rows) fc.rows.push_back(std::move(rw));
+    }
     return P4_OK;
 }
 
@@ -708,6 +913,7 @@ int32_t Scan::loadTags(Conn* c, int fi, std::deque<Row>& rows) {
 
 // One page of a file in seq order (one read transaction).
 int32_t Scan::fetchSeq(int fi) {
+    if (kDriven_) return fetchCandidates(fi, false);
     FileCur& fc = cur_[size_t(fi)];
     FRef& fr = files_[size_t(fi)];
     if (fc.done) return P4_OK;
@@ -848,6 +1054,7 @@ int32_t Scan::nextSeq(Row** out) {
 
 // One page of a file in w order (descending, or ascending for EPOCH windows).
 int32_t Scan::fetchW(int fi) {
+    if (kDriven_) return fetchCandidates(fi, true);
     FileCur& fc = cur_[size_t(fi)];
     FRef& fr = files_[size_t(fi)];
     if (fc.done) return P4_OK;
