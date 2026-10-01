@@ -262,36 +262,9 @@ int relBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
 }
 
 // ---- cursors ----------------------------------------------------------------
-// One source's cursor.
-struct Sub {
-    P4Cursor* c = nullptr;
-    P4Row row{};
-    bool has = false;
-    bool done = false;
-    std::string source;
-};
-
 struct RelCursor : sqlite3_vtab_cursor {
     RelVtab* vt = nullptr;
-    // The specs' storage: deques keep every element in place while the
-    // specs point into them, for the cursors' lifetime.
-    std::deque<P4Value> vals;
-    std::vector<P4Pred> preds;
-    std::deque<std::string> strs;
-    std::vector<P4ScanSpec> specs;   // one per sub
-    std::vector<Sub> subs;
-    bool merge = false;              // merge by seq (ordered plans), else one after another
-    bool desc = false;
-    size_t at = 0;                   // concatenation: the current sub; merge: the sub holding the row
-    bool eof = true;
-    std::string sourceText;          // "<TYPE>@<source>" of the current row
-    ~RelCursor() { closeAll(); }
-    void closeAll() {
-        EngineCall ec;
-        for (Sub& s : subs)
-            if (s.c) p4_cursor_close(s.c);
-        subs.clear();
-    }
+    RelScan scan;
 };
 
 Stmt* stmtOf(RelVtab* vt) { return vt->ls->cur; }
@@ -301,70 +274,6 @@ int fail(RelCursor* c, int32_t status, const std::string& what) {
     sqlite3_free(c->vt->zErrMsg);
     c->vt->zErrMsg = sqlite3_mprintf("%s", what.c_str());
     return SQLITE_ERROR;
-}
-
-// Advances one sub to its next row. 0 or a negative status.
-int32_t step(Sub& s) {
-    s.has = false;
-    if (s.done) return 0;
-    int32_t rc;
-    {
-        EngineCall ec;
-        rc = p4_cursor_next(s.c, &s.row);
-        if (rc == 0) {
-            p4_cursor_close(s.c);
-            s.c = nullptr;
-            s.done = true;
-        }
-    }
-    if (rc < 0) return rc;
-    s.has = rc > 0;
-    return 0;
-}
-
-int32_t open(RelCursor* c, size_t i) {
-    Sub& s = c->subs[i];
-    int32_t rc;
-    {
-        EngineCall ec;
-        rc = p4_cursor_open(c->vt->ls->lane, &c->specs[i], &s.c);
-    }
-    if (rc < 0) {
-        s.c = nullptr;
-        s.done = true;
-        return rc;
-    }
-    return step(s);
-}
-
-void setSource(RelCursor* c, const Sub& s) { c->sourceText = c->vt->t->name + "@" + s.source; }
-
-// Positions on the next output row (after `at` was consumed).
-int32_t settle(RelCursor* c) {
-    if (c->merge) {
-        size_t best = SIZE_MAX;
-        for (size_t i = 0; i < c->subs.size(); i++) {
-            const Sub& s = c->subs[i];
-            if (!s.has) continue;
-            if (best == SIZE_MAX) {
-                best = i;
-                continue;
-            }
-            const int64_t a = s.row.seq, b = c->subs[best].row.seq;
-            if (c->desc ? a > b : a < b) best = i;   // ties: source order
-        }
-        c->eof = best == SIZE_MAX;
-        c->at = best;
-    } else {
-        while (c->at < c->subs.size() && !c->subs[c->at].has) {
-            if (++c->at >= c->subs.size()) break;
-            const int32_t rc = open(c, c->at);
-            if (rc < 0) return rc;
-        }
-        c->eof = c->at >= c->subs.size();
-    }
-    if (!c->eof) setSource(c, c->subs[c->at]);
-    return 0;
 }
 
 // ---- xFilter ------------------------------------------------------------------
@@ -431,28 +340,14 @@ bool spaceAt(const unsigned char* s, int n) {
 int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc, sqlite3_value** argv) {
     RelCursor* c = static_cast<RelCursor*>(cur);
     RelVtab* vt = c->vt;
-    const TypeEntry* t = vt->t;
-    c->closeAll();
-    c->vals.clear();
-    c->preds.clear();
-    c->strs.clear();
-    c->specs.clear();
-    c->eof = true;
-    c->at = 0;
-    c->merge = (idxNum & kPlanOrdered) != 0;
-    c->desc = (idxNum & kPlanDesc) != 0;
-    const bool hydrate = (idxNum & kPlanHydrate) != 0;
+    c->scan.close();
+    ScanArgs args;
+    args.merge = (idxNum & kPlanOrdered) != 0;
+    args.desc = (idxNum & kPlanDesc) != 0;
+    args.hydrate = (idxNum & kPlanHydrate) != 0;
 
     // Constraints.
     Bounds seq;
-    std::string sourceEq;
-    bool hasSourceEq = false;
-    struct PredIn {
-        uint8_t field, op;
-        P4Value v;
-        std::string text;
-    };
-    std::vector<PredIn> pin;
     int64_t col0Lo = INT64_MIN, col0Hi = INT64_MAX, col0Eq = 0;
     bool col0HasEq = false;
     const size_t plen = idxStr ? std::strlen(idxStr) : 0;
@@ -471,11 +366,11 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
             case 'E':
             case 'T':
                 if (intBound(v, op, &iv, &seq.empty)) {
-                    PredIn p;
+                    ScanPred p;
                     p.field = target == 'E' ? P4_F_EPOCH : P4_F_TS;
                     p.op = predOp(op);
-                    p.v = P4Value{1, iv, 0, nullptr, 0};
-                    pin.push_back(p);
+                    p.i = iv;
+                    args.preds.push_back(p);
                 }
                 break;
             case 'A':   // COL0 is `u64pos`: zero and negatives are absent there
@@ -494,116 +389,70 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
                     const unsigned char* s = sqlite3_value_text(v);
                     const int n = sqlite3_value_bytes(v);
                     if (n > 0 && !spaceAt(s, n)) {
-                        PredIn p;
+                        ScanPred p;
                         p.field = P4_F_COL1;
                         p.op = P4_OP_EQ;
+                        p.isText = true;
                         p.text.assign(reinterpret_cast<const char*>(s), size_t(n));
-                        p.v = P4Value{3, 0, 0, nullptr, 0};
-                        pin.push_back(p);
+                        args.preds.push_back(p);
                     }
                 }
                 break;
             case 'R':
                 if (sqlite3_value_type(v) == SQLITE_TEXT) {
                     const std::string s(reinterpret_cast<const char*>(sqlite3_value_text(v)), size_t(sqlite3_value_bytes(v)));
-                    if (hasSourceEq && s != sourceEq) seq.empty = true;
-                    hasSourceEq = true;
-                    sourceEq = s;
+                    if (args.hasSourceEq && s != args.sourceEq) seq.empty = true;
+                    args.hasSourceEq = true;
+                    args.sourceEq = s;
                 }
                 break;
         }
     }
+    auto col0 = [&](uint8_t op, int64_t v) {
+        ScanPred p;
+        p.field = P4_F_COL0;
+        p.op = op;
+        p.i = v;
+        args.preds.push_back(p);
+    };
     if (col0HasEq) {
-        if (col0Eq >= 1) pin.push_back({P4_F_COL0, P4_OP_EQ, P4Value{1, col0Eq, 0, nullptr, 0}, std::string()});
+        if (col0Eq >= 1) col0(P4_OP_EQ, col0Eq);
     } else if (col0Lo >= 1) {
-        pin.push_back({P4_F_COL0, P4_OP_GE, P4Value{1, col0Lo, 0, nullptr, 0}, std::string()});
-        if (col0Hi != INT64_MAX) pin.push_back({P4_F_COL0, P4_OP_LE, P4Value{1, col0Hi, 0, nullptr, 0}, std::string()});
+        col0(P4_OP_GE, col0Lo);
+        if (col0Hi != INT64_MAX) col0(P4_OP_LE, col0Hi);
     }
     if (seq.after < 0) seq.after = 0;
     if (seq.through < 1 || seq.after >= seq.through) seq.empty = true;
     if (seq.empty) return SQLITE_OK;
 
-    // Sources: one cursor each.
-    std::vector<std::string> srcs;
-    int32_t rc = sourcesOf(vt->ls, t->name, &srcs);
-    if (rc < 0) return fail(c, rc, "sources unavailable");
-    const std::string prefix = t->name + "@";
-    std::vector<std::string> want;   // the sources this scan returns
-    if (vt->kind == kRelAlias) {
-        if (std::binary_search(srcs.begin(), srcs.end(), vt->source)) want.push_back(vt->source);
-    } else {
-        want = srcs;
-    }
-    if (hasSourceEq) {
-        if (sourceEq.compare(0, prefix.size(), prefix) != 0) return SQLITE_OK;
-        const std::string s = sourceEq.substr(prefix.size());
-        want.erase(std::remove_if(want.begin(), want.end(), [&](const std::string& x) { return x != s; }), want.end());
-    }
-    if (want.empty()) return SQLITE_OK;
-
-    // Spec storage: predicates point into vals, text into strs.
-    for (PredIn& p : pin) {
-        P4Value v = p.v;
-        if (p.v.type == 3) {
-            c->strs.push_back(p.text);
-            v.s = reinterpret_cast<const uint8_t*>(c->strs.back().data());
-            v.n = uint32_t(c->strs.back().size());
-        }
-        c->vals.push_back(v);
-        c->preds.push_back(P4Pred{p.field, p.op, 1, &c->vals.back()});
-    }
-    P4ScanSpec base;
-    std::memset(&base, 0, sizeof(base));
-    base.type = t->name.c_str();
-    base.seqAfter = seq.after;
-    base.seqThrough = seq.through == INT64_MAX ? 0 : seq.through;
-    base.preds = c->preds.empty() ? nullptr : c->preds.data();
-    base.nPreds = uint32_t(c->preds.size());
-    base.order = c->desc ? P4_ORDER_SEQ_DESC : P4_ORDER_SEQ_ASC;
-    base.hydrate = hydrate ? 1 : 0;
-    base.bound = t->bound;
-    for (const std::string& src : want) {
-        c->strs.push_back(src);
-        P4ScanSpec sp = base;
-        sp.lane.source = c->strs.back().c_str();
-        c->specs.push_back(sp);
-        c->subs.emplace_back();
-        c->subs.back().source = src;
-    }
-    // Concatenation opens one cursor at a time; a merge needs every head.
-    if (c->merge) {
-        for (size_t i = 0; i < c->subs.size(); i++) {
-            rc = open(c, i);
-            if (rc < 0) return fail(c, rc, "reader cursor failed");
-        }
-    } else {
-        rc = open(c, 0);
-        if (rc < 0) return fail(c, rc, "reader cursor failed");
-    }
-    rc = settle(c);
+    args.seqAfter = seq.after;
+    args.seqThrough = seq.through == INT64_MAX ? 0 : seq.through;
+    RelSpec rel;
+    rel.kind = vt->kind;
+    rel.type = vt->t->name;
+    rel.source = vt->source;
+    const int32_t rc = c->scan.open(vt->ls, *vt->t, rel, args);
     if (rc < 0) return fail(c, rc, "reader cursor failed");
     return SQLITE_OK;
 }
 
 int relNext(sqlite3_vtab_cursor* cur) {
     RelCursor* c = static_cast<RelCursor*>(cur);
-    if (c->eof) return SQLITE_OK;
-    int32_t rc = step(c->subs[c->at]);
-    if (rc >= 0) rc = settle(c);
+    const int32_t rc = c->scan.next();
     if (rc < 0) return fail(c, rc, "reader cursor failed");
     return SQLITE_OK;
 }
 
-int relEof(sqlite3_vtab_cursor* cur) { return static_cast<RelCursor*>(cur)->eof ? 1 : 0; }
+int relEof(sqlite3_vtab_cursor* cur) { return static_cast<RelCursor*>(cur)->scan.eof() ? 1 : 0; }
 
 int relColumn(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int i) {
     RelCursor* c = static_cast<RelCursor*>(cur);
     RelVtab* vt = c->vt;
-    if (c->eof) {
+    if (c->scan.eof()) {
         sqlite3_result_null(ctx);
         return SQLITE_OK;
     }
-    const P4Row& r = c->subs[c->at].row;
+    const P4Row& r = c->scan.row();
     const uint8_t* p = nullptr;
     size_t n = 0;
     if (i < vt->ns || i == vt->meta(kData)) {
@@ -618,7 +467,11 @@ int relColumn(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int i) {
         return SQLITE_OK;
     }
     switch (i - vt->ns) {
-        case kSource: sqlite3_result_text(ctx, c->sourceText.data(), int(c->sourceText.size()), SQLITE_TRANSIENT); break;
+        case kSource: {
+            const std::string& st = c->scan.sourceText();
+            sqlite3_result_text(ctx, st.data(), int(st.size()), SQLITE_TRANSIENT);
+            break;
+        }
         case kRowid:
         case kSeq: sqlite3_result_int64(ctx, r.seq); break;
         case kOffset: sqlite3_result_int64(ctx, 0); break;
@@ -650,7 +503,7 @@ int relColumn(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int i) {
 
 int relRowid(sqlite3_vtab_cursor* cur, sqlite3_int64* out) {
     RelCursor* c = static_cast<RelCursor*>(cur);
-    *out = c->eof ? 0 : c->subs[c->at].row.seq;
+    *out = c->scan.eof() ? 0 : c->scan.row().seq;
     return SQLITE_OK;
 }
 
@@ -680,13 +533,151 @@ sqlite3_module gRelModule = {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// RelScan
+// ---------------------------------------------------------------------------
+void RelScan::close() {
+    EngineCall ec;
+    for (Sub& s : subs_)
+        if (s.c) p4_cursor_close(s.c);
+    subs_.clear();
+    specs_.clear();
+    preds_.clear();
+    vals_.clear();
+    strs_.clear();
+    at_ = 0;
+    eof_ = true;
+}
+
+int32_t RelScan::open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, const ScanArgs& a) {
+    close();
+    ls_ = ls;
+    merge_ = a.merge;
+    desc_ = a.desc;
+    std::vector<std::string> srcs;
+    int32_t rc = sourcesOf(ls, t.name, &srcs);
+    if (rc < 0) return rc;
+    const std::string prefix = t.name + "@";
+    std::vector<std::string> want;   // the sources this scan returns
+    if (rel.kind == kRelAlias) {
+        if (std::binary_search(srcs.begin(), srcs.end(), rel.source)) want.push_back(rel.source);
+    } else {
+        want = srcs;
+    }
+    if (a.hasSourceEq) {
+        if (a.sourceEq.compare(0, prefix.size(), prefix) != 0) return P4_OK;
+        const std::string s = a.sourceEq.substr(prefix.size());
+        want.erase(std::remove_if(want.begin(), want.end(), [&](const std::string& x) { return x != s; }), want.end());
+    }
+    if (want.empty()) return P4_OK;
+    for (const ScanPred& p : a.preds) {
+        P4Value v{p.isText ? uint8_t(3) : uint8_t(1), p.i, 0, nullptr, 0};
+        if (p.isText) {
+            strs_.push_back(p.text);
+            v.s = reinterpret_cast<const uint8_t*>(strs_.back().data());
+            v.n = uint32_t(strs_.back().size());
+        }
+        vals_.push_back(v);
+        preds_.push_back(P4Pred{p.field, p.op, 1, &vals_.back()});
+    }
+    P4ScanSpec base;
+    std::memset(&base, 0, sizeof(base));
+    base.type = t.name.c_str();
+    base.seqAfter = a.seqAfter;
+    base.seqThrough = a.seqThrough;
+    base.preds = preds_.empty() ? nullptr : preds_.data();
+    base.nPreds = uint32_t(preds_.size());
+    base.order = a.desc ? P4_ORDER_SEQ_DESC : P4_ORDER_SEQ_ASC;
+    base.hydrate = a.hydrate ? 1 : 0;
+    base.bound = t.bound;
+    for (const std::string& src : want) {
+        strs_.push_back(src);
+        P4ScanSpec sp = base;
+        sp.lane.source = strs_.back().c_str();
+        specs_.push_back(sp);
+        subs_.emplace_back();
+        subs_.back().sourceText = prefix + src;
+    }
+    // Concatenation opens one cursor at a time; a merge needs every head.
+    for (size_t i = 0; i < (merge_ ? subs_.size() : 1); i++) {
+        rc = openSub(i);
+        if (rc < 0) return rc;
+    }
+    return settle();
+}
+
+int32_t RelScan::next() {
+    if (eof_) return P4_OK;
+    const int32_t rc = step(subs_[at_]);
+    return rc < 0 ? rc : settle();
+}
+
+// Advances one sub to its next row. P4_OK or a status.
+int32_t RelScan::step(Sub& s) {
+    s.has = false;
+    if (s.done) return P4_OK;
+    int32_t rc;
+    {
+        EngineCall ec;
+        rc = p4_cursor_next(s.c, &s.row);
+        if (rc == 0) {
+            p4_cursor_close(s.c);
+            s.c = nullptr;
+            s.done = true;
+        }
+    }
+    if (rc < 0) return rc;
+    s.has = rc > 0;
+    return P4_OK;
+}
+
+int32_t RelScan::openSub(size_t i) {
+    Sub& s = subs_[i];
+    int32_t rc;
+    {
+        EngineCall ec;
+        rc = p4_cursor_open(ls_->lane, &specs_[i], &s.c);
+    }
+    if (rc < 0) {
+        s.c = nullptr;
+        s.done = true;
+        return rc;
+    }
+    return step(s);
+}
+
+// Positions on the next output row (after the current one was consumed).
+int32_t RelScan::settle() {
+    if (merge_) {
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < subs_.size(); i++) {
+            const Sub& s = subs_[i];
+            if (!s.has) continue;
+            if (best == SIZE_MAX) {
+                best = i;
+                continue;
+            }
+            const int64_t x = s.row.seq, y = subs_[best].row.seq;
+            if (desc_ ? x > y : x < y) best = i;   // ties: source order
+        }
+        eof_ = best == SIZE_MAX;
+        at_ = best;
+        return P4_OK;
+    }
+    while (at_ < subs_.size() && !subs_[at_].has) {
+        if (++at_ >= subs_.size()) break;
+        const int32_t rc = openSub(at_);
+        if (rc < 0) return rc;
+    }
+    eof_ = at_ >= subs_.size();
+    return P4_OK;
+}
+
 int registerModule(LaneState* ls) { return sqlite3_create_module_v2(ls->db, "flatsql_p4", &gRelModule, ls, nullptr); }
 
 bool isRelation(const LaneState* ls, const char* name) { return name && ls->relations.count(lower(name)) != 0; }
 
-int32_t ensureRelation(LaneState* ls, const std::string& name, std::string* err) {
-    const std::string key = lower(name);
-    if (ls->relations.count(key)) return 0;
+int32_t resolveRelation(LaneState* ls, const std::string& name, RelSpec* out, std::string* err) {
     const size_t at = name.find('@');
     const std::string typePart = at == std::string::npos ? name : name.substr(0, at);
     const TypeEntry* t = typeByName(ls, typePart);
@@ -713,6 +704,16 @@ int32_t ensureRelation(LaneState* ls, const std::string& name, std::string* err)
             }
         if (spec.kind != kRelAlias) return 0;   // format 1: no per-source table for a source it never saw
     }
+    *out = spec;
+    return 1;
+}
+
+int32_t ensureRelation(LaneState* ls, const std::string& name, std::string* err) {
+    const std::string key = lower(name);
+    if (ls->relations.count(key)) return 0;
+    RelSpec spec;
+    const int32_t found = resolveRelation(ls, name, &spec, err);
+    if (found <= 0) return found;
     ls->relations.emplace(key, spec);
     const std::string ddl = "CREATE VIRTUAL TABLE " + quoteIdent(name) + " USING flatsql_p4";
     char* msg = nullptr;

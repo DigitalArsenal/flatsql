@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <string>
 #include <vector>
@@ -87,8 +88,12 @@ void arenaUnregister(LaneArena* a);
 // connections are shared by every lane and never live in a lane's arena.
 class EngineCall {
 public:
-    EngineCall() : saved_(arenaBound()) { arenaBind(nullptr); }
-    ~EngineCall() { arenaBind(saved_); }
+    EngineCall() : saved_(arenaBound()) {
+        if (saved_) arenaBind(nullptr);
+    }
+    ~EngineCall() {
+        if (saved_) arenaBind(saved_);
+    }
     EngineCall(const EngineCall&) = delete;
     EngineCall& operator=(const EngineCall&) = delete;
 
@@ -196,6 +201,69 @@ namespace p4sql {
 // ---------------------------------------------------------------------------
 // Relations (vtab.cpp)
 // ---------------------------------------------------------------------------
+// A reader predicate a scan carries (CONTRACT §3.5 tag 17 / P4Pred), one value.
+struct ScanPred {
+    uint8_t field = 0, op = 0;
+    bool isText = false;
+    int64_t i = 0;
+    std::string text;
+};
+
+// What a relation scan is asked for (the pushed-down constraints).
+struct ScanArgs {
+    int64_t seqAfter = 0, seqThrough = 0;   // exclusive / inclusive; 0 = none
+    std::vector<ScanPred> preds;
+    bool hasSourceEq = false;               // _source = sourceEq ("<TYPE>@<source>")
+    std::string sourceEq;
+    bool merge = false, desc = false;       // merge the sources by seq (descending), else one after another
+    bool hydrate = true;
+};
+
+// The rows of one relation: the type's A18 window (the reader applies the
+// bound first, C-17), a reader cursor per source with a live tag, the
+// sources one after another or merged by seq. The one implementation of the
+// relation semantics, for the virtual tables and the raw-stream fast path.
+class RelScan {
+public:
+    RelScan() = default;
+    ~RelScan() { close(); }
+    RelScan(const RelScan&) = delete;
+    RelScan& operator=(const RelScan&) = delete;
+    // Positions on the first row. P4_OK or a status.
+    int32_t open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, const ScanArgs& a);
+    int32_t next();   // P4_OK or a status
+    bool eof() const { return eof_; }
+    const P4Row& row() const { return subs_[at_].row; }
+    const std::string& sourceText() const { return subs_[at_].sourceText; }   // the row's _source
+    void close();
+
+private:
+    struct Sub {
+        P4Cursor* c = nullptr;
+        P4Row row{};
+        bool has = false;
+        bool done = false;
+        std::string sourceText;
+    };
+    int32_t openSub(size_t i);
+    int32_t step(Sub& s);
+    int32_t settle();
+    LaneState* ls_ = nullptr;
+    // The specs' storage: deques keep every element in place while the
+    // specs point into them, for the cursors' lifetime.
+    std::deque<P4Value> vals_;
+    std::vector<P4Pred> preds_;
+    std::deque<std::string> strs_;
+    std::vector<P4ScanSpec> specs_;   // one per sub
+    std::vector<Sub> subs_;
+    bool merge_ = false, desc_ = false;
+    size_t at_ = 0;                   // concatenation: the current sub; merge: the sub holding the row
+    bool eof_ = true;
+};
+
+// The relation `name` names (case-insensitive): 1 found, 0 not a relation,
+// < 0 status. Creates nothing.
+int32_t resolveRelation(LaneState* ls, const std::string& name, RelSpec* out, std::string* err);
 int registerModule(LaneState* ls);
 // Refreshes the registered types from the engine (p4_types).
 int32_t loadTypes(LaneState* ls, std::string* err);
