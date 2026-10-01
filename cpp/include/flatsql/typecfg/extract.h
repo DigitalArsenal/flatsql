@@ -9,6 +9,11 @@
 //           alt: str:<path>      parseEpochString (Go storage parity)
 //                f64floor:<path> floor(double seconds), 0 = absent
 //                i64s:<path> | i64ms:<path>
+//   bucket  <alt>|<alt>...     the time that picks a record's content month in
+//                              store format 4 (file and type-index bucket);
+//                              the epoch alternatives. Absent: the epoch
+//                              (C-1: IQC buckets by CAPTURE_START and exposes
+//                              no epoch)
 //   col <n> <alt>|<alt>...     COL(n) posting
 //           alt: u64pos:<path>  unsigned > 0 | str:<path> trimmed, non-empty
 //                enum:<path>    enum name, trimmed; "" and "UNKNOWN" absent
@@ -71,6 +76,8 @@ struct Extracted {
     bool hasEpoch = false;
     int64_t epochMs = 0;     // payload epoch (ms)
     int64_t epochSec = 0;    // Go epoch_unix parity (floor seconds)
+    bool hasBucket = false;  // the bucket time (floor seconds): bucket rule, else the epoch
+    int64_t bucketSec = 0;
     ColValue cols[kMaxCols];
     const uint8_t* identity = nullptr;  // supersede identity ("" = none)
     size_t identityLen = 0;
@@ -112,6 +119,8 @@ public:
     uint64_t ringCap() const { return ringCap_; }
     uint32_t flags() const { return flags_; }
     bool hasSupersede() const { return !supersede_.empty(); }
+    bool hasEpochRule() const { return !epoch_.empty(); }
+    bool hasBucketTime() const { return !epoch_.empty() || !bucket_.empty(); }
     bool verifies() const { return (flags_ & kVerifyBfbs) && schema_ != nullptr; }
     uint32_t nCols() const { return nCols_; }
     // Readers (T2): the binary schema, for column projection.
@@ -160,6 +169,7 @@ private:
     bool readF64(const uint8_t* root, const Path& p, double* v) const;
     bool readEnumName(const uint8_t* root, const Path& p, const uint8_t** s, size_t* n,
                       uint8_t* scratch, size_t scratchLen) const;
+    bool evalTime(const uint8_t* root, const std::vector<Alt>& alts, int64_t* sec, int64_t* ms) const;
 
     std::string schemaName_;
     uint8_t fid_[4] = {0, 0, 0, 0};
@@ -171,6 +181,7 @@ private:
     uint64_t fp_ = 0;
     const reflection::Schema* schema_ = nullptr;
     std::vector<Alt> epoch_;
+    std::vector<Alt> bucket_;
     std::vector<Alt> cols_[kMaxCols];
     uint32_t nCols_ = 0;
     int epochDayCol_ = -1;
