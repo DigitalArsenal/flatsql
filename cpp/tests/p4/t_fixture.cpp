@@ -790,3 +790,28 @@ P4_SLOW_TEST(g6_bench) {
     closeEngine(600000);
     if (!argInt("keep", 0)) removeTree(root.substr(0, root.size() - 6));
 }
+
+// Opens a store and verifies it (REBUILD 8: the type index against the
+// files, integrity_check on every file), printing each type's answer.
+//   flatsql_p4_test --test=store_check --store=<dir with fsql4> [--mode=0|1|2]
+P4_SLOW_TEST(store_check) {
+    const std::string store = argStr("store", "");
+    if (store.empty()) {
+        std::printf("  skipped: --store\n");
+        return;
+    }
+    EngineOpts o;
+    o.createMode = uint8_t(argInt("mode", 0));
+    const int32_t rc = openEngine(store + "/fsql4", o);
+    REQUIRE(rc == P4_OK, "open: " + std::to_string(rc));
+    TlvW rb;
+    rb.u32(63, 8);
+    Result v = call(P4_OPC_REBUILD, rb.b, CallOpts{0, 0, 0, 0, 0, 0, false, 3600000});
+    CHECK_EQ(v.status, P4_OK, v.err);
+    for (size_t i = 0; i < v.rows.size(); i++) {
+        std::printf("  %s: %lld entries, %lld mismatches\n", v.s(i, "type").c_str(), (long long)v.i(i, "entries"),
+                    (long long)v.i(i, "mismatches"));
+        CHECK_EQ(v.i(i, "mismatches"), int64_t(0), "verify " + v.s(i, "type"));
+    }
+    closeEngine(600000);
+}
