@@ -672,6 +672,57 @@ P4_SLOW_TEST(g3_bench) {
 //       object at 20 epochs: p50/p99 (gate: under format 2's p99).
 P4_SLOW_TEST(g6_bench) {
     const std::string mode = argStr("mode", "nearest");
+    if (mode == "iqc") {
+        // IQC (CAPTURE_START months, ingest identities) to --entries records in
+        // 4,096-record calls: the write cost per entry at the start and the end.
+        const std::string root = argStr("store", scratchDir("g6iqc")) + "/fsql4";
+        EngineOpts o;
+        o.writers = 4;
+        REQUIRE(openEngine(root, o) == P4_OK, "open");
+        REQUIRE(registerType(iqcType()) == P4_OK, "register");
+        const int64_t entries = argInt("entries", 2000000);
+        const int calls = int(entries / 4096);
+        std::vector<double> perEntryUs;
+        const uint64_t t0 = flatsql::ps::monoNs();
+        for (int c = 0; c < calls; c++) {
+            Batch b;
+            b.type = "IQC";
+            b.peer = "12D3KooWSigmf" + std::to_string(c % 4);
+            b.tags.push_back(Tag{"iqengine", "IQEngine", "", "b" + std::to_string(c / 16), "", "", ""});
+            b.at = 1790000000;
+            for (int i = 0; i < 4096; i++) {
+                In in;
+                const uint64_t n = uint64_t(c) * 4096 + uint64_t(i);
+                in.frame = iqcFrame("E" + std::to_string(n % 5000), isoTime(unixOf(2024, 1, 1) + int64_t(n) * 37), 16, n);
+                in.ts = 1790000000;
+                in.hasIdent = true;
+                std::memset(in.ident, 0, 32);
+                fp::st64(in.ident, n);
+                b.recs.push_back(std::move(in));
+            }
+            const uint64_t s = flatsql::ps::monoNs();
+            Result r = put(b);
+            perEntryUs.push_back(double(flatsql::ps::monoNs() - s) / 1e3 / 4096);
+            if (r.status != P4_OK) {
+                CHECK_EQ(r.status, P4_OK, r.err);
+                break;
+            }
+        }
+        const size_t k = std::max<size_t>(1, perEntryUs.size() / 10);
+        auto mean = [](std::vector<double>::const_iterator a, std::vector<double>::const_iterator b) {
+            double sum = 0;
+            size_t n = 0;
+            for (; a != b; ++a, ++n) sum += *a;
+            return n ? sum / double(n) : 0.0;
+        };
+        report("g6.iqc.entries", double(perEntryUs.size()) * 4096, "entries");
+        report("g6.iqc.rate", double(perEntryUs.size()) * 4096 / (double(flatsql::ps::monoNs() - t0) / 1e9), "rec/s");
+        report("g6.iqc.first_tenth_us", mean(perEntryUs.begin(), perEntryUs.begin() + long(k)), "us/entry");
+        report("g6.iqc.last_tenth_us", mean(perEntryUs.end() - long(k), perEntryUs.end()), "us/entry");
+        closeEngine(600000);
+        if (!argInt("keep", 0)) removeTree(root.substr(0, root.size() - 6));
+        return;
+    }
     if (mode != "nearest") return;
     const int producers = int(argInt("producers", 101)), months = int(argInt("months", 30)), per = int(argInt("per", 100));
     const int objects = int(argInt("objects", 1000));
