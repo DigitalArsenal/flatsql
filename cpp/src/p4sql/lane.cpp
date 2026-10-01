@@ -426,6 +426,109 @@ int32_t run(LaneState* ls, Stmt& st, sqlite3_stmt* s, Out& out, std::string* msg
     }
 }
 
+// ---- the A18 raw stream -------------------------------------------------------------
+// `SELECT _data FROM <relation>` in raw-stream mode (benchset R17, the A18
+// relations SDN streams to the network) is the relation's frames in scan
+// order: served from RelScan without the SQLite VM, whose per-row cost
+// (0.16-0.19 us per frame in wasm, measured) would otherwise exceed the
+// read itself on these shapes. The statement text must be exactly that
+// (any case and spacing, one optional ';'); anything else, and any name that
+// is not a relation, goes through SQLite.
+namespace dscan {
+
+void ws(const char*& p, const char* e) {
+    while (p < e && std::isspace(uint8_t(*p))) p++;
+}
+
+// A keyword (case-insensitive) followed by at least one space.
+bool keyword(const char*& p, const char* e, const char* k) {
+    const size_t n = std::strlen(k);
+    if (size_t(e - p) <= n) return false;
+    for (size_t i = 0; i < n; i++)
+        if (std::tolower(uint8_t(p[i])) != k[i]) return false;
+    if (!std::isspace(uint8_t(p[n]))) return false;
+    p += n;
+    ws(p, e);
+    return true;
+}
+
+// An identifier: "quoted" ("" escapes) or bare [A-Za-z_][A-Za-z0-9_]*.
+bool ident(const char*& p, const char* e, std::string* out) {
+    out->clear();
+    if (p < e && *p == '"') {
+        for (p++; p < e; p++) {
+            if (*p == '"') {
+                if (p + 1 < e && p[1] == '"') {
+                    out->push_back('"');
+                    p++;
+                    continue;
+                }
+                p++;
+                return !out->empty();
+            }
+            out->push_back(*p);
+        }
+        return false;
+    }
+    if (p >= e || !(std::isalpha(uint8_t(*p)) || *p == '_')) return false;
+    while (p < e && (std::isalnum(uint8_t(*p)) || *p == '_')) out->push_back(*p++);
+    return true;
+}
+
+// The relation named by `SELECT _data FROM <relation>`, or false.
+bool match(const char* sql, size_t n, std::string* relation) {
+    const char* p = sql;
+    const char* e = sql + n;
+    ws(p, e);
+    std::string col;
+    if (!keyword(p, e, "select") || !ident(p, e, &col) || lower(col) != "_data") return false;
+    ws(p, e);
+    if (!keyword(p, e, "from") || !ident(p, e, relation)) return false;
+    ws(p, e);
+    if (p < e && *p == ';') p++;
+    ws(p, e);
+    return p == e;
+}
+
+}  // namespace dscan
+
+// Serves the statement when it is the A18 raw stream: true and *status set,
+// or false (the SQL path runs it).
+bool dataStream(LaneState* ls, const P4SqlRequest* req, Out& out, int32_t* status, std::string* msg) {
+    if (!(req->flags & P4_SLOT_RAW) || req->paramsLen > 4 || !req->sql) return false;
+    std::vector<rb1::Cell> params;
+    if (!rb1::decodeParams(req->params, req->paramsLen, &params) || !params.empty()) return false;
+    std::string name;
+    if (!dscan::match(req->sql, req->sqlLen, &name)) return false;
+    RelSpec rel;
+    std::string err;
+    if (resolveRelation(ls, name, &rel, &err) != 1) return false;
+    const TypeEntry* t = typeByName(ls, rel.type);
+    if (!t) return false;
+    RelScan scan;
+    int32_t rc = scan.open(ls, *t, rel, ScanArgs());
+    std::vector<Cell> cells(1);
+    while (rc == P4_OK && !scan.eof()) {
+        const P4Row& r = scan.row();
+        const uint8_t* p = nullptr;
+        size_t n = 0;
+        payloadOf(t->fid, r.data, r.dataLen, &p, &n);
+        if (n == 0) {   // _data is NULL: not a BLOB cell, as on the SQL path
+            *msg = "not-a-record-stream: raw stream queries must return only BLOB cells";
+            rc = P4_E_SQL;
+            break;
+        }
+        cells[0].type = SQLITE_BLOB;
+        cells[0].p = p;
+        cells[0].n = n;
+        rc = out.row(cells, msg);
+        if (rc == P4_OK) rc = scan.next();
+    }
+    if (rc < 0 && msg->empty()) *msg = rc == P4_E_CANCELLED ? "cancelled" : "reader cursor failed";
+    *status = rc;
+    return true;
+}
+
 // The hook's status, its text in the slot's err when it failed (C-19).
 int32_t reply(LaneState* ls, int32_t status, const std::string& msg) {
     if (status < 0 && !msg.empty()) {
@@ -521,6 +624,10 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
     Out out(ls, (req->flags & P4_SLOT_RAW) != 0, req->maxResultRows, req->maxResultBytes);
     std::string msg;
     int32_t status = P4_OK;
+    if (dataStream(ls, req, out, &status, &msg)) {
+        const int32_t emitted = out.finish(status, &msg);
+        return reply(ls, status != P4_OK ? status : emitted, msg);
+    }
     {
         SandboxScope scope(ls, &st);
         ls->cur = &st;

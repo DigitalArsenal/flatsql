@@ -11,6 +11,7 @@
 #ifndef P4SQL_NO_ORACLE
 #include "format1_oracle.h"
 #endif
+#include "../../src/p4sql/internal.h"
 #include "p4sql_test.h"
 
 using namespace p4sqlt;
@@ -414,6 +415,81 @@ P4SQL_TEST(pushdown_col0_col1) {
     const Result r = h.sql("SELECT _data FROM OMM WHERE NORAD_CAT_ID = 25010");
     CHECK_EQ(r.rows.size(), size_t(3));
     CHECK(r.rowsExamined == 60);   // the fake filters by examining; the engine seeks (r_dk)
+}
+
+
+// The A18 raw stream (`SELECT _data FROM <relation>`, raw mode) is served
+// without SQLite; its bytes, caps, errors and cancel equal the SQL path's
+// (`WHERE 1` sends the same statement through SQLite).
+P4SQL_TEST(raw_data_stream_fast_path_equals_sql) {
+    Harness h;
+    p4fake::Type& ct = h.addType("CAT", "$CAT", bfbsOf("CAT"), 10);
+    ct.rules = kCatRules;
+    for (int64_t s = 1; s <= 15; s++) h.put("CAT", cat(s, uint32_t(40000 + s), {"celestrak-satcat-csv"}));
+    for (int64_t s = 16; s <= 30; s++)
+        h.put("CAT", cat(s, uint32_t(40000 + s), s % 4 == 0 ? std::vector<std::string>{"celestrak-satcat", "celestrak-satcat-csv"}
+                                                              : std::vector<std::string>{"celestrak-satcat"}));
+    h.addType("OMM", "$OMM", bfbsOf("OMM"), 400000);
+    for (int64_t s = 1; s <= 40; s++) h.put("OMM", omm(s, uint32_t(25000 + s), 1789000000 + s, {"celestrak-gp"}));
+    auto* ls = static_cast<flatsql::p4sql::LaneState*>(h.lane.sqlState);
+    const uint32_t sb = P4_SLOT_RAW | P4_SLOT_SANDBOX;
+    struct Case {
+        const char* fast;
+        const char* sql;
+        const char* relation;   // lower case
+    };
+    const Case cases[] = {
+        {"SELECT _data FROM \"CAT@celestrak-satcat\"", "SELECT _data FROM \"CAT@celestrak-satcat\" WHERE 1", "cat@celestrak-satcat"},
+        {"SELECT _data FROM \"CAT@celestrak-satcat-csv\"", "SELECT _data FROM \"CAT@celestrak-satcat-csv\" WHERE 1",
+         "cat@celestrak-satcat-csv"},
+        {"SELECT _data FROM CAT", "SELECT _data FROM CAT WHERE 1", "cat"},
+        {"  select _DATA\n from \"omm@CELESTRAK-GP\" ; ", "SELECT _data FROM \"OMM@celestrak-gp\" WHERE 1", "omm@celestrak-gp"},
+        {"SELECT \"_data\" FROM omm;", "SELECT _data FROM OMM WHERE 1", "omm"},
+    };
+    for (const Case& c : cases) {
+        const Result fast = h.sql(c.fast, {}, sb);
+        CHECK_EQ(fast.status, 0);
+        if (ls->relations.count(c.relation)) failAt(__FILE__, __LINE__, std::string(c.fast) + ": went through SQLite");
+        const Result slow = h.sql(c.sql, {}, sb);
+        CHECK_EQ(slow.status, 0);
+        CHECK(ls->relations.count(c.relation) == 1);
+        if (fast.raw != slow.raw) failAt(__FILE__, __LINE__, std::string(c.fast) + ": bytes differ from the SQL path");
+    }
+    // Other shapes and other modes go through SQLite.
+    Result r = h.sql("SELECT _data FROM \"CAT@celestrak-satcat\" LIMIT 3", {}, sb);
+    std::vector<std::string> frames;
+    CHECK(rb1::rawSplit(r.raw.data(), r.raw.size(), &frames) && frames.size() == 3);
+    r = h.sql("SELECT _data FROM CAT", {}, P4_SLOT_SANDBOX);
+    CHECK(r.ended && r.rows.size() == 12);   // RB1, not raw
+    r = h.sql("SELECT _data FROM \"CAT@nope\"", {}, sb);   // not a relation: SQLite says so
+    CHECK_EQ(r.status, P4_E_SQL);
+    CHECK(r.error.find("no such table") != std::string::npos);
+    // Caps and cancel, as on the SQL path.
+    Caps caps;
+    caps.maxResultRows = 3;
+    r = h.sql("SELECT _data FROM OMM", {}, sb, caps);
+    CHECK_EQ(r.status, P4_E_BUDGET);
+    CHECK(r.error.find("row-cap") == 0);
+    frames.clear();   // rawSplit appends
+    CHECK(rb1::rawSplit(r.raw.data(), r.raw.size(), &frames) && frames.size() == 3);
+    Caps bytes;
+    bytes.maxResultBytes = 500;
+    r = h.sql("SELECT _data FROM OMM", {}, sb, bytes);
+    CHECK_EQ(r.status, P4_E_BUDGET);
+    CHECK(r.raw.size() <= 500);
+    Caps cancel;
+    cancel.cancelAfterRows = 5;
+    r = h.sql("SELECT _data FROM OMM", {}, sb, cancel);
+    CHECK_EQ(r.status, P4_E_CANCELLED);
+    // A record with no bytes: _data is NULL, not a record stream (both paths).
+    p4fake::Rec empty = omm(41, 25041, 1789000041, {"celestrak-gp"});
+    empty.data.clear();
+    h.put("OMM", empty);
+    r = h.sql("SELECT _data FROM OMM", {}, sb);
+    CHECK_EQ(r.status, P4_E_SQL);
+    CHECK(r.error.find("not-a-record-stream") == 0);
+    r = h.sql("SELECT _data FROM OMM WHERE 1", {}, sb);
+    CHECK_EQ(r.status, P4_E_SQL);
 }
 
 #endif  // FLATSQL_P4SQL_FAKE
