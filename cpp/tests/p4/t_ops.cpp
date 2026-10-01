@@ -64,9 +64,10 @@ int64_t walBytes(const std::string& dir) {
 
 }  // namespace
 
-// C-1: IQC's bucket time is CAPTURE_START; it exposes no epoch. C-5: a type
-// with data keeps its time rules. The ingest identity dedupes (IDENT_DUP).
-P4_TEST(t_typecfg_bucket_and_identity) {
+// IQC exposes no epoch (format 1's rule) and its partition is one file. C-5:
+// a type with data keeps its epoch rule. The ingest identity dedupes
+// (IDENT_DUP).
+P4_TEST(t_typecfg_identity) {
     const std::string root = scratchDir("typecfg") + "/fsql4";
     REQUIRE(openEngine(root) == P4_OK, "open");
     REQUIRE(registerType(iqcType()) == P4_OK, "register IQC");
@@ -88,11 +89,10 @@ P4_TEST(t_typecfg_bucket_and_identity) {
     b.recs = {a, c};
     Result r = put(b);
     REQUIRE(r.status == P4_OK && r.rows.size() == 2, r.err);
-    CHECK(fp::ioExists(root + "/P/IQC/1/202601.0.db"), "January file (CAPTURE_START)");
-    CHECK(fp::ioExists(root + "/P/IQC/1/202603.0.db"), "March file");
+    CHECK(fp::ioExists(root + "/P/IQC/1.db"), "the partition's one file");
     Result g = get("IQC", {cidVec(a.frame), cidVec(c.frame)});
     REQUIRE(g.rows.size() == 2, "both");
-    CHECK(g.null(0, "epoch") && g.null(1, "epoch"), "no exposed epoch (C-1)");
+    CHECK(g.null(0, "epoch") && g.null(1, "epoch"), "no exposed epoch");
     // The same identity again (different bytes: a re-fetch) is IDENT_DUP.
     Batch b2 = b;
     In a2;
@@ -106,13 +106,13 @@ P4_TEST(t_typecfg_bucket_and_identity) {
     CHECK_EQ(d.i(0, "action"), int64_t(P4_ACT_IDENT_DUP), "IDENT_DUP");
     CHECK_EQ(d.i(0, "seq"), r.i(0, "seq"), "the holder's seq");
     CHECK_EQ(get("IQC", {cidVec(a2.frame)}).rows.size(), size_t(0), "the repeat's bytes are not stored");
-    // C-5: identical re-registration is a no-op; a changed bucket rule is refused.
+    // C-5: identical re-registration is a no-op; a changed epoch rule is refused.
     CHECK_EQ(registerType(iqcType()), P4_OK, "identical");
     TestType changed = iqcType();
-    changed.rules = "bucket str:RETRIEVED_AT\n";
-    CHECK_EQ(registerType(changed), P4_E_FORMAT, "bucket rule change refused");
+    changed.rules = "epoch str:RETRIEVED_AT\n";
+    CHECK_EQ(registerType(changed), P4_E_FORMAT, "epoch rule change refused");
     TestType widened = iqcType();
-    widened.rules = "bucket str:CAPTURE_START\ncol 1 str:ENTITY_ID\n";
+    widened.rules = "col 1 str:ENTITY_ID\n";
     CHECK_EQ(registerType(widened), P4_OK, "other rules may change");
     closeEngine();
     // Specs are persisted (C-5): a reopen serves before re-registration.
@@ -121,7 +121,8 @@ P4_TEST(t_typecfg_bucket_and_identity) {
     closeEngine();
 }
 
-// §3.8.7: batch supersede; a lane row goes at 0; a file is unlinked at 0 rows.
+// §3.8.7: batch supersede; a lane row goes at 0; an emptied partition keeps
+// its one file (C-32).
 // §3.7: CAT supersede-on-ingest by (source, object identity).
 P4_TEST(t_supersede) {
     const std::string root = scratchDir("supersede") + "/fsql4";
@@ -155,16 +156,15 @@ P4_TEST(t_supersede) {
         CHECK(lanes.s(0, "batch") == "b2", "b2");
         CHECK_EQ(lanes.i(0, "records"), int64_t(100), "b2's records");
     }
-    // Everything superseded: the file goes.
+    // Everything superseded: the file stays, empty.
     TlvW sz;
     sz.text(1, "PNM").text(11, "prov").text(12, "src").text(60, "none").u8(61, 1);
     Result all = call(P4_OPC_SUPERSEDE, sz.b);
-    CHECK_EQ(all.i(0, "files_deleted"), int64_t(1), "the emptied file is deleted");
-    for (int i = 0; i < 200 && fp::ioExists(root + "/P/PNM/1/0.0.db"); i++) flatsql::ps::sleepNs(10000000);
-    CHECK(!fp::ioExists(root + "/P/PNM/1/0.0.db"), "unlinked");
+    CHECK_EQ(all.i(0, "files_deleted"), int64_t(0), "a partition keeps its file");
     CHECK_EQ(headN("PNM"), int64_t(0), "empty");
     REQUIRE(put(batchOf(t, "peerA", b1, 500, 3)).status == P4_OK, "a later write");
-    CHECK(fp::ioExists(root + "/P/PNM/1/0.1.db"), "a new generation");
+    CHECK(fp::ioExists(root + "/P/PNM/1.db"), "the same file");
+    CHECK_EQ(headN("PNM"), int64_t(3), "the later records");
     // CAT supersede on ingest.
     REQUIRE(registerType(catType()) == P4_OK, "register CAT");
     auto cats = [&](const std::string& source, const std::string& batch, const std::string& name) {
@@ -193,44 +193,47 @@ P4_TEST(t_supersede) {
     closeEngine();
 }
 
-// §3.8.11 quota by content month (D1): the oldest month goes first, whole files.
+// §3.8.11 (v11): quota deletes the oldest records by arrival, across the
+// type's partitions; the counts and the index follow.
 P4_TEST(t_quota) {
     const std::string root = scratchDir("quota") + "/fsql4";
     REQUIRE(openEngine(root) == P4_OK, "open");
     REQUIRE(registerType(ommType()) == P4_OK, "register");
-    const char* months[3] = {"2025-01-15T00:00:00", "2025-02-15T00:00:00", "2025-03-15T00:00:00"};
     for (int m = 0; m < 3; m++) {
         Batch b;
         b.type = "OMM";
-        b.peer = "12D3KooWQ";
+        b.peer = m == 1 ? "12D3KooWQ2" : "12D3KooWQ1";  // two partitions
         b.tags.push_back(Tag{"p", "s", "", "b", "", "", ""});
-        for (int i = 0; i < 200; i++) {
+        for (int i = 0; i < 2000; i++) {
             In in;
-            in.frame = ommFrame(uint32_t(m * 1000 + i + 1), "X", months[m], 15, 300);
-            in.ts = 1790000000;
+            in.frame = ommFrame(uint32_t(m * 10000 + i + 1), "X", "2025-01-15T00:00:00", 15, 300);
+            in.ts = 1790000000 + m;
             b.recs.push_back(std::move(in));
         }
-        REQUIRE(put(b).status == P4_OK, "month");
+        REQUIRE(put(b).status == P4_OK, "batch");
     }
-    CHECK_EQ(headN("OMM"), int64_t(600), "600");
+    CHECK_EQ(headN("OMM"), int64_t(6000), "6,000");
     TlvW s4;
     s4.u8(45, 4);
     Result disk = call(P4_OPC_SUMMARY, s4.b);
     REQUIRE(disk.rows.size() == 1, disk.err);
-    const int64_t total = disk.i(0, "db_bytes") + disk.i(0, "wal_bytes") + disk.i(0, "index_bytes");
-    // Drop just enough: one month (the oldest) must go.
+    const int64_t used = disk.i(0, "db_bytes") - disk.i(0, "free_bytes") + disk.i(0, "wal_bytes") + disk.i(0, "index_bytes") +
+                         disk.i(0, "journal_bytes");
+    // A quota about half of what the store uses: the oldest arrivals go first.
     TlvW q;
-    q.u64(62, uint64_t(total - 1));
+    q.u64(62, uint64_t(used / 2));
     Result qg = call(P4_OPC_QUOTA_GC, q.b);
     REQUIRE(qg.status == P4_OK && qg.rows.size() == 1, qg.err);
-    CHECK(qg.i(0, "files_dropped") >= 1, "a file dropped");
-    CHECK_EQ(qg.i(0, "records_dropped") % 200, int64_t(0), "whole months");
-    CHECK(get("OMM", {cidVec(ommFrame(1, "X", months[0], 15, 300))}).rows.empty(), "January is gone");
-    CHECK_EQ(get("OMM", {cidVec(ommFrame(2001, "X", months[2], 15, 300))}).rows.size(), size_t(1), "March stays");
-    CHECK_EQ(headN("OMM"), 600 - qg.i(0, "records_dropped"), "counts follow");
+    const int64_t dropped = qg.i(0, "records_dropped");
+    CHECK(dropped > 0, "records dropped");
+    CHECK_EQ(qg.i(0, "files_dropped"), int64_t(0), "partitions keep their files");
+    CHECK(get("OMM", {cidVec(ommFrame(1, "X", "2025-01-15T00:00:00", 15, 300))}).rows.empty(), "the first arrival is gone");
+    CHECK_EQ(get("OMM", {cidVec(ommFrame(22000, "X", "2025-01-15T00:00:00", 15, 300))}).rows.size(), size_t(1),
+             "the last arrival stays");
+    CHECK_EQ(headN("OMM"), 6000 - dropped, "counts follow");
     closeEngine();
     REQUIRE(openEngine(root) == P4_OK, "reopen");
-    CHECK_EQ(headN("OMM"), 600 - qg.i(0, "records_dropped"), "after reopen");
+    CHECK_EQ(headN("OMM"), 6000 - dropped, "after reopen");
     TlvW rb;
     rb.u32(63, 8);
     Result v = call(P4_OPC_REBUILD, rb.b);
@@ -302,7 +305,7 @@ P4_TEST(t_rebuild) {
     if (cl.rows.size() == 1) CHECK_EQ(cl.i(0, "reject"), int64_t(P4_REJ_SEQ), "a seq held by another CID");
     auto hasIndex = [&](const char* name) {
         sqlite3* db = nullptr;
-        sqlite3_open_v2((root + "/P/MIG/1/0.0.db").c_str(), &db, SQLITE_OPEN_READONLY, nullptr);
+        sqlite3_open_v2((root + "/P/MIG/1.db").c_str(), &db, SQLITE_OPEN_READONLY, nullptr);
         sqlite3_stmt* s;
         sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name=?1", -1, &s, nullptr);
         sqlite3_bind_text(s, 1, name, -1, SQLITE_STATIC);
@@ -315,7 +318,7 @@ P4_TEST(t_rebuild) {
     TlvW r1;
     r1.u32(63, 1).text(1, "MIG");
     CHECK_EQ(call(P4_OPC_REBUILD, r1.b).status, P4_OK, "REBUILD 1");
-    CHECK(hasIndex("r_w") && hasIndex("rl_sid"), "indexes built");
+    CHECK(hasIndex("r_w") && hasIndex("rl_sid") && hasIndex("r_c"), "indexes built");
     closeEngine();
 }
 

@@ -1,8 +1,9 @@
 // Store format 4: the maintenance thread (design §5.3, §7, §8). Never on a
 // caller's path: type-index flushes, PASSIVE/RESTART checkpoints, closing
-// evicted writer connections (a close may checkpoint), unlinking retired
-// files, QUOTA_GC and REBUILD, and the background FTS index.
+// evicted writer connections (a close may checkpoint), QUOTA_GC and REBUILD,
+// and the background FTS index.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
@@ -40,14 +41,6 @@ Conn* maintConn(MaintState& m, const std::string& path) {
     return c;
 }
 
-void maintDrop(MaintState& m, const std::string& path) {
-    auto it = m.conns.find(path);
-    if (it == m.conns.end()) return;
-    delete it->second;
-    m.conns.erase(it);
-    m.lru.remove(path);
-}
-
 void checkpoint(Engine* e, MaintState& m, const std::string& path) {
     Conn* c = maintConn(m, path);
     if (!c) return;
@@ -65,42 +58,6 @@ void checkpoint(Engine* e, MaintState& m, const std::string& path) {
         sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_RESTART, &log, &ck);
         e->bump(kStRestart);
     }
-}
-
-void unlinkFile(Engine* e, MaintState& m, File* f) {
-    // Wait for the writer to let go, then close its connection here.
-    for (int i = 0; i < 30000; i++) {
-        Conn* w = nullptr;
-        {
-            std::lock_guard<std::mutex> g(e->wconnMu);
-            if (f->wPins == 0) {
-                w = f->w;
-                f->w = nullptr;
-                if (f->inLru) {
-                    e->wlru.erase(f->lru);
-                    f->inLru = false;
-                    e->nWConn--;
-                }
-                delete w;
-                break;
-            }
-        }
-        ps::sleepNs(1000000);
-    }
-    maintDrop(m, f->path);
-    e->rpool.dropPath(f->path);
-    for (int i = 0; i < 30000 && f->users.load() > 0; i++) ps::sleepNs(1000000);
-    e->rpool.dropPath(f->path);
-    {
-        std::lock_guard<std::mutex> g(gWalMu);
-        gWalPages.erase(f->path);
-    }
-    // The main file last: a leftover -wal never meets a new file at the path
-    // (and paths are never reused anyway: generation suffixes).
-    ioUnlink(f->path + "-wal");
-    ioUnlink(f->path + "-journal");
-    ioUnlink(f->path);
-    e->bump(kStUnlinked);
 }
 
 }  // namespace
@@ -134,157 +91,203 @@ int walHook(void* arg, sqlite3* db, const char* zDb, int nPages) {
     return SQLITE_OK;
 }
 
-// ---- QUOTA_GC (mode 1: by content month, owner D1) -------------------------------------------------
+// ---- QUOTA_GC: the oldest records by arrival (C-32) ----------------------------------------------
 namespace {
-int64_t diskBytes(const std::string& path) {
-    int64_t n = 0;
-    for (const char* sfx : {"", "-wal", "-journal"}) {
-        const int64_t s = ioSize(path + sfx);
-        if (s > 0) n += s;
+int64_t sizeOf(const std::string& path) {
+    const int64_t n = ioSize(path);
+    return n > 0 ? n : 0;
+}
+
+std::vector<Type*> typesWithFiles(Engine* e) {
+    std::vector<Type*> types;
+    std::lock_guard<std::mutex> g(e->typesMu);
+    for (auto& t : e->types)
+        if (t->hasFiles.load(std::memory_order_acquire)) types.push_back(t.get());
+    return types;
+}
+
+std::vector<File*> createdFiles(Type* t) {
+    std::vector<File*> files;
+    std::lock_guard<std::mutex> g(t->mu);
+    for (auto& p : t->parts)
+        if (p->file->created) files.push_back(p->file.get());
+    return files;
+}
+
+// Bytes the store occupies. On disk: every file with its WAL and rollback
+// journal (an upper bound, no page counts). In use: each partition file's
+// pages less its free pages (SQLite reuses them; pages still in the WAL are
+// counted by page_count, so the WAL file itself is not added), plus the type
+// files and any rollback journal.
+int64_t storeBytes(Engine* e, bool inUse) {
+    int64_t total = 0;
+    for (Type* t : typesWithFiles(e)) {
+        for (File* f : createdFiles(t)) {
+            total += sizeOf(f->path + "-journal");
+            if (!inUse) {
+                total += sizeOf(f->path) + sizeOf(f->path + "-wal");
+                continue;
+            }
+            int rc = 0;
+            Conn* c = e->rpool.acquire(f->path, OpenKind::Reader, &rc, nullptr);
+            if (!c) {
+                total += sizeOf(f->path) + sizeOf(f->path + "-wal");
+                continue;
+            }
+            sqlite3_stmt* q = c->sql("SELECT ((SELECT page_count FROM pragma_page_count) - (SELECT freelist_count FROM"
+                                     " pragma_freelist_count)) * (SELECT page_size FROM pragma_page_size)");
+            if (q && sqlite3_step(q) == SQLITE_ROW) total += sqlite3_column_int64(q, 0);
+            if (q) sqlite3_reset(q);
+            e->rpool.release(c);
+        }
+        for (const std::string* p : {&t->pIdx, &t->pJnl, &t->pFts})
+            for (const char* sfx : {"", "-journal"}) total += sizeOf(*p + sfx);
+        if (!inUse)
+            for (const std::string* p : {&t->pIdx, &t->pJnl, &t->pFts}) total += sizeOf(*p + "-wal");
     }
-    return n;
+    return total;
+}
+
+// The oldest record of a type by arrival: its seq and ts (seq 0: none).
+int32_t oldestOf(Engine* e, Type* t, int64_t* seq, int64_t* ts) {
+    *seq = 0;
+    *ts = INT64_MAX;
+    for (File* f : createdFiles(t)) {
+        int rc = 0;
+        Conn* c = e->rpool.acquire(f->path, OpenKind::Reader, &rc, nullptr);
+        if (!c) return statusOfSqlite(rc);
+        sqlite3_stmt* q = c->sql("SELECT seq, ts FROM r ORDER BY seq LIMIT 1");
+        int r = q ? sqlite3_step(q) : SQLITE_ERROR;
+        if (r == SQLITE_ROW && (!*seq || sqlite3_column_int64(q, 1) < *ts)) {
+            *seq = sqlite3_column_int64(q, 0);
+            *ts = sqlite3_column_int64(q, 1);
+        }
+        if (q) sqlite3_reset(q);
+        e->rpool.release(c);
+        if (r != SQLITE_ROW && r != SQLITE_DONE) return statusOfSqlite(r);
+    }
+    return P4_OK;
+}
+
+// Deletes the type's `want` oldest records by arrival (copies included):
+// the cut is merged over its partitions' seq indexes, and each partition's
+// writer deletes its rows (per-partition writers).
+int32_t quotaPass(Engine* e, Type* t, size_t want, int64_t* records, int64_t* bytes) {
+    std::vector<std::pair<int64_t, uint32_t>> all;  // (seq, pid)
+    std::vector<Part*> parts;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        for (auto& p : t->parts)
+            if (p->file->created && p->file->n > 0) parts.push_back(p.get());
+    }
+    for (Part* p : parts) {
+        int rc = 0;
+        Conn* c = e->rpool.acquire(p->file->path, OpenKind::Reader, &rc, nullptr);
+        if (!c) return statusOfSqlite(rc);
+        sqlite3_stmt* q = c->sql("SELECT seq FROM r INDEXED BY r_s ORDER BY seq LIMIT ?1");
+        if (!q) q = c->sql("SELECT seq FROM r ORDER BY seq LIMIT ?1");
+        int r = SQLITE_ERROR;
+        if (q) {
+            sqlite3_bind_int64(q, 1, int64_t(want));
+            while ((r = sqlite3_step(q)) == SQLITE_ROW) all.push_back({sqlite3_column_int64(q, 0), p->pid});
+            sqlite3_reset(q);
+        }
+        e->rpool.release(c);
+        if (r != SQLITE_DONE) return statusOfSqlite(r);
+    }
+    std::sort(all.begin(), all.end());
+    // The want oldest distinct seqs, with every partition's copy of each.
+    std::map<uint32_t, std::vector<int64_t>> byPid;
+    size_t distinct = 0;
+    int64_t last = 0;
+    for (auto& x : all) {
+        if (x.first != last) {
+            if (distinct == want) break;
+            distinct++;
+            last = x.first;
+        }
+        byPid[x.second].push_back(x.first);
+    }
+    if (byPid.empty()) return P4_OK;
+    Shared* s = new (std::nothrow) Shared();
+    if (!s) return P4_E_NOMEM;
+    s->kind = Shared::kQuota;
+    s->type = t;
+    s->remaining.store(int(byPid.size()) + 1);
+    for (auto& kv : byPid) {
+        WriteTask* wt = new WriteTask();
+        wt->op = P4_OPC_QUOTA_GC;
+        wt->part = t->partById(kv.first);
+        wt->shared = s;
+        wt->dels = std::move(kv.second);
+        pushTask(e, wt->part, wt);
+    }
+    finishShared(e, s);  // this thread's own reference
+    while (!s->done.load(std::memory_order_acquire)) ps::sleepNs(1000000);
+    const int32_t status = s->status.load();
+    *records += s->a.load();
+    *bytes += s->b.load();
+    delete s;
+    return status;
 }
 }  // namespace
 
-int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* filesDropped, int64_t* recordsDropped, int64_t* bytesFreed,
-                bool enforce) {
-    *filesDropped = *recordsDropped = *bytesFreed = 0;
-    if (e->cfg.quotaMode != 1) return P4_E_UNSUPPORTED;
-    std::vector<Type*> types;
-    {
+int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFreed, bool enforce) {
+    *records = *bytesFreed = 0;
+    auto setOver = [&](bool over) {
+        if (!enforce) return;
         std::lock_guard<std::mutex> g(e->typesMu);
-        for (auto& t : e->types) types.push_back(t.get());
-    }
-    for (;;) {
-        int64_t total = 0;
-        Type* oldestType = nullptr;
-        int64_t oldest = INT64_MAX;
-        for (Type* t : types) {
-            std::vector<std::pair<int64_t, std::string>> files;
-            {
-                std::lock_guard<std::mutex> g(t->mu);
-                for (auto& p : t->parts)
-                    for (auto& kv : p->files)
-                        if (kv.second->created && !kv.second->retired) files.push_back({kv.first, kv.second->path});
-            }
-            int64_t current = monthOfSec(nowSec());
-            for (auto& f : files) {
-                total += diskBytes(f.second);
-                if (f.first > 0 && f.first < oldest && f.first < current) {
-                    oldest = f.first;
-                    oldestType = t;
-                }
-            }
-            total += diskBytes(t->pIdx) + diskBytes(t->pJnl) + diskBytes(t->pFts);
+        for (auto& t : e->types) {
+            std::lock_guard<std::mutex> tg(t->mu);
+            t->overQuota = over;
         }
-        if (uint64_t(total) <= maxBytes) {
-            if (enforce)
-                for (Type* t : types) {
-                    std::lock_guard<std::mutex> g(t->mu);
-                    t->overQuota = false;
-                }
+    };
+    // The file sizes first: a store whose files fit needs no page counts.
+    if (uint64_t(storeBytes(e, false)) <= maxBytes) {
+        setOver(false);
+        return P4_OK;
+    }
+    const int64_t before = storeBytes(e, true);
+    int64_t used = before;
+    while (uint64_t(used) > maxBytes && !e->stopping.load()) {
+        // The type whose oldest record arrived first gives up its oldest.
+        Type* victim = nullptr;
+        int64_t oldestTs = INT64_MAX;
+        for (Type* t : typesWithFiles(e)) {
+            int64_t seq = 0, ts = 0;
+            const int32_t rc = oldestOf(e, t, &seq, &ts);
+            if (rc != P4_OK) return rc;
+            if (seq && ts < oldestTs) {
+                oldestTs = ts;
+                victim = t;
+            }
+        }
+        if (!victim) {
+            // Nothing left to delete: under the configured quota, writes
+            // refuse (P4_E_NOSPACE) while reads continue.
+            setOver(true);
             return P4_OK;
         }
-        if (!oldestType) {
-            // Nothing droppable but the current month: under the configured
-            // quota, writes refuse (P4_E_NOSPACE) while reads continue.
-            if (enforce)
-                for (Type* t : types) {
-                    std::lock_guard<std::mutex> g(t->mu);
-                    t->overQuota = true;
-                }
-            return P4_OK;
-        }
-        Type* t = oldestType;
-        typeIndexFlush(t, true);
-        std::lock_guard<std::mutex> fg(t->flushMu);
-        std::vector<File*> drop;
-        int64_t rows = 0, payload = 0;
-        {
+        // A batch sized to the excess at the store's mean bytes per record
+        // (at most 32,768 per transaction); the next pass measures again.
+        int64_t held = 0;
+        for (Type* t : typesWithFiles(e)) {
             std::lock_guard<std::mutex> g(t->mu);
-            for (auto& p : t->parts) {
-                auto it = p->files.find(oldest);
-                if (it != p->files.end() && !it->second->retired) {
-                    it->second->dropping = true;  // new claims are refused from here
-                    drop.push_back(it->second);
-                }
-            }
+            held += t->uniq + t->copies;
         }
-        // Wait until every claimed write has published and no writer has the
-        // files pinned; then nothing writes them again.
-        bool quiet = false;
-        for (int i = 0; i < 30000 && !quiet; i++) {
-            quiet = true;
-            {
-                std::lock_guard<std::mutex> g(t->mu);
-                for (File* f : drop) quiet = quiet && f->inflight == 0;
-            }
-            if (quiet) {
-                std::lock_guard<std::mutex> g(e->wconnMu);
-                for (File* f : drop) quiet = quiet && f->wPins == 0;
-            }
-            if (!quiet) ps::sleepNs(1000000);
-        }
-        if (!quiet) {
-            std::lock_guard<std::mutex> g(t->mu);
-            for (File* f : drop) f->dropping = false;
-            return P4_E_BUSY;  // the next pass retries
-        }
-        int64_t distinct = 0;
-        {
-            sqlite3_stmt* s = t->idx->sql("SELECT count(DISTINCT cid) FROM c WHERE tb=?1");
-            sqlite3_bind_int64(s, 1, oldest);
-            if (sqlite3_step(s) == SQLITE_ROW) distinct = sqlite3_column_int64(s, 0);
-            sqlite3_reset(s);
-        }
-        for (File* f : drop) {
-            const int64_t db = diskBytes(f->path);
-            {
-                std::lock_guard<std::mutex> g(t->mu);
-                rows += f->n;
-                payload += f->bytes;
-                // Pending entries of the month go with it.
-                for (CEnt& x : t->pend.raw())
-                    if ((x.st == 1 || x.st == 2) && x.tb == oldest && x.pid == f->part->pid) t->pend.kill(x.tb, x.key, x.pid);
-            }
-            retireFile(e, f);
-            *bytesFreed += db;
-            (*filesDropped)++;
-        }
-        // One range delete per index table (WHERE tb = ?).
-        Conn* c = t->idx;
-        c->exec("BEGIN IMMEDIATE");
-        for (const char* sql : {"DELETE FROM c WHERE tb=?1", "DELETE FROM ident WHERE tb=?1", "DELETE FROM obj WHERE tb=?1",
-                                "DELETE FROM file WHERE tb=?1", "DELETE FROM lanecnt WHERE tb=?1"}) {
-            sqlite3_stmt* s = c->sql(sql);
-            if (!s) continue;
-            sqlite3_bind_int64(s, 1, oldest);
-            sqlite3_step(s);
-            sqlite3_reset(s);
-        }
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            t->uniq -= distinct;
-            t->copies -= rows - distinct;
-            t->uniqBytes -= rows ? int64_t(double(payload) * double(distinct) / double(rows)) : 0;
-            if (t->uniq < 0) t->uniq = 0;
-            if (t->copies < 0) t->copies = 0;
-            if (t->uniqBytes < 0) t->uniqBytes = 0;
-            t->tbs.erase(std::remove(t->tbs.begin(), t->tbs.end(), oldest), t->tbs.end());
-            const char* mk[3] = {"uniq", "uniq_bytes", "copies"};
-            const int64_t mv[3] = {t->uniq, t->uniqBytes, t->copies};
-            for (int i = 0; i < 3; i++) {
-                sqlite3_stmt* s = c->sql("INSERT OR REPLACE INTO meta(k, v) VALUES(?1,?2)");
-                sqlite3_bind_text(s, 1, mk[i], -1, SQLITE_STATIC);
-                sqlite3_bind_int64(s, 2, mv[i]);
-                sqlite3_step(s);
-                sqlite3_reset(s);
-            }
-        }
-        c->exec("COMMIT");
-        *recordsDropped += rows;
-        e->bump(kStQuotaFiles, drop.size());
+        const double perRecord = held > 0 ? double(used) / double(held) : double(used);
+        const double excess = double(used) - double(maxBytes);
+        const size_t want = size_t(std::min(32768.0, std::max(1.0, std::ceil(excess / perRecord))));
+        int64_t n = 0, b = 0;
+        const int32_t rc = quotaPass(e, victim, want, &n, &b);
+        if (rc != P4_OK) return rc;
+        *records += n;
+        if (n == 0) break;
+        used = storeBytes(e, true);
     }
+    *bytesFreed = std::max<int64_t>(0, before - used);
+    setOver(uint64_t(used) > maxBytes);
+    return P4_OK;
 }
 
 // ---- REBUILD ------------------------------------------------------------------------------------------
@@ -302,107 +305,59 @@ void why(const char* what, const std::string& path, int64_t a, int64_t b) {
 #endif
 }
 
-// Compares (and with fix, rewrites) the type index's c, file and lanecnt rows
-// against the partition files, and obj against the files' ent rows.
+// Compares (and with fix, rewrites) the type index against the partition
+// files: its c rows against every file's CID index, merged in CID order (one
+// sequential walk of each side), and the files' counters and lane counts
+// against their rows.
 int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
+    (void)e;
+    if (!t->hasFiles.load(std::memory_order_acquire)) return P4_OK;
     std::shared_ptr<const Spec> sp = t->spec();
     int32_t rc = typeIndexFlush(t, true);
     if (rc != P4_OK) return rc;
     std::lock_guard<std::mutex> fg(t->flushMu);
-    std::vector<File*> files;
-    {
-        std::lock_guard<std::mutex> g(t->mu);
-        for (auto& p : t->parts)
-            for (auto& kv : p->files)
-                if (kv.second->created && !kv.second->retired) files.push_back(kv.second);
-    }
+    std::vector<File*> files = createdFiles(t);
     Conn* x = t->idx;
     // An error ends the pass with that error (M9): a statement that stops
     // early must not read as missing rows, and a fix must not rewrite the
     // index from a partial read.
-    Conn* c = nullptr;
+    std::vector<Conn*> conns;
     std::string where;  // the file being read (diagnostics)
     auto fail = [&](int src) -> int32_t {
-        why((std::string("verify failed (") + (c ? sqlite3_errmsg(c->db) : "open") + ")").c_str(), where, src, 0);
-        if (c) delete c;
+        why("verify failed", where, src, 0);
+        for (Conn* c : conns) delete c;
         if (fix) x->exec("ROLLBACK");
         return statusOfSqlite(src == SQLITE_OK || src == SQLITE_ROW || src == SQLITE_DONE ? SQLITE_ERROR : src);
     };
-    if (fix && x->exec("BEGIN IMMEDIATE") != SQLITE_OK) return P4_E_IO;
-    int64_t cRows = 0;
-    {
-        sqlite3_stmt* s = x->sql("SELECT count(*) FROM c");
-        const int src = s ? sqlite3_step(s) : SQLITE_ERROR;
-        if (src == SQLITE_ROW) cRows = sqlite3_column_int64(s, 0);
-        if (s) sqlite3_reset(s);
-        if (src != SQLITE_ROW) return fail(src);
-    }
-    int64_t fileRows = 0;
-    if (fix) {
-        for (const char* sql : {"DELETE FROM c", "DELETE FROM obj", "DELETE FROM file", "DELETE FROM lanecnt"}) {
-            const int src = x->exec(sql);
-            if (src != SQLITE_OK) return fail(src);
-        }
-    }
     for (File* f : files) {
-        c = nullptr;
+        Conn* c = nullptr;
         where = f->path;
-        {
-            const int orc = openConn(f->path, OpenKind::Maint, 4096, 0, &c, nullptr);
-            if (orc != SQLITE_OK) {
-                c = nullptr;
-                return fail(orc);
-            }
-        }
-        const uint32_t pid = f->part->pid;
-        sqlite3_stmt* s = c->sql("SELECT seq, cid, length(d), w, e, k IS NULL FROM r");
+        const int orc = openConn(f->path, OpenKind::Maint, 4096, 0, &c, nullptr);
+        if (orc != SQLITE_OK) return fail(orc);
+        conns.push_back(c);
+    }
+    if (fix && x->exec("BEGIN IMMEDIATE") != SQLITE_OK) return fail(SQLITE_BUSY);
+    // 1. Each file's counters and lanes from its own rows.
+    for (size_t fi = 0; fi < files.size(); fi++) {
+        File* f = files[fi];
+        Conn* c = conns[fi];
+        where = f->path;
+        sqlite3_stmt* s = c->sql("SELECT seq, length(d), w, e FROM r");
         if (!s) return fail(SQLITE_ERROR);
-        int64_t n = 0, bytes = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN, nnull = 0, nk = 0;
+        int64_t n = 0, bytes = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN, nnull = 0;
         int src;
         while ((src = sqlite3_step(s)) == SQLITE_ROW) {
             const int64_t seq = sqlite3_column_int64(s, 0);
             n++;
-            bytes += sqlite3_column_int64(s, 2);
+            bytes += sqlite3_column_int64(s, 1);
             minseq = std::min(minseq, seq);
             maxseq = std::max(maxseq, seq);
-            minw = std::min(minw, sqlite3_column_int64(s, 3));
-            maxw = std::max(maxw, sqlite3_column_int64(s, 3));
-            if (sqlite3_column_type(s, 4) == SQLITE_NULL && sp->hasEpochRule) nnull++;
-            if (sqlite3_column_int(s, 5) && sp->ek) nk++;
-            v->entries++;
-            if (fix) {
-                sqlite3_stmt* ins = x->get(S_C_INS);
-                sqlite3_bind_int64(ins, 1, f->tb);
-                sqlite3_bind_blob(ins, 2, sqlite3_column_blob(s, 1), 32, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(ins, 3, pid);
-                sqlite3_bind_int64(ins, 4, seq);
-                const int irc = sqlite3_step(ins);
-                sqlite3_reset(ins);
-                if (irc != SQLITE_DONE) {
-                    sqlite3_reset(s);
-                    return fail(irc);
-                }
-            } else {
-                sqlite3_stmt* q = x->sql("SELECT seq FROM c WHERE tb=?1 AND cid=?2 AND pid=?3");
-                sqlite3_bind_int64(q, 1, f->tb);
-                sqlite3_bind_blob(q, 2, sqlite3_column_blob(s, 1), 32, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(q, 3, pid);
-                const int qrc = sqlite3_step(q);
-                const bool ok = qrc == SQLITE_ROW && sqlite3_column_int64(q, 0) == seq;
-                sqlite3_reset(q);
-                if (qrc != SQLITE_ROW && qrc != SQLITE_DONE) {
-                    sqlite3_reset(s);
-                    return fail(qrc);
-                }
-                if (!ok) {
-                    v->mismatches++;
-                    why("c entry", f->path, seq, 0);
-                }
-            }
+            minw = std::min(minw, sqlite3_column_int64(s, 2));
+            maxw = std::max(maxw, sqlite3_column_int64(s, 2));
+            if (sqlite3_column_type(s, 3) == SQLITE_NULL && sp->hasEpochRule) nnull++;
         }
         sqlite3_reset(s);
         if (src != SQLITE_DONE) return fail(src);
-        fileRows += n;
         int64_t fn, fbytes;
         std::map<uint32_t, LaneCount> mem;
         {
@@ -411,7 +366,7 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
             fbytes = f->bytes;
             mem = f->lanes;
         }
-        if (fn != n || fbytes != bytes) {
+        if (!fix && (fn != n || fbytes != bytes)) {
             v->mismatches++;
             why("file counters n", f->path, fn, n);
             why("file counters bytes", f->path, fbytes, bytes);
@@ -429,20 +384,21 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
         }
         sqlite3_reset(s);
         if (src != SQLITE_DONE) return fail(src);
-        for (auto& kv : real) {
-            auto it = mem.find(kv.first);
-            if (it == mem.end() || it->second.n != kv.second.first || it->second.bytes != kv.second.second) {
-                v->mismatches++;
-                why("lane n", f->path, it == mem.end() ? -1 : it->second.n, kv.second.first);
-                why("lane bytes", f->path, it == mem.end() ? -1 : it->second.bytes, kv.second.second);
+        if (!fix) {
+            for (auto& kv : real) {
+                auto it = mem.find(kv.first);
+                if (it == mem.end() || it->second.n != kv.second.first || it->second.bytes != kv.second.second) {
+                    v->mismatches++;
+                    why("lane n", f->path, it == mem.end() ? -1 : it->second.n, kv.second.first);
+                    why("lane bytes", f->path, it == mem.end() ? -1 : it->second.bytes, kv.second.second);
+                }
             }
-        }
-        for (auto& kv : mem)
-            if (!real.count(kv.first)) {
-                v->mismatches++;
-                why("lane in memory only", f->path, kv.first, kv.second.n);
-            }
-        if (fix) {
+            for (auto& kv : mem)
+                if (!real.count(kv.first)) {
+                    v->mismatches++;
+                    why("lane in memory only", f->path, kv.first, kv.second.n);
+                }
+        } else {
             std::lock_guard<std::mutex> g(t->mu);
             f->n = n;
             f->bytes = bytes;
@@ -451,7 +407,6 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
             f->minw = minw;
             f->maxw = maxw;
             f->nnull = nnull;
-            f->nk = nk;
             for (auto& kv : real) {
                 LaneCount& lc = f->lanes[kv.first];
                 lc.n = kv.second.first;
@@ -461,51 +416,115 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
                 if (!real.count(it->first)) it = f->lanes.erase(it);
                 else ++it;
             f->touched = true;
-            f->objRefresh = true;
         }
-        // obj against ent
-        if (sp->ek && !fix) {
-            sqlite3_stmt* q = c->sql("SELECT k, n, fw, lw FROM ent WHERE n>0");
-            if (!q) return fail(SQLITE_ERROR);
-            while ((src = sqlite3_step(q)) == SQLITE_ROW) {
-                sqlite3_stmt* o = x->sql("SELECT n, fw, lw FROM obj WHERE k=?1 AND tb=?2 AND pid=?3");
-                sqlite3_bind_value(o, 1, sqlite3_column_value(q, 0));
-                sqlite3_bind_int64(o, 2, f->tb);
-                sqlite3_bind_int64(o, 3, pid);
-                const bool ok = sqlite3_step(o) == SQLITE_ROW && sqlite3_column_int64(o, 0) == sqlite3_column_int64(q, 1) &&
-                                sqlite3_column_int64(o, 1) == sqlite3_column_int64(q, 2) &&
-                                sqlite3_column_int64(o, 2) == sqlite3_column_int64(q, 3);
-                sqlite3_reset(o);
-                if (!ok) {
-                    v->mismatches++;
-                    why("obj", f->path, 0, 0);
-                }
-            }
-            sqlite3_reset(q);
-            if (src != SQLITE_DONE) return fail(src);
+    }
+    // 2. CID entries: every file's (cid, seq) in CID order, merged by (cid,
+    //    pid), against c in (cid, pid) order (fix: c rewritten in that order,
+    //    one sequential append).
+    struct Cur {
+        sqlite3_stmt* s = nullptr;
+        uint32_t pid = 0;
+        uint8_t key[32];
+        int64_t seq = 0;
+        bool live = false;
+    };
+    std::vector<Cur> cur(files.size());
+    auto advance = [&](Cur& k) -> int {
+        const int r = sqlite3_step(k.s);
+        k.live = r == SQLITE_ROW && sqlite3_column_bytes(k.s, 0) == 32;
+        if (k.live) {
+            std::memcpy(k.key, sqlite3_column_blob(k.s, 0), 32);
+            k.seq = sqlite3_column_int64(k.s, 1);
         }
-        delete c;
-        c = nullptr;
+        return r == SQLITE_ROW || r == SQLITE_DONE ? SQLITE_OK : r;
+    };
+    for (size_t fi = 0; fi < files.size(); fi++) {
+        where = files[fi]->path;
+        cur[fi].pid = files[fi]->part->pid;
+        cur[fi].s = conns[fi]->sql("SELECT cid, seq FROM r ORDER BY cid");  // r_c (a sort before REBUILD 1)
+        if (!cur[fi].s) return fail(SQLITE_ERROR);
+        const int r = advance(cur[fi]);
+        if (r != SQLITE_OK) return fail(r);
     }
-    if (!fix && cRows != fileRows) {
-        v->mismatches += std::max<int64_t>(cRows - fileRows, fileRows - cRows);
-        why("c rows vs file rows", t->name, cRows, fileRows);
+    if (fix) {
+        const int src = x->exec("DELETE FROM c");
+        if (src != SQLITE_OK) return fail(src);
     }
+    sqlite3_stmt* ci = nullptr;
+    bool ciLive = false;
+    uint8_t ciKey[32];
+    uint32_t ciPid = 0;
+    int64_t ciSeq = 0;
+    auto ciAdvance = [&]() -> int {
+        const int r = sqlite3_step(ci);
+        ciLive = r == SQLITE_ROW && sqlite3_column_bytes(ci, 0) == 32;
+        if (ciLive) {
+            std::memcpy(ciKey, sqlite3_column_blob(ci, 0), 32);
+            ciPid = uint32_t(sqlite3_column_int64(ci, 1));
+            ciSeq = sqlite3_column_int64(ci, 2);
+        }
+        return r == SQLITE_ROW || r == SQLITE_DONE ? SQLITE_OK : r;
+    };
+    if (!fix) {
+        ci = x->sql("SELECT cid, pid, seq FROM c ORDER BY cid, pid");
+        if (!ci) return fail(SQLITE_ERROR);
+        const int r = ciAdvance();
+        if (r != SQLITE_OK) return fail(r);
+    }
+    for (;;) {
+        int best = -1;
+        for (size_t fi = 0; fi < cur.size(); fi++) {
+            if (!cur[fi].live) continue;
+            if (best < 0) { best = int(fi); continue; }
+            const int c = std::memcmp(cur[fi].key, cur[size_t(best)].key, 32);
+            if (c < 0 || (c == 0 && cur[fi].pid < cur[size_t(best)].pid)) best = int(fi);
+        }
+        if (best < 0 && !ciLive) break;
+        if (fix) {
+            Cur& k = cur[size_t(best)];
+            sqlite3_stmt* ins = x->get(S_C_INS);
+            sqlite3_bind_blob(ins, 1, k.key, 32, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ins, 2, k.pid);
+            sqlite3_bind_int64(ins, 3, k.seq);
+            const int irc = sqlite3_step(ins);
+            sqlite3_reset(ins);
+            if (irc != SQLITE_DONE) return fail(irc);
+            v->entries++;
+            where = files[size_t(best)]->path;
+            const int r = advance(k);
+            if (r != SQLITE_OK) return fail(r);
+            continue;
+        }
+        // verify: the smaller side advances; equal keys must agree on seq
+        int cmp;
+        if (best < 0) cmp = 1;
+        else if (!ciLive) cmp = -1;
+        else {
+            cmp = std::memcmp(cur[size_t(best)].key, ciKey, 32);
+            if (cmp == 0) cmp = cur[size_t(best)].pid < ciPid ? -1 : cur[size_t(best)].pid > ciPid ? 1 : 0;
+        }
+        if (cmp <= 0) v->entries++;
+        if (cmp != 0 || cur[size_t(best)].seq != ciSeq) {
+            v->mismatches++;
+            why("c entry", cmp < 0 ? files[size_t(best)]->path : t->name, cmp <= 0 ? cur[size_t(best)].seq : ciSeq, cmp);
+        }
+        if (cmp <= 0) {
+            const int r = advance(cur[size_t(best)]);
+            if (r != SQLITE_OK) return fail(r);
+        }
+        if (cmp >= 0) {
+            const int r = ciAdvance();
+            if (r != SQLITE_OK) return fail(r);
+        }
+    }
+    for (size_t fi = 0; fi < cur.size(); fi++) sqlite3_reset(cur[fi].s);
+    if (ci) sqlite3_reset(ci);
+    for (Conn* c : conns) delete c;
+    conns.clear();
     if (fix) {
         const int crc = x->exec("COMMIT");
         if (crc != SQLITE_OK) return fail(crc);
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            for (auto& p : t->parts) {
-                p->n = p->bytes = 0;
-                for (auto& kv : p->files) {
-                    p->n += kv.second->n;
-                    p->bytes += kv.second->bytes;
-                }
-            }
-        }
     }
-    (void)e;
     return P4_OK;
 }
 }  // namespace
@@ -542,14 +561,7 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
         Verify v;
         if (what & 1) {
             // Partition secondary indexes after a migration's bulk append.
-            std::vector<File*> files;
-            {
-                std::lock_guard<std::mutex> g(t->mu);
-                for (auto& p : t->parts)
-                    for (auto& kv : p->files)
-                        if (kv.second->created && !kv.second->retired) files.push_back(kv.second);
-            }
-            for (File* f : files) {
+            for (File* f : createdFiles(t)) {
                 Conn* c = nullptr;
                 if (openConn(f->path, OpenKind::Maint, 65536, 0, &c, nullptr) != SQLITE_OK) return P4_E_IO;
                 const int32_t rc = fileCreateIndexes(t, c);
@@ -585,14 +597,11 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
             v.mismatches = vv.mismatches;
             // C-27: every live file of the type, its index and its journal.
             std::vector<std::string> paths;
-            {
-                std::lock_guard<std::mutex> g(t->mu);
-                for (auto& p : t->parts)
-                    for (auto& kv : p->files)
-                        if (kv.second->created && !kv.second->retired) paths.push_back(kv.second->path);
+            for (File* f : createdFiles(t)) paths.push_back(f->path);
+            if (t->hasFiles.load()) {
+                paths.push_back(t->pIdx);
+                paths.push_back(t->pJnl);
             }
-            paths.push_back(t->pIdx);
-            paths.push_back(t->pJnl);
             for (const std::string& path : paths)
                 if (!fileIntact(path)) {
                     v.mismatches++;
@@ -608,7 +617,7 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
 // ---- FTS (background; never on the ingest path) -------------------------------------------------------
 int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
     std::shared_ptr<const Spec> sp = t->spec();
-    if (!sp->fullText) return P4_OK;
+    if (!sp->fullText || !t->hasFiles.load(std::memory_order_acquire)) return P4_OK;  // no data: no .fts yet
     std::lock_guard<std::mutex> g(t->ftsMu);
     if (!t->fts) {
         Conn* c = nullptr;
@@ -635,9 +644,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
     {
         std::lock_guard<std::mutex> tg(t->mu);
         for (auto& p : t->parts)
-            for (auto& kv : p->files)
-                if (kv.second->created && !kv.second->retired && kv.second->maxseq > t->ftsThrough)
-                    paths.push_back(kv.second->path);
+            if (p->file->created && p->file->maxseq > t->ftsThrough) paths.push_back(p->file->path);
     }
     const std::string fid(reinterpret_cast<const char*>(sp->tc.fid()), 4);
     // The cut: seqs interleave across files, so a bounded pass indexes every
@@ -717,11 +724,11 @@ void runMaintSlot(Engine* e, uint32_t slot) {
             out.end(P4_E_ARG, "QUOTA_GC: tag 62 is a u64");
             return;
         }
-        int64_t files = 0, records = 0, bytes = 0;
-        const int32_t rc = maxBytes ? quotaGc(e, maxBytes, &files, &records, &bytes, false) : P4_OK;
+        int64_t records = 0, bytes = 0;
+        const int32_t rc = maxBytes ? quotaGc(e, maxBytes, &records, &bytes, false) : P4_OK;
         if (rc == P4_OK) {
             out.enc.beginRow();
-            out.enc.i64(files);
+            out.enc.i64(0);  // files_dropped: a partition keeps its file (C-32)
             out.enc.i64(records);
             out.enc.i64(bytes);
             out.enc.endRow();
@@ -775,7 +782,7 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
     Bell& b = e->bells[thread];
     MaintState m;
     uint64_t lastTick = 0;
-    int rebuildTicks = 0;
+    int quotaTicks = 0;
     for (;;) {
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
         for (;;) {
@@ -797,9 +804,6 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
                     }
                     checkpoint(e, m, mt.path);
                     break;
-                case MaintTask::kUnlink:
-                    unlinkFile(e, m, mt.file);
-                    break;
                 case MaintTask::kSlot:
                     e->slot(mt.slot)->thread = thread;
                     runMaintSlot(e, mt.slot);
@@ -810,11 +814,7 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
         const uint64_t now = monoNs();
         if (now - lastTick >= 100ull * 1000 * 1000) {
             lastTick = now;
-            std::vector<Type*> types;
-            {
-                std::lock_guard<std::mutex> g(e->typesMu);
-                for (auto& t : e->types) types.push_back(t.get());
-            }
+            const std::vector<Type*> types = typesWithFiles(e);
             uint64_t pending = 0;
             for (Type* t : types) {
                 std::lock_guard<std::mutex> g(t->mu);
@@ -822,14 +822,11 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
             }
             for (Type* t : types) typeIndexFlush(t, pending >= e->cfg.pendingBytes);
             for (Type* t : types) ftsCatchUp(e, t, false);
-            if (++rebuildTicks >= 50) {  // every 5 s: files with removals since the last look
-                rebuildTicks = 0;
-                maybeRebuildFiles(e);
-            }
             const uint64_t q = e->quota.load();
-            if (q) {
-                int64_t a, bb, c;
-                quotaGc(e, q, &a, &bb, &c, true);
+            if (q && ++quotaTicks >= 10) {  // the configured quota, once a second
+                quotaTicks = 0;
+                int64_t a, bb;
+                quotaGc(e, q, &a, &bb, true);
             }
         }
         b.state.store(0, std::memory_order_seq_cst);

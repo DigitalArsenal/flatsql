@@ -11,9 +11,9 @@ namespace p4 {
 
 std::string pathJoin(const std::string& a, const std::string& b) { return a + "/" + b; }
 
-std::string Type::filePath(uint32_t pid, int64_t tb, int32_t gen) const {
-    char buf[64];
-    std::snprintf(buf, sizeof buf, "/%u/%lld.%d.db", pid, (long long)tb, gen);
+std::string Type::filePath(uint32_t pid) const {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "/%u.db", pid);
     return pDir + buf;
 }
 
@@ -77,7 +77,6 @@ int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::s
     s->bytes.assign(p, p + n);
     s->rules = s->tc.rules();
     s->hasEpochRule = s->tc.hasEpochRule();
-    s->hasBucket = s->tc.hasBucketTime();
     s->hasSupersede = s->tc.hasSupersede();
     size_t at = 0;
     const std::string& r = s->rules;
@@ -89,7 +88,7 @@ int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::s
         if (hash != std::string::npos) line = line.substr(0, hash);
         line = trimLine(line);
         if (line.rfind("object ", 0) == 0) s->hasObject = true;
-        if (line.rfind("epoch ", 0) == 0 || line.rfind("bucket ", 0) == 0) s->timeRules += line + "\n";
+        if (line.rfind("epoch ", 0) == 0) s->epochRule += line + "\n";
         at = nl + 1;
     }
     s->ek = s->hasEpochRule && s->hasObject;
@@ -199,52 +198,23 @@ bool markersActivated(const Markers& m) {
            m.migratedFormat == 4;
 }
 
-// Retired generations left on disk by a crash between the drop (J_DROP) and
-// the unlink. Every path a type ever used is <month>.<gen>.db with gen at
-// most the gens table's maximum, so no directory listing is needed (the wasm
-// host has none). A path is removed only when no live file holds it.
-void sweepRetired(Type* t) {
-    for (auto& p : t->parts) {
-        // A live, empty file whose path is gone (its index row outlived it): it
-        // has no rows to lose, so it is uncreated again and the writer remakes it.
-        for (auto& kv : p->files) {
-            File* f = kv.second;
-            if (f->created && !f->retired && f->n == 0 && !ioExists(f->path)) f->created = false;
-        }
-        std::map<int64_t, int32_t> top = p->maxGen;
-        for (auto& f : p->all) {
-            int32_t& g = top[f->tb];
-            g = std::max(g, f->gen);
-        }
-        for (auto& kv : top) {
-            // The swept generations stay used (B9): a path is never reused, so
-            // no reader's or VFS node's state can meet a new file on it.
-            if (p->maxGen[kv.first] < kv.second) {
-                p->maxGen[kv.first] = kv.second;
-                sqlite3_stmt* s = t->idx->sql(
-                    "INSERT INTO gens(pid, tb, gen) VALUES(?1,?2,?3) ON CONFLICT(pid, tb) DO UPDATE SET gen=max(gen, excluded.gen)");
-                if (s) {
-                    sqlite3_bind_int64(s, 1, p->pid);
-                    sqlite3_bind_int64(s, 2, kv.first);
-                    sqlite3_bind_int64(s, 3, kv.second);
-                    sqlite3_step(s);
-                    sqlite3_reset(s);
-                }
-            }
-            for (int32_t g = 0; g <= kv.second; g++) {
-                auto live = p->files.find(kv.first);
-                if (live != p->files.end() && live->second->gen == g && !live->second->retired) continue;
-                const std::string path = t->filePath(p->pid, kv.first, g);
-                for (const char* sfx : {"-wal", "-journal", ""})
-                    if (ioExists(path + sfx)) {
-                        ioUnlink(path + sfx);
-                        t->e->bump(kStUnlinked);
-                    }
-            }
-        }
-    }
+// The type index and journal: opened (made when absent), the journal's tail
+// replayed into the index before any read (M8), the seq floor applied.
+int32_t typeFilesOpen(Type* t, std::string* err) {
+    int32_t rc = typeIndexOpen(t, err);
+    if (rc != P4_OK) return rc;
+    rc = journalOpen(t, err);
+    if (rc != P4_OK) return rc;
+    rc = journalReplay(t, err);
+    if (rc != P4_OK) return rc;
+    std::lock_guard<std::mutex> g(t->mu);
+    if (t->nextSeq < int64_t(t->e->cfg.gseqFloor)) t->nextSeq = int64_t(t->e->cfg.gseqFloor);
+    t->visRecompute();
+    return P4_OK;
 }
 
+// A registered type. Its T/ files are opened only when they exist: a type
+// that never had a write costs its .spec and nothing else (C-32).
 int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std::string* err) {
     t->e = e;
     t->name = sp->name;
@@ -256,16 +226,34 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
     t->pSpec = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".spec");
     t->pend.init(1024);
     t->flushing.init(16);
-    int32_t rc = typeIndexOpen(t, err);
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        t->nextSeq = int64_t(e->cfg.gseqFloor);
+        t->visRecompute();
+    }
+    if (!ioExists(t->pIdx) && !ioExists(t->pJnl)) return P4_OK;
+    const int32_t rc = typeFilesOpen(t, err);
     if (rc != P4_OK) return rc;
-    rc = journalOpen(t, err);
-    if (rc != P4_OK) return rc;
-    rc = journalReplay(t, err);
-    if (rc != P4_OK) return rc;
-    sweepRetired(t);
+    t->hasFiles.store(true, std::memory_order_release);
     return P4_OK;
 }
 }  // namespace
+
+int32_t typeFilesEnsure(Type* t, std::string* err) {
+    if (t->hasFiles.load(std::memory_order_acquire)) return P4_OK;
+    std::lock_guard<std::mutex> g(t->openMu);
+    if (t->hasFiles.load(std::memory_order_acquire)) return P4_OK;
+    const int32_t rc = typeFilesOpen(t, err);
+    if (rc != P4_OK) {
+        delete t->idx;
+        t->idx = nullptr;
+        delete t->jdb;
+        t->jdb = nullptr;
+        return rc;
+    }
+    t->hasFiles.store(true, std::memory_order_release);
+    return P4_OK;
+}
 
 
 // ---- registry --------------------------------------------------------------------------
@@ -278,6 +266,9 @@ Part* partFor(Type* t, const std::string& producer, const std::string& peer, boo
     p->pid = uint32_t(t->parts.size() + 1);
     p->producer = producer;
     p->peer = peer;
+    p->file = std::make_unique<File>();
+    p->file->part = p.get();
+    p->file->path = t->filePath(p->pid);
     Engine* e = t->e;
     p->owner = e->writers.empty() ? 0 : e->nextOwner.fetch_add(1) % uint32_t(e->writers.size());
     Part* raw = p.get();
@@ -400,7 +391,9 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
             e->ftsHold.store(true);
             break;
     }
-    // Types: the catalog, then each type's spec, type index and journal tail.
+    e->cfg.gseqFloor = floor;
+    // Types: the catalog, then each type's spec; the type index and journal
+    // tail of the types that have them.
     for (const std::string& name : names) {
         std::vector<uint8_t> fb, tlv;
         const std::string sp = pathJoin(pathJoin(e->cfg.root, "T"), name + ".spec");
@@ -411,16 +404,10 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
         auto t = std::make_unique<Type>();
         rc = openType(e, t.get(), spec, &e2);
         if (rc != P4_OK) { *err = name + ": " + e2; return rc; }
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            if (t->nextSeq < int64_t(floor)) t->nextSeq = int64_t(floor);
-            t->visRecompute();
-        }
         e->typeByName[name] = t.get();
         e->types.push_back(std::move(t));
     }
     e->markers = m;
-    e->cfg.gseqFloor = floor;
     rc = mailboxInit(e, err);
     if (rc != P4_OK) return rc;
     return P4_OK;
@@ -441,8 +428,8 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
             std::lock_guard<std::mutex> tg(t->mu);
             hasData = !t->parts.empty();
         }
-        if (hasData && cur->timeRules != spec->timeRules) {
-            *err = "the epoch/bucket rule of a type with data cannot change (C-5)";
+        if (hasData && cur->epochRule != spec->epochRule) {
+            *err = "the epoch rule of a type with data cannot change (C-5)";
             return P4_E_FORMAT;
         }
         const std::vector<uint8_t> fb = specFileBytes(spec->bytes);
@@ -461,11 +448,6 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
     auto t = std::make_unique<Type>();
     rc = openType(e, t.get(), spec, err);
     if (rc != P4_OK) return rc;
-    {
-        std::lock_guard<std::mutex> tg(t->mu);
-        if (t->nextSeq < int64_t(e->cfg.gseqFloor)) t->nextSeq = int64_t(e->cfg.gseqFloor);
-        t->visRecompute();
-    }
     e->typeByName[spec->name] = t.get();
     e->types.push_back(std::move(t));
     return P4_OK;
@@ -480,7 +462,8 @@ int32_t engineActivate(Engine* e) {
     std::vector<Type*> types;
     {
         std::lock_guard<std::mutex> g(e->typesMu);
-        for (auto& t : e->types) types.push_back(t.get());
+        for (auto& t : e->types)
+            if (t->hasFiles.load()) types.push_back(t.get());
     }
     for (Type* t : types) {
         int32_t rc = typeIndexFlush(t, true);
@@ -493,8 +476,7 @@ int32_t engineActivate(Engine* e) {
         {
             std::lock_guard<std::mutex> g(t->mu);
             for (auto& p : t->parts)
-                for (auto& kv : p->files)
-                    if (kv.second->created) paths.push_back(kv.second->path);
+                if (p->file->created) paths.push_back(p->file->path);
         }
         paths.push_back(t->pIdx);
         paths.push_back(t->pJnl);
@@ -531,11 +513,10 @@ int32_t engineStats(Engine* e, uint8_t* out, int32_t cap) {
             std::lock_guard<std::mutex> tg(t->mu);
             parts += t->parts.size();
             pending += t->pend.bytes() + t->flushing.bytes();
-            for (auto& p : t->parts)
-                for (auto& f : p->all) {
-                    if (f->created && !f->retired) files++;
-                    if (f->quarantined) quarantined++;
-                }
+            for (auto& p : t->parts) {
+                if (p->file->created) files++;
+                if (p->file->quarantined) quarantined++;
+            }
         }
     }
     {

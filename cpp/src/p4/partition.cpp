@@ -1,15 +1,15 @@
 // Store format 4: partition files and the write path (design §2.1, §4).
 //
 // A partition (producer x type) is pinned to one writer thread, which holds
-// the one writer connection of each of its files. A group (one or more queued
-// PUT calls of the partition, at most group-commit records) is:
+// the one writer connection of its file. A group (one or more queued PUT
+// calls of the partition, at most group-commit records) is:
 //   1. prepared outside any lock: checks, extraction, the CID key;
 //   2. deduplicated: holders probed without the type lock; under the type's
 //      dedupe lock only the keys that looked new are rechecked, then seqs are
-//      assigned in (file, content time) order and the range is in flight (M7);
-//   3. journaled (synchronous=FULL) before any partition file commits;
-//   4. written: one transaction per touched month file (rows, tag instances,
-//      CAT supersede, the file's lane and meta counters);
+//      assigned in content-time order and the range is in flight (M7);
+//   3. journaled (synchronous=FULL) before the partition file commits;
+//   4. written: one transaction (rows, tag instances, CAT supersede, the
+//      file's lane and meta counters);
 //   5. published: entries flushable, counters, the visible-through watermark;
 //   6. acked, after the commit and the publish (C-4).
 #include <algorithm>
@@ -30,26 +30,26 @@ const char* kFileSchema =
     " maxts INTEGER);"
     "CREATE TABLE IF NOT EXISTS r(seq INTEGER PRIMARY KEY, cid BLOB NOT NULL, e INTEGER, k, ts INTEGER NOT NULL,"
     " p TEXT, f BLOB, s INTEGER, x BLOB, d BLOB NOT NULL,"
-    " w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL,"
-    " wd INTEGER GENERATED ALWAYS AS (coalesce(e, ts) / 86400) VIRTUAL);"
+    " w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL);"
     // Tag instances keyed by seq first: a page's tags are one key range (no
     // lookups); rl_sid(sid, seq) serves source-ordered scans and supersede.
     "CREATE TABLE IF NOT EXISTS rl(sid INTEGER NOT NULL, seq INTEGER NOT NULL, lane INTEGER NOT NULL,"
     " at INTEGER NOT NULL, u TEXT, PRIMARY KEY(seq, sid, lane)) WITHOUT ROWID;";
 }  // namespace
 
+// The file's indexes (owner layout, C-32): arrival seq (the rowid, and r_s:
+// the seqs alone, 12 B a row, for newest-N cuts and oldest-first quota);
+// source newest-first (rl_sid); object + epoch (r_ke: one seek per object for
+// EPOCH nearest / as_of / forward, object predicates, CAT supersede); epoch
+// windows (r_w on w = coalesce(e, ts)); CID (r_c).
 int32_t fileCreateIndexes(Type* t, Conn* c) {
     std::shared_ptr<const Spec> sp = t->spec();
-    // r_s: the seqs alone (12 B a row at the fixture), so the A18 bound's cut
-    // (the type's N-th newest seq) walks an index, not the records' pages.
     std::string ddl =
         "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC);"
         "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
+        "CREATE INDEX IF NOT EXISTS r_c ON r(cid);"
         "CREATE INDEX IF NOT EXISTS rl_sid ON rl(sid, seq);";
-    if (sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_dk ON r(wd, k, w) WHERE k IS NOT NULL;"
-                       "CREATE INDEX IF NOT EXISTS r_nk ON r(w) WHERE k IS NULL;";  // records without an object (EPOCH)
-    if (sp->hasObject && !sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_k ON r(k, w) WHERE k IS NOT NULL;";
-    if (sp->hasEpochRule) ddl += "CREATE INDEX IF NOT EXISTS r_en ON r(cid) WHERE e IS NULL;";
+    if (sp->hasObject) ddl += "CREATE INDEX IF NOT EXISTS r_ke ON r(k, e);";
     ddl += "INSERT OR REPLACE INTO meta(k, v) VALUES('ix', 1);";
     const int rc = c->exec(ddl.c_str());
     return rc == SQLITE_OK ? P4_OK : statusOfSqlite(rc);
@@ -58,7 +58,6 @@ int32_t fileCreateIndexes(Type* t, Conn* c) {
 int32_t fileSchema(Type* t, Conn* c, File* f, bool indexes) {
     std::shared_ptr<const Spec> sp = t->spec();
     std::string ddl = std::string("BEGIN IMMEDIATE;") + kFileSchema;
-    if (sp->ek) ddl += "CREATE TABLE IF NOT EXISTS ent(k PRIMARY KEY, n INTEGER NOT NULL, fw INTEGER NOT NULL, lw INTEGER NOT NULL) WITHOUT ROWID;";
     int rc = c->exec(ddl.c_str());
     if (rc != SQLITE_OK) {
         c->exec("ROLLBACK");
@@ -73,8 +72,7 @@ int32_t fileSchema(Type* t, Conn* c, File* f, bool indexes) {
         return r == SQLITE_DONE;
     };
     bool ok = meta("format", "4") && meta("type", t->name) && meta("producer", f->part->producer) &&
-              meta("peer", f->part->peer) && meta("pid", std::to_string(f->part->pid)) &&
-              meta("tb", std::to_string(f->tb)) && meta("gen", std::to_string(f->gen));
+              meta("peer", f->part->peer) && meta("pid", std::to_string(f->part->pid));
     if (ok && !indexes) {
         sqlite3_stmt* s = c->sql("INSERT OR IGNORE INTO meta(k, v) VALUES('ix', 0)");
         ok = s && sqlite3_step(s) == SQLITE_DONE;
@@ -91,34 +89,6 @@ int32_t fileSchema(Type* t, Conn* c, File* f, bool indexes) {
     }
     if (indexes) return fileCreateIndexes(t, c);
     return P4_OK;
-}
-
-File* fileFor(Type* t, Part* p, int64_t tb, bool create) {
-    auto it = p->files.find(tb);
-    if (it != p->files.end() && !it->second->retired) return it->second;
-    if (!create) return nullptr;
-    int32_t gen = 0;
-    for (auto& f : p->all)
-        if (f->tb == tb && f->gen >= gen) gen = f->gen + 1;
-    // Never reuse a path (B9): past every generation ever used (the gens
-    // table survives the files), and past any present on disk.
-    if (auto mg = p->maxGen.find(tb); mg != p->maxGen.end() && mg->second >= gen) gen = mg->second + 1;
-    for (;;) {
-        const std::string path = t->filePath(p->pid, tb, gen);
-        if (!ioExists(path) && !ioExists(path + "-wal") && !ioExists(path + "-journal")) break;
-        gen++;
-    }
-    auto f = std::make_unique<File>();
-    f->part = p;
-    f->tb = tb;
-    f->gen = gen;
-    f->path = t->filePath(p->pid, tb, gen);
-    p->maxGen[tb] = gen;
-    File* raw = f.get();
-    if (it != p->files.end()) it->second->retired = true;
-    p->files[tb] = raw;
-    p->all.push_back(std::move(f));
-    return raw;
 }
 
 // ---- writer connections (≤ writer conns open; the LRU never closes a pinned one) ----------------
@@ -243,7 +213,6 @@ struct Rec {
     // derived
     int32_t reject = 0;
     uint8_t key[32];
-    int64_t tb = 0;
     bool hasE = false;
     int64_t e = 0, w = 0;
     int kType = 0;  // 0 none, 1 int, 3 text
@@ -258,7 +227,7 @@ struct Rec {
     // decision
     int action = 0;
     int64_t seq = 0;
-    File* file = nullptr;
+    bool inFile = false;  // written to this partition's file (a row or tag instances)
     bool write = false;   // a new row in this partition (NEW, COPY, MIGRATED)
     bool dupOf = false;   // a repeat of an earlier record of the group
     size_t first = 0;     // that record (group index)
@@ -287,36 +256,11 @@ struct Call {
 
 // A deletion: a row of this partition's file.
 struct Del {
-    File* file;
-    int64_t seq, len, w, tb;
+    int64_t seq, len, w;
     uint8_t key[32];
-    bool hasK = false;
-    sqlite3_value* k = nullptr;
     std::vector<std::pair<uint32_t, uint32_t>> lanes;  // (sid, lane) of its tags
     int others = 0;  // other holders of the CID
 };
-
-std::string objTouchKey(uint32_t pid, int64_t tb, int kType, int64_t kInt, const std::string& kText) {
-    std::string k(12, '\0');
-    st32(reinterpret_cast<uint8_t*>(&k[0]), pid);
-    st64(reinterpret_cast<uint8_t*>(&k[4]), uint64_t(tb));
-    if (kType == 1) {
-        k.push_back('i');
-        uint8_t b[8];
-        st64(b, uint64_t(kInt));
-        k.append(reinterpret_cast<const char*>(b), 8);
-    } else {
-        k.push_back('t');
-        k += kText;
-    }
-    return k;
-}
-
-std::string objTouchKeyValue(uint32_t pid, int64_t tb, sqlite3_value* v) {
-    if (sqlite3_value_type(v) == SQLITE_INTEGER) return objTouchKey(pid, tb, 1, sqlite3_value_int64(v), "");
-    const unsigned char* t = sqlite3_value_text(v);
-    return objTouchKey(pid, tb, 3, 0, t ? std::string(reinterpret_cast<const char*>(t), sqlite3_value_bytes(v)) : "");
-}
 
 void bindK(sqlite3_stmt* s, int i, const Rec& r) {
     if (r.kType == 1) sqlite3_bind_int64(s, i, r.kInt);
@@ -380,10 +324,10 @@ private:
     int32_t probe();
     int32_t assign();
     int32_t writeJournal();
-    int32_t writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& dels);
-    void publish(const std::unordered_set<File*>& ok, const std::unordered_set<File*>& failed);
+    int32_t writeFile(std::vector<size_t>& idxs);
+    void publish(bool committed);
     void respond();
-    int32_t readHolder(const Holder& h, int64_t tb, Rec& r);
+    int32_t readHolder(const Holder& h, Rec& r);
     void fail(int32_t status, const std::string& err);
 
     Engine* e_;
@@ -393,8 +337,9 @@ private:
     P4Lane L_;  // the probes' type-index connections
     std::vector<Call> calls_;
     std::vector<Rec> recs_;
-    std::vector<File*> files_;  // touched, by tb
-    std::unordered_map<File*, std::vector<Del>> dels_;
+    std::vector<uint32_t> callOf_;  // record index -> its call
+    bool writes_ = false;     // the group writes the partition file
+    std::vector<Del> dels_;   // CAT supersede-on-ingest: rows retired by this group
     std::vector<std::pair<int64_t, int64_t>> inflight_;
     int64_t jfirst_ = 0;
     uint64_t flushEpoch_ = 0;
@@ -516,6 +461,7 @@ bool Group::parseCall(Call& c) {
         }
         c.recs.push_back(recs_.size());
         recs_.push_back(std::move(r));
+        callOf_.push_back(uint32_t(&c - calls_.data()));
     }
     if (p != end) goto malformed;
     return true;
@@ -560,7 +506,6 @@ void Group::prepare(Rec& r, const Call& c) {
     tc.extract(r.frame, r.frameLen, &x, scratch, sizeof scratch);
     r.hasE = x.hasEpoch;
     r.e = x.epochSec;
-    r.tb = sp_->hasBucket && x.hasBucket ? monthOfSec(x.bucketSec) : 0;
     r.w = r.hasE ? r.e : r.ts;
     if (x.objectCol >= 0 && x.objectCol < int(ps::kMaxCols) && x.cols[x.objectCol].present) {
         const ps::ColValue& cv = x.cols[x.objectCol];
@@ -592,16 +537,12 @@ void Group::prepare(Rec& r, const Call& c) {
     }
 }
 
-int32_t Group::readHolder(const Holder& h, int64_t tb, Rec& r) {
-    Part* hp;
+int32_t Group::readHolder(const Holder& h, Rec& r) {
     File* hf = nullptr;
     {
         std::lock_guard<std::mutex> g(t_->mu);
-        hp = t_->partById(h.pid);
-        if (hp) {
-            auto it = hp->files.find(tb);
-            if (it != hp->files.end() && it->second->created && !it->second->retired) hf = it->second;
-        }
+        Part* hp = t_->partById(h.pid);
+        if (hp && hp->file->created) hf = hp->file.get();
     }
     if (!hf) return 0;
     int rc = 0;
@@ -635,26 +576,24 @@ int32_t Group::probe() {
         std::lock_guard<std::mutex> g(t_->mu);
         flushEpoch_ = uint64_t(t_->lastFlushMs);
     }
-    // In-group repeats: sort by (tb, key); later occurrences repeat the first.
+    // In-group repeats: sort by key; later occurrences repeat the first.
     std::vector<size_t> ord;
     for (size_t i = 0; i < recs_.size(); i++)
         if (!recs_[i].reject && recs_[i].frame) ord.push_back(i);
-    std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
-        if (recs_[a].tb != recs_[b].tb) return recs_[a].tb < recs_[b].tb;
-        return std::memcmp(recs_[a].key, recs_[b].key, 32) < 0;
-    });
+    std::stable_sort(ord.begin(), ord.end(),
+                     [&](size_t a, size_t b) { return std::memcmp(recs_[a].key, recs_[b].key, 32) < 0; });
     std::vector<Holder> hs;
     for (size_t oi = 0; oi < ord.size(); oi++) {
         Rec& r = recs_[ord[oi]];
         if (oi > 0) {
             Rec& q = recs_[ord[oi - 1]];
-            if (q.tb == r.tb && std::memcmp(q.key, r.key, 32) == 0) {
+            if (std::memcmp(q.key, r.key, 32) == 0) {
                 r.dupOf = true;
                 r.first = q.dupOf ? q.first : ord[oi - 1];
                 continue;
             }
         }
-        int32_t rc = holdersOf(&L_, t_, r.tb, r.key, &hs);
+        int32_t rc = holdersOf(&L_, t_, r.key, &hs);
         if (rc != P4_OK) return rc;
         const Holder* mine = nullptr;
         for (const Holder& h : hs)
@@ -672,7 +611,7 @@ int32_t Group::probe() {
                 if (r.seqIn != h.seq) { r.reject = P4_REJ_SEQ; break; }
                 // C-22: the copy stores the holder's d and ts, as an ingest
                 // COPY (a holder still in flight: the call's own, same bytes).
-                const int32_t got = readHolder(h, r.tb, r);
+                const int32_t got = readHolder(h, r);
                 if (got < 0) return got;
                 if (got == 1) {
                     r.d = r.own.data();
@@ -685,7 +624,7 @@ int32_t Group::probe() {
                 copied = true;
                 break;
             }
-            const int32_t got = readHolder(h, r.tb, r);
+            const int32_t got = readHolder(h, r);
             if (got < 0) return got;
             if (got == 1) {
                 r.seq = h.seq;
@@ -702,24 +641,20 @@ int32_t Group::probe() {
         if (migrate && sp_->identity && r.ident && !r.tagsIn.empty()) {
             // A migrated record keeps its ingest identity (format 1's
             // sdn_record_ingest_identity row) for later ingest-mode repeats.
-            for (auto& c : calls_)
-                for (size_t gi : c.recs)
-                    if (gi == ord[oi] && r.tagsIn[0].first < c.tags.size()) {
-                        const std::string b = c.tags[r.tagsIn[0].first].f6[0] + '\0' + c.tags[r.tagsIn[0].first].f6[1];
-                        uint8_t dg[32];
-                        ps::sha256(b.data(), b.size(), dg);
-                        r.identSrc = ld64(dg) & 0x7fffffffffffffffull;
-                        r.identNew = true;
-                        std::memcpy(r.identCid, r.key, 32);
-                    }
+            const Call& c = calls_[callOf_[ord[oi]]];
+            if (r.tagsIn[0].first < c.tags.size()) {
+                const std::string b = c.tags[r.tagsIn[0].first].f6[0] + '\0' + c.tags[r.tagsIn[0].first].f6[1];
+                uint8_t dg[32];
+                ps::sha256(b.data(), b.size(), dg);
+                r.identSrc = ld64(dg) & 0x7fffffffffffffffull;
+                r.identNew = true;
+                std::memcpy(r.identCid, r.key, 32);
+            }
         }
         // An ingest identity the lane already holds (IQC).
         if (sp_->identity && r.ident && !migrate) {
-            const Call* call = nullptr;
-            for (auto& c : calls_)
-                for (size_t gi : c.recs)
-                    if (gi == ord[oi]) call = &c;
-            if (call && !call->tags.empty()) {
+            const Call* call = &calls_[callOf_[ord[oi]]];
+            if (!call->tags.empty()) {
                 std::string ps2[2] = {call->tags[0].f6[0], call->tags[0].f6[1]};
                 std::string b = ps2[0] + '\0' + ps2[1];
                 uint8_t dg[32];
@@ -727,11 +662,11 @@ int32_t Group::probe() {
                 r.identSrc = ld64(dg) & 0x7fffffffffffffffull;
                 int64_t hseq = 0;
                 uint8_t hcid[32];
-                rc = identHolder(&L_, t_, r.tb, r.identSrc, r.ident, &hseq, hcid);
+                rc = identHolder(&L_, t_, r.identSrc, r.ident, &hseq, hcid);
                 if (rc != P4_OK) return rc;
                 if (hseq) {
                     std::vector<Holder> ih;
-                    rc = holdersOf(&L_, t_, r.tb, hcid, &ih);
+                    rc = holdersOf(&L_, t_, hcid, &ih);
                     if (rc != P4_OK) return rc;
                     if (!ih.empty()) {
                         // The holder takes this write's tags: retag it here, or copy it here.
@@ -745,7 +680,7 @@ int32_t Group::probe() {
                                 r.seq = h.seq;
                             }
                         if (!here) {
-                            const int32_t got = readHolder(ih[0], r.tb, r);
+                            const int32_t got = readHolder(ih[0], r);
                             if (got < 0) return got;
                             if (got == 1) {
                                 r.write = true;
@@ -785,7 +720,7 @@ int32_t Group::assign() {
         // Recheck: another writer of the type may have taken it since the probe.
         std::vector<Holder> hs;
         if (flushed) {
-            const int32_t rc = holdersOf(&L_, t_, r.tb, r.key, &hs);
+            const int32_t rc = holdersOf(&L_, t_, r.key, &hs);
             if (rc != P4_OK) return rc;
         } else {
             std::lock_guard<std::mutex> g(t_->mu);
@@ -796,8 +731,8 @@ int32_t Group::assign() {
                     hs.push_back(Holder{x.pid, x.seq});
                 }
             };
-            t_->pend.each(r.tb, r.key, note);
-            t_->flushing.each(r.tb, r.key, note);
+            t_->pend.each(r.key, note);
+            t_->flushing.each(r.key, note);
         }
         if (!hs.empty()) {
             if (migrate) {
@@ -814,7 +749,7 @@ int32_t Group::assign() {
                 r.seq = hs[0].seq;
                 continue;
             }
-            const int32_t got = readHolder(hs[0], r.tb, r);
+            const int32_t got = readHolder(hs[0], r);
             if (got < 0) return got;
             if (got == 1) {
                 r.action = P4_ACT_COPY;
@@ -834,14 +769,14 @@ int32_t Group::assign() {
         {
             std::lock_guard<std::mutex> g(t_->mu);
             for (auto& p : t_->parts)
-                for (auto& kv : p->files)
-                    if (kv.second->created && !kv.second->retired) paths.push_back(kv.second->path);
+                if (p->file->created) paths.push_back(p->file->path);
         }
         for (const std::string& path : paths) {
             int rc = 0;
             Conn* c = e_->rpool.acquire(path, OpenKind::Reader, &rc, nullptr);
             if (!c) return statusOfSqlite(rc);
-            sqlite3_stmt* s = c->sql("SELECT seq FROM r");
+            sqlite3_stmt* s = c->sql("SELECT seq FROM r INDEXED BY r_s");
+            if (!s) s = c->sql("SELECT seq FROM r");  // before REBUILD 1
             while (s && sqlite3_step(s) == SQLITE_ROW) t_->migrateSeqs.insert(sqlite3_column_int64(s, 0));
             if (s) sqlite3_reset(s);
             e_->rpool.release(c);
@@ -851,7 +786,6 @@ int32_t Group::assign() {
     std::sort(fresh.begin(), fresh.end(), [&](size_t a, size_t b) {
         const Rec& x = recs_[a];
         const Rec& y = recs_[b];
-        if (x.tb != y.tb) return x.tb < y.tb;
         if (x.w != y.w) return x.w < y.w;
         return std::memcmp(x.key, y.key, 32) < 0;
     });
@@ -873,16 +807,15 @@ int32_t Group::assign() {
         }
         for (Rec& r : recs_) {
             if (r.reject || r.dupOf || !r.write) continue;
-            t_->pend.put(r.key, r.tb, p_->pid, r.seq, 4);
+            t_->pend.put(r.key, p_->pid, r.seq, 4);
             if (r.identNew) {
                 IdentEnt ie;
-                ie.tb = r.tb;
                 ie.src = r.identSrc;
                 std::memcpy(ie.h, r.ident, 32);
                 std::memcpy(ie.cid, r.identCid, 32);
                 ie.seq = r.seq;
                 ie.st = 4;
-                t_->identPend[identMapKey(ie.tb, ie.src, ie.h)] = ie;
+                t_->identPend[identMapKey(ie.src, ie.h)] = ie;
             }
         }
         if (hi) {
@@ -921,20 +854,18 @@ int32_t Group::writeJournal() {
     Conn* j = t_->jdb;
     int rc = j->exec("BEGIN IMMEDIATE");
     int64_t rows = 0;
-    auto addRow = [&](int op, int64_t tb, const uint8_t* k, const uint8_t* c, int64_t pid, int64_t seq, int64_t gen,
-                      const std::string* s, int64_t v) {
+    auto addRow = [&](int op, const uint8_t* k, const uint8_t* c, int64_t pid, int64_t seq, const std::string* s,
+                      int64_t v) {
         if (rc != SQLITE_OK) return;
         sqlite3_stmt* q = j->get(S_J_INS);
         if (!q) { rc = SQLITE_ERROR; return; }
         sqlite3_bind_int(q, 1, op);
-        sqlite3_bind_int64(q, 2, tb);
-        if (k) sqlite3_bind_blob(q, 3, k, 32, SQLITE_STATIC); else sqlite3_bind_null(q, 3);
-        if (c) sqlite3_bind_blob(q, 4, c, 32, SQLITE_STATIC); else sqlite3_bind_null(q, 4);
-        sqlite3_bind_int64(q, 5, pid);
-        sqlite3_bind_int64(q, 6, seq);
-        sqlite3_bind_int64(q, 7, gen);
-        if (s) sqlite3_bind_text(q, 8, s->data(), int(s->size()), SQLITE_STATIC); else sqlite3_bind_null(q, 8);
-        sqlite3_bind_int64(q, 9, v);
+        if (k) sqlite3_bind_blob(q, 2, k, 32, SQLITE_STATIC); else sqlite3_bind_null(q, 2);
+        if (c) sqlite3_bind_blob(q, 3, c, 32, SQLITE_STATIC); else sqlite3_bind_null(q, 3);
+        sqlite3_bind_int64(q, 4, pid);
+        sqlite3_bind_int64(q, 5, seq);
+        if (s) sqlite3_bind_text(q, 6, s->data(), int(s->size()), SQLITE_STATIC); else sqlite3_bind_null(q, 6);
+        sqlite3_bind_int64(q, 7, v);
         const int r = sqlite3_step(q);
         sqlite3_reset(q);
         if (r != SQLITE_DONE) rc = r;
@@ -942,30 +873,29 @@ int32_t Group::writeJournal() {
     };
     if (partNew_) {
         const std::string s = p_->producer + '\x1f' + p_->peer;
-        addRow(J_PART, 0, nullptr, nullptr, p_->pid, 0, 0, &s, 0);
+        addRow(J_PART, nullptr, nullptr, p_->pid, 0, &s, 0);
     }
     {
         std::lock_guard<std::mutex> g(t_->mu);
         for (uint32_t id : newSrcs_) {
             SrcDef* d = t_->srcById(id);
             const std::string s = d->provider + '\x1f' + d->source;
-            addRow(J_SRC, 0, nullptr, nullptr, 0, id, 0, &s, 0);
+            addRow(J_SRC, nullptr, nullptr, 0, id, &s, 0);
         }
         for (uint32_t id : newLanes_) {
             LaneDef* l = t_->laneById(id);
             const std::string s = l->provider + '\x1f' + l->source + '\x1f' + l->batch + '\x1f' + l->ckey + '\x1f' +
                                   l->ppeer + '\x1f' + l->pkey;
-            addRow(J_LANE, 0, nullptr, nullptr, 0, id, 0, &s, l->sid);
+            addRow(J_LANE, nullptr, nullptr, 0, id, &s, l->sid);
         }
     }
-    for (File* f : files_) addRow(J_FILE, f->tb, nullptr, nullptr, p_->pid, 0, f->gen, nullptr, 0);
+    if (writes_) addRow(J_FILE, nullptr, nullptr, p_->pid, 0, nullptr, 0);
     for (Rec& r : recs_) {
         if (r.reject || r.dupOf || !r.write || r.superseded) continue;
-        addRow(J_C, r.tb, r.key, nullptr, p_->pid, r.seq, 0, nullptr, 0);
-        if (r.identNew) addRow(J_IDENT, r.tb, r.ident, r.identCid, p_->pid, r.seq, 0, nullptr, int64_t(r.identSrc));
+        addRow(J_C, r.key, nullptr, p_->pid, r.seq, nullptr, 0);
+        if (r.identNew) addRow(J_IDENT, r.ident, r.identCid, p_->pid, r.seq, nullptr, int64_t(r.identSrc));
     }
-    for (auto& kv : dels_)
-        for (Del& d : kv.second) addRow(J_DEL, d.tb, d.key, nullptr, p_->pid, d.seq, 0, nullptr, d.len);
+    for (Del& d : dels_) addRow(J_DEL, d.key, nullptr, p_->pid, d.seq, nullptr, d.len);
     if (rc == SQLITE_OK) rc = j->exec("COMMIT");
     if (rc != SQLITE_OK) {
         lastErr_ = std::string(sqlite3_errmsg(j->db)) + " (" + std::to_string(rc) + ")";
@@ -986,13 +916,13 @@ int32_t Group::writeJournal() {
 
 
 struct FileOut {
-    int64_t n, bytes, ncopy, minseq, maxseq, minw, maxw, maxts, nnull, mints, mine, maxe, nk;
+    int64_t n, bytes, ncopy, minseq, maxseq, minw, maxw, maxts, nnull, mints, mine, maxe;
     std::map<uint32_t, LaneCount> lanes;  // touched lanes, their new counts
-    std::vector<std::string> objKeys;
-    bool empty = false;
 };
 
-int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& dels) {
+int32_t Group::writeFile(std::vector<size_t>& idxs) {
+    File* f = p_->file.get();
+    std::vector<Del>& dels = dels_;
     int32_t status = P4_OK;
     std::string err;
     Conn* c = writerPin(e_, f, &status, &err);
@@ -1004,7 +934,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     {
         std::lock_guard<std::mutex> g(t_->mu);
         o.n = f->n; o.bytes = f->bytes; o.ncopy = f->ncopy; o.minseq = f->minseq; o.maxseq = f->maxseq;
-        o.minw = f->minw; o.maxw = f->maxw; o.maxts = f->maxts; o.nnull = f->nnull; o.nk = f->nk;
+        o.minw = f->minw; o.maxw = f->maxw; o.maxts = f->maxts; o.nnull = f->nnull;
         o.mints = f->mints; o.mine = f->mine; o.maxe = f->maxe;
     }
     auto laneCount = [&](uint32_t id) -> LaneCount& {
@@ -1028,9 +958,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     for (size_t gi : idxs) {
         if (rc != SQLITE_OK) break;
         Rec& r = recs_[gi];
-        const Call* call = nullptr;
-        for (auto& cc : calls_)
-            if (std::find(cc.recs.begin(), cc.recs.end(), gi) != cc.recs.end()) call = &cc;
+        const Call* call = &calls_[callOf_[gi]];
         int64_t rowLen = r.dLen;
         if (r.write && !r.superseded) {
             sqlite3_stmt* s = c->get(S_INS);
@@ -1068,15 +996,6 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
             if (r.hasE && r.e < o.mine) o.mine = r.e;
             if (r.hasE && r.e > o.maxe) o.maxe = r.e;
             if (!r.hasE && sp_->hasEpochRule) o.nnull++;
-            if (!r.kType && sp_->ek) o.nk++;
-            if (sp_->ek && r.kType) {
-                sqlite3_stmt* u = c->get(S_ENT_UP);
-                bindK(u, 1, r);
-                sqlite3_bind_int64(u, 2, r.w);
-                bad(sqlite3_step(u));
-                sqlite3_reset(u);
-                o.objKeys.push_back(objTouchKey(p_->pid, f->tb, r.kType, r.kInt, r.kText));
-            }
         } else if (!r.inst.empty()) {
             // A held row takes tags: it must be this CID's row.
             sqlite3_stmt* s = c->get(S_R_LEN);
@@ -1161,17 +1080,6 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
         const bool gone = sqlite3_changes(c->db) > 0;
         sqlite3_reset(s);
         if (!gone) continue;
-        if (sp_->ek && d.k) {
-            sqlite3_stmt* u = c->get(S_ENT_DEC);
-            sqlite3_bind_value(u, 1, d.k);
-            bad(sqlite3_step(u));
-            sqlite3_reset(u);
-            u = c->get(S_ENT_GONE);
-            sqlite3_bind_value(u, 1, d.k);
-            bad(sqlite3_step(u));
-            sqlite3_reset(u);
-            o.objKeys.push_back(objTouchKeyValue(p_->pid, f->tb, d.k));
-        }
         o.n--;
         o.bytes -= d.len;
         for (auto& sl : d.lanes) {
@@ -1260,21 +1168,17 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     }
     writerUnpin(e_, f);
     e_->bump(kStGroupCommits);
-    o.empty = o.n <= 0;
     // Publish this file's counters.
     std::lock_guard<std::mutex> g(t_->mu);
     f->n = o.n; f->bytes = o.bytes; f->ncopy = o.ncopy; f->minseq = o.minseq; f->maxseq = o.maxseq;
-    f->minw = o.minw; f->maxw = o.maxw; f->maxts = o.maxts; f->nnull = o.nnull; f->nk = o.nk;
+    f->minw = o.minw; f->maxw = o.maxw; f->maxts = o.maxts; f->nnull = o.nnull;
     f->mints = o.mints; f->mine = o.mine; f->maxe = o.maxe;
     for (auto& kv : o.lanes) {
         if (kv.second.n <= 0) f->lanes.erase(kv.first);
         else f->lanes[kv.first] = kv.second;
     }
-    for (auto& k : o.objKeys) t_->touchedObj.insert(k);
     f->created = true;
     f->touched = true;
-    f->removed += int64_t(dels.size());
-    noteTb(t_, f->tb);
     return P4_OK;
 }
 
@@ -1286,14 +1190,14 @@ void Group::fail(int32_t status, const std::string& err) {
         }
 }
 
-void Group::publish(const std::unordered_set<File*>& ok, const std::unordered_set<File*>& failed) {
+void Group::publish(bool fileCommitted) {
     std::lock_guard<std::mutex> g(t_->mu);
     for (Rec& r : recs_) {
         if (r.dupOf || !r.write) continue;
-        const bool committed = r.file && ok.count(r.file) && !r.reject && !r.superseded;
-        if (r.reject && !r.file) continue;
+        const bool committed = fileCommitted && r.inFile && !r.reject && !r.superseded;
+        if (r.reject && !r.inFile) continue;
         if (committed) {
-            t_->pend.put(r.key, r.tb, p_->pid, r.seq, 1);
+            t_->pend.put(r.key, p_->pid, r.seq, 1);
             if (r.action == P4_ACT_NEW || r.action == P4_ACT_MIGRATED) {
                 t_->uniq++;
                 t_->uniqBytes += r.dLen;
@@ -1301,26 +1205,24 @@ void Group::publish(const std::unordered_set<File*>& ok, const std::unordered_se
                 t_->copies++;
             }
             if (r.identNew) {
-                auto it = t_->identPend.find(identMapKey(r.tb, r.identSrc, r.ident));
+                auto it = t_->identPend.find(identMapKey(r.identSrc, r.ident));
                 if (it != t_->identPend.end()) it->second.st = 1;
             }
         } else {
-            t_->pend.kill(r.tb, r.key, p_->pid);
-            if (r.identNew) t_->identPend.erase(identMapKey(r.tb, r.identSrc, r.ident));
+            t_->pend.kill(r.key, p_->pid);
+            if (r.identNew) t_->identPend.erase(identMapKey(r.identSrc, r.ident));
         }
     }
-    for (auto& kv : dels_) {
-        if (!ok.count(kv.first)) continue;
-        for (Del& d : kv.second) {
-            t_->pend.kill(d.tb, d.key, p_->pid);
-            t_->pend.put(d.key, d.tb, p_->pid, d.seq, 2);
+    if (fileCommitted)
+        for (Del& d : dels_) {
+            t_->pend.kill(d.key, p_->pid);
+            t_->pend.put(d.key, p_->pid, d.seq, 2);
             if (d.others) t_->copies--;
             else {
                 t_->uniq--;
                 t_->uniqBytes -= d.len;
             }
         }
-    }
     for (auto& r : inflight_) {
         for (size_t i = 0; i < t_->inflight.size(); i++)
             if (t_->inflight[i] == r) {
@@ -1336,12 +1238,6 @@ void Group::publish(const std::unordered_set<File*>& ok, const std::unordered_se
                 break;
             }
     }
-    p_->n = p_->bytes = 0;
-    for (auto& kv : p_->files) {
-        p_->n += kv.second->n;
-        p_->bytes += kv.second->bytes;
-    }
-    (void)failed;
 }
 
 void Group::respond() {
@@ -1452,75 +1348,63 @@ void Group::run(std::vector<WriteTask*>& tasks) {
         respond();
         return;
     }
+    // The type's T/ files exist from its first write (C-32).
+    {
+        std::string err;
+        const int32_t frc = typeFilesEnsure(t_, &err);
+        if (frc != P4_OK) {
+            fail(frc, "type files: " + err);
+            respond();
+            return;
+        }
+    }
     int32_t rc = probe();
     if (rc != P4_OK) {
         fail(rc, "dedupe probe failed");
         respond();
         return;
     }
-    // Files: one per bucket month the group writes or retags in, claimed
-    // until the publish (a quota drop waits for the claims).
-    struct Claims {
-        Type* t;
-        std::vector<File*> files;
-        ~Claims() {
-            for (File* f : files) fileRelease(t, f);
-        }
-    } claims{t_, {}};
-    bool dropping = false;
+    File* f = p_->file.get();
     {
         std::lock_guard<std::mutex> g(t_->mu);
         for (Rec& r : recs_) {
             if (r.reject || r.dupOf || !r.action) continue;
             if (!r.write && r.inst.empty()) continue;
-            File* f = fileFor(t_, p_, r.tb, r.write);
-            if (!f) {
-                r.reject = P4_REJ_BAD_ENTRY;
-                continue;
-            }
-            if (f->dropping) {
-                dropping = true;
-                break;
-            }
-            if (calls_[0].mode == 1 && !f->created) f->indexed = false;
-            r.file = f;
-            if (std::find(files_.begin(), files_.end(), f) == files_.end()) {
-                fileClaim(f);
-                claims.files.push_back(f);
-                files_.push_back(f);
-            }
+            r.inFile = true;
+            writes_ = true;
         }
+        if (calls_[0].mode == 1 && !f->created) f->indexed = false;
     }
-    if (dropping) {
-        // A month being dropped: the calls retry after the drop (new generation).
-        fail(P4_E_BUSY, "a content month is being dropped (quota); retry");
-        respond();
-        return;
-    }
-    // Repeats inside the group that add tags write to their first record's file.
+    // Repeats inside the group that add tags write with their first record.
     for (Rec& r : recs_)
-        if (r.dupOf && !r.inst.empty()) r.file = recs_[r.first].file;
+        if (r.dupOf && !r.inst.empty()) r.inFile = recs_[r.first].inFile;
     // CAT supersede-on-ingest: this partition's rows of the same (source,
     // object identity), retired in the same transaction (record_supersede.go).
-    if (sp_->hasSupersede) {
+    if (sp_->hasSupersede && calls_[0].mode == 0) {
         std::unordered_map<std::string, size_t> lastOf;
         for (size_t i = 0; i < recs_.size(); i++) {
             Rec& r = recs_[i];
-            if (r.reject || r.dupOf || !r.write || !r.hasSup || calls_[0].mode == 1) continue;
+            if (r.reject || r.dupOf || !r.write || !r.hasSup) continue;
             const std::string key = std::to_string(r.supSid) + '\x1f' + r.supIdentity;
             auto it = lastOf.find(key);
             if (it != lastOf.end()) recs_[it->second].superseded = true;
             lastOf[key] = i;
         }
+        bool created;
+        {
+            std::lock_guard<std::mutex> g(t_->mu);
+            created = f->created;
+        }
+        Conn* c = nullptr;
         for (Rec& r : recs_) {
-            if (r.reject || r.dupOf || !r.write || !r.hasSup || r.superseded || !r.kType || !r.file || !r.file->created ||
-                calls_[0].mode == 1)
-                continue;
-            int32_t prc = P4_OK;
-            Conn* c = writerPin(e_, r.file, &prc, nullptr);
+            if (r.reject || r.dupOf || !r.write || !r.hasSup || r.superseded || !r.kType || !created) continue;
             if (!c) {
-                fail(prc, "writer open failed");
-                break;
+                int32_t prc = P4_OK;
+                c = writerPin(e_, f, &prc, nullptr);
+                if (!c) {
+                    fail(prc, "writer open failed");
+                    break;
+                }
             }
             sqlite3_stmt* s = c->get(S_SUP_K);
             bindK(s, 1, r);
@@ -1535,29 +1419,28 @@ void Group::run(std::vector<WriteTask*>& tasks) {
                                                   size_t(sqlite3_column_bytes(s, 4)));
                 if (id != r.supIdentity) continue;
                 Del d;
-                d.file = r.file;
                 d.seq = sqlite3_column_int64(s, 0);
                 d.len = sqlite3_column_int64(s, 2);
                 d.w = sqlite3_column_int64(s, 5);
-                d.tb = r.file->tb;
                 std::memcpy(d.key, sqlite3_column_blob(s, 1), 32);
                 cand.push_back(std::move(d));
             }
             sqlite3_reset(s);
             for (Del& d : cand) {
                 bool seen = false;
-                for (Del& x : dels_[r.file]) seen = seen || x.seq == d.seq;
+                for (Del& x : dels_) seen = seen || x.seq == d.seq;
                 if (seen) continue;
                 sqlite3_stmt* q = c->get(S_RL_OF);
                 sqlite3_bind_int64(q, 1, d.seq);
                 while (sqlite3_step(q) == SQLITE_ROW)
                     d.lanes.push_back({uint32_t(sqlite3_column_int64(q, 0)), uint32_t(sqlite3_column_int64(q, 1))});
                 sqlite3_reset(q);
-                dels_[r.file].push_back(std::move(d));
+                dels_.push_back(std::move(d));
             }
-            writerUnpin(e_, r.file);
         }
-        for (auto& kv : dels_) e_->bump(kStCatSuperseded, kv.second.size());
+        if (c) writerUnpin(e_, f);
+        if (!dels_.empty()) writes_ = true;
+        e_->bump(kStCatSuperseded, dels_.size());
     }
     bool ok = true;
     for (Call& c : calls_) ok = ok && c.status == P4_OK;
@@ -1568,72 +1451,38 @@ void Group::run(std::vector<WriteTask*>& tasks) {
     rc = assign();
     if (rc != P4_OK) {
         fail(rc, "seq assignment failed");
-        std::unordered_set<File*> none;
-        publish(none, none);
+        publish(false);
         respond();
         return;
     }
     rc = writeJournal();
     if (rc != P4_OK) {
         fail(rc, "journal commit failed: " + lastErr_);
-        std::unordered_set<File*> none;
-        publish(none, none);
+        publish(false);
         respond();
         return;
     }
-    std::sort(files_.begin(), files_.end(), [](File* a, File* b) { return a->tb < b->tb; });
-    std::unordered_set<File*> okFiles, failedFiles;
-    for (File* f : files_) {
+    bool committed = false;
+    if (writes_) {
         std::vector<size_t> idxs;
         for (size_t i = 0; i < recs_.size(); i++)
-            if (recs_[i].file == f && !recs_[i].reject) idxs.push_back(i);
-        std::vector<Del>& dl = dels_[f];
-        // Delete values for ent: read k from the rows before they go.
-        if (!dl.empty()) {
-            int32_t prc = P4_OK;
-            Conn* c = writerPin(e_, f, &prc, nullptr);
-            if (c) {
-                for (Del& d : dl) {
-                    sqlite3_stmt* s = c->sql("SELECT k FROM r WHERE seq=?1");
-                    sqlite3_bind_int64(s, 1, d.seq);
-                    if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL)
-                        d.k = sqlite3_value_dup(sqlite3_column_value(s, 0));
-                    sqlite3_reset(s);
-                }
-                writerUnpin(e_, f);
-            }
-        }
-        rc = writeFile(f, idxs, dl);
-        for (Del& d : dl)
-            if (d.k) {
-                sqlite3_value_free(d.k);
-                d.k = nullptr;
-            }
-        if (rc == P4_OK) {
-            okFiles.insert(f);
-        } else {
-            failedFiles.insert(f);
+            if (recs_[i].inFile && !recs_[i].reject) idxs.push_back(i);
+        rc = writeFile(idxs);
+        committed = rc == P4_OK;
+        if (!committed)
             for (Call& c : calls_)
                 for (size_t gi : c.recs)
-                    if (recs_[gi].file == f && c.status == P4_OK) {
+                    if (recs_[gi].inFile && c.status == P4_OK) {
                         c.status = rc;
                         c.err = "partition file commit failed: " + lastErr_;
                     }
-        }
     }
     {
         // A retired row's last-copy decision is atomic with the publish (dmu).
         std::lock_guard<std::mutex> dg(t_->dmu);
-        for (auto& kv : dels_) {
-            if (!okFiles.count(kv.first)) continue;
-            for (Del& d : kv.second) {
-                std::vector<Holder> hs;
-                d.others = 0;
-                if (holdersOf(&L_, t_, d.tb, d.key, &hs) == P4_OK)
-                    for (auto& h : hs) d.others += h.pid != p_->pid;
-            }
-        }
-        publish(okFiles, failedFiles);
+        if (committed)
+            for (Del& d : dels_) d.others = othersHolding(&L_, t_, d.key, p_->pid);
+        publish(committed);
     }
     respond();
     bool kick;

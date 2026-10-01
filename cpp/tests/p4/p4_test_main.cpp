@@ -218,7 +218,7 @@ TestType& catType() {
 }
 TestType& iqcType() {
     static TestType t = [] {
-        TestType x = makeType(kIqc, "IQC", "$IQC", "bucket str:CAPTURE_START\n");
+        TestType x = makeType(kIqc, "IQC", "$IQC", "");
         x.identity = true;
         x.pageSize = 16384;
         return x;

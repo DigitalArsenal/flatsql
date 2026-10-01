@@ -64,7 +64,7 @@ TestType realType(const std::string& dir, const std::string& name) {
                   "supersede pair:uri:CATALOG_URI,CATALOG_OBJECT_ID|u64:norad:NORAD_CAT_ID|str:object:OBJECT_ID\n";
         t.fullText = true;
     } else if (name == "IQC") {
-        t.rules = "bucket str:CAPTURE_START\n";
+        t.rules = "";
         t.identity = true;
         t.pageSize = 16384;
     }
@@ -458,6 +458,75 @@ P4_SLOW_TEST(g2_fixture) {
             mism++;
             std::printf("  %s INDEX_PAGE differs (%zu rows vs %zu)\n", type.c_str(), pg.rows.size(), i);
         }
+        // EPOCH points (as_of, forward, nearest) for every object: format 1's
+        // queryPointEpochRecords ranking, on its index joined to its table.
+        if (type == "OMM" || type == "MPE") {
+            const std::string ent =
+                type == "OMM" ? "COALESCE(CASE WHEN idx.norad_cat_id IS NOT NULL THEN CAST(idx.norad_cat_id AS TEXT) END,"
+                                " NULLIF(idx.entity_id, ''), idx.cid)"
+                              : "COALESCE(NULLIF(idx.entity_id, ''), CASE WHEN idx.norad_cat_id IS NOT NULL THEN"
+                                " CAST(idx.norad_cat_id AS TEXT) END, idx.cid)";
+            int64_t lo = 0, hi = 0;
+            sqlite3_prepare_v2(fx, "SELECT min(epoch_unix), max(epoch_unix) FROM sdn_record_index WHERE schema_name=?1", -1, &q,
+                               nullptr);
+            sqlite3_bind_text(q, 1, (type + ".fbs").c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(q) == SQLITE_ROW) {
+                lo = sqlite3_column_int64(q, 0);
+                hi = sqlite3_column_int64(q, 1);
+            }
+            sqlite3_finalize(q);
+            std::string tbl;
+            for (auto& p : parts)
+                if (p.type == type) tbl = p.table;
+            const int64_t ats[3] = {lo + (hi - lo) / 4, lo + (hi - lo) / 2, hi - (hi - lo) / 20};
+            for (int profile = 2; profile <= 4; profile++)
+                for (int64_t at : ats) {
+                    std::string where = "idx.epoch_unix IS NOT NULL";
+                    std::string rank = "e DESC, cid ASC";
+                    if (profile == 3) where += " AND idx.epoch_unix <= ?2";
+                    if (profile == 4) {
+                        where += " AND idx.epoch_unix >= ?2";
+                        rank = "e ASC, cid ASC";
+                    }
+                    if (profile == 2) rank = "ABS(e - ?2) ASC, CASE WHEN e <= ?2 THEN 0 ELSE 1 END ASC, e DESC, cid ASC";
+                    const std::string sql =
+                        "WITH c AS (SELECT d.cid AS cid, " + ent + " AS k, idx.epoch_unix AS e FROM \"" + tbl +
+                        "\" d JOIN sdn_record_index idx ON idx.schema_name=?1 AND idx.cid=d.cid WHERE " + where +
+                        "), r AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY k ORDER BY " + rank +
+                        ") rn FROM c) SELECT k, cid, e FROM r WHERE rn=1 ORDER BY k";
+                    std::vector<std::string> want;
+                    const uint64_t f1t = flatsql::ps::monoNs();
+                    if (sqlite3_prepare_v2(fx, sql.c_str(), -1, &q, nullptr) != SQLITE_OK) {
+                        std::printf("  F1 epoch SQL: %s\n", sqlite3_errmsg(fx));
+                        mism++;
+                        continue;
+                    }
+                    sqlite3_bind_text(q, 1, (type + ".fbs").c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(q, 2, at);
+                    while (sqlite3_step(q) == SQLITE_ROW)
+                        want.push_back(std::string(ct(q, 0)) + "|" + ct(q, 1) + "|" + std::to_string(sqlite3_column_int64(q, 2)));
+                    sqlite3_finalize(q);
+                    const double f1ms = double(flatsql::ps::monoNs() - f1t) / 1e6;
+                    TlvW ep;
+                    ep.text(1, type).u8(30, uint8_t(profile)).i64(31, at);
+                    const uint64_t f4t = flatsql::ps::monoNs();
+                    Result er = call(P4_OPC_EPOCH, ep.b, CallOpts{0, 0, 0, 0, 0, 0, false, 600000});
+                    const double f4ms = double(flatsql::ps::monoNs() - f4t) / 1e6;
+                    std::vector<std::string> got;
+                    for (size_t i = 0; i < er.rows.size(); i++)
+                        got.push_back(er.s(i, "key") + "|" + er.s(i, "cid") + "|" + std::to_string(er.i(i, "epoch")));
+                    std::printf("  %s EPOCH %d at %lld: %zu objects (F1 %zu), %.1f ms (F1 SQL %.1f ms), examined %llu\n",
+                                type.c_str(), profile, (long long)at, got.size(), want.size(), f4ms, f1ms,
+                                (unsigned long long)er.rowsExamined);
+                    if (er.status != P4_OK || got != want) {
+                        mism++;
+                        size_t d = 0;
+                        while (d < got.size() && d < want.size() && got[d] == want[d]) d++;
+                        std::printf("    differs at %zu: %s vs %s\n", d, d < got.size() ? got[d].c_str() : "-",
+                                    d < want.size() ? want[d].c_str() : "-");
+                    }
+                }
+        }
         std::printf("  %s: %d sampled records checked\n", type.c_str(), checked);
     }
     TlvW v8;
@@ -567,7 +636,7 @@ P4_SLOW_TEST(a18_probe) {
 //   --mode=w06 --store=<fixture clone>: batch supersede of OMM keeping
 //       OMM-celestrak-gp-b053 (benchset W06: every OMM record goes).
 //   --mode=w10 --store=<fixture clone>: quota GC to 90% of the store's bytes
-//       (benchset W10: the oldest content months go first).
+//       (benchset W10: the oldest arrivals go first).
 P4_SLOW_TEST(g3_bench) {
     const std::string mode = argStr("mode", "producers");
     if (mode == "producers") {
@@ -667,13 +736,13 @@ P4_SLOW_TEST(g3_bench) {
 
 // G6 measurements.
 //   --mode=nearest [--producers=101] [--months=30] [--per=100] [--objects=1000]
-//       [--store=<dir>] [--keep=1]: an OMM store of producers x months files
-//       (3,030 at the defaults), then EPOCH nearest (profile 2) over every
-//       object at 20 epochs: p50/p99 (gate: under format 2's p99).
+//       [--store=<dir>] [--keep=1]: an OMM store of 101 producers (one file
+//       each) with epochs over 30 months, then EPOCH nearest (profile 2) over
+//       every object at 20 epochs: p50/p99 (gate: under format 2's p99).
 P4_SLOW_TEST(g6_bench) {
     const std::string mode = argStr("mode", "nearest");
     if (mode == "iqc") {
-        // IQC (CAPTURE_START months, ingest identities) to --entries records in
+        // IQC (ingest identities) to --entries records in
         // 4,096-record calls: the write cost per entry at the start and the end.
         const std::string root = argStr("store", scratchDir("g6iqc")) + "/fsql4";
         EngineOpts o;

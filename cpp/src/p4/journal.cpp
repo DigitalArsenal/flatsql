@@ -1,9 +1,9 @@
 // Store format 4: the per-type intent journal (design §3.2, B3).
 //
-// T/<TYPE>.jnl is a SQLite file with synchronous=FULL. Before any partition
-// file of a group commits, one journal transaction appends the group's
-// intents: the partition, new sources and lanes, every file it writes, one row
-// per new CID entry and ingest identity, and delete intents. Seq blocks are
+// T/<TYPE>.jnl is a SQLite file with synchronous=FULL. Before a partition
+// file commits, one journal transaction appends the group's intents: the
+// partition, new sources and lanes, the file it writes, one row per new CID
+// entry and ingest identity, and delete intents. Seq blocks are
 // reserved in jm before any seq of the block can commit. The type index is
 // derived and flushed lazily; open replays the journal tail into it, keeping
 // each CID entry only if its row exists in its file (read by rowid, CID
@@ -18,8 +18,8 @@ namespace p4 {
 
 namespace {
 const char* kJournalSchema =
-    "CREATE TABLE IF NOT EXISTS j(id INTEGER PRIMARY KEY AUTOINCREMENT, op INTEGER NOT NULL, tb INTEGER,"
-    " k BLOB, c BLOB, pid INTEGER, seq INTEGER, gen INTEGER, s TEXT, v INTEGER);"
+    "CREATE TABLE IF NOT EXISTS j(id INTEGER PRIMARY KEY AUTOINCREMENT, op INTEGER NOT NULL,"
+    " k BLOB, c BLOB, pid INTEGER, seq INTEGER, s TEXT, v INTEGER);"
     "CREATE TABLE IF NOT EXISTS jm(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;";
 
 std::vector<std::string> splitUnit(const std::string& s, size_t want) {
@@ -110,28 +110,25 @@ int32_t journalReplay(Type* t, std::string* err) {
 
     struct JE {
         int op;
-        int64_t tb, seq, v;
+        int64_t seq, v;
         uint32_t pid;
-        int32_t gen;
         uint8_t k[32];
         uint8_t c[32];
         std::string s;
     };
     std::vector<JE> rows;
-    sqlite3_stmt* q = j->sql("SELECT op, tb, k, c, pid, seq, gen, s, v FROM j ORDER BY id");
+    sqlite3_stmt* q = j->sql("SELECT op, k, c, pid, seq, s, v FROM j ORDER BY id");
     if (!q) { *err = sqlite3_errmsg(j->db); return P4_E_IO; }
     int rc;
     while ((rc = sqlite3_step(q)) == SQLITE_ROW) {
         JE x{};
         x.op = sqlite3_column_int(q, 0);
-        x.tb = sqlite3_column_int64(q, 1);
-        if (sqlite3_column_bytes(q, 2) == 32) std::memcpy(x.k, sqlite3_column_blob(q, 2), 32);
-        if (sqlite3_column_bytes(q, 3) == 32) std::memcpy(x.c, sqlite3_column_blob(q, 3), 32);
-        x.pid = uint32_t(sqlite3_column_int64(q, 4));
-        x.seq = sqlite3_column_int64(q, 5);
-        x.gen = sqlite3_column_int(q, 6);
-        x.s = colText(q, 7);
-        x.v = sqlite3_column_int64(q, 8);
+        if (sqlite3_column_bytes(q, 1) == 32) std::memcpy(x.k, sqlite3_column_blob(q, 1), 32);
+        if (sqlite3_column_bytes(q, 2) == 32) std::memcpy(x.c, sqlite3_column_blob(q, 2), 32);
+        x.pid = uint32_t(sqlite3_column_int64(q, 3));
+        x.seq = sqlite3_column_int64(q, 4);
+        x.s = colText(q, 5);
+        x.v = sqlite3_column_int64(q, 6);
         rows.push_back(std::move(x));
     }
     sqlite3_reset(q);
@@ -201,45 +198,12 @@ int32_t journalReplay(Type* t, std::string* err) {
         } else if (x.op == J_FILE) {
             Part* p = t->partById(x.pid);
             if (!p) continue;
-            File* f = nullptr;
-            auto it = p->files.find(x.tb);
-            if (it != p->files.end() && it->second->gen == x.gen) {
-                f = it->second;
-            } else if (it == p->files.end() || it->second->gen < x.gen) {
-                auto nf = std::make_unique<File>();
-                nf->part = p;
-                nf->tb = x.tb;
-                nf->gen = x.gen;
-                nf->path = t->filePath(p->pid, x.tb, x.gen);
-                f = nf.get();
-                if (it != p->files.end()) it->second->retired = true;
-                p->files[x.tb] = f;
-                p->all.push_back(std::move(nf));
+            File* f = p->file.get();
+            if (!checked.count(f)) {
+                checked.insert(f);
+                f->created = fileHasSchema(f->path);
             }
-            if (f) {
-                if (!checked.count(f)) {
-                    checked.insert(f);
-                    f->created = fileHasSchema(f->path);
-                }
-                f->touched = true;
-                f->objRefresh = true;
-                noteTb(t, x.tb);
-            }
-        } else if (x.op == J_DROP) {
-            Part* p = t->partById(x.pid);
-            if (!p) continue;
-            auto it = p->files.find(x.tb);
-            if (it != p->files.end() && it->second->gen == x.gen) {
-                it->second->retired = true;
-                p->files.erase(it);
-                // The drop's index rows, if the crash came before they went
-                // (the J_DROP is still here, so no flush has run past it).
-                const int32_t drc = dropIndexRows(t, x.pid, x.tb);
-                if (drc != P4_OK) {
-                    *err = "replay: completing a drop failed";
-                    return drc;
-                }
-            }
+            f->touched = true;
         }
     }
     // 2. Entries, checked against the files. One maintenance connection per
@@ -254,18 +218,16 @@ int32_t journalReplay(Type* t, std::string* err) {
         conns[f] = c;
         return c;
     };
-    auto fileOf = [&](uint32_t pid, int64_t tb) -> File* {
+    auto fileOf = [&](uint32_t pid) -> File* {
         Part* p = t->partById(pid);
-        if (!p) return nullptr;
-        auto it = p->files.find(tb);
-        return it == p->files.end() ? nullptr : it->second;
+        return p ? p->file.get() : nullptr;
     };
     Conn* idx = t->idx;
     std::unordered_set<int64_t> liveSeqs;
     std::shared_ptr<const Spec> sp = t->spec_;
     for (const JE& x : rows) {
         if (x.op != J_C && x.op != J_DEL) continue;
-        File* f = fileOf(x.pid, x.tb);
+        File* f = fileOf(x.pid);
         Conn* c = f ? connOf(f) : nullptr;
         bool present = false;
         int64_t len = 0;
@@ -283,11 +245,10 @@ int32_t journalReplay(Type* t, std::string* err) {
         }
         bool inIndex = false;
         {
-            sqlite3_stmt* s = idx->sql("SELECT 1 FROM c WHERE tb=?1 AND cid=?2 AND pid=?3");
+            sqlite3_stmt* s = idx->sql("SELECT 1 FROM c WHERE cid=?1 AND pid=?2");
             if (s) {
-                sqlite3_bind_int64(s, 1, x.tb);
-                sqlite3_bind_blob(s, 2, x.k, 32, SQLITE_STATIC);
-                sqlite3_bind_int64(s, 3, x.pid);
+                sqlite3_bind_blob(s, 1, x.k, 32, SQLITE_STATIC);
+                sqlite3_bind_int64(s, 2, x.pid);
                 inIndex = sqlite3_step(s) == SQLITE_ROW;
                 sqlite3_reset(s);
             }
@@ -296,7 +257,7 @@ int32_t journalReplay(Type* t, std::string* err) {
         int others = 0;
         {
             std::vector<Holder> hs;
-            holdersWith(t, idx, x.tb, x.k, &hs, true);
+            holdersWith(t, idx, x.k, &hs, true);
             for (auto& h : hs) others += h.pid != x.pid;
         }
         if (x.op == J_C) {
@@ -305,105 +266,91 @@ int32_t journalReplay(Type* t, std::string* err) {
             if (x.seq >= t->nextSeq) t->nextSeq = x.seq + 1;
             if (!inIndex) {
                 bool pendingHas = false;
-                t->pend.each(x.tb, x.k, [&](const CEnt& ce) { pendingHas = pendingHas || (ce.pid == x.pid && ce.st == 1); });
+                t->pend.each(x.k, [&](const CEnt& ce) { pendingHas = pendingHas || (ce.pid == x.pid && ce.st == 1); });
                 if (!pendingHas) {
                     if (others) t->copies++;
                     else { t->uniq++; t->uniqBytes += len; }
-                    t->pend.put(x.k, x.tb, x.pid, x.seq, 1);
+                    t->pend.put(x.k, x.pid, x.seq, 1);
                 }
-                noteTb(t, x.tb);
             }
         } else {  // J_DEL: applied when the row is gone
             if (present) continue;
             bool pendingLive = false;
-            t->pend.each(x.tb, x.k, [&](const CEnt& ce) { pendingLive = pendingLive || (ce.pid == x.pid && ce.st == 1); });
+            t->pend.each(x.k, [&](const CEnt& ce) { pendingLive = pendingLive || (ce.pid == x.pid && ce.st == 1); });
             if (inIndex || pendingLive) {
                 if (others) t->copies--;
                 else { t->uniq--; t->uniqBytes -= x.v; }
-                t->pend.kill(x.tb, x.k, x.pid);
-                t->pend.put(x.k, x.tb, x.pid, x.seq, 2);
+                t->pend.kill(x.k, x.pid);
+                t->pend.put(x.k, x.pid, x.seq, 2);
             }
         }
     }
     for (const JE& x : rows) {
         if (x.op != J_IDENT || !liveSeqs.count(x.seq)) continue;
         IdentEnt ie;
-        ie.tb = x.tb;
         ie.src = uint64_t(x.v);
         std::memcpy(ie.h, x.k, 32);
         std::memcpy(ie.cid, x.c, 32);
         ie.seq = x.seq;
         ie.st = 1;
-        t->identPend[identMapKey(ie.tb, ie.src, ie.h)] = ie;
+        t->identPend[identMapKey(ie.src, ie.h)] = ie;
     }
-    // 3. Recount every touched file from its own meta and lane rows.
+    // 3. Recount every touched file from its own rows and lane rows.
     for (auto& p : t->parts) {
-        bool any = false;
-        for (auto& kv : p->files) {
-            File* f = kv.second;
-            if (!f->touched) continue;
-            any = true;
-            Conn* c = connOf(f);
-            if (!c) continue;
-            f->n = f->bytes = f->ncopy = f->nnull = f->maxts = f->nk = 0;
-            f->minseq = INT64_MAX;
-            f->maxseq = 0;
-            f->minw = INT64_MAX;
-            f->maxw = INT64_MIN;
-            sqlite3_stmt* s = c->sql(
-                "SELECT count(*), coalesce(sum(length(d)),0), min(seq), max(seq), min(w), max(w), coalesce(max(ts),0),"
-                " coalesce(sum(e IS NULL),0), min(ts), min(e), max(e), coalesce(sum(k IS NULL),0) FROM r");
-            if (s && sqlite3_step(s) == SQLITE_ROW) {
-                f->n = sqlite3_column_int64(s, 0);
-                f->bytes = sqlite3_column_int64(s, 1);
-                if (f->n) {
-                    f->minseq = sqlite3_column_int64(s, 2);
-                    f->maxseq = sqlite3_column_int64(s, 3);
-                    f->minw = sqlite3_column_int64(s, 4);
-                    f->maxw = sqlite3_column_int64(s, 5);
-                }
-                f->maxts = sqlite3_column_int64(s, 6);
-                f->nnull = sqlite3_column_int64(s, 7);
-                f->mints = sqlite3_column_type(s, 8) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 8);
-                f->mine = sqlite3_column_type(s, 9) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 9);
-                f->maxe = sqlite3_column_type(s, 10) == SQLITE_NULL ? INT64_MIN : sqlite3_column_int64(s, 10);
-                f->nk = sqlite3_column_int64(s, 11);
+        File* f = p->file.get();
+        if (!f->touched) continue;
+        Conn* c = connOf(f);
+        if (!c) continue;
+        f->n = f->bytes = f->ncopy = f->nnull = f->maxts = 0;
+        f->minseq = INT64_MAX;
+        f->maxseq = 0;
+        f->minw = INT64_MAX;
+        f->maxw = INT64_MIN;
+        sqlite3_stmt* s = c->sql(
+            "SELECT count(*), coalesce(sum(length(d)),0), min(seq), max(seq), min(w), max(w), coalesce(max(ts),0),"
+            " coalesce(sum(e IS NULL),0), min(ts), min(e), max(e) FROM r");
+        if (s && sqlite3_step(s) == SQLITE_ROW) {
+            f->n = sqlite3_column_int64(s, 0);
+            f->bytes = sqlite3_column_int64(s, 1);
+            if (f->n) {
+                f->minseq = sqlite3_column_int64(s, 2);
+                f->maxseq = sqlite3_column_int64(s, 3);
+                f->minw = sqlite3_column_int64(s, 4);
+                f->maxw = sqlite3_column_int64(s, 5);
             }
-            if (s) sqlite3_reset(s);
-            s = c->sql("SELECT v FROM meta WHERE k='ncopy'");
-            if (s && sqlite3_step(s) == SQLITE_ROW) f->ncopy = sqlite3_column_int64(s, 0);
-            if (s) sqlite3_reset(s);
-            s = c->sql("SELECT v FROM meta WHERE k='ix'");
-            if (s && sqlite3_step(s) == SQLITE_ROW) f->indexed = sqlite3_column_int64(s, 0) != 0;
-            if (s) sqlite3_reset(s);
-            f->lanes.clear();
-            s = c->sql(
-                "SELECT id, n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts FROM lane WHERE n>0");
-            while (s && sqlite3_step(s) == SQLITE_ROW) {
-                LaneCount lc;
-                lc.n = sqlite3_column_int64(s, 1);
-                lc.bytes = sqlite3_column_int64(s, 2);
-                lc.minw = sqlite3_column_type(s, 3) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 3);
-                lc.maxw = sqlite3_column_type(s, 4) == SQLITE_NULL ? INT64_MIN : sqlite3_column_int64(s, 4);
-                lc.maxseq = sqlite3_column_int64(s, 5);
-                lc.created = sqlite3_column_int64(s, 6);
-                lc.updated = sqlite3_column_int64(s, 7);
-                lc.maxat = sqlite3_column_int64(s, 8);
-                lc.url = colText(s, 9);
-                lc.url0 = colText(s, 10);
-                lc.maxts = sqlite3_column_int64(s, 11);
-                f->lanes[uint32_t(sqlite3_column_int64(s, 0))] = lc;
-            }
-            if (s) sqlite3_reset(s);
-            if (f->maxseq >= t->nextSeq) t->nextSeq = f->maxseq + 1;
+            f->maxts = sqlite3_column_int64(s, 6);
+            f->nnull = sqlite3_column_int64(s, 7);
+            f->mints = sqlite3_column_type(s, 8) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 8);
+            f->mine = sqlite3_column_type(s, 9) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 9);
+            f->maxe = sqlite3_column_type(s, 10) == SQLITE_NULL ? INT64_MIN : sqlite3_column_int64(s, 10);
         }
-        if (any) {
-            p->n = p->bytes = 0;
-            for (auto& kv : p->files) {
-                p->n += kv.second->n;
-                p->bytes += kv.second->bytes;
-            }
+        if (s) sqlite3_reset(s);
+        s = c->sql("SELECT v FROM meta WHERE k='ncopy'");
+        if (s && sqlite3_step(s) == SQLITE_ROW) f->ncopy = sqlite3_column_int64(s, 0);
+        if (s) sqlite3_reset(s);
+        s = c->sql("SELECT v FROM meta WHERE k='ix'");
+        if (s && sqlite3_step(s) == SQLITE_ROW) f->indexed = sqlite3_column_int64(s, 0) != 0;
+        if (s) sqlite3_reset(s);
+        f->lanes.clear();
+        s = c->sql(
+            "SELECT id, n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts FROM lane WHERE n>0");
+        while (s && sqlite3_step(s) == SQLITE_ROW) {
+            LaneCount lc;
+            lc.n = sqlite3_column_int64(s, 1);
+            lc.bytes = sqlite3_column_int64(s, 2);
+            lc.minw = sqlite3_column_type(s, 3) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 3);
+            lc.maxw = sqlite3_column_type(s, 4) == SQLITE_NULL ? INT64_MIN : sqlite3_column_int64(s, 4);
+            lc.maxseq = sqlite3_column_int64(s, 5);
+            lc.created = sqlite3_column_int64(s, 6);
+            lc.updated = sqlite3_column_int64(s, 7);
+            lc.maxat = sqlite3_column_int64(s, 8);
+            lc.url = colText(s, 9);
+            lc.url0 = colText(s, 10);
+            lc.maxts = sqlite3_column_int64(s, 11);
+            f->lanes[uint32_t(sqlite3_column_int64(s, 0))] = lc;
         }
+        if (s) sqlite3_reset(s);
+        if (f->maxseq >= t->nextSeq) t->nextSeq = f->maxseq + 1;
     }
     for (auto& kv : conns) delete kv.second;
     (void)sp;

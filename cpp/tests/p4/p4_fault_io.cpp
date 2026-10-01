@@ -58,11 +58,7 @@ int32_t flatsql_io_close(int32_t h) { return faultFs().close(h); }
 namespace {
 
 TestType& faultType() {
-    static TestType t = [] {
-        TestType x = pnmLikeType("PNM");
-        x.rules += "bucket str:NAME\n";
-        return x;
-    }();
+    static TestType t = pnmLikeType("PNM");
     return t;
 }
 

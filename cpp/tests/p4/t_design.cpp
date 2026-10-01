@@ -1,5 +1,5 @@
-// The design's regression tests (design §14): t_close (B1), t_dropreuse (B9),
-// t_gap (B2), t_crash and t_kill (B3, M8).
+// The design's regression tests (design §14): t_close (B1), t_gap (B2),
+// t_crash and t_kill (B3, M8).
 //
 // A "crash" is a real process death: the engine runs in a forked child that
 // _exits (or is killed with SIGKILL) without stopping; the parent reopens the
@@ -178,48 +178,6 @@ P4_TEST(t_close) {
 
 #endif
 
-// B9: a dropped month's path is never reused; a late record for that month
-// lands in the next generation; old and new readers see it.
-P4_TEST(t_dropreuse) {
-    const std::string root = scratchDir("dropreuse") + "/fsql4";
-    REQUIRE(openEngine(root) == P4_OK, "open");
-    REQUIRE(registerType(ommType()) == P4_OK, "register");
-    auto batch = [&](uint32_t from, int n, const std::string& epoch) {
-        Batch b;
-        b.type = "OMM";
-        b.peer = "12D3KooWDrop";
-        b.tags.push_back(Tag{"prov", "src", "", "b1", "", "", ""});
-        for (int i = 0; i < n; i++) {
-            In in;
-            in.frame = ommFrame(from + uint32_t(i), "X", epoch);
-            in.ts = 1790000000;
-            b.recs.push_back(std::move(in));
-        }
-        return b;
-    };
-    Result r = put(batch(1000, 1000, "2020-01-15T00:00:00"));
-    REQUIRE(r.status == P4_OK, r.err);
-    Result s = scanAfter("OMM", 0, 0);
-    CHECK_EQ(s.rows.size(), size_t(1000), "reader sees 1,000");
-    const std::string gen0 = root + "/P/OMM/1/202001.0.db";
-    CHECK(fp::ioExists(gen0), "generation 0");
-    TlvW q;
-    q.u64(62, 1);  // drop until 1 byte: every month but the current one
-    Result qg = call(P4_OPC_QUOTA_GC, q.b);
-    CHECK_EQ(qg.status, P4_OK, qg.err);
-    if (qg.rows.size() == 1) CHECK_EQ(qg.i(0, "records_dropped"), int64_t(1000), "dropped");
-    for (int i = 0; i < 200 && fp::ioExists(gen0); i++) flatsql::ps::sleepNs(10000000);
-    CHECK(!fp::ioExists(gen0), "unlinked");
-    r = put(batch(5000, 10, "2020-01-20T00:00:00"));
-    CHECK_EQ(r.status, P4_OK, r.err);
-    CHECK(fp::ioExists(root + "/P/OMM/1/202001.1.db"), "the late records went to generation 1");
-    CHECK_EQ(scanAfter("OMM", 0, 0).rows.size(), size_t(10), "a reader sees the 10 late records");
-    closeEngine();
-    REQUIRE(openEngine(root) == P4_OK, "reopen");
-    CHECK_EQ(scanAfter("OMM", 0, 0).rows.size(), size_t(10), "after reopen");
-    closeEngine();
-}
-
 // B2: a datasync follower never skips a committed record: a writer that took
 // lower seqs and commits late holds the visible-through mark below them.
 P4_TEST(t_gap) {
@@ -326,23 +284,15 @@ P4_TEST(t_crash) {
 
 // ---- the kill loop -------------------------------------------------------------------------------
 namespace {
-// The kill loop's type: PNM with a content month (NAME carries a time), so
-// quota drops have months to drop.
+// The kill loop's type: PNM, one file per partition.
 TestType& killType() {
-    static TestType t = [] {
-        TestType x = pnmLikeType("PNM");
-        x.rules += "bucket str:NAME\n";
-        return x;
-    }();
+    static TestType t = pnmLikeType("PNM");
     return t;
 }
 
-// A record's month follows its id (500 ids per call, four months), so a
-// repeat of earlier ids is the same bytes in the same month.
+// A repeat of earlier ids is the same bytes.
 std::vector<uint8_t> killFrame(uint64_t id) {
-    char name[32];
-    std::snprintf(name, sizeof name, "2026-%02d-15T00:00:00", 6 + int((id / 500) % 4));
-    return buildFrame(killType(), {Field::str("FILE_ID", "file-" + std::to_string(id)), Field::str("NAME", name),
+    return buildFrame(killType(), {Field::str("FILE_ID", "file-" + std::to_string(id)), Field::str("NAME", "n" + std::to_string(id)),
                                    Field::raw("BODY", std::vector<uint8_t>(160, uint8_t(id)))});
 }
 
@@ -358,9 +308,9 @@ Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from
 }
 
 // One step of the workload the kill lands in: 3 producers; every 5th call
-// repeats earlier records under another producer (copies); calls rotate over
-// four content months; every 13th call supersedes a batch and every 11th
-// drops months to a 4 MiB quota (file drops, new generations).
+// repeats earlier records under another producer (copies); every 13th call
+// supersedes a batch and every 11th deletes the oldest arrivals down to a
+// 4 MiB quota.
 void killWorkStep(int c, uint64_t* id) {
     Batch b = killBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), *id, 500);
     if (c % 5 == 4)

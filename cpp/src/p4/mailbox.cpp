@@ -334,6 +334,8 @@ const std::vector<std::string>& colsOfWrite(uint32_t op) {
     }
 }
 
+}  // namespace
+
 void pushTask(Engine* e, Part* p, WriteTask* wt) {
     WriterState& ws = *e->writers[p->owner];
     {
@@ -347,6 +349,8 @@ void pushTask(Engine* e, Part* p, WriteTask* wt) {
     }
     e->wake(e->firstOfClass[1] + p->owner);
 }
+
+namespace {
 
 void routeWrite(Engine* e, uint32_t wi, uint32_t slot, P4Lane* L) {
     SlotHeader* h = e->slot(slot);
@@ -451,7 +455,7 @@ void routeWrite(Engine* e, uint32_t wi, uint32_t slot, P4Lane* L) {
     }
     s->slot = slot;
     s->type = t;
-    std::vector<std::pair<Part*, std::vector<std::pair<int64_t, int64_t>>>> targets;
+    std::vector<std::pair<Part*, std::vector<int64_t>>> targets;
     if (op == P4_OPC_SUPERSEDE) {
         s->kind = Shared::kSupersede;
         uint8_t apply = 0;
@@ -476,13 +480,7 @@ void routeWrite(Engine* e, uint32_t wi, uint32_t slot, P4Lane* L) {
             doneStatus(e, slot, colsOfWrite(op), P4_E_ARG, "DELETE needs CIDs (tag 40)");
             return;
         }
-        std::vector<int64_t> tbs;
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            tbs = t->tbs;
-        }
-        if (tbs.empty()) tbs.push_back(0);
-        std::map<uint32_t, std::vector<std::pair<int64_t, int64_t>>> byPid;
+        std::map<uint32_t, std::vector<int64_t>> byPid;
         const uint32_t n = ld32(cids->v);
         std::vector<Holder> hs;
         for (uint32_t i = 0; i < n; i++) {
@@ -490,11 +488,8 @@ void routeWrite(Engine* e, uint32_t wi, uint32_t slot, P4Lane* L) {
             if (!cidBinValid(c36)) continue;
             uint8_t key[32];
             cidKeyFromDigest(c36 + 4, key);
-            for (int64_t tb : tbs) {
-                if (holdersOf(L, t, tb, key, &hs) != P4_OK) continue;
-                for (auto& h : hs) byPid[h.pid].push_back({tb, h.seq});
-                if (!hs.empty()) break;
-            }
+            if (holdersOf(L, t, key, &hs) != P4_OK) continue;
+            for (auto& h : hs) byPid[h.pid].push_back(h.seq);
         }
         std::lock_guard<std::mutex> g(t->mu);
         for (auto& kv : byPid) {
@@ -569,7 +564,8 @@ void writerLoop(Engine* e, uint32_t wi) {
         if (takeGroup(e, wi, &p, &tasks)) {
             did = true;
             const int op = tasks[0]->op;
-            for (WriteTask* wt : tasks) e->slot(wt->slot)->thread = tThread;
+            for (WriteTask* wt : tasks)
+                if (!wt->shared || wt->shared->kind != Shared::kQuota) e->slot(wt->slot)->thread = tThread;
             if (op == P4_OPC_PUT) putGroup(e, wi, p, tasks);
             else if (op == P4_OPC_SUPERSEDE) supersedePart(e, p, tasks[0]);
             else deletePart(e, p, tasks[0]);
@@ -780,6 +776,7 @@ int32_t engineStop(Engine* e, double deadlineMs) {
     }
     e->rpool.closeAll();
     for (Type* t : types) {
+        t->hasFiles.store(false, std::memory_order_release);  // closed: nothing reads or flushes them again
         if (t->idx) {
             sqlite3_wal_checkpoint_v2(t->idx->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
             delete t->idx;

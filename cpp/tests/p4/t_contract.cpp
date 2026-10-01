@@ -2,8 +2,9 @@
 // (identities through a migration, and a repeat's tags on the held record),
 // C-22 (a torn STORE reopens as a migration target; a migrate COPY keeps the
 // holder's bytes and ts), C-25 (a type with an empty BFBS), C-27 (REBUILD 8
-// runs integrity_check), and the file rebuild by VACUUM INTO (design §7) and
-// a crash between a file's creation and its schema (journal replay).
+// runs integrity_check), a crash between a file's creation and its schema
+// (journal replay), C-31/C-32 reads (object key and exact CID through the
+// file's indexes; EPOCH points by one seek per object).
 #include <cstring>
 #include <fstream>
 #include <random>
@@ -222,45 +223,6 @@ P4_TEST(t_contract_empty_bfbs) {
     closeEngine();
 }
 
-// Design §7: a file whose free pages reach the share and floor is rewritten
-// by VACUUM INTO its next generation (maintenance, here with a 1-byte floor),
-// swapped in; the old generation goes; answers and verify are unchanged.
-P4_TEST(t_file_rebuild) {
-    const std::string root = scratchDir("rebuild-file") + "/fsql4";
-    EngineOpts o;
-    o.extra = TlvW().u32(45, 100).u64(46, 1).b;  // 10% free and 1 byte rebuild a file
-    REQUIRE(openEngine(root, o) == P4_OK, "open");
-    TestType pnm = pnmLikeType("PNM");
-    REQUIRE(registerType(pnm) == P4_OK, "register");
-    REQUIRE(put(pnmBatch(pnm, "12D3KooWA", "b1", 0, 3000)).status == P4_OK, "b1");
-    REQUIRE(put(pnmBatch(pnm, "12D3KooWA", "b2", 2000, 1000)).status == P4_OK, "b2 retags 2000..2999");
-    const std::string gen0 = root + "/P/PNM/1/0.0.db";
-    REQUIRE(fp::ioExists(gen0), "generation 0");
-    TlvW s;
-    s.text(1, "PNM").text(11, "prov").text(12, "src").text(60, "b2").u8(61, 1);
-    Result sup = call(P4_OPC_SUPERSEDE, s.b);
-    REQUIRE(sup.status == P4_OK && sup.rows.size() == 1, sup.err);
-    CHECK_EQ(sup.i(0, "records_deleted"), int64_t(2000), "2,000 rows deleted");
-    const std::string gen1 = root + "/P/PNM/1/0.1.db";
-    for (int i = 0; i < 1500 && !(fp::ioExists(gen1) && !fp::ioExists(gen0)); i++) flatsql::ps::sleepNs(10000000);
-    CHECK(fp::ioExists(gen1), "rebuilt into generation 1");
-    CHECK(!fp::ioExists(gen0), "generation 0 unlinked");
-    TlvW sc;
-    sc.text(1, "PNM").u8(5, P4_ORDER_SEQ_ASC);
-    CHECK_EQ(call(P4_OPC_SCAN, sc.b).rows.size(), size_t(1000), "1,000 records after the rebuild");
-    CHECK_EQ(get("PNM", {cidOfFrame(pnmFrame(pnm, 2500))}).rows.size(), size_t(1), "GET");
-    Result v = rebuild(8);
-    for (size_t i = 0; i < v.rows.size(); i++) CHECK_EQ(v.i(i, "mismatches"), int64_t(0), "verify");
-    CHECK(fp::ioSize(gen1) < 3000 * 200, "the free pages are gone");
-    REQUIRE(put(pnmBatch(pnm, "12D3KooWA", "b3", 5000, 10)).status == P4_OK, "writes go to the new generation");
-    closeEngine();
-    REQUIRE(openEngine(root, o) == P4_OK, "reopen");
-    CHECK_EQ(call(P4_OPC_SCAN, sc.b).rows.size(), size_t(1010), "after reopen");
-    v = rebuild(8);
-    for (size_t i = 0; i < v.rows.size(); i++) CHECK_EQ(v.i(i, "mismatches"), int64_t(0), "verify after reopen");
-    closeEngine();
-}
-
 #if !defined(__wasm__)
 namespace {
 // Runs SQL on a closed store's file with the stock VFS (test-side tampering).
@@ -290,7 +252,7 @@ P4_TEST(t_contract_integrity_check) {
     REQUIRE(v.rows.size() == 1, v.err);
     CHECK_EQ(v.i(0, "mismatches"), int64_t(0), "intact");
     closeEngine();
-    const std::string f = root + "/P/PNM/1/0.0.db";
+    const std::string f = root + "/P/PNM/1.db";
     sqlInt(f, "PRAGMA wal_checkpoint(TRUNCATE)");
     const int64_t root_w = sqlInt(f, "SELECT rootpage FROM sqlite_schema WHERE name='r_w'");
     const int64_t ps = sqlInt(f, "PRAGMA page_size");
@@ -306,48 +268,35 @@ P4_TEST(t_contract_integrity_check) {
     v = rebuild(8, "PNM");
     REQUIRE(v.status == P4_OK && v.rows.size() == 1, v.err);
     CHECK(v.i(0, "mismatches") >= 1, "the damaged file is a mismatch");
-    CHECK(v.err.find("integrity_check failed: ") == 0 && v.err.find("0.0.db") != std::string::npos, "named: " + v.err);
+    CHECK(v.err.find("integrity_check failed: ") == 0 && v.err.find("/1.db") != std::string::npos, "named: " + v.err);
     closeEngine();
 }
 
-// A crash after a file was created (empty, WAL mode) and its J_FILE
-// journaled, before its schema committed: the reopen completes the schema
-// instead of trusting the file (the migrate kill -9 landing blocker).
+// A crash after a new partition's file was created (empty, WAL mode) and its
+// J_PART and J_FILE journaled, before its schema committed: the reopen
+// completes the schema instead of trusting the file (the migrate kill -9
+// landing blocker).
 P4_TEST(t_replay_torn_create) {
     const std::string root = scratchDir("torn-create") + "/fsql4";
     REQUIRE(openEngine(root) == P4_OK, "open");
     TestType t = pnmLikeType("PNM");
-    t.rules += "bucket str:NAME\n";
-    auto frame = [&](uint64_t id, const char* month) {
-        return buildFrame(t, {Field::str("FILE_ID", "f" + std::to_string(id)), Field::str("NAME", month),
-                              Field::raw("BODY", std::vector<uint8_t>(64, uint8_t(id)))});
-    };
     REQUIRE(registerType(t) == P4_OK, "register");
-    Batch b;
-    b.type = "PNM";
-    b.peer = "12D3KooWA";
-    b.tags.push_back(Tag{"prov", "src", "", "b1", "", "", ""});
-    b.at = 1790000000;
-    for (int i = 0; i < 10; i++) {
-        In in;
-        in.frame = frame(uint64_t(i), "2026-06-15T00:00:00");
-        in.ts = 1790000000;
-        b.recs.push_back(std::move(in));
-    }
-    REQUIRE(put(b).status == P4_OK, "June");
+    REQUIRE(put(pnmBatch(t, "12D3KooWA", "b1", 0, 10)).status == P4_OK, "partition 1");
     closeEngine();
-    // The torn state: July's file exists in WAL mode without tables, and the
-    // journal holds its J_FILE.
-    const std::string july = root + "/P/PNM/1/202607.0.db";
-    sqlInt(july, "PRAGMA journal_mode=WAL");
-    CHECK_EQ(sqlInt(july, "SELECT count(*) FROM sqlite_schema"), int64_t(0), "no tables");
-    sqlInt(root + "/T/PNM.jnl",
-           "INSERT INTO j(op, tb, k, c, pid, seq, gen, s, v) VALUES(4, 202607, NULL, NULL, 1, 0, 0, NULL, 0) RETURNING id");
+    // The torn state: partition 2's file exists in WAL mode without tables,
+    // and the journal holds its J_PART and J_FILE.
+    const std::string peerB = "12D3KooWB";
+    const std::string token = flatsql::ps::producerToken(reinterpret_cast<const uint8_t*>(peerB.data()), peerB.size());
+    const std::string f2 = root + "/P/PNM/2.db";
+    sqlInt(f2, "PRAGMA journal_mode=WAL");
+    CHECK_EQ(sqlInt(f2, "SELECT count(*) FROM sqlite_schema"), int64_t(0), "no tables");
+    sqlInt(root + "/T/PNM.jnl", "INSERT INTO j(op, k, c, pid, seq, s, v) VALUES(1, NULL, NULL, 2, 0, '" + token + "' || char(31) || '" +
+                                    peerB + "', 0) RETURNING id");
+    sqlInt(root + "/T/PNM.jnl", "INSERT INTO j(op, k, c, pid, seq, s, v) VALUES(4, NULL, NULL, 2, 0, NULL, 0) RETURNING id");
     REQUIRE(openEngine(root) == P4_OK, "reopen");
-    Batch jb = b;
-    for (int i = 0; i < 10; i++) jb.recs[size_t(i)].frame = frame(uint64_t(100 + i), "2026-07-15T00:00:00");
+    Batch jb = pnmBatch(t, peerB, "b1", 100, 10);
     Result r = put(jb);
-    CHECK_EQ(r.status, P4_OK, "July accepts writes: " + r.err);
+    CHECK_EQ(r.status, P4_OK, "partition 2 accepts writes: " + r.err);
     CHECK_EQ(get("PNM", {cidOfFrame(jb.recs[3].frame)}).rows.size(), size_t(1), "readable");
     Result v = rebuild(8, "PNM");
     REQUIRE(v.rows.size() == 1, v.err);
@@ -442,7 +391,7 @@ P4_TEST(t_reader_object_key_in_bound) {
     CHECK_EQ(w.seqs.size(), expect(107, 107).size(), "W order: the same rows");
     CursorRun none = cursorRun("OMM", 0, P4_ORDER_SEQ_ASC, &eq, 1);
     CHECK_EQ(none.seqs.size(), size_t(60), "no bound: every row of the object");
-    // An object type without an epoch (r_k).
+    // An object type without an epoch (r_ke, e NULL).
     Batch cb;
     cb.type = "CAT";
     cb.peer = "12D3KooWSatcat";
@@ -491,10 +440,9 @@ P4_TEST(t_cid_key_roundtrip) {
     CHECK_EQ(order, 0, "memcmp order of keys = text order");
 }
 
-// G6: EPOCH nearest / as_of / forward through the object directory answer
-// what the scan answers: several producers and months, copies, records
-// without an object, objects changed since the last flush, a source filter,
-// a maximum delta.
+// EPOCH nearest / as_of / forward by one r_ke seek per object per partition
+// answer what the scan answers: several producers, copies, records without
+// an object, a source filter, a maximum delta.
 P4_TEST(t_epoch_object_directory) {
     const std::string root = scratchDir("epochdir") + "/fsql4";
     EngineOpts o;

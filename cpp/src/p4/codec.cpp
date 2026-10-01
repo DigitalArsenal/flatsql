@@ -210,27 +210,6 @@ bool cidDigestFromText(const char* s, size_t n, uint8_t d[32]) {
 }
 
 // ---- time -----------------------------------------------------------------------------
-namespace {
-void civilFromDays(int64_t z, int* y, int* m, int* d) {
-    z += 719468;
-    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-    const unsigned doe = unsigned(z - era * 146097);
-    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    const int64_t yy = int64_t(yoe) + era * 400;
-    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const unsigned mp = (5 * doy + 2) / 153;
-    *d = int(doy - (153 * mp + 2) / 5 + 1);
-    *m = int(mp < 10 ? mp + 3 : mp - 9);
-    *y = int(yy + (*m <= 2));
-}
-}  // namespace
-
-int64_t monthOfSec(int64_t sec) {
-    int y, m, d;
-    civilFromDays(floorDiv(sec, 86400), &y, &m, &d);
-    return int64_t(y) * 100 + m;
-}
-
 int64_t nowSec() { return floorDiv(wallMs(), 1000); }
 
 void dayText(int64_t sec, char out[11]) {
@@ -284,15 +263,13 @@ int32_t parseConfig(const uint8_t* p, size_t n, Config* c, std::string* err) {
     setU32(42, &c->flushEntries);
     setU32(43, &c->seqBlock);
     setU32(44, &c->backlogCredit);
-    setU32(45, &c->rebuildFreePermille);
-    setU64(46, &c->rebuildMinBytes);
-    if (tlvU8(v, 47, &u8, &bad) && u8) c->quotaMode = u8;
+    // Tags 45-47 (file rebuild, quota mode) are ignored (v11: no file
+    // rebuilds; quota deletes the oldest records by arrival).
     setU64(48, &c->sandboxHeap);
     setU64(49, &c->sandboxRows);
     setU64(50, &c->sandboxBytes);
     if (bad) { *err = "config: a typed tag has the wrong length"; return P4_E_ARG; }
     if (c->createMode > 2) { *err = "config: create mode must be 0, 1 or 2"; return P4_E_ARG; }
-    if (c->quotaMode != 1 && c->quotaMode != 2) { *err = "config: quota mode must be 1 or 2"; return P4_E_ARG; }
     if (c->writers == 0) {
         const uint32_t w = c->cores > 1 ? c->cores - 1 : 1;
         c->writers = w > 8 ? 8 : w;
@@ -453,30 +430,20 @@ const char* stmtSql(StmtId id) {
         case S_R_GET: return "SELECT cid, e, k, ts, x, length(d), p, f, NULL FROM r WHERE seq=?1";
         case S_R_LEN: return "SELECT length(d), cid, e, k, w FROM r WHERE seq=?1";
         case S_R_HOLDER: return "SELECT d, ts, cid FROM r WHERE seq=?1";
-        case S_ENT_UP:
-            return "INSERT INTO ent(k,n,fw,lw) VALUES(?1,1,?2,?2) ON CONFLICT(k) DO UPDATE SET n=n+1, "
-                   "fw=min(fw,excluded.fw), lw=max(lw,excluded.lw)";
-        case S_ENT_DEC: return "UPDATE ent SET n=n-1 WHERE k=?1";
-        case S_ENT_GONE: return "DELETE FROM ent WHERE k=?1 AND n<=0";
-        case S_ENT_ONE: return "SELECT n, fw, lw FROM ent WHERE k=?1";
         case S_SUP_K: return "SELECT seq, cid, length(d), s, d, w, e FROM r WHERE k=?1 AND seq<>?2";
         case S_LANE_UP:
             return "INSERT OR REPLACE INTO lane(id,sid,batch,ckey,ppeer,pkey,url,url0,created,updated,maxat,n,bytes,"
                    "minw,maxw,maxseq,maxts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)";
-        case S_LANE_GET: return "SELECT url0 FROM lane WHERE id=?1";
         case S_LANE_DEL: return "DELETE FROM lane WHERE id=?1";
         case S_SRC_INS: return "INSERT OR IGNORE INTO src(id,provider,source) VALUES(?1,?2,?3)";
         case S_META_SET: return "INSERT OR REPLACE INTO meta(k,v) VALUES(?1,?2)";
-        case S_META_GET: return "SELECT v FROM meta WHERE k=?1";
-        case S_RL_SID_DESC: return "SELECT seq FROM rl WHERE sid=?1 AND seq<?2 AND seq>=?3 ORDER BY seq DESC";
-        case S_RL_SID_ASC: return "SELECT seq FROM rl WHERE sid=?1 AND seq>?2 AND seq<=?3 ORDER BY seq";
-        case S_C_GET: return "SELECT pid, seq FROM c WHERE tb=?1 AND cid=?2";
-        case S_C_INS: return "INSERT OR REPLACE INTO c(tb,cid,pid,seq) VALUES(?1,?2,?3,?4)";
-        case S_C_DEL: return "DELETE FROM c WHERE tb=?1 AND cid=?2 AND pid=?3";
-        case S_IDENT_GET: return "SELECT seq, cid FROM ident WHERE tb=?1 AND src=?2 AND h=?3";
-        case S_IDENT_INS: return "INSERT OR REPLACE INTO ident(tb,src,h,seq,cid) VALUES(?1,?2,?3,?4,?5)";
-        case S_IDENT_DEL: return "DELETE FROM ident WHERE tb=?1 AND src=?2 AND h=?3";
-        case S_J_INS: return "INSERT INTO j(op,tb,k,c,pid,seq,gen,s,v) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)";
+        case S_C_GET: return "SELECT pid, seq FROM c WHERE cid=?1";
+        case S_C_INS: return "INSERT OR REPLACE INTO c(cid,pid,seq) VALUES(?1,?2,?3)";
+        case S_C_DEL: return "DELETE FROM c WHERE cid=?1 AND pid=?2";
+        case S_IDENT_GET: return "SELECT seq, cid FROM ident WHERE src=?1 AND h=?2";
+        case S_IDENT_INS: return "INSERT OR REPLACE INTO ident(src,h,seq,cid) VALUES(?1,?2,?3,?4)";
+        case S_IDENT_DEL: return "DELETE FROM ident WHERE src=?1 AND h=?2";
+        case S_J_INS: return "INSERT INTO j(op,k,c,pid,seq,s,v) VALUES(?1,?2,?3,?4,?5,?6,?7)";
         case S_J_DEL: return "DELETE FROM j WHERE id<=?1";
         case S_JM_SET: return "INSERT OR REPLACE INTO jm(k,v) VALUES(?1,?2)";
         default: return nullptr;
