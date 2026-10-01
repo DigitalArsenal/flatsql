@@ -124,7 +124,12 @@ void Format1::feedWindow(const p4fake::Type& t) {
 bool Format1::query(const std::string& sql, const std::vector<rb1::Cell>& params, std::vector<std::string>* names,
                     std::vector<std::vector<rb1::Cell>>* rows, std::string* err) {
     flatsql::QueryResult r;
-    if (!db_->queryNoThrow(sql, valuesOf(params), r, err)) return false;
+    try {
+        if (!db_->queryNoThrow(sql, valuesOf(params), r, err)) return false;
+    } catch (const std::exception& e) {
+        *err = e.what();
+        return false;
+    }
     *names = r.columns;
     rows->clear();
     for (const auto& row : r.rows) {
@@ -138,7 +143,12 @@ bool Format1::query(const std::string& sql, const std::vector<rb1::Cell>& params
 bool Format1::raw(const std::string& sql, const std::vector<rb1::Cell>& params, std::vector<uint8_t>* out,
                   std::string* err) {
     flatsql::FlatSQLDatabase::RawStreamResult r;
-    if (!db_->queryRawFlatBufferStream(sql, valuesOf(params), &r, err)) return false;
+    try {   // format 1's raw-stream path throws for some SQL errors
+        if (!db_->queryRawFlatBufferStream(sql, valuesOf(params), &r, err)) return false;
+    } catch (const std::exception& e) {
+        *err = e.what();
+        return false;
+    }
     out->assign(r.stream->begin(), r.stream->end());
     return true;
 }
