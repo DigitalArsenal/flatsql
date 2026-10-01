@@ -3,7 +3,6 @@
 // format 1 creates its engine from (vectors/format1_columns.txt).
 #ifdef FLATSQL_P4SQL_FAKE
 
-#include <dirent.h>
 
 #include <fstream>
 #include <map>

@@ -51,7 +51,8 @@ public:
                 cap = p4_lane_heap_cap(ls->lane);   // config tag 48 (C-18)
             }
             std::unique_ptr<LaneArena> a(new LaneArena());
-            if (cap && a->init(size_t(cap)) && arenaRegister(a.get())) ls->arena = a.release();
+            const bool fits = cap && cap <= uint64_t(SIZE_MAX / 2);   // wasm32: size_t is 32 bits
+            if (fits && a->init(size_t(cap)) && arenaRegister(a.get())) ls->arena = a.release();
         }
         if (!ls->arena) {
             ok_ = false;
@@ -431,8 +432,6 @@ int32_t run(LaneState* ls, Stmt& st, sqlite3_stmt* s, Out& out, std::string* msg
     }
 }
 
-// SURFACE (op 31): one row per (relation, column), relations in type name
-// order, each type's <TYPE> then its "<TYPE>@<source>" relations by source.
 // The hook's status, its text in the slot's err when it failed (C-19).
 int32_t reply(LaneState* ls, int32_t status, const std::string& msg) {
     if (status < 0 && !msg.empty()) {
@@ -442,6 +441,8 @@ int32_t reply(LaneState* ls, int32_t status, const std::string& msg) {
     return status;
 }
 
+// SURFACE (op 31): one row per (relation, column), relations in type name
+// order, each type's <TYPE> then its "<TYPE>@<source>" relations by source.
 int32_t surfaceRows(LaneState* ls, Out& out, std::string* msg) {
     int32_t rc = loadTypes(ls, msg);
     if (rc < 0) return rc;
