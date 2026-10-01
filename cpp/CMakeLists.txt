@@ -978,6 +978,21 @@ else()
         target_compile_definitions(flatsql_p4_test PRIVATE
             P4_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
         add_test(NAME FlatSQLStoreFormat4Test COMMAND flatsql_p4_test)
+        # Power loss: the same engine objects over FaultFs (in-memory files
+        # that keep what a crash leaves), the test main and its loop only.
+        add_executable(flatsql_p4_fault_test
+            tests/p4/p4_test_main.cpp tests/p4/p4_fault_io.cpp test/io_fault.cpp
+            $<TARGET_OBJECTS:flatsql_p4_core>
+            ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
+            ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
+            ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
+            ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp)
+        target_link_libraries(flatsql_p4_fault_test PRIVATE sqlite3_p4 Threads::Threads)
+        target_include_directories(flatsql_p4_fault_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${FLATBUFFERS_INCLUDE_DIR} ${SQLITE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/p4 ${CMAKE_CURRENT_SOURCE_DIR}/test)
+        target_compile_definitions(flatsql_p4_fault_test PRIVATE
+            P4_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
     endif()
 
     add_executable(flatsql_full_text_search_test tests/full_text_search_test.cpp)

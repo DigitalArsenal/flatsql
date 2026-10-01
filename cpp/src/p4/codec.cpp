@@ -565,6 +565,11 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
     if (kind == OpenKind::Writer || kind == OpenKind::Index || kind == OpenKind::Journal) {
         std::snprintf(sql, sizeof sql, "PRAGMA page_size=%u", pageSize ? pageSize : 4096);
         sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+        // A new file's switch to WAL commits through a rollback journal;
+        // EXTRA makes SQLite delete that journal durably (with dsync=1 the VFS
+        // fsyncs the directory), so a power loss cannot bring it back as a
+        // hot journal over the WAL. The pragma below sets the steady level.
+        sqlite3_exec(db, "PRAGMA synchronous=EXTRA", nullptr, nullptr, nullptr);
         rc = sqlite3_exec(db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
         if (rc != SQLITE_OK) {
             if (err) *err = sqlite3_errmsg(db);

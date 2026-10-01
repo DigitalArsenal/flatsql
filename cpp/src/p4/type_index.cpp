@@ -459,6 +459,7 @@ int32_t dropIndexRows(Type* t, uint32_t pid, int64_t tb) {
 
 int32_t typeIndexFlush(Type* t, bool force) {
     Engine* e = t->e;
+    if (!t->idx || !t->jdb) return P4_OK;  // a type whose open failed (the engine's init is unwinding)
     std::lock_guard<std::mutex> fg(t->flushMu);
     std::vector<CEnt> ents;
     std::vector<IdentEnt> idents;

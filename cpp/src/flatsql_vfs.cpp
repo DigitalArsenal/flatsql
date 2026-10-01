@@ -39,10 +39,10 @@
 // stops at the oldest reader's mark).
 //
 // DIRECTORY DURABILITY. A connection opened with the URI parameter dsync=1
-// creates its WAL and journal files with FLATSQL_IO_CREATE_PARENTS, so a host
-// fsyncs the parent directory when the file is newly created and a commit
-// that lives in a new WAL survives power loss. Without it (format 1) opens are
-// unchanged.
+// creates its database, WAL and journal files with FLATSQL_IO_CREATE_PARENTS,
+// so a host fsyncs the parent directory when the file is newly created and a
+// commit that lives in a new file survives power loss. Without it (format 1)
+// opens are unchanged.
 
 #include "flatsql/flatsql_io.h"
 
@@ -584,7 +584,7 @@ int32_t translateOpenFlags(const char* name, int flags) {
     if (flags & SQLITE_OPEN_CREATE)    out |= FLATSQL_IO_CREATE;
     if (flags & SQLITE_OPEN_EXCLUSIVE) out |= FLATSQL_IO_EXCL;
     if (flags & SQLITE_OPEN_DELETEONCLOSE) out |= FLATSQL_IO_DELETE_ON_CLOSE;
-    if ((flags & SQLITE_OPEN_CREATE) && (flags & (SQLITE_OPEN_WAL | SQLITE_OPEN_MAIN_JOURNAL)) &&
+    if ((flags & SQLITE_OPEN_CREATE) && (flags & (SQLITE_OPEN_MAIN_DB | SQLITE_OPEN_WAL | SQLITE_OPEN_MAIN_JOURNAL)) &&
         sqlite3_uri_boolean(name, "dsync", 0))
         out |= FLATSQL_IO_CREATE_PARENTS;
     if (out == 0) out = FLATSQL_IO_READ;
@@ -636,11 +636,16 @@ int fsOpen(sqlite3_vfs*, const char* name, sqlite3_file* file, int flags,
     return SQLITE_OK;
 }
 
-int fsDelete(sqlite3_vfs*, const char* name, int /*syncDir*/) {
+int fsDelete(sqlite3_vfs*, const char* name, int syncDir) {
     if (!name) return SQLITE_OK;
-    const int32_t rc = flatsql_io_open(name,
-                                       static_cast<int32_t>(std::strlen(name)),
-                                       FLATSQL_IO_UNLINK);
+    // A dsync=1 connection's deletes are durable when SQLite asks (a rollback
+    // journal's delete is its commit: a crash must not bring it back as a hot
+    // journal). UNLINK_IF_UNUSED makes the host fsync the parent directory.
+    const bool durable = syncDir && sqlite3_uri_boolean(name, "dsync", 0);
+    int32_t rc = flatsql_io_open(name, static_cast<int32_t>(std::strlen(name)),
+                                 durable ? FLATSQL_IO_UNLINK | FLATSQL_IO_UNLINK_IF_UNUSED : FLATSQL_IO_UNLINK);
+    if (durable && rc == FLATSQL_IO_ERR_BUSY)
+        rc = flatsql_io_open(name, static_cast<int32_t>(std::strlen(name)), FLATSQL_IO_UNLINK);
     if (rc == FLATSQL_IO_ERR_NOENT) return SQLITE_OK;  // already gone
     return rc < 0 ? SQLITE_IOERR_DELETE : SQLITE_OK;
 }

@@ -168,6 +168,17 @@ bash scripts/build-wasm.sh --ps-tests && node scripts/p4-wasm-suite.mjs [--kill-
   bucket and identity rules, supersede, quota, rebuild, budget, group
   commit. `t_contract.cpp`: C-21/C-26, C-22, C-25, C-27, the file rebuild, a
   torn file creation, object-key reads inside the bound.
+- `p4_fault_io.cpp` (`flatsql_p4_fault_test --test=t_power_loss --slow=1`):
+  the engine over FaultFs (in-memory files that keep what a power loss
+  leaves: unsynced writes dropped, a random subset kept in order or
+  reordered, the last write torn, or kill -9), frozen at a random I/O call
+  per round; after the crash every acknowledged record is there, REBUILD 8
+  (with `integrity_check`) is clean and the count equals a full scan's
+  distinct CIDs. It found that engine-created SQLite files lacked durable
+  directory entries and that the rollback journal of a new file's switch to
+  WAL could come back as a hot journal; with `dsync=1` the VFS now creates
+  database files with `CREATE_PARENTS` and deletes durably when SQLite asks
+  (`synchronous=EXTRA` during the switch).
 - `t_fixture.cpp` (`g2_fixture`): loads the host-02-sized format-1 fixture as
   store-migrate does and compares GET, TAGS, SCAN, WINDOW and INDEX_PAGE with
   format 1 per type.

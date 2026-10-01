@@ -192,13 +192,14 @@ jobs:
         git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
         git -C ../flatbuffers checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
 
-    - name: Native engine suite and 300 kill -9 rounds
+    - name: Native engine suite, 300 kill -9 rounds, 200 power-loss rounds
       working-directory: cpp
       run: |
         cmake -B build-p4 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFLATBUFFERS_DIR=$GITHUB_WORKSPACE/../flatbuffers
-        cmake --build build-p4 --target flatsql_p4_test -j 4
+        cmake --build build-p4 --target flatsql_p4_test flatsql_p4_fault_test -j 4
         ./build-p4/flatsql_p4_test
         ./build-p4/flatsql_p4_test --test=t_kill --rounds=300 --seed=$GITHUB_RUN_NUMBER
+        ./build-p4/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=200 --seed=$GITHUB_RUN_NUMBER
 
     - name: The SQL surface's suite (format 1 as the oracle)
       if: hashFiles('cpp/tests/p4sql/CMakeLists.txt') != ''
