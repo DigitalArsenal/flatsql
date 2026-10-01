@@ -148,13 +148,19 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked)
 P4_SLOW_TEST(t_power_loss) {
     FaultFs& fs = faultFs();
     const int rounds = int(argInt("rounds", 200));
-    const std::string root = "/p4fault/fsql4";
+    // A fresh store every 50 rounds keeps each round's check (a full scan and
+    // REBUILD 8) bounded.
+    std::string root;
     std::mt19937_64 rng(uint64_t(argInt("seed", 1)));
     std::set<std::string> acked;
     uint64_t id = 1;
     int pass = 0, fail = 0;
     const char* modes[] = {"drop-all", "drop-subset", "tear-last", "reorder", "keep-all"};
     for (int round = 1; round <= rounds; round++) {
+        if ((round - 1) % 50 == 0) {
+            root = "/p4fault/s" + std::to_string((round - 1) / 50) + "/fsql4";
+            acked.clear();
+        }
         EngineOpts o;
         o.writers = 3;
         o.flushEntries = 2000;
