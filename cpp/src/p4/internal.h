@@ -616,6 +616,7 @@ int32_t journalReplay(Type* t, std::string* err);  // at open, before any read (
 int32_t typeIndexOpen(Type* t, std::string* err);  // load the registry and counters
 // Every copy of (tb, key): pending layers over the type index.
 int32_t holdersOf(P4Lane* L, Type* t, int64_t tb, const uint8_t* key, std::vector<Holder>* out);
+int32_t holdersWith(Type* t, Conn* idx, int64_t tb, const uint8_t* key, std::vector<Holder>* out, bool locked);
 // The live holder of an ingest identity (0 when none).
 int32_t identHolder(P4Lane* L, Type* t, int64_t tb, uint64_t src, const uint8_t h[32], int64_t* seq,
                     uint8_t cid[32]);
@@ -642,7 +643,7 @@ int32_t runRead(P4Lane* L, uint32_t op);  // ops 10-17 on a lane
 
 // ---- maintain.cpp ----------------------------------------------------------------------------------
 void maintenanceLoop(P4Engine* e, uint32_t thread);
-int32_t quotaGc(P4Engine* e, uint64_t maxBytes, int64_t* files, int64_t* records, int64_t* bytes);
+int32_t quotaGc(P4Engine* e, uint64_t maxBytes, int64_t* files, int64_t* records, int64_t* bytes, bool enforce);
 int32_t rebuildOp(P4Engine* e, Type* only, uint32_t what, std::vector<std::array<int64_t, 2>>* rows,
                   std::vector<Type*>* rowTypes);
 int32_t ftsCatchUp(P4Engine* e, Type* t, bool all);

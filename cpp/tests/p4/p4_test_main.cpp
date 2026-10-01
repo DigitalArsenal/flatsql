@@ -615,8 +615,11 @@ int main(int argc, char** argv) {
             return 0;
         }
     int ran = 0;
+    bool exact = false;
+    for (const auto& t : p4t::registry()) exact = exact || filter == t.name;
     for (const auto& t : p4t::registry()) {
-        if (!filter.empty() && std::string(t.name).find(filter) == std::string::npos) continue;
+        if (!filter.empty() && (exact ? filter != t.name : std::string(t.name).find(filter) == std::string::npos)) continue;
+        if (!filter.empty() && !exact && t.slow && !slow) continue;
         if (filter.empty() && t.slow && !slow) continue;
         const int before = p4t::gFailures;
         const auto t0 = std::chrono::steady_clock::now();

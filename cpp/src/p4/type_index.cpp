@@ -243,7 +243,9 @@ Conn* indexReader(P4Lane* L, Type* t, int32_t* rc) {
     return c;
 }
 
-int32_t holdersOf(P4Lane* L, Type* t, int64_t tb, const uint8_t* key, std::vector<Holder>* out) {
+// Every copy of (tb, key): the pending layers (newest state per pid; a
+// delete hides the index row) over the type index. locked: Type::mu is held.
+int32_t holdersWith(Type* t, Conn* c, int64_t tb, const uint8_t* key, std::vector<Holder>* out, bool locked) {
     out->clear();
     struct Seen {
         uint32_t pid;
@@ -253,7 +255,8 @@ int32_t holdersOf(P4Lane* L, Type* t, int64_t tb, const uint8_t* key, std::vecto
     Seen seen[16];
     int ns = 0;
     {
-        std::lock_guard<std::mutex> g(t->mu);
+        std::unique_lock<std::mutex> g(t->mu, std::defer_lock);
+        if (!locked) g.lock();
         auto note = [&](const CEnt& x) {
             for (int i = 0; i < ns; i++)
                 if (seen[i].pid == x.pid) return;
@@ -262,9 +265,6 @@ int32_t holdersOf(P4Lane* L, Type* t, int64_t tb, const uint8_t* key, std::vecto
         t->pend.each(tb, key, note);
         t->flushing.each(tb, key, note);
     }
-    int32_t rc = P4_OK;
-    Conn* c = indexReader(L, t, &rc);
-    if (!c) return rc;
     sqlite3_stmt* s = c->get(S_C_GET);
     if (!s) return P4_E_INTERNAL;
     sqlite3_bind_int64(s, 1, tb);
@@ -282,6 +282,13 @@ int32_t holdersOf(P4Lane* L, Type* t, int64_t tb, const uint8_t* key, std::vecto
         if (!seen[i].del) out->push_back(Holder{seen[i].pid, seen[i].seq});
     std::sort(out->begin(), out->end(), [](const Holder& a, const Holder& b) { return a.pid < b.pid; });
     return P4_OK;
+}
+
+int32_t holdersOf(P4Lane* L, Type* t, int64_t tb, const uint8_t* key, std::vector<Holder>* out) {
+    int32_t rc = P4_OK;
+    Conn* c = indexReader(L, t, &rc);
+    if (!c) return rc;
+    return holdersWith(t, c, tb, key, out, false);
 }
 
 int32_t identHolder(P4Lane* L, Type* t, int64_t tb, uint64_t src, const uint8_t h[32], int64_t* seq, uint8_t cid[32]) {

@@ -1494,13 +1494,7 @@ void Group::run(std::vector<WriteTask*>& tasks) {
             }
             writerUnpin(e_, r.file);
         }
-        for (auto& kv : dels_)
-            for (Del& d : kv.second) {
-                std::vector<Holder> hs;
-                if (holdersOf(&L_, t_, d.tb, d.key, &hs) == P4_OK)
-                    for (auto& h : hs) d.others += h.pid != p_->pid;
-                e_->bump(kStCatSuperseded);
-            }
+        for (auto& kv : dels_) e_->bump(kStCatSuperseded, kv.second.size());
     }
     bool ok = true;
     for (Call& c : calls_) ok = ok && c.status == P4_OK;
@@ -1564,7 +1558,20 @@ void Group::run(std::vector<WriteTask*>& tasks) {
                     }
         }
     }
-    publish(okFiles, failedFiles);
+    {
+        // A retired row's last-copy decision is atomic with the publish (dmu).
+        std::lock_guard<std::mutex> dg(t_->dmu);
+        for (auto& kv : dels_) {
+            if (!okFiles.count(kv.first)) continue;
+            for (Del& d : kv.second) {
+                std::vector<Holder> hs;
+                d.others = 0;
+                if (holdersOf(&L_, t_, d.tb, d.key, &hs) == P4_OK)
+                    for (auto& h : hs) d.others += h.pid != p_->pid;
+            }
+        }
+        publish(okFiles, failedFiles);
+    }
     respond();
     bool kick;
     {
