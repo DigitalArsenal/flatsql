@@ -1,7 +1,8 @@
 // FlatSQL store format 4, SQL surface: shared internals (CONTRACT.md §3.9).
 //
 //   heap.cpp      the per-lane allocator (SQLITE_CONFIG_MALLOC dispatch, the
-//                 sandbox heap cap), copy-adapted from ps/lane_arena.cpp
+//                 sandbox heap cap, the hard heap counter of C-30),
+//                 copy-adapted from ps/lane_arena.cpp
 //   columns.cpp   format 1's relation columns and cell values, from the BFBS
 //   vtab.cpp      the relation module over the p4 reader (from ps/vtab_*)
 //   lane.cpp      p4sql_lane_init/exec/surface/lane_free (from ps/lane.cpp
@@ -79,6 +80,7 @@ private:
 };
 
 int32_t heapInstall();               // SQLITE_CONFIG_MALLOC; before sqlite3_initialize
+void heapLimitRefresh();             // reads sqlite3_hard_heap_limit64 into the allocator (C-30)
 void arenaBind(LaneArena* a);         // the calling thread's arena (nullptr = the system allocator)
 LaneArena* arenaBound();
 bool arenaRegister(LaneArena* a);     // so a pointer finds its arena from any thread; false: no slot
@@ -188,16 +190,6 @@ struct LaneState {
 
 LaneState* stateOf(P4Lane* lane);
 
-}  // namespace p4sql
-}  // namespace flatsql
-
-// C-19 (contract v3): the running slot's err, implemented by the engine.
-// lane.cpp carries a weak no-op until the engine's p4_reader.h declares it.
-extern "C" void p4_lane_set_error(P4Lane* lane, const char* msg, uint32_t n);
-
-namespace flatsql {
-namespace p4sql {
-
 // ---------------------------------------------------------------------------
 // Relations (vtab.cpp)
 // ---------------------------------------------------------------------------
@@ -213,16 +205,15 @@ struct ScanPred {
 struct ScanArgs {
     int64_t seqAfter = 0, seqThrough = 0;   // exclusive / inclusive; 0 = none
     std::vector<ScanPred> preds;
-    bool hasSourceEq = false;               // _source = sourceEq ("<TYPE>@<source>")
-    std::string sourceEq;
-    bool merge = false, desc = false;       // merge the sources by seq (descending), else one after another
+    bool desc = false;                      // seq descending, else ascending
     bool hydrate = true;
 };
 
-// The rows of one relation: the type's A18 window (the reader applies the
-// bound first, C-17), a reader cursor per source with a live tag, the
-// sources one after another or merged by seq. The one implementation of the
-// relation semantics, for the virtual tables and the raw-stream fast path.
+// The rows of one relation through one reader cursor with the type's A18
+// bound N (C-31): "<TYPE>@<source>" passes lane.source, so the reader walks
+// that source's newest N; <TYPE> passes no lane filter, so it reads the
+// type's newest N, each record once. The one implementation of the relation
+// semantics, for the virtual tables and the raw-stream fast path.
 class RelScan {
 public:
     RelScan() = default;
@@ -233,32 +224,26 @@ public:
     int32_t open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, const ScanArgs& a);
     int32_t next();   // P4_OK or a status
     bool eof() const { return eof_; }
-    const P4Row& row() const { return subs_[at_].row; }
-    const std::string& sourceText() const { return subs_[at_].sourceText; }   // the row's _source
+    const P4Row& row() const { return row_; }
+    // The row's _source: the relation's "<TYPE>@<source>"; for <TYPE>,
+    // "<TYPE>@" + the matched (earliest live) tag's source, or
+    // "<TYPE>@local" for a record with no live tag.
+    const std::string& sourceText();
     void close();
 
 private:
-    struct Sub {
-        P4Cursor* c = nullptr;
-        P4Row row{};
-        bool has = false;
-        bool done = false;
-        std::string sourceText;
-    };
-    int32_t openSub(size_t i);
-    int32_t step(Sub& s);
-    int32_t settle();
-    LaneState* ls_ = nullptr;
-    // The specs' storage: deques keep every element in place while the
-    // specs point into them, for the cursors' lifetime.
+    P4Cursor* c_ = nullptr;
+    P4Row row_{};
+    bool eof_ = true;
+    bool alias_ = false;
+    std::string prefix_;   // "<TYPE>@"
+    std::string source_;   // the row's _source (fixed for an alias)
+    // The spec's storage: deques keep every element in place while the spec
+    // points into them, for the cursor's lifetime.
     std::deque<P4Value> vals_;
     std::vector<P4Pred> preds_;
     std::deque<std::string> strs_;
-    std::vector<P4ScanSpec> specs_;   // one per sub
-    std::vector<Sub> subs_;
-    bool merge_ = false, desc_ = false;
-    size_t at_ = 0;                   // concatenation: the current sub; merge: the sub holding the row
-    bool eof_ = true;
+    P4ScanSpec spec_{};
 };
 
 // The relation `name` names (case-insensitive): 1 found, 0 not a relation,

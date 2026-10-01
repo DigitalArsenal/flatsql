@@ -1,22 +1,21 @@
 // FlatSQL store format 4, SQL surface: the record relations (CONTRACT.md
 // §3.9 "Relations"; design §6). Copy-adapted from format 2's
-// ps/vtab_partition.cpp (module, plans, columns) and ps/vtab_fanout.cpp
-// (merging sources) onto the p4 reader (flatsql/p4/p4_reader.h).
+// ps/vtab_partition.cpp (module, plans, columns) onto the p4 reader
+// (flatsql/p4/p4_reader.h).
 //
-// The A18 window is format 1's: the type's newest N seqs (N = the type's
-// bound), applied by the reader before every other filter, the lane filter
-// included (C-17).
-//   "<TYPE>@<source>"  one cursor: the window narrowed to records with a live
-//                      tag of the source;
-//   <TYPE>             one row per (record, live source) of the window: a
-//                      cursor per source, the sources one after another
-//                      (format 1's UNION ALL view over its per-source tables),
-//                      or merged by seq when the statement orders by it.
+// A18 (C-31), one reader cursor per scan with the type's bound N:
+//   "<TYPE>@<source>"  lane.source = the source: the newest N records of the
+//                      type from that source (the reader walks the source's
+//                      own index newest-first and stops at N);
+//   <TYPE>             no lane filter: the type's newest N records, one row
+//                      each, _source from the record's earliest live tag, or
+//                      "<TYPE>@local" with none (format 1 keeps one resident
+//                      row per record, in its first source's partition).
 //
 // Pushed down (always re-checked by SQLite, so a pushdown only has to be a
 // superset of the rows SQLite keeps): _seq/_rowid ranges, _epoch and _ts
-// ranges, COL0/COL1 (the columns the type's `col 0`/`col 1` rules extract),
-// and _source equality.
+// ranges, COL0/COL1 (the columns the type's `col 0`/`col 1` rules extract).
+// A _source equality only empties a scan it cannot match.
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -342,9 +341,9 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
     RelVtab* vt = c->vt;
     c->scan.close();
     ScanArgs args;
-    args.merge = (idxNum & kPlanOrdered) != 0;
     args.desc = (idxNum & kPlanDesc) != 0;
     args.hydrate = (idxNum & kPlanHydrate) != 0;
+    const std::string prefix = vt->t->name + "@";
 
     // Constraints.
     Bounds seq;
@@ -398,12 +397,11 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
                     }
                 }
                 break;
-            case 'R':
+            case 'R':   // _source = s: an alias holds one value; <TYPE> holds "<TYPE>@..." only
                 if (sqlite3_value_type(v) == SQLITE_TEXT) {
                     const std::string s(reinterpret_cast<const char*>(sqlite3_value_text(v)), size_t(sqlite3_value_bytes(v)));
-                    if (args.hasSourceEq && s != args.sourceEq) seq.empty = true;
-                    args.hasSourceEq = true;
-                    args.sourceEq = s;
+                    if (vt->kind == kRelAlias ? s != prefix + vt->source : s.compare(0, prefix.size(), prefix) != 0)
+                        seq.empty = true;
                 }
                 break;
         }
@@ -537,39 +535,21 @@ sqlite3_module gRelModule = {
 // RelScan
 // ---------------------------------------------------------------------------
 void RelScan::close() {
-    EngineCall ec;
-    for (Sub& s : subs_)
-        if (s.c) p4_cursor_close(s.c);
-    subs_.clear();
-    specs_.clear();
+    if (c_) {
+        EngineCall ec;
+        p4_cursor_close(c_);
+        c_ = nullptr;
+    }
     preds_.clear();
     vals_.clear();
     strs_.clear();
-    at_ = 0;
     eof_ = true;
 }
 
 int32_t RelScan::open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, const ScanArgs& a) {
     close();
-    ls_ = ls;
-    merge_ = a.merge;
-    desc_ = a.desc;
-    std::vector<std::string> srcs;
-    int32_t rc = sourcesOf(ls, t.name, &srcs);
-    if (rc < 0) return rc;
-    const std::string prefix = t.name + "@";
-    std::vector<std::string> want;   // the sources this scan returns
-    if (rel.kind == kRelAlias) {
-        if (std::binary_search(srcs.begin(), srcs.end(), rel.source)) want.push_back(rel.source);
-    } else {
-        want = srcs;
-    }
-    if (a.hasSourceEq) {
-        if (a.sourceEq.compare(0, prefix.size(), prefix) != 0) return P4_OK;
-        const std::string s = a.sourceEq.substr(prefix.size());
-        want.erase(std::remove_if(want.begin(), want.end(), [&](const std::string& x) { return x != s; }), want.end());
-    }
-    if (want.empty()) return P4_OK;
+    alias_ = rel.kind == kRelAlias;
+    prefix_ = t.name + "@";
     for (const ScanPred& p : a.preds) {
         P4Value v{p.isText ? uint8_t(3) : uint8_t(1), p.i, 0, nullptr, 0};
         if (p.isText) {
@@ -580,97 +560,53 @@ int32_t RelScan::open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, con
         vals_.push_back(v);
         preds_.push_back(P4Pred{p.field, p.op, 1, &vals_.back()});
     }
-    P4ScanSpec base;
-    std::memset(&base, 0, sizeof(base));
-    base.type = t.name.c_str();
-    base.seqAfter = a.seqAfter;
-    base.seqThrough = a.seqThrough;
-    base.preds = preds_.empty() ? nullptr : preds_.data();
-    base.nPreds = uint32_t(preds_.size());
-    base.order = a.desc ? P4_ORDER_SEQ_DESC : P4_ORDER_SEQ_ASC;
-    base.hydrate = a.hydrate ? 1 : 0;
-    base.bound = t.bound;
-    for (const std::string& src : want) {
-        strs_.push_back(src);
-        P4ScanSpec sp = base;
-        sp.lane.source = strs_.back().c_str();
-        specs_.push_back(sp);
-        subs_.emplace_back();
-        subs_.back().sourceText = prefix + src;
+    std::memset(&spec_, 0, sizeof(spec_));
+    spec_.type = t.name.c_str();
+    spec_.seqAfter = a.seqAfter;
+    spec_.seqThrough = a.seqThrough;
+    spec_.preds = preds_.empty() ? nullptr : preds_.data();
+    spec_.nPreds = uint32_t(preds_.size());
+    spec_.order = a.desc ? P4_ORDER_SEQ_DESC : P4_ORDER_SEQ_ASC;
+    spec_.hydrate = a.hydrate ? 1 : 0;
+    spec_.bound = t.bound;
+    if (alias_) {
+        strs_.push_back(rel.source);
+        spec_.lane.source = strs_.back().c_str();
+        source_ = prefix_ + rel.source;
     }
-    // Concatenation opens one cursor at a time; a merge needs every head.
-    for (size_t i = 0; i < (merge_ ? subs_.size() : 1); i++) {
-        rc = openSub(i);
-        if (rc < 0) return rc;
+    int32_t rc;
+    {
+        EngineCall ec;
+        rc = p4_cursor_open(ls->lane, &spec_, &c_);
     }
-    return settle();
+    if (rc < 0) {
+        c_ = nullptr;
+        return rc;
+    }
+    eof_ = false;
+    return next();
 }
 
 int32_t RelScan::next() {
-    if (eof_) return P4_OK;
-    const int32_t rc = step(subs_[at_]);
-    return rc < 0 ? rc : settle();
-}
-
-// Advances one sub to its next row. P4_OK or a status.
-int32_t RelScan::step(Sub& s) {
-    s.has = false;
-    if (s.done) return P4_OK;
-    int32_t rc;
-    {
-        EngineCall ec;
-        rc = p4_cursor_next(s.c, &s.row);
-        if (rc == 0) {
-            p4_cursor_close(s.c);
-            s.c = nullptr;
-            s.done = true;
-        }
-    }
-    if (rc < 0) return rc;
-    s.has = rc > 0;
-    return P4_OK;
-}
-
-int32_t RelScan::openSub(size_t i) {
-    Sub& s = subs_[i];
-    int32_t rc;
-    {
-        EngineCall ec;
-        rc = p4_cursor_open(ls_->lane, &specs_[i], &s.c);
-    }
-    if (rc < 0) {
-        s.c = nullptr;
-        s.done = true;
-        return rc;
-    }
-    return step(s);
-}
-
-// Positions on the next output row (after the current one was consumed).
-int32_t RelScan::settle() {
-    if (merge_) {
-        size_t best = SIZE_MAX;
-        for (size_t i = 0; i < subs_.size(); i++) {
-            const Sub& s = subs_[i];
-            if (!s.has) continue;
-            if (best == SIZE_MAX) {
-                best = i;
-                continue;
-            }
-            const int64_t x = s.row.seq, y = subs_[best].row.seq;
-            if (desc_ ? x > y : x < y) best = i;   // ties: source order
-        }
-        eof_ = best == SIZE_MAX;
-        at_ = best;
+    if (!c_) {
+        eof_ = true;
         return P4_OK;
     }
-    while (at_ < subs_.size() && !subs_[at_].has) {
-        if (++at_ >= subs_.size()) break;
-        const int32_t rc = openSub(at_);
-        if (rc < 0) return rc;
+    EngineCall ec;
+    const int32_t rc = p4_cursor_next(c_, &row_);
+    if (rc > 0) return P4_OK;
+    p4_cursor_close(c_);
+    c_ = nullptr;
+    eof_ = true;
+    return rc;   // 0 at the end, else the reader's status
+}
+
+const std::string& RelScan::sourceText() {
+    if (!alias_) {
+        const P4Tag* tag = row_.tag;
+        source_ = prefix_ + (tag && tag->source ? tag->source : "local");
     }
-    eof_ = at_ >= subs_.size();
-    return P4_OK;
+    return source_;
 }
 
 int registerModule(LaneState* ls) { return sqlite3_create_module_v2(ls->db, "flatsql_p4", &gRelModule, ls, nullptr); }

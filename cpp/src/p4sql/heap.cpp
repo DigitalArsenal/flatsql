@@ -17,6 +17,11 @@
 // statements (SDN's own epoch and module SQL) and every engine call use the
 // system allocator: the epoch window over 400,000 OMM rows sorts more than a
 // sandbox arena holds, as it does in format 1's engine.
+//
+// C-30: SQLite runs without memory statistics (SQLITE_DEFAULT_MEMSTATUS=0),
+// so this allocator counts every SQLite allocation in one atomic counter and
+// refuses one past the hard heap limit (sqlite3_hard_heap_limit64, config tag
+// 27). The counter serves stats 29/30 (p4sql_heap_used / p4sql_heap_peak).
 #include <sqlite3.h>
 
 #include <cstdlib>
@@ -353,40 +358,80 @@ struct FallbackHdr {
     uint64_t size;
 };
 
+// C-30: bytes live (each block's usable size, what memSize reports), the
+// high-water mark, and the hard heap limit (0 = none).
+std::atomic<uint64_t> gUsed{0};
+std::atomic<uint64_t> gPeak{0};
+std::atomic<uint64_t> gLimit{0};
+
+// Counts `n` more bytes in. false: past the hard limit, nothing counted.
+bool reserve(uint64_t n) {
+    const uint64_t now = gUsed.fetch_add(n, std::memory_order_relaxed) + n;
+    const uint64_t lim = gLimit.load(std::memory_order_relaxed);
+    if (lim && now > lim) {
+        gUsed.fetch_sub(n, std::memory_order_relaxed);
+        return false;
+    }
+    uint64_t peak = gPeak.load(std::memory_order_relaxed);
+    while (now > peak && !gPeak.compare_exchange_weak(peak, now, std::memory_order_relaxed)) {
+    }
+    return true;
+}
+
+void release(uint64_t n) { gUsed.fetch_sub(n, std::memory_order_relaxed); }
+
+size_t sizeOf(LaneArena* a, void* p) {
+    return a ? a->usable(p) : size_t((static_cast<FallbackHdr*>(p) - 1)->size);
+}
+
 void* memMalloc(int n) {
-    if (n < 0) return nullptr;
-    if (LaneArena* a = tArena) return a->alloc(size_t(n));
-    FallbackHdr* h = static_cast<FallbackHdr*>(std::malloc(sizeof(FallbackHdr) + size_t(n)));
-    if (!h) return nullptr;
-    h->magic = kFallbackMagic;
-    h->size = uint64_t(n);
-    return h + 1;
+    if (n < 0 || !reserve(uint64_t(n))) return nullptr;
+    void* p = nullptr;
+    if (LaneArena* a = tArena) {
+        p = a->alloc(size_t(n));
+        if (p) gUsed.fetch_add(a->usable(p) - size_t(n), std::memory_order_relaxed);   // the block's rounding
+    } else if (FallbackHdr* h = static_cast<FallbackHdr*>(std::malloc(sizeof(FallbackHdr) + size_t(n)))) {
+        h->magic = kFallbackMagic;
+        h->size = uint64_t(n);
+        p = h + 1;
+    }
+    if (!p) release(uint64_t(n));
+    return p;
 }
 
 void memFree(void* p) {
     if (!p) return;
-    if (LaneArena* a = ownerOf(p)) {
-        a->free(p);
-        return;
-    }
-    std::free(static_cast<FallbackHdr*>(p) - 1);
+    LaneArena* a = ownerOf(p);
+    release(sizeOf(a, p));
+    if (a) a->free(p);
+    else std::free(static_cast<FallbackHdr*>(p) - 1);
 }
 
 void* memRealloc(void* p, int n) {
     if (!p) return memMalloc(n);
     if (n < 0) return nullptr;
-    if (LaneArena* a = ownerOf(p)) return a->realloc(p, size_t(n));
-    FallbackHdr* h = static_cast<FallbackHdr*>(std::realloc(static_cast<FallbackHdr*>(p) - 1,
-                                                            sizeof(FallbackHdr) + size_t(n)));
-    if (!h) return nullptr;
-    h->size = uint64_t(n);
-    return h + 1;
+    LaneArena* a = ownerOf(p);
+    const size_t old = sizeOf(a, p);
+    if (size_t(n) > old && !reserve(uint64_t(n) - old)) return nullptr;
+    void* q = nullptr;
+    if (a) {
+        q = a->realloc(p, size_t(n));
+    } else if (FallbackHdr* h = static_cast<FallbackHdr*>(
+                   std::realloc(static_cast<FallbackHdr*>(p) - 1, sizeof(FallbackHdr) + size_t(n)))) {
+        h->size = uint64_t(n);
+        q = h + 1;
+    }
+    // Settle the counter to the block's size now (or back, on failure).
+    const size_t counted = size_t(n) > old ? size_t(n) : old;
+    const size_t now = q ? sizeOf(a, q) : old;
+    if (now > counted) gUsed.fetch_add(now - counted, std::memory_order_relaxed);
+    else release(counted - now);
+    return q;
 }
 
 int memSize(void* p) {
     if (!p) return 0;
-    if (LaneArena* a = ownerOf(p)) return int(a->usable(p));
-    return int((static_cast<FallbackHdr*>(p) - 1)->size);
+    return int(sizeOf(ownerOf(p), p));
 }
 
 int memRoundup(int n) { return (n + 15) & ~15; }
@@ -425,8 +470,19 @@ int32_t heapInstall() {
     return rc == SQLITE_OK ? P4_OK : P4_E_INTERNAL;
 }
 
+// The engine sets the limit in flatsql_p4_init after the allocator is
+// installed, so a lane reads it at its start (never inside an allocation:
+// sqlite3_hard_heap_limit64 takes SQLite's mem0 mutex).
+void heapLimitRefresh() {
+    const sqlite3_int64 lim = sqlite3_hard_heap_limit64(-1);
+    if (lim >= 0) gLimit.store(uint64_t(lim), std::memory_order_relaxed);
+}
+
 void arenaBind(LaneArena* a) { tArena = a; }
 LaneArena* arenaBound() { return tArena; }
 
 }  // namespace p4sql
 }  // namespace flatsql
+
+extern "C" uint64_t p4sql_heap_used(void) { return flatsql::p4sql::gUsed.load(std::memory_order_relaxed); }
+extern "C" uint64_t p4sql_heap_peak(void) { return flatsql::p4sql::gPeak.load(std::memory_order_relaxed); }

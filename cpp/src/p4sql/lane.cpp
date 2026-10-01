@@ -4,10 +4,13 @@
 // raw-stream output, the result caps, the progress handler) and
 // ps/admission.cpp (the sandbox authorizer). The engine owns the lane
 // thread, the slot and its ring: a statement's output goes out through
-// p4_emit, which waits for ring space itself, so nothing here parks.
+// p4_emit, which waits for ring space itself, so nothing here parks. The
+// output is the RB1 header and whole blocks (or raw frames); the engine ends
+// the stream with RB1E after the hook returns (C-28), with the row count set
+// here (C-29).
 //
 // Every plan is bounded by construction (each relation reads at most its A18
-// window), so format 2's interactive admission (index-bounded plans only) has
+// bound), so format 2's interactive admission (index-bounded plans only) has
 // nothing left to refuse.
 //
 // Status mapping (all returned, never trapped):
@@ -327,18 +330,14 @@ public:
         return P4_OK;
     }
 
-    // Closes the output: the RB1 end marker (status included, the reader's
-    // counts: C-18) and the rest.
-    int32_t finish(int32_t status, std::string* msg) {
-        if (!raw_) {
-            uint64_t examined = 0, read = 0;
-            {
-                EngineCall ec;
-                p4_lane_counters(ls_->lane, &examined, &read);
-            }
-            enc_.end(status, rows_, examined, read);
-        }
-        return flush(msg);
+    // Closes the output: the open block and the rest, and the row count for
+    // the slot (C-29). The engine writes RB1E after the hook returns (C-28).
+    int32_t finish(std::string* msg) {
+        if (!raw_) enc_.flushBlock();
+        const int32_t rc = flush(msg);
+        EngineCall ec;
+        p4_lane_set_rows(ls_->lane, rows_);
+        return rc;
     }
 
 private:
@@ -585,13 +584,10 @@ int32_t surfaceRows(LaneState* ls, Out& out, std::string* msg) {
 
 using namespace flatsql::p4sql;
 
-// Until the engine implements C-19 the error text is dropped (never the
-// status); the engine's strong definition replaces this one.
-extern "C" __attribute__((weak)) void p4_lane_set_error(P4Lane*, const char*, uint32_t) {}
-
 extern "C" int32_t p4sql_global_init(void) { return heapInstall(); }
 
 extern "C" int32_t p4sql_lane_init(P4Lane* lane) {
+    heapLimitRefresh();
     std::unique_ptr<LaneState> ls(new LaneState());
     ls->lane = lane;
     const int rc = sqlite3_open_v2(":memory:", &ls->db,
@@ -625,7 +621,7 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
     std::string msg;
     int32_t status = P4_OK;
     if (dataStream(ls, req, out, &status, &msg)) {
-        const int32_t emitted = out.finish(status, &msg);
+        const int32_t emitted = out.finish(&msg);
         return reply(ls, status != P4_OK ? status : emitted, msg);
     }
     {
@@ -655,7 +651,7 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
         if (s) sqlite3_finalize(s);   // releases the reader cursors and the statement's arena memory now
         ls->cur = nullptr;
     }
-    const int32_t emitted = out.finish(status, &msg);
+    const int32_t emitted = out.finish(&msg);
     return reply(ls, status != P4_OK ? status : emitted, msg);
 }
 
@@ -666,7 +662,7 @@ extern "C" int32_t p4sql_surface(P4Lane* lane) {
     out.header({"name", "kind", "source", "column", "placeholder", "bound"});
     std::string msg;
     const int32_t status = surfaceRows(ls, out, &msg);
-    const int32_t emitted = out.finish(status, &msg);
+    const int32_t emitted = out.finish(&msg);
     return reply(ls, status != P4_OK ? status : emitted, msg);
 }
 
