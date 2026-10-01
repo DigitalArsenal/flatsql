@@ -455,7 +455,6 @@ std::string TypeConfig::resolve(const std::string& text, Path* out) const {
 
 std::string TypeConfig::compile(const std::string& rules) {
     epoch_.clear();
-    bucket_.clear();
     for (auto& c : cols_) c.clear();
     supersede_.clear();
     objectCols_.clear();
@@ -471,21 +470,20 @@ std::string TypeConfig::compile(const std::string& rules) {
         const size_t sp = line.find(' ');
         const std::string cmd = line.substr(0, sp);
         std::string rest = sp == std::string::npos ? "" : trimAscii(line.substr(sp + 1));
-        if (cmd == "epoch" || cmd == "bucket") {
-            std::vector<Alt>& into = cmd == "epoch" ? epoch_ : bucket_;
+        if (cmd == "epoch") {
             for (const std::string& a : split(rest, '|')) {
                 const size_t c = a.find(':');
-                if (c == std::string::npos) return cmd + " alternative needs kind:path";
+                if (c == std::string::npos) return "epoch alternative needs kind:path";
                 const std::string k = a.substr(0, c);
                 Alt alt;
                 if (k == "str") alt.kind = kAltEpochStr;
                 else if (k == "f64floor") alt.kind = kAltEpochF64Floor;
                 else if (k == "i64s") alt.kind = kAltEpochI64s;
                 else if (k == "i64ms") alt.kind = kAltEpochI64ms;
-                else return "unknown " + cmd + " alternative " + k;
+                else return "unknown epoch alternative " + k;
                 const std::string err = resolve(a.substr(c + 1), &alt.a);
                 if (!err.empty()) return err;
-                into.push_back(alt);
+                epoch_.push_back(alt);
             }
         } else if (cmd == "col") {
             const size_t sp2 = rest.find(' ');
@@ -717,53 +715,6 @@ bool TypeConfig::readEnumName(const uint8_t* root, const Path& p, const uint8_t*
     return true;
 }
 
-// The first alternative that yields a time (epoch and bucket rules).
-bool TypeConfig::evalTime(const uint8_t* root, const std::vector<Alt>& alts, int64_t* sec,
-                          int64_t* ms) const {
-    bool have = false;
-    for (size_t ai = 0; ai < alts.size(); ai++) {
-        const Alt& a = alts[ai];
-        if (a.kind == kAltEpochStr) {
-            const uint8_t* s;
-            size_t n;
-            if (!readString(root, a.a, &s, &n)) continue;
-            trimSpace(&s, &n);
-            if (n == 0) continue;  // Go: empty -> next alternative
-            int64_t es, ems;
-            // Go tries the fallback only when the first string is empty; a
-            // present but unparsable string leaves the epoch absent.
-            if (parseEpochString(s, n, &es, &ems)) {
-                have = true;
-                *sec = es;
-                *ms = ems;
-            }
-            break;
-        } else if (a.kind == kAltEpochF64Floor) {
-            double v;
-            if (!readF64(root, a.a, &v) || v == 0 || !std::isfinite(v)) continue;
-            const double fl = std::floor(v);
-            if (fl < -9.2e18 || fl > 9.2e18) continue;
-            have = true;
-            *sec = int64_t(fl);
-            *ms = int64_t(std::floor(v * 1000.0));
-            break;
-        } else {
-            int64_t v;
-            if (!readI64(root, a.a, &v) || v == 0) continue;
-            have = true;
-            if (a.kind == kAltEpochI64s) {
-                *sec = v;
-                *ms = v * 1000;
-            } else {
-                *ms = v;
-                *sec = v >= 0 ? v / 1000 : -((-v + 999) / 1000);
-            }
-            break;
-        }
-    }
-    return have;
-}
-
 void TypeConfig::extract(const uint8_t* frame, size_t len, Extracted* out, uint8_t* scratch,
                          size_t scratchLen) const {
     *out = Extracted();
@@ -784,14 +735,46 @@ void TypeConfig::extract(const uint8_t* frame, size_t len, Extracted* out, uint8
             break;
         }
     }
-    // Epoch, then the bucket time (C-1): the bucket rule, else the epoch.
-    if (keyed) out->hasEpoch = evalTime(root, epoch_, &out->epochSec, &out->epochMs);
-    if (keyed && !bucket_.empty()) {
-        int64_t ms = 0;
-        out->hasBucket = evalTime(root, bucket_, &out->bucketSec, &ms);
-    } else {
-        out->hasBucket = out->hasEpoch;
-        out->bucketSec = out->epochSec;
+    // Epoch
+    for (size_t ai = 0; keyed && ai < epoch_.size(); ai++) {
+        const Alt& a = epoch_[ai];
+        if (a.kind == kAltEpochStr) {
+            const uint8_t* s;
+            size_t n;
+            if (!readString(root, a.a, &s, &n)) continue;
+            trimSpace(&s, &n);
+            if (n == 0) continue;  // Go: empty -> next alternative
+            int64_t sec, ms;
+            // Go tries the fallback only when the first string is empty; a
+            // present but unparsable string leaves the epoch absent.
+            if (parseEpochString(s, n, &sec, &ms)) {
+                out->hasEpoch = true;
+                out->epochSec = sec;
+                out->epochMs = ms;
+            }
+            break;
+        } else if (a.kind == kAltEpochF64Floor) {
+            double v;
+            if (!readF64(root, a.a, &v) || v == 0 || !std::isfinite(v)) continue;
+            const double fl = std::floor(v);
+            if (fl < -9.2e18 || fl > 9.2e18) continue;
+            out->hasEpoch = true;
+            out->epochSec = int64_t(fl);
+            out->epochMs = int64_t(std::floor(v * 1000.0));
+            break;
+        } else {
+            int64_t v;
+            if (!readI64(root, a.a, &v) || v == 0) continue;
+            out->hasEpoch = true;
+            if (a.kind == kAltEpochI64s) {
+                out->epochSec = v;
+                out->epochMs = v * 1000;
+            } else {
+                out->epochMs = v;
+                out->epochSec = v >= 0 ? v / 1000 : -((-v + 999) / 1000);
+            }
+            break;
+        }
     }
     // Columns
     for (uint32_t c = 0; keyed && c < nCols_; c++) {
