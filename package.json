@@ -1,6 +1,6 @@
 {
   "name": "flatsql",
-  "version": "3.6.0",
+  "version": "3.7.0",
   "description": "SQL queries over raw FlatBuffer storage: the SQLite-backed wasm engine, the multithreaded partition store (flatsql-ps-threads.wasm) and store format 4, one SQLite file per partition (flatsql-p4-threads.wasm)",
   "type": "module",
   "main": "wasm/index.js",
