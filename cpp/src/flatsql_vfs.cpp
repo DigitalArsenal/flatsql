@@ -6,56 +6,190 @@
 // IndexedDB store and a WasmEdge preopen is which host satisfies the seven
 // imports. No `#ifdef __EMSCRIPTEN__` appears in this file, and none may.
 //
-// Locking is a deliberate no-op. FlatSQL is opened by exactly one writer — the
-// one-daemon-per-box law guarantees it on the server, and a browser tab owns
-// its own store. Rollback-journal crash safety does not depend on locking; it
-// depends on xSync ordering, which is honoured. WAL works on the wasi targets:
-// the wal-index lives on the heap (xShm* below), which is sound only because
-// there is one connection. The browser target keeps SQLITE_OMIT_WAL.
+// PER-PATH NODES. A main database file opened with the URI parameter share=1
+// attaches to the one node of its path. The node holds what the connections
+// to that path share, all in the instance's memory:
+//
+//   - the WAL index: heap regions shared by every connection to the path
+//     (xShmMap/xShmLock/xShmBarrier/xShmUnmap), with the eight shm locks;
+//   - the database-file locks (xLock/xUnlock/xCheckReservedLock), with the
+//     unix VFS's inode rules: SHARED / RESERVED / PENDING / EXCLUSIVE. SQLite's
+//     own "am I the last connection" test (EXCLUSIVE on the database file at
+//     close) then sees the other connections, so closing one connection never
+//     checkpoints and deletes the WAL under the others.
+//
+// A file opened without share=1 (format 1: FlatSQL is opened by exactly one
+// writer, which the one-daemon-per-box law guarantees on the server and tab
+// ownership in the browser) gets a private node: every lock is granted and the
+// WAL index is private heap memory, as before nodes existed. SQLite's own unix
+// VFS simulates shared memory with heap memory the same way when a database is
+// held under an exclusive lock (sqlite3.c, unixOpenSharedMemory). Store format
+// 4 opens every connection with share=1: one writer and readers per file, all
+// in one instance, share the node. Paths are never reused by format 4
+// (generation-suffixed file names), so a node keyed by path never attaches to
+// a dropped file.
+//
+// READAHEAD. A connection opened with the URI parameter ra=1 (format 4's
+// readers) reads ahead sequentially: after three nearby reads in one
+// direction it reads up to `bytes` at once, forward or backward, in up to
+// `streams` streams per connection. The buffers are dropped whenever the
+// connection takes or releases a WAL read-mark lock, so a page from before a
+// checkpoint is never served: inside one read transaction SQLite reads from
+// the database file only pages that no checkpoint may overwrite (backfill
+// stops at the oldest reader's mark).
+//
+// DIRECTORY DURABILITY. A connection opened with the URI parameter dsync=1
+// creates its WAL and journal files with FLATSQL_IO_CREATE_PARENTS, so a host
+// fsyncs the parent directory when the file is newly created and a commit
+// that lives in a new WAL survives power loss. Without it (format 1) opens are
+// unchanged.
 
 #include "flatsql/flatsql_io.h"
 
 #include <sqlite3.h>
 
-#include <cstring>
+#include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <string>
+#include <unordered_map>
 
-#if !defined(__wasm__)
-#include <random>
+// Threads exist natively and on wasm32 with the atomics feature
+// (wasm32-wasip1-threads). The single-threaded wasm lanes compile no mutex.
+#if !defined(__wasm__) || defined(__wasm_atomics__)
+#define FLATSQL_VFS_THREADS 1
+#include <mutex>
+#include <time.h>
+#else
+#define FLATSQL_VFS_THREADS 0
 #endif
 
 namespace {
 
 constexpr int kMaxPathLen = 1024;
 
-// HEAP-BACKED WAL-INDEX. SQLite's own unix VFS does exactly this when the
-// database is held under an exclusive lock: "we do not really need shared
-// memory. No shared memory file is created. The shared memory will be
-// simulated with heap memory." (sqlite3.c, unixOpenSharedMemory).
-//
-// That is precisely this lane's situation — FlatSQL is opened by exactly one
-// writer, which the one-daemon-per-box law guarantees on the server and tab
-// ownership guarantees in the browser. The wal-index only has to be SHARED
-// when several processes attach; for a single connection it is just memory.
-//
 // 64 regions is the cap. Regions are szRegion bytes (32 KiB in practice), so
 // this covers a wal-index far larger than any WAL this engine will checkpoint,
 // and the map fails loudly rather than silently wrapping past the end.
 constexpr int kMaxShmRegions = 64;
+constexpr int kShmLocks = SQLITE_SHM_NLOCK;   // 8
+constexpr int kReadMarkFirst = 3;             // WAL_READ_LOCK(0)
+constexpr int kRaStreak = 3;
+constexpr int kRaMaxStreams = 8;
+
+#if FLATSQL_VFS_THREADS
+std::mutex& nodeMutex() {
+    static std::mutex* m = new std::mutex();  // never destroyed: files may outlive statics
+    return *m;
+}
+struct NodeLock {
+    NodeLock() { nodeMutex().lock(); }
+    ~NodeLock() { nodeMutex().unlock(); }
+};
+#else
+struct NodeLock {};
+#endif
+
+struct FlatSqlFile;
+
+struct Node {
+    std::string path;
+    bool shared = false;  // in the path table (share=1); else private to one file
+    int nref = 0;  // open main-database files on this path
+    // database-file locks
+    int nshared = 0;  // files holding SHARED or more
+    FlatSqlFile* reserved = nullptr;
+    FlatSqlFile* pending = nullptr;
+    FlatSqlFile* exclusive = nullptr;
+    // WAL index
+    void* regions[kMaxShmRegions] = {};
+    int regionSize = 0;
+    int nshm = 0;  // files that mapped the WAL index
+    int shmShared[kShmLocks] = {};
+    FlatSqlFile* shmExcl[kShmLocks] = {};
+};
+
+std::unordered_map<std::string, Node*>& nodes() {
+    static auto* m = new std::unordered_map<std::string, Node*>();
+    return *m;
+}
+
+std::atomic<int64_t> gShmBytes{0};
+std::atomic<int64_t> gShmBytesPeak{0};
+std::atomic<int64_t> gRaReads{0};
+std::atomic<int64_t> gRaHits{0};
+std::atomic<int64_t> gRaBytes{0};
+std::atomic<int> gRaStreams{2};
+std::atomic<int> gRaBytesPerRead{1 << 20};
+
+struct RaStream {
+    uint8_t* buf;
+    sqlite3_int64 off;
+    int len;
+    sqlite3_int64 last;
+    int dir;
+    int streak;
+    uint64_t used;
+};
 
 struct FlatSqlFile {
     sqlite3_file base;   // must be first
     int32_t handle;
     int deleteOnClose;
     char path[kMaxPathLen];
-    void* shmRegions[kMaxShmRegions];
-    int shmRegionSize;
+    Node* node;          // main database files only
+    int lock;            // this file's SQLITE_LOCK_* level
+    int mapped;          // mapped the node's WAL index
+    uint16_t shmShared;  // shm locks held SHARED by this file
+    uint16_t shmExcl;    // shm locks held EXCLUSIVE by this file
+    // readahead (ra=1)
+    int ra;
+    RaStream rs[kRaMaxStreams];
+    uint64_t tick;
 };
 
-// Defined below with the rest of the shm methods; fsClose needs it first.
-void freeShmRegions(FlatSqlFile* f);
+void freeRegions(Node* n) {
+    for (int i = 0; i < kMaxShmRegions; ++i) {
+        if (n->regions[i] != nullptr) {
+            sqlite3_free(n->regions[i]);
+            n->regions[i] = nullptr;
+            gShmBytes.fetch_sub(n->regionSize, std::memory_order_relaxed);
+        }
+    }
+    n->regionSize = 0;
+}
+
+// Node table mutex held.
+Node* nodeAttach(const char* path, bool shared) {
+    if (!shared) {
+        Node* n = new (std::nothrow) Node();
+        if (n) n->nref = 1;
+        return n;
+    }
+    auto& m = nodes();
+    auto it = m.find(path);
+    Node* n;
+    if (it == m.end()) {
+        n = new (std::nothrow) Node();
+        if (!n) return nullptr;
+        n->path = path;
+        n->shared = true;
+        m.emplace(n->path, n);
+    } else {
+        n = it->second;
+    }
+    n->nref++;
+    return n;
+}
+
+// Node table mutex held.
+void nodeRelease(Node* n) {
+    if (--n->nref > 0 || n->nshm > 0) return;
+    freeRegions(n);
+    if (n->shared) nodes().erase(n->path);
+    delete n;
+}
 
 int mapIoError(int32_t status, int fallback) {
     switch (status) {
@@ -68,9 +202,44 @@ int mapIoError(int32_t status, int fallback) {
     }
 }
 
+void raDrop(FlatSqlFile* f) {
+    for (int i = 0; i < kRaMaxStreams; ++i) {
+        if (f->rs[i].buf) sqlite3_free(f->rs[i].buf);
+        f->rs[i] = RaStream{nullptr, 0, 0, -1, 0, 0, 0};
+    }
+}
+
+// Drops this file's shm locks and mapping. Node table mutex held.
+void shmDetach(FlatSqlFile* f) {
+    Node* n = f->node;
+    if (!n || !f->mapped) return;
+    for (int i = 0; i < kShmLocks; ++i) {
+        const uint16_t b = uint16_t(1u << i);
+        if (f->shmExcl & b) n->shmExcl[i] = nullptr;
+        if (f->shmShared & b) n->shmShared[i]--;
+    }
+    f->shmExcl = f->shmShared = 0;
+    f->mapped = 0;
+    // The last unmap frees the WAL index: the next connection rebuilds it
+    // from the -wal file (recovery), as a lone connection always did.
+    if (--n->nshm == 0) freeRegions(n);
+}
+
 int fsClose(sqlite3_file* file) {
     auto* f = reinterpret_cast<FlatSqlFile*>(file);
-    freeShmRegions(f);
+    if (f->node) {
+        NodeLock g;
+        Node* n = f->node;
+        shmDetach(f);
+        if (f->lock >= SQLITE_LOCK_SHARED) n->nshared--;
+        if (n->reserved == f) n->reserved = nullptr;
+        if (n->pending == f) n->pending = nullptr;
+        if (n->exclusive == f) n->exclusive = nullptr;
+        f->lock = SQLITE_LOCK_NONE;
+        nodeRelease(n);
+        f->node = nullptr;
+    }
+    if (f->ra) raDrop(f);
     if (f->handle < 0) return SQLITE_OK;
     const int32_t rc = flatsql_io_close(f->handle);
     f->handle = -1;
@@ -81,9 +250,7 @@ int fsClose(sqlite3_file* file) {
     return rc < 0 ? mapIoError(rc, SQLITE_IOERR_CLOSE) : SQLITE_OK;
 }
 
-int fsRead(sqlite3_file* file, void* buf, int amount, sqlite3_int64 offset) {
-    auto* f = reinterpret_cast<FlatSqlFile*>(file);
-    if (f->handle < 0) return SQLITE_IOERR_READ;
+int ioRead(FlatSqlFile* f, void* buf, int amount, sqlite3_int64 offset) {
     const int32_t got = flatsql_io_read(f->handle, buf, amount,
                                         static_cast<double>(offset));
     if (got < 0) return mapIoError(got, SQLITE_IOERR_READ);
@@ -96,10 +263,90 @@ int fsRead(sqlite3_file* file, void* buf, int amount, sqlite3_int64 offset) {
     return SQLITE_OK;
 }
 
+// Sequential readahead (ra=1 connections).
+int raRead(FlatSqlFile* f, void* buf, int amount, sqlite3_int64 offset) {
+    const int streams = gRaStreams.load(std::memory_order_relaxed);
+    const int raBytes = gRaBytesPerRead.load(std::memory_order_relaxed);
+    f->tick++;
+    for (int i = 0; i < streams; ++i) {
+        RaStream* s = &f->rs[i];
+        if (s->len > 0 && offset >= s->off && offset + amount <= s->off + s->len) {
+            std::memcpy(buf, s->buf + (offset - s->off), static_cast<size_t>(amount));
+            s->last = offset;
+            s->used = f->tick;
+            gRaHits.fetch_add(1, std::memory_order_relaxed);
+            return SQLITE_OK;
+        }
+    }
+    // The stream this read continues: the one whose last read is nearest
+    // (within a readahead), else the least recently used one restarts.
+    RaStream* s = nullptr;
+    sqlite3_int64 best = INT64_MAX;
+    for (int i = 0; i < streams; ++i) {
+        RaStream* x = &f->rs[i];
+        if (x->last < 0) continue;
+        sqlite3_int64 d = offset - x->last;
+        if (d < 0) d = -d;
+        if (d <= raBytes && d < best) {
+            best = d;
+            s = x;
+        }
+    }
+    if (!s) {
+        s = &f->rs[0];
+        for (int i = 1; i < streams; ++i)
+            if (f->rs[i].used < s->used) s = &f->rs[i];
+        s->streak = 0;
+        s->dir = 0;
+        s->last = offset;
+        s->used = f->tick;
+        s->len = 0;
+        return ioRead(f, buf, amount, offset);
+    }
+    const sqlite3_int64 d = offset - s->last;
+    const int dir = d > 0 ? 1 : d < 0 ? -1 : 0;
+    if (dir != 0 && dir == s->dir) s->streak++; else s->streak = 0;
+    s->dir = dir;
+    s->last = offset;
+    s->used = f->tick;
+    if (s->streak >= kRaStreak && amount <= raBytes / 4) {
+        sqlite3_int64 start = dir > 0 ? offset : offset + amount - raBytes;
+        if (start < 0) start = 0;
+        const double size = flatsql_io_size(f->handle);
+        sqlite3_int64 end = start + raBytes;
+        if (size >= 0 && end > static_cast<sqlite3_int64>(size)) end = static_cast<sqlite3_int64>(size);
+        if (end >= offset + amount && end > start) {
+            if (!s->buf) s->buf = static_cast<uint8_t*>(sqlite3_malloc(raBytes));
+            const int len = static_cast<int>(end - start);
+            if (s->buf) {
+                const int32_t got = flatsql_io_read(f->handle, s->buf, len, static_cast<double>(start));
+                if (got == len) {
+                    s->off = start;
+                    s->len = len;
+                    gRaReads.fetch_add(1, std::memory_order_relaxed);
+                    gRaBytes.fetch_add(len, std::memory_order_relaxed);
+                    std::memcpy(buf, s->buf + (offset - start), static_cast<size_t>(amount));
+                    return SQLITE_OK;
+                }
+            }
+            s->len = 0;
+        }
+    }
+    return ioRead(f, buf, amount, offset);
+}
+
+int fsRead(sqlite3_file* file, void* buf, int amount, sqlite3_int64 offset) {
+    auto* f = reinterpret_cast<FlatSqlFile*>(file);
+    if (f->handle < 0) return SQLITE_IOERR_READ;
+    if (f->ra) return raRead(f, buf, amount, offset);
+    return ioRead(f, buf, amount, offset);
+}
+
 int fsWrite(sqlite3_file* file, const void* buf, int amount,
             sqlite3_int64 offset) {
     auto* f = reinterpret_cast<FlatSqlFile*>(file);
     if (f->handle < 0) return SQLITE_IOERR_WRITE;
+    if (f->ra) raDrop(f);
     int written = 0;
     while (written < amount) {
         const int32_t n = flatsql_io_write(
@@ -115,6 +362,7 @@ int fsWrite(sqlite3_file* file, const void* buf, int amount,
 int fsTruncate(sqlite3_file* file, sqlite3_int64 size) {
     auto* f = reinterpret_cast<FlatSqlFile*>(file);
     if (f->handle < 0) return SQLITE_IOERR_TRUNCATE;
+    if (f->ra) raDrop(f);
     const int32_t rc = flatsql_io_truncate(f->handle, static_cast<double>(size));
     return rc < 0 ? mapIoError(rc, SQLITE_IOERR_TRUNCATE) : SQLITE_OK;
 }
@@ -135,11 +383,59 @@ int fsFileSize(sqlite3_file* file, sqlite3_int64* outSize) {
     return SQLITE_OK;
 }
 
-int fsLock(sqlite3_file*, int) { return SQLITE_OK; }
-int fsUnlock(sqlite3_file*, int) { return SQLITE_OK; }
+// Database-file locks in memory, with the unix VFS's inode rules.
+int fsLock(sqlite3_file* file, int want) {
+    auto* f = reinterpret_cast<FlatSqlFile*>(file);
+    if (!f->node || f->lock >= want) return SQLITE_OK;
+    NodeLock g;
+    Node* n = f->node;
+    const bool otherPending = n->pending && n->pending != f;
+    const bool otherExclusive = n->exclusive && n->exclusive != f;
+    if (want == SQLITE_LOCK_SHARED) {
+        if (otherPending || otherExclusive) return SQLITE_BUSY;
+        n->nshared++;
+        f->lock = SQLITE_LOCK_SHARED;
+        return SQLITE_OK;
+    }
+    if (want == SQLITE_LOCK_RESERVED) {
+        if ((n->reserved && n->reserved != f) || otherPending || otherExclusive) return SQLITE_BUSY;
+        n->reserved = f;
+        f->lock = SQLITE_LOCK_RESERVED;
+        return SQLITE_OK;
+    }
+    // EXCLUSIVE, by way of PENDING: once PENDING is held no new SHARED lock is
+    // granted, and EXCLUSIVE waits for the other SHARED holders to leave.
+    if (otherPending || otherExclusive) return SQLITE_BUSY;
+    n->pending = f;
+    if (f->lock < SQLITE_LOCK_PENDING) f->lock = SQLITE_LOCK_PENDING;
+    if (n->nshared - (f->lock >= SQLITE_LOCK_SHARED ? 1 : 0) > 0) return SQLITE_BUSY;
+    n->exclusive = f;
+    n->pending = nullptr;
+    f->lock = SQLITE_LOCK_EXCLUSIVE;
+    return SQLITE_OK;
+}
 
-int fsCheckReservedLock(sqlite3_file*, int* out) {
+int fsUnlock(sqlite3_file* file, int to) {
+    auto* f = reinterpret_cast<FlatSqlFile*>(file);
+    if (!f->node || f->lock <= to) return SQLITE_OK;
+    NodeLock g;
+    Node* n = f->node;
+    if (n->reserved == f) n->reserved = nullptr;
+    if (n->pending == f) n->pending = nullptr;
+    if (n->exclusive == f) n->exclusive = nullptr;
+    if (to == SQLITE_LOCK_NONE && f->lock >= SQLITE_LOCK_SHARED) n->nshared--;
+    f->lock = to;
+    return SQLITE_OK;
+}
+
+int fsCheckReservedLock(sqlite3_file* file, int* out) {
+    auto* f = reinterpret_cast<FlatSqlFile*>(file);
     *out = 0;
+    if (!f->node) return SQLITE_OK;
+    NodeLock g;
+    Node* n = f->node;
+    *out = (n->reserved && n->reserved != f) || (n->pending && n->pending != f) ||
+           (n->exclusive && n->exclusive != f);
     return SQLITE_OK;
 }
 
@@ -161,29 +457,25 @@ int fsDeviceCharacteristics(sqlite3_file*) {
     return 0;
 }
 
-void freeShmRegions(FlatSqlFile* f) {
-    for (int i = 0; i < kMaxShmRegions; ++i) {
-        if (f->shmRegions[i] != nullptr) {
-            sqlite3_free(f->shmRegions[i]);
-            f->shmRegions[i] = nullptr;
-        }
-    }
-    f->shmRegionSize = 0;
-}
-
 int fsShmMap(sqlite3_file* file, int iRegion, int szRegion, int bExtend,
              void volatile** pp) {
     auto* f = reinterpret_cast<FlatSqlFile*>(file);
     *pp = nullptr;
-    if (iRegion < 0 || iRegion >= kMaxShmRegions || szRegion <= 0) {
+    if (!f->node || iRegion < 0 || iRegion >= kMaxShmRegions || szRegion <= 0) {
         return SQLITE_IOERR_SHMMAP;
     }
-    if (f->shmRegionSize == 0) {
-        f->shmRegionSize = szRegion;
-    } else if (f->shmRegionSize != szRegion) {
+    NodeLock g;
+    Node* n = f->node;
+    if (n->regionSize == 0) {
+        n->regionSize = szRegion;
+    } else if (n->regionSize != szRegion) {
         return SQLITE_IOERR_SHMMAP;
     }
-    if (f->shmRegions[iRegion] == nullptr) {
+    if (!f->mapped) {
+        f->mapped = 1;
+        n->nshm++;
+    }
+    if (n->regions[iRegion] == nullptr) {
         // bExtend == 0 asks "does it exist yet?" and must not allocate: the
         // pager uses the null answer to decide a recovery is needed.
         if (!bExtend) return SQLITE_OK;
@@ -192,20 +484,75 @@ int fsShmMap(sqlite3_file* file, int iRegion, int szRegion, int bExtend,
         // Zeroed: SQLite requires a freshly created wal-index region to read
         // as zero, or a dirty region is read as a valid header.
         std::memset(mem, 0, static_cast<size_t>(szRegion));
-        f->shmRegions[iRegion] = mem;
+        n->regions[iRegion] = mem;
+        const int64_t now = gShmBytes.fetch_add(szRegion, std::memory_order_relaxed) + szRegion;
+        int64_t peak = gShmBytesPeak.load(std::memory_order_relaxed);
+        while (now > peak && !gShmBytesPeak.compare_exchange_weak(peak, now)) {
+        }
     }
-    *pp = f->shmRegions[iRegion];
+    *pp = n->regions[iRegion];
     return SQLITE_OK;
 }
 
-// One connection owns this wal-index, so every lock is trivially available.
-int fsShmLock(sqlite3_file*, int, int, int) { return SQLITE_OK; }
+int fsShmLock(sqlite3_file* file, int ofst, int nLocks, int flags) {
+    auto* f = reinterpret_cast<FlatSqlFile*>(file);
+    if (!f->node || !f->mapped || ofst < 0 || nLocks < 1 || ofst + nLocks > kShmLocks)
+        return SQLITE_IOERR_SHMLOCK;
+    // A read-mark lock starts or ends a WAL read transaction: drop the
+    // readahead buffers (they may hold pages a checkpoint has rewritten since).
+    if (f->ra && ofst + nLocks > kReadMarkFirst) raDrop(f);
+    NodeLock g;
+    Node* n = f->node;
+    if (flags & SQLITE_SHM_UNLOCK) {
+        for (int i = ofst; i < ofst + nLocks; ++i) {
+            const uint16_t b = uint16_t(1u << i);
+            if (f->shmExcl & b) {
+                n->shmExcl[i] = nullptr;
+                f->shmExcl = uint16_t(f->shmExcl & ~b);
+            }
+            if (f->shmShared & b) {
+                n->shmShared[i]--;
+                f->shmShared = uint16_t(f->shmShared & ~b);
+            }
+        }
+        return SQLITE_OK;
+    }
+    if (flags & SQLITE_SHM_SHARED) {
+        for (int i = ofst; i < ofst + nLocks; ++i)
+            if (n->shmExcl[i] && n->shmExcl[i] != f) return SQLITE_BUSY;
+        for (int i = ofst; i < ofst + nLocks; ++i) {
+            const uint16_t b = uint16_t(1u << i);
+            if (!(f->shmShared & b)) {
+                n->shmShared[i]++;
+                f->shmShared = uint16_t(f->shmShared | b);
+            }
+        }
+        return SQLITE_OK;
+    }
+    for (int i = ofst; i < ofst + nLocks; ++i) {
+        const uint16_t b = uint16_t(1u << i);
+        if ((n->shmExcl[i] && n->shmExcl[i] != f) ||
+            n->shmShared[i] - ((f->shmShared & b) ? 1 : 0) > 0)
+            return SQLITE_BUSY;
+    }
+    for (int i = ofst; i < ofst + nLocks; ++i) {
+        n->shmExcl[i] = f;
+        f->shmExcl = uint16_t(f->shmExcl | (1u << i));
+    }
+    return SQLITE_OK;
+}
 
-// Single-threaded wasm: no other core's view needs ordering.
-void fsShmBarrier(sqlite3_file*) {}
+void fsShmBarrier(sqlite3_file*) {
+#if FLATSQL_VFS_THREADS
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
 
 int fsShmUnmap(sqlite3_file* file, int /*deleteFlag*/) {
-    freeShmRegions(reinterpret_cast<FlatSqlFile*>(file));
+    auto* f = reinterpret_cast<FlatSqlFile*>(file);
+    if (!f->node) return SQLITE_OK;
+    NodeLock g;
+    shmDetach(f);
     return SQLITE_OK;
 }
 
@@ -228,13 +575,16 @@ const sqlite3_io_methods kIoMethods = {
     nullptr, nullptr,  // v3 xFetch/xUnfetch (no mmap in any lane)
 };
 
-int32_t translateOpenFlags(int flags) {
+int32_t translateOpenFlags(const char* name, int flags) {
     int32_t out = 0;
     if (flags & SQLITE_OPEN_READONLY)  out |= FLATSQL_IO_READ;
     if (flags & SQLITE_OPEN_READWRITE) out |= FLATSQL_IO_READ | FLATSQL_IO_WRITE;
     if (flags & SQLITE_OPEN_CREATE)    out |= FLATSQL_IO_CREATE;
     if (flags & SQLITE_OPEN_EXCLUSIVE) out |= FLATSQL_IO_EXCL;
     if (flags & SQLITE_OPEN_DELETEONCLOSE) out |= FLATSQL_IO_DELETE_ON_CLOSE;
+    if ((flags & SQLITE_OPEN_CREATE) && (flags & (SQLITE_OPEN_WAL | SQLITE_OPEN_MAIN_JOURNAL)) &&
+        sqlite3_uri_boolean(name, "dsync", 0))
+        out |= FLATSQL_IO_CREATE_PARENTS;
     if (out == 0) out = FLATSQL_IO_READ;
     return out;
 }
@@ -258,11 +608,24 @@ int fsOpen(sqlite3_vfs*, const char* name, sqlite3_file* file, int flags,
     std::memcpy(f->path, name, len + 1);
 
     const int32_t handle = flatsql_io_open(name, static_cast<int32_t>(len),
-                                           translateOpenFlags(flags));
+                                           translateOpenFlags(name, flags));
     if (handle < 0) return mapIoError(handle, SQLITE_CANTOPEN);
 
     f->handle = handle;
     f->deleteOnClose = (flags & SQLITE_OPEN_DELETEONCLOSE) ? 1 : 0;
+    if (flags & SQLITE_OPEN_MAIN_DB) {
+        {
+            NodeLock g;
+            f->node = nodeAttach(f->path, sqlite3_uri_boolean(name, "share", 0) != 0);
+        }
+        if (!f->node) {
+            flatsql_io_close(handle);
+            f->handle = -1;
+            return SQLITE_NOMEM;
+        }
+        f->ra = sqlite3_uri_boolean(name, "ra", 0) ? 1 : 0;
+        if (f->ra) raDrop(f);
+    }
     f->base.pMethods = &kIoMethods;
     if (outFlags) {
         *outFlags = (flags & SQLITE_OPEN_READONLY) ? SQLITE_OPEN_READONLY
@@ -318,8 +681,18 @@ int fsRandomness(sqlite3_vfs*, int byteCount, char* out) {
 }
 
 int fsSleep(sqlite3_vfs*, int microseconds) {
-    // Nothing to sleep for: single writer, no lock contention, and neither
-    // wasm lane may block the host thread.
+#if FLATSQL_VFS_THREADS
+    // Several connections to one path (format 4) can meet a held lock; the
+    // busy handler and WAL retries sleep here. One connection never does.
+    if (microseconds > 0) {
+        struct timespec ts;
+        ts.tv_sec = microseconds / 1000000;
+        ts.tv_nsec = static_cast<long>(microseconds % 1000000) * 1000;
+        nanosleep(&ts, nullptr);
+    }
+#endif
+    // The single-threaded lanes have one connection and nothing to wait for,
+    // and may not block the host thread.
     return microseconds;
 }
 
@@ -377,6 +750,28 @@ int registerFlatSqlIoVfs(bool makeDefault) {
         g_registered = true;
     }
     return rc;
+}
+
+void setFlatSqlIoReadahead(int streams, int bytes) {
+    if (streams < 1) streams = 1;
+    if (streams > kRaMaxStreams) streams = kRaMaxStreams;
+    if (bytes < 64 * 1024) bytes = 64 * 1024;
+    gRaStreams.store(streams, std::memory_order_relaxed);
+    gRaBytesPerRead.store(bytes, std::memory_order_relaxed);
+}
+
+FlatSqlIoVfsStats flatSqlIoVfsStats() {
+    FlatSqlIoVfsStats s;
+    s.walIndexBytes = gShmBytes.load(std::memory_order_relaxed);
+    s.walIndexBytesPeak = gShmBytesPeak.load(std::memory_order_relaxed);
+    s.readaheadReads = gRaReads.load(std::memory_order_relaxed);
+    s.readaheadHits = gRaHits.load(std::memory_order_relaxed);
+    s.readaheadBytes = gRaBytes.load(std::memory_order_relaxed);
+    {
+        NodeLock g;
+        s.nodes = static_cast<int64_t>(nodes().size());
+    }
+    return s;
 }
 
 }  // namespace flatsql
