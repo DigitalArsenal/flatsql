@@ -27,6 +27,7 @@ struct Slice {
     std::string type;
     uint64_t bound;
     std::vector<std::string> tables;   // partition tables of the type
+    std::string rules;                 // SDN's (storage/format2/typeconfig.go typeRules)
     p4fake::Type* t = nullptr;
 };
 
@@ -197,15 +198,19 @@ P4SQL_TEST(fixture_slice_r17_r18_r19_equal_format1) {
     }
     Harness h;
     std::vector<Slice> slices = {
-        {"OMM", 400000, {"sds_p_source_celestrak__OMM"}},
-        {"MPE", 10000, {"sds_p_source_celestrak__MPE"}},
-        {"CAT", 10000, {"sds_p_source_celestrak__CAT"}},
-        {"IQC", 10000, {"sds_p_source_sigmf__IQC", "sds_p_16Uiu2HAm1LbvwjEHW2GDP2ZQZvwHLZrz2jbYoRLQmJEQ3wZ5Fm45__IQC"}},
+        {"OMM", 400000, {"sds_p_source_celestrak__OMM"},
+         "epoch str:EPOCH|str:CREATION_DATE\ncol 0 u64pos:NORAD_CAT_ID\ncol 1 str:OBJECT_ID\nepoch_day 4\nobject 0,1\n"},
+        {"MPE", 10000, {"sds_p_source_celestrak__MPE"}, "epoch f64floor:EPOCH\ncol 1 str:ENTITY_ID\nepoch_day 4\nobject 1\n"},
+        {"CAT", 10000, {"sds_p_source_celestrak__CAT"},
+         "col 0 u64pos:NORAD_CAT_ID\ncol 1 str:OBJECT_ID\ncol 2 enum:OBJECT_TYPE\ncol 3 enum:OPS_STATUS_CODE\nobject 0,1\n"},
+        {"IQC", 10000, {"sds_p_source_sigmf__IQC", "sds_p_16Uiu2HAm1LbvwjEHW2GDP2ZQZvwHLZrz2jbYoRLQmJEQ3wZ5Fm45__IQC"},
+         "bucket str:CAPTURE_START\n"},
     };
     const auto t0 = std::chrono::steady_clock::now();
     for (Slice& sl : slices) {
         const std::string fid = "$" + sl.type;
         sl.t = &h.addType(sl.type, fid.c_str(), readFile(vectorDir() + "/" + sl.type + ".bfbs"), sl.bound);
+        sl.t->rules = sl.rules;
         std::string err;
         CHECK(loadSlice(db, h, sl, n, &err));
         if (!err.empty()) std::fprintf(stderr, "    %s\n", err.c_str());
@@ -255,7 +260,7 @@ P4SQL_TEST(fixture_slice_r17_r18_r19_equal_format1) {
     // R17: A18 relations (sandboxed raw streams).
     const uint32_t sb = P4_SLOT_RAW | P4_SLOT_SANDBOX;
     Result r = frames("CAT", "SELECT _data FROM \"CAT@celestrak-satcat\"", {}, sb);
-    CHECK(r.rowsExamined <= 10000 + 2);
+    CHECK(r.rowsExamined <= 10000);
     r = frames("CAT", "SELECT _data FROM \"CAT@celestrak-satcat-csv\"", {}, sb);
     CHECK_EQ(framesOf(r.raw), size_t(0));   // benchset R17: the window is all celestrak-satcat
     r = frames("IQC", "SELECT _data FROM \"IQC@IQEngine\"", {}, sb);

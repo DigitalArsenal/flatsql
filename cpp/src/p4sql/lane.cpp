@@ -45,8 +45,13 @@ public:
     SandboxScope(LaneState* ls, Stmt* st) : saved_(arenaBound()) {
         if (!st->sandbox) return;
         if (!ls->arena) {
+            uint64_t cap;
+            {
+                EngineCall ec;
+                cap = p4_lane_heap_cap(ls->lane);   // config tag 48 (C-18)
+            }
             std::unique_ptr<LaneArena> a(new LaneArena());
-            if (a->init(size_t(kSandboxHeapCap)) && arenaRegister(a.get())) ls->arena = a.release();
+            if (cap && a->init(size_t(cap)) && arenaRegister(a.get())) ls->arena = a.release();
         }
         if (!ls->arena) {
             ok_ = false;
@@ -321,9 +326,17 @@ public:
         return P4_OK;
     }
 
-    // Closes the output: the RB1 end marker (status included) and the rest.
-    int32_t finish(int32_t status, const Stmt& st, std::string* msg) {
-        if (!raw_) enc_.end(status, rows_, st.rowsExamined, st.bytesRead);
+    // Closes the output: the RB1 end marker (status included, the reader's
+    // counts: C-18) and the rest.
+    int32_t finish(int32_t status, std::string* msg) {
+        if (!raw_) {
+            uint64_t examined = 0, read = 0;
+            {
+                EngineCall ec;
+                p4_lane_counters(ls_->lane, &examined, &read);
+            }
+            enc_.end(status, rows_, examined, read);
+        }
         return flush(msg);
     }
 
@@ -420,6 +433,15 @@ int32_t run(LaneState* ls, Stmt& st, sqlite3_stmt* s, Out& out, std::string* msg
 
 // SURFACE (op 31): one row per (relation, column), relations in type name
 // order, each type's <TYPE> then its "<TYPE>@<source>" relations by source.
+// The hook's status, its text in the slot's err when it failed (C-19).
+int32_t reply(LaneState* ls, int32_t status, const std::string& msg) {
+    if (status < 0 && !msg.empty() && p4_lane_set_error) {
+        EngineCall ec;
+        p4_lane_set_error(ls->lane, msg.data(), uint32_t(std::min<size_t>(msg.size(), 255)));
+    }
+    return status;
+}
+
 int32_t surfaceRows(LaneState* ls, Out& out, std::string* msg) {
     int32_t rc = loadTypes(ls, msg);
     if (rc < 0) return rc;
@@ -527,22 +549,19 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
         if (s) sqlite3_finalize(s);   // releases the reader cursors and the statement's arena memory now
         ls->cur = nullptr;
     }
-    const int32_t emitted = out.finish(status, st, &msg);
-    ls->lastError = msg;
-    return status != P4_OK ? status : emitted;
+    const int32_t emitted = out.finish(status, &msg);
+    return reply(ls, status != P4_OK ? status : emitted, msg);
 }
 
 extern "C" int32_t p4sql_surface(P4Lane* lane) {
     LaneState* ls = stateOf(lane);
     if (!ls) return P4_E_INTERNAL;
-    Stmt st;
     Out out(ls, false, 0, 0);
     out.header({"name", "kind", "source", "column", "placeholder", "bound"});
     std::string msg;
     const int32_t status = surfaceRows(ls, out, &msg);
-    const int32_t emitted = out.finish(status, st, &msg);
-    ls->lastError = msg;
-    return status != P4_OK ? status : emitted;
+    const int32_t emitted = out.finish(status, &msg);
+    return reply(ls, status != P4_OK ? status : emitted, msg);
 }
 
 extern "C" void p4sql_lane_free(P4Lane* lane) {

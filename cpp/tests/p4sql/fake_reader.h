@@ -50,6 +50,7 @@ struct Type {
     std::vector<uint8_t> bfbs;
     uint64_t bound = 10000;
     uint8_t epochProfile = 0;
+    std::string rules;            // the spec's tag-4 rules text
     std::vector<Rec> recs;        // ascending seq
     int64_t visibleThrough = 0;   // 0 = every record
 };
@@ -85,6 +86,8 @@ struct P4Lane {
     uint64_t rowsExamined = 0, bytesRead = 0;
     std::vector<uint8_t> out;     // p4_emit
     uint64_t emits = 0;
+    std::string err;              // p4_lane_set_error
+    uint64_t heapCap = 64ull << 20;   // p4_lane_heap_cap (config tag 48)
     int64_t cancelAfterRows = -1; // tests: set the cancel word after this many rows examined
     std::vector<p4fake::OpenedSpec> opened;
     // p4_types / p4_sources storage (valid until the lane's next call).
@@ -97,6 +100,7 @@ struct P4Lane {
         rowsExamined = bytesRead = 0;
         out.clear();
         emits = 0;
+        err.clear();
         cancelAfterRows = -1;
         opened.clear();
     }

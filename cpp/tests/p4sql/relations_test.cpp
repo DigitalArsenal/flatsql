@@ -31,6 +31,12 @@ std::string cidOf(const std::string& type, int64_t seq) {
     return c;
 }
 
+// SDN's rules (storage/format2/typeconfig.go typeRules): COL0/COL1.
+const char* kOmmRules = "epoch str:EPOCH|str:CREATION_DATE\ncol 0 u64pos:NORAD_CAT_ID\ncol 1 str:OBJECT_ID\nepoch_day 4\nobject 0,1\n";
+const char* kCatRules =
+    "col 0 u64pos:NORAD_CAT_ID\ncol 1 str:OBJECT_ID\ncol 2 enum:OBJECT_TYPE\ncol 3 enum:OPS_STATUS_CODE\nobject 0,1\n"
+    "supersede pair:uri:CATALOG_URI,CATALOG_OBJECT_ID|u64:norad:NORAD_CAT_ID|str:object:OBJECT_ID\n";
+
 p4fake::Tag tagOf(const std::string& source, int64_t at) {
     p4fake::Tag t;
     t.provider = "space-data-network-02";
@@ -152,6 +158,7 @@ P4SQL_TEST(omm_rows_and_frames_equal_format1) {
     Harness h;
     CHECK_EQ(h.initStatus(), 0);
     p4fake::Type& t = h.addType("OMM", "$OMM", bfbsOf("OMM"), 400000);
+    t.rules = kOmmRules;   // NORAD_CAT_ID and OBJECT_ID constraints reach the reader
     for (int64_t s = 1; s <= 120; s++)
         h.put("OMM", omm(s * 3, uint32_t(25000 + (s * 37) % 900), 1789000000 + s * 4000, {"celestrak-gp"}));
     Format1 f1({"OMM"}, {"$OMM"});
@@ -219,6 +226,7 @@ P4SQL_TEST(omm_rows_and_frames_equal_format1) {
 P4SQL_TEST(a18_window_is_the_types_newest_n) {
     Harness h;
     p4fake::Type& t = h.addType("CAT", "$CAT", bfbsOf("CAT"), 10);
+    t.rules = kCatRules;
     for (int64_t s = 1; s <= 15; s++) h.put("CAT", cat(s, uint32_t(40000 + s), {"celestrak-satcat-csv"}));
     for (int64_t s = 16; s <= 30; s++)
         h.put("CAT", cat(s, uint32_t(40000 + s), s % 4 == 0 ? std::vector<std::string>{"celestrak-satcat", "celestrak-satcat-csv"}
@@ -232,15 +240,15 @@ P4SQL_TEST(a18_window_is_the_types_newest_n) {
     Result r = h.sql("SELECT _data FROM \"CAT@celestrak-satcat-csv\"", {}, P4_SLOT_RAW | P4_SLOT_SANDBOX);
     sameFrames(h, f1, "SELECT _data FROM \"CAT@celestrak-satcat-csv\"", {}, P4_SLOT_RAW | P4_SLOT_SANDBOX, &frames);
     CHECK_EQ(frames, size_t(2));   // seq 24 and 28 of the window (21..30) carry both sources
-    // Never past the bound: two one-row probes, then the window.
-    CHECK(r.rowsExamined <= 10 + 2);
+    // Never past the bound: one cursor over the window (C-17).
+    CHECK(r.rowsExamined <= 10);
     sameRows(h, f1, "SELECT _source, COUNT(*) FROM CAT GROUP BY _source");
     sameRows(h, f1, "SELECT NORAD_CAT_ID, _source FROM CAT");   // the sources one after another
     sameRows(h, f1, "SELECT COUNT(*) FROM CAT");
     sameRows(h, f1, "SELECT _data FROM CAT WHERE NORAD_CAT_ID = ?1", P({cInt(40024)}));
     sameFrames(h, f1, "SELECT _data FROM CAT WHERE NORAD_CAT_ID = ?1", P({cInt(40024)}));
     r = h.sql("SELECT COUNT(*) FROM CAT");
-    CHECK(r.rowsExamined <= 2 * 10 + 2);
+    CHECK(r.rowsExamined <= 2 * 10);   // a cursor per source, each over the window
     // Ordered by seq: merged across the sources.
     r = h.sql("SELECT _seq, _source FROM CAT ORDER BY _seq");
     CHECK_EQ(r.rows.size(), size_t(12));
@@ -346,6 +354,66 @@ P4SQL_TEST(relation_names) {
     CHECK_EQ(r.status, P4_E_SQL);
     CHECK(r.error.find("no such table: NOPE") != std::string::npos);
     CHECK(r.ended && r.endStatus == P4_E_SQL);
+}
+
+
+// COL0/COL1 (the type's `col 0`/`col 1` rules, C-16): pushed as reader
+// predicates only where they keep every row SQLite keeps. COL0 is `u64pos`
+// (zero and negatives are absent there): equality on a positive value, or a
+// range with a positive lower bound. COL1 is `str`, trimmed, empty = absent:
+// equality on non-empty text without surrounding space.
+P4SQL_TEST(pushdown_col0_col1) {
+    Harness h;
+    p4fake::Type& t = h.addType("OMM", "$OMM", bfbsOf("OMM"), 400000);
+    t.rules = kOmmRules;
+    for (int64_t s = 1; s <= 60; s++) h.put("OMM", omm(s, uint32_t(25000 + s % 20), 1789000000 + s, {"celestrak-gp"}));
+    struct Case {
+        const char* where;
+        std::vector<std::pair<uint8_t, uint8_t>> preds;   // field, op
+        const char* plainWhere = nullptr;   // the same rows without pushdown (default: `+column`)
+    };
+    const Case cases[] = {
+        {"NORAD_CAT_ID = 25010", {{P4_F_COL0, P4_OP_EQ}}},
+        // The column's INTEGER affinity makes '25010' an integer; `+column`
+        // would drop the affinity, so the plain plan compares the integer.
+        {"NORAD_CAT_ID = '25010'", {{P4_F_COL0, P4_OP_EQ}}, "+NORAD_CAT_ID = 25010"},
+        {"NORAD_CAT_ID = 0", {}},
+        {"NORAD_CAT_ID BETWEEN 25005 AND 25012", {{P4_F_COL0, P4_OP_GE}, {P4_F_COL0, P4_OP_LE}}},
+        {"NORAD_CAT_ID > 25015", {{P4_F_COL0, P4_OP_GE}}},
+        {"NORAD_CAT_ID < 25003", {}},
+        {"NORAD_CAT_ID >= -5 AND NORAD_CAT_ID < 25003", {}},
+        {"OBJECT_ID = '1998-001A'", {{P4_F_COL1, P4_OP_EQ}}},
+        {"OBJECT_ID = ' 1998-001A'", {}},
+        {"OBJECT_ID = ''", {}},
+        {"OBJECT_ID > '1998-001A'", {}},
+    };
+    for (const Case& c : cases) {
+        const std::string pushed = std::string("SELECT _seq, NORAD_CAT_ID, OBJECT_ID FROM OMM WHERE ") + c.where;
+        std::string plain = c.plainWhere ? std::string("SELECT _seq, NORAD_CAT_ID, OBJECT_ID FROM OMM WHERE ") + c.plainWhere
+                                         : pushed;
+        for (const char* col : {"NORAD_CAT_ID", "OBJECT_ID"}) {
+            if (c.plainWhere) break;
+            const std::string w = std::string(" ") + col + " ";
+            size_t at = plain.find("WHERE");
+            while ((at = plain.find(w, at)) != std::string::npos) {
+                plain.replace(at, w.size(), std::string(" +") + col + " ");
+                at += w.size() + 1;
+            }
+        }
+        const Result a = h.sql(pushed), b = h.sql(plain);
+        CHECK_EQ(a.status, 0);
+        CHECK_EQ(b.status, 0);
+        if (!(a.rows == b.rows)) failAt(__FILE__, __LINE__, std::string(c.where) + ": rows differ from the plain plan");
+        CHECK_EQ(a.opened.size(), size_t(1));
+        if (a.opened.size() != 1) continue;
+        std::vector<std::pair<uint8_t, uint8_t>> got;
+        for (const auto& p : a.opened[0].preds) got.push_back({p.field, p.op});
+        if (got != c.preds) failAt(__FILE__, __LINE__, std::string(c.where) + ": unexpected reader predicates");
+    }
+    // The pushed equality reads one object's rows only.
+    const Result r = h.sql("SELECT _data FROM OMM WHERE NORAD_CAT_ID = 25010");
+    CHECK_EQ(r.rows.size(), size_t(3));
+    CHECK(r.rowsExamined == 60);   // the fake filters by examining; the engine seeks (r_dk)
 }
 
 #endif  // FLATSQL_P4SQL_FAKE

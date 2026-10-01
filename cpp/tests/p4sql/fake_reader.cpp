@@ -123,7 +123,6 @@ struct P4Cursor {
     std::vector<PredC> preds;
     bool desc = false, hydrate = false;
     uint64_t limit = 0, offset = 0;
-    std::string boundSource;    // A18 bound of lane.source
     // Iteration over t->recs indexes [lo, hi).
     size_t lo = 0, hi = 0, pos = 0;
     uint64_t skipped = 0, returned = 0;
@@ -133,12 +132,6 @@ struct P4Cursor {
 };
 
 namespace {
-bool hasSourceTag(const Rec& r, const std::string& s) {
-    for (const Tag& t : r.tags)
-        if (t.source == s) return true;
-    return false;
-}
-
 // 36-byte binary CID -> base32 text (CIDv1: 'b' + base32 lower of the bytes).
 std::string cidText(const uint8_t* b) {
     static const char* a = "abcdefghijklmnopqrstuvwxyz234567";
@@ -205,21 +198,8 @@ int32_t p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out) {
                          recs.begin());
     c->lo = 0;
     c->hi = nVis;
-    if (spec->bound) {
-        if (spec->lane.source) {
-            // §3.8.8 as the contract states it: the newest N of lane.source.
-            c->boundSource = spec->lane.source;
-            uint64_t n = 0;
-            size_t i = nVis;
-            while (i > 0 && n < spec->bound) {
-                i--;
-                if (hasSourceTag(recs[i], c->boundSource)) n++;
-            }
-            c->lo = i;
-        } else if (nVis > spec->bound) {
-            c->lo = nVis - size_t(spec->bound);
-        }
-    }
+    // A18 (C-17): the type's newest N seqs, before every other filter.
+    if (spec->bound && nVis > spec->bound) c->lo = nVis - size_t(spec->bound);
     // A seq range is a seek, not a scan (the bound is applied first).
     const size_t afterIdx = size_t(std::upper_bound(recs.begin(), recs.end(), c->after,
                                                     [](int64_t s, const Rec& r) { return s < r.seq; }) -
@@ -257,7 +237,6 @@ int32_t p4_cursor_next(P4Cursor* c, P4Row* row) {
         if (lane->cancelAfterRows >= 0 && int64_t(lane->rowsExamined) >= lane->cancelAfterRows) lane->cancel = 1;
         if (lane->cancel.load()) return P4_E_CANCELLED;
         if (lane->maxRowsExamined && lane->rowsExamined > lane->maxRowsExamined) return P4_E_BUDGET;
-        if (!c->boundSource.empty() && !hasSourceTag(r, c->boundSource)) continue;
         if (r.seq <= c->after || r.seq > c->through) continue;
         if (!c->cid.empty() && r.cid != c->cid) continue;
         if (c->hasPeer && r.peer != c->peer) continue;
@@ -341,6 +320,8 @@ int32_t p4_types(P4Lane* lane, const P4TypeInfo** out, uint32_t* n) {
         std::memcpy(ti.fid, t.fid, 4);
         ti.a18Bound = t.bound;
         ti.epochProfile = t.epochProfile;
+        ti.rules = t.rules.c_str();
+        ti.rulesLen = uint32_t(t.rules.size());
         lane->typeInfos.push_back(ti);
     }
     *out = lane->typeInfos.data();
@@ -366,6 +347,15 @@ int32_t p4_sources(P4Lane* lane, const char* type, const char* const** out, uint
     *n = uint32_t(lane->srcPtrs.size());
     return P4_OK;
 }
+
+uint64_t p4_lane_heap_cap(P4Lane* lane) { return lane->heapCap; }
+
+void p4_lane_counters(P4Lane* lane, uint64_t* rowsExamined, uint64_t* bytesRead) {
+    *rowsExamined = lane->rowsExamined;
+    *bytesRead = lane->bytesRead;
+}
+
+void p4_lane_set_error(P4Lane* lane, const char* msg, uint32_t n) { lane->err.assign(msg, std::min<uint32_t>(n, 255)); }
 
 int64_t p4_visible_through(P4Engine* e, const char* type) {
     auto it = e->types.find(type ? type : "");

@@ -4,16 +4,14 @@
 // (merging sources) onto the p4 reader (flatsql/p4/p4_reader.h).
 //
 // The A18 window is format 1's: the type's newest N seqs (N = the type's
-// bound), applied before every predicate.
-//   "<TYPE>@<source>"  the window's records with a live tag of the source;
-//   <TYPE>             one row per (record, live source) of the window, the
-//                      sources one after another (format 1's UNION ALL view
-//                      over its per-source tables), or merged by seq when the
-//                      statement orders by it.
-// When the type has one source, one bounded cursor serves either relation.
-// Otherwise the window is found with two one-row probes (its newest and its
-// oldest seq) and each source is read with a lane-filtered cursor over that
-// seq range, so no relation reads past its bound.
+// bound), applied by the reader before every other filter, the lane filter
+// included (C-17).
+//   "<TYPE>@<source>"  one cursor: the window narrowed to records with a live
+//                      tag of the source;
+//   <TYPE>             one row per (record, live source) of the window: a
+//                      cursor per source, the sources one after another
+//                      (format 1's UNION ALL view over its per-source tables),
+//                      or merged by seq when the statement orders by it.
 //
 // Pushed down (always re-checked by SQLite, so a pushdown only has to be a
 // superset of the rows SQLite keeps): _seq/_rowid ranges, _epoch and _ts
@@ -39,9 +37,7 @@ std::string lower(const std::string& s) {
 
 namespace {
 
-// CONTRACT §3.9 gives P4TypeInfo no rules text; the coordinator was asked to
-// add it. Until then no schema column maps to COL0/COL1 (no COL pushdown).
-std::string rulesOf(const P4TypeInfo&) { return std::string(); }
+std::string rulesOf(const P4TypeInfo& t) { return t.rules ? std::string(t.rules, t.rulesLen) : std::string(); }
 
 // COL0/COL1 from the type's rules: one alternative on a top-level field
 // ("col 0 u64pos:NORAD_CAT_ID", "col 1 str:OBJECT_ID") makes that column's
@@ -266,14 +262,13 @@ int relBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
 }
 
 // ---- cursors ----------------------------------------------------------------
+// One source's cursor.
 struct Sub {
     P4Cursor* c = nullptr;
     P4Row row{};
     bool has = false;
     bool done = false;
-    std::string source;        // the rows' source, when fixed by the cursor's lane filter
-    bool fromTag = false;      // the rows' source is their matched tag's (untagged rows skipped)
-    std::string requireTag;    // keep only rows whose matched tag has this source
+    std::string source;
 };
 
 struct RelCursor : sqlite3_vtab_cursor {
@@ -308,33 +303,23 @@ int fail(RelCursor* c, int32_t status, const std::string& what) {
     return SQLITE_ERROR;
 }
 
-// Advances one sub to its next kept row. 0 or a negative status.
-int32_t step(RelCursor* c, Sub& s) {
+// Advances one sub to its next row. 0 or a negative status.
+int32_t step(Sub& s) {
     s.has = false;
     if (s.done) return 0;
-    for (;;) {
-        int32_t rc;
-        {
-            EngineCall ec;
-            rc = p4_cursor_next(s.c, &s.row);
-        }
-        if (rc < 0) return rc;
+    int32_t rc;
+    {
+        EngineCall ec;
+        rc = p4_cursor_next(s.c, &s.row);
         if (rc == 0) {
-            s.done = true;
-            EngineCall ec;
             p4_cursor_close(s.c);
             s.c = nullptr;
-            return 0;
+            s.done = true;
         }
-        if (Stmt* st = stmtOf(c->vt)) {
-            st->rowsExamined++;
-            st->bytesRead += s.row.dataLen;
-        }
-        if (s.fromTag && !s.row.tag) continue;   // untagged: no live source
-        if (!s.requireTag.empty() && (!s.row.tag || !s.row.tag->source || s.requireTag != s.row.tag->source)) continue;
-        s.has = true;
-        return 0;
     }
+    if (rc < 0) return rc;
+    s.has = rc > 0;
+    return 0;
 }
 
 int32_t open(RelCursor* c, size_t i) {
@@ -349,14 +334,10 @@ int32_t open(RelCursor* c, size_t i) {
         s.done = true;
         return rc;
     }
-    return step(c, s);
+    return step(s);
 }
 
-void setSource(RelCursor* c, const Sub& s) {
-    c->sourceText = c->vt->t->name + "@";
-    if (s.fromTag) c->sourceText += s.row.tag && s.row.tag->source ? s.row.tag->source : "";
-    else c->sourceText += s.source;
-}
+void setSource(RelCursor* c, const Sub& s) { c->sourceText = c->vt->t->name + "@" + s.source; }
 
 // Positions on the next output row (after `at` was consumed).
 int32_t settle(RelCursor* c) {
@@ -445,36 +426,6 @@ uint8_t predOp(char op) {
 bool spaceAt(const unsigned char* s, int n) {
     auto sp = [](unsigned char ch) { return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v'; };
     return n > 0 && (sp(s[0]) || sp(s[n - 1]));
-}
-
-// The window of a type: its newest N seqs, as [floor, ceil]. 1 = empty.
-int32_t window(RelCursor* c, int64_t* floorSeq, int64_t* ceilSeq) {
-    const TypeEntry* t = c->vt->t;
-    for (int probe = 0; probe < 2; probe++) {
-        P4ScanSpec sp;
-        std::memset(&sp, 0, sizeof(sp));
-        sp.type = t->name.c_str();
-        sp.order = probe == 0 ? P4_ORDER_SEQ_DESC : P4_ORDER_SEQ_ASC;
-        sp.limit = 1;
-        sp.bound = t->bound;
-        if (probe == 1) sp.seqThrough = *ceilSeq;
-        P4Cursor* pc = nullptr;
-        P4Row row{};
-        int32_t rc;
-        {
-            EngineCall ec;
-            rc = p4_cursor_open(c->vt->ls->lane, &sp, &pc);
-            if (rc >= 0) {
-                rc = p4_cursor_next(pc, &row);
-                p4_cursor_close(pc);
-            }
-        }
-        if (rc < 0) return rc;
-        if (rc == 0) return 1;
-        if (Stmt* st = stmtOf(c->vt)) st->rowsExamined++;
-        (probe == 0 ? *ceilSeq : *floorSeq) = row.seq;
-    }
-    return 0;
 }
 
 int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc, sqlite3_value** argv) {
@@ -572,7 +523,7 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
     if (seq.through < 1 || seq.after >= seq.through) seq.empty = true;
     if (seq.empty) return SQLITE_OK;
 
-    // Sources.
+    // Sources: one cursor each.
     std::vector<std::string> srcs;
     int32_t rc = sourcesOf(vt->ls, t->name, &srcs);
     if (rc < 0) return fail(c, rc, "sources unavailable");
@@ -610,33 +561,14 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
     base.nPreds = uint32_t(c->preds.size());
     base.order = c->desc ? P4_ORDER_SEQ_DESC : P4_ORDER_SEQ_ASC;
     base.hydrate = hydrate ? 1 : 0;
-
-    if (srcs.size() == 1) {
-        // One source: one bounded cursor; its tagged rows are that source's.
-        base.bound = t->bound;
-        c->specs.push_back(base);
+    base.bound = t->bound;
+    for (const std::string& src : want) {
+        c->strs.push_back(src);
+        P4ScanSpec sp = base;
+        sp.lane.source = c->strs.back().c_str();
+        c->specs.push_back(sp);
         c->subs.emplace_back();
-        Sub& s = c->subs.back();
-        s.fromTag = true;
-        s.requireTag = want[0];
-        c->merge = false;
-    } else {
-        int64_t lo = 0, hi = 0;
-        rc = window(c, &lo, &hi);
-        if (rc < 0) return fail(c, rc, "window probe failed");
-        if (rc == 1) return SQLITE_OK;
-        base.seqAfter = std::max(base.seqAfter, lo - 1);
-        const int64_t through = base.seqThrough ? std::min(base.seqThrough, hi) : hi;
-        if (through <= base.seqAfter) return SQLITE_OK;
-        base.seqThrough = through;
-        for (const std::string& src : want) {
-            c->strs.push_back(src);
-            P4ScanSpec sp = base;
-            sp.lane.source = c->strs.back().c_str();
-            c->specs.push_back(sp);
-            c->subs.emplace_back();
-            c->subs.back().source = src;
-        }
+        c->subs.back().source = src;
     }
     // Concatenation opens one cursor at a time; a merge needs every head.
     if (c->merge) {
@@ -656,7 +588,7 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
 int relNext(sqlite3_vtab_cursor* cur) {
     RelCursor* c = static_cast<RelCursor*>(cur);
     if (c->eof) return SQLITE_OK;
-    int32_t rc = step(c, c->subs[c->at]);
+    int32_t rc = step(c->subs[c->at]);
     if (rc >= 0) rc = settle(c);
     if (rc < 0) return fail(c, rc, "reader cursor failed");
     return SQLITE_OK;

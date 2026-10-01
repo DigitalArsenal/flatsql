@@ -10,7 +10,6 @@
 #include <iterator>
 #include <sstream>
 
-#include "../../src/p4sql/internal.h"
 #include "flatbuffers/idl.h"
 #include "p4sql_test.h"
 
@@ -153,8 +152,7 @@ p4fake::Type& Harness::addType(const std::string& name, const char fid[4], const
 Result Harness::finish(int32_t status, bool raw) {
     Result r;
     r.status = status;
-    auto* ls = static_cast<flatsql::p4sql::LaneState*>(lane.sqlState);
-    if (ls) r.error = ls->lastError;
+    r.error = lane.err;
     r.raw = lane.out;
     r.rowsExamined = lane.rowsExamined;
     r.bytesRead = lane.bytesRead;

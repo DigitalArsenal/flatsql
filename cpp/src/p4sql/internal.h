@@ -96,9 +96,6 @@ private:
     LaneArena* saved_;
 };
 
-// Default cap of a sandboxed statement's lane heap (config tag 48's default;
-// p4_reader.h does not expose the configured value).
-constexpr int64_t kSandboxHeapCap = 64ll << 20;
 // Sandbox CPU work without reads (recursive CTEs, cross joins of constants):
 // VM steps, counted by the progress handler (format 2's default).
 constexpr uint64_t kSandboxMaxVmSteps = 200000000ull;
@@ -153,8 +150,6 @@ struct Stmt {
     bool sandbox = false;
     int32_t status = 0;               // a P4 status raised inside a vtab or the progress handler
     std::string message;
-    uint64_t rowsExamined = 0;        // rows taken from reader cursors
-    uint64_t bytesRead = 0;           // hydrated record bytes
     uint64_t vmSteps = 0;
     LaneArena* arena = nullptr;         // bound for a sandboxed statement
     uint64_t arenaFailures = 0;         // the arena's failures when it was bound
@@ -184,12 +179,20 @@ struct LaneState {
     std::map<std::string, TypeEntry> types;      // key: lower-case name
     std::map<std::string, RelSpec> relations;    // key: lower-case relation name
     Stmt* cur = nullptr;
-    // The last statement's error text. CONTRACT §3.9 has no way yet to put
-    // it in the slot's err (requested: p4_lane_set_error).
-    std::string lastError;
 };
 
 LaneState* stateOf(P4Lane* lane);
+
+}  // namespace p4sql
+}  // namespace flatsql
+
+// C-19 (contract v3): the running slot's err. Declared weak until the
+// engine's p4_reader.h carries it, so p4sql links against an engine that
+// does not implement it yet (the text is then lost, never the status).
+extern "C" void p4_lane_set_error(P4Lane* lane, const char* msg, uint32_t n) __attribute__((weak));
+
+namespace flatsql {
+namespace p4sql {
 
 // ---------------------------------------------------------------------------
 // Relations (vtab.cpp)

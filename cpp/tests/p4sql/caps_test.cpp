@@ -322,7 +322,7 @@ P4SQL_TEST(sandbox_cannot_starve_writers) {
         std::this_thread::sleep_for(std::chrono::milliseconds(300));   // warm-up
         const uint64_t start = w.rows.load();
         const auto m0 = std::chrono::steady_clock::now();
-        while (std::chrono::steady_clock::now() - m0 < std::chrono::milliseconds(1500)) {
+        while (std::chrono::steady_clock::now() - m0 < std::chrono::milliseconds(1000)) {
             if (withHog) {
                 const Result r = h.sql(hog, {}, P4_SLOT_SANDBOX);
                 if (r.status == P4_E_BUDGET) (*trips)++;
@@ -338,24 +338,27 @@ P4SQL_TEST(sandbox_cannot_starve_writers) {
         if (w.nomem.load()) std::fprintf(stderr, "    writer: rc %d %s\n", w.firstRc, w.firstMsg.c_str());
         return double(end - start) / secs;
     };
-    // Alternating runs; the median of each arm (the box is shared).
-    std::vector<double> alone, hogged;
+    // Paired runs (alone, then beside the sandbox, back to back); the median
+    // of the pairs' ratios (the box is shared and its load drifts).
+    std::vector<double> alone, hogged, ratios;
     uint64_t trips = 0;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 7; i++) {
         alone.push_back(measure(false, &trips));
         hogged.push_back(measure(true, &trips));
+        ratios.push_back(hogged.back() / alone.back());
     }
     std::remove(path.c_str());
     std::remove((path + "-wal").c_str());
     std::remove((path + "-shm").c_str());
     std::sort(alone.begin(), alone.end());
     std::sort(hogged.begin(), hogged.end());
-    report("writer_rows_per_s_alone", alone[2], "rows/s");
-    report("writer_rows_per_s_with_capped_sandbox", hogged[2], "rows/s");
-    report("writer_rate_ratio", hogged[2] / alone[2], "x");
+    std::sort(ratios.begin(), ratios.end());
+    report("writer_rows_per_s_alone_median", alone[3], "rows/s");
+    report("writer_rows_per_s_with_capped_sandbox_median", hogged[3], "rows/s");
+    report("writer_rate_ratio_median_of_pairs", ratios[3], "x");
     report("sandbox_heap_cap_trips", double(trips), "statements");
     CHECK(trips > 0);
-    CHECK(hogged[2] >= 0.9 * alone[2]);
+    CHECK(ratios[3] >= 0.9);
     sqlite3_hard_heap_limit64(prior);
 }
 
