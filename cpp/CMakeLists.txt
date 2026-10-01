@@ -895,7 +895,7 @@ else()
     # metadata-only tiers).
     include(${CMAKE_CURRENT_SOURCE_DIR}/test/ps/tb_sources.cmake)
 
-    # ---- store format 4 ("p4": one SQLite file per partition x content month) ----
+    # ---- store format 4 ("p4": one SQLite file per partition, producer x record type) ----
     # SQLite 3.53.4 unmodified: multi-thread mode, WAL, FTS5, no memory
     # statistics (C-30: the SQL surface's allocator counts and enforces the
     # hard heap); files only through FlatSQL's own VFS (flatsql_io). The SQL

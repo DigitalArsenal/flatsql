@@ -2,22 +2,24 @@
 
 ## 3.7.0
 
-- Store format 4 (docs/STORE-FORMAT-4.md): one SQLite file per partition and UTC content
-  month, SQLite unmodified, as `wasm/flatsql-p4-threads.wasm` (wasm32-wasip1-threads; package
+- Store format 4 (docs/STORE-FORMAT-4.md): one SQLite file per partition (producer x record
+  type), SQLite unmodified, as `wasm/flatsql-p4-threads.wasm` (wasm32-wasip1-threads; package
   export `flatsql/p4-threads.wasm`) and the native `flatsql_p4` library. The ABI is
   `cpp/include/flatsql/p4/flatsql_p4.h` (ops 1-31, RB1 results), the SQL surface's reader API
-  `p4_reader.h`. Writer threads own partitions and group-commit every queued call; an intent
-  journal per type makes the derived type index crash-safe; maintenance (index flushes,
-  checkpoints, quota by content month, full text, file rebuild by `VACUUM INTO`) runs on a
-  background thread. Migrate mode loads format 1 keeping its rowids and tag instances: the
-  host-02-sized fixture loads at 783 B per copy with answers equal to format 1.
+  `p4_reader.h`. Each file indexes arrival, source (newest first), object + epoch, epoch and
+  CID: `<TYPE>@<source>` is that source's newest N, and EPOCH nearest / as_of / forward take
+  one seek per object per partition. Writer threads own partitions and group-commit every
+  queued call; an intent journal per type makes the derived type index crash-safe; a type's
+  index, journal and full-text files are made by its first write; maintenance (index flushes,
+  checkpoints, quota by arrival, full text) runs on a background thread. Migrate mode loads
+  format 1 keeping its rowids and tag instances: the host-02-sized fixture loads at 828 B per
+  copy with answers equal to format 1, EPOCH points included.
 - SQLite 3.53.4 (the official amalgamation, byte-identical; CMake checks its sha256) for every
   artifact.
 - `flatsql_io` VFS: per-path nodes (a shared heap WAL index and in-memory locks for
   connections that opt in with `share=1`, reader readahead with `ra=1`); format 1 behaviour is
   unchanged.
-- typecfg (moved from `src/ps/extract.*` to `src/typecfg/`): the `bucket` directive names the
-  time that picks a record's content month, separately from the exposed epoch.
+- typecfg: moved from `src/ps/extract.*` to `src/typecfg/`, unchanged.
 - CI runs the format-4 suites natively and under the Node wasi-threads host, with kill -9
   loops; `npm-publish.yml` refuses a release whose `flatsql-p4-threads.wasm` is not the
   committed build.

@@ -1,207 +1,293 @@
-# FlatSQL store format 4: one SQLite file per partition and month
+# FlatSQL store format 4: one SQLite file per partition
 
-Store format 4 keeps each partition's records in SQLite files, one file per
-partition and UTC content month, with SQLite 3.53.4 unmodified (VFS, WAL and
-configuration only). The engine is `cpp/src/p4`; it ships as
-`wasm/flatsql-p4-threads.wasm` (wasm32-wasip1-threads). The design is the
-stack's `docs/architecture/flatsql-sqlite-partitions.md` (gates G1-G7); the
-interfaces are the build-out contract (`CONTRACT.md`, version 9: the ABI in
-`cpp/include/flatsql/p4/flatsql_p4.h`, the reader API for the SQL surface in
-`cpp/include/flatsql/p4/p4_reader.h`). This file records what was built, how
-to run it, and what was measured.
+Store format 4 keeps each partition's records in one SQLite file. A partition
+is one producer and one record type. SQLite 3.53.4 is unmodified: only the
+VFS, WAL and configuration are FlatSQL's. The engine is `cpp/src/p4`; it ships
+as `wasm/flatsql-p4-threads.wasm` (wasm32-wasip1-threads).
+
+- **Design:** the stack's `docs/architecture/flatsql-sqlite-partitions.md`,
+  with its owner revision of 2026-10-01.
+- **Interfaces:** the build-out contract (`CONTRACT.md`, version 11):
+  - the ABI in `cpp/include/flatsql/p4/flatsql_p4.h`;
+  - the reader API for the SQL surface in `cpp/include/flatsql/p4/p4_reader.h`.
+
+This file records what was built, how to run it, and what was measured.
 
 ## 1. Layout
 
 ```
 <data>/fsql4/
-  STORE                       64 B, magic FSQ4, format 4 (C-7); written last by activation
-  MIGRATED                    40 B, magic FSQM, format 4
-  T/TYPES                     the registered types (crc'd records)
-  T/<TYPE>.spec               the registered spec TLV (C-5); a reopen serves before re-registration
-  T/<TYPE>.idx                the type index (derived; rebuilt from the files)
-  T/<TYPE>.jnl                the intent journal
-  T/<TYPE>.fts                full text (FTS5, contentless-delete; background)
-  P/<TYPE>/<pid>/<YYYYMM>.<gen>.db   a partition's month
+  STORE                 64 B, magic FSQ4, format 4 (C-7); written last by activation
+  MIGRATED              40 B, magic FSQM, format 4
+  T/TYPES               the registered types (crc'd records)
+  T/<TYPE>.spec         the registered spec TLV (C-5); a reopen serves before re-registration
+  T/<TYPE>.idx          the type index (derived; rebuilt from the files)
+  T/<TYPE>.jnl          the intent journal
+  T/<TYPE>.fts          full text (FTS5, contentless-delete; background)
+  P/<TYPE>/<pid>.db     the partition's one file, for its life
 ```
 
-- A partition is (type, producer token); the token comes from the peer
-  (C-13). The month is the record's bucket time (`bucket` rule, else the
-  `epoch` rule, C-1); a type without either has one month, `0`.
-- Generations are never reused (B9): the type index's `gens` table keeps the
-  highest generation per (partition, month) across drops and restarts, and a
-  new file probes past any path on disk.
+- **Partition:** (type, producer token). The token comes from the peer (C-13).
+- **No months and no generations** (C-32). A partition never changes or
+  drops its file. An emptied partition keeps its file, and SQLite reuses the
+  free pages.
+- **Lazy type files:** a type's `.idx`, `.jnl` and `.fts` are made by its
+  first write. A registered type without data has only its `.spec`, so an
+  open costs O(types with data).
 
 ## 2. Files
 
-**Partition file.** `meta` (format, type, producer, peer, pid, tb, gen, ix,
-ncopy), `src` and `lane` (a lane is format 1's tag key, C-3, with its
-counters), `r(seq PK, cid, e, k, ts, p, f, s, x, d, w, wd)` with `w` =
-`coalesce(e, ts)`, tag instances `rl(sid, seq, lane, at, u)` WITHOUT ROWID keyed `(seq, sid, lane)` (a page's tags are one key range),
-and for object types `ent(k, n, fw, lw)`. Indexes: `r_w(w DESC)`, `r_s(seq)`
-(the seqs alone: the A18 cut walks it, not the records' pages; 12 B a row),
-`rl_sid(sid, seq)` (source-ordered scans, supersede), `r_dk(wd, k, w)` (epoch and object), `r_k(k, w)` (object, no
-epoch), `r_en(cid) WHERE e IS NULL` (epoch rule). There is no CID index in a
-file: CID lookups go through the type index. Writers open with
-`synchronous=FULL`, WAL, no autocheckpoint.
+**Partition file.**
+- Tables:
+  - `meta`: format, type, producer, peer, pid, ix, and the counters;
+  - `src` and `lane`: a lane is format 1's tag key (C-3), with its counters;
+  - `r(seq PK, cid, e, k, ts, p, f, s, x, d, w)`, where `w` = `coalesce(e, ts)`;
+  - tag instances `rl(sid, seq, lane, at, u)`, WITHOUT ROWID, keyed
+    `(seq, sid, lane)`.
 
-**Type index** (`.idx`, `synchronous=FULL`: a flush trims the journal after
-its commit): `c(tb, cid, pid, seq)`,
-`ident`, `obj`, `part`, `src`, `lanes`, `file`, `gens`, `lanecnt`, `meta`
-(uniq, copies, next_seq). It is a cache of the files plus the journal: every
-row can be rebuilt (REBUILD 2).
+| Index | Purpose |
+|---|---|
+| the rowid and `r_s(seq)` | arrival: the datasync cursor; newest-N cuts and oldest-first quota read `r_s`, not the records' pages |
+| `rl_sid(sid, seq)` | source, newest first: `<TYPE>@<source>`, source pages, supersede |
+| `r_ke(k, e)` | object and epoch: EPOCH points, object predicates, CAT supersede |
+| `r_w(w DESC)` | epoch windows (`w DESC`, ties in CID order) |
+| `r_c(cid)` | CID order, merged over the partitions |
 
-**Intent journal** (`.jnl`): `j(id AUTOINCREMENT, op, tb, k, c, pid, seq,
-gen, s, v)` and `jm(seq_reserved)`. Ops: partition, lane, source, file
-(J_FILE), entry (J_C), identity, removal (J_DEL), drop (J_DROP). A group
-journals its entries before its partition files commit; flushes merge
-committed entries into the type index and cut the journal behind them.
+- Writers open with `synchronous=FULL`, WAL, and no autocheckpoint.
+
+**Type index** (`.idx`, `synchronous=FULL`).
+- Tables:
+  - `c(cid, pid, seq)`: every copy of a CID (dedupe, GET, TAGS, DELETE, exact-CID reads);
+  - `ident(src, h, seq, cid)`: IQC ingest identities;
+  - `part`, `src`, `lanes`, `file(pid, …)`, `lanecnt(lane, pid, …)` and `meta(uniq, copies, next_seq)`.
+- It is a cache of the files plus the journal. Every row except `ident` can
+  be rebuilt from the files (REBUILD 2).
+
+**Intent journal** (`.jnl`).
+- Tables: `j(id AUTOINCREMENT, op, k, c, pid, seq, s, v)` and `jm(seq_reserved)`.
+- Ops: partition, lane, source, file (J_FILE), entry (J_C), identity, and removal (J_DEL).
+- A group journals its entries before its partition file commits. A flush
+  merges committed entries into the type index and cuts the journal behind them.
 
 ## 3. Writes
 
-- Calls arrive in mailbox slots (two pools: 8 MiB write requests, 64 KiB
-  read requests, C-6); writer threads own partitions (pinned, with a credit:
-  `P4_E_BUSY` when a partition's backlog is full).
-- A writer takes every queued call of a partition into one group (up to
-  `groupRecords`): parse and extract, dedupe probe against the type index
-  and the pending map, seq assignment (durable seq blocks), journal, one
-  transaction per partition file, publish, ack. The ack follows the commit
-  and the visible-through publish (C-4).
-- Copies (a CID held by another producer), retags, CAT supersede-on-ingest
-  (ingest mode only, C-20), IQC ingest identities (IDENT_DUP tags the held
-  record, C-26), batch supersede and deletes are journaled removals.
-- Migrate mode (PUT mode 1, create mode 2): seqs and tag instances are the
-  caller's (format 1's rowids and `created_at`), a COPY keeps the holder's
-  bytes and ts (C-22), identities are registered (C-21), secondary indexes
-  wait for REBUILD 1, and full text waits for activation.
+- **Calls and writers.**
+  - Calls arrive in mailbox slots, in two pools (C-6): 8 MiB write requests
+    and 64 KiB read requests.
+  - Writer threads own partitions: each is pinned to one writer, with a
+    credit. A full backlog answers `P4_E_BUSY`.
+- **A group.** A writer takes every queued call of a partition, up to
+  `groupRecords`, and runs these steps:
+  1. parse and extract;
+  2. probe dedupe against the type index and the pending map;
+  3. assign seqs, from durable seq blocks;
+  4. journal;
+  5. commit one transaction on the partition's file;
+  6. publish;
+  7. ack.
+  The ack follows the commit and the visible-through publish (C-4).
+- **Removals.** These are all journaled removals:
+  - copies (a CID held by another producer) and retags;
+  - CAT supersede-on-ingest (ingest mode only, C-20);
+  - IQC ingest identities (IDENT_DUP tags the held record, C-26);
+  - batch supersede, deletes and quota deletions.
+- **Migrate mode** (PUT mode 1, create mode 2):
+  - seqs and tag instances are the caller's (format 1's rowids and `created_at`);
+  - a COPY keeps the holder's bytes and ts (C-22);
+  - identities are registered (C-21);
+  - secondary indexes wait for REBUILD 1, and full text waits for activation.
 
 ## 4. Crash safety
 
-Every open replays the journal before serving (M8: replay opens each file it
-checks, which recovers its WAL):
+Every open replays the journal before it serves (M8). Replay opens each file
+it checks, which recovers that file's WAL.
 
-1. Registry: partitions, sources, lanes, files. A J_FILE whose file has no
-   committed schema (killed between the empty file and its schema) is not
-   trusted: the writer completes it. A J_DROP still in the journal had its
-   index rows kept by the crash: replay removes them and the counters lose
-   the dropped copies.
-2. Entries: each J_C or J_DEL is checked against its file by seq and CID;
-   counters move only for entries the index lacks.
-3. Touched files are recounted from their own rows.
-4. Retired generations left on disk are unlinked (paths are known from
-   `gens`; the wasm host has no directory listing).
+1. **Registry:** partitions, sources, lanes and files. A J_FILE whose file has
+   no committed schema is not trusted: the writer completes it. That state is
+   a kill between the empty file and its schema.
+2. **Entries:** each J_C or J_DEL is checked against its file by seq and CID.
+   Counters move only for entries the index lacks.
+3. **Recount:** touched files are recounted from their own rows.
 
-The type index never records a file whose schema has not committed. A quota
-drop refuses new claims on the month's files and waits until claimed writes
-have published before it retires them.
+The type index never records a file whose schema has not committed. Nothing
+unlinks or replaces a partition file.
+
+The month layout's wasm-only kill anomaly cannot arise in this layout.
+- **What it was.** About 1% of wasm kill rounds left a type-index row naming
+  an empty file that no longer existed (`P/PNM/3/202609.163.db`). 562276b
+  remade such a file at open.
+- **Root cause.** Not reproduced; the exact interleaving is unknown. The
+  state needed a month file that a supersede had emptied, retired and
+  unlinked many times over: generation 163 of one month.
+- **Why it is gone.** Nothing retires, unlinks or replaces a partition file
+  in this layout, so the state cannot occur. The heal is deleted. The wasm
+  kill loop passes 100 of 100 rounds without it.
 
 ## 5. Maintenance
 
-One background thread (never on a caller's path): type-index flushes,
-PASSIVE and RESTART checkpoints from the WAL hook (partition files, the type
-index, the journal and full text; the VFS indexes up to 4,194,304 WAL frames
-per file), closing evicted writer
-connections, unlinking retired files once their readers close, the
-configured quota, full text, journal VACUUM when a flush empties it, and the
-file rebuild: a file whose free pages reach 15% and 64 MB (config tags 45,
-46) is rewritten by `VACUUM INTO` its next generation and swapped in; its
-writes answer `P4_E_BUSY` meanwhile.
+One background thread does this work, never on a caller's path:
+- type-index flushes;
+- PASSIVE and RESTART checkpoints from the WAL hook, for partition files, the
+  type index, the journal and full text;
+- closing evicted writer connections;
+- the configured quota, once a second;
+- full text;
+- a journal VACUUM when a flush empties it.
 
-- **QUOTA_GC** (mode 1, D1): drops whole content months, oldest first, never
-  the current one; past the configured quota writes refuse with
-  `P4_E_NOSPACE` while reads continue.
-- **REBUILD**: 1 partition secondary indexes (after a migration's bulk
-  append), 2 the type index from the files, 4 full text, 8 verify (the index
-  against the files, and `PRAGMA integrity_check` on every live file, the
-  type index and the journal, C-27; a damaged file is a mismatch named in
-  the slot err). Verify returns errors as errors (M9), never as mismatches.
+- **QUOTA_GC** (C-32) deletes the oldest records by arrival.
+  - The victim is the type whose oldest record arrived first.
+  - The cut is merged over that type's `r_s` indexes, and each partition's
+    writer deletes its rows (per-partition writers).
+  - Each pass deletes at most 32,768 records, sized to the excess at the
+    store's mean bytes per record, until the bytes in use fit.
+  - Bytes in use count each partition file's pages less its free pages
+    (pages still in the WAL are counted by `page_count`), plus the type files
+    and any rollback journal.
+  - When nothing is left to delete and the store is still over quota, writes
+    refuse with `P4_E_NOSPACE` while reads continue.
+  - `files_dropped` is always 0.
+- **REBUILD:**
+  - **1** builds the partition secondary indexes, after a migration's bulk append.
+  - **2** rebuilds the type index from the files: `c` is rewritten in CID
+    order, from every file's `(cid, seq)` merged.
+  - **4** rebuilds full text.
+  - **8** verifies, changing nothing:
+    - `c` against the files' CIDs, merged (one sequential walk of each side);
+    - the counters and lanes against the rows;
+    - `PRAGMA integrity_check` on every live file, the type index and the
+      journal (C-27). A damaged file is a mismatch, named in the slot err.
 
 ## 6. Reads
 
-Orders: seq (datasync), w (windows: `w DESC`, ties in CID order), CID (the
-type index's months, paged and merged with the pending layer). Copies
-collapse to one row per CID (the lowest pid that matches), also under OFFSET.
-The A18 bound is the type's newest N seqs before every other filter (C-17,
-C-24). An equality, IN or range predicate on the object rule's first column
-reads through `ent` and `r_dk`/`r_k` instead of walking the window, so a
-NORAD equality inside OMM's 400,000 bound reads that object's rows. Caps
-(rows examined, bytes read, result rows and bytes, cancel) end a read with
-its status; RB1 streams always end with RB1E. The SQL surface (`src/p4sql`)
-answers ops 30 and 31 through `p4_reader.h`; the engine writes their RB1E
-(C-28). Without the surface ops 30/31 answer `P4_E_UNSUPPORTED`.
+**Orders.**
+- **Seq** (datasync): per-file pages by rowid, merged.
+- **w** (windows): `r_w`, with ties in CID order.
+- **CID:** each file's `r_c`, merged by (CID, pid).
+
+Copies collapse to one row per CID: the lowest pid that matches, also under
+OFFSET.
+
+**A18 bound (C-31).**
+- With `lane.source` set, the bound is that source's newest N records: one
+  newest-first walk of each partition's `rl_sid`, merged, stopping at N. The
+  scan then reads through `rl_sid` above the cut.
+- Without a source, the bound is the type's newest N (`r_s`).
+- Every other filter applies above the cut.
+- `<TYPE>@<source>` therefore returns that source's records. This is an
+  intended difference from format 1, whose per-type in-memory window answered
+  `CAT@celestrak-satcat-csv` with 0 frames.
+
+**Candidates instead of a walk.**
+- An exact CID (tag 8) is one type-index probe.
+- An equality, IN or range predicate on the object rule's first column reads
+  `r_ke`.
+
+**EPOCH nearest / as_of / forward** (C-32) take one `r_ke` seek per object
+per partition.
+- The objects are walked in k order: a seek to the next k.
+- Each object's run is read from the target, in rank order, until an epoch
+  group has a row that passes the filters. The lowest CID of that group
+  wins, which is format 1's ranking.
+- A record without an object is its own entity, keyed by its CID.
+
+**Caps** end a read with its status: rows examined, bytes read, result rows
+and bytes, and cancel. RB1 streams always end with RB1E.
+
+**SQL surface.** `src/p4sql` answers ops 30 and 31 through `p4_reader.h`, and
+the engine writes their RB1E (C-28). Without the surface, ops 30 and 31
+answer `P4_E_UNSUPPORTED`.
 
 ## 7. Memory
 
-One engine-wide budget (design §9): SQLite is built without memory
-statistics (C-30); the hard heap limit (config tag 27, 640 MiB) is enforced
-by the SQL surface's allocator, which also serves stats 29/30. Reader
-connections are pooled (tag `readerConns`, 512 KiB cache each), writer
-connections are an LRU (`writerConns`), pending index entries flush at
-`pendingBytes` (64 MiB).
+There is one engine-wide budget (design §9).
+- SQLite is built without memory statistics (C-30). The SQL surface's
+  allocator enforces the hard heap limit (config tag 27, 640 MiB) and serves
+  stats 29 and 30.
+- Reader connections are pooled (tag 23), with a 512 KiB cache each (tag 24).
+- Writer connections are an LRU (tag 21).
+- Pending type-index entries flush at `pendingBytes` (64 MiB).
 
 ## 8. The artifact
 
 | | |
 |---|---|
-| Build | `bash scripts/build-wasm.sh --ps` (with flatsql-ps-threads.wasm) or `--ps-tests` (plus `cpp/build-ps-wasm/flatsql-p4-test.wasm`); released bytes: `--ps --linux` (Docker, Linux wasi-sdk 30). CMake: `cpp/cmake/flatsql_p4_wasm.cmake`, globbing `src/p4`, `src/p4sql`, `tests/p4`, `tests/p4sql`. |
-| SQLite | 3.53.4 amalgamation, byte-identical (CMake checks its sha256): `THREADSAFE=2`, WAL, FTS5, `DEFAULT_MEMSTATUS=0`, `TEMP_STORE=3`, `SQLITE_OS_OTHER`; the only VFS is `flatsql_io` (per-path nodes: shared heap WAL index, in-memory locks, reader readahead), registered as the default by `src/p4/capi_wasm.cpp`, which also installs pthread mutexes. |
-| Imports | `wasi_snapshot_preview1`: `clock_time_get environ_get environ_sizes_get fd_close fd_prestat_dir_name fd_prestat_get fd_seek fd_write proc_exit sched_yield` (environ from libc++'s locale in the full-text tokenizer); `wasi.thread-spawn`; `env.memory` (shared, at most 32768 pages); the seven `env.flatsql_io_*`. `scripts/check-wasm-imports.mjs` fails on any change. |
-| Exports | `flatsql_p4_init start stop wake layout register_type activate set_quota stats alloc free`, `wasi_thread_start`, `_initialize`, `memory`. |
-| Host | As for the partition store (docs/PARTITION-STORE-WASM.md): grow the shared heap before `flatsql_p4_start`; the Node host is `wasm/ps-node-host.mjs`. |
+| Build | `bash scripts/build-wasm.sh --ps` builds it with `flatsql-ps-threads.wasm`. `--ps-tests` also builds `cpp/build-ps-wasm/flatsql-p4-test.wasm`. Released bytes: `--ps --linux` (Docker, Linux wasi-sdk 30). CMake: `cpp/cmake/flatsql_p4_wasm.cmake`, globbing `src/p4`, `src/p4sql`, `tests/p4` and `tests/p4sql`. |
+| SQLite | The 3.53.4 amalgamation, byte-identical (CMake checks its sha256). Options: `THREADSAFE=2`, WAL, FTS5, `DEFAULT_MEMSTATUS=0`, `TEMP_STORE=3`, `SQLITE_OS_OTHER`. The only VFS is `flatsql_io`. |
+| Imports | `wasi_snapshot_preview1`, `wasi.thread-spawn`, `env.memory` (shared, at most 32768 pages) and the seven `env.flatsql_io_*`. `scripts/check-wasm-imports.mjs` fails on any change. |
+| Exports | `flatsql_p4_init start stop wake layout register_type activate set_quota stats alloc free`, `wasi_thread_start`, `_initialize` and `memory`. |
+| Host | As for the partition store (docs/PARTITION-STORE-WASM.md): grow the shared heap before `flatsql_p4_start`. The Node host is `wasm/ps-node-host.mjs`. |
 
 ## 9. Tests
 
 ```
-FLATBUFFERS_DIR=<flatbuffers> cmake -S cpp -B cpp/build && cmake --build cpp/build --target flatsql_p4_test -j 6
-cpp/build/flatsql_p4_test                       # the fast suite
-cpp/build/flatsql_p4_test --test=t_kill --rounds=1000
-cpp/build/flatsql_p4_test --test=g2_fixture --fixture=<format-1 control.flatsqldb> --bfbs=<search-schemas> [--store=<dir>]
-bash scripts/build-wasm.sh --ps-tests && node scripts/p4-wasm-suite.mjs [--kill-rounds 1000]
+FLATBUFFERS_DIR=<flatbuffers> cmake -S cpp -B cpp/build && cmake --build cpp/build --target flatsql_p4_test flatsql_p4_fault_test -j 6
+cpp/build/flatsql_p4_test                                     # the fast suite
+cpp/build/flatsql_p4_test --test=t_kill --rounds=100          # kill -9 loop
+cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=100
+cpp/build/flatsql_p4_test --test=g2_fixture --fixture=<format-1 control.flatsqldb> --bfbs=<search-schemas> [--store=<dir> --keep=1]
+bash scripts/build-wasm.sh --ps-tests && node scripts/p4-wasm-suite.mjs [--kill-rounds 100]
 ```
 
-- `t_design.cpp`: t_close (B1), t_dropreuse (B9), t_gap (B2), t_crash and
-  t_kill (B3, M8). The kill loop's workload has three producers, copies,
-  batch supersede every 13th call and a quota drop to 4 MiB every 11th
-  (content months rotate, generations advance); each round kills the engine
-  with SIGKILL at a random point and checks: every file passes
-  `integrity_check`, every row on disk is found by CID, the count equals the
-  distinct CIDs on disk, REBUILD 8 finds no mismatch, new seqs are above
-  every seq on disk, and no file is left open. The wasm loop kills the
-  guest's workers in the Node host.
-- `t_abi.cpp`: markers, golden vectors, every op of §3.5. `t_ops.cpp`:
-  bucket and identity rules, supersede, quota, rebuild, budget, group
-  commit. `t_contract.cpp`: C-21/C-26, C-22, C-25, C-27, the file rebuild, a
-  torn file creation, object-key reads inside the bound.
-- `p4_fault_io.cpp` (`flatsql_p4_fault_test --test=t_power_loss --slow=1`):
-  the engine over FaultFs (in-memory files that keep what a power loss
-  leaves: unsynced writes dropped, a random subset kept in order or
-  reordered, the last write torn, or kill -9), frozen at a random I/O call
-  per round; after the crash every acknowledged record is there, REBUILD 8
-  (with `integrity_check`) is clean and the count equals a full scan's
-  distinct CIDs. It found that engine-created SQLite files lacked durable
-  directory entries and that the rollback journal of a new file's switch to
-  WAL could come back as a hot journal; with `dsync=1` the VFS now creates
-  database files with `CREATE_PARENTS` and deletes durably when SQLite asks
-  (`synchronous=EXTRA` during the switch).
-- `t_fixture.cpp` (`g2_fixture`): loads the host-02-sized format-1 fixture as
-  store-migrate does and compares GET, TAGS, SCAN, WINDOW and INDEX_PAGE with
-  format 1 per type.
+- **`t_kill`.** A forked engine ingests from three producers, with copies, a
+  batch supersede every 13th call and a quota of 4 MiB every 11th. It is
+  killed with SIGKILL at a random point, then the check runs:
+  - every file passes `integrity_check`;
+  - every row on disk is found by CID;
+  - the count equals the distinct CIDs on disk;
+  - REBUILD 8 finds no mismatch;
+  - new seqs are above every seq on disk;
+  - no file is left open.
+  The wasm loop kills the guest's workers in the Node host.
+- **`t_power_loss`.** The engine runs over FaultFs, frozen at a random I/O
+  call per round, with five crash modes. After the crash, every acknowledged
+  record must be there, REBUILD 8 must be clean, and the count must equal a
+  full scan's distinct CIDs.
+- **`g2_fixture`.**
+  - It loads the host-02-sized format-1 fixture as store-migrate does.
+  - It compares GET, TAGS, SCAN, WINDOW and INDEX_PAGE with format 1 per type.
+  - It compares EPOCH nearest, as_of and forward for every OMM and MPE
+    object with format 1's `queryPointEpochRecords` ranking SQL, run on the
+    fixture.
+- **Benches** (`t_fixture.cpp`):
+  - `g3_bench`, modes `producers`, `w01`, `w06` and `w10`;
+  - `a18_probe`;
+  - `g6_bench`;
+  - `open_bench`.
 
 ## 10. Measured
 
-Mac Studio (28 threads, shared with other sessions; the load is the
-1-minute average). Native unless marked wasm (V8 under the Node host). The
-brief's gates are judged in WasmEdge AOT, back to back with formats 1 and 2,
-at low load; these numbers are the engine's side.
+**Conditions.**
+- Mac Studio, 28 threads, shared with other sessions. The load is the
+  1-minute average.
+- Native unless marked wasm. The wasm runs used V8 under the Node host.
+- The brief's gates are judged in WasmEdge AOT through SDN, back to back
+  with formats 1 and 2, at low load. These numbers are the engine's side, at
+  high load, with few samples per shape.
 
 | | |
 |---|---|
-| G2 fixture | 4,364,873 copies of 3,945,845 records (OMM, MPE, CAT, IQC) loaded in 89-101 s (43-49k copies/s, load 15-33); REBUILD 1 in 8-10 s; **795.4 B per copy** (gate < 800; format 1 2,366, format 2 1,742); 0 differences against format 1 in GET bytes/seq/ts/peer, TAGS, SCAN order, WINDOW and INDEX_PAGE per type; REBUILD 8 clean. |
-| Kill -9 | 1,000 of 1,000 rounds natively (562276b, c94b3ed) and 1,000 of 1,000 in wasm (562276b and c94b3ed) with three producers, copies, supersede and quota drops, load 10-45. |
-| Power loss | `t_power_loss`: 1,000 of 1,000 rounds over the five crash modes (22eca7c, seed 11; a fresh store every 50 rounds), and 300 of 300 on one store (5ccd41a, seed 7, 598,008 acknowledged records kept), load 22-38. |
-| G3 ingest | OMM 4,096-record calls: 1 producer 37.6k rec/s, call p50 101 / p99 177 ms (wasm 31.4k, p99 256 ms); 4 producers 69.6k; 8 producers 111k (wasm 25.8k), load 43-48. With the kill and power-loss loops running beside it (fsync-heavy): 1 producer 25-30k rec/s, p99 275-364 ms; 8 producers 82k (load 15-23). Format 2: 17.4k one writer, 6.6k four, call p99 306-494 ms. |
-| Group commit | One-record calls with 1,024 in flight: 512-record groups, 392 WAL B/record against 315 for 4,096-record calls (gate 2x). |
-| W06, W10 | Fixture clone: batch supersede of all 1,696,780 OMM records in 42.7 s (load 29); quota GC to 90% drops 3 month files, 1,829,338 records, in 1.4 s; REBUILD 8 clean after both. |
-| G6 nearest | 3,030 files (101 producers x 30 months, 303,000 records, 1,000 objects): EPOCH nearest p50 339 ms, p99 661 ms (load 49) through the object directory; the scan it replaces: p50 3.4 s, p99 6.9 s (format 2's p99 on the fixture: 0.9-1.3 s). |
-| G6 IQC | 8M entries with identities (4 producers, CAPTURE_START months): 48.5k rec/s, 20.27 us per entry in the first tenth, 20.28 in the last (load 11.5). The 100M-entry run is not done. |
-| G6 budget | 10 types x 8 readers: 20 reader connections, 48 MiB max RSS; 30 types: 60 connections, 95 MiB (heap counters need the SQL surface's allocator, C-30). |
-| A18 (R17) | Fixture clone, `p4_cursor_open`, engine-cold / warm p50: OMM NORAD=25544 in the 400,000 bound 18-63 / 18 ms (format 1 181 / 149 ms); IQC@IQEngine 13-51 / 11 ms (F1 12 / 11); CAT@satcat 8-19 / 8 ms (F1 6.2 / 3.3); CAT@satcat-csv 2.3 / 2.0 ms (F1 0.5, F2 1.8); MPE@gp 7-25 / 6.5 ms (F1 3.5 / 2.8); load 31-33. CAT, MPE and the empty CAT source stay slower than format 1's in-memory hot window. |
+| Fixture load (G2) | 4,364,873 copies of 3,945,845 records (OMM, MPE, CAT, IQC) in 138 s (31.5k copies/s, load 31). REBUILD 1 took 19.2 s. **827.6 B per copy** (915.5 B per record), against format 2's 1,742 and format 1's 2,366. 0 differences from format 1 in GET bytes/seq/ts/peer, TAGS, SCAN order, WINDOW and INDEX_PAGE, and in the 18 EPOCH point queries below. REBUILD 8 is clean. |
+| EPOCH, every object | Fixture, 3 epochs per profile, load 29-37. **OMM, 32,015 objects:** as_of and forward 133-136 ms, nearest 165-171 ms. **MPE, 32,486 objects:** as_of and forward 149-163 ms, nearest 195-418 ms. Format 1's ranking SQL on the same fixture (native SQLite, not the deployed engine): 0.35-8.6 s. |
+| A18 (C-31), warm | `p4_cursor_open`, fixture, load 30-46. **OMM@celestrak-gp NORAD=25544** inside the 400,000 bound: 13 frames, 17-18 ms (format 1: 181 cold / 149 warm). **IQC@IQEngine:** 9-11 ms. **CAT@celestrak-satcat:** 7.8-8.2 ms. **CAT@celestrak-satcat-csv:** 10,000 records under C-31, 7.7-8.6 ms. **MPE@celestrak-gp:** 7-8.9 ms. An 8 MiB reader cache, instead of 512 KiB, takes CAT to 6.6 ms. |
+| HEAD by exact CID | 0.67 ms first, 17-33 µs after, on the fixture (was a ~5 s type scan). |
+| W01, OMM ingest | 32,015 records into the fixture's OMM partition (1.7M rows), 4,096-record calls. The first call after open is cold: 1,038 ms. After that: 20.6-21.2k rec/s, call p50 195-225 ms, p99 229-271 ms (load 38-45). **The same clone with `r_c` dropped:** 61-64k rec/s, p50 55-59 ms, p99 71-81 ms, first call 364 ms (load 23-29). The per-file CID index costs about 3× on ingest (§11). |
+| G3, fresh store | OMM, 4,096-record calls. One producer: 52.8k rec/s, call p50 65 / p99 87 ms (load 31). Eight producers: 140k rec/s, p99 894 ms (load 33). Format 2: 17.4k with one writer and 6.6k with four, call p99 306-494 ms. |
+| W06 | Batch supersede of all 1,696,780 OMM records on a fixture clone: 31.4 s (load 26). The month layout took 42.7 s and the prototype 9.7 s. It is I/O-bound: the deletes rewrite pages of the random-key indexes (`r_c`, `r_ke`). |
+| W10 | Quota to 90% of the fixture clone's bytes: 196,608 oldest records deleted in 6.4 s (load 42). REBUILD 8 is clean. |
+| First open | 232 registered types, as the daemon registers them. **First open:** open 37 ms, registration 3.45 s (232 durable spec writes, load 34), close 41 ms, 235 files in T/. **Reopen:** 20 ms, re-registration 0.5 ms. The month build took 62-81 s and wrote 940 type files. |
+| Crash | Native t_kill 100 of 100 and t_power_loss 100 of 100. Wasm kill 100 of 100. Load 23-39. |
+
+## 11. Open: the per-file CID index
+
+C-32 puts a CID index in every partition file, as `r_c`.
+- **The cost.** A record's CID is a random key, so a 4,096-record commit
+  dirties about one `r_c` leaf page per record. On the fixture's OMM file,
+  W01 runs about 3× slower with `r_c` than without it (§10).
+- **Prior evidence.** The design's prototype measured the same cost (v1:
+  "A random 32-byte key per row made writes 10–25× worse").
+- **What `r_c` serves.** It serves only CID-ordered windows and REBUILD 2.
+  The type index already maps every CID to its copies.
+- **Where the gate stands.** Warm ingest p99 stays under format 2's
+  306-494 ms. The cold first call after an open does not.
+- **Proposed.** Dropping `r_c`, and serving CID order from the type index, is
+  a contract change for the coordinator.

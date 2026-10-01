@@ -1,5 +1,5 @@
-/* FlatSQL store format 4 ("p4"): one SQLite file per partition x UTC content
- * month. The instance C ABI (CONTRACT.md §3.2-§3.4, contract version 1).
+/* FlatSQL store format 4 ("p4"): one SQLite file per partition (producer x
+ * record type). The instance C ABI (CONTRACT.md §3.2-§3.4).
  *
  * i32 and f64 only on the export boundary; everything else is bytes in shared
  * memory. Requests are TLV ([u16 tag][u32 len][value], little-endian,
