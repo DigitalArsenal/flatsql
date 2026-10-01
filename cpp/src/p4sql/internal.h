@@ -186,10 +186,9 @@ LaneState* stateOf(P4Lane* lane);
 }  // namespace p4sql
 }  // namespace flatsql
 
-// C-19 (contract v3): the running slot's err. Declared weak until the
-// engine's p4_reader.h carries it, so p4sql links against an engine that
-// does not implement it yet (the text is then lost, never the status).
-extern "C" void p4_lane_set_error(P4Lane* lane, const char* msg, uint32_t n) __attribute__((weak));
+// C-19 (contract v3): the running slot's err, implemented by the engine.
+// lane.cpp carries a weak no-op until the engine's p4_reader.h declares it.
+extern "C" void p4_lane_set_error(P4Lane* lane, const char* msg, uint32_t n);
 
 namespace flatsql {
 namespace p4sql {

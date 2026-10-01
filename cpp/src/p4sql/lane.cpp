@@ -435,7 +435,7 @@ int32_t run(LaneState* ls, Stmt& st, sqlite3_stmt* s, Out& out, std::string* msg
 // order, each type's <TYPE> then its "<TYPE>@<source>" relations by source.
 // The hook's status, its text in the slot's err when it failed (C-19).
 int32_t reply(LaneState* ls, int32_t status, const std::string& msg) {
-    if (status < 0 && !msg.empty() && p4_lane_set_error) {
+    if (status < 0 && !msg.empty()) {
         EngineCall ec;
         p4_lane_set_error(ls->lane, msg.data(), uint32_t(std::min<size_t>(msg.size(), 255)));
     }
@@ -486,6 +486,10 @@ int32_t surfaceRows(LaneState* ls, Out& out, std::string* msg) {
 }  // namespace flatsql
 
 using namespace flatsql::p4sql;
+
+// Until the engine implements C-19 the error text is dropped (never the
+// status); the engine's strong definition replaces this one.
+extern "C" __attribute__((weak)) void p4_lane_set_error(P4Lane*, const char*, uint32_t) {}
 
 extern "C" int32_t p4sql_global_init(void) { return heapInstall(); }
 
