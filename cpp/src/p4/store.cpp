@@ -205,6 +205,12 @@ bool markersActivated(const Markers& m) {
 // host has none). A path is removed only when no live file holds it.
 void sweepRetired(Type* t) {
     for (auto& p : t->parts) {
+        // A live, empty file whose path is gone (its index row outlived it): it
+        // has no rows to lose, so it is uncreated again and the writer remakes it.
+        for (auto& kv : p->files) {
+            File* f = kv.second;
+            if (f->created && !f->retired && f->n == 0 && !ioExists(f->path)) f->created = false;
+        }
         std::map<int64_t, int32_t> top = p->maxGen;
         for (auto& f : p->all) {
             int32_t& g = top[f->tb];
