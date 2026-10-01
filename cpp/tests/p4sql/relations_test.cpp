@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <cstring>
 
+#ifndef P4SQL_NO_ORACLE
 #include "format1_oracle.h"
+#endif
 #include "p4sql_test.h"
 
 using namespace p4sqlt;
@@ -83,6 +85,7 @@ p4fake::Rec cat(int64_t seq, uint32_t norad, const std::vector<std::string>& sou
     return r;
 }
 
+#ifndef P4SQL_NO_ORACLE
 // Rows compared with format 1's; the columns at `mask` (_rowid, _offset:
 // format 1's are its hot-window positions, format 4's the seq and 0) skipped.
 void sameRows(Harness& h, Format1& f1, const std::string& sql, const std::vector<rb1::Cell>& params = {},
@@ -136,10 +139,13 @@ void sameFrames(Harness& h, Format1& f1, const std::string& sql, const std::vect
     }
 }
 
+#endif
+
 std::vector<rb1::Cell> P(std::initializer_list<rb1::Cell> c) { return std::vector<rb1::Cell>(c); }
 
 }  // namespace
 
+#ifndef P4SQL_NO_ORACLE
 // OMM, one source: every column of every row (enum, table and vector
 // columns read as format 1 reads them), and the R17/R18/R19 OMM shapes.
 P4SQL_TEST(omm_rows_and_frames_equal_format1) {
@@ -248,6 +254,8 @@ P4SQL_TEST(a18_window_is_the_types_newest_n) {
     CHECK_EQ(r.status, P4_E_SQL);
     CHECK(r.error.find("no such table") != std::string::npos);
 }
+
+#endif  // P4SQL_NO_ORACLE
 
 // One source: one bounded cursor, never past N rows.
 P4SQL_TEST(a18_single_source_reads_n_rows) {
