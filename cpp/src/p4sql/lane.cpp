@@ -417,15 +417,9 @@ int32_t run(LaneState* ls, Stmt& st, sqlite3_stmt* s, Out& out, std::string* msg
             *msg = st.message;
             return st.status;
         }
-        int32_t check;
-        {
-            EngineCall ec;
-            check = p4_lane_check(ls->lane);   // cancel is honoured between rows
-        }
-        if (check < 0) {
-            *msg = check == P4_E_CANCELLED ? "cancelled" : "work budget exhausted";
-            return check;
-        }
+        // Cancel and the reader caps are honoured between rows by the
+        // reader's cursors (every row) and the progress handler (statements
+        // that read no rows), and at every emit.
         cellsOf(s, ncols, &cells);
         const int32_t w = out.row(cells, msg);
         if (w < 0) return w;

@@ -52,6 +52,8 @@ struct Type {
     uint8_t epochProfile = 0;
     std::string rules;            // the spec's tag-4 rules text
     std::vector<Rec> recs;        // ascending seq
+    std::vector<std::string> sources;   // cached by p4_sources (cleared by put)
+    int64_t sourcesAt = -1;             // the visible-through they were computed at
     int64_t visibleThrough = 0;   // 0 = every record
 };
 

@@ -14,6 +14,7 @@ using p4fake::Tag;
 using p4fake::Type;
 
 void P4Engine::put(const std::string& type, Rec r) {
+    types[type].sourcesAt = -1;
     auto& v = types[type].recs;
     auto it = std::lower_bound(v.begin(), v.end(), r.seq, [](const Rec& a, int64_t s) { return a.seq < s; });
     v.insert(it, std::move(r));
@@ -334,14 +335,19 @@ int32_t p4_sources(P4Lane* lane, const char* type, const char* const** out, uint
     lane->srcPtrs.clear();
     auto it = lane->engine->types.find(type ? type : "");
     if (it == lane->engine->types.end()) return P4_E_NOTYPE;
-    const int64_t visible = visibleOf(it->second);
-    std::vector<std::string> s;
-    for (const Rec& r : it->second.recs)
-        if (r.seq <= visible)
-            for (const Tag& t : r.tags) s.push_back(t.source);
-    std::sort(s.begin(), s.end());
-    s.erase(std::unique(s.begin(), s.end()), s.end());
-    lane->srcStore = s;
+    Type& ty = it->second;
+    const int64_t visible = visibleOf(ty);
+    if (ty.sourcesAt != visible) {
+        std::vector<std::string> s;
+        for (const Rec& r : ty.recs)
+            if (r.seq <= visible)
+                for (const Tag& t : r.tags) s.push_back(t.source);
+        std::sort(s.begin(), s.end());
+        s.erase(std::unique(s.begin(), s.end()), s.end());
+        ty.sources = std::move(s);
+        ty.sourcesAt = visible;
+    }
+    lane->srcStore = ty.sources;
     for (const std::string& x : lane->srcStore) lane->srcPtrs.push_back(x.c_str());
     *out = lane->srcPtrs.data();
     *n = uint32_t(lane->srcPtrs.size());
