@@ -602,6 +602,7 @@ void runSlot(P4Lane* L, uint32_t slot) {
     L->ringBytes = e->ringBytes[e->poolOf(slot)];
     L->rowsExamined = L->bytesRead = L->rowsOut = L->outBytes = 0;
     L->trip = 0;
+    L->err.clear();
     L->out.clear();
     uint32_t expect = P4_SLOT_QUEUED;
     if (h->cancel.load(std::memory_order_acquire)) {
@@ -657,13 +658,22 @@ void runSlot(P4Lane* L, uint32_t slot) {
         } else {
             status = p4sql_surface(L);
         }
-        if (status == P4_E_UNSUPPORTED && L->outBytes == 0) {
-            respondEmpty(L, {}, status, "the SQL surface is not in this build");
+        if (status == P4_E_UNSUPPORTED && L->outBytes == 0 && L->out.empty()) {
+            respondEmpty(L, {}, status, L->err.empty() ? "the SQL surface is not in this build" : L->err);
             return;
         }
         if (status == P4_E_BUDGET) e->bump(kStSqlBudgetTrips);
+        // C-28: in RB1 mode the engine ends the stream, tripped or not, with
+        // the returned status, the slot's counters and C-29's rows (a stream
+        // that never started gets an empty header first). RAW is unchanged.
+        if (!(h->flags & P4_SLOT_RAW)) {
+            const bool started = L->outBytes > 0 || !L->out.empty();
+            ps::rb1::Encoder enc(&L->out);
+            if (!started) enc.header({});
+            enc.end(status, L->rowsOut, L->rowsExamined, L->bytesRead);
+        }
         flushFinal(L);
-        slotDoneLane(L, status, status == P4_OK ? std::string() : std::string("SQL op failed"));
+        slotDoneLane(L, status, !L->err.empty() ? L->err : status == P4_OK ? std::string() : std::string("SQL op failed"));
         return;
     }
     respondEmpty(L, {}, P4_E_ARG, "unknown op");

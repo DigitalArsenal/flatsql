@@ -896,14 +896,16 @@ else()
     include(${CMAKE_CURRENT_SOURCE_DIR}/test/ps/tb_sources.cmake)
 
     # ---- store format 4 ("p4": one SQLite file per partition x content month) ----
-    # SQLite 3.53.4 unmodified: multi-thread mode, WAL, FTS5; files only through
-    # FlatSQL's own VFS (flatsql_io). The SQL surface (src/p4sql) is globbed in;
-    # without it the engine's weak defaults answer ops 30/31 with UNSUPPORTED.
+    # SQLite 3.53.4 unmodified: multi-thread mode, WAL, FTS5, no memory
+    # statistics (C-30: the SQL surface's allocator counts and enforces the
+    # hard heap); files only through FlatSQL's own VFS (flatsql_io). The SQL
+    # surface (src/p4sql) is globbed in; without it src/p4/p4sql_weak.cpp
+    # answers ops 30/31 with UNSUPPORTED (and is left out when it is there).
     add_library(sqlite3_p4 STATIC ${SQLITE_DIR}/sqlite3.c)
     target_include_directories(sqlite3_p4 PUBLIC ${SQLITE_DIR})
     target_compile_definitions(sqlite3_p4 PRIVATE
         SQLITE_THREADSAFE=2
-        SQLITE_DEFAULT_MEMSTATUS=1
+        SQLITE_DEFAULT_MEMSTATUS=0
         SQLITE_TEMP_STORE=3
         SQLITE_OMIT_LOAD_EXTENSION=1
         SQLITE_OMIT_DEPRECATED=1
@@ -918,6 +920,10 @@ else()
         "${CMAKE_CURRENT_SOURCE_DIR}/src/p4/*.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/p4sql/*.cpp")
     list(FILTER FLATSQL_P4_SOURCES EXCLUDE REGEX "/capi_wasm\\.cpp$")
+    file(GLOB FLATSQL_P4SQL_PRESENT "${CMAKE_CURRENT_SOURCE_DIR}/src/p4sql/*.cpp")
+    if(FLATSQL_P4SQL_PRESENT)
+        list(FILTER FLATSQL_P4_SOURCES EXCLUDE REGEX "/p4sql_weak\\.cpp$")
+    endif()
     # The engine without host I/O: flatsql_p4 adds the native seven imports;
     # the fault tests supply their own.
     add_library(flatsql_p4_core OBJECT
@@ -956,12 +962,18 @@ else()
     list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/p4_fault_io\\.cpp$")
     list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/tests/p4sql/.*fake.*\\.cpp$")
     if(FLATSQL_P4_TEST_SOURCES)
+        # The engine's objects, not the archive: every object is linked
+        # (the SQL surface's included), as in the wasm artifact.
         add_executable(flatsql_p4_test ${FLATSQL_P4_TEST_SOURCES}
+            $<TARGET_OBJECTS:flatsql_p4_core>
+            src/flatsql_io_native.cpp
             ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
             ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
             ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
             ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp)
-        target_link_libraries(flatsql_p4_test PRIVATE flatsql_p4)
+        target_link_libraries(flatsql_p4_test PRIVATE sqlite3_p4 Threads::Threads)
+        target_include_directories(flatsql_p4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${FLATBUFFERS_INCLUDE_DIR} ${SQLITE_DIR})
         target_include_directories(flatsql_p4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src/p4)
         target_compile_definitions(flatsql_p4_test PRIVATE
             P4_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")

@@ -30,4 +30,15 @@ void    p4sql_lane_free(P4Lane* lane);
 #endif
 #endif
 
+// v9, C-30: the SQL surface's allocator counters (stats 29/30); declared
+// here too while the surface's header predates them.
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint64_t p4sql_heap_used(void);
+uint64_t p4sql_heap_peak(void);
+#ifdef __cplusplus
+}
+#endif
+
 #endif

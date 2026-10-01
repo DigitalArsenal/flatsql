@@ -385,8 +385,8 @@ int32_t dropIndexRows(Type* t, uint32_t pid, int64_t tb) {
     if (n == 0 && fileN == 0) return P4_OK;
     rc = c->exec("BEGIN IMMEDIATE");
     const char* sqls[] = {
-        "DELETE FROM ident WHERE tb=?1 AND cid IN (SELECT x.cid FROM c x WHERE x.tb=?1 AND x.pid=?2 AND NOT EXISTS"
-        " (SELECT 1 FROM c y WHERE y.tb=x.tb AND y.cid=x.cid AND y.pid<>x.pid))",
+        ("DELETE FROM ident WHERE tb=?1 AND cid IN (SELECT x.cid FROM c x WHERE x.tb=?1 AND x.pid=?2 AND NOT EXISTS"
+         " (SELECT 1 FROM c y WHERE y.tb=x.tb AND y.cid=x.cid AND y.pid<>x.pid))"),
         "DELETE FROM c WHERE tb=?1 AND pid=?2", "DELETE FROM obj WHERE tb=?1 AND pid=?2",
         "DELETE FROM lanecnt WHERE tb=?1 AND pid=?2", "DELETE FROM file WHERE tb=?1 AND pid=?2"};
     for (const char* sql : sqls) {

@@ -227,6 +227,7 @@ struct File {
     // dropping file is refused (the call answers P4_E_BUSY). Type::mu.
     bool dropping = false;
     int inflight = 0;
+    int64_t removed = 0;       // rows removed since the last free-page check (file rebuild, §7)
     bool indexed = true;       // secondary indexes present (false between a migration's append and REBUILD 1)
     bool touched = false;      // changed since the last flush
     bool objRefresh = false;   // rewrite all of its obj rows at the next flush (journal replay)
@@ -517,7 +518,6 @@ struct P4Engine {
     flatsql::p4::Markers markers;
     std::atomic<uint64_t> stat[flatsql::p4::kStCount];
     std::atomic<uint64_t> quota{0};
-    std::atomic<uint64_t> heapPeak{0};
     std::atomic<bool> stopping{false};
     // A migration target (create mode 2) holds full-text indexing until
     // activation: migrated rows keep format 1's seqs, below the watermark.
@@ -589,6 +589,7 @@ struct P4Lane {
     uint64_t maxRows = 0, maxBytes = 0, maxResultRows = 0, maxResultBytes = 0, heapCap = 0;
     uint64_t rowsExamined = 0, bytesRead = 0, rowsOut = 0, outBytes = 0;
     int32_t trip = 0;  // a cap or cancel that tripped (sticky for the op)
+    std::string err;   // the op's error text (p4_lane_set_error, C-19)
     // per-thread caches
     std::vector<std::shared_ptr<const flatsql::p4::Spec>> specRefs;  // keep p4_types' pointers valid
     std::vector<std::string> typeNames;
@@ -657,6 +658,13 @@ void putGroup(P4Engine* e, uint32_t writer, Part* p, std::vector<WriteTask*>& ta
 void supersedePart(P4Engine* e, Part* p, WriteTask* task);
 void deletePart(P4Engine* e, Part* p, WriteTask* task);
 void finishShared(P4Engine* e, Shared* s);
+// File rebuild (design §7): VACUUM INTO the next generation, swapped in; the
+// old generation is unlinked when its last reader closes. Writes to the file
+// answer P4_E_BUSY meanwhile. Any thread (it takes Type::flushMu).
+int32_t rebuildFile(P4Engine* e, File* f);
+// The maintenance pass: files with removals since the last check whose free
+// pages reach Config::rebuildFreePermille and rebuildMinBytes are rebuilt.
+void maybeRebuildFiles(P4Engine* e);
 int32_t retireFile(P4Engine* e, File* f);
 
 // ---- reader.cpp -----------------------------------------------------------------------------------
@@ -666,7 +674,7 @@ int32_t runRead(P4Lane* L, uint32_t op);  // ops 10-17 on a lane
 void maintenanceLoop(P4Engine* e, uint32_t thread);
 int32_t quotaGc(P4Engine* e, uint64_t maxBytes, int64_t* files, int64_t* records, int64_t* bytes, bool enforce);
 int32_t rebuildOp(P4Engine* e, Type* only, uint32_t what, std::vector<std::array<int64_t, 2>>* rows,
-                  std::vector<Type*>* rowTypes);
+                  std::vector<Type*>* rowTypes, std::string* firstBad = nullptr);
 int32_t ftsCatchUp(P4Engine* e, Type* t, bool all);
 int walHook(void* arg, sqlite3* db, const char* zDb, int nPages);
 

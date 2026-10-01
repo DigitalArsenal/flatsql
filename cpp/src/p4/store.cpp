@@ -386,7 +386,11 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
             }
             break;
         case 2:
-            if (m.storePresent) { *err = "a migration target has no STORE yet"; return P4_E_FORMAT; }
+            // A valid STORE is an activated store. A torn STORE next to a
+            // valid MIGRATED is an activation in progress (C-22): reopened
+            // here, rewritten by flatsql_p4_activate.
+            if (m.storeValid) { *err = "a migration target has no valid STORE yet"; return P4_E_FORMAT; }
+            if (m.storePresent && !m.migratedValid) { *err = "a torn STORE without a valid MIGRATED"; return P4_E_FORMAT; }
             e->ftsHold.store(true);
             break;
     }
@@ -533,12 +537,10 @@ int32_t engineStats(Engine* e, uint8_t* out, int32_t cap) {
         v[kStWriterConns] = e->nWConn;
     }
     v[kStReaderConns] = e->rpool.open();
-    const uint64_t heap = uint64_t(sqlite3_memory_used()) + pending;
-    uint64_t peak = e->heapPeak.load();
-    while (heap > peak && !e->heapPeak.compare_exchange_weak(peak, heap)) {
-    }
-    v[kStHeap] = heap;
-    v[kStHeapPeak] = std::max<uint64_t>(e->heapPeak.load(), uint64_t(sqlite3_memory_highwater(0)));
+    // C-30: SQLite runs without memory statistics; the SQL surface's
+    // allocator counts (0 without the surface).
+    v[kStHeap] = p4sql_heap_used();
+    v[kStHeapPeak] = p4sql_heap_peak();
     v[kStPendingBytes] = pending;
     v[kStLiveFiles] = files;
     v[kStTypes] = types;

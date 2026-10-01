@@ -369,6 +369,7 @@ P4_TEST(t_budget) {
     REQUIRE(st.size() >= size_t(fp::kStCount), "stats");
     report(("t_budget.heap_peak_" + std::to_string(nTypes) + "_types").c_str(), double(st[fp::kStHeapPeak]) / 1048576.0, "MiB");
     report("t_budget.reader_conns", double(st[fp::kStReaderConns]), "connections");
+    // C-30: the heap is the SQL surface's allocator count (0 without it).
     CHECK(st[fp::kStHeapPeak] <= (640ull << 20), "inside the hard heap (640 MiB)");
     closeEngine();
 }

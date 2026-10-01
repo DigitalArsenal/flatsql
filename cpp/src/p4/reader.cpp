@@ -1444,11 +1444,6 @@ int32_t opGet(P4Lane* L, const std::vector<Tlv>& v) {
                 if (emitted && !every) break;
                 // the file of (pid, tb)
                 int fi = -1;
-                for (int k = 0;; k++) {
-                    const FRef* fr = nullptr;
-                    (void)fr;
-                    break;
-                }
                 File* f = nullptr;
                 std::string producer, peer;
                 {
@@ -2564,6 +2559,15 @@ int64_t p4_visible_through(P4Engine* e, const char* type) {
 }
 
 uint64_t p4_lane_heap_cap(P4Lane* lane) { return lane ? lane->heapCap : 0; }
+
+void p4_lane_set_error(P4Lane* lane, const char* msg, uint32_t n) {
+    if (!lane) return;
+    lane->err.assign(msg ? msg : "", msg ? std::min<uint32_t>(n, 255) : 0);
+}
+
+void p4_lane_set_rows(P4Lane* lane, uint64_t rows) {
+    if (lane) lane->rowsOut = rows;
+}
 
 void p4_lane_counters(P4Lane* lane, uint64_t* rowsExamined, uint64_t* bytesRead) {
     if (!lane) return;

@@ -356,7 +356,8 @@ std::string encodeCols(const ps::Extracted& x, uint32_t nCols) {
 
 class Group {
 public:
-    Group(Engine* e, uint32_t writer, Part* p) : e_(e), writer_(writer), p_(p), t_(p->type) {
+    Group(Engine* e, uint32_t writer, Part* p) : e_(e), p_(p), t_(p->type) {
+        (void)writer;
         L_.e = e;
         L_.thread = writer;
         L_.cls = P4_CLASS_WRITE;
@@ -380,7 +381,6 @@ private:
     void fail(int32_t status, const std::string& err);
 
     Engine* e_;
-    uint32_t writer_;
     Part* p_;
     Type* t_;
     std::shared_ptr<const Spec> sp_;
@@ -664,6 +664,15 @@ int32_t Group::probe() {
         for (const Holder& h : hs) {
             if (migrate) {
                 if (r.seqIn != h.seq) { r.reject = P4_REJ_SEQ; break; }
+                // C-22: the copy stores the holder's d and ts, as an ingest
+                // COPY (a holder still in flight: the call's own, same bytes).
+                const int32_t got = readHolder(h, r.tb, r);
+                if (got < 0) return got;
+                if (got == 1) {
+                    r.d = r.own.data();
+                    r.dLen = uint32_t(r.own.size());
+                    r.sealed = nullptr;
+                }
                 r.seq = h.seq;
                 r.action = P4_ACT_COPY;
                 r.write = true;
@@ -1256,6 +1265,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     for (auto& k : o.objKeys) t_->touchedObj.insert(k);
     f->created = true;
     f->touched = true;
+    f->removed += int64_t(dels.size());
     noteTb(t_, f->tb);
     return P4_OK;
 }

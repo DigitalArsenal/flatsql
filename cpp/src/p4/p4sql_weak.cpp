@@ -1,7 +1,8 @@
-// Weak defaults for the SQL surface hooks (CONTRACT.md §3.9). The engine's
-// CMake globs cpp/src/p4sql/*.cpp into the engine; their strong definitions
-// replace these. Without the SQL surface, ops 30 (SQL) and 31 (SURFACE)
-// return P4_E_UNSUPPORTED.
+// Defaults for the SQL surface hooks (CONTRACT.md §3.9), built only when
+// cpp/src/p4sql is absent (the CMake files drop this file when the surface is
+// in the tree, so a static archive can never pick these over the surface's).
+// Without the SQL surface, ops 30 (SQL) and 31 (SURFACE) return
+// P4_E_UNSUPPORTED and stats 29/30 read 0.
 #include "sql_bridge.h"
 
 extern "C" {
@@ -11,5 +12,7 @@ __attribute__((weak)) int32_t p4sql_lane_init(P4Lane*) { return P4_OK; }
 __attribute__((weak)) int32_t p4sql_exec(P4Lane*, const P4SqlRequest*) { return P4_E_UNSUPPORTED; }
 __attribute__((weak)) int32_t p4sql_surface(P4Lane*) { return P4_E_UNSUPPORTED; }
 __attribute__((weak)) void p4sql_lane_free(P4Lane*) {}
+__attribute__((weak)) uint64_t p4sql_heap_used(void) { return 0; }
+__attribute__((weak)) uint64_t p4sql_heap_peak(void) { return 0; }
 
 }

@@ -199,7 +199,7 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* filesDropped, int64_t* re
         typeIndexFlush(t, true);
         std::lock_guard<std::mutex> fg(t->flushMu);
         std::vector<File*> drop;
-        int64_t rows = 0, ncopy = 0, payload = 0;
+        int64_t rows = 0, payload = 0;
         {
             std::lock_guard<std::mutex> g(t->mu);
             for (auto& p : t->parts) {
@@ -242,7 +242,6 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* filesDropped, int64_t* re
             {
                 std::lock_guard<std::mutex> g(t->mu);
                 rows += f->n;
-                ncopy += f->ncopy;
                 payload += f->bytes;
                 // Pending entries of the month go with it.
                 for (CEnt& x : t->pend.raw())
@@ -506,8 +505,28 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
 }
 }  // namespace
 
+namespace {
+// C-27: PRAGMA integrity_check through the engine (a maintenance connection,
+// which also recovers a WAL first). Anything but "ok" (or an open failure) is
+// a damaged file.
+bool fileIntact(const std::string& path) {
+    Conn* c = nullptr;
+    if (openConn(path, OpenKind::Maint, 4096, 0, &c, nullptr) != SQLITE_OK) return false;
+    sqlite3_stmt* s = c->sql("PRAGMA integrity_check");
+    bool ok = false;
+    if (s) {
+        const int rc = sqlite3_step(s);
+        ok = rc == SQLITE_ROW && std::strcmp(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)), "ok") == 0 &&
+             sqlite3_step(s) == SQLITE_DONE;
+        sqlite3_reset(s);
+    }
+    delete c;
+    return ok;
+}
+}  // namespace
+
 int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<int64_t, 2>>* rows,
-                  std::vector<Type*>* rowTypes) {
+                  std::vector<Type*>* rowTypes, std::string* firstBad) {
     std::vector<Type*> types;
     {
         std::lock_guard<std::mutex> g(e->typesMu);
@@ -559,6 +578,21 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
             if (rc != P4_OK) return rc;
             v.entries = vv.entries;
             v.mismatches = vv.mismatches;
+            // C-27: every live file of the type, its index and its journal.
+            std::vector<std::string> paths;
+            {
+                std::lock_guard<std::mutex> g(t->mu);
+                for (auto& p : t->parts)
+                    for (auto& kv : p->files)
+                        if (kv.second->created && !kv.second->retired) paths.push_back(kv.second->path);
+            }
+            paths.push_back(t->pIdx);
+            paths.push_back(t->pJnl);
+            for (const std::string& path : paths)
+                if (!fileIntact(path)) {
+                    v.mismatches++;
+                    if (firstBad && firstBad->empty()) *firstBad = path;
+                }
         }
         rows->push_back({v.entries, v.mismatches});
         rowTypes->push_back(t);
@@ -712,7 +746,8 @@ void runMaintSlot(Engine* e, uint32_t slot) {
     }
     std::vector<std::array<int64_t, 2>> rows;
     std::vector<Type*> rt;
-    const int32_t rc = rebuildOp(e, only, what, &rows, &rt);
+    std::string damaged;
+    const int32_t rc = rebuildOp(e, only, what, &rows, &rt, &damaged);
     if (rc == P4_OK) {
         for (size_t i = 0; i < rows.size(); i++) {
             out.enc.beginRow();
@@ -723,7 +758,9 @@ void runMaintSlot(Engine* e, uint32_t slot) {
             out.rows++;
         }
     }
-    out.end(rc, rc == P4_OK ? "" : "REBUILD failed");
+    out.end(rc, rc != P4_OK         ? std::string("REBUILD failed")
+                : damaged.empty() ? std::string()
+                                  : "integrity_check failed: " + damaged);
 }
 }  // namespace
 
@@ -732,6 +769,7 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
     Bell& b = e->bells[thread];
     MaintState m;
     uint64_t lastTick = 0;
+    int rebuildTicks = 0;
     for (;;) {
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
         for (;;) {
@@ -778,14 +816,14 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
             }
             for (Type* t : types) typeIndexFlush(t, pending >= e->cfg.pendingBytes);
             for (Type* t : types) ftsCatchUp(e, t, false);
+            if (++rebuildTicks >= 50) {  // every 5 s: files with removals since the last look
+                rebuildTicks = 0;
+                maybeRebuildFiles(e);
+            }
             const uint64_t q = e->quota.load();
             if (q) {
                 int64_t a, bb, c;
                 quotaGc(e, q, &a, &bb, &c, true);
-            }
-            const uint64_t heap = uint64_t(sqlite3_memory_used());
-            uint64_t peak = e->heapPeak.load();
-            while (heap > peak && !e->heapPeak.compare_exchange_weak(peak, heap)) {
             }
         }
         b.state.store(0, std::memory_order_seq_cst);
