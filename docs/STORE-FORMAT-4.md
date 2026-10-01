@@ -186,10 +186,20 @@ bash scripts/build-wasm.sh --ps-tests && node scripts/p4-wasm-suite.mjs [--kill-
 
 ## 10. Measured
 
-Mac Studio (28 threads, shared; the load is the 1-minute average):
+Mac Studio (28 threads, shared with other sessions; the load is the
+1-minute average). Native unless marked wasm (V8 under the Node host). The
+brief's gates are judged in WasmEdge AOT, back to back with formats 1 and 2,
+at low load; these numbers are the engine's side.
 
 | | |
 |---|---|
-| G2 fixture | 4,364,873 copies of 3,945,845 records (OMM, MPE, CAT, IQC) loaded in 101 s (43k copies/s, load 15-23; 193 s at load 39-44); REBUILD 1 in 10 s; **795.5 B per copy** with `r_s` (783.2 without it; gate < 800; format 1 2,366, format 2 1,742); 0 differences against format 1 in GET bytes/seq/ts/peer, TAGS, SCAN order, WINDOW and INDEX_PAGE per type; REBUILD 8 clean. |
+| G2 fixture | 4,364,873 copies of 3,945,845 records (OMM, MPE, CAT, IQC) loaded in 89-101 s (43-49k copies/s, load 15-33); REBUILD 1 in 8-10 s; **795.4 B per copy** (gate < 800; format 1 2,366, format 2 1,742); 0 differences against format 1 in GET bytes/seq/ts/peer, TAGS, SCAN order, WINDOW and INDEX_PAGE per type; REBUILD 8 clean. |
+| Kill -9 | 1,000 of 1,000 rounds natively and 1,000 of 1,000 in wasm (three producers, copies, supersede, quota drops, load 15-45). |
+| Power loss | `t_power_loss`: 300 of 300 rounds over the five crash modes, 598,008 acknowledged records kept (load 22-38). |
+| G3 ingest | OMM 4,096-record calls: 1 producer 37.6k rec/s, call p50 101 / p99 177 ms (wasm 31.4k, p99 256 ms); 4 producers 69.6k; 8 producers 111k (wasm 25.8k), load 43-48. With the kill and power-loss loops running beside it (fsync-heavy): 1 producer 25-30k rec/s, p99 275-364 ms; 8 producers 82k (load 15-23). Format 2: 17.4k one writer, 6.6k four, call p99 306-494 ms. |
 | Group commit | One-record calls with 1,024 in flight: 512-record groups, 392 WAL B/record against 315 for 4,096-record calls (gate 2x). |
-| Kill loop | native 400 of 400 rounds at load 11-38 with drops and supersede; the 1,000-round runs are recorded in the release notes. |
+| W06, W10 | Fixture clone: batch supersede of all 1,696,780 OMM records in 42.7 s (load 29); quota GC to 90% drops 3 month files, 1,829,338 records, in 1.4 s; REBUILD 8 clean after both. |
+| G6 nearest | 3,030 files (101 producers x 30 months, 303,000 records, 1,000 objects): EPOCH nearest p50 339 ms, p99 661 ms (load 49) through the object directory; the scan it replaces: p50 3.4 s, p99 6.9 s (format 2's p99 on the fixture: 0.9-1.3 s). |
+| G6 IQC | 2M entries with identities: 24.3k rec/s, 28.2 us per entry in the first tenth, 35.4 in the last (load 31). The 100M-entry run is not done. |
+| G6 budget | 10 types x 8 readers: 20 reader connections, 48 MiB max RSS; 30 types: 60 connections, 95 MiB (heap counters need the SQL surface's allocator, C-30). |
+| A18 (R17) | Fixture clone, `p4_cursor_open`, engine-cold / warm p50: OMM NORAD=25544 in the 400,000 bound 18-63 / 18 ms (format 1 181 / 149 ms); IQC@IQEngine 13-51 / 11 ms (F1 12 / 11); CAT@satcat 8-19 / 8 ms (F1 6.2 / 3.3); CAT@satcat-csv 2.3 / 2.0 ms (F1 0.5, F2 1.8); MPE@gp 7-25 / 6.5 ms (F1 3.5 / 2.8); load 31-33. CAT, MPE and the empty CAT source stay slower than format 1's in-memory hot window. |
