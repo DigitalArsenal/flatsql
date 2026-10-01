@@ -577,7 +577,10 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
             return rc;
         }
     }
-    const char* sync = kind == OpenKind::Index ? "NORMAL" : "FULL";
+    // FULL everywhere: a flush trims the journal right after its type-index
+    // commit, so that commit must be durable first (NORMAL lost acknowledged
+    // records to a power loss between the two: t_power_loss).
+    const char* sync = "FULL";
     std::snprintf(sql, sizeof sql,
                   "PRAGMA synchronous=%s; PRAGMA cache_size=-%u; PRAGMA mmap_size=0; PRAGMA temp_store=MEMORY;"
                   " PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=%lld",

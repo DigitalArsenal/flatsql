@@ -44,7 +44,8 @@ epoch), `r_en(cid) WHERE e IS NULL` (epoch rule). There is no CID index in a
 file: CID lookups go through the type index. Writers open with
 `synchronous=FULL`, WAL, no autocheckpoint.
 
-**Type index** (`.idx`, `synchronous=NORMAL`): `c(tb, cid, pid, seq)`,
+**Type index** (`.idx`, `synchronous=FULL`: a flush trims the journal after
+its commit): `c(tb, cid, pid, seq)`,
 `ident`, `obj`, `part`, `src`, `lanes`, `file`, `gens`, `lanecnt`, `meta`
 (uniq, copies, next_seq). It is a cache of the files plus the journal: every
 row can be rebuilt (REBUILD 2).
