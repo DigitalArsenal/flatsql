@@ -74,7 +74,9 @@ constexpr int kMaxPathLen = 1024;
 // 64 regions is the cap. Regions are szRegion bytes (32 KiB in practice), so
 // this covers a wal-index far larger than any WAL this engine will checkpoint,
 // and the map fails loudly rather than silently wrapping past the end.
-constexpr int kMaxShmRegions = 64;
+// 32 KiB regions, 4,096 WAL frames each: 1,024 index a WAL of 4,194,304
+// frames (16 GiB at 4 KiB pages). Allocated as SQLite maps them.
+constexpr int kMaxShmRegions = 1024;
 constexpr int kShmLocks = SQLITE_SHM_NLOCK;   // 8
 constexpr int kReadMarkFirst = 3;             // WAL_READ_LOCK(0)
 constexpr int kRaStreak = 3;

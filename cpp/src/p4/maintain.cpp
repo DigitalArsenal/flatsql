@@ -621,6 +621,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         sqlite3_stmt* s = c->sql("SELECT v FROM ftsmeta WHERE k='through'");
         if (s && sqlite3_step(s) == SQLITE_ROW) t->ftsThrough = sqlite3_column_int64(s, 0);
         if (s) sqlite3_reset(s);
+        sqlite3_wal_hook(c->db, walHook, e);
         t->fts = c;
     }
     const int64_t vis = t->vis.load(std::memory_order_acquire);

@@ -144,6 +144,7 @@ int32_t typeIndexOpen(Type* t, std::string* err) {
             return statusOfSqlite(rc);
         }
     }
+    sqlite3_wal_hook(c->db, walHook, t->e);  // its WAL is checkpointed by the maintenance thread
     t->idx = c;
     std::lock_guard<std::mutex> g(t->mu);
     // Every registry read either completes or fails the open (M9): a statement

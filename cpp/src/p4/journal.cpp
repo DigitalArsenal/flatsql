@@ -57,6 +57,7 @@ int32_t journalOpen(Type* t, std::string* err) {
     Conn* c = nullptr;
     int rc = openConn(t->pJnl, OpenKind::Journal, 1024, 4096, &c, err);
     if (rc != SQLITE_OK) return statusOfSqlite(rc);
+    sqlite3_wal_hook(c->db, walHook, t->e);  // its WAL is checkpointed by the maintenance thread
     rc = c->exec(kJournalSchema);
     if (rc != SQLITE_OK) {
         if (err) *err = sqlite3_errmsg(c->db);

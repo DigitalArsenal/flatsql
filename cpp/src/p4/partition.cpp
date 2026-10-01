@@ -968,6 +968,7 @@ int32_t Group::writeJournal() {
         for (Del& d : kv.second) addRow(J_DEL, d.tb, d.key, nullptr, p_->pid, d.seq, 0, nullptr, d.len);
     if (rc == SQLITE_OK) rc = j->exec("COMMIT");
     if (rc != SQLITE_OK) {
+        lastErr_ = std::string(sqlite3_errmsg(j->db)) + " (" + std::to_string(rc) + ")";
         j->exec("ROLLBACK");
         return statusOfSqlite(rc);
     }
@@ -1574,7 +1575,7 @@ void Group::run(std::vector<WriteTask*>& tasks) {
     }
     rc = writeJournal();
     if (rc != P4_OK) {
-        fail(rc, "journal commit failed");
+        fail(rc, "journal commit failed: " + lastErr_);
         std::unordered_set<File*> none;
         publish(none, none);
         respond();
