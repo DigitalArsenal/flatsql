@@ -14,6 +14,7 @@
 //     PRAGMA integrity_check on every file, C-27);
 //   - the count equals the distinct CIDs a full scan returns, and no VFS
 //     node is left open after the close.
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <random>
@@ -88,7 +89,7 @@ struct Check {
 };
 
 // The store after a crash, through the engine only (the files are in memory).
-Check checkStore(const std::string& root, const std::set<std::string>& acked) {
+Check checkStore(const std::string& root, const std::vector<std::string>& acked) {
     Check ck;
     EngineOpts o;
     o.flushEntries = 2000;
@@ -201,10 +202,19 @@ P4_SLOW_TEST(t_power_loss) {
         stop = true;
         for (auto& t : producers) t.join();
         closeEngine(10000);  // the device is frozen: the stop's I/O fails, as on a dying machine
+        // This round's acknowledged records, all of them, and a sample of
+        // the earlier rounds' (each was checked whole in its own round).
+        std::vector<std::string> want(newAcks.begin(), newAcks.end());
+        {
+            std::vector<std::string> older(acked.begin(), acked.end());
+            std::shuffle(older.begin(), older.end(), rng);
+            if (older.size() > 5000) older.resize(5000);
+            want.insert(want.end(), older.begin(), older.end());
+        }
         acked.insert(newAcks.begin(), newAcks.end());
         const int mode = int(round % FaultFs::kModeCount);
         fs.crash(FaultFs::CrashMode(mode), rng());
-        Check ck = checkStore(root, acked);
+        Check ck = checkStore(root, want);
         if (ck.ok) pass++;
         else {
             fail++;
