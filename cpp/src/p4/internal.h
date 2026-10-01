@@ -222,6 +222,11 @@ struct File {
     bool created = false;      // exists on disk with its schema (readers skip it until then)
     bool retired = false;      // dropped or replaced: readers skip it, writers never use it again
     bool quarantined = false;  // corrupt: P4_E_CORRUPT for ops that need it
+    // A quota drop sets dropping, then waits for inflight (writes that claimed
+    // the file: groups until they publish, removals) to reach 0; a claim on a
+    // dropping file is refused (the call answers P4_E_BUSY). Type::mu.
+    bool dropping = false;
+    int inflight = 0;
     bool indexed = true;       // secondary indexes present (false between a migration's append and REBUILD 1)
     bool touched = false;      // changed since the last flush
     bool objRefresh = false;   // rewrite all of its obj rows at the next flush (journal replay)
@@ -243,6 +248,7 @@ struct Part {
     uint32_t owner = 0;    // writer thread index
     std::map<int64_t, File*> files;          // live files by tb (Type::mu)
     std::vector<std::unique_ptr<File>> all;  // every File (live and retired; never freed while the engine runs)
+    std::map<int64_t, int32_t> maxGen;       // the highest generation ever used per tb (the gens table; Type::mu)
     int64_t n = 0, bytes = 0;
     bool journaled = false;  // its J_PART row is durable
     // backlog (WriterState::mu of the owner)
@@ -513,6 +519,9 @@ struct P4Engine {
     std::atomic<uint64_t> quota{0};
     std::atomic<uint64_t> heapPeak{0};
     std::atomic<bool> stopping{false};
+    // A migration target (create mode 2) holds full-text indexing until
+    // activation: migrated rows keep format 1's seqs, below the watermark.
+    std::atomic<bool> ftsHold{false};
     std::atomic<uint32_t>* stopWord = nullptr;
 
     // types (typesMu; never removed while the engine runs)
@@ -609,6 +618,16 @@ uint64_t laneHash(const std::string* f6);
 enum JOp : int { J_PART = 1, J_LANE = 2, J_SRC = 3, J_FILE = 4, J_C = 5, J_IDENT = 6, J_DEL = 7, J_DROP = 8 };
 int32_t journalOpen(Type* t, std::string* err);
 // The journal's last-id high water and the durable seq reservation.
+// Claims a file for a write (Type::mu held): false when it is dropping or
+// retired. Every claim is released with fileRelease.
+inline bool fileClaim(File* f) {
+    if (f->dropping || f->retired) return false;
+    f->inflight++;
+    return true;
+}
+void fileRelease(Type* t, File* f);
+// VACUUMs an emptied journal holding more than keepPages free pages (jmu held).
+void journalReclaim(Type* t, int64_t keepPages);
 int32_t journalReserve(Type* t, int64_t through);  // jmu held by caller? no: takes jmu
 int32_t journalReplay(Type* t, std::string* err);  // at open, before any read (M8)
 
@@ -621,6 +640,8 @@ int32_t holdersWith(Type* t, Conn* idx, int64_t tb, const uint8_t* key, std::vec
 int32_t identHolder(P4Lane* L, Type* t, int64_t tb, uint64_t src, const uint8_t h[32], int64_t* seq,
                     uint8_t cid[32]);
 Conn* indexReader(P4Lane* L, Type* t, int32_t* rc);
+// Completes an interrupted drop of (pid, tb) in the type index (replay).
+int32_t dropIndexRows(Type* t, uint32_t pid, int64_t tb);
 int32_t typeIndexFlush(Type* t, bool force);  // maintenance thread
 int32_t typeIndexRebuild(Type* t, bool verifyOnly, int64_t* entries, int64_t* mismatches);
 void noteTb(Type* t, int64_t tb);  // mu held

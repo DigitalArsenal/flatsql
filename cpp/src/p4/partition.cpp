@@ -94,7 +94,9 @@ File* fileFor(Type* t, Part* p, int64_t tb, bool create) {
     int32_t gen = 0;
     for (auto& f : p->all)
         if (f->tb == tb && f->gen >= gen) gen = f->gen + 1;
-    // Never reuse a path (B9): skip every generation present on disk.
+    // Never reuse a path (B9): past every generation ever used (the gens
+    // table survives the files), and past any present on disk.
+    if (auto mg = p->maxGen.find(tb); mg != p->maxGen.end() && mg->second >= gen) gen = mg->second + 1;
     for (;;) {
         const std::string path = t->filePath(p->pid, tb, gen);
         if (!ioExists(path) && !ioExists(path + "-wal") && !ioExists(path + "-journal")) break;
@@ -105,6 +107,7 @@ File* fileFor(Type* t, Part* p, int64_t tb, bool create) {
     f->tb = tb;
     f->gen = gen;
     f->path = t->filePath(p->pid, tb, gen);
+    p->maxGen[tb] = gen;
     File* raw = f.get();
     if (it != p->files.end()) it->second->retired = true;
     p->files[tb] = raw;
@@ -681,6 +684,20 @@ int32_t Group::probe() {
             }
         }
         if (r.reject || copied) continue;
+        if (migrate && sp_->identity && r.ident && !r.tagsIn.empty()) {
+            // A migrated record keeps its ingest identity (format 1's
+            // sdn_record_ingest_identity row) for later ingest-mode repeats.
+            for (auto& c : calls_)
+                for (size_t gi : c.recs)
+                    if (gi == ord[oi] && r.tagsIn[0].first < c.tags.size()) {
+                        const std::string b = c.tags[r.tagsIn[0].first].f6[0] + '\0' + c.tags[r.tagsIn[0].first].f6[1];
+                        uint8_t dg[32];
+                        ps::sha256(b.data(), b.size(), dg);
+                        r.identSrc = ld64(dg) & 0x7fffffffffffffffull;
+                        r.identNew = true;
+                        std::memcpy(r.identCid, r.key, 32);
+                    }
+        }
         // An ingest identity the lane already holds (IQC).
         if (sp_->identity && r.ident && !migrate) {
             const Call* call = nullptr;
@@ -1215,7 +1232,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     }
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) {
-        lastErr_ = std::string(sqlite3_errmsg(c->db)) + " (" + std::to_string(rc) + ")";
+        lastErr_ = std::string(sqlite3_errmsg(c->db)) + " (" + std::to_string(rc) + ") " + f->path;
         c->exec("ROLLBACK");
         writerUnpin(e_, f);
         if ((rc & 0xff) == SQLITE_CORRUPT || (rc & 0xff) == SQLITE_NOTADB) {
@@ -1423,7 +1440,16 @@ void Group::run(std::vector<WriteTask*>& tasks) {
         respond();
         return;
     }
-    // Files: one per bucket month the group writes or retags in.
+    // Files: one per bucket month the group writes or retags in, claimed
+    // until the publish (a quota drop waits for the claims).
+    struct Claims {
+        Type* t;
+        std::vector<File*> files;
+        ~Claims() {
+            for (File* f : files) fileRelease(t, f);
+        }
+    } claims{t_, {}};
+    bool dropping = false;
     {
         std::lock_guard<std::mutex> g(t_->mu);
         for (Rec& r : recs_) {
@@ -1434,10 +1460,24 @@ void Group::run(std::vector<WriteTask*>& tasks) {
                 r.reject = P4_REJ_BAD_ENTRY;
                 continue;
             }
+            if (f->dropping) {
+                dropping = true;
+                break;
+            }
             if (calls_[0].mode == 1 && !f->created) f->indexed = false;
             r.file = f;
-            if (std::find(files_.begin(), files_.end(), f) == files_.end()) files_.push_back(f);
+            if (std::find(files_.begin(), files_.end(), f) == files_.end()) {
+                fileClaim(f);
+                claims.files.push_back(f);
+                files_.push_back(f);
+            }
         }
+    }
+    if (dropping) {
+        // A month being dropped: the calls retry after the drop (new generation).
+        fail(P4_E_BUSY, "a content month is being dropped (quota); retry");
+        respond();
+        return;
     }
     // Repeats inside the group that add tags write to their first record's file.
     for (Rec& r : recs_)

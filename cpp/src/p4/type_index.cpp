@@ -200,6 +200,14 @@ int32_t typeIndexOpen(Type* t, std::string* err) {
         p->all.push_back(std::move(f));
     }
     if (s) sqlite3_reset(s);
+    s = c->sql("SELECT pid, tb, gen FROM gens");
+    while (s && sqlite3_step(s) == SQLITE_ROW) {
+        Part* p = t->partById(uint32_t(sqlite3_column_int64(s, 0)));
+        if (!p) continue;
+        int32_t& g = p->maxGen[sqlite3_column_int64(s, 1)];
+        g = std::max(g, sqlite3_column_int(s, 2));
+    }
+    if (s) sqlite3_reset(s);
     s = c->sql(
         "SELECT lane, pid, tb, n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts FROM lanecnt WHERE n>0");
     while (s && sqlite3_step(s) == SQLITE_ROW) {
@@ -332,6 +340,7 @@ struct FileSnap {
     int64_t tb;
     int32_t gen;
     bool live;
+    bool created;  // its schema committed; until then only the generation is recorded
     int64_t n, bytes, ncopy, minseq, maxseq, minw, maxw, maxts, nnull, mints, mine, maxe;
     bool indexed, objRefresh;
     std::string path;
@@ -343,6 +352,76 @@ struct ObjTouch {
     std::string k;  // the object key as stored (int: 8 bytes LE with a 'i' tag; text: 't' + bytes)
 };
 }  // namespace
+
+// Completes a drop (J_DROP) a crash interrupted before the index rows went:
+// the partition's rows of that month leave c, obj, lanecnt and file, ident
+// rows whose record had no other copy leave too, and the counters lose the
+// copies (a record held only here is no longer unique). Opening only
+// (Type::mu held, the index connection unshared).
+int32_t dropIndexRows(Type* t, uint32_t pid, int64_t tb) {
+    Conn* c = t->idx;
+    int64_t n = 0, last = 0, fileBytes = 0, fileN = 0;
+    sqlite3_stmt* s = c->sql(
+        "SELECT count(*), coalesce(sum(NOT EXISTS (SELECT 1 FROM c y WHERE y.tb=x.tb AND y.cid=x.cid AND y.pid<>x.pid)),0)"
+        " FROM c x WHERE x.tb=?1 AND x.pid=?2");
+    if (!s) return P4_E_IO;
+    sqlite3_bind_int64(s, 1, tb);
+    sqlite3_bind_int64(s, 2, pid);
+    int rc = sqlite3_step(s);
+    if (rc == SQLITE_ROW) {
+        n = sqlite3_column_int64(s, 0);
+        last = sqlite3_column_int64(s, 1);
+    }
+    sqlite3_reset(s);
+    if (rc != SQLITE_ROW) return statusOfSqlite(rc);
+    s = c->sql("SELECT coalesce(sum(n),0), coalesce(sum(bytes),0) FROM file WHERE pid=?1 AND tb=?2");
+    sqlite3_bind_int64(s, 1, pid);
+    sqlite3_bind_int64(s, 2, tb);
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        fileN = sqlite3_column_int64(s, 0);
+        fileBytes = sqlite3_column_int64(s, 1);
+    }
+    sqlite3_reset(s);
+    if (n == 0 && fileN == 0) return P4_OK;
+    rc = c->exec("BEGIN IMMEDIATE");
+    const char* sqls[] = {
+        "DELETE FROM ident WHERE tb=?1 AND cid IN (SELECT x.cid FROM c x WHERE x.tb=?1 AND x.pid=?2 AND NOT EXISTS"
+        " (SELECT 1 FROM c y WHERE y.tb=x.tb AND y.cid=x.cid AND y.pid<>x.pid))",
+        "DELETE FROM c WHERE tb=?1 AND pid=?2", "DELETE FROM obj WHERE tb=?1 AND pid=?2",
+        "DELETE FROM lanecnt WHERE tb=?1 AND pid=?2", "DELETE FROM file WHERE tb=?1 AND pid=?2"};
+    for (const char* sql : sqls) {
+        if (rc != SQLITE_OK) break;
+        sqlite3_stmt* d = c->sql(sql);
+        if (!d) { rc = SQLITE_ERROR; break; }
+        sqlite3_bind_int64(d, 1, tb);
+        sqlite3_bind_int64(d, 2, pid);
+        const int r = sqlite3_step(d);
+        sqlite3_reset(d);
+        if (r != SQLITE_DONE) rc = r;
+    }
+    t->uniq = std::max<int64_t>(0, t->uniq - last);
+    t->copies = std::max<int64_t>(0, t->copies - (n - last));
+    if (fileN > 0) t->uniqBytes = std::max<int64_t>(0, t->uniqBytes - int64_t(double(fileBytes) * double(last) / double(fileN)));
+    const char* mk[3] = {"uniq", "uniq_bytes", "copies"};
+    const int64_t mv[3] = {t->uniq, t->uniqBytes, t->copies};
+    for (int i = 0; i < 3 && rc == SQLITE_OK; i++) {
+        sqlite3_stmt* m = c->sql("INSERT OR REPLACE INTO meta(k, v) VALUES(?1,?2)");
+        sqlite3_bind_text(m, 1, mk[i], -1, SQLITE_STATIC);
+        sqlite3_bind_int64(m, 2, mv[i]);
+        const int r = sqlite3_step(m);
+        sqlite3_reset(m);
+        if (r != SQLITE_DONE) rc = r;
+    }
+    if (rc == SQLITE_OK) rc = c->exec("COMMIT");
+    if (rc != SQLITE_OK) {
+        c->exec("ROLLBACK");
+        return statusOfSqlite(rc);
+    }
+    bool held = false;  // another partition may still hold the month
+    for (auto& p : t->parts) held = held || p->files.count(tb);
+    if (!held) t->tbs.erase(std::remove(t->tbs.begin(), t->tbs.end(), tb), t->tbs.end());
+    return P4_OK;
+}
 
 int32_t typeIndexFlush(Type* t, bool force) {
     Engine* e = t->e;
@@ -403,6 +482,7 @@ int32_t typeIndexFlush(Type* t, bool force) {
                 fs.gen = f->gen;
                 auto lf = p->files.find(f->tb);
                 fs.live = !f->retired && lf != p->files.end() && lf->second == f.get();
+                fs.created = f->created;
                 fs.n = f->n; fs.bytes = f->bytes; fs.ncopy = f->ncopy; fs.minseq = f->minseq; fs.maxseq = f->maxseq;
                 fs.minw = f->minw; fs.maxw = f->maxw; fs.maxts = f->maxts; fs.nnull = f->nnull;
                 fs.mints = f->mints; fs.mine = f->mine; fs.maxe = f->maxe;
@@ -520,6 +600,9 @@ int32_t typeIndexFlush(Type* t, bool force) {
             step(s);
             continue;
         }
+        // A file row means a file with its schema (a reopen trusts it); one
+        // whose creation has not committed is only a used generation.
+        if (!f.created) continue;
         sqlite3_stmt* s = c->sql(
             "INSERT OR REPLACE INTO file(pid, tb, gen, n, bytes, ncopy, minseq, maxseq, minw, maxw, maxts, nnull, ix,"
             " mints, mine, maxe) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)");
@@ -719,6 +802,7 @@ int32_t typeIndexFlush(Type* t, bool force) {
             sqlite3_step(s);
             sqlite3_reset(s);
         }
+        journalReclaim(t, 256);  // 1 MiB of slack for the next entries
     }
     std::lock_guard<std::mutex> g(t->mu);
     t->flushing.clear();

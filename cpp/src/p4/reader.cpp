@@ -997,13 +997,16 @@ int32_t Scan::nextW(Row** out) {
             if (c) return c < 0;
             return files_[size_t(a.fi)].pid < files_[size_t(b.fi)].pid;
         });
+        // Copies are adjacent (CID order): one row per CID, the lowest pid
+        // that matches; a copy of a skipped (offset) CID is skipped with it.
+        bool taken = false;
+        uint8_t takenKey[32];
         for (size_t i = 0; i < g.size(); i++) {
             L_->rowsExamined++;
-            if (i > 0 && std::memcmp(g[i].key, g[i - 1].key, 32) == 0 && !group_.empty() &&
-                std::memcmp(group_.back().key, g[i].key, 32) == 0)
-                continue;  // a copy already taken
+            if (taken && std::memcmp(takenKey, g[i].key, 32) == 0) continue;
             if (!rowMatches(g[i])) continue;
-            if (!group_.empty() && std::memcmp(group_.back().key, g[i].key, 32) == 0) continue;
+            std::memcpy(takenKey, g[i].key, 32);
+            taken = true;
             if (skipped_ < s_.offset) {
                 skipped_++;
                 continue;
@@ -1142,15 +1145,15 @@ int32_t Scan::nextCid(Row** out) {
         if (!have) return 0;
         L_->rowsExamined++;
         if (haveLast_ && std::memcmp(lastKey_, x.key.data(), 32) == 0) continue;  // a copy of a taken CID
+        if (x.seq > hi_) continue;  // not yet visible
+        auto it = fileOf_.find((uint64_t(x.pid) << 32) ^ uint64_t(x.tb));
+        if (it == fileOf_.end()) continue;
         if (simple && skipped_ < s_.offset) {
             std::memcpy(lastKey_, x.key.data(), 32);
             haveLast_ = true;
             skipped_++;
             continue;
         }
-        if (x.seq > hi_) continue;  // not yet visible
-        auto it = fileOf_.find((uint64_t(x.pid) << 32) ^ uint64_t(x.tb));
-        if (it == fileOf_.end()) continue;
         const int fi = it->second;
         std::deque<Row> rows;
         int rc2 = 0;

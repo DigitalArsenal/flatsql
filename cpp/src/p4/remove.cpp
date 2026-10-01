@@ -285,6 +285,11 @@ int32_t removeFromFile(Engine* e, Part* p, File* f, const std::vector<Inst>& ins
 
 }  // namespace
 
+void fileRelease(Type* t, File* f) {
+    std::lock_guard<std::mutex> g(t->mu);
+    f->inflight--;
+}
+
 // A file with no row left is retired at once (readers skip it, writers make a
 // new generation) and unlinked by the maintenance thread once nothing uses it.
 int32_t retireFile(Engine* e, File* f) {
@@ -381,9 +386,16 @@ void supersedePart(Engine* e, Part* p, WriteTask* task) {
             if (!f->created || f->retired) continue;
             bool has = false;
             for (uint32_t id : drop) has = has || f->lanes.count(id);
-            if (has) files.push_back(f);
+            if (has && fileClaim(f)) files.push_back(f);  // a dropping file goes anyway
         }
     }
+    struct Claims {
+        Type* t;
+        std::vector<File*>& files;
+        ~Claims() {
+            for (File* f : files) fileRelease(t, f);
+        }
+    } claims{t, files};
     std::string in;
     for (uint32_t id : drop) in += (in.empty() ? "" : ",") + std::to_string(id);
     for (File* f : files) {
@@ -482,18 +494,30 @@ void deletePart(Engine* e, Part* p, WriteTask* task) {
     Shared* s = task->shared;
     Type* t = p->type;
     std::map<File*, std::vector<Gone>> byFile;
+    std::vector<File*> claimed;
     for (const auto& h : task->dels) {  // (tb, seq)
         File* f;
         {
             std::lock_guard<std::mutex> g(t->mu);
             auto it = p->files.find(h.first);
             f = it == p->files.end() || !it->second->created || it->second->retired ? nullptr : it->second;
+            if (f && !byFile.count(f)) {
+                if (!fileClaim(f)) f = nullptr;  // being dropped: the rows go with it
+                else claimed.push_back(f);
+            }
         }
         if (!f) continue;
         Gone g;
         g.seq = h.second;
         byFile[f].push_back(g);
     }
+    struct Claims {
+        Type* t;
+        std::vector<File*>& files;
+        ~Claims() {
+            for (File* f : files) fileRelease(t, f);
+        }
+    } claims{t, claimed};
     for (auto& kv : byFile) {
         bool emptied = false;
         const size_t want = kv.second.size();

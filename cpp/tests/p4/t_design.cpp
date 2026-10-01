@@ -325,8 +325,66 @@ P4_TEST(t_crash) {
 #endif
 
 // ---- the kill loop -------------------------------------------------------------------------------
-// t_kill_run ingests until killed (3 producers; every 5th call repeats the
-// previous call's records under another producer; a small flush threshold so
+namespace {
+// The kill loop's type: PNM with a content month (NAME carries a time), so
+// quota drops have months to drop.
+TestType& killType() {
+    static TestType t = [] {
+        TestType x = pnmLikeType("PNM");
+        x.rules += "bucket str:NAME\n";
+        return x;
+    }();
+    return t;
+}
+
+// A record's month follows its id (500 ids per call, four months), so a
+// repeat of earlier ids is the same bytes in the same month.
+std::vector<uint8_t> killFrame(uint64_t id) {
+    char name[32];
+    std::snprintf(name, sizeof name, "2026-%02d-15T00:00:00", 6 + int((id / 500) % 4));
+    return buildFrame(killType(), {Field::str("FILE_ID", "file-" + std::to_string(id)), Field::str("NAME", name),
+                                   Field::raw("BODY", std::vector<uint8_t>(160, uint8_t(id)))});
+}
+
+Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from, int n) {
+    Batch b = pnmBatch(peer, batch, from, 0);
+    for (int i = 0; i < n; i++) {
+        In in;
+        in.frame = killFrame(from + uint64_t(i));
+        in.ts = 1790000000;
+        b.recs.push_back(std::move(in));
+    }
+    return b;
+}
+
+// One step of the workload the kill lands in: 3 producers; every 5th call
+// repeats earlier records under another producer (copies); calls rotate over
+// four content months; every 13th call supersedes a batch and every 11th
+// drops months to a 4 MiB quota (file drops, new generations).
+void killWorkStep(int c, uint64_t* id) {
+    Batch b = killBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), *id, 500);
+    if (c % 5 == 4)
+        for (int i = 0; i < 500; i++) b.recs[size_t(i)].frame = killFrame(*id - 1000 + uint64_t(i));
+    *id += 500;
+    Result r = put(b);
+    if (r.status != P4_OK) {
+        std::fprintf(stderr, "  put failed: %d %s\n", r.status, r.err.c_str());
+        std::_Exit(1);
+    }
+    if (c % 13 == 12) {
+        TlvW s;
+        s.text(1, "PNM").text(11, "prov").text(12, "src").text(60, "b" + std::to_string(c / 7)).u8(61, 1);
+        call(P4_OPC_SUPERSEDE, s.b);
+    }
+    if (c % 11 == 10) {
+        TlvW q;
+        q.u64(62, 4ull << 20);
+        call(P4_OPC_QUOTA_GC, q.b);
+    }
+}
+}  // namespace
+
+// t_kill_run ingests until killed (killWorkStep; a small flush threshold so
 // flushes and journal cleanup happen often); t_kill_check reopens and checks.
 P4_SLOW_TEST(t_kill_run) {
     const std::string root = argStr("store", "");
@@ -335,25 +393,9 @@ P4_SLOW_TEST(t_kill_run) {
     o.flushEntries = 5000;
     o.writers = 3;
     REQUIRE(openEngine(root, o) == P4_OK, "open");
-    REQUIRE(registerType(pnm()) == P4_OK, "register");
+    REQUIRE(registerType(killType()) == P4_OK, "register");
     uint64_t id = uint64_t(argInt("base", 1)) * 100000000ull;
-    for (int c = 0;; c++) {
-        Batch b = pnmBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), id, 500);
-        if (c % 5 == 4)
-            for (int i = 0; i < 500; i++) b.recs[size_t(i)].frame = pnmFrame(id - 1000 + uint64_t(i));
-        id += 500;
-        Result r = put(b);
-        if (r.status != P4_OK) {
-            std::fprintf(stderr, "put failed: %d %s\n", r.status, r.err.c_str());
-            std::_Exit(1);
-        }
-        if (c % 13 == 12) {
-            // supersede runs under the kill too
-            TlvW s;
-            s.text(1, "PNM").text(11, "prov").text(12, "src").text(60, "b" + std::to_string(c / 7)).u8(61, 1);
-            call(P4_OPC_SUPERSEDE, s.b);
-        }
-    }
+    for (int c = 0;; c++) killWorkStep(c, &id);
 }
 
 namespace {
@@ -364,7 +406,7 @@ bool killCheck(const std::string& root, std::string* why) {
         *why = "reopen failed";
         return false;
     }
-    if (registerType(pnm()) != P4_OK) {
+    if (registerType(killType()) != P4_OK) {
         *why = "register failed";
         closeEngine();
         return false;
@@ -408,18 +450,24 @@ bool killCheck(const std::string& root, std::string* why) {
     rb.u32(63, 8);
     Result v = call(P4_OPC_REBUILD, rb.b);
     const int64_t mism = v.rows.size() == 1 ? v.i(0, "mismatches") : -1;
+    if (mism < 0) std::fprintf(stderr, "  check: REBUILD 8 failed: %d %s\n", v.status, v.err.c_str());
     static uint64_t nextFresh = 9000000000ull;
     nextFresh += 1000;
-    Result fresh = put(pnmBatch("producer0", "after", nextFresh + flatsql::ps::monoNs() % 1000000000ull * 1000, 100));
+    Result fresh = put(killBatch("producer0", "after", nextFresh + flatsql::ps::monoNs() % 1000000000ull * 1000, 100));
     bool above = fresh.status == P4_OK && fresh.rows.size() == 100;
     if (fresh.status != P4_OK) std::fprintf(stderr, "  check: fresh PUT failed: %d %s\n", fresh.status, fresh.err.c_str());
     for (size_t i = 0; i < fresh.rows.size(); i++) above = above && fresh.i(i, "seq") > maxSeq;
     closeEngine();
+    // A closed engine leaves no file open: no VFS node (a forked child would
+    // inherit its locks and WAL index).
+    const int64_t nodesLeft = flatsql::flatSqlIoVfsStats().nodes;
+    if (nodesLeft) std::fprintf(stderr, "  check: %lld VFS nodes left open after close\n", (long long)nodesLeft);
     char buf[256];
-    std::snprintf(buf, sizeof buf, "rows %lld distinct %zu count %lld missing %lld mismatches %lld above %d",
-                  (long long)rows, distinct.size(), (long long)count, (long long)missing, (long long)mism, int(above));
+    std::snprintf(buf, sizeof buf, "rows %lld distinct %zu count %lld missing %lld mismatches %lld above %d nodes %lld",
+                  (long long)rows, distinct.size(), (long long)count, (long long)missing, (long long)mism, int(above),
+                  (long long)nodesLeft);
     *why = buf;
-    return missing == 0 && count == int64_t(distinct.size()) && mism == 0 && above;
+    return missing == 0 && count == int64_t(distinct.size()) && mism == 0 && above && nodesLeft == 0;
 }
 }  // namespace
 
@@ -446,27 +494,12 @@ P4_SLOW_TEST(t_kill) {
             EngineOpts o;
             o.flushEntries = 5000;
             o.writers = 3;
-            if (openEngine(root, o) != P4_OK || registerType(pnm()) != P4_OK) {
+            if (openEngine(root, o) != P4_OK || registerType(killType()) != P4_OK) {
                 std::fprintf(stderr, "  child: open failed\n");
                 _exit(2);
             }
             uint64_t id = uint64_t(round) * 100000000ull;
-            for (int c = 0;; c++) {
-                Batch b = pnmBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), id, 500);
-                if (c % 5 == 4)
-                    for (int i = 0; i < 500; i++) b.recs[size_t(i)].frame = pnmFrame(id - 1000 + uint64_t(i));
-                id += 500;
-                Result pr = put(b);
-                if (pr.status != P4_OK) {
-                    std::fprintf(stderr, "  child: put failed: %d %s\n", pr.status, pr.err.c_str());
-                    _exit(1);
-                }
-                if (c % 13 == 12) {
-                    TlvW s;
-                    s.text(1, "PNM").text(11, "prov").text(12, "src").text(60, "b" + std::to_string(c / 7)).u8(61, 1);
-                    call(P4_OPC_SUPERSEDE, s.b);
-                }
-            }
+            for (int c = 0;; c++) killWorkStep(c, &id);
         }
         flatsql::ps::sleepNs(uint64_t(100 + rng() % 900) * 1000000ull + uint64_t(rng() % 3) * 1000000000ull / 4);
         kill(pid, SIGKILL);
@@ -478,6 +511,11 @@ P4_SLOW_TEST(t_kill) {
         } else {
             fail++;
             std::printf("  round %d FAIL: %s\n", round, why.c_str());
+            if (argInt("stop-on-fail", 0)) {
+                std::printf("  store kept: %s\n", root.c_str());
+                CHECK_EQ(fail, 0, "every round");
+                return;
+            }
         }
         if (round % 50 == 0) std::printf("  t_kill: %d rounds, %d pass, %d fail (load %.1f)\n", round, pass, fail, loadAvg());
     }
