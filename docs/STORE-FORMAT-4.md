@@ -36,10 +36,10 @@ to run it, and what was measured.
 **Partition file.** `meta` (format, type, producer, peer, pid, tb, gen, ix,
 ncopy), `src` and `lane` (a lane is format 1's tag key, C-3, with its
 counters), `r(seq PK, cid, e, k, ts, p, f, s, x, d, w, wd)` with `w` =
-`coalesce(e, ts)`, tag instances `rl(sid, seq, lane, at, u)` WITHOUT ROWID,
+`coalesce(e, ts)`, tag instances `rl(sid, seq, lane, at, u)` WITHOUT ROWID keyed `(seq, sid, lane)` (a page's tags are one key range),
 and for object types `ent(k, n, fw, lw)`. Indexes: `r_w(w DESC)`, `r_s(seq)`
 (the seqs alone: the A18 cut walks it, not the records' pages; 12 B a row),
-`rl_seq(seq)`, `r_dk(wd, k, w)` (epoch and object), `r_k(k, w)` (object, no
+`rl_sid(sid, seq)` (source-ordered scans, supersede), `r_dk(wd, k, w)` (epoch and object), `r_k(k, w)` (object, no
 epoch), `r_en(cid) WHERE e IS NULL` (epoch rule). There is no CID index in a
 file: CID lookups go through the type index. Writers open with
 `synchronous=FULL`, WAL, no autocheckpoint.

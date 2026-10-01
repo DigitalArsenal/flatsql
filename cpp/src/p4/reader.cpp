@@ -250,6 +250,7 @@ private:
         bool done = false;
         bool opened = false;
         size_t candPos = 0;     // object-key candidates taken so far
+        uint64_t probed = 0, kept = 0;  // tag-first pages: rows probed, rows that matched
     };
     int32_t collectCandidates();
     int32_t fetchCandidates(int fi, bool wOrder);
@@ -914,8 +915,7 @@ int32_t Scan::loadTags(Conn* c, int fi, std::deque<Row>& rows) {
         }
         return P4_OK;
     }
-    q = c->sql("SELECT seq, sid, lane, at, u FROM rl INDEXED BY rl_seq WHERE seq>=?1 AND seq<=?2");
-    if (!q) q = c->sql("SELECT seq, sid, lane, at, u FROM rl WHERE seq>=?1 AND seq<=?2");
+    q = c->sql("SELECT seq, sid, lane, at, u FROM rl WHERE seq>=?1 AND seq<=?2");
     if (!q) return P4_E_INTERNAL;
     sqlite3_bind_int64(q, 1, a);
     sqlite3_bind_int64(q, 2, b);
@@ -981,10 +981,11 @@ int32_t Scan::fetchSeq(int fi) {
             sqlite3_bind_int64(q, 3, hi_);
         }
         sqlite3_bind_int64(q, 4, page * 2);
-    } else if (s_.lane && fr.laneN * 4 < fr.n * 3) {
+    } else if (s_.lane && fr.laneN * 4 < fr.n * 3 && !(fc.probed >= 256 && fc.kept * 4 >= fc.probed * 3)) {
         // A source filter that leaves out a quarter or more here (and is not
         // selective enough for rl): the page's seqs from r_s, their tags,
-        // then the rows of the matching seqs only.
+        // then the rows of the matching seqs only; once a quarter or less of
+        // what this file showed is left out, its pages read fused again.
         q = c->sql(desc ? "SELECT seq FROM r INDEXED BY r_s WHERE seq<?1 AND seq>?2 ORDER BY seq DESC LIMIT ?3"
                         : "SELECT seq FROM r INDEXED BY r_s WHERE seq>?1 AND seq<=?2 ORDER BY seq LIMIT ?3");
         if (!q)
@@ -1011,9 +1012,11 @@ int32_t Scan::fetchSeq(int fi) {
         if (status == P4_OK) status = loadTags(c, fi, probe);
         std::vector<int64_t> keep;
         std::unordered_map<int64_t, std::vector<TagInst>> tagsOf;
+        fc.probed += probe.size();
         for (auto& pr : probe) {
             bool any = false;
             for (const TagInst& ti : pr.tags) any = any || laneMatch(ti);
+            if (any) fc.kept++;
             if (!any) {
                 L_->rowsExamined++;  // the kept rows are counted by next()
                 continue;

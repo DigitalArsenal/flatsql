@@ -315,7 +315,7 @@ P4_TEST(t_rebuild) {
     TlvW r1;
     r1.u32(63, 1).text(1, "MIG");
     CHECK_EQ(call(P4_OPC_REBUILD, r1.b).status, P4_OK, "REBUILD 1");
-    CHECK(hasIndex("r_w") && hasIndex("rl_seq"), "indexes built");
+    CHECK(hasIndex("r_w") && hasIndex("rl_sid"), "indexes built");
     closeEngine();
 }
 

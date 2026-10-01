@@ -32,8 +32,10 @@ const char* kFileSchema =
     " p TEXT, f BLOB, s INTEGER, x BLOB, d BLOB NOT NULL,"
     " w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL,"
     " wd INTEGER GENERATED ALWAYS AS (coalesce(e, ts) / 86400) VIRTUAL);"
+    // Tag instances keyed by seq first: a page's tags are one key range (no
+    // lookups); rl_sid(sid, seq) serves source-ordered scans and supersede.
     "CREATE TABLE IF NOT EXISTS rl(sid INTEGER NOT NULL, seq INTEGER NOT NULL, lane INTEGER NOT NULL,"
-    " at INTEGER NOT NULL, u TEXT, PRIMARY KEY(sid, seq, lane)) WITHOUT ROWID;";
+    " at INTEGER NOT NULL, u TEXT, PRIMARY KEY(seq, sid, lane)) WITHOUT ROWID;";
 }  // namespace
 
 int32_t fileCreateIndexes(Type* t, Conn* c) {
@@ -43,7 +45,7 @@ int32_t fileCreateIndexes(Type* t, Conn* c) {
     std::string ddl =
         "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC);"
         "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
-        "CREATE INDEX IF NOT EXISTS rl_seq ON rl(seq);";
+        "CREATE INDEX IF NOT EXISTS rl_sid ON rl(sid, seq);";
     if (sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_dk ON r(wd, k, w) WHERE k IS NOT NULL;"
                        "CREATE INDEX IF NOT EXISTS r_nk ON r(w) WHERE k IS NULL;";  // records without an object (EPOCH)
     if (sp->hasObject && !sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_k ON r(k, w) WHERE k IS NOT NULL;";
