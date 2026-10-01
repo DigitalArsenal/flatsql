@@ -355,9 +355,9 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
             }
         }
         const uint32_t pid = f->part->pid;
-        sqlite3_stmt* s = c->sql("SELECT seq, cid, length(d), w, e FROM r");
+        sqlite3_stmt* s = c->sql("SELECT seq, cid, length(d), w, e, k IS NULL FROM r");
         if (!s) return fail(SQLITE_ERROR);
-        int64_t n = 0, bytes = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN, nnull = 0;
+        int64_t n = 0, bytes = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN, nnull = 0, nk = 0;
         int src;
         while ((src = sqlite3_step(s)) == SQLITE_ROW) {
             const int64_t seq = sqlite3_column_int64(s, 0);
@@ -368,6 +368,7 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
             minw = std::min(minw, sqlite3_column_int64(s, 3));
             maxw = std::max(maxw, sqlite3_column_int64(s, 3));
             if (sqlite3_column_type(s, 4) == SQLITE_NULL && sp->hasEpochRule) nnull++;
+            if (sqlite3_column_int(s, 5) && sp->ek) nk++;
             v->entries++;
             if (fix) {
                 sqlite3_stmt* ins = x->get(S_C_INS);
@@ -450,6 +451,7 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
             f->minw = minw;
             f->maxw = maxw;
             f->nnull = nnull;
+            f->nk = nk;
             for (auto& kv : real) {
                 LaneCount& lc = f->lanes[kv.first];
                 lc.n = kv.second.first;

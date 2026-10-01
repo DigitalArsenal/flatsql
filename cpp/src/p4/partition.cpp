@@ -44,7 +44,8 @@ int32_t fileCreateIndexes(Type* t, Conn* c) {
         "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC);"
         "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
         "CREATE INDEX IF NOT EXISTS rl_seq ON rl(seq);";
-    if (sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_dk ON r(wd, k, w) WHERE k IS NOT NULL;";
+    if (sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_dk ON r(wd, k, w) WHERE k IS NOT NULL;"
+                       "CREATE INDEX IF NOT EXISTS r_nk ON r(w) WHERE k IS NULL;";  // records without an object (EPOCH)
     if (sp->hasObject && !sp->ek) ddl += "CREATE INDEX IF NOT EXISTS r_k ON r(k, w) WHERE k IS NOT NULL;";
     if (sp->hasEpochRule) ddl += "CREATE INDEX IF NOT EXISTS r_en ON r(cid) WHERE e IS NULL;";
     ddl += "INSERT OR REPLACE INTO meta(k, v) VALUES('ix', 1);";
@@ -982,7 +983,7 @@ int32_t Group::writeJournal() {
 
 
 struct FileOut {
-    int64_t n, bytes, ncopy, minseq, maxseq, minw, maxw, maxts, nnull, mints, mine, maxe;
+    int64_t n, bytes, ncopy, minseq, maxseq, minw, maxw, maxts, nnull, mints, mine, maxe, nk;
     std::map<uint32_t, LaneCount> lanes;  // touched lanes, their new counts
     std::vector<std::string> objKeys;
     bool empty = false;
@@ -1000,7 +1001,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     {
         std::lock_guard<std::mutex> g(t_->mu);
         o.n = f->n; o.bytes = f->bytes; o.ncopy = f->ncopy; o.minseq = f->minseq; o.maxseq = f->maxseq;
-        o.minw = f->minw; o.maxw = f->maxw; o.maxts = f->maxts; o.nnull = f->nnull;
+        o.minw = f->minw; o.maxw = f->maxw; o.maxts = f->maxts; o.nnull = f->nnull; o.nk = f->nk;
         o.mints = f->mints; o.mine = f->mine; o.maxe = f->maxe;
     }
     auto laneCount = [&](uint32_t id) -> LaneCount& {
@@ -1064,6 +1065,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
             if (r.hasE && r.e < o.mine) o.mine = r.e;
             if (r.hasE && r.e > o.maxe) o.maxe = r.e;
             if (!r.hasE && sp_->hasEpochRule) o.nnull++;
+            if (!r.kType && sp_->ek) o.nk++;
             if (sp_->ek && r.kType) {
                 sqlite3_stmt* u = c->get(S_ENT_UP);
                 bindK(u, 1, r);
@@ -1259,7 +1261,7 @@ int32_t Group::writeFile(File* f, std::vector<size_t>& idxs, std::vector<Del>& d
     // Publish this file's counters.
     std::lock_guard<std::mutex> g(t_->mu);
     f->n = o.n; f->bytes = o.bytes; f->ncopy = o.ncopy; f->minseq = o.minseq; f->maxseq = o.maxseq;
-    f->minw = o.minw; f->maxw = o.maxw; f->maxts = o.maxts; f->nnull = o.nnull;
+    f->minw = o.minw; f->maxw = o.maxw; f->maxts = o.maxts; f->nnull = o.nnull; f->nk = o.nk;
     f->mints = o.mints; f->mine = o.mine; f->maxe = o.maxe;
     for (auto& kv : o.lanes) {
         if (kv.second.n <= 0) f->lanes.erase(kv.first);

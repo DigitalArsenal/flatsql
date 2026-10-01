@@ -218,6 +218,7 @@ struct File {
     // counters (Type::mu); the file's meta and lane rows are the durable copy
     int64_t n = 0, bytes = 0, ncopy = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN,
             maxts = 0, nnull = 0, mints = INT64_MAX, mine = INT64_MAX, maxe = INT64_MIN;
+    int64_t nk = 0;  // rows written without an object key (an upper bound between recounts; EPOCH reads them)
     std::map<uint32_t, LaneCount> lanes;  // live lanes (n > 0) by lane id
     bool created = false;      // exists on disk with its schema (readers skip it until then)
     bool retired = false;      // dropped or replaced: readers skip it, writers never use it again
@@ -231,6 +232,7 @@ struct File {
     bool indexed = true;       // secondary indexes present (false between a migration's append and REBUILD 1)
     bool touched = false;      // changed since the last flush
     bool objRefresh = false;   // rewrite all of its obj rows at the next flush (journal replay)
+    bool objRefreshing = false;  // a running flush rewrites them (readers read ent instead)
     // writer connection (Engine::wconnMu)
     Conn* w = nullptr;
     int wPins = 0;
@@ -369,6 +371,7 @@ struct Type {
     PMap pend, flushing;
     std::unordered_map<std::string, IdentEnt> identPend, identFlushing;
     std::unordered_set<std::string> touchedObj;  // pid|tb|k whose obj rows to refresh
+    std::unordered_set<std::string> touchedObjFlushing;  // those a running flush writes (readers: maybe stale)
     int64_t lastFlushMs = 0;
     bool overQuota = false;
 
@@ -660,6 +663,8 @@ void deletePart(P4Engine* e, Part* p, WriteTask* task);
 void finishShared(P4Engine* e, Shared* s);
 // File rebuild (design §7): VACUUM INTO the next generation, swapped in; the
 // old generation is unlinked when its last reader closes. Writes to the file
+// Tests compare the EPOCH object-directory answers with the scan's.
+extern std::atomic<bool> gEpochScanOnly;
 // answer P4_E_BUSY meanwhile. Any thread (it takes Type::flushMu).
 int32_t rebuildFile(P4Engine* e, File* f);
 // The maintenance pass: files with removals since the last check whose free

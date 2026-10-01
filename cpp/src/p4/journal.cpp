@@ -344,14 +344,14 @@ int32_t journalReplay(Type* t, std::string* err) {
             any = true;
             Conn* c = connOf(f);
             if (!c) continue;
-            f->n = f->bytes = f->ncopy = f->nnull = f->maxts = 0;
+            f->n = f->bytes = f->ncopy = f->nnull = f->maxts = f->nk = 0;
             f->minseq = INT64_MAX;
             f->maxseq = 0;
             f->minw = INT64_MAX;
             f->maxw = INT64_MIN;
             sqlite3_stmt* s = c->sql(
                 "SELECT count(*), coalesce(sum(length(d)),0), min(seq), max(seq), min(w), max(w), coalesce(max(ts),0),"
-                " coalesce(sum(e IS NULL),0), min(ts), min(e), max(e) FROM r");
+                " coalesce(sum(e IS NULL),0), min(ts), min(e), max(e), coalesce(sum(k IS NULL),0) FROM r");
             if (s && sqlite3_step(s) == SQLITE_ROW) {
                 f->n = sqlite3_column_int64(s, 0);
                 f->bytes = sqlite3_column_int64(s, 1);
@@ -366,6 +366,7 @@ int32_t journalReplay(Type* t, std::string* err) {
                 f->mints = sqlite3_column_type(s, 8) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 8);
                 f->mine = sqlite3_column_type(s, 9) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 9);
                 f->maxe = sqlite3_column_type(s, 10) == SQLITE_NULL ? INT64_MIN : sqlite3_column_int64(s, 10);
+                f->nk = sqlite3_column_int64(s, 11);
             }
             if (s) sqlite3_reset(s);
             s = c->sql("SELECT v FROM meta WHERE k='ncopy'");

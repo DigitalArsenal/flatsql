@@ -490,3 +490,96 @@ P4_TEST(t_cid_key_roundtrip) {
     CHECK_EQ(bad, 0, "round trips");
     CHECK_EQ(order, 0, "memcmp order of keys = text order");
 }
+
+// G6: EPOCH nearest / as_of / forward through the object directory answer
+// what the scan answers: several producers and months, copies, records
+// without an object, objects changed since the last flush, a source filter,
+// a maximum delta.
+P4_TEST(t_epoch_object_directory) {
+    const std::string root = scratchDir("epochdir") + "/fsql4";
+    EngineOpts o;
+    o.flushEntries = 3000;
+    REQUIRE(openEngine(root, o) == P4_OK, "open");
+    REQUIRE(registerType(ommType()) == P4_OK, "register OMM");
+    std::mt19937 rng(5);
+    const int64_t base = unixOf(2026, 5, 1);
+    for (int pi = 0; pi < 4; pi++)
+        for (int call = 0; call < 6; call++) {
+            Batch b;
+            b.type = "OMM";
+            b.peer = "12D3KooWEp" + std::to_string(pi);
+            b.tags.push_back(Tag{"prov", pi % 2 ? "srcA" : "srcB", "", "b" + std::to_string(call), "", "", ""});
+            b.at = 1790000000;
+            for (int i = 0; i < 150; i++) {
+                In in;
+                const int64_t e = base + int64_t(rng() % (120 * 86400));
+                const uint32_t norad = uint32_t(1 + rng() % 60);
+                if (i % 37 == 0) {
+                    // no object: neither NORAD_CAT_ID nor OBJECT_ID
+                    in.frame = buildFrame(ommType(), {Field::str("OBJECT_NAME", "X" + std::to_string(i)),
+                                                      Field::str("EPOCH", isoTime(e))});
+                } else {
+                    in.frame = ommFrame(norad, "2026-0" + std::to_string(norad % 9) + "A", isoTime(e), 15.0 + double(i % 7));
+                }
+                in.ts = 1790000000;
+                b.recs.push_back(std::move(in));
+            }
+            if (call == 5 && pi == 3) b.recs[0].frame = b.recs[1].frame;  // a repeat inside the call
+            REQUIRE(put(b).status == P4_OK, "put");
+        }
+    // copies: producer 0's first call again from producer 9
+    {
+        Batch b;
+        b.type = "OMM";
+        b.peer = "12D3KooWEp9";
+        b.tags.push_back(Tag{"prov", "srcC", "", "c", "", "", ""});
+        b.at = 1790000000;
+        std::mt19937 again(5);
+        for (int i = 0; i < 150; i++) {
+            In in;
+            const int64_t e = base + int64_t(again() % (120 * 86400));
+            const uint32_t norad = uint32_t(1 + again() % 60);
+            if (i % 37 == 0) continue;
+            in.frame = ommFrame(norad, "2026-0" + std::to_string(norad % 9) + "A", isoTime(e), 15.0 + double(i % 7));
+            in.ts = 1790000000;
+            b.recs.push_back(std::move(in));
+        }
+        REQUIRE(put(b).status == P4_OK, "copies");
+    }
+    auto run = [&](uint8_t profile, int64_t at, const char* source, int64_t maxDelta) {
+        TlvW ep;
+        ep.text(1, "OMM").u8(30, profile).i64(31, at);
+        if (source) ep.text(12, source);
+        if (maxDelta) ep.i64(32, maxDelta);
+        Result r = call(P4_OPC_EPOCH, ep.b);
+        std::vector<std::string> rows;
+        for (size_t i = 0; i < r.rows.size(); i++)
+            rows.push_back(r.s(i, "cid") + "/" + std::to_string(r.i(i, "seq")) + "/" + r.s(i, "producer") + "/" +
+                           r.s(i, "source"));
+        return std::make_pair(r.status, rows);
+    };
+    int compared = 0, differ = 0;
+    size_t total = 0;
+    for (int q = 0; q < 24; q++) {
+        const uint8_t profile = uint8_t(2 + q % 3);
+        const int64_t at = base + int64_t(rng() % (130 * 86400)) - 5 * 86400;
+        const char* source = q % 4 == 3 ? "srcA" : nullptr;
+        const int64_t maxDelta = q % 5 == 4 ? 3 * 86400 : 0;
+        fp::gEpochScanOnly = true;
+        auto want = run(profile, at, source, maxDelta);
+        fp::gEpochScanOnly = false;
+        auto got = run(profile, at, source, maxDelta);
+        CHECK_EQ(got.first, P4_OK, "status");
+        compared++;
+        total += got.second.size();
+        if (want.second != got.second) {
+            differ++;
+            if (differ <= 3)
+                std::printf("  profile %d at %lld source %s: %zu vs %zu rows\n", profile, (long long)at, source ? source : "-",
+                            got.second.size(), want.second.size());
+        }
+    }
+    CHECK_EQ(differ, 0, "directory answers = scan answers (" + std::to_string(compared) + " queries)");
+    CHECK(total > 24 * 20, "the queries answer rows: " + std::to_string(total));
+    closeEngine();
+}

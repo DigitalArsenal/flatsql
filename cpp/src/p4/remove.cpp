@@ -639,7 +639,7 @@ int32_t rebuildFile(Engine* e, File* f) {
         nf->gen = gen;
         nf->path = np;
         nf->n = f->n; nf->bytes = f->bytes; nf->ncopy = f->ncopy; nf->minseq = f->minseq; nf->maxseq = f->maxseq;
-        nf->minw = f->minw; nf->maxw = f->maxw; nf->maxts = f->maxts; nf->nnull = f->nnull;
+        nf->minw = f->minw; nf->maxw = f->maxw; nf->maxts = f->maxts; nf->nnull = f->nnull; nf->nk = f->nk;
         nf->mints = f->mints; nf->mine = f->mine; nf->maxe = f->maxe;
         nf->lanes = f->lanes;
         nf->indexed = f->indexed;

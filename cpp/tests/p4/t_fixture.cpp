@@ -7,15 +7,15 @@
 //
 //   flatsql_p4_test --test=g2_fixture --fixture=<control.flatsqldb>
 //       --bfbs=<sdn-server/internal/sds/search-schemas> [--store=<dir>] [--keep=1]
-#if !defined(__wasm__)
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <atomic>
-#include <cstring>
-#include <filesystem>
-#include <map>
-#include <set>
 #include <chrono>
+#include <cstring>
+#include <map>
+#include <random>
+#include <set>
 #include <thread>
 
 #include "internal.h"
@@ -23,6 +23,9 @@
 
 using namespace p4t;
 namespace fp = flatsql::p4;
+
+#if !defined(__wasm__)
+#include <filesystem>
 
 namespace {
 
@@ -489,10 +492,10 @@ P4_SLOW_TEST(a18_probe) {
     EngineOpts o;
     o.createMode = 0;
     REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
-    if (argInt("rebuild1", 0)) {
-        // Partition secondary indexes a newer engine adds (CREATE INDEX IF NOT EXISTS).
+    if (argInt("rebuild", argInt("rebuild1", 0))) {
+        // REBUILD what (1: partition secondary indexes a newer engine adds; 2: the type index).
         TlvW r1;
-        r1.u32(63, 1);
+        r1.u32(63, uint32_t(argInt("rebuild", 1)));
         CHECK_EQ(call(P4_OPC_REBUILD, r1.b, CallOpts{0, 0, 0, 0, 0, 0, false, 3600000}).status, P4_OK, "REBUILD 1");
         closeEngine(600000);
         return;
@@ -557,3 +560,182 @@ P4_SLOW_TEST(a18_probe) {
     closeEngine();
 }
 #endif
+
+// G3 measurements.
+//   --mode=producers [--producers=8] [--calls=40]: OMM 4,096-record calls
+//       from N producers at once (one partition each): rec/s, call p50/p99.
+//   --mode=w06 --store=<fixture clone>: batch supersede of OMM keeping
+//       OMM-celestrak-gp-b053 (benchset W06: every OMM record goes).
+//   --mode=w10 --store=<fixture clone>: quota GC to 90% of the store's bytes
+//       (benchset W10: the oldest content months go first).
+P4_SLOW_TEST(g3_bench) {
+    const std::string mode = argStr("mode", "producers");
+    if (mode == "producers") {
+        const std::string root = scratchDir("g3") + "/fsql4";
+        EngineOpts o;
+        o.writers = uint32_t(argInt("writers", 8));
+        o.writeSlots = 64;
+        REQUIRE(openEngine(root, o) == P4_OK, "open");
+        REQUIRE(registerType(ommType()) == P4_OK, "register");
+        const int producers = int(argInt("producers", 8));
+        const int calls = int(argInt("calls", 40));
+        std::vector<std::vector<double>> lat(static_cast<size_t>(producers));
+        std::atomic<int> failures{0};
+        const uint64_t t0 = flatsql::ps::monoNs();
+        std::vector<std::thread> th;
+        for (int pi = 0; pi < producers; pi++)
+            th.emplace_back([&, pi] {
+                for (int c = 0; c < calls; c++) {
+                    Batch b;
+                    b.type = "OMM";
+                    b.peer = "12D3KooWProducer" + std::to_string(pi);
+                    b.tags.push_back(Tag{"prov", "src" + std::to_string(pi), "", "b" + std::to_string(c), "", "", ""});
+                    b.at = 1790000000 + c;
+                    for (int i = 0; i < 4096; i++) {
+                        In in;
+                        const uint32_t norad = uint32_t(10000 + (pi * 7919 + c * 4096 + i) % 60000);
+                        in.frame = ommFrame(norad, "2026-001A",
+                                            isoTime(unixOf(2026, 9, 1) + int64_t(c) * 3600 + int64_t(pi) * 60 + i % 60), 15.5,
+                                            300);
+                        in.ts = 1790000000 + c;
+                        b.recs.push_back(std::move(in));
+                    }
+                    const uint64_t s = flatsql::ps::monoNs();
+                    Result r = put(b);
+                    lat[size_t(pi)].push_back(double(flatsql::ps::monoNs() - s) / 1e6);
+                    if (r.status != P4_OK) failures++;
+                }
+            });
+        for (auto& t : th) t.join();
+        const double secs = double(flatsql::ps::monoNs() - t0) / 1e9;
+        std::vector<double> all;
+        for (auto& v : lat) all.insert(all.end(), v.begin(), v.end());
+        std::sort(all.begin(), all.end());
+        const double recs = double(producers) * calls * 4096;
+        report("g3.producers", double(producers), "producers");
+        report("g3.rate", recs / secs, "rec/s");
+        report("g3.call_p50", all[all.size() / 2], "ms");
+        report("g3.call_p99", all[size_t(double(all.size() - 1) * 0.99)], "ms");
+        CHECK_EQ(failures.load(), 0, "every call");
+        closeEngine(600000);
+        removeTree(root.substr(0, root.size() - 6));
+        return;
+    }
+    const std::string store = argStr("store", "");
+    if (store.empty()) {
+        std::printf("  skipped: --store\n");
+        return;
+    }
+    EngineOpts o;
+    o.createMode = 0;
+    REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
+    CallOpts slow{0, 0, 0, 0, 0, 0, false, 3600000};
+    if (mode == "w06") {
+        TlvW s;
+        s.text(1, "OMM").text(11, "space-data-network-02").text(12, "celestrak-gp").text(60, "OMM-celestrak-gp-b053").u8(61, 1);
+        const uint64_t t0 = flatsql::ps::monoNs();
+        Result r = call(P4_OPC_SUPERSEDE, s.b, slow);
+        const double secs = double(flatsql::ps::monoNs() - t0) / 1e9;
+        REQUIRE(r.status == P4_OK && r.rows.size() == 1, r.err);
+        report("w06.seconds", secs, "s");
+        report("w06.records_deleted", double(r.i(0, "records_deleted")), "records");
+        report("w06.tags_deleted", double(r.i(0, "tags_deleted")), "tags");
+        CHECK_EQ(r.i(0, "records_deleted"), int64_t(1696780), "benchset W06 expected_records_deleted");
+    } else if (mode == "w10") {
+        TlvW f4;
+        f4.u8(45, 4);
+        Result st = call(P4_OPC_SUMMARY, f4.b);
+        int64_t total = 0;
+        for (size_t i = 0; i < st.rows.size(); i++)
+            total += st.i(i, "db_bytes") + st.i(i, "wal_bytes") + st.i(i, "index_bytes") + st.i(i, "fts_bytes");
+        TlvW q;
+        q.u64(62, uint64_t(double(total) * 0.9));
+        const uint64_t t0 = flatsql::ps::monoNs();
+        Result r = call(P4_OPC_QUOTA_GC, q.b, slow);
+        const double secs = double(flatsql::ps::monoNs() - t0) / 1e9;
+        REQUIRE(r.status == P4_OK && r.rows.size() == 1, r.err);
+        report("w10.seconds", secs, "s");
+        report("w10.files_dropped", double(r.i(0, "files_dropped")), "files");
+        report("w10.records_dropped", double(r.i(0, "records_dropped")), "records");
+    }
+    TlvW v8;
+    v8.u32(63, 8);
+    Result v = call(P4_OPC_REBUILD, v8.b, slow);
+    for (size_t i = 0; i < v.rows.size(); i++) CHECK_EQ(v.i(i, "mismatches"), int64_t(0), "verify " + v.s(i, "type"));
+    closeEngine(600000);
+}
+
+// G6 measurements.
+//   --mode=nearest [--producers=101] [--months=30] [--per=100] [--objects=1000]
+//       [--store=<dir>] [--keep=1]: an OMM store of producers x months files
+//       (3,030 at the defaults), then EPOCH nearest (profile 2) over every
+//       object at 20 epochs: p50/p99 (gate: under format 2's p99).
+P4_SLOW_TEST(g6_bench) {
+    const std::string mode = argStr("mode", "nearest");
+    if (mode != "nearest") return;
+    const int producers = int(argInt("producers", 101)), months = int(argInt("months", 30)), per = int(argInt("per", 100));
+    const int objects = int(argInt("objects", 1000));
+    const std::string root = argStr("store", scratchDir("g6")) + "/fsql4";
+    struct stat st0;
+    const bool exists = ::stat((root + "/STORE").c_str(), &st0) == 0;
+    EngineOpts o;
+    o.writers = 8;
+    o.writeSlots = 64;
+    REQUIRE(openEngine(root, o) == P4_OK, "open");
+    REQUIRE(registerType(ommType()) == P4_OK, "register");
+    const int64_t t0 = unixOf(2024, 1, 1);
+    auto monthStart = [&](int m) { return unixOf(2024 + m / 12, 1 + m % 12, 1); };
+    if (!exists) {
+        std::atomic<int> next{0}, failures{0};
+        const uint64_t s0 = flatsql::ps::monoNs();
+        std::vector<std::thread> th;
+        for (int w = 0; w < 8; w++)
+            th.emplace_back([&] {
+                for (int job; (job = next.fetch_add(1)) < producers * months;) {
+                    const int pi = job / months, m = job % months;
+                    Batch b;
+                    b.type = "OMM";
+                    b.peer = "12D3KooWG6Producer" + std::to_string(pi);
+                    b.tags.push_back(Tag{"prov", "src", "", "m" + std::to_string(m), "", "", ""});
+                    b.at = 1790000000;
+                    for (int i = 0; i < per; i++) {
+                        In in;
+                        const uint32_t norad = uint32_t(1 + (pi * 10 + i) % objects);
+                        in.frame = ommFrame(norad, "2024-001A", isoTime(monthStart(m) + int64_t(i) * 20000 + pi * 7), 15.5);
+                        in.ts = 1790000000;
+                        b.recs.push_back(std::move(in));
+                    }
+                    if (put(b).status != P4_OK) failures++;
+                }
+            });
+        for (auto& t : th) t.join();
+        report("g6.build.seconds", double(flatsql::ps::monoNs() - s0) / 1e9, "s");
+        CHECK_EQ(failures.load(), 0, "build");
+    }
+    {
+        TlvW f4;
+        f4.u8(45, 4).text(1, "OMM");
+        Result st = call(P4_OPC_SUMMARY, f4.b);
+        if (st.rows.size() == 1) report("g6.files", double(st.i(0, "files")), "files");
+    }
+    std::mt19937 rng(11);
+    std::vector<double> ms;
+    size_t rows = 0;
+    for (int q = 0; q < int(argInt("queries", 20)); q++) {
+        const int64_t at = t0 + int64_t(rng() % uint32_t(monthStart(months) - t0));
+        TlvW ep;
+        ep.text(1, "OMM").u8(30, 2).i64(31, at).u64(3, 50000);
+        const uint64_t s = flatsql::ps::monoNs();
+        Result r = call(P4_OPC_EPOCH, ep.b, CallOpts{0, 0, 0, 0, 0, 0, false, 600000});
+        ms.push_back(double(flatsql::ps::monoNs() - s) / 1e6);
+        CHECK_EQ(r.status, P4_OK, r.err);
+        rows = r.rows.size();
+        if (q == 0) report("g6.nearest.examined", double(r.rowsExamined), "rows");
+    }
+    std::sort(ms.begin(), ms.end());
+    report("g6.nearest.rows", double(rows), "objects");
+    report("g6.nearest.p50", ms[ms.size() / 2], "ms");
+    report("g6.nearest.p99", ms.back(), "ms");
+    closeEngine(600000);
+    if (!argInt("keep", 0)) removeTree(root.substr(0, root.size() - 6));
+}
