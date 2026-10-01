@@ -1,16 +1,19 @@
 #!/bin/bash
 # Build the wasm artifacts.
 #
-#   bash scripts/build-wasm.sh            emscripten artifacts, then the partition store
-#   bash scripts/build-wasm.sh --ps       only the partition store (flatsql-ps-threads.wasm)
-#   bash scripts/build-wasm.sh --ps-tests the partition store plus its wasm test
-#                                         commands (cpp/build-ps-wasm/flatsql-ps-test*.wasm)
+#   bash scripts/build-wasm.sh            emscripten artifacts, then the wasi-threads ones
+#   bash scripts/build-wasm.sh --ps       only the wasi-threads artifacts: the partition
+#                                         store (flatsql-ps-threads.wasm) and store
+#                                         format 4 (flatsql-p4-threads.wasm)
+#   bash scripts/build-wasm.sh --ps-tests those plus their wasm test commands
+#                                         (cpp/build-ps-wasm/flatsql-ps-test*.wasm,
+#                                         flatsql-p4-test.wasm)
 #   bash scripts/build-wasm.sh --ps --linux
-#                                         the partition store as released: inside
-#                                         Docker with the Linux wasi-sdk 30 tarball
+#                                         the wasi-threads artifacts as released:
+#                                         inside Docker with the Linux wasi-sdk 30 tarball
 #
-# The partition store is built with wasi-sdk 30 for wasm32-wasip1-threads
-# (docs/PARTITION-STORE-WASM.md). WASI_SDK_PATH (default /opt/wasi-sdk, then
+# The wasi-threads artifacts are built with wasi-sdk 30 for wasm32-wasip1-threads
+# (docs/PARTITION-STORE-WASM.md, docs/STORE-FORMAT-4.md). WASI_SDK_PATH (default /opt/wasi-sdk, then
 # ~/.local/wasi-sdk/current) names the installation; the build refuses any
 # other wasi-sdk version. The released bytes are the Linux build (CI and
 # npm-publish.yml; arm64 and x86_64 agree). The macOS wasi-sdk tarball ships a
@@ -110,7 +113,7 @@ build_ps() {
         -DWASI_SDK_PREFIX="$sdk" -DCMAKE_BUILD_TYPE=Release
     # shellcheck disable=SC2086
     cmake --build "$CPP_DIR/build-ps-wasm" --target $targets -j "${FLATSQL_BUILD_JOBS:-8}"
-    cp "$CPP_DIR/build-ps-wasm/flatsql-ps-threads.wasm" "$PROJECT_ROOT/wasm/"
+    cp "$CPP_DIR/build-ps-wasm/flatsql-ps-threads.wasm" "$CPP_DIR/build-ps-wasm/flatsql-p4-threads.wasm" "$PROJECT_ROOT/wasm/"
 }
 
 sha256_of() {
@@ -141,7 +144,7 @@ build_ps_linux() {
     fi
     local fb="${FLATBUFFERS_DIR:-$PROJECT_ROOT/../flatbuffers}"
     [ -f "$fb/include/flatbuffers/flatbuffers.h" ] || { echo "Error: FlatBuffers not found at $fb"; exit 1; }
-    echo "Building flatsql-ps-threads.wasm in Docker (Linux wasi-sdk $WASI_SDK_VERSION, $arch)..."
+    echo "Building flatsql-ps-threads.wasm and flatsql-p4-threads.wasm in Docker (Linux wasi-sdk $WASI_SDK_VERSION, $arch)..."
     docker run --rm \
         -v "$CPP_DIR":/w/flatsql/cpp:ro \
         -v "$(cd "$fb" && pwd)":/w/flatbuffers:ro \
@@ -153,8 +156,8 @@ build_ps_linux() {
             cmake -S /w/flatsql/cpp -B /tmp/b -G Ninja \
                 -DCMAKE_TOOLCHAIN_FILE=/w/flatsql/cpp/cmake/wasi-threads-toolchain.cmake \
                 -DWASI_SDK_PREFIX=/opt/wasi-sdk -DFLATBUFFERS_DIR=/w/flatbuffers -DCMAKE_BUILD_TYPE=Release >/dev/null
-            cmake --build /tmp/b --target flatsql_ps_threads -j ${FLATSQL_BUILD_JOBS:-8}
-            cp /tmp/b/flatsql-ps-threads.wasm /w/out/"
+            cmake --build /tmp/b --target flatsql_ps_threads flatsql_p4_threads -j ${FLATSQL_BUILD_JOBS:-8}
+            cp /tmp/b/flatsql-ps-threads.wasm /tmp/b/flatsql-p4-threads.wasm /w/out/"
 }
 
 if [ "$MODE" = "all" ]; then
@@ -164,9 +167,9 @@ if [ "$LINUX" = "1" ]; then
     [ "$MODE" = "ps" ] || { echo "Error: --linux builds only the artifact (--ps)"; exit 2; }
     build_ps_linux
 elif [ "$MODE" = "ps-tests" ]; then
-    build_ps "flatsql_ps_threads flatsql_ps_test_wasm flatsql_ps_test_memio"
+    build_ps "flatsql_ps_threads flatsql_ps_test_wasm flatsql_ps_test_memio flatsql_p4_threads flatsql_p4_test_wasm"
 else
-    build_ps "flatsql_ps_threads"
+    build_ps "flatsql_ps_threads flatsql_p4_threads"
 fi
 
 cd "$PROJECT_ROOT"

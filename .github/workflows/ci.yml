@@ -159,3 +159,64 @@ jobs:
       run: >
         node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand
         --runTestsByPath test/ps-parity-vectors.test.ts -t 'C runner'
+
+  # Store format 4 (docs/STORE-FORMAT-4.md): the native engine suite with the
+  # kill -9 loop, the SQL surface's own suite (format 1 as the oracle) when it
+  # is in the tree, and flatsql-p4-threads.wasm: its import surface, the
+  # suite and the kill loop under the Node wasi-threads host.
+  p4:
+    runs-on: ubuntu-latest
+    env:
+      WASI_SDK_PATH: /opt/wasi-sdk
+      FLATSQL_BUILD_JOBS: '4'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
+    - name: Install wasi-sdk 30, ninja
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build cmake
+        curl -fsSL -o /tmp/wasi-sdk.tar.gz \
+          https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
+        echo "0507679dff16814b74516cd969a9b16d2ced1347388024bc7966264648c78bfb  /tmp/wasi-sdk.tar.gz" | sha256sum -c -
+        sudo mkdir -p /opt/wasi-sdk
+        sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
+
+    - name: Clone FlatBuffers (DigitalArsenal pin)
+      run: |
+        git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
+        git -C ../flatbuffers checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
+
+    - name: Native engine suite and 300 kill -9 rounds
+      working-directory: cpp
+      run: |
+        cmake -B build-p4 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFLATBUFFERS_DIR=$GITHUB_WORKSPACE/../flatbuffers
+        cmake --build build-p4 --target flatsql_p4_test -j 4
+        ./build-p4/flatsql_p4_test
+        ./build-p4/flatsql_p4_test --test=t_kill --rounds=300 --seed=$GITHUB_RUN_NUMBER
+
+    - name: The SQL surface's suite (format 1 as the oracle)
+      if: hashFiles('cpp/tests/p4sql/CMakeLists.txt') != ''
+      run: |
+        cmake -S cpp/tests/p4sql -B build-p4sql -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DFLATBUFFERS_DIR=$GITHUB_WORKSPACE/../flatbuffers
+        cmake --build build-p4sql --target flatsql_p4sql_fake_test -j 4
+        ./build-p4sql/flatsql_p4sql_fake_test
+
+    - name: Build the wasi-threads artifacts and test commands
+      run: bash scripts/build-wasm.sh --ps-tests
+
+    - name: The committed artifact is this source's build
+      run: |
+        if ! git diff --quiet -- wasm/flatsql-p4-threads.wasm; then
+          echo "::warning::wasm/flatsql-p4-threads.wasm differs from this commit's build; a release commit must carry the rebuilt artifact (npm-publish.yml refuses otherwise)"
+        fi
+        sha256sum wasm/flatsql-p4-threads.wasm
+
+    - name: The engine suite and 100 kill rounds under the Node host
+      run: node scripts/p4-wasm-suite.mjs --kill-rounds 100

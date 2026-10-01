@@ -65,9 +65,10 @@ jobs:
           cp cpp/build-wasm/flatsql-wasi.wasm wasm/ || true
           cp cpp/build-wasm/flatsql-spatial.wasm sdm/ || true
 
-      # The partition store artifact (A34): wasi-sdk 30, the same pinned
-      # flatbuffers. The published bytes must be the committed bytes, so a
-      # release commit carries the artifact its sources build.
+      # The wasi-threads artifacts (the partition store, A34, and store format
+      # 4): wasi-sdk 30, the same pinned flatbuffers. The published bytes must
+      # be the committed bytes, so a release commit carries the artifacts its
+      # sources build.
       - name: Install wasi-sdk 30
         run: |
           curl -fsSL -o /tmp/wasi-sdk.tar.gz \
@@ -77,17 +78,17 @@ jobs:
           sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
           cat /opt/wasi-sdk/VERSION
 
-      - name: Build flatsql-ps-threads.wasm, check imports, write integrity.json
+      - name: Build flatsql-ps-threads.wasm and flatsql-p4-threads.wasm, check imports, write integrity.json
         env:
           WASI_SDK_PATH: /opt/wasi-sdk
           FLATSQL_BUILD_JOBS: '4'
         run: bash scripts/build-wasm.sh --ps
 
-      - name: The published artifact is the committed artifact
+      - name: The published artifacts are the committed artifacts
         run: |
-          sha256sum wasm/flatsql-ps-threads.wasm
-          git diff --exit-code --stat -- wasm/flatsql-ps-threads.wasm
-          node -e "const j=require('./wasm/integrity.json');console.log(JSON.stringify(j.files['flatsql-ps-threads.wasm']))"
+          sha256sum wasm/flatsql-ps-threads.wasm wasm/flatsql-p4-threads.wasm
+          git diff --exit-code --stat -- wasm/flatsql-ps-threads.wasm wasm/flatsql-p4-threads.wasm
+          node -e "const j=require('./wasm/integrity.json');for(const f of ['flatsql-ps-threads.wasm','flatsql-p4-threads.wasm'])console.log(f,JSON.stringify(j.files[f]))"
 
       - name: Verify build output
         run: |
