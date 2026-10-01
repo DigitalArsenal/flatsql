@@ -493,14 +493,25 @@ int32_t Scan::open() {
     return collectCandidates();
 }
 
-// Candidates instead of a walk: an exact CID (tag 8) reads each partition's
-// r_c; an equality, IN or range predicate on the object rule's first column
-// (the object key k, when that column is present) reads r_ke(k, e). The
-// candidates are rechecked by rowMatches. A COL0 equality inside OMM's
-// 400,000 bound reads its object's rows, not the window (R17/R19); an exact-CID
-// HEAD is one probe per partition, not a type scan.
+// Candidates instead of a walk: an exact CID (tag 8) is one type-index probe
+// (its holders' seqs); an equality, IN or range predicate on the object rule's
+// first column (the object key k, when that column is present) reads r_ke(k,
+// e). The candidates are rechecked by rowMatches. A COL0 equality inside OMM's
+// 400,000 bound reads its object's rows, not the window (R17/R19); an
+// exact-CID HEAD is one probe, not a type scan.
 int32_t Scan::collectCandidates() {
     if (s_.order == P4_ORDER_CID || files_.empty()) return P4_OK;
+    if (s_.hasCid) {
+        std::vector<Holder> hs;
+        const int32_t rc = holdersOf(L_, t_, s_.cidKey, &hs);
+        if (rc != P4_OK) return rc;
+        cand_.assign(files_.size(), {});
+        for (const Holder& h : hs)
+            for (size_t fi = 0; fi < files_.size(); fi++)
+                if (files_[fi].pid == h.pid && h.seq > lo_ && h.seq <= hi_) cand_[fi].push_back(h.seq);
+        kDriven_ = true;
+        return P4_OK;
+    }
     auto bindCell = [](sqlite3_stmt* q, int i, const ps::rb1::Cell& c) {
         if (c.type == ps::rb1::kInt) sqlite3_bind_int64(q, i, c.i);
         else if (c.type == ps::rb1::kReal) sqlite3_bind_double(q, i, c.d);
@@ -508,7 +519,7 @@ int32_t Scan::collectCandidates() {
     };
     const Spec2::Pred* kp = nullptr;
     const int oc = sp_->hasObject ? sp_->tc.firstObjectCol() : -1;
-    if (!s_.hasCid && oc >= 0 && oc <= 3)
+    if (oc >= 0 && oc <= 3)
         for (const auto& p : s_.preds)
             if (p.field == P4_F_COL0 + oc && !p.vals.empty() &&
                 (p.op == P4_OP_EQ || p.op == P4_OP_IN || p.op == P4_OP_BETWEEN || p.op == P4_OP_GE || p.op == P4_OP_GT ||
@@ -516,24 +527,19 @@ int32_t Scan::collectCandidates() {
                 kp = &p;
                 break;
             }
-    if (!s_.hasCid && !kp) return P4_OK;
+    if (!kp) return P4_OK;
     if (kp)
         for (const auto& v : kp->vals)
             if (v.type != ps::rb1::kInt && v.type != ps::rb1::kText && v.type != ps::rb1::kReal) return P4_OK;
     const bool eq = kp && (kp->op == P4_OP_EQ || kp->op == P4_OP_IN);
     const bool hasLo = kp && (kp->op == P4_OP_BETWEEN || kp->op == P4_OP_GE || kp->op == P4_OP_GT);
     const bool hasHi = kp && (kp->op == P4_OP_BETWEEN || kp->op == P4_OP_LE || kp->op == P4_OP_LT);
-    std::string sql;
-    if (s_.hasCid) {
-        sql = "SELECT seq FROM r INDEXED BY r_c WHERE cid=?1 AND seq>?3 AND seq<=?4";
-    } else {
-        sql = "SELECT seq FROM r INDEXED BY r_ke WHERE seq>?3 AND seq<=?4";
-        if (eq) sql += " AND k=?1";
-        else {
-            if (hasLo) sql += std::string(" AND k") + (kp->op == P4_OP_GT ? ">" : ">=") + "?1";
-            if (hasHi) sql += std::string(" AND k") + (kp->op == P4_OP_LT ? "<" : "<=") + "?2";
-            if (!hasLo) sql += " AND k IS NOT NULL";
-        }
+    std::string sql = "SELECT seq FROM r INDEXED BY r_ke WHERE seq>?3 AND seq<=?4";
+    if (eq) sql += " AND k=?1";
+    else {
+        if (hasLo) sql += std::string(" AND k") + (kp->op == P4_OP_GT ? ">" : ">=") + "?1";
+        if (hasHi) sql += std::string(" AND k") + (kp->op == P4_OP_LT ? "<" : "<=") + "?2";
+        if (!hasLo) sql += " AND k IS NOT NULL";
     }
     const size_t kMaxCand = 200000;
     size_t total = 0;
@@ -563,9 +569,6 @@ int32_t Scan::collectCandidates() {
         c->exec("BEGIN");
         if (!q) {
             status = P4_E_INTERNAL;
-        } else if (s_.hasCid) {
-            sqlite3_bind_blob(q, 1, s_.cidKey, 32, SQLITE_STATIC);
-            collect();
         } else if (eq) {
             for (size_t i = 0; status == P4_OK && i < kp->vals.size(); i++) {
                 bindCell(q, 1, kp->vals[i]);
@@ -889,8 +892,9 @@ int32_t Scan::fetchSeq(int fi) {
     c->exec("BEGIN");
     const int page = 256;
     std::vector<int64_t> seqs;
-    // Tag-driven when a source filter is selective here.
-    const bool byTag = s_.lane && sids_.size() == 1 && fr.laneN * 2 < fr.n;
+    // Tag-driven when a source filter is selective here, and always for a
+    // source's newest N (C-31: one walk of the source's index).
+    const bool byTag = s_.lane && sids_.size() == 1 && (fr.laneN * 2 < fr.n || (s_.bound && s_.lfSet[1]));
     sqlite3_stmt* q;
     if (byTag) {
         q = c->sql(desc ? "SELECT seq FROM rl WHERE sid=?1 AND seq<?2 AND seq>?3 ORDER BY seq DESC LIMIT ?4"
@@ -1496,21 +1500,26 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
 int32_t Scan::fetchCidKeys(int fi) {
     FileCur& fc = cur_[size_t(fi)];
     if (fc.done) return P4_OK;
+    if (s_.hasCid) {
+        // An exact CID: its holders (one type-index probe), this file's copy.
+        fc.done = true;
+        std::vector<Holder> hs;
+        const int32_t rc = holdersOf(L_, t_, s_.cidKey, &hs);
+        if (rc != P4_OK) return rc;
+        std::array<uint8_t, 32> k;
+        std::memcpy(k.data(), s_.cidKey, 32);
+        for (const Holder& h : hs)
+            if (h.pid == files_[size_t(fi)].pid) fc.keys.push_back({k, h.seq});
+        return P4_OK;
+    }
     int rc = 0;
     Conn* c = e_->rpool.acquire(files_[size_t(fi)].path, OpenKind::Reader, &rc, nullptr);
     if (!c) return statusOfSqlite(rc);
-    sqlite3_stmt* q;
-    if (s_.hasCid) {
-        q = c->sql("SELECT cid, seq FROM r INDEXED BY r_c WHERE cid=?1");
-        if (!q) q = c->sql("SELECT cid, seq FROM r WHERE cid=?1");  // before REBUILD 1
-        if (q) sqlite3_bind_blob(q, 1, s_.cidKey, 32, SQLITE_STATIC);
-    } else {
-        q = c->sql("SELECT cid, seq FROM r INDEXED BY r_c WHERE cid>?1 ORDER BY cid LIMIT 1024");
-        if (!q) q = c->sql("SELECT cid, seq FROM r WHERE cid>?1 ORDER BY cid LIMIT 1024");  // before REBUILD 1
-        if (q) {
-            if (fc.started) sqlite3_bind_blob(q, 1, fc.lastKey.data(), 32, SQLITE_STATIC);
-            else sqlite3_bind_blob(q, 1, "", 0, SQLITE_STATIC);
-        }
+    sqlite3_stmt* q = c->sql("SELECT cid, seq FROM r INDEXED BY r_c WHERE cid>?1 ORDER BY cid LIMIT 1024");
+    if (!q) q = c->sql("SELECT cid, seq FROM r WHERE cid>?1 ORDER BY cid LIMIT 1024");  // before REBUILD 1
+    if (q) {
+        if (fc.started) sqlite3_bind_blob(q, 1, fc.lastKey.data(), 32, SQLITE_STATIC);
+        else sqlite3_bind_blob(q, 1, "", 0, SQLITE_STATIC);
     }
     int r = SQLITE_ERROR;
     size_t got = 0;
@@ -1528,7 +1537,7 @@ int32_t Scan::fetchCidKeys(int fi) {
     e_->rpool.release(c);
     if (r != SQLITE_DONE) return statusOfSqlite(r);
     fc.started = true;
-    if (s_.hasCid || got < 1024) fc.done = true;
+    if (got < 1024) fc.done = true;
     return P4_OK;
 }
 

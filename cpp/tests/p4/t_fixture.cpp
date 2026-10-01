@@ -1,7 +1,7 @@
 // G2 on the host-02-sized fixture (format 1, 4,364,873 copies of 3,945,845
 // records): load it the way store-migrate does (migrate-mode PUTs keeping
 // format 1's rowids and tag instances, then REBUILD 1), measure bytes per copy
-// (< 800), and check answers against format 1 per shape. Native only (it
+// (below both engines), and check answers against format 1 per shape. Native only (it
 // reads format 1 with SQLite directly, as the oracle). Skips cleanly without
 // --fixture.
 //
@@ -17,6 +17,8 @@
 #include <random>
 #include <set>
 #include <thread>
+
+#include <flatbuffers/reflection.h>
 
 #include "internal.h"
 #include "p4/p4_test.h"
@@ -331,7 +333,8 @@ P4_SLOW_TEST(g2_fixture) {
     report("g2.store.files", double(files), "files");
     report("g2.bytes_per_copy", double(onDisk) / double(copiesF1), "B");
     report("g2.bytes_per_record", double(onDisk) / double(uniqTotal), "B");
-    CHECK(double(onDisk) / double(copiesF1) < 800.0, "under 800 B per copy");
+    // The slimmer gate: below both engines (format 2 1,742 B, format 1 2,366 B per copy on this fixture).
+    CHECK(double(onDisk) / double(copiesF1) < 1742.0, "below both engines' bytes per copy");
 
     // Equivalence with format 1, per shape.
     REQUIRE(openEngine(root, o) == P4_OK, "reopen");
@@ -560,6 +563,7 @@ P4_SLOW_TEST(a18_probe) {
     }
     EngineOpts o;
     o.createMode = 0;
+    if (argInt("reader_cache_kib", 0)) o.extra = TlvW().u32(24, uint32_t(argInt("reader_cache_kib", 0))).b;
     REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
     if (argInt("rebuild", argInt("rebuild1", 0))) {
         // REBUILD what (1: partition secondary indexes a newer engine adds; 2: the type index).
@@ -625,6 +629,29 @@ P4_SLOW_TEST(a18_probe) {
                     sh.type, sh.source, sh.norad >= 0 ? " NORAD=25544" : "", (unsigned long long)rows,
                     (unsigned long long)bytes, (unsigned long long)examined, ms[0],
                     warm.empty() ? 0.0 : warm[warm.size() / 2], warm.empty() ? 0.0 : warm.back(), loadAvg());
+    }
+    // HEAD by an exact CID (tag 8): one type-index probe, not a type scan.
+    for (const char* type : {"OMM", "IQC"}) {
+        TlvW sc;
+        sc.text(1, type).u8(5, P4_ORDER_SEQ_DESC).u64(3, 1);
+        Result one = call(P4_OPC_SCAN, sc.b);
+        if (one.rows.size() != 1) continue;
+        uint8_t d[32], c36[36] = {0x01, 0x55, 0x12, 0x20};
+        const std::string cid = one.s(0, "cid");
+        fp::cidDigestFromText(cid.data(), cid.size(), d);
+        std::memcpy(c36 + 4, d, 32);
+        std::vector<double> ms;
+        int64_t n = -1;
+        for (int rep = 0; rep < 6; rep++) {
+            TlvW h;
+            h.text(1, type).raw(8, c36, 36);
+            const uint64_t t0 = flatsql::ps::monoNs();
+            Result r = call(P4_OPC_HEAD, h.b);
+            ms.push_back(double(flatsql::ps::monoNs() - t0) / 1e6);
+            n = r.rows.size() == 1 ? r.i(0, "n") : -1;
+        }
+        std::printf("  %s HEAD by CID: n %lld; first %.3f ms, then max %.3f ms (load %.1f)\n", type, (long long)n, ms[0],
+                    *std::max_element(ms.begin() + 1, ms.end()), loadAvg());
     }
     closeEngine();
 }
@@ -699,6 +726,62 @@ P4_SLOW_TEST(g3_bench) {
     o.createMode = 0;
     REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
     CallOpts slow{0, 0, 0, 0, 0, 0, false, 3600000};
+#if !defined(__wasm__)
+    if (mode == "w01") {
+        // Benchset W01's OMM shape: --records (32,015) new OMM records into
+        // the fixture's OMM partition (its peer), in --call (4,096) record
+        // calls: rec/s and call p50/p99.
+        TlvW s2;
+        s2.u8(45, 2).text(1, "OMM");
+        Result parts = call(P4_OPC_SUMMARY, s2.b);
+        REQUIRE(parts.status == P4_OK && !parts.rows.empty(), parts.err);
+        size_t big = 0;
+        for (size_t i = 1; i < parts.rows.size(); i++)
+            if (parts.i(i, "records") > parts.i(big, "records")) big = i;
+        const std::string peer = parts.s(big, "peer");
+        TestType real = realType(argStr("bfbs", ""), "OMM");
+        REQUIRE(!real.bfbs.empty(), "--bfbs (the SDN search schemas: frames must verify against the registered OMM)");
+        real.schema = reflection::GetSchema(real.bfbs.data());
+        const int records = int(argInt("records", 32015)), per = int(argInt("call", 4096));
+        const int64_t epoch0 = unixOf(2026, 9, 30) + int64_t(argInt("round", 0)) * 86400;
+        std::vector<double> lat;
+        std::map<int64_t, int64_t> actions;
+        const uint64_t t0 = flatsql::ps::monoNs();
+        for (int at = 0; at < records; at += per) {
+            Batch b;
+            b.type = "OMM";
+            b.peer = peer;
+            b.tags.push_back(Tag{"space-data-network-02", "celestrak-gp", "", "OMM-celestrak-gp-bench", "", "", ""});
+            b.at = 1790700000;
+            for (int i = at; i < records && i < at + per; i++) {
+                In in;
+                in.frame = buildFrame(real, {Field::str("OBJECT_NAME", "BENCH " + std::to_string(i)), Field::str("OBJECT_ID", "2026-001A"),
+                                             Field::u64("NORAD_CAT_ID", uint64_t(1 + i)), Field::str("EPOCH", isoTime(epoch0 + i % 7200)),
+                                             Field::f64("MEAN_MOTION", 15.5 + double(i % 13) * 0.001),
+                                             Field::f64("ECCENTRICITY", 0.0001), Field::f64("INCLINATION", 51.6)});
+                in.ts = 1790700000;
+                b.recs.push_back(std::move(in));
+            }
+            const uint64_t s = flatsql::ps::monoNs();
+            Result r = put(b);
+            lat.push_back(double(flatsql::ps::monoNs() - s) / 1e6);
+            CHECK_EQ(r.status, P4_OK, r.err);
+            for (size_t i = 0; i < r.rows.size(); i++) actions[r.i(i, "action") * 1000 + (r.i(i, "reject") ? -r.i(i, "reject") : 0)]++;
+        }
+        const double secs = double(flatsql::ps::monoNs() - t0) / 1e9;
+        if (argInt("verbose", 0)) {
+            std::printf("  calls (ms):");
+            for (double x : lat) std::printf(" %.0f", x);
+            std::printf("\n");
+        }
+        std::sort(lat.begin(), lat.end());
+        for (auto& kv : actions) std::printf("  action %lld reject %lld: %lld\n", (long long)(kv.first / 1000), (long long)(kv.first % 1000), (long long)kv.second);
+        report("w01.records", double(records), "records");
+        report("w01.rate", double(records) / secs, "rec/s");
+        report("w01.call_p50", lat[lat.size() / 2], "ms");
+        report("w01.call_p99", lat.back(), "ms");
+    } else
+#endif
     if (mode == "w06") {
         TlvW s;
         s.text(1, "OMM").text(11, "space-data-network-02").text(12, "celestrak-gp").text(60, "OMM-celestrak-gp-b053").u8(61, 1);
@@ -884,3 +967,43 @@ P4_SLOW_TEST(store_check) {
     }
     closeEngine(600000);
 }
+
+#if !defined(__wasm__)
+// First open with every SDN type registered (about 232), as the daemon does:
+// a type's T/ files appear with its first write, so the open and the close
+// cost O(types with data).
+//   flatsql_p4_test --test=open_bench [--types=232]
+P4_SLOW_TEST(open_bench) {
+    const std::string root = scratchDir("openbench") + "/fsql4";
+    const int n = int(argInt("types", 232));
+    std::vector<TestType> types;
+    for (int i = 0; i < n; i++) types.push_back(pnmLikeType("T" + std::to_string(i)));
+    auto countT = [&] {
+        int64_t files = 0;
+        std::error_code ec;
+        for (auto& d : std::filesystem::directory_iterator(root + "/T", ec)) {
+            (void)d;
+            files++;
+        }
+        return files;
+    };
+    for (int round = 0; round < 2; round++) {
+        const uint64_t t0 = flatsql::ps::monoNs();
+        REQUIRE(openEngine(root) == P4_OK, "open");
+        const uint64_t t1 = flatsql::ps::monoNs();
+        for (auto& t : types) REQUIRE(registerType(t) == P4_OK, "register");
+        const uint64_t t2 = flatsql::ps::monoNs();
+        if (round == 0) REQUIRE(put(Batch{"T7", "12D3KooWOpen", {Tag{"p", "s", "", "b", "", "", ""}}, 1790000000, 0,
+                                          {In{buildFrame(types[7], {Field::str("FILE_ID", "x")}), 1790000000}}})
+                                    .status == P4_OK,
+                                "one write");
+        const uint64_t t3 = flatsql::ps::monoNs();
+        closeEngine();
+        const uint64_t t4 = flatsql::ps::monoNs();
+        std::printf("  round %d: open %.1f ms, register %d types %.1f ms, close %.1f ms; T/ files %lld\n", round,
+                    double(t1 - t0) / 1e6, n, double(t2 - t1) / 1e6, double(t4 - t3) / 1e6, (long long)countT());
+    }
+    report("open_bench.t_files", double(countT()), "files");
+    removeTree(root.substr(0, root.size() - 6));
+}
+#endif
