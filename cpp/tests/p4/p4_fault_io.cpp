@@ -5,10 +5,13 @@
 // crash applies one of five modes to the unsynced writes (all vanish, a
 // random subset survives in order, the last write is torn, a random subset
 // survives reordered, or everything survives: kill -9). The engine runs a
-// workload until the device freezes at a random mutating call, is stopped
-// (its I/O failing, as a dying machine's), the crash is applied, and the
-// store is reopened and checked through the engine:
-//   - every record whose PUT was acknowledged is there (C-4: the ack follows
+// workload (three producers over three feeds: prov@src, prov@src2 and the
+// local file; a fifth of the calls repeat earlier records, so records sit in
+// more than one feed file) until the device freezes at a random mutating
+// call, is stopped (its I/O failing, as a dying machine's), the crash is
+// applied, and the store is reopened and checked through the engine:
+//   - every record whose PUT was acknowledged is there, and every
+//     acknowledged tag instance still lists its source (C-4: the ack follows
 //     the commit, so a power loss cannot take it);
 //   - REBUILD 8 finds no mismatch (the type index against the files, and
 //     PRAGMA integrity_check on every file, C-27);
@@ -85,7 +88,11 @@ struct Check {
 };
 
 // The store after a crash, through the engine only (the files are in memory).
-Check checkStore(const std::string& root, const std::vector<std::string>& acked) {
+// acked: CID keys; inst: (CID key, source) of acknowledged tagged writes,
+// each of which must still list that source's tag (C-37: the record's row
+// in that feed's file).
+Check checkStore(const std::string& root, const std::vector<std::string>& acked,
+                 const std::vector<std::pair<std::string, std::string>>& inst) {
     Check ck;
     EngineOpts o;
     o.flushEntries = 2000;
@@ -106,6 +113,27 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked)
         found += g.rows.size();
     }
     if (found != want.size()) ck.fail("acknowledged records lost: " + std::to_string(want.size() - found));
+    // every acknowledged tag instance is there, in its feed
+    size_t instLost = 0;
+    for (size_t i = 0; i < inst.size(); i += 256) {
+        const size_t end = std::min(inst.size(), i + 256);
+        TlvW tw;
+        tw.text(1, "PNM");
+        std::vector<uint8_t> cl(4);
+        fp::st32(cl.data(), uint32_t(end - i));
+        for (size_t k = i; k < end; k++) cl.insert(cl.end(), inst[k].first.begin(), inst[k].first.end());
+        tw.raw(40, cl.data(), cl.size());
+        Result tg = call(P4_OPC_TAGS, tw.b);
+        if (tg.status != P4_OK) {
+            ck.fail("TAGS failed: " + tg.err);
+            break;
+        }
+        std::set<std::string> have;
+        for (size_t r = 0; r < tg.rows.size(); r++) have.insert(tg.s(r, "cid") + "|" + tg.s(r, "source"));
+        for (size_t k = i; k < end; k++)
+            if (!have.count(cidText(reinterpret_cast<const uint8_t*>(inst[k].first.data())) + "|" + inst[k].second)) instLost++;
+    }
+    if (instLost) ck.fail("acknowledged tag instances lost: " + std::to_string(instLost));
     // count = distinct CIDs of a full scan
     std::set<std::string> distinct;
     int64_t after = 0;
@@ -149,6 +177,7 @@ P4_SLOW_TEST(t_power_loss) {
     std::string root;
     std::mt19937_64 rng(uint64_t(argInt("seed", 1)));
     std::set<std::string> acked;
+    std::set<std::pair<std::string, std::string>> ackedInst;
     uint64_t id = 1;
     int pass = 0, fail = 0;
     const char* modes[] = {"drop-all", "drop-subset", "tear-last", "reorder", "keep-all"};
@@ -156,6 +185,7 @@ P4_SLOW_TEST(t_power_loss) {
         if ((round - 1) % 50 == 0) {
             root = "/p4fault/s" + std::to_string((round - 1) / 50) + "/fsql4";
             acked.clear();
+            ackedInst.clear();
         }
         EngineOpts o;
         o.writers = 3;
@@ -170,6 +200,7 @@ P4_SLOW_TEST(t_power_loss) {
         std::atomic<bool> stop{false};
         std::mutex mu;
         std::set<std::string> newAcks;
+        std::set<std::pair<std::string, std::string>> newInst;
         std::vector<std::thread> producers;
         for (int pi = 0; pi < 3; pi++)
             producers.emplace_back([&, pi] {
@@ -178,7 +209,10 @@ P4_SLOW_TEST(t_power_loss) {
                     Batch b;
                     b.type = "PNM";
                     b.peer = "12D3KooWFault" + std::to_string(pi);
-                    b.tags.push_back(Tag{"prov", "src", "", "b" + std::to_string(c % 5), "", "", ""});
+                    // three feeds (C-37): prov@src, prov@src2 and the local file
+                    const int feed = (c + pi) % 3;
+                    const std::string src = feed == 0 ? "src" : "src2";
+                    if (feed < 2) b.tags.push_back(Tag{"prov", src, "", "b" + std::to_string(c % 5), "", "", ""});
                     b.at = 1790000000;
                     uint64_t base;
                     {
@@ -197,7 +231,10 @@ P4_SLOW_TEST(t_power_loss) {
                     Result res = put(b);
                     if (res.status != P4_OK) continue;
                     std::lock_guard<std::mutex> g(mu);
-                    for (auto& in : b.recs) newAcks.insert(cidKeyOf(in.frame));
+                    for (auto& in : b.recs) {
+                        newAcks.insert(cidKeyOf(in.frame));
+                        if (feed < 2) newInst.emplace(cidKeyOf(in.frame), src);
+                    }
                 }
             });
         for (int i = 0; i < 3000 && !fs.frozen(); i++) flatsql::ps::sleepNs(1000000);
@@ -214,9 +251,17 @@ P4_SLOW_TEST(t_power_loss) {
             want.insert(want.end(), older.begin(), older.end());
         }
         acked.insert(newAcks.begin(), newAcks.end());
+        std::vector<std::pair<std::string, std::string>> wantInst(newInst.begin(), newInst.end());
+        {
+            std::vector<std::pair<std::string, std::string>> older(ackedInst.begin(), ackedInst.end());
+            std::shuffle(older.begin(), older.end(), rng);
+            if (older.size() > 5000) older.resize(5000);
+            wantInst.insert(wantInst.end(), older.begin(), older.end());
+        }
+        ackedInst.insert(newInst.begin(), newInst.end());
         const int mode = int(round % FaultFs::kModeCount);
         fs.crash(FaultFs::CrashMode(mode), rng());
-        Check ck = checkStore(root, want);
+        Check ck = checkStore(root, want, wantInst);
         if (ck.ok) pass++;
         else {
             fail++;
@@ -227,8 +272,8 @@ P4_SLOW_TEST(t_power_loss) {
             if (argInt("stop-on-fail", 0)) break;
         }
         if (round % 25 == 0)
-            std::printf("  t_power_loss: %d rounds, %d pass, %d fail, %zu acknowledged records (load %.1f)\n", round, pass, fail,
-                        acked.size(), loadAvg());
+            std::printf("  t_power_loss: %d rounds, %d pass, %d fail, %zu acknowledged records, %zu tag instances (load %.1f)\n", round,
+                        pass, fail, acked.size(), ackedInst.size(), loadAvg());
     }
     std::printf("  t_power_loss: %d pass, %d fail of %d rounds\n", pass, fail, pass + fail);
     CHECK_EQ(fail, 0, "every round");

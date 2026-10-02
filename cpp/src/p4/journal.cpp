@@ -1,17 +1,22 @@
-// Store format 4: the per-type intent journal (design §3.2, B3).
+// Store format 4: the per-type intent journal (design §3.2, B3; CONTRACT C-37).
 //
-// T/<TYPE>.jnl is a SQLite file with synchronous=FULL. Before a partition
-// file commits, one journal transaction appends the group's intents: the
-// partition, new sources and lanes, the file it writes, one row per new CID
-// entry and ingest identity, and delete intents. Seq blocks are
-// reserved in jm before any seq of the block can commit. The type index is
-// derived and flushed lazily; open replays the journal tail into it, keeping
-// each CID entry only if its row exists in its file (read by rowid, CID
-// compared), and reloads every touched file's counters from its meta and lane
-// rows, which commit with the rows (O(touched files), not O(rows)).
+// T/<TYPE>.jnl is a SQLite file with synchronous=FULL. Before a write's
+// first feed file commits, one journal transaction names what it touches:
+// J_TOUCH (feed file, seq, CID) for every record row set it changes, the
+// feed and token ids it registers (J_FEED, J_TOK), the ingest identities it
+// adds (J_IDENT), and the seq reservation (jm). The feed files then commit,
+// then the type index (record.cpp); the next write's journal transaction
+// cuts the rows the index has applied.
 //
-// Journal ids are AUTOINCREMENT, so they never restart when the table empties
-// (a restart once let a flush delete rows it had not merged).
+// Open replays the tail: the ids are registered; every touched feed file's
+// counters are reloaded from its meta (they commit with its rows); every
+// touched record is read from its feed files and brought in line (every
+// copy with every instance; local rows only without one: a write cut
+// between two feed files leaves rows that only add, completed here); its
+// type-index entries and the type's counters are set from its rows. Replay
+// costs O(the tail), not O(rows).
+//
+// Journal ids are AUTOINCREMENT, so they never restart when the table empties.
 #include <algorithm>
 
 #include "internal.h"
@@ -21,8 +26,8 @@ namespace p4 {
 
 namespace {
 const char* kJournalSchema =
-    "CREATE TABLE IF NOT EXISTS j(id INTEGER PRIMARY KEY AUTOINCREMENT, op INTEGER NOT NULL,"
-    " k BLOB, c BLOB, pid INTEGER, seq INTEGER, s TEXT, v INTEGER);"
+    "CREATE TABLE IF NOT EXISTS j(id INTEGER PRIMARY KEY AUTOINCREMENT, op INTEGER NOT NULL, fid INTEGER, seq INTEGER,"
+    " k BLOB, s TEXT, v INTEGER);"
     "CREATE TABLE IF NOT EXISTS jm(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;";
 
 std::vector<std::string> splitUnit(const std::string& s, size_t want) {
@@ -43,17 +48,6 @@ const char* colText(sqlite3_stmt* s, int i) {
     const unsigned char* t = sqlite3_column_text(s, i);
     return t ? reinterpret_cast<const char*>(t) : "";
 }
-// Opening the file recovers its WAL first (a maintenance connection).
-bool fileHasSchema(const std::string& path) {
-    if (!ioExists(path)) return false;
-    Conn* c = nullptr;
-    if (openConn(path, OpenKind::Maint, 256, 0, &c, nullptr) != SQLITE_OK) return true;  // let the reader report it
-    sqlite3_stmt* s = c->sql("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='r'");
-    const bool has = s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_int64(s, 0) == 1;
-    if (s) sqlite3_reset(s);
-    delete c;
-    return has;
-}
 }  // namespace
 
 int32_t journalOpen(Type* t, std::string* err) {
@@ -71,297 +65,173 @@ int32_t journalOpen(Type* t, std::string* err) {
     return P4_OK;
 }
 
-int32_t journalReserve(Type* t, int64_t through) {
-    std::lock_guard<std::mutex> g(t->jmu);
-    sqlite3_stmt* s = t->jdb->get(S_JM_SET);
-    if (!s) return P4_E_INTERNAL;
-    sqlite3_bind_text(s, 1, "seq_reserved", -1, SQLITE_STATIC);
-    sqlite3_bind_int64(s, 2, through);
-    const int rc = sqlite3_step(s);
-    sqlite3_reset(s);
-    t->e->bump(kStJournalSyncs);
-    return rc == SQLITE_DONE ? P4_OK : statusOfSqlite(rc);
-}
-
 int32_t journalReplay(Type* t, std::string* err) {
     Conn* j = t->jdb;
+    if (!j) return P4_E_INTERNAL;
     {
         sqlite3_stmt* s = j->sql("SELECT v FROM jm WHERE k='seq_reserved'");
-        if (s && sqlite3_step(s) == SQLITE_ROW) t->seqReserved = sqlite3_column_int64(s, 0);
-        if (s) sqlite3_reset(s);
-        s = j->sql("SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name='j'),0)");
-        if (s && sqlite3_step(s) == SQLITE_ROW) t->jlast = sqlite3_column_int64(s, 0);
+        if (s && sqlite3_step(s) == SQLITE_ROW) {
+            std::lock_guard<std::mutex> g(t->mu);
+            t->seqReserved = sqlite3_column_int64(s, 0);
+            if (t->seqReserved >= t->nextSeq) t->nextSeq = t->seqReserved + 1;
+        }
         if (s) sqlite3_reset(s);
     }
-    if (t->seqReserved >= t->nextSeq) t->nextSeq = t->seqReserved + 1;
-
     struct JE {
         int op;
+        uint32_t fid;
         int64_t seq, v;
-        uint32_t pid;
-        uint8_t k[32];
-        uint8_t c[32];
-        std::string s;
+        std::string k, s;
     };
     std::vector<JE> rows;
-    sqlite3_stmt* q = j->sql("SELECT op, k, c, pid, seq, s, v FROM j ORDER BY id");
-    if (!q) { *err = sqlite3_errmsg(j->db); return P4_E_IO; }
+    sqlite3_stmt* q = j->sql("SELECT op, fid, seq, k, s, v FROM j ORDER BY id");
+    if (!q) {
+        if (err) *err = sqlite3_errmsg(j->db);
+        return P4_E_IO;
+    }
     int rc;
     while ((rc = sqlite3_step(q)) == SQLITE_ROW) {
-        JE x{};
+        JE x;
         x.op = sqlite3_column_int(q, 0);
-        if (sqlite3_column_bytes(q, 1) == 32) std::memcpy(x.k, sqlite3_column_blob(q, 1), 32);
-        if (sqlite3_column_bytes(q, 2) == 32) std::memcpy(x.c, sqlite3_column_blob(q, 2), 32);
-        x.pid = uint32_t(sqlite3_column_int64(q, 3));
-        x.seq = sqlite3_column_int64(q, 4);
-        x.s = colText(q, 5);
-        x.v = sqlite3_column_int64(q, 6);
+        x.fid = uint32_t(sqlite3_column_int64(q, 1));
+        x.seq = sqlite3_column_int64(q, 2);
+        if (sqlite3_column_type(q, 3) == SQLITE_BLOB)
+            x.k.assign(static_cast<const char*>(sqlite3_column_blob(q, 3)), size_t(sqlite3_column_bytes(q, 3)));
+        x.s = colText(q, 4);
+        x.v = sqlite3_column_int64(q, 5);
         rows.push_back(std::move(x));
     }
     sqlite3_reset(q);
-    if (rc != SQLITE_DONE) { *err = sqlite3_errmsg(j->db); return statusOfSqlite(rc); }
+    if (rc != SQLITE_DONE) {
+        if (err) *err = sqlite3_errmsg(j->db);
+        return statusOfSqlite(rc);
+    }
     if (rows.empty()) return P4_OK;
 
-    std::lock_guard<std::mutex> g(t->mu);
-    // 1. Registry: partitions, sources, lanes, files.
-    // A file is created once its schema committed: a crash between the
-    // empty file (ioTouch) and the schema leaves a file without tables, which
-    // the writer completes (CREATE ... IF NOT EXISTS) instead of trusting.
-    std::unordered_set<Part*> checked;
-    for (const JE& x : rows) {
-        if (x.op == J_PART) {
-            const auto f = splitUnit(x.s, 2);
-            while (t->parts.size() < x.pid) {
-                // pids are assigned in order; a gap is a partition whose J_PART row
-                // is later in the tail (never expected): keep numbering stable.
-                Part* p = partFor(t, "\x1f#" + std::to_string(t->parts.size() + 1), "", true);
-                (void)p;
-            }
-            Part* p = t->partById(x.pid);
-            if (p && p->producer.rfind("\x1f#", 0) == 0) {
-                t->partByProducer.erase(p->producer);
-                p->producer = f[0];
-                p->peer = f[1];
-                t->partByProducer.emplace(p->producer, p->pid);
-            }
-            if (p) p->journaled = true;
-        } else if (x.op == J_SRC) {
-            const auto f = splitUnit(x.s, 2);
-            while (t->srcs.size() < uint64_t(x.seq)) srcFor(t, "\x1f#" + std::to_string(t->srcs.size() + 1), "", true);
-            SrcDef* s = t->srcById(uint32_t(x.seq));
-            if (s && s->provider.rfind("\x1f#", 0) == 0) {
-                t->srcByName.erase(s->provider + '\x1f' + s->source);
-                s->provider = f[0];
-                s->source = f[1];
-                t->srcByName.emplace(s->provider + '\x1f' + s->source, s->id);
-            }
-            if (s) t->srcJournaled[s->id - 1] = 1;
-        } else if (x.op == J_LANE) {
-            const auto f = splitUnit(x.s, 6);
-            while (t->lanes.size() < uint64_t(x.seq)) {
-                std::string ph[6] = {"\x1f#" + std::to_string(t->lanes.size() + 1), "", "", "", "", ""};
-                laneFor(t, ph, true);
-            }
-            LaneDef* l = t->laneById(uint32_t(x.seq));
-            if (l && l->provider.rfind("\x1f#", 0) == 0) {
-                std::string old[6] = {l->provider, l->source, l->batch, l->ckey, l->ppeer, l->pkey};
-                std::string key;
-                for (auto& o : old) key += o + '\x1f';
-                t->laneByIdentity.erase(key);
-                l->provider = f[0];
-                l->source = f[1];
-                l->batch = f[2];
-                l->ckey = f[3];
-                l->ppeer = f[4];
-                l->pkey = f[5];
-                l->sid = uint32_t(x.v);
-                std::string nf[6] = {f[0], f[1], f[2], f[3], f[4], f[5]};
-                l->h = laneHash(nf);
-                std::string nk;
-                for (auto& o : nf) nk += o + '\x1f';
-                t->laneByIdentity.emplace(nk, l->id);
-            }
-            if (l) t->laneJournaled[l->id - 1] = 1;
-        } else if (x.op == J_FILE) {
-            Part* p = t->partById(x.pid);
-            if (!p) continue;
-            Part* f = &*p;
-            if (!checked.count(f)) {
-                checked.insert(f);
-                f->created = fileHasSchema(f->path);
-            }
-            f->touched = true;
-        }
-    }
-    // 2. Entries, checked against the files. One maintenance connection per
-    //    file, opened here: opening it recovers the file's WAL before any read
-    //    is served (M8).
-    std::unordered_map<Part*, Conn*> conns;
-    auto connOf = [&](Part* f) -> Conn* {
-        auto it = conns.find(f);
-        if (it != conns.end()) return it->second;
-        Conn* c = nullptr;
-        if (f->created && openConn(f->path, OpenKind::Maint, 2048, 0, &c, nullptr) != SQLITE_OK) c = nullptr;
-        conns[f] = c;
-        return c;
-    };
-    auto fileOf = [&](uint32_t pid) -> Part* {
-        Part* p = t->partById(pid);
-        return p ? p : nullptr;
-    };
-    Conn* idx = t->idx;
-    std::unordered_set<int64_t> liveSeqs;
-    std::shared_ptr<const Spec> sp = t->spec_;
-    // The entries in CID order (journal order within a CID: a CID's entries
-    // are what its outcome depends on), so the index probes walk the type
-    // index once instead of reading a random page per entry. One probe per
-    // CID gives both this partition's index row and the other holders.
-    std::vector<size_t> order;
-    for (size_t i = 0; i < rows.size(); i++)
-        if (rows[i].op == J_C || rows[i].op == J_DEL) order.push_back(i);
-    std::stable_sort(order.begin(), order.end(),
-                     [&](size_t a, size_t b) { return std::memcmp(rows[a].k, rows[b].k, 32) < 0; });
-    // Each entry's row, probed in (file, seq) order (the files' pages in turn).
-    std::vector<size_t> byRow(order);
-    std::sort(byRow.begin(), byRow.end(), [&](size_t a, size_t b) {
-        return rows[a].pid != rows[b].pid ? rows[a].pid < rows[b].pid : rows[a].seq < rows[b].seq;
-    });
-    std::vector<int64_t> rowLen(rows.size(), -1);  // -1: the entry's row is not in its file
-    for (size_t oi : byRow) {
-        const JE& x = rows[oi];
-        Part* f = fileOf(x.pid);
-        Conn* c = f ? connOf(f) : nullptr;
-        if (!c) continue;
-        sqlite3_stmt* s = c->get(S_R_LEN);
-        if (!s) continue;
-        sqlite3_bind_int64(s, 1, x.seq);
-        if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_bytes(s, 1) == 32 &&
-            std::memcmp(sqlite3_column_blob(s, 1), x.k, 32) == 0)
-            rowLen[oi] = sqlite3_column_int64(s, 0);
-        sqlite3_reset(s);
-    }
-    std::vector<std::pair<uint32_t, int64_t>> inIdx;  // the CID's index rows (pid, seq)
-    const uint8_t* inIdxKey = nullptr;
-    for (size_t oi : order) {
-        const JE& x = rows[oi];
-        const bool present = rowLen[oi] >= 0;
-        const int64_t len = present ? rowLen[oi] : 0;
-        if (!inIdxKey || std::memcmp(inIdxKey, x.k, 32) != 0) {
-            inIdx.clear();
-            inIdxKey = x.k;
-            sqlite3_stmt* s = idx->get(S_C_GET);
-            if (s) {
-                sqlite3_bind_blob(s, 1, x.k, 32, SQLITE_STATIC);
-                while (sqlite3_step(s) == SQLITE_ROW)
-                    inIdx.push_back({uint32_t(sqlite3_column_int64(s, 0)), sqlite3_column_int64(s, 1)});
-                sqlite3_reset(s);
+    // 1. Ids: feeds and tokens.
+    std::map<int64_t, std::set<uint32_t>> touched;  // seq -> feed files
+    std::set<uint32_t> files;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        for (const JE& x : rows) {
+            if (x.op == J_FEED) {
+                const auto f = splitUnit(x.s, 3);
+                Feed* fd = feedRestore(t, x.fid, f[0], f[1], f[2]);
+                fd->created = ioExists(fd->path);
+            } else if (x.op == J_TOK) {
+                const auto f = splitUnit(x.s, 2);
+                const uint32_t id = uint32_t(x.v);
+                while (t->toks.size() + 1 < id) {
+                    TokDef ph;
+                    ph.token = "\x1f#" + std::to_string(t->toks.size() + 1);
+                    t->toks.push_back(ph);
+                }
+                if (t->toks.size() + 1 == id) {
+                    TokDef d;
+                    d.token = f[0];
+                    d.peer = f[1];
+                    t->toks.push_back(d);
+                } else if (t->toks[id - 1].token.rfind("\x1f#", 0) == 0) {
+                    t->toks[id - 1].token = f[0];
+                    t->toks[id - 1].peer = f[1];
+                }
+                t->toks[id - 1].registered = true;
+                t->tokByToken[t->toks[id - 1].token] = id;
+            } else if (x.op == J_TOUCH) {
+                touched[x.seq].insert(x.fid);
+                files.insert(x.fid);
+                if (x.seq >= t->nextSeq) t->nextSeq = x.seq + 1;
             }
         }
-        bool inIndex = false;
-        for (auto& r : inIdx) inIndex = inIndex || r.first == x.pid;
-        // Other holders: the pending layer over the index (a pending delete
-        // hides its row), as holdersWith.
-        int others = 0;
+    }
+    // 2. Every touched feed file's counters, from its meta (committed with
+    //    its rows): the cut write may have committed it without the index.
+    for (uint32_t fid : files) {
+        Feed* f;
         {
-            uint32_t seen[16];
-            bool del[16];
-            int ns = 0;
-            auto note = [&](const CEnt& ce) {
-                for (int i = 0; i < ns; i++)
-                    if (seen[i] == ce.pid) return;
-                if (ns < 16) {
-                    seen[ns] = ce.pid;
-                    del[ns++] = ce.st == 2;
-                }
-            };
-            t->pend.each(x.k, note);
-            t->flushing.each(x.k, note);
-            for (auto& r : inIdx) {
-                bool dup = false;
-                for (int i = 0; i < ns; i++) dup = dup || seen[i] == r.first;
-                if (!dup && ns < 16) {
-                    seen[ns] = r.first;
-                    del[ns++] = false;
-                }
-            }
-            for (int i = 0; i < ns; i++) others += !del[i] && seen[i] != x.pid;
+            std::lock_guard<std::mutex> g(t->mu);
+            f = t->feedById(fid);
+            if (f && !f->created) f->created = ioExists(f->path);
         }
-        if (x.op == J_C) {
-            if (!present) continue;  // its file never committed
-            liveSeqs.insert(x.seq);
-            if (x.seq >= t->nextSeq) t->nextSeq = x.seq + 1;
-            if (!inIndex) {
-                bool pendingHas = false;
-                t->pend.each(x.k, [&](const CEnt& ce) { pendingHas = pendingHas || (ce.pid == x.pid && ce.st == 1); });
-                if (!pendingHas) {
-                    if (others) t->copies++;
-                    else { t->uniq++; t->uniqBytes += len; }
-                    t->pend.put(x.k, x.pid, x.seq, 1);
-                }
-            }
-        } else {  // J_DEL: applied when the row is gone
-            if (present) continue;
-            bool pendingLive = false;
-            t->pend.each(x.k, [&](const CEnt& ce) { pendingLive = pendingLive || (ce.pid == x.pid && ce.st == 1); });
-            if (inIndex || pendingLive) {
-                if (others) t->copies--;
-                else { t->uniq--; t->uniqBytes -= x.v; }
-                t->pend.kill(x.k, x.pid);
-                t->pend.put(x.k, x.pid, x.seq, 2);
-            }
+        if (!f) continue;
+        bool created;
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            created = f->created;
         }
-    }
-    for (const JE& x : rows) {
-        if (x.op != J_IDENT || !liveSeqs.count(x.seq)) continue;
-        IdentEnt ie;
-        ie.src = uint64_t(x.v);
-        std::memcpy(ie.h, x.k, 32);
-        std::memcpy(ie.cid, x.c, 32);
-        ie.seq = x.seq;
-        ie.st = 1;
-        t->identPend[identMapKey(ie.src, ie.h)] = ie;
-    }
-    // 3. Every touched file's counters from its meta and lane rows (committed
-    //    with its rows by every write and removal).
-    for (auto& p : t->parts) {
-        Part* f = &*p;
-        if (!f->touched) continue;
-        Conn* c = connOf(f);
-        if (!c) continue;
+        if (!created) continue;
+        int32_t st = P4_OK;
+        std::string er;
+        Conn* c = writerPin(t->e, f, &st, &er);
+        if (!c) {
+            if (err) *err = "replay: open " + f->path + ": " + er;
+            return st;
+        }
         Counters k;
         bool indexed = true;
-        if (readMeta(c, &k, &indexed) != SQLITE_OK) {
-            if (err) *err = "meta of " + f->path + ": " + sqlite3_errmsg(c->db);
-            for (auto& kv : conns) delete kv.second;
-            return P4_E_IO;
+        std::map<InstId, InstCount> inst;
+        int r = readMeta(c, &k, &indexed);
+        if (r == SQLITE_OK) r = readInst(f, c, &inst);
+        writerUnpin(t->e, f);
+        if (r != SQLITE_OK) {
+            if (err) *err = "replay: counters of " + f->path;
+            return statusOfSqlite(r);
         }
-        countersTo(f, k);
+        std::lock_guard<std::mutex> g(t->mu);
+        f->k = k;
         f->indexed = indexed;
-        sqlite3_stmt* s = nullptr;
-        f->lanes.clear();
-        s = c->sql(
-            "SELECT id, n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts, minseq FROM lane WHERE n>0");
-        while (s && sqlite3_step(s) == SQLITE_ROW) {
-            LaneCount lc;
-            lc.n = sqlite3_column_int64(s, 1);
-            lc.bytes = sqlite3_column_int64(s, 2);
-            lc.minw = sqlite3_column_type(s, 3) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 3);
-            lc.maxw = sqlite3_column_type(s, 4) == SQLITE_NULL ? INT64_MIN : sqlite3_column_int64(s, 4);
-            lc.maxseq = sqlite3_column_int64(s, 5);
-            lc.created = sqlite3_column_int64(s, 6);
-            lc.updated = sqlite3_column_int64(s, 7);
-            lc.maxat = sqlite3_column_int64(s, 8);
-            lc.url = colText(s, 9);
-            lc.url0 = colText(s, 10);
-            lc.maxts = sqlite3_column_int64(s, 11);
-            lc.minseq = sqlite3_column_type(s, 12) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 12);
-            f->lanes[uint32_t(sqlite3_column_int64(s, 0))] = lc;
-        }
-        if (s) sqlite3_reset(s);
-        if (f->maxseq >= t->nextSeq) t->nextSeq = f->maxseq + 1;
+        f->inst = std::move(inst);
     }
-    for (auto& kv : conns) delete kv.second;
-    (void)sp;
+    // 3. Every touched record across its feed files, brought in line; its
+    //    index entries and the counters from its rows.
+    WriteCtx w(t->e, t);
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        for (auto& f : t->feeds) w.migrate = w.migrate || !f->indexed;
+    }
+    for (auto& kv : touched) {
+        int32_t lrc = P4_OK;
+        RecState* r = w.bySeq(kv.first, &lrc, &kv.second);
+        if (!r) {
+            if (err) *err = "replay: seq " + std::to_string(kv.first) + ": " + w.err;
+            return lrc;
+        }
+        w.touchAll(r);
+        for (uint32_t fid : kv.second) r->touched.insert(fid);
+        if (!r->rows.empty()) w.normalize(r);
+    }
+    for (const JE& x : rows) {
+        if (x.op != J_IDENT || x.k.size() != 64) continue;
+        RecState* r = w.known(x.seq);
+        if (!r) {
+            int32_t lrc = P4_OK;
+            r = w.bySeq(x.seq, &lrc);
+            if (!r) {
+                if (err) *err = "replay: identity of seq " + std::to_string(x.seq) + ": " + w.err;
+                return lrc;
+            }
+        }
+        if (std::memcmp(r->key, x.k.data() + 32, 32) != 0) continue;
+        IdentNew in;
+        in.src = uint64_t(x.v);
+        std::memcpy(in.h, x.k.data(), 32);
+        in.rec = r;
+        w.idents.push_back(in);
+        if (r->touched.empty()) w.touchAll(r);
+    }
+    const int32_t crc = w.commit(false);
+    if (crc != P4_OK) {
+        if (err) *err = "replay: " + w.err;
+        return crc;
+    }
+    // 4. Applied: the journal's rows go.
+    rc = j->exec("DELETE FROM j");
+    if (rc != SQLITE_OK) {
+        if (err) *err = std::string("replay: journal cut: ") + sqlite3_errmsg(j->db);
+        return statusOfSqlite(rc);
+    }
+    std::lock_guard<std::mutex> g(t->mu);
+    t->jcut = 0;
     t->visRecompute();
     return P4_OK;
 }

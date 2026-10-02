@@ -1,5 +1,5 @@
 // Store format 4: the store (markers, the type catalog, registration,
-// activation, stop, stats) and the partition / lane / source registry.
+// activation, stop, stats) and the feed / token registry.
 #include <cstdio>
 
 #include "flatsql/flatsql_io.h"
@@ -10,12 +10,6 @@ namespace flatsql {
 namespace p4 {
 
 std::string pathJoin(const std::string& a, const std::string& b) { return a + "/" + b; }
-
-std::string Type::filePath(uint32_t pid) const {
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "/%u.db", pid);
-    return pDir + buf;
-}
 
 void Type::visRecompute() {
     int64_t v = nextSeq - 1;
@@ -207,34 +201,34 @@ bool markersActivated(const Markers& m) {
 }
 
 // The type index and journal: opened (made when absent), the journal's tail
-// replayed into the index before any read (M8), the seq floor applied.
+// replayed (every touched record brought in line across its feed files, the
+// index set from them) before any read (M8), the seq floor applied.
 int32_t typeFilesOpen(Type* t, std::string* err) {
     int32_t rc = typeIndexOpen(t, err);
     if (rc != P4_OK) return rc;
     rc = journalOpen(t, err);
     if (rc != P4_OK) return rc;
+    {
+        // Every feed the index names, against the disk: a missing file
+        // without records is made again by its next write; a missing file
+        // with records is quarantined (P4_E_CORRUPT, named), never silently
+        // remade.
+        std::lock_guard<std::mutex> g(t->mu);
+        for (auto& f : t->feeds) {
+            f->created = ioExists(f->path);
+            if (!f->created && f->k.recs > 0) f->quarantined = true;
+        }
+    }
     rc = journalReplay(t, err);
     if (rc != P4_OK) return rc;
     std::lock_guard<std::mutex> g(t->mu);
-    // Every partition the index says has a file, against the disk: a missing
-    // file without rows is made again by its next write; a missing file with
-    // rows is quarantined (P4_E_CORRUPT, named), never silently remade.
-    uint32_t files = 0;
-    for (auto& p : t->parts) {
-        if (p->created && !ioExists(p->path)) {
-            if (p->n == 0) p->created = false;
-            else p->quarantined = true;
-        }
-        files += p->created;
-    }
-    t->e->rpool.addFiles(files);
     if (t->nextSeq < int64_t(t->e->cfg.gseqFloor)) t->nextSeq = int64_t(t->e->cfg.gseqFloor);
     t->visRecompute();
     return P4_OK;
 }
 
 // A registered type. Its T/ files are opened only when they exist: a type
-// that never had a write costs its .spec and nothing else (C-32).
+// that never had a write costs its .spec and nothing else.
 int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std::string* err) {
     t->e = e;
     t->name = sp->name;
@@ -244,8 +238,9 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
     t->pJnl = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".jnl");
     t->pFts = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".fts");
     t->pSpec = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".spec");
-    t->pend.init(1024);
-    t->flushing.init(16);
+    // Every feed file of a type is written by one writer thread: a record's
+    // rows across its feeds commit in order on it.
+    t->owner = e->cfg.writers ? e->nextOwner.fetch_add(1) % e->cfg.writers : 0;
     {
         std::lock_guard<std::mutex> g(t->mu);
         t->nextSeq = int64_t(e->cfg.gseqFloor);
@@ -257,6 +252,41 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
     t->hasFiles.store(true, std::memory_order_release);
     typeFileBytes(t);
     return P4_OK;
+}
+
+// A file name for a feed: its provider and source, URL-escaped outside
+// [A-Za-z0-9._-], joined by '@' ("local" for no source). A name that would
+// collide with another feed's on a case-insensitive file system, or is long,
+// carries the feed id.
+std::string feedFileName(Type* t, const std::string& provider, const std::string& source, uint32_t fid) {
+    if (provider.empty() && source.empty()) return "local";
+    auto enc = [](const std::string& s) {
+        static const char* hx = "0123456789ABCDEF";
+        std::string o;
+        for (unsigned char c : s) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                c == '-') {
+                o.push_back(char(c));
+            } else {
+                o.push_back('%');
+                o.push_back(hx[c >> 4]);
+                o.push_back(hx[c & 15]);
+            }
+        }
+        return o;
+    };
+    std::string name = enc(provider) + "@" + enc(source);
+    if (name.size() > 160) name = name.substr(0, 140) + "~" + std::to_string(fid);
+    auto lower = [](std::string s) {
+        for (char& c : s)
+            if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+        return s;
+    };
+    const std::string ln = lower(name);
+    bool clash = name[0] == '.';
+    for (auto& f : t->feeds) clash = clash || lower(f->name) == ln;
+    if (clash) name += "~" + std::to_string(fid);
+    return name;
 }
 }  // namespace
 
@@ -276,85 +306,63 @@ int32_t typeFilesEnsure(Type* t, std::string* err) {
     return P4_OK;
 }
 
-
 // ---- registry --------------------------------------------------------------------------
-Part* partFor(Type* t, const std::string& producer, const std::string& peer, bool create) {
-    auto it = t->partByProducer.find(producer);
-    if (it != t->partByProducer.end()) return t->parts[it->second - 1].get();
-    if (!create) return nullptr;
-    auto p = std::make_unique<Part>();
-    p->type = t;
-    p->pid = uint32_t(t->parts.size() + 1);
-    p->producer = producer;
-    p->peer = peer;
-    p->path = t->filePath(p->pid);
-    Engine* e = t->e;
-    p->owner = e->writers.empty() ? 0 : e->nextOwner.fetch_add(1) % uint32_t(e->writers.size());
-    Part* raw = p.get();
-    t->parts.push_back(std::move(p));
-    t->partByProducer.emplace(producer, raw->pid);
-    return raw;
-}
-
-uint64_t laneHash(const std::string* f6) {
-    std::string b;
-    for (int i = 0; i < 6; i++) {
-        b += f6[i];
-        b.push_back('\0');
+Feed* feedRestore(Type* t, uint32_t fid, const std::string& provider, const std::string& source, const std::string& name) {
+    while (t->feeds.size() < fid) {
+        // Ids are assigned in order; a gap (never expected) keeps numbering stable.
+        auto ph = std::make_unique<Feed>();
+        ph->type = t;
+        ph->fid = uint32_t(t->feeds.size() + 1);
+        ph->provider = "\x1f#" + std::to_string(ph->fid);
+        ph->name = "\x1f#" + std::to_string(ph->fid);
+        t->feeds.push_back(std::move(ph));
     }
-    uint8_t d[32];
-    ps::sha256(b.data(), b.size(), d);
-    return ld64(d) & 0x7fffffffffffffffull;
-}
-
-namespace {
-std::string identityKey(const std::string* f6) {
-    std::string b;
-    for (int i = 0; i < 6; i++) {
-        b += f6[i];
-        b.push_back('\x1f');
+    Feed* f = t->feeds[fid - 1].get();
+    if (f->provider.rfind("\x1f#", 0) == 0 || f->name.empty()) {
+        f->provider = provider;
+        f->source = source;
+        f->name = name;
+        f->local = provider.empty() && source.empty();
+        f->path = pathJoin(t->pDir, name + ".db");
+        t->feedByKey[provider + '\x1f' + source] = fid;
     }
-    return b;
+    f->registered = true;
+    return f;
 }
-}  // namespace
 
-SrcDef* srcFor(Type* t, const std::string& provider, const std::string& source, bool create) {
-    const std::string key = provider + '\x1f' + source;
-    auto it = t->srcByName.find(key);
-    if (it != t->srcByName.end()) return t->srcs[it->second - 1].get();
+Feed* feedFor(Type* t, const std::string& provider, const std::string& source, bool create, bool* made) {
+    if (made) *made = false;
+    auto it = t->feedByKey.find(provider + '\x1f' + source);
+    if (it != t->feedByKey.end()) return t->feeds[it->second - 1].get();
     if (!create) return nullptr;
-    auto s = std::make_unique<SrcDef>();
-    s->id = uint32_t(t->srcs.size() + 1);
-    s->provider = provider;
-    s->source = source;
-    SrcDef* raw = s.get();
-    t->srcs.push_back(std::move(s));
-    t->srcJournaled.push_back(0);
-    t->srcByName.emplace(key, raw->id);
+    auto f = std::make_unique<Feed>();
+    f->type = t;
+    f->fid = uint32_t(t->feeds.size() + 1);
+    f->provider = provider;
+    f->source = source;
+    f->local = provider.empty() && source.empty();
+    f->name = feedFileName(t, provider, source, f->fid);
+    f->path = pathJoin(t->pDir, f->name + ".db");
+    Feed* raw = f.get();
+    t->feeds.push_back(std::move(f));
+    t->feedByKey.emplace(provider + '\x1f' + source, raw->fid);
+    if (made) *made = true;
     return raw;
 }
 
-LaneDef* laneFor(Type* t, const std::string* f6, bool create) {
-    const std::string key = identityKey(f6);
-    auto it = t->laneByIdentity.find(key);
-    if (it != t->laneByIdentity.end()) return t->lanes[it->second - 1].get();
-    if (!create) return nullptr;
-    SrcDef* s = srcFor(t, f6[0], f6[1], true);
-    auto l = std::make_unique<LaneDef>();
-    l->id = uint32_t(t->lanes.size() + 1);
-    l->sid = s->id;
-    l->h = laneHash(f6);
-    l->provider = f6[0];
-    l->source = f6[1];
-    l->batch = f6[2];
-    l->ckey = f6[3];
-    l->ppeer = f6[4];
-    l->pkey = f6[5];
-    LaneDef* raw = l.get();
-    t->lanes.push_back(std::move(l));
-    t->laneJournaled.push_back(0);
-    t->laneByIdentity.emplace(key, raw->id);
-    return raw;
+uint32_t tokFor(Type* t, const std::string& token, const std::string& peer, bool create, bool* made) {
+    if (made) *made = false;
+    auto it = t->tokByToken.find(token);
+    if (it != t->tokByToken.end()) return it->second;
+    if (!create) return 0;
+    TokDef d;
+    d.token = token;
+    d.peer = peer;
+    t->toks.push_back(std::move(d));
+    const uint32_t id = uint32_t(t->toks.size());
+    t->tokByToken.emplace(token, id);
+    if (made) *made = true;
+    return id;
 }
 
 // ---- init ----------------------------------------------------------------------------------
@@ -367,7 +375,10 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     sqlite3_soft_heap_limit64(int64_t(e->cfg.softHeap));
     sqlite3_hard_heap_limit64(int64_t(e->cfg.hardHeap));
     flatsql::setFlatSqlIoReadahead(int(e->cfg.raStreams), int(e->cfg.raBytes));
-    e->rpool.configure(e->cfg.readerConns, e->cfg.readerCacheKiB);
+    // The reader pool's share of the one budget: its connections' caches,
+    // and idle readers close while the heap is past three quarters of the
+    // soft limit (the writers' share is never taken by idle readers).
+    e->rpool.configure(e->cfg.readerConns, e->cfg.readerCacheKiB, e->cfg.softHeap / 4 * 3);
 
     Markers& m = e->markers;
     rc = readMarkers(e, &m);
@@ -411,6 +422,8 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
             break;
     }
     e->cfg.gseqFloor = floor;
+    rc = mailboxInit(e, err);
+    if (rc != P4_OK) return rc;
     // Types: the catalog, then each type's spec; the type index and journal
     // tail of the types that have them.
     for (const std::string& name : names) {
@@ -427,8 +440,6 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
         e->types.push_back(std::move(t));
     }
     e->markers = m;
-    rc = mailboxInit(e, err);
-    if (rc != P4_OK) return rc;
     return P4_OK;
 }
 
@@ -445,14 +456,14 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
         bool hasData;
         {
             std::lock_guard<std::mutex> tg(t->mu);
-            hasData = !t->parts.empty();
+            hasData = !t->feeds.empty();
         }
         if (hasData && cur->epochRule != spec->epochRule) {
             *err = "the epoch rule of a type with data cannot change (C-5)";
             return P4_E_FORMAT;
         }
-        // Rows keep the object key (r.k, r_ke) and sealed records their COL
-        // values from the rules they were written under.
+        // Rows keep the object key (r.k, r_ke, x_k) and sealed records their
+        // COL values from the rules they were written under.
         if (hasData && cur->keyRules != spec->keyRules) {
             *err = "the object and col rules of a type with data cannot change (C-5)";
             return P4_E_FORMAT;
@@ -491,19 +502,18 @@ int32_t engineActivate(Engine* e) {
             if (t->hasFiles.load()) types.push_back(t.get());
     }
     for (Type* t : types) {
-        int32_t rc = typeIndexFlush(t, true);
-        if (rc != P4_OK) return rc;
-        {
-            // The migration's journal, emptied by the flush, at rest: its free
-            // pages go (no writer runs on a store being activated).
-            std::lock_guard<std::mutex> g(t->jmu);
+        // The type index is written with every write (nothing pending); the
+        // migration's journal, applied, goes at rest with its free pages (no
+        // writer runs on a store being activated).
+        if (t->jdb) {
+            t->jdb->exec("DELETE FROM j");
             t->jdb->exec("VACUUM");
         }
         std::vector<std::string> paths;
         {
             std::lock_guard<std::mutex> g(t->mu);
-            for (auto& p : t->parts)
-                if (p->created) paths.push_back(p->path);
+            for (auto& f : t->feeds)
+                if (f->created) paths.push_back(f->path);
         }
         paths.push_back(t->pIdx);
         paths.push_back(t->pJnl);
@@ -534,17 +544,16 @@ int32_t engineActivate(Engine* e) {
 int32_t engineStats(Engine* e, uint8_t* out, int32_t cap) {
     uint64_t v[kStCount];
     for (int i = 0; i < kStCount; i++) v[i] = e->stat[i].load(std::memory_order_relaxed);
-    uint64_t files = 0, parts = 0, quarantined = 0, pending = 0, types = 0;
+    uint64_t files = 0, feeds = 0, quarantined = 0, types = 0;
     {
         std::lock_guard<std::mutex> g(e->typesMu);
         types = e->types.size();
         for (auto& t : e->types) {
             std::lock_guard<std::mutex> tg(t->mu);
-            parts += t->parts.size();
-            pending += t->pend.bytes() + t->flushing.bytes();
-            for (auto& p : t->parts) {
-                if (p->created) files++;
-                if (p->quarantined) quarantined++;
+            feeds += t->feeds.size();
+            for (auto& f : t->feeds) {
+                if (f->created) files++;
+                if (f->quarantined) quarantined++;
             }
         }
     }
@@ -557,10 +566,10 @@ int32_t engineStats(Engine* e, uint8_t* out, int32_t cap) {
     // allocator counts (0 without the surface).
     v[kStHeap] = p4sql_heap_used();
     v[kStHeapPeak] = p4sql_heap_peak();
-    v[kStPendingBytes] = pending;
+    v[kStPendingBytes] = 0;  // the type index is written with every write
     v[kStLiveFiles] = files;
     v[kStTypes] = types;
-    v[kStPartitions] = parts;
+    v[kStPartitions] = feeds;
     v[kStQuarantined] = quarantined;
     const int32_t need = int32_t(sizeof v);
     const int32_t n = cap < need ? (cap / 8) * 8 : need;

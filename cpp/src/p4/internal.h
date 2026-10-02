@@ -1,27 +1,38 @@
 // FlatSQL store format 4 ("p4"): engine internals.
 //
-// One SQLite file per partition (producer x record type), SQLite 3.53.4
-// unmodified, every file through FlatSQL's own VFS (flatsql_io). The design is
-// stack docs/architecture/flatsql-sqlite-partitions.md with its owner revision
-// (2026-10-01); the interfaces are CONTRACT.md (v11) §1-§4;
-// docs/STORE-FORMAT-4.md is the as-built description.
+// One SQLite file per SOURCE FEED x standard (CONTRACT C-37, owner layout of
+// 2026-10-02): P/<TYPE>/<feed>.db, where a feed is a record's (provider,
+// source) tag pair; a record with no source lives in P/<TYPE>/local.db.
+// SQLite 3.53.4 unmodified, every file through FlatSQL's own VFS
+// (flatsql_io). The interfaces are CONTRACT.md §1-§4; docs/STORE-FORMAT-4.md
+// is the as-built description.
+//
+// A row of a feed file is one delivery of a record: one copy of it (the
+// publishing node: the producer token and peer that stored it, with the tag's
+// producer peer and key) in one batch of that feed. A row keeps the record
+// bytes verbatim, its signature, epoch, object key, ts, the delivery's `at`,
+// and small per-file ids for the node, the batch, the content key and the
+// url. No provider or source string is in a row: the file is the feed.
+// The same record from two feeds is a row in each feed's file under one seq.
+// Within a feed file the rows of a record are its copies x its instances
+// (every copy of a record appears with every one of its instances in the
+// feed), so a batch supersede of one feed file never loses a copy the record
+// keeps elsewhere.
 //
 // Layout under the root (<data>/fsql4):
 //   STORE, MIGRATED                      markers (§2.2)
 //   T/TYPES                              registered type names (append-only records with a crc)
 //   T/<TYPE>.spec                        the registered spec TLV, plus a crc tag
-//   T/<TYPE>.idx                         type index: derived, rebuildable (c, ident, part, src, lanes, lanecnt, meta)
+//   T/<TYPE>.idx                         type index: feeds, tokens, x (one entry per record x feed), ident, counters
 //   T/<TYPE>.jnl                         intent journal (synchronous=FULL)
-//   T/<TYPE>.fts                         FTS5 (maintenance thread)
-//   P/<TYPE>/<pid>.db                    the partition's one file, for its life
-// A type's T/ files (index, journal, full text) are made by its first write;
-// a registered type without data has only its .spec.
+//   T/<TYPE>.fts                         FTS5 (background)
+//   P/<TYPE>/<feed>.db                   one file per source feed of the type
 //
-// Threads: writers (partitions pinned to them), interactive / bulk / sandbox
-// lanes, one maintenance thread. Lock order, outermost first: Engine::typesMu,
-// Type::dmu, Type::jmu, Type::mu, Engine::wconnMu. Type::flushMu is held only
-// by the maintenance thread (and stop) and is never taken under a writer lock.
-// No lock is held across a partition file's I/O except by its one writer.
+// Threads: writers (every feed file of a type is written by the type's one
+// writer thread; a file has one writer connection), interactive / bulk /
+// sandbox lanes, one maintenance thread and one long-work thread. Lock order,
+// outermost first: Engine::typesMu, Type::mu, Feed::dictMu, Engine::wconnMu.
+// No lock is held across a feed file's I/O except by its one writer.
 #ifndef FLATSQL_P4_INTERNAL_H
 #define FLATSQL_P4_INTERNAL_H
 
@@ -38,6 +49,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -104,10 +116,10 @@ int64_t nowSec();
 void dayText(int64_t sec, char out[11]);  // "YYYY-MM-DD"
 
 // ---- statistics (§3.10; entries only ever appended) ----------------------------------
-// kStUnlinked, kStQuotaFiles and kStTwoPhase are always 0 in the owner layout
-// (a partition keeps its one file; there are no merges): the frozen ABI keeps
-// their slots until a re-freeze removes them, as it keeps SUPERSEDE's
-// files_deleted and QUOTA_GC's files_dropped columns (always 0).
+// kStUnlinked, kStQuotaFiles and kStTwoPhase are always 0 in this layout (a
+// feed keeps its one file; there are no merges): the frozen ABI keeps their
+// slots, as it keeps SUPERSEDE's files_deleted and QUOTA_GC's files_dropped
+// columns (always 0). kStPartitions counts feed files.
 enum Stat : int {
     kStPuts, kStPutRecords, kStNew, kStCopies, kStRetags, kStDups, kStIdentDups, kStRejects,
     kStCatSuperseded, kStSupersedeTags, kStSupersedeRecords, kStDeletes, kStGroupCommits,
@@ -163,11 +175,12 @@ void ioPrefault(const std::string& path);  // reads the file once, start to end 
 
 // ---- SQLite connections --------------------------------------------------------------------
 enum StmtId : int {
-    // partition file
-    S_INS, S_RL_INS, S_RL_ONE, S_RL_URL, S_RL_OF, S_RL_DEL_SEQ, S_R_DEL, S_R_ROW, S_R_GET, S_R_LEN, S_R_HOLDER,
-    S_SUP_K, S_LANE_UP, S_LANE_DEL, S_SRC_INS, S_META_SET,
+    // feed file
+    S_R_SEQ, S_R_SEQD, S_R_D, S_R_INS, S_R_DEL, S_R_URL, S_R_MAXRID, S_META_SET,
+    S_NODE_INS, S_BATCH_INS, S_CKEY_GET, S_CKEY_INS, S_URL_GET, S_URL_TEXT, S_URL_INS, S_CKEY_TEXT,
+    S_INST_PUT, S_INST_DEL,
     // type index
-    S_C_GET, S_C_INS, S_C_DEL, S_IDENT_GET, S_IDENT_INS, S_IDENT_DEL,
+    S_X_CID, S_X_SEQ, S_X_PUT, S_X_DEL, S_IDENT_GET, S_IDENT_INS,
     // journal
     S_J_INS, S_J_DEL, S_JM_SET,
     S_COUNT
@@ -177,6 +190,7 @@ struct Conn {
     sqlite3_stmt* st[S_COUNT] = {};
     std::unordered_map<std::string, sqlite3_stmt*> dyn;  // other statements, by SQL text
     std::string path;
+    uint32_t cacheKiB = 0;  // a pooled reader's page cache (its share of the pool's budget)
     ~Conn();
     sqlite3_stmt* get(StmtId id);             // reset and cleared; nullptr on a prepare error
     sqlite3_stmt* sql(const std::string& s);  // cached by text; reset and cleared
@@ -195,119 +209,90 @@ extern thread_local char tSqlLog[200];  // this thread's last SQLite error log l
 // header (no file I/O on a connection that just committed).
 int64_t dbBytesOf(Conn* c, int64_t* freeBytes);
 
+// ---- keys --------------------------------------------------------------------------------------
+// An object key value (r.k / x.k): none, an integer or text.
+struct KVal {
+    int type = 0;  // 0 none, 1 integer, 3 text
+    int64_t i = 0;
+    std::string s;
+    void bind(sqlite3_stmt* q, int at) const;
+    void from(sqlite3_stmt* q, int col);
+    bool operator==(const KVal& o) const { return type == o.type && i == o.i && s == o.s; }
+    std::string text() const { return type == 1 ? std::to_string(i) : type == 3 ? s : std::string(); }
+};
+
 // ---- engine objects ------------------------------------------------------------------------
 struct Type;
-struct Part;
+struct Feed;
 
-struct SrcDef {
-    uint32_t id = 0;
-    std::string provider, source;
+// A feed file's small id tables. Nodes (the copy: producer token and peer)
+// and batches (format 1's summary key inside the feed: batch, producer peer,
+// producer key) are few and cached whole; content keys and urls are looked up
+// in the file (a url may be per record).
+struct NodeDef {
+    std::string producer, peer;
 };
-struct LaneDef {
-    uint32_t id = 0;
-    uint32_t sid = 0;
-    uint64_t h = 0;  // 63 bits of SHA-256 over the six identity fields (lanecnt key)
-    std::string provider, source, batch, ckey, ppeer, pkey;
+struct BatchDef {
+    std::string batch, ppeer, pkey;
 };
-// A lane's counters in one file (the file's lane row), mirrored in memory.
-struct LaneCount {
-    int64_t n = 0, bytes = 0, minw = INT64_MAX, maxw = INT64_MIN, maxseq = 0;
-    int64_t created = 0, updated = 0, maxat = 0, maxts = 0;
-    int64_t minseq = INT64_MAX;  // a lower bound once rows go (exact after REBUILD 2)
-    std::string url;   // the latest write's url (SUMMARY 3)
-    std::string url0;  // an instance's url when its rl.u is NULL
+struct Dict {
+    std::vector<NodeDef> node;    // index id-1
+    std::vector<BatchDef> batch;  // index id-1
+    std::unordered_map<std::string, uint32_t> nodeId, batchId;
+    bool loaded = false;
+};
+std::string nodeKey(const std::string& producer, const std::string& peer);
+std::string batchKey(const std::string& batch, const std::string& ppeer, const std::string& pkey);
+
+// An instance (a batch number and content key) in one feed file: the records
+// holding it (each once), their bytes (each record's smallest copy), and
+// format 1's summary times. The strings are the instance's identity.
+struct InstCount {
+    std::string batch, ppeer, pkey, ckey;
+    int64_t n = 0, bytes = 0, minw = INT64_MAX, maxw = INT64_MIN, minseq = INT64_MAX, maxseq = 0;
+    int64_t first = 0, updated = 0, maxat = 0, maxts = 0;
+    std::string url;  // the latest write's url (SUMMARY 3)
+};
+using InstId = std::pair<uint32_t, uint32_t>;  // (batch id, ckey id; 0 = "")
+
+// A feed file's counters, committed in its meta with its rows. Exact: rows,
+// recs (records), bytes (over rows), nnull (records without an epoch).
+// Bounds: the rest.
+struct Counters {
+    int64_t rows = 0, recs = 0, bytes = 0, nnull = 0;
+    int64_t minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN;
+    int64_t mints = INT64_MAX, maxts = 0, mine = INT64_MAX, maxe = INT64_MIN;
 };
 
-struct WriteTask;
-
-// A partition (producer x type) and its one file, P/<TYPE>/<pid>.db, for its
-// life (C-32). The counters mirror the file's meta and lane rows (the
-// durable copy), under Type::mu.
-struct Part {
+struct Feed {
     Type* type = nullptr;
-    uint32_t pid = 0;
-    std::string producer;  // the producer token (C-13)
-    std::string peer;      // the first writer's peer (REC.peer when r.p is NULL, C-2)
-    uint32_t owner = 0;    // writer thread index
-    std::string path;
-    int64_t n = 0, bytes = 0, ncopy = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN,
-            maxts = 0, nnull = 0, mints = INT64_MAX, mine = INT64_MAX, maxe = INT64_MIN;
-    std::map<uint32_t, LaneCount> lanes;  // live lanes (n > 0) by lane id
+    uint32_t fid = 0;
+    std::string provider, source;  // both "" for local
+    std::string name, path;
+    bool local = false;
+    // Type::mu
+    Counters k;
+    std::map<InstId, InstCount> inst;  // live instances (n > 0)
     bool created = false;      // exists on disk with its schema (readers skip it until then)
     bool quarantined = false;  // corrupt: P4_E_CORRUPT for ops that need it
     bool indexed = true;       // secondary indexes present (false between a migration's append and REBUILD 1)
-    bool touched = false;      // changed since the last flush
-    bool journaled = false;    // its J_PART row is durable
-    int64_t dbBytes = -1, freeBytes = 0;  // the file's pages and free pages after its last commit (-1: not yet read)
+    bool registered = false;   // in the journal or the type index (a write journals it before its first use)
+    int64_t dbBytes = -1, freeBytes = 0;  // pages and free pages after its writer's last commit (-1: not read)
+    // dictMu
+    std::mutex dictMu;
+    Dict dict;
     // writer connection (Engine::wconnMu)
-    Conn* w = nullptr;
+    struct Conn* w = nullptr;
     int wPins = 0;
-    std::list<Part*>::iterator lru;
+    std::list<Feed*>::iterator lru;
     bool inLru = false;
-    // backlog (WriterState::mu of the owner)
-    std::deque<WriteTask*> backlog;
-    uint64_t backlogRecords = 0;
-    bool ready = false;  // on the owner's ready list
 };
 
-// Pending type-index c entries, in memory until a flush writes them. st: 1
-// insert (committed), 2 delete (committed), 3 dead, 4 in flight (assigned,
-// its partition file not yet committed: visible to dedupe, never flushed).
-struct CEnt {
-    uint8_t key[32];
-    int64_t seq;
-    uint32_t pid;
-    uint8_t st;
-};
-class PMap {
-public:
-    void init(uint32_t want);
-    void clear() {
-        a_.clear();
-        used_ = live_ = 0;
-    }
-    void put(const uint8_t* key, uint32_t pid, int64_t seq, uint8_t st);
-    // f(const CEnt&) for each pid's newest state of key.
-    template <class F>
-    void each(const uint8_t* key, F f) const {
-        if (a_.empty()) return;
-        const uint32_t mask = uint32_t(a_.size() - 1);
-        for (uint32_t i = hashOf(key) & mask;; i = (i + 1) & mask) {
-            const CEnt& x = a_[i];
-            if (x.st == 0) return;
-            if (x.st != 3 && std::memcmp(x.key, key, 32) == 0) f(x);
-        }
-    }
-    void kill(const uint8_t* key, uint32_t pid);
-    uint32_t live() const { return live_; }
-    size_t bytes() const { return a_.size() * sizeof(CEnt); }
-    std::vector<CEnt>& raw() { return a_; }
-    const std::vector<CEnt>& raw() const { return a_; }
-
-private:
-    static uint32_t hashOf(const uint8_t* key) {
-        uint32_t h;
-        std::memcpy(&h, key + 8, 4);
-        return h * 2654435761u;
-    }
-    void grow();
-    std::vector<CEnt> a_;
-    uint32_t used_ = 0, live_ = 0;
-};
-
-// Pending ingest identities (IQC): (src, h) -> holder (st as CEnt).
-struct IdentEnt {
-    uint64_t src = 0;
-    uint8_t h[32] = {};
-    int64_t seq = 0;
-    uint8_t cid[32] = {};
-    uint8_t st = 0;
-};
-std::string identMapKey(uint64_t src, const uint8_t h[32]);
-
-struct Holder {
-    uint32_t pid;
-    int64_t seq;
+// A producer token of the type (a copy's identity), with its copies' counters.
+struct TokDef {
+    std::string token, peer;
+    int64_t n = 0, bytes = 0, mints = INT64_MAX, maxts = 0, maxseq = 0;
+    bool registered = false;  // in the journal or the type index
 };
 
 // A registered spec and what the engine derives from it. Immutable once
@@ -322,14 +307,16 @@ struct Spec {
     uint8_t epochProfile = 0;
     bool fullText = false;
     bool hasEpochRule = false;
-    bool hasObject = false;     // an object rule: r.k, indexed r_ke(k, e)
-    bool hasSupersede = false;  // supersede-on-ingest (CAT): r.s scope
-    bool ek = false;            // epoch + object: EPOCH points by one r_ke seek per object
+    bool hasObject = false;     // an object rule: r.k, indexed r_ke(k, e) and x_k
+    bool hasSupersede = false;  // supersede-on-ingest (CAT)
+    bool ek = false;            // epoch + object: EPOCH points by one seek per object
     std::string epochRule;      // the epoch line (C-5)
     std::string keyRules;       // the object and col lines: fixed in a type's rows once it has data (C-5)
     std::string rules;
 };
 int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::string* err);
+
+struct WriteTask;
 
 struct Type {
     Engine* e = nullptr;
@@ -347,42 +334,59 @@ struct Type {
 
     // registry and counters (mu)
     std::mutex mu;
-    std::vector<std::unique_ptr<Part>> parts;  // index pid-1
-    std::unordered_map<std::string, uint32_t> partByProducer;
-    std::vector<std::unique_ptr<LaneDef>> lanes;  // index id-1
-    std::unordered_map<std::string, uint32_t> laneByIdentity;
-    std::vector<std::unique_ptr<SrcDef>> srcs;  // index id-1
-    std::unordered_map<std::string, uint32_t> srcByName;
-    std::vector<uint8_t> laneJournaled, srcJournaled;  // by id-1
-    int64_t uniq = 0, uniqBytes = 0, copies = 0;
+    std::vector<std::unique_ptr<Feed>> feeds;  // index fid-1
+    std::unordered_map<std::string, uint32_t> feedByKey;  // provider \x1f source -> fid
+    std::vector<TokDef> toks;                              // index id-1
+    std::unordered_map<std::string, uint32_t> tokByToken;
+    int64_t uniq = 0, uniqBytes = 0, copies = 0, copyBytes = 0;
+    int64_t mine = INT64_MAX, maxe = INT64_MIN, mints = INT64_MAX, maxts = 0, maxseq = 0;  // bounds
     int64_t nextSeq = 1;
     int64_t seqReserved = 0;
     std::atomic<int64_t> vis{0};  // visible-through (B2)
-    std::vector<std::pair<int64_t, int64_t>> inflight;  // (lo, hi) of calls in flight
-    PMap pend, flushing;
-    std::unordered_map<std::string, IdentEnt> identPend, identFlushing;
-    int64_t lastFlushMs = 0;
+    std::vector<std::pair<int64_t, int64_t>> inflight;  // (lo, hi) of new seqs in flight
     bool overQuota = false;
+    bool broken = false;  // the type index could not be brought in line with the files: writes refuse
+    std::string brokenWhy;
 
-    std::mutex dmu;  // writers of this type: the recheck and seq assignment (M7)
-    std::mutex jmu;  // the journal connection
-    Conn* jdb = nullptr;
-    int64_t jlast = 0;
-    std::vector<int64_t> jinflight;  // first journal id of each group journaled and not yet committed (mu)
-    std::mutex flushMu;              // the type index writer (maintenance)
-    Conn* idx = nullptr;
-    std::atomic<int64_t> idxBytes{0}, ftsBytes{0};  // T/ files (index + journal, full text), set by the maintenance thread
+    // The type's writer thread owns these (and init / replay before threads run).
+    uint32_t owner = 0;
+    struct Conn* idx = nullptr;  // type index (writer)
+    struct Conn* jdb = nullptr;  // journal
+    int64_t jcut = 0;            // journal rows <= jcut are applied to the index
+
+    std::atomic<int64_t> idxBytes{0}, ftsBytes{0};  // T/ files, set by the maintenance thread
     std::mutex ftsMu;
-    Conn* fts = nullptr;
+    struct Conn* fts = nullptr;
     int64_t ftsThrough = 0;
     uint8_t ftsState = 0;  // 0 off, 1 building, 2 ready
 
-    Part* partById(uint32_t pid) { return pid >= 1 && pid <= parts.size() ? parts[pid - 1].get() : nullptr; }
-    LaneDef* laneById(uint32_t id) { return id >= 1 && id <= lanes.size() ? lanes[id - 1].get() : nullptr; }
-    SrcDef* srcById(uint32_t id) { return id >= 1 && id <= srcs.size() ? srcs[id - 1].get() : nullptr; }
+    // the writer backlog (WriterState::mu of the owner)
+    std::deque<WriteTask*> backlog;
+    uint64_t backlogRecords = 0;
+    bool ready = false;
+
+    Feed* feedById(uint32_t fid) { return fid >= 1 && fid <= feeds.size() ? feeds[fid - 1].get() : nullptr; }
+    TokDef* tokById(uint32_t id) { return id >= 1 && id <= toks.size() ? &toks[id - 1] : nullptr; }
     void visRecompute();  // mu held
-    std::string filePath(uint32_t pid) const;
 };
+
+// ---- the type index's entry: one per (record, feed file) -------------------------------------
+struct CopyLen {
+    uint32_t tok;
+    int64_t len;
+};
+struct XEnt {
+    int64_t seq = 0;
+    uint32_t fid = 0;
+    uint8_t key[32] = {};
+    int64_t len = 0, w = 0;
+    KVal k;
+    bool hasE = false;
+    int64_t e = 0;
+    std::vector<CopyLen> cp;  // the copies whose rows are in this feed (token id ascending)
+};
+std::string cpEncode(const std::vector<CopyLen>& cp);
+bool cpDecode(const void* p, size_t n, std::vector<CopyLen>* out);
 
 // ---- mailbox (§3.4) ---------------------------------------------------------------------------
 struct alignas(64) SlotHeader {
@@ -435,67 +439,62 @@ struct alignas(64) Bell {
     uint8_t pad[56];
 };
 
-// A write op queued for a partition's owner writer.
-struct Shared;
+// Work for a type's writer thread: a slot's write op, or internal work
+// (quota, REBUILD) whose waiter (the long-work thread) watches `done`.
+struct Internal {
+    std::atomic<bool> done{false};
+    int32_t status = P4_OK;
+    std::string err;
+    int64_t a = 0, b = 0;  // QUOTA: records, bytes; REBUILD: entries, mismatches
+    std::vector<int64_t> seqs;  // QUOTA: the seqs to delete
+    uint32_t what = 0;          // REBUILD
+    std::string firstBad;       // REBUILD 8: the first damaged file
+};
 struct WriteTask {
     uint32_t slot = 0;
     int op = 0;
     int mode = 0;  // PUT: 0 ingest, 1 migrate (a group never mixes them)
     uint64_t records = 0;
-    Part* part = nullptr;
-    Shared* shared = nullptr;   // fan-out ops (SUPERSEDE, DELETE, quota)
-    std::vector<int64_t> dels;  // DELETE, quota: seqs of this partition's copies
-};
-// The common state of a fan-out op: the slot completes when every partition's
-// part has committed. A quota pass has no slot: its waiter sees done.
-struct Shared {
-    // kQuota and kRepair have no slot: their waiter (the maintenance work) sees done.
-    enum Kind { kSupersede, kDelete, kQuota, kRepair } kind = kSupersede;
-    bool internal() const { return kind == kQuota || kind == kRepair; }
-    std::atomic<bool> done{false};
-    std::atomic<int> remaining{0};
-    std::atomic<int64_t> a{0}, b{0}, c{0};
-    std::atomic<int32_t> status{0};
-    std::mutex errMu;
-    std::string err;
-    uint32_t slot = 0;
     Type* type = nullptr;
-    std::string provider, source, keep;  // SUPERSEDE
-    bool apply = false;
-    std::vector<std::array<uint8_t, 32>> keys;  // DELETE: CID keys
+    Internal* internal = nullptr;  // quota and REBUILD from the long-work thread
 };
 
 struct WriterState {
     std::mutex mu;
-    std::deque<Part*> ready;  // partitions with a backlog
+    std::deque<Type*> ready;  // types with a backlog
 };
 
-// Reader connections: one capped pool for every thread. A connection is
-// checked out for one page (one short read transaction) and returned.
+// Reader connections: one pool for every thread, inside the engine's one
+// memory budget whatever the number of feed files. A connection is checked
+// out for one page (one short read transaction) and returned. Idle
+// connections close, least recently used first, while the pool has more than
+// `cap` open, while their page caches together pass cap x cacheKiB (a larger
+// cache counts for more), or while the engine's heap is past `pressure` bytes.
 class ReaderPool {
 public:
-    void configure(uint32_t cap, uint32_t cacheKiB) {
-        cap_ = cap;
+    void configure(uint32_t cap, uint32_t cacheKiB, uint64_t pressure) {
+        cap_ = cap ? cap : 1;
         cacheKiB_ = cacheKiB;
+        budgetKiB_ = uint64_t(cap_) * cacheKiB;
+        pressure_ = pressure;
     }
     // A reader connection on path (an idle one, or a new one). nullptr: *rc set.
     Conn* acquire(const std::string& path, OpenKind kind, int* rc, std::string* err);
     void release(Conn* c);
     void dropPath(const std::string& path);  // closes idle connections to path
-    void closeAll();
+    void closeAll();                         // closes every idle connection (also: memory relief)
     uint32_t open() const { return open_.load(std::memory_order_relaxed); }
-    // The pool keeps at least one idle connection per partition file (a
-    // type-wide read touches every file of its type; a cap below the file
-    // count reopens files on every such read).
-    void addFiles(uint32_t n) { files_.fetch_add(n, std::memory_order_relaxed); }
 
 private:
+    void trim(std::vector<Conn*>* close);  // mu_ held
+    void unlinkIdle(Conn* v);              // mu_ held
     std::mutex mu_;
     std::unordered_multimap<std::string, Conn*> idle_;
     std::list<Conn*> lru_;  // idle, oldest at the back
     std::unordered_map<Conn*, std::list<Conn*>::iterator> pos_;
     uint32_t cap_ = 256, cacheKiB_ = 512;
-    std::atomic<uint32_t> open_{0}, files_{0};
+    uint64_t budgetKiB_ = 256ull * 512, usedKiB_ = 0, pressure_ = 0;
+    std::atomic<uint32_t> open_{0};
 };
 
 // Maintenance work items.
@@ -545,9 +544,9 @@ struct P4Engine {
     // writers
     std::vector<std::unique_ptr<flatsql::p4::WriterState>> writers;
     std::atomic<uint32_t> nextOwner{0};
-    // writer connections (wconnMu): LRU over files with an open writer connection
+    // writer connections (wconnMu): LRU over feed files with an open writer connection
     std::mutex wconnMu;
-    std::list<flatsql::p4::Part*> wlru;
+    std::list<flatsql::p4::Feed*> wlru;
     uint32_t nWConn = 0;
     // reader connections
     flatsql::p4::ReaderPool rpool;
@@ -564,8 +563,8 @@ struct P4Engine {
     std::deque<flatsql::p4::MaintTask> maintQ;
     uint32_t maintThread = 0;
     // Long maintenance (REBUILD and QUOTA_GC slots, the configured quota, the
-    // full-text index) runs on its own thread, so WAL checkpoints and
-    // type-index flushes never wait behind it.
+    // full-text index) runs on its own thread, so WAL checkpoints never wait
+    // behind it. Its type work runs on each type's writer thread.
     std::thread slowThread;
     std::mutex slowMu;
     std::condition_variable slowCv;
@@ -625,92 +624,188 @@ int32_t engineStop(P4Engine* e, double deadlineMs);
 int32_t engineStats(P4Engine* e, uint8_t* out, int32_t cap);
 // The type index and journal, made on the type's first write (lazy T/ files).
 int32_t typeFilesEnsure(Type* t, std::string* err);
-Part* partFor(Type* t, const std::string& producer, const std::string& peer, bool create);  // mu held
-LaneDef* laneFor(Type* t, const std::string* f6, bool create);  // mu held; f6: provider, source, batch, ckey, ppeer, pkey
-SrcDef* srcFor(Type* t, const std::string& provider, const std::string& source, bool create);  // mu held
-uint64_t laneHash(const std::string* f6);
+// The feed of (provider, source); ("", "") is local. mu held. create: register
+// it (its file is made by its first write); *made is set when it is new.
+Feed* feedFor(Type* t, const std::string& provider, const std::string& source, bool create, bool* made = nullptr);
+Feed* feedRestore(Type* t, uint32_t fid, const std::string& provider, const std::string& source, const std::string& name);  // mu held
+uint32_t tokFor(Type* t, const std::string& token, const std::string& peer, bool create, bool* made = nullptr);  // mu held
+std::string pathJoin(const std::string& a, const std::string& b);
 
 // ---- journal.cpp ------------------------------------------------------------------------------
-// J_FILE marks a partition file the group changed: a retag-only group or a
-// tag-only supersede chunk changes its lane counters with no J_C/J_DEL row.
-enum JOp : int { J_PART = 1, J_LANE = 2, J_SRC = 3, J_FILE = 4, J_C = 5, J_IDENT = 6, J_DEL = 7 };
+// J_FEED and J_TOK register ids; J_TOUCH names a (record, feed file) a write
+// changes; J_IDENT an ingest identity. A write journals them (synchronous=FULL)
+// before its first file commit; open replays the tail: every touched record
+// is brought in line across its files and the type index is set from them.
+enum JOp : int { J_FEED = 1, J_TOK = 2, J_TOUCH = 3, J_IDENT = 4 };
 int32_t journalOpen(Type* t, std::string* err);
-int32_t journalReserve(Type* t, int64_t through);  // takes jmu
-int32_t journalReplay(Type* t, std::string* err);  // at open, before any read (M8)
+int32_t journalReplay(Type* t, std::string* err);  // at open, before any read (M8); also after a failed index commit
 
 // ---- type_index.cpp -----------------------------------------------------------------------------
 int32_t typeIndexOpen(Type* t, std::string* err);  // load the registry and counters
-// Every copy of key: pending layers over the type index.
-int32_t holdersOf(P4Lane* L, Type* t, const uint8_t* key, std::vector<Holder>* out);
-int32_t holdersWith(Type* t, Conn* idx, const uint8_t* key, std::vector<Holder>* out, bool locked);
-// How many other partitions hold key, for a removal's last-copy decision
-// (the caller holds Type::dmu, so every published write is counted and every
-// in-flight one is pending).
-int othersHolding(P4Lane* L, Type* t, const uint8_t* key, uint32_t pid);
-// The live holder of an ingest identity (0 when none).
-int32_t identHolder(P4Lane* L, Type* t, uint64_t src, const uint8_t h[32], int64_t* seq, uint8_t cid[32]);
+// The entries of a CID / of a seq.
+int32_t xOfCid(Conn* c, const uint8_t key[32], std::vector<XEnt>* out);
+int32_t xOfSeq(Conn* c, int64_t seq, std::vector<XEnt>* out);
 // A type-index reader connection for the lane; nullptr with *rc = P4_OK when
 // the type has no index yet (no data).
 Conn* indexReader(P4Lane* L, Type* t, int32_t* rc);
-// CID buckets (the type index's cb): a CID's bucket, and every bucket's
-// distinct CIDs counted from c, read from cb, or written to cb (with meta cb).
-constexpr int kCidBuckets = 4096;
-int cidBucket(const uint8_t* key);
-int cbCount(Conn* c, std::vector<int64_t>* n);
-int cbRead(Conn* c, std::vector<int64_t>* n);
-int cbWrite(Conn* c, const std::vector<int64_t>& n);
-// The maintenance thread passes wait = false: a type whose flush lock a
-// REBUILD holds is skipped this tick (its entries stay pending).
-int32_t typeIndexFlush(Type* t, bool force, bool wait = true);
+// The holder of an ingest identity (seq 0 when none).
+int32_t identGet(Conn* c, uint64_t src, const uint8_t h[32], int64_t* seq, uint8_t cid[32]);
+uint64_t identSrcOf(const std::string& provider, const std::string& source);
 
-// ---- partition.cpp -------------------------------------------------------------------------------
-// The writer connection of a file (created on first use), pinned for the caller.
-Conn* writerPin(P4Engine* e, Part* f, int32_t* rc, std::string* err);
-void writerUnpin(P4Engine* e, Part* f);
-int32_t fileSchema(Type* t, Conn* c, Part* f, bool indexes);
-int32_t fileCreateIndexes(Type* t, Conn* c);
-// A partition file's counters: its meta rows (committed with its rows) and
-// their copy in Part (Type::mu). Bounds: none is INT64_MAX / INT64_MIN.
-struct Counters {
-    int64_t n = 0, bytes = 0, ncopy = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN,
-            maxts = 0, nnull = 0, mints = INT64_MAX, mine = INT64_MAX, maxe = INT64_MIN;
+// One record's type-level change: its entries before and after (every feed
+// file holding it). xCount moves the counters in a TypeCounts copy (the
+// writer's, stored into the Type under its mu after the index commit);
+// xWrite writes the index rows (in the caller's index transaction).
+struct XChange {
+    std::vector<XEnt> before, after;
+    int64_t ts = 0;  // the record's ts (bounds of an added record)
 };
-Counters countersOf(const Part* f);              // Type::mu held
-void countersTo(Part* f, const Counters& k);     // Type::mu held
+struct TypeCounts {
+    int64_t uniq = 0, uniqBytes = 0, copies = 0, copyBytes = 0;
+    int64_t mine = INT64_MAX, maxe = INT64_MIN, mints = INT64_MAX, maxts = 0, maxseq = 0, nextSeq = 1;
+    std::vector<TokDef> toks;  // index id-1
+    std::set<uint32_t> dirtyToks;  // tokens whose counters (or registration) this write changes
+};
+TypeCounts typeCountsOf(Type* t);             // Type::mu held
+void typeCountsTo(Type* t, const TypeCounts& c);  // Type::mu held
+void xCount(const XChange& x, TypeCounts* tc);
+int xWrite(Conn* idx, const XChange& x);  // SQLite rc
+// A feed's mirror in the type index (its counters and live instances).
+struct FeedSnap {
+    uint32_t fid = 0;
+    std::string provider, source, name;
+    Counters k;
+    bool indexed = true;
+    std::map<InstId, InstCount> inst;
+};
+FeedSnap feedSnapOf(Feed* f);  // Type::mu held
+int indexPutFeed(Conn* idx, const FeedSnap& f);       // SQLite rc
+int indexPutCounts(Conn* idx, const TypeCounts& c);  // the meta counters and the dirty tokens
+int indexPutTok(Conn* idx, uint32_t id, const TokDef& d);
+
+// ---- partition.cpp (feed files) -------------------------------------------------------------------
+// The writer connection of a feed file (made with its schema on first use), pinned for the caller.
+Conn* writerPin(P4Engine* e, Feed* f, int32_t* rc, std::string* err);
+void writerUnpin(P4Engine* e, Feed* f);
+int32_t fileCreateIndexes(Type* t, Conn* c);
+int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes);
 int writeMeta(Conn* c, const Counters& k, int64_t now);  // in the caller's write transaction; SQLite rc
 int readMeta(Conn* c, Counters* k, bool* indexed);       // SQLite rc
-// A file's object count (meta 'nobj', files with r_ke) and epoch histogram
-// (table wh: rows with an epoch per hour, meta 'wh' = 1). Exact when present:
-// every writer keeps them in the transaction that changes the rows. A file
-// an older engine wrote has neither (readers walk) until REBUILD 1 or 2.
-struct KVal {
-    int type = 0;  // 0 none, 1 integer, 3 text
-    int64_t i = 0;
-    std::string s;
-    void bind(sqlite3_stmt* q, int at) const;
-    void from(sqlite3_stmt* q, int col);
+int readInst(Feed* f, Conn* c, std::map<InstId, InstCount>* out);  // SQLite rc; strings from the file's dictionary
+// The dictionary of a feed file, loaded through c (any connection of the
+// file) when needed. Returns false on a read error.
+bool dictEnsure(Feed* f, Conn* c);
+bool dictNode(Feed* f, Conn* c, uint32_t id, NodeDef* out);
+bool dictBatch(Feed* f, Conn* c, uint32_t id, BatchDef* out);
+std::string dictCkey(Conn* c, uint32_t id);  // "" for 0
+std::string dictUrl(Conn* c, uint32_t id);   // "" for 0
+void putGroup(P4Engine* e, uint32_t writer, Type* t, std::vector<WriteTask*>& tasks);
+// The supersede identity of a stored record (unsealed bytes only).
+std::string identityOf(const ps::TypeConfig& tc, const uint8_t* d, size_t n);
+
+// ---- record.cpp: a record's rows across its feed files, changed and committed ------------------
+struct RowR {
+    uint32_t fid = 0;
+    int64_t rid = 0;  // 0: a new row (its rid is assigned at the commit)
+    uint32_t tok = 0;          // the copy (type token id)
+    std::string peer;          // the copy's peer
+    bool inst = false;         // an instance (feed rows) or none (local rows)
+    std::string batch, ppeer, pkey, ckey;
+    std::string url;
+    int64_t at = 0;
+    int64_t ts = 0, len = 0;
+    std::string sig, fcols;
+    bool sealed = false;
+    bool hasD = false;
+    std::string d;
+    uint32_t srcFid = 0;   // a new row whose bytes are another row's (fetched at the commit)
+    int64_t srcRid = 0;
+    bool del = false;      // to delete
+    bool urlSet = false;   // the url changed (an existing row)
+    bool loaded = false;   // read from its file (an existing row)
+    uint32_t nId = 0, bId = 0, cId = 0, uId = 0;  // its file's ids (an existing row)
+    bool live() const { return !del; }
+    bool sameInst(const RowR& o) const {
+        return fid == o.fid && inst == o.inst && batch == o.batch && ppeer == o.ppeer && pkey == o.pkey && ckey == o.ckey;
+    }
 };
-inline int64_t hourOf(int64_t e) { return floorDiv(e, 3600); }
-struct Derived {
-    int64_t nobj = -1;  // -1: not kept by this file
-    bool wh = false;
-    std::map<int64_t, int64_t> dh;  // hour -> rows added (removed < 0)
-    int load(Conn* c, bool objects);  // in the write transaction; objects: the file has r_ke
-    bool fresh(Conn* c, const KVal& k, bool hasE, int64_t e);  // k has no row (before an insert, after a delete)
-    void added(bool freshK, bool hasE, int64_t e);
-    int removed(Conn* c, const KVal& k, bool hasE, int64_t e);  // after the row's delete
-    int save(Conn* c);
+struct RecState {
+    uint8_t key[32] = {};
+    int64_t seq = 0;
+    bool existed = false;  // in the type before this write
+    bool hasE = false;
+    int64_t e = 0, ts = 0, w = 0;
+    KVal k;
+    std::vector<XEnt> before;  // its index entries before
+    std::vector<RowR> rows;    // its rows: loaded, then changed
+    std::set<uint32_t> fids;   // feed files it has rows in (before), or gets rows in
+    std::set<uint32_t> touched;  // feed files whose rows (or index entry) this write changes
+    std::set<uint32_t> loadedFids;
 };
-int derivedRecount(Type* t, Conn* c);  // counts both from the rows, in the caller's write transaction
-bool derivedIntact(Type* t, const std::string& path);  // REBUILD 8: what the file keeps equals its rows
-void putGroup(P4Engine* e, uint32_t writer, Part* p, std::vector<WriteTask*>& tasks);
-void supersedePart(P4Engine* e, Part* p, WriteTask* task);
-// DELETE and quota: the given seqs of this partition's file.
-void deletePart(P4Engine* e, Part* p, WriteTask* task);
-// REBUILD 2 on the partition's writer: its counters and lane rows recounted
-// from its rows and tag instances, written back to the file and published.
-void repairPart(P4Engine* e, Part* p, WriteTask* task);
-void finishShared(P4Engine* e, Shared* s);
+// An ingest identity a write registers (IQC): (src, h) -> the record.
+struct IdentNew {
+    uint64_t src;
+    uint8_t h[32];
+    RecState* rec;
+};
+// One type's write context (the type's writer thread, or open's replay).
+class WriteCtx {
+public:
+    WriteCtx(Engine* e, Type* t);
+    ~WriteCtx();
+    Engine* e;
+    Type* t;
+    std::shared_ptr<const Spec> sp;
+    std::string err;
+    // A record by CID key / by seq: loaded from the type index and its files
+    // (nullptr with *rc on an error). A key with no entry is a new record.
+    RecState* byKey(const uint8_t key[32], int32_t* rc);
+    RecState* bySeq(int64_t seq, int32_t* rc, const std::set<uint32_t>* moreFids = nullptr);
+    RecState* known(int64_t seq);  // already loaded by this write
+    int32_t loadD(RowR& r);  // the stored bytes of an existing row
+    // A delivery: copy `copy.tok` (its data in `copy`, used when the copy is
+    // new) with the given instances. Every copy of the record then appears
+    // with every instance in each feed (local rows when it has none).
+    struct Inst {
+        uint32_t fid;
+        std::string batch, ppeer, pkey, ckey, url;
+        int64_t at;
+    };
+    struct Out {
+        bool copyNew = false, instNew = false, urlChanged = false;
+    };
+    void deliver(RecState* r, const RowR& copy, const std::vector<Inst>& insts, Out* out);
+    void normalize(RecState* r);  // every copy with every instance; local rows only without one
+    void dropFid(RecState* r, uint32_t fid);  // every row of the record in that feed
+    void dropAll(RecState* r);
+    void touchAll(RecState* r);  // its entries are rewritten from its rows (replay, repair)
+    const std::vector<RecState*>& records() const { return order_; }
+    // Journal (unless at replay: the journal's own rows), files, index.
+    int32_t commit(bool journal);
+    bool migrate = false;  // migrate mode: instance times are the caller's (C-36), new files without indexes
+    int64_t now = 0;
+    std::vector<IdentNew> idents;
+    std::set<uint32_t> committedFids, failedFids;
+    int64_t jlast = 0;  // the journal id this write ended at
+private:
+    int32_t loadRows(RecState* r, uint32_t fid);
+    int32_t journalWrite();
+    int32_t commitFile(Feed* f, const std::vector<RecState*>& recs);
+    int32_t indexCommit();
+    void fill(RecState* r);
+    std::deque<RecState> store_;
+    std::vector<RecState*> order_;
+    std::unordered_map<std::string, RecState*> byKey_;
+    std::unordered_map<int64_t, RecState*> bySeq_;
+};
+// The x entry of a record in one feed file from its live rows (false: none).
+bool entryOf(const RecState& r, uint32_t fid, XEnt* out);
+
+// ---- remove.cpp ----------------------------------------------------------------------------------
+void supersedeOp(P4Engine* e, Type* t, WriteTask* task);
+void deleteOp(P4Engine* e, Type* t, WriteTask* task);
+void quotaWork(P4Engine* e, Type* t, Internal* in);    // in->seqs: delete these records
+void rebuildWork(P4Engine* e, Type* t, Internal* in);  // in->what: 1, 2, 8
 
 // ---- reader.cpp -----------------------------------------------------------------------------------
 int32_t runRead(P4Lane* L, uint32_t op);  // ops 10-17 on a lane
@@ -719,8 +814,6 @@ int32_t runRead(P4Lane* L, uint32_t op);  // ops 10-17 on a lane
 void maintenanceLoop(P4Engine* e, uint32_t thread);
 void slowLoop(P4Engine* e);
 int32_t quotaGc(P4Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytes, bool enforce);
-int32_t rebuildOp(P4Engine* e, Type* only, uint32_t what, std::vector<std::array<int64_t, 2>>* rows,
-                  std::vector<Type*>* rowTypes, std::string* firstBad = nullptr);
 int32_t ftsCatchUp(P4Engine* e, Type* t, bool all);
 int walHook(void* arg, sqlite3* db, const char* zDb, int nPages);
 // Each WAL's frames not yet checkpointed (4 KiB pages), per engine; their sum
@@ -729,14 +822,16 @@ int64_t walBytesOf(P4Engine* e, const std::string& path);
 void walNote(P4Engine* e, const std::string& path, int64_t frames);  // 0 forgets the path
 void walExtNote(P4Engine* e, const std::string& path, int64_t frames);  // a WAL's extent (0: started over / gone)
 void typeFileBytes(Type* t);                  // refreshes idxBytes and ftsBytes (maintenance thread)
+// Runs internal work on the type's writer thread and waits for it.
+int32_t runOnWriter(P4Engine* e, Type* t, int op, Internal* in);
 
 // ---- mailbox.cpp --------------------------------------------------------------------------------------
 extern thread_local uint32_t tThread;  // the running service thread's index
 int32_t mailboxInit(P4Engine* e, std::string* err);
 void mailboxLayout(P4Engine* e, FlatsqlP4Layout* out);
 int32_t startThreads(P4Engine* e);
-// Queues a write task on its partition's owner writer (internal tasks too).
-void pushTask(P4Engine* e, Part* p, WriteTask* wt);
+// Queues a write task on its type's writer (internal tasks too).
+void pushTask(P4Engine* e, Type* t, WriteTask* wt);
 // The slot's output: append bytes to its ring (waits for space; checks cancel).
 int32_t emitBytes(P4Lane* L, const uint8_t* p, size_t n);
 int32_t flushOut(P4Lane* L);    // L->out to the ring (honours cancel and the caps)
@@ -756,7 +851,6 @@ struct SlotOut {
     int32_t flush();  // buffered bytes to the ring
     int32_t end(int32_t status, const std::string& err);
 };
-std::string pathJoin(const std::string& a, const std::string& b);
 
 }  // namespace p4
 }  // namespace flatsql

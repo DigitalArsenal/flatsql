@@ -1,17 +1,24 @@
-// Store format 4: partition files and the write path (design §2.1, §4).
+// Store format 4: feed files and the PUT path (CONTRACT C-37, §3.7).
 //
-// A partition (producer x type) is pinned to one writer thread, which holds
-// the one writer connection of its file. A group (one or more queued PUT
-// calls of the partition, at most group-commit records) is:
-//   1. prepared outside any lock: checks, extraction, the CID key;
-//   2. deduplicated: holders probed without the type lock; under the type's
-//      dedupe lock only the keys that looked new are rechecked, then seqs are
-//      assigned in content-time order and the range is in flight (M7);
-//   3. journaled (synchronous=FULL) before the partition file commits;
-//   4. written: one transaction (rows, tag instances, CAT supersede, the
-//      file's lane and meta counters);
-//   5. published: entries flushable, counters, the visible-through watermark;
-//   6. acked, after the commit and the publish (C-4).
+// A feed file (one source feed x standard) holds the deliveries of its feed:
+//   r(rid PK, seq, n, b, c, u, at, cid, e, k, ts, f, x, d, w = coalesce(e, ts))
+//     rid = seq << 16 | j: a record's rows are one rowid range (arrival order);
+//     n the publishing node (node: producer token, peer), b the batch (batch:
+//     batch, producer peer, producer key; 0 on local rows), c the content key
+//     and u the url (small ids, 0 = ""), at when this feed delivered it;
+//     d the record bytes verbatim (sealed bytes when sealed), x the
+//     signature, f a sealed record's extracted COL values.
+//   indexes: r_s(seq) arrival, r_c(cid), r_ke(k, e) object + epoch, r_w(w DESC, cid) epoch, r_b(b) batch
+//   inst(b, c, ...) each instance's counters; meta: the file's counters
+// The file is the feed: its provider and source are in its meta, never in a row.
+//
+// A PUT group (one or more queued PUT calls of a type, at most group-commit
+// records) runs on the type's writer: checks and extraction, each record
+// loaded from the type index and its feed files, its delivery planned (a new
+// record, a new copy, a new instance, a repeat), seqs assigned for new
+// records in content-time order, then the journal, the feed files and the
+// type index commit (record.cpp), and every call is acked after its records
+// are durable and visible (C-4).
 #include <algorithm>
 
 #include "internal.h"
@@ -19,51 +26,43 @@
 namespace flatsql {
 namespace p4 {
 
-// ---- partition files ------------------------------------------------------------------------
+// ---- feed files ------------------------------------------------------------------------------
 namespace {
 const char* kFileSchema =
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v) WITHOUT ROWID;"
-    "CREATE TABLE IF NOT EXISTS src(id INTEGER PRIMARY KEY, provider TEXT NOT NULL, source TEXT NOT NULL);"
-    "CREATE TABLE IF NOT EXISTS lane(id INTEGER PRIMARY KEY, sid INTEGER NOT NULL, batch TEXT NOT NULL,"
-    " ckey TEXT NOT NULL, ppeer TEXT NOT NULL, pkey TEXT NOT NULL, url TEXT, url0 TEXT, created INTEGER,"
-    " updated INTEGER, maxat INTEGER, n INTEGER, bytes INTEGER, minw INTEGER, maxw INTEGER, maxseq INTEGER,"
-    " maxts INTEGER, minseq INTEGER);"
-    "CREATE TABLE IF NOT EXISTS r(seq INTEGER PRIMARY KEY, cid BLOB NOT NULL, e INTEGER, k, ts INTEGER NOT NULL,"
-    " p TEXT, f BLOB, s INTEGER, x BLOB, d BLOB NOT NULL,"
-    " w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL);"
-    // Tag instances keyed by seq first: a page's tags are one key range (no
-    // lookups); rl_sid(sid, seq) serves source-ordered scans and supersede.
-    "CREATE TABLE IF NOT EXISTS rl(sid INTEGER NOT NULL, seq INTEGER NOT NULL, lane INTEGER NOT NULL,"
-    " at INTEGER NOT NULL, u TEXT, PRIMARY KEY(seq, sid, lane)) WITHOUT ROWID;"
-    // Rows with an epoch per hour (Derived): epoch window and day counts.
-    "CREATE TABLE IF NOT EXISTS wh(b INTEGER PRIMARY KEY, n INTEGER NOT NULL);";
+    "CREATE TABLE IF NOT EXISTS node(id INTEGER PRIMARY KEY, producer TEXT NOT NULL, peer TEXT NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS batch(id INTEGER PRIMARY KEY, batch TEXT NOT NULL, ppeer TEXT NOT NULL, pkey TEXT NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS ckey(id INTEGER PRIMARY KEY, ckey TEXT NOT NULL UNIQUE);"
+    "CREATE TABLE IF NOT EXISTS url(id INTEGER PRIMARY KEY, url TEXT NOT NULL UNIQUE);"
+    "CREATE TABLE IF NOT EXISTS inst(b INTEGER NOT NULL, c INTEGER NOT NULL, n INTEGER NOT NULL, bytes INTEGER NOT NULL,"
+    " minw, maxw, minseq, maxseq, first, updated, maxat, maxts, url TEXT, PRIMARY KEY(b, c)) WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS r(rid INTEGER PRIMARY KEY, seq INTEGER NOT NULL, n INTEGER NOT NULL, b INTEGER NOT NULL,"
+    " c INTEGER NOT NULL, u INTEGER NOT NULL, at INTEGER NOT NULL, cid BLOB NOT NULL, e INTEGER, k, ts INTEGER NOT NULL,"
+    " f BLOB, x BLOB, d BLOB NOT NULL, w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL);";
 }  // namespace
 
-// The file's indexes (owner layout, C-32): arrival seq (the rowid, and r_s:
-// the seqs alone, 12 B a row, for newest-N cuts and oldest-first quota);
-// source newest-first (rl_sid); object + epoch (r_ke: one seek per object for
-// EPOCH nearest / as_of / forward, object predicates, CAT supersede); epoch
-// windows (r_w on w = coalesce(e, ts), then the CID: a window's equal-w
-// group is in its CID order in the index, so a page reads only its own rows).
-// The type index is the one CID index (C-34): r_w is no CID lookup.
+// The file's indexes (C-37 (4)): arrival seq (r_s: the seqs alone, for
+// newest-N cuts and oldest-first quota), CID, object + epoch (r_ke: one seek
+// per object for EPOCH nearest / as_of / forward, object predicates, CAT
+// supersede), epoch windows (r_w on w = coalesce(e, ts), then the CID), and
+// the batch (r_b: batch supersede and batch-filtered reads).
 int32_t fileCreateIndexes(Type* t, Conn* c) {
     std::shared_ptr<const Spec> sp = t->spec();
     std::string ddl =
         "BEGIN IMMEDIATE;"
-        "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC, cid);"
         "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
-        "CREATE INDEX IF NOT EXISTS rl_sid ON rl(sid, seq);";
+        "CREATE INDEX IF NOT EXISTS r_c ON r(cid);"
+        "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC, cid);"
+        "CREATE INDEX IF NOT EXISTS r_b ON r(b);";
     if (sp->hasObject) ddl += "CREATE INDEX IF NOT EXISTS r_ke ON r(k, e);";
     ddl += "INSERT OR REPLACE INTO meta(k, v) VALUES('ix', 1);";
     int rc = c->exec(ddl.c_str());
-    if (rc == SQLITE_OK) rc = derivedRecount(t, c);
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) c->exec("ROLLBACK");
     return rc == SQLITE_OK ? P4_OK : statusOfSqlite(rc);
 }
 
-int32_t fileSchema(Type* t, Conn* c, Part* f, bool indexes) {
-    std::shared_ptr<const Spec> sp = t->spec();
+int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes) {
     std::string ddl = std::string("BEGIN IMMEDIATE;") + kFileSchema;
     int rc = c->exec(ddl.c_str());
     if (rc != SQLITE_OK) {
@@ -72,14 +71,15 @@ int32_t fileSchema(Type* t, Conn* c, Part* f, bool indexes) {
     }
     auto meta = [&](const char* k, const std::string& v) {
         sqlite3_stmt* s = c->get(S_META_SET);
+        if (!s) return false;
         sqlite3_bind_text(s, 1, k, -1, SQLITE_STATIC);
         sqlite3_bind_text(s, 2, v.data(), int(v.size()), SQLITE_TRANSIENT);
         const int r = sqlite3_step(s);
         sqlite3_reset(s);
         return r == SQLITE_DONE;
     };
-    bool ok = meta("format", "4") && meta("type", t->name) && meta("producer", f->producer) &&
-              meta("peer", f->peer) && meta("pid", std::to_string(f->pid)) && meta("wh", "1");
+    bool ok = meta("format", "4") && meta("layout", "feed") && meta("type", t->name) && meta("provider", f->provider) &&
+              meta("source", f->source) && meta("fid", std::to_string(f->fid));
     if (ok && !indexes) {
         sqlite3_stmt* s = c->sql("INSERT OR IGNORE INTO meta(k, v) VALUES('ix', 0)");
         ok = s && sqlite3_step(s) == SQLITE_DONE;
@@ -98,219 +98,22 @@ int32_t fileSchema(Type* t, Conn* c, Part* f, bool indexes) {
     return P4_OK;
 }
 
-// ---- the object count and the epoch histogram -----------------------------------------------------
-void KVal::bind(sqlite3_stmt* q, int at) const {
-    if (type == 1) sqlite3_bind_int64(q, at, i);
-    else if (type == 3) sqlite3_bind_text(q, at, s.data(), int(s.size()), SQLITE_TRANSIENT);
-    else sqlite3_bind_null(q, at);
-}
-
-void KVal::from(sqlite3_stmt* q, int col) {
-    const int ct = sqlite3_column_type(q, col);
-    type = ct == SQLITE_INTEGER ? 1 : ct == SQLITE_TEXT ? 3 : 0;
-    i = type == 1 ? sqlite3_column_int64(q, col) : 0;
-    if (type == 3) s.assign(reinterpret_cast<const char*>(sqlite3_column_text(q, col)), size_t(sqlite3_column_bytes(q, col)));
-    else s.clear();
-}
-
-int Derived::load(Conn* c, bool objects) {
-    nobj = -1;
-    wh = false;
-    dh.clear();
-    sqlite3_stmt* q = c->sql("SELECT k, v FROM meta WHERE k IN ('nobj','wh')");
-    if (!q) return SQLITE_ERROR;
-    int r;
-    while ((r = sqlite3_step(q)) == SQLITE_ROW) {
-        if (sqlite3_column_type(q, 1) == SQLITE_NULL) continue;
-        const char* k = reinterpret_cast<const char*>(sqlite3_column_text(q, 0));
-        if (k && std::strcmp(k, "nobj") == 0 && objects) nobj = sqlite3_column_int64(q, 1);
-        else if (k && std::strcmp(k, "wh") == 0) wh = sqlite3_column_int64(q, 1) == 1;
-    }
-    sqlite3_reset(q);
-    return r == SQLITE_DONE ? SQLITE_OK : r;
-}
-
-// No row of object k: probed next to (k, e), the entry the row's insert or
-// delete touches (the same r_ke leaf, so no extra page is read).
-bool Derived::fresh(Conn* c, const KVal& k, bool hasE, int64_t e) {
-    if (nobj < 0 || k.type == 0) return false;
-    auto probe = [&](const char* sql) -> int {
-        sqlite3_stmt* q = c->sql(sql);
-        if (!q) return SQLITE_ERROR;
-        k.bind(q, 1);
-        if (hasE) sqlite3_bind_int64(q, 2, e);
-        const int r = sqlite3_step(q);
-        sqlite3_reset(q);
-        return r;
-    };
-    int r;
-    if (hasE) {
-        r = probe("SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 AND e<=?2 ORDER BY e DESC LIMIT 1");
-        if (r == SQLITE_DONE) r = probe("SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 AND e>?2 ORDER BY e LIMIT 1");
-        if (r == SQLITE_DONE) r = probe("SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 AND e IS NULL LIMIT 1");
-    } else {
-        r = probe("SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 LIMIT 1");
-    }
-    if (r != SQLITE_ROW && r != SQLITE_DONE) nobj = -2;  // cannot keep it: dropped at save
-    return r == SQLITE_DONE;
-}
-
-void Derived::added(bool freshK, bool hasE, int64_t e) {
-    if (freshK && nobj >= 0) nobj++;
-    if (wh && hasE) dh[hourOf(e)]++;
-}
-
-int Derived::removed(Conn* c, const KVal& k, bool hasE, int64_t e) {
-    if (wh && hasE) dh[hourOf(e)]--;
-    if (nobj >= 0 && k.type != 0 && fresh(c, k, hasE, e)) nobj--;
-    return SQLITE_OK;
-}
-
-int Derived::save(Conn* c) {
-    if (wh) {
-        sqlite3_stmt* up = c->sql("INSERT INTO wh(b, n) VALUES(?1, ?2) ON CONFLICT(b) DO UPDATE SET n=n+excluded.n");
-        sqlite3_stmt* gone = c->sql("DELETE FROM wh WHERE b=?1 AND n<=0");
-        if (!up || !gone) return SQLITE_ERROR;
-        for (auto& kv : dh) {
-            if (kv.second == 0) continue;
-            sqlite3_bind_int64(up, 1, kv.first);
-            sqlite3_bind_int64(up, 2, kv.second);
-            int r = sqlite3_step(up);
-            sqlite3_reset(up);
-            if (r != SQLITE_DONE) return r;
-            if (kv.second > 0) continue;
-            sqlite3_bind_int64(gone, 1, kv.first);
-            r = sqlite3_step(gone);
-            sqlite3_reset(gone);
-            if (r != SQLITE_DONE) return r;
-        }
-        dh.clear();
-    }
-    if (nobj == -2) {  // a check failed: the count is no longer known
-        const int r = c->exec("DELETE FROM meta WHERE k='nobj'");
-        nobj = -1;
-        return r;
-    }
-    if (nobj >= 0) {
-        sqlite3_stmt* s = c->get(S_META_SET);
-        if (!s) return SQLITE_ERROR;
-        sqlite3_bind_text(s, 1, "nobj", -1, SQLITE_STATIC);
-        sqlite3_bind_int64(s, 2, nobj);
-        const int r = sqlite3_step(s);
-        sqlite3_reset(s);
-        if (r != SQLITE_DONE) return r;
-    }
-    return SQLITE_OK;
-}
-
-namespace {
-// Both counts from the rows: one pass over r_ke's (k, e) keys when the file
-// has them, else over the rows.
-int derivedCount(bool objects, Conn* c, std::map<int64_t, int64_t>* hours, int64_t* nobj) {
-    sqlite3_stmt* q = c->sql(objects ? "SELECT k, e FROM r INDEXED BY r_ke" : "SELECT NULL, e FROM r WHERE e IS NOT NULL");
-    if (!q) return SQLITE_ERROR;
-    *nobj = 0;
-    KVal prev, cur;
-    int r;
-    while ((r = sqlite3_step(q)) == SQLITE_ROW) {
-        if (objects) {
-            cur.from(q, 0);
-            if (cur.type != 0 && (cur.type != prev.type || cur.i != prev.i || cur.s != prev.s)) {
-                (*nobj)++;
-                std::swap(prev, cur);
-            }
-        }
-        if (sqlite3_column_type(q, 1) != SQLITE_NULL) (*hours)[hourOf(sqlite3_column_int64(q, 1))]++;
-    }
-    sqlite3_reset(q);
-    return r == SQLITE_DONE ? SQLITE_OK : r;
-}
-}  // namespace
-
-bool derivedIntact(Type* t, const std::string& path) {
-    Conn* c = nullptr;
-    if (openConn(path, OpenKind::Maint, 4096, 0, &c, nullptr) != SQLITE_OK) return false;
-    bool ok = c->exec("BEGIN") == SQLITE_OK;
-    Derived d;
-    bool ix = true;
-    {
-        sqlite3_stmt* m = c->sql("SELECT v FROM meta WHERE k='ix'");
-        if (m && sqlite3_step(m) == SQLITE_ROW && sqlite3_column_type(m, 0) != SQLITE_NULL) ix = sqlite3_column_int64(m, 0) != 0;
-        if (m) sqlite3_reset(m);
-    }
-    const bool objects = t->spec()->hasObject && ix;
-    if (ok) ok = d.load(c, objects) == SQLITE_OK;
-    if (ok && (d.wh || d.nobj >= 0)) {
-        std::map<int64_t, int64_t> hours, stored;
-        int64_t nobj = 0;
-        ok = derivedCount(objects, c, &hours, &nobj) == SQLITE_OK;
-        if (ok && d.nobj >= 0) ok = nobj == d.nobj;
-        if (ok && d.wh) {
-            sqlite3_stmt* q = c->sql("SELECT b, n FROM wh");
-            ok = q != nullptr;
-            while (ok && sqlite3_step(q) == SQLITE_ROW) stored[sqlite3_column_int64(q, 0)] = sqlite3_column_int64(q, 1);
-            if (q) sqlite3_reset(q);
-            ok = ok && stored == hours;
-        }
-    }
-    c->exec("COMMIT");
-    delete c;
-    return ok;
-}
-
-int derivedRecount(Type* t, Conn* c) {
-    const bool objects = t->spec()->hasObject;
-    int rc = c->exec("CREATE TABLE IF NOT EXISTS wh(b INTEGER PRIMARY KEY, n INTEGER NOT NULL); DELETE FROM wh;");
-    if (rc != SQLITE_OK) return rc;
-    std::map<int64_t, int64_t> hours;
-    int64_t nobj = 0;
-    int r = derivedCount(objects, c, &hours, &nobj);
-    if (r != SQLITE_OK) return r;
-    sqlite3_stmt* ins = c->sql("INSERT INTO wh(b, n) VALUES(?1, ?2)");
-    if (!ins) return SQLITE_ERROR;
-    for (auto& kv : hours) {
-        sqlite3_bind_int64(ins, 1, kv.first);
-        sqlite3_bind_int64(ins, 2, kv.second);
-        r = sqlite3_step(ins);
-        sqlite3_reset(ins);
-        if (r != SQLITE_DONE) return r;
-    }
-    std::string meta = "INSERT OR REPLACE INTO meta(k, v) VALUES('wh', 1);";
-    if (objects) meta += "INSERT OR REPLACE INTO meta(k, v) VALUES('nobj', " + std::to_string(nobj) + ");";
-    return c->exec(meta.c_str());
-}
-
-// ---- the file's counters ------------------------------------------------------------------------
-Counters countersOf(const Part* f) {
-    Counters k;
-    k.n = f->n; k.bytes = f->bytes; k.ncopy = f->ncopy; k.minseq = f->minseq; k.maxseq = f->maxseq;
-    k.minw = f->minw; k.maxw = f->maxw; k.maxts = f->maxts; k.nnull = f->nnull;
-    k.mints = f->mints; k.mine = f->mine; k.maxe = f->maxe;
-    return k;
-}
-
-void countersTo(Part* f, const Counters& k) {
-    f->n = k.n; f->bytes = k.bytes; f->ncopy = k.ncopy; f->minseq = k.minseq; f->maxseq = k.maxseq;
-    f->minw = k.minw; f->maxw = k.maxw; f->maxts = k.maxts; f->nnull = k.nnull;
-    f->mints = k.mints; f->mine = k.mine; f->maxe = k.maxe;
-}
-
 int writeMeta(Conn* c, const Counters& k, int64_t now) {
-    const bool any = k.n > 0;
+    const bool any = k.rows > 0;
     const struct {
         const char* k;
         bool set;
         int64_t v;
-    } kv[] = {{"n", true, k.n},
+    } kv[] = {{"rows", true, k.rows},
+              {"recs", true, k.recs},
               {"bytes", true, k.bytes},
-              {"ncopy", true, k.ncopy},
+              {"nnull", true, k.nnull},
               {"minseq", any && k.minseq != INT64_MAX, k.minseq},
               {"maxseq", true, k.maxseq},
               {"minw", any && k.minw != INT64_MAX, k.minw},
               {"maxw", any && k.maxw != INT64_MIN, k.maxw},
-              {"maxts", true, k.maxts},
-              {"nnull", true, k.nnull},
               {"mints", any && k.mints != INT64_MAX, k.mints},
+              {"maxts", true, k.maxts},
               {"mine", k.mine != INT64_MAX, k.mine},
               {"maxe", k.maxe != INT64_MIN, k.maxe},
               {"updated", true, now}};
@@ -336,19 +139,19 @@ int readMeta(Conn* c, Counters* k, bool* indexed) {
     while ((r = sqlite3_step(s)) == SQLITE_ROW) {
         if (sqlite3_column_type(s, 1) == SQLITE_NULL) continue;
         const char* key = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-        const int64_t v = sqlite3_column_int64(s, 1);
         if (!key) continue;
         const std::string n(key);
-        if (n == "n") k->n = v;
+        const int64_t v = sqlite3_column_int64(s, 1);
+        if (n == "rows") k->rows = v;
+        else if (n == "recs") k->recs = v;
         else if (n == "bytes") k->bytes = v;
-        else if (n == "ncopy") k->ncopy = v;
+        else if (n == "nnull") k->nnull = v;
         else if (n == "minseq") k->minseq = v;
         else if (n == "maxseq") k->maxseq = v;
         else if (n == "minw") k->minw = v;
         else if (n == "maxw") k->maxw = v;
-        else if (n == "maxts") k->maxts = v;
-        else if (n == "nnull") k->nnull = v;
         else if (n == "mints") k->mints = v;
+        else if (n == "maxts") k->maxts = v;
         else if (n == "mine") k->mine = v;
         else if (n == "maxe") k->maxe = v;
         else if (n == "ix") *indexed = v != 0;
@@ -357,8 +160,126 @@ int readMeta(Conn* c, Counters* k, bool* indexed) {
     return r == SQLITE_DONE ? SQLITE_OK : r;
 }
 
-// ---- writer connections (≤ writer conns open; the LRU never closes a pinned one) ----------------
-Conn* writerPin(Engine* e, Part* f, int32_t* rc, std::string* err) {
+int readInst(Feed* f, Conn* c, std::map<InstId, InstCount>* out) {
+    out->clear();
+    if (!dictEnsure(f, c)) return SQLITE_ERROR;
+    sqlite3_stmt* s = c->sql("SELECT b, c, n, bytes, minw, maxw, minseq, maxseq, first, updated, maxat, maxts, url FROM inst");
+    if (!s) return SQLITE_ERROR;
+    int r;
+    std::vector<std::pair<InstId, InstCount>> got;
+    while ((r = sqlite3_step(s)) == SQLITE_ROW) {
+        InstCount ic;
+        const InstId id(uint32_t(sqlite3_column_int64(s, 0)), uint32_t(sqlite3_column_int64(s, 1)));
+        ic.n = sqlite3_column_int64(s, 2);
+        ic.bytes = sqlite3_column_int64(s, 3);
+        ic.minw = sqlite3_column_type(s, 4) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 4);
+        ic.maxw = sqlite3_column_type(s, 5) == SQLITE_NULL ? INT64_MIN : sqlite3_column_int64(s, 5);
+        ic.minseq = sqlite3_column_type(s, 6) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 6);
+        ic.maxseq = sqlite3_column_int64(s, 7);
+        ic.first = sqlite3_column_int64(s, 8);
+        ic.updated = sqlite3_column_int64(s, 9);
+        ic.maxat = sqlite3_column_int64(s, 10);
+        ic.maxts = sqlite3_column_int64(s, 11);
+        const unsigned char* u = sqlite3_column_text(s, 12);
+        if (u) ic.url = reinterpret_cast<const char*>(u);
+        if (ic.n > 0) got.push_back({id, std::move(ic)});
+    }
+    sqlite3_reset(s);
+    if (r != SQLITE_DONE) return r;
+    for (auto& kv : got) {
+        BatchDef bd;
+        if (!dictBatch(f, c, kv.first.first, &bd)) return SQLITE_CORRUPT;
+        kv.second.batch = bd.batch;
+        kv.second.ppeer = bd.ppeer;
+        kv.second.pkey = bd.pkey;
+        kv.second.ckey = dictCkey(c, kv.first.second);
+        (*out)[kv.first] = std::move(kv.second);
+    }
+    return SQLITE_OK;
+}
+
+// ---- the dictionary -------------------------------------------------------------------------------
+namespace {
+// Loads the node and batch tables through c (ids only grow; a reload adds
+// what a newer snapshot has). dictMu held.
+bool dictLoad(Feed* f, Conn* c) {
+    Dict& d = f->dict;
+    sqlite3_stmt* q = c->sql("SELECT id, producer, peer FROM node WHERE id>?1 ORDER BY id");
+    if (!q) return false;
+    sqlite3_bind_int64(q, 1, int64_t(d.node.size()));
+    int r;
+    while ((r = sqlite3_step(q)) == SQLITE_ROW) {
+        const uint32_t id = uint32_t(sqlite3_column_int64(q, 0));
+        if (id != d.node.size() + 1) break;  // ids are dense from 1
+        NodeDef n{reinterpret_cast<const char*>(sqlite3_column_text(q, 1)), reinterpret_cast<const char*>(sqlite3_column_text(q, 2))};
+        d.nodeId[nodeKey(n.producer, n.peer)] = id;
+        d.node.push_back(std::move(n));
+    }
+    sqlite3_reset(q);
+    if (r != SQLITE_DONE && r != SQLITE_ROW) return false;
+    q = c->sql("SELECT id, batch, ppeer, pkey FROM batch WHERE id>?1 ORDER BY id");
+    if (!q) return false;
+    sqlite3_bind_int64(q, 1, int64_t(d.batch.size()));
+    while ((r = sqlite3_step(q)) == SQLITE_ROW) {
+        const uint32_t id = uint32_t(sqlite3_column_int64(q, 0));
+        if (id != d.batch.size() + 1) break;
+        BatchDef b{reinterpret_cast<const char*>(sqlite3_column_text(q, 1)), reinterpret_cast<const char*>(sqlite3_column_text(q, 2)),
+                   reinterpret_cast<const char*>(sqlite3_column_text(q, 3))};
+        d.batchId[batchKey(b.batch, b.ppeer, b.pkey)] = id;
+        d.batch.push_back(std::move(b));
+    }
+    sqlite3_reset(q);
+    if (r != SQLITE_DONE && r != SQLITE_ROW) return false;
+    d.loaded = true;
+    return true;
+}
+}  // namespace
+
+bool dictEnsure(Feed* f, Conn* c) {
+    std::lock_guard<std::mutex> g(f->dictMu);
+    if (f->dict.loaded) return true;
+    return dictLoad(f, c);
+}
+
+bool dictNode(Feed* f, Conn* c, uint32_t id, NodeDef* out) {
+    std::lock_guard<std::mutex> g(f->dictMu);
+    if (id == 0) return false;
+    if (id > f->dict.node.size() && !dictLoad(f, c)) return false;
+    if (id > f->dict.node.size()) return false;
+    *out = f->dict.node[id - 1];
+    return true;
+}
+
+bool dictBatch(Feed* f, Conn* c, uint32_t id, BatchDef* out) {
+    std::lock_guard<std::mutex> g(f->dictMu);
+    if (id == 0) return false;
+    if (id > f->dict.batch.size() && !dictLoad(f, c)) return false;
+    if (id > f->dict.batch.size()) return false;
+    *out = f->dict.batch[id - 1];
+    return true;
+}
+
+namespace {
+std::string textOf(Conn* c, StmtId id, uint32_t v) {
+    if (v == 0) return std::string();
+    sqlite3_stmt* q = c->get(id);
+    if (!q) return std::string();
+    sqlite3_bind_int64(q, 1, v);
+    std::string out;
+    if (sqlite3_step(q) == SQLITE_ROW) {
+        const unsigned char* t = sqlite3_column_text(q, 0);
+        if (t) out.assign(reinterpret_cast<const char*>(t), size_t(sqlite3_column_bytes(q, 0)));
+    }
+    sqlite3_reset(q);
+    return out;
+}
+}  // namespace
+
+std::string dictCkey(Conn* c, uint32_t id) { return textOf(c, S_CKEY_TEXT, id); }
+std::string dictUrl(Conn* c, uint32_t id) { return textOf(c, S_URL_TEXT, id); }
+
+// ---- writer connections (<= writer conns open; the LRU never closes a pinned one) ----------------
+Conn* writerPin(Engine* e, Feed* f, int32_t* rc, std::string* err) {
     {
         std::lock_guard<std::mutex> g(e->wconnMu);
         if (f->w) {
@@ -372,7 +293,13 @@ Conn* writerPin(Engine* e, Part* f, int32_t* rc, std::string* err) {
     }
     Type* t = f->type;
     std::shared_ptr<const Spec> sp = t->spec();
-    if (!f->created) {
+    bool created, indexed;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        created = f->created;
+        indexed = f->indexed;
+    }
+    if (!created) {
         // The directory chain and the empty file, made durable, before SQLite opens it.
         const int32_t r = ioTouch(f->path);
         if (r != P4_OK) {
@@ -389,26 +316,23 @@ Conn* writerPin(Engine* e, Part* f, int32_t* rc, std::string* err) {
         return nullptr;
     }
     sqlite3_wal_hook(c->db, walHook, e);
-    if (!f->created) {
-        bool migrating = false;
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            migrating = !f->indexed;
-        }
-        const int32_t s = fileSchema(t, c, f, !migrating);
+    if (!created) {
+        const int32_t s = fileSchema(t, c, f, indexed);
         if (s != P4_OK) {
             delete c;
             *rc = s;
             if (err) *err = "schema " + f->path;
             return nullptr;
         }
+        std::lock_guard<std::mutex> g(t->mu);
+        f->created = true;
     }
     std::vector<Conn*> victims;
     {
         std::lock_guard<std::mutex> g(e->wconnMu);
         while (e->nWConn >= e->cfg.writerConns && !e->wlru.empty()) {
             auto it = e->wlru.end();
-            Part* v = nullptr;
+            Feed* v = nullptr;
             while (it != e->wlru.begin()) {
                 --it;
                 if ((*it)->wPins == 0) {
@@ -432,21 +356,35 @@ Conn* writerPin(Engine* e, Part* f, int32_t* rc, std::string* err) {
     }
     // Closing a connection may checkpoint: the maintenance thread does it.
     if (!victims.empty()) {
-        std::lock_guard<std::mutex> g(e->maintMu);
-        for (Conn* v : victims) {
-            MaintTask mt;
-            mt.kind = MaintTask::kClose;
-            mt.conn = v;
-            e->maintQ.push_back(mt);
+        {
+            std::lock_guard<std::mutex> g(e->maintMu);
+            for (Conn* v : victims) {
+                MaintTask mt;
+                mt.kind = MaintTask::kClose;
+                mt.conn = v;
+                e->maintQ.push_back(mt);
+            }
         }
+        e->kickMaintenance();
     }
-    if (!victims.empty()) e->kickMaintenance();
     return c;
 }
 
-void writerUnpin(Engine* e, Part* f) {
+void writerUnpin(Engine* e, Feed* f) {
     std::lock_guard<std::mutex> g(e->wconnMu);
     if (f->wPins > 0) f->wPins--;
+}
+
+// The supersede identity of a stored record (unsealed bytes only).
+std::string identityOf(const ps::TypeConfig& tc, const uint8_t* d, size_t n) {
+    if (!d || n < 8) return std::string();
+    std::vector<uint8_t> frame(n + 4);
+    st32(frame.data(), uint32_t(n));
+    std::memcpy(frame.data() + 4, d, n);
+    ps::Extracted x;
+    uint8_t scratch[2048];
+    tc.extract(frame.data(), frame.size(), &x, scratch, sizeof scratch);
+    return x.identity ? std::string(reinterpret_cast<const char*>(x.identity), x.identityLen) : std::string();
 }
 
 // ---- PUT -------------------------------------------------------------------------------------------
@@ -458,7 +396,7 @@ struct TagIn {
     std::string f6[6];  // provider, source, batch, ckey, ppeer, pkey
     std::string url;
     bool valid = true;
-    LaneDef* lane = nullptr;
+    uint32_t fid = 0;
 };
 
 struct Rec {
@@ -481,31 +419,15 @@ struct Rec {
     uint8_t key[32];
     bool hasE = false;
     int64_t e = 0, w = 0;
-    int kType = 0;  // 0 none, 1 int, 3 text
-    int64_t kInt = 0;
-    std::string kText;
+    KVal k;
     std::string fCols;  // sealed: the extracted COL values
     bool hasSup = false;
     std::string supIdentity;
-    uint32_t supSid = 0;  // the scope of this write (0: unattributed)
     const uint8_t* d = nullptr;
     uint32_t dLen = 0;
-    // decision
+    // outcome
     int action = 0;
-    int64_t seq = 0;
-    bool inFile = false;  // written to this partition's file (a row or tag instances)
-    bool write = false;   // a new row in this partition (NEW, COPY, MIGRATED)
-    bool dupOf = false;   // a repeat of an earlier record of the group
-    size_t first = 0;     // that record (group index)
-    std::vector<uint8_t> own;  // COPY: the holder's bytes
-    bool identNew = false;
-    uint64_t identSrc = 0;
-    uint8_t identCid[32];
-    std::vector<std::pair<uint32_t, int64_t>> inst;  // (lane id, at)
-    std::vector<std::string> instUrl;
-    bool retagged = false;
-    bool urlChanged = false;
-    bool superseded = false;  // retired by a later record of the group
+    RecState* rs = nullptr;
 };
 
 struct Call {
@@ -513,41 +435,13 @@ struct Call {
     uint32_t slot = 0;
     int mode = 0;
     std::string peer, token;
+    uint32_t tok = 0;
     std::vector<TagIn> tags;
     int64_t at = 0;
     std::vector<size_t> recs;  // group indexes
     int32_t status = P4_OK;
     std::string err;
 };
-
-// A deletion: a row of this partition's file.
-struct Del {
-    int64_t seq, len, w;
-    bool hasE = false;
-    int64_t e = 0;
-    KVal k;
-    uint8_t key[32];
-    std::vector<std::pair<uint32_t, uint32_t>> lanes;  // (sid, lane) of its tags
-    int others = 0;  // other holders of the CID
-};
-
-void bindK(sqlite3_stmt* s, int i, const Rec& r) {
-    if (r.kType == 1) sqlite3_bind_int64(s, i, r.kInt);
-    else if (r.kType == 3) sqlite3_bind_text(s, i, r.kText.data(), int(r.kText.size()), SQLITE_STATIC);
-    else sqlite3_bind_null(s, i);
-}
-
-// The supersede identity of a stored record (unsealed bytes only).
-std::string identityOf(const ps::TypeConfig& tc, const uint8_t* d, size_t n) {
-    if (!d || n < 8) return std::string();
-    std::vector<uint8_t> frame(n + 4);
-    st32(frame.data(), uint32_t(n));
-    std::memcpy(frame.data() + 4, d, n);
-    ps::Extracted x;
-    uint8_t scratch[2048];
-    tc.extract(frame.data(), frame.size(), &x, scratch, sizeof scratch);
-    return x.identity ? std::string(reinterpret_cast<const char*>(x.identity), x.identityLen) : std::string();
-}
 
 // Sealed records keep their extracted COL values in r.f: [u8 col][u8 type 1|3][u64 | u16 len + bytes].
 std::string encodeCols(const ps::Extracted& x, uint32_t nCols) {
@@ -575,46 +469,23 @@ std::string encodeCols(const ps::Extracted& x, uint32_t nCols) {
 
 class Group {
 public:
-    Group(Engine* e, uint32_t writer, Part* p) : e_(e), p_(p), t_(p->type) {
-        (void)writer;
-        L_.e = e;
-        L_.thread = writer;
-        L_.cls = P4_CLASS_WRITE;
-    }
-    ~Group() {
-        for (auto& kv : L_.idx) delete kv.second;
-        L_.idx.clear();
-    }
+    Group(Engine* e, Type* t) : e_(e), t_(t) {}
     void run(std::vector<WriteTask*>& tasks);
 
 private:
     bool parseCall(Call& c);
     void prepare(Rec& r, const Call& c);
-    int32_t probe();
-    int32_t assign();
-    int32_t writeJournal();
-    int32_t writeFile(std::vector<size_t>& idxs);
-    void publish(bool committed);
-    void respond();
-    int32_t readHolder(const Holder& h, Rec& r);
     void fail(int32_t status, const std::string& err);
+    void respond();
+    int32_t supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t scope);
 
     Engine* e_;
-    Part* p_;
     Type* t_;
     std::shared_ptr<const Spec> sp_;
-    P4Lane L_;  // the probes' type-index connections
     std::vector<Call> calls_;
     std::vector<Rec> recs_;
     std::vector<uint32_t> callOf_;  // record index -> its call
-    bool writes_ = false;     // the group writes the partition file
-    std::vector<Del> dels_;   // CAT supersede-on-ingest: rows retired by this group
-    std::vector<std::pair<int64_t, int64_t>> inflight_;
-    int64_t jfirst_ = 0;
-    uint64_t flushEpoch_ = 0;
-    std::vector<uint32_t> newLanes_, newSrcs_;
-    bool partNew_ = false;
-    std::string lastErr_;
+    std::map<std::pair<uint32_t, std::string>, RecState*> supOf_;  // (feed, identity) -> its record in this group
 };
 
 bool Group::parseCall(Call& c) {
@@ -762,7 +633,7 @@ void Group::prepare(Rec& r, const Call& c) {
         return;
     }
     if (c.mode == 1) {
-        if (r.seqIn <= 0) { r.reject = P4_REJ_SEQ; return; }
+        if (r.seqIn <= 0 || r.seqIn > (int64_t(1) << 46)) { r.reject = P4_REJ_SEQ; return; }
         for (auto& ti : r.tagsIn)
             if (ti.first >= c.tags.size() || !c.tags[ti.first].valid) { r.reject = P4_REJ_TAG; return; }
     } else {
@@ -779,11 +650,11 @@ void Group::prepare(Rec& r, const Call& c) {
     if (x.objectCol >= 0 && x.objectCol < int(ps::kMaxCols) && x.cols[x.objectCol].present) {
         const ps::ColValue& cv = x.cols[x.objectCol];
         if (cv.isU64) {
-            r.kType = 1;
-            r.kInt = int64_t(cv.u);
+            r.k.type = 1;
+            r.k.i = int64_t(cv.u);
         } else {
-            r.kType = 3;
-            r.kText.assign(reinterpret_cast<const char*>(cv.s), cv.n);
+            r.k.type = 3;
+            r.k.s.assign(reinterpret_cast<const char*>(cv.s), cv.n);
         }
     }
     if (x.identity && x.identityLen) {
@@ -798,651 +669,6 @@ void Group::prepare(Rec& r, const Call& c) {
         r.d = r.frame + 4;
         r.dLen = r.frameLen - 4;
     }
-    // Tag instances.
-    if (c.mode == 1) {
-        for (auto& ti : r.tagsIn) r.inst.push_back({ti.first, ti.second});
-    } else {
-        for (size_t i = 0; i < c.tags.size(); i++) r.inst.push_back({uint32_t(i), c.at});
-    }
-}
-
-int32_t Group::readHolder(const Holder& h, Rec& r) {
-    Part* hf = nullptr;
-    {
-        std::lock_guard<std::mutex> g(t_->mu);
-        Part* hp = t_->partById(h.pid);
-        if (hp && hp->created) hf = hp;
-    }
-    if (!hf) return 0;
-    int rc = 0;
-    std::string err;
-    Conn* c = e_->rpool.acquire(hf->path, OpenKind::Reader, &rc, &err);
-    if (!c) return statusOfSqlite(rc);
-    sqlite3_stmt* s = c->get(S_R_HOLDER);
-    int found = 0;
-    int32_t status = P4_OK;
-    if (!s) status = P4_E_INTERNAL;
-    else {
-        sqlite3_bind_int64(s, 1, h.seq);
-        const int sr = sqlite3_step(s);
-        if (sr == SQLITE_ROW && sqlite3_column_bytes(s, 2) == 32 && std::memcmp(sqlite3_column_blob(s, 2), r.key, 32) == 0) {
-            const uint8_t* d = static_cast<const uint8_t*>(sqlite3_column_blob(s, 0));
-            r.own.assign(d, d + sqlite3_column_bytes(s, 0));
-            r.ts = sqlite3_column_int64(s, 1);
-            found = 1;
-        } else if (sr != SQLITE_ROW && sr != SQLITE_DONE) {
-            status = statusOfSqlite(sr);
-        }
-        sqlite3_reset(s);
-    }
-    e_->rpool.release(c);
-    return status != P4_OK ? status : found;
-}
-
-// Dedupe probes (no type lock), then the recheck and seq assignment under dmu.
-int32_t Group::probe() {
-    {
-        std::lock_guard<std::mutex> g(t_->mu);
-        flushEpoch_ = uint64_t(t_->lastFlushMs);
-    }
-    // In-group repeats: sort by key; later occurrences repeat the first.
-    std::vector<size_t> ord;
-    for (size_t i = 0; i < recs_.size(); i++)
-        if (!recs_[i].reject && recs_[i].frame) ord.push_back(i);
-    std::stable_sort(ord.begin(), ord.end(),
-                     [&](size_t a, size_t b) { return std::memcmp(recs_[a].key, recs_[b].key, 32) < 0; });
-    std::vector<Holder> hs;
-    for (size_t oi = 0; oi < ord.size(); oi++) {
-        Rec& r = recs_[ord[oi]];
-        if (oi > 0) {
-            Rec& q = recs_[ord[oi - 1]];
-            if (std::memcmp(q.key, r.key, 32) == 0) {
-                r.dupOf = true;
-                r.first = q.dupOf ? q.first : ord[oi - 1];
-                continue;
-            }
-        }
-        int32_t rc = holdersOf(&L_, t_, r.key, &hs);
-        if (rc != P4_OK) return rc;
-        const Holder* mine = nullptr;
-        for (const Holder& h : hs)
-            if (h.pid == p_->pid) mine = &h;
-        const bool migrate = calls_[0].mode == 1;  // a group never mixes modes (run() splits them)
-        if (mine) {
-            r.seq = mine->seq;
-            if (migrate && r.seqIn != mine->seq) { r.reject = P4_REJ_SEQ; continue; }
-            r.action = migrate ? P4_ACT_MIGRATED : P4_ACT_DUP;  // DUP becomes RETAG if an instance is new
-            continue;
-        }
-        bool copied = false;
-        for (const Holder& h : hs) {
-            if (migrate) {
-                if (r.seqIn != h.seq) { r.reject = P4_REJ_SEQ; break; }
-                // C-35: a migrated copy stores its OWN bytes and ts (that
-                // format-1 table's stored bytes; a sealed envelope differs per
-                // copy). Stored bytes never change.
-                r.seq = h.seq;
-                r.action = P4_ACT_COPY;
-                r.write = true;
-                copied = true;
-                break;
-            }
-            const int32_t got = readHolder(h, r);
-            if (got < 0) return got;
-            if (got == 1) {
-                r.seq = h.seq;
-                r.action = P4_ACT_COPY;
-                r.write = true;
-                r.d = r.own.data();
-                r.dLen = uint32_t(r.own.size());
-                r.sealed = nullptr;
-                copied = true;
-                break;
-            }
-        }
-        if (r.reject || copied) continue;
-        if (migrate && sp_->identity && r.ident && !r.tagsIn.empty()) {
-            // A migrated record keeps its ingest identity (format 1's
-            // sdn_record_ingest_identity row) for later ingest-mode repeats.
-            const Call& c = calls_[callOf_[ord[oi]]];
-            if (r.tagsIn[0].first < c.tags.size()) {
-                const std::string b = c.tags[r.tagsIn[0].first].f6[0] + '\0' + c.tags[r.tagsIn[0].first].f6[1];
-                uint8_t dg[32];
-                ps::sha256(b.data(), b.size(), dg);
-                r.identSrc = ld64(dg) & 0x7fffffffffffffffull;
-                r.identNew = true;
-                std::memcpy(r.identCid, r.key, 32);
-            }
-        }
-        // An ingest identity the lane already holds (IQC).
-        if (sp_->identity && r.ident && !migrate) {
-            const Call* call = &calls_[callOf_[ord[oi]]];
-            if (!call->tags.empty()) {
-                std::string ps2[2] = {call->tags[0].f6[0], call->tags[0].f6[1]};
-                std::string b = ps2[0] + '\0' + ps2[1];
-                uint8_t dg[32];
-                ps::sha256(b.data(), b.size(), dg);
-                r.identSrc = ld64(dg) & 0x7fffffffffffffffull;
-                int64_t hseq = 0;
-                uint8_t hcid[32];
-                rc = identHolder(&L_, t_, r.identSrc, r.ident, &hseq, hcid);
-                if (rc != P4_OK) return rc;
-                if (hseq) {
-                    std::vector<Holder> ih;
-                    rc = holdersOf(&L_, t_, hcid, &ih);
-                    if (rc != P4_OK) return rc;
-                    if (!ih.empty()) {
-                        // The holder takes this write's tags: retag it here, or copy it here.
-                        r.action = P4_ACT_IDENT_DUP;
-                        std::memcpy(r.key, hcid, 32);
-                        r.seq = ih[0].seq;
-                        bool here = false;
-                        for (const Holder& h : ih)
-                            if (h.pid == p_->pid) {
-                                here = true;
-                                r.seq = h.seq;
-                            }
-                        if (!here) {
-                            const int32_t got = readHolder(ih[0], r);
-                            if (got < 0) return got;
-                            if (got == 1) {
-                                r.write = true;
-                                r.d = r.own.data();
-                                r.dLen = uint32_t(r.own.size());
-                                r.sealed = nullptr;
-                                r.fCols.clear();
-                            } else {
-                                r.action = 0;  // stale: a new record after all
-                            }
-                        }
-                        if (r.action) continue;
-                    }
-                }
-                r.identNew = true;
-                std::memcpy(r.identCid, r.key, 32);
-            }
-        }
-        r.action = migrate ? P4_ACT_MIGRATED : P4_ACT_NEW;
-        r.write = true;
-    }
-    return P4_OK;
-}
-
-int32_t Group::assign() {
-    std::lock_guard<std::mutex> dg(t_->dmu);
-    const bool migrate = calls_[0].mode == 1;
-    bool flushed;
-    {
-        std::lock_guard<std::mutex> g(t_->mu);
-        flushed = uint64_t(t_->lastFlushMs) != flushEpoch_;
-    }
-    std::vector<size_t> fresh;
-    for (size_t i = 0; i < recs_.size(); i++) {
-        Rec& r = recs_[i];
-        if (r.reject || r.dupOf || !r.write || (r.action != P4_ACT_NEW && r.action != P4_ACT_MIGRATED)) continue;
-        // Recheck: another writer of the type may have taken it since the probe.
-        std::vector<Holder> hs;
-        if (flushed) {
-            const int32_t rc = holdersOf(&L_, t_, r.key, &hs);
-            if (rc != P4_OK) return rc;
-        } else {
-            std::lock_guard<std::mutex> g(t_->mu);
-            auto note = [&](const CEnt& x) {
-                if (x.st == 1 || x.st == 4) {
-                    for (auto& h : hs)
-                        if (h.pid == x.pid) return;
-                    hs.push_back(Holder{x.pid, x.seq});
-                }
-            };
-            t_->pend.each(r.key, note);
-            t_->flushing.each(r.key, note);
-        }
-        if (!hs.empty()) {
-            if (migrate) {
-                if (hs[0].seq != r.seqIn) { r.reject = P4_REJ_SEQ; continue; }
-                r.action = P4_ACT_COPY;
-                r.seq = hs[0].seq;
-                continue;
-            }
-            bool mine = false;
-            for (auto& h : hs) mine = mine || h.pid == p_->pid;
-            if (mine) {
-                r.action = P4_ACT_DUP;
-                r.write = false;
-                r.seq = hs[0].seq;
-                continue;
-            }
-            const int32_t got = readHolder(hs[0], r);
-            if (got < 0) return got;
-            r.action = P4_ACT_COPY;
-            r.seq = hs[0].seq;
-            if (got == 1) {
-                r.d = r.own.data();
-                r.dLen = uint32_t(r.own.size());
-                r.sealed = nullptr;
-                r.fCols.clear();
-            }
-            // got == 0: the holder is in flight (another producer's group,
-            // its file not committed yet). The CID still has one seq
-            // (§3.8.2): this copy takes it and keeps its own bytes (the same
-            // CID is the same plaintext).
-            continue;
-        }
-        fresh.push_back(i);
-    }
-    std::sort(fresh.begin(), fresh.end(), [&](size_t a, size_t b) {
-        const Rec& x = recs_[a];
-        const Rec& y = recs_[b];
-        if (x.w != y.w) return x.w < y.w;
-        return std::memcmp(x.key, y.key, 32) < 0;
-    });
-    int64_t lo = INT64_MAX, hi = 0;
-    {
-        std::lock_guard<std::mutex> g(t_->mu);
-        for (size_t i : fresh) {
-            Rec& r = recs_[i];
-            if (migrate) {
-                // Format 1's rowid, unique per type: a seq another row of this
-                // file holds is refused by the insert (P4_REJ_SEQ); a repeat of
-                // a migrated record is found by its CID above.
-                r.seq = r.seqIn;
-                if (r.seq >= t_->nextSeq) t_->nextSeq = r.seq + 1;
-            } else {
-                r.seq = t_->nextSeq++;
-            }
-            lo = std::min(lo, r.seq);
-            hi = std::max(hi, r.seq);
-        }
-        for (Rec& r : recs_) {
-            if (r.reject || r.dupOf || !r.write) continue;
-            t_->pend.put(r.key, p_->pid, r.seq, 4);
-            if (r.identNew) {
-                IdentEnt ie;
-                ie.src = r.identSrc;
-                std::memcpy(ie.h, r.ident, 32);
-                std::memcpy(ie.cid, r.identCid, 32);
-                ie.seq = r.seq;
-                ie.st = 4;
-                t_->identPend[identMapKey(ie.src, ie.h)] = ie;
-            }
-        }
-        if (hi) {
-            t_->inflight.push_back({lo, hi});
-            inflight_.push_back({lo, hi});
-            if (t_->inflight.size() > e_->stat[kStMaxInflight].load()) e_->stat[kStMaxInflight].store(t_->inflight.size());
-            t_->visRecompute();
-        }
-    }
-    // Repeats inside the group take their first record's seq.
-    for (Rec& r : recs_)
-        if (r.dupOf) {
-            const Rec& f = recs_[r.first];
-            r.seq = f.seq;
-            r.action = f.reject ? 0 : P4_ACT_DUP;
-            if (f.reject) r.reject = f.reject;
-        }
-    // The seq block is durable before any seq of it can commit.
-    int64_t need = 0;
-    {
-        std::lock_guard<std::mutex> g(t_->mu);
-        if (t_->nextSeq - 1 > t_->seqReserved) {
-            t_->seqReserved = t_->nextSeq - 1 + int64_t(e_->cfg.seqBlock);
-            need = t_->seqReserved;
-        }
-    }
-    if (need) {
-        const int32_t rc = journalReserve(t_, need);
-        if (rc != P4_OK) return rc;
-    }
-    return P4_OK;
-}
-
-int32_t Group::writeJournal() {
-    std::lock_guard<std::mutex> jg(t_->jmu);
-    Conn* j = t_->jdb;
-    int rc = j->exec("BEGIN IMMEDIATE");
-    int64_t rows = 0;
-    auto addRow = [&](int op, const uint8_t* k, const uint8_t* c, int64_t pid, int64_t seq, const std::string* s,
-                      int64_t v) {
-        if (rc != SQLITE_OK) return;
-        sqlite3_stmt* q = j->get(S_J_INS);
-        if (!q) { rc = SQLITE_ERROR; return; }
-        sqlite3_bind_int(q, 1, op);
-        if (k) sqlite3_bind_blob(q, 2, k, 32, SQLITE_STATIC); else sqlite3_bind_null(q, 2);
-        if (c) sqlite3_bind_blob(q, 3, c, 32, SQLITE_STATIC); else sqlite3_bind_null(q, 3);
-        sqlite3_bind_int64(q, 4, pid);
-        sqlite3_bind_int64(q, 5, seq);
-        if (s) sqlite3_bind_text(q, 6, s->data(), int(s->size()), SQLITE_STATIC); else sqlite3_bind_null(q, 6);
-        sqlite3_bind_int64(q, 7, v);
-        const int r = sqlite3_step(q);
-        sqlite3_reset(q);
-        if (r != SQLITE_DONE) rc = r;
-        rows++;
-    };
-    if (partNew_) {
-        const std::string s = p_->producer + '\x1f' + p_->peer;
-        addRow(J_PART, nullptr, nullptr, p_->pid, 0, &s, 0);
-    }
-    {
-        std::lock_guard<std::mutex> g(t_->mu);
-        for (uint32_t id : newSrcs_) {
-            SrcDef* d = t_->srcById(id);
-            const std::string s = d->provider + '\x1f' + d->source;
-            addRow(J_SRC, nullptr, nullptr, 0, id, &s, 0);
-        }
-        for (uint32_t id : newLanes_) {
-            LaneDef* l = t_->laneById(id);
-            const std::string s = l->provider + '\x1f' + l->source + '\x1f' + l->batch + '\x1f' + l->ckey + '\x1f' +
-                                  l->ppeer + '\x1f' + l->pkey;
-            addRow(J_LANE, nullptr, nullptr, 0, id, &s, l->sid);
-        }
-    }
-    if (writes_) addRow(J_FILE, nullptr, nullptr, p_->pid, 0, nullptr, 0);
-    for (Rec& r : recs_) {
-        if (r.reject || r.dupOf || !r.write || r.superseded) continue;
-        addRow(J_C, r.key, nullptr, p_->pid, r.seq, nullptr, 0);
-        if (r.identNew) addRow(J_IDENT, r.ident, r.identCid, p_->pid, r.seq, nullptr, int64_t(r.identSrc));
-    }
-    for (Del& d : dels_) addRow(J_DEL, d.key, nullptr, p_->pid, d.seq, nullptr, d.len);
-    if (rc == SQLITE_OK) rc = j->exec("COMMIT");
-    if (rc != SQLITE_OK) {
-        lastErr_ = std::string(sqlite3_errmsg(j->db)) + " (" + std::to_string(rc) + ")";
-        j->exec("ROLLBACK");
-        return statusOfSqlite(rc);
-    }
-    e_->bump(kStJournalSyncs);
-    const int64_t last = sqlite3_last_insert_rowid(j->db);
-    jfirst_ = rows ? last - rows + 1 : 0;
-    std::lock_guard<std::mutex> g(t_->mu);
-    if (last > t_->jlast) t_->jlast = last;
-    if (jfirst_) t_->jinflight.push_back(jfirst_);
-    if (partNew_) p_->journaled = true;
-    for (uint32_t id : newSrcs_) t_->srcJournaled[id - 1] = 1;
-    for (uint32_t id : newLanes_) t_->laneJournaled[id - 1] = 1;
-    return P4_OK;
-}
-
-
-struct FileOut : Counters {
-    std::map<uint32_t, LaneCount> lanes;  // touched lanes, their new counts
-};
-
-int32_t Group::writeFile(std::vector<size_t>& idxs) {
-    Part* f = p_;
-    std::vector<Del>& dels = dels_;
-    int32_t status = P4_OK;
-    std::string err;
-    Conn* c = writerPin(e_, f, &status, &err);
-    if (!c) {
-        lastErr_ = "writer open: " + err;
-        return status;
-    }
-    FileOut o;
-    {
-        std::lock_guard<std::mutex> g(t_->mu);
-        static_cast<Counters&>(o) = countersOf(f);
-    }
-    auto laneCount = [&](uint32_t id) -> LaneCount& {
-        auto it = o.lanes.find(id);
-        if (it != o.lanes.end()) return it->second;
-        LaneCount lc;
-        {
-            std::lock_guard<std::mutex> g(t_->mu);
-            auto fi = f->lanes.find(id);
-            if (fi != f->lanes.end()) lc = fi->second;
-        }
-        return o.lanes.emplace(id, lc).first->second;
-    };
-    int rc = c->exec("BEGIN IMMEDIATE");
-    auto bad = [&](int r) {
-        if (rc == SQLITE_OK && r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) rc = r;
-    };
-    Derived dv;
-    if (rc == SQLITE_OK) {
-        bool ix;
-        {
-            std::lock_guard<std::mutex> g(t_->mu);
-            ix = f->indexed;
-        }
-        bad(dv.load(c, sp_->hasObject && ix));
-    }
-    std::unordered_set<uint32_t> sids;
-    const int64_t now = nowSec();
-    // A migration carries format 1's lane times: first seen = the earliest
-    // tag instance, updated = the latest (format 1's source summary).
-    const bool migrateTimes = !calls_.empty() && calls_[0].mode == 1;
-    std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) { return recs_[a].seq < recs_[b].seq; });
-    for (size_t gi : idxs) {
-        if (rc != SQLITE_OK) break;
-        Rec& r = recs_[gi];
-        const Call* call = &calls_[callOf_[gi]];
-        int64_t rowLen = r.dLen;
-        if (r.write && !r.superseded) {
-            KVal kv;
-            kv.type = r.kType;
-            kv.i = r.kInt;
-            kv.s = r.kText;
-            const bool freshK = dv.fresh(c, kv, r.hasE, r.e);
-            sqlite3_stmt* s = c->get(S_INS);
-            sqlite3_bind_int64(s, 1, r.seq);
-            sqlite3_bind_blob(s, 2, r.key, 32, SQLITE_STATIC);
-            if (r.hasE) sqlite3_bind_int64(s, 3, r.e); else sqlite3_bind_null(s, 3);
-            bindK(s, 4, r);
-            sqlite3_bind_int64(s, 5, r.ts);
-            if (!r.peer.empty() && r.peer != p_->peer) sqlite3_bind_text(s, 6, r.peer.data(), int(r.peer.size()), SQLITE_STATIC);
-            else if (call && call->peer != p_->peer && !call->peer.empty()) sqlite3_bind_text(s, 6, call->peer.data(), int(call->peer.size()), SQLITE_STATIC);
-            else sqlite3_bind_null(s, 6);
-            if (r.sealed && !r.fCols.empty()) sqlite3_bind_blob(s, 7, r.fCols.data(), int(r.fCols.size()), SQLITE_STATIC);
-            else if (r.sealed) sqlite3_bind_blob(s, 7, "", 0, SQLITE_STATIC);
-            else sqlite3_bind_null(s, 7);
-            if (sp_->hasSupersede && r.supSid) sqlite3_bind_int64(s, 8, r.supSid); else sqlite3_bind_null(s, 8);
-            if (r.sigLen) sqlite3_bind_blob(s, 9, r.sig, r.sigLen, SQLITE_STATIC); else sqlite3_bind_null(s, 9);
-            sqlite3_bind_blob(s, 10, r.d, int(r.dLen), SQLITE_STATIC);
-            const int ir = sqlite3_step(s);
-            sqlite3_reset(s);
-            if (ir == SQLITE_CONSTRAINT || (ir & 0xff) == SQLITE_CONSTRAINT) {
-                r.reject = P4_REJ_SEQ;  // the seq is held by another row of this file
-                continue;
-            }
-            bad(ir);
-            if (rc != SQLITE_OK) break;
-            dv.added(freshK, r.hasE, r.e);
-            o.n++;
-            o.bytes += r.dLen;
-            if (r.action == P4_ACT_COPY || (r.action == P4_ACT_IDENT_DUP && r.write)) o.ncopy++;
-            if (r.seq < o.minseq) o.minseq = r.seq;
-            if (r.seq > o.maxseq) o.maxseq = r.seq;
-            if (r.w < o.minw) o.minw = r.w;
-            if (r.w > o.maxw) o.maxw = r.w;
-            if (r.ts > o.maxts) o.maxts = r.ts;
-            if (r.ts < o.mints) o.mints = r.ts;
-            if (r.hasE && r.e < o.mine) o.mine = r.e;
-            if (r.hasE && r.e > o.maxe) o.maxe = r.e;
-            if (!r.hasE && sp_->hasEpochRule) o.nnull++;
-        } else if (!r.inst.empty()) {
-            // A held row takes tags: it must be this CID's row.
-            sqlite3_stmt* s = c->get(S_R_LEN);
-            sqlite3_bind_int64(s, 1, r.seq);
-            const int sr = sqlite3_step(s);
-            const bool ok = sr == SQLITE_ROW && sqlite3_column_bytes(s, 1) == 32 &&
-                            std::memcmp(sqlite3_column_blob(s, 1), r.key, 32) == 0;
-            if (ok) {
-                rowLen = sqlite3_column_int64(s, 0);
-                r.w = sqlite3_column_int64(s, 4);
-            }
-            sqlite3_reset(s);
-            if (sr != SQLITE_ROW && sr != SQLITE_DONE) { bad(sr); break; }
-            if (!ok) { r.reject = P4_REJ_BAD_ENTRY; continue; }
-        }
-        for (size_t ii = 0; ii < r.inst.size() && rc == SQLITE_OK; ii++) {
-            const TagIn& tag = call->tags[r.inst[ii].first];
-            LaneDef* l = tag.lane;
-            const int64_t at = r.inst[ii].second;
-            sids.insert(l->sid);
-            LaneCount& lc = laneCount(l->id);
-            if (lc.n == 0 && lc.url0.empty() && lc.created == 0) {
-                // The lane's first instance in this file.
-                lc.url0 = tag.url;
-                lc.created = at;
-            }
-            sqlite3_stmt* s = c->get(S_RL_INS);
-            sqlite3_bind_int64(s, 1, l->sid);
-            sqlite3_bind_int64(s, 2, r.seq);
-            sqlite3_bind_int64(s, 3, l->id);
-            sqlite3_bind_int64(s, 4, at);
-            if (tag.url != lc.url0) sqlite3_bind_text(s, 5, tag.url.data(), int(tag.url.size()), SQLITE_STATIC);
-            else sqlite3_bind_null(s, 5);
-            bad(sqlite3_step(s));
-            sqlite3_reset(s);
-            if (rc != SQLITE_OK) break;
-            if (sqlite3_changes(c->db) > 0) {
-                lc.n++;
-                lc.bytes += rowLen;
-                if (r.w < lc.minw) lc.minw = r.w;
-                if (r.w > lc.maxw) lc.maxw = r.w;
-                if (r.seq > lc.maxseq) lc.maxseq = r.seq;
-                if (r.seq < lc.minseq) lc.minseq = r.seq;
-                if (at > lc.maxat) lc.maxat = at;
-                if (r.ts > lc.maxts) lc.maxts = r.ts;
-                if (!r.write) r.retagged = true;
-            } else {
-                // DUP: source_url follows the latest write (C-3); at is unchanged.
-                sqlite3_stmt* q = c->get(S_RL_ONE);
-                sqlite3_bind_int64(q, 1, l->sid);
-                sqlite3_bind_int64(q, 2, r.seq);
-                sqlite3_bind_int64(q, 3, l->id);
-                std::string cur = lc.url0;
-                if (sqlite3_step(q) == SQLITE_ROW && sqlite3_column_type(q, 1) != SQLITE_NULL)
-                    cur.assign(reinterpret_cast<const char*>(sqlite3_column_text(q, 1)), sqlite3_column_bytes(q, 1));
-                sqlite3_reset(q);
-                if (cur != tag.url) {
-                    sqlite3_stmt* u = c->get(S_RL_URL);
-                    sqlite3_bind_int64(u, 1, l->sid);
-                    sqlite3_bind_int64(u, 2, r.seq);
-                    sqlite3_bind_int64(u, 3, l->id);
-                    if (tag.url != lc.url0) sqlite3_bind_text(u, 4, tag.url.data(), int(tag.url.size()), SQLITE_STATIC);
-                    else sqlite3_bind_null(u, 4);
-                    bad(sqlite3_step(u));
-                    sqlite3_reset(u);
-                    r.urlChanged = true;
-                }
-            }
-            lc.url = tag.url;
-            if (migrateTimes) {
-                if (at > lc.updated) lc.updated = at;
-                if (at < lc.created || lc.created == 0) lc.created = at;
-            } else if (now > lc.updated) {
-                lc.updated = now;
-            }
-        }
-    }
-    // CAT supersede (and batch deletes): rows retired in this transaction.
-    for (Del& d : dels) {
-        if (rc != SQLITE_OK) break;
-        sqlite3_stmt* s = c->get(S_RL_DEL_SEQ);
-        sqlite3_bind_int64(s, 1, d.seq);
-        bad(sqlite3_step(s));
-        sqlite3_reset(s);
-        s = c->get(S_R_DEL);
-        sqlite3_bind_int64(s, 1, d.seq);
-        bad(sqlite3_step(s));
-        const bool gone = sqlite3_changes(c->db) > 0;
-        sqlite3_reset(s);
-        if (!gone) continue;
-        bad(dv.removed(c, d.k, d.hasE, d.e));
-        o.n--;
-        o.bytes -= d.len;
-        for (auto& sl : d.lanes) {
-            LaneCount& lc = laneCount(sl.second);
-            lc.n--;
-            lc.bytes -= d.len;
-            sids.insert(sl.first);
-        }
-    }
-    // The file's lane, source and meta rows, in the same transaction.
-    for (auto& kv : o.lanes) {
-        if (rc != SQLITE_OK) break;
-        LaneDef* l;
-        {
-            std::lock_guard<std::mutex> g(t_->mu);
-            l = t_->laneById(kv.first);
-        }
-        if (kv.second.n <= 0) {
-            sqlite3_stmt* s = c->get(S_LANE_DEL);
-            sqlite3_bind_int64(s, 1, kv.first);
-            bad(sqlite3_step(s));
-            sqlite3_reset(s);
-            continue;
-        }
-        const LaneCount& lc = kv.second;
-        sqlite3_stmt* s = c->get(S_LANE_UP);
-        sqlite3_bind_int64(s, 1, kv.first);
-        sqlite3_bind_int64(s, 2, l->sid);
-        sqlite3_bind_text(s, 3, l->batch.data(), int(l->batch.size()), SQLITE_STATIC);
-        sqlite3_bind_text(s, 4, l->ckey.data(), int(l->ckey.size()), SQLITE_STATIC);
-        sqlite3_bind_text(s, 5, l->ppeer.data(), int(l->ppeer.size()), SQLITE_STATIC);
-        sqlite3_bind_text(s, 6, l->pkey.data(), int(l->pkey.size()), SQLITE_STATIC);
-        sqlite3_bind_text(s, 7, lc.url.data(), int(lc.url.size()), SQLITE_STATIC);
-        sqlite3_bind_text(s, 8, lc.url0.data(), int(lc.url0.size()), SQLITE_STATIC);
-        sqlite3_bind_int64(s, 9, lc.created);
-        sqlite3_bind_int64(s, 10, lc.updated);
-        sqlite3_bind_int64(s, 11, lc.maxat);
-        sqlite3_bind_int64(s, 12, lc.n);
-        sqlite3_bind_int64(s, 13, lc.bytes);
-        if (lc.minw != INT64_MAX) sqlite3_bind_int64(s, 14, lc.minw); else sqlite3_bind_null(s, 14);
-        if (lc.maxw != INT64_MIN) sqlite3_bind_int64(s, 15, lc.maxw); else sqlite3_bind_null(s, 15);
-        sqlite3_bind_int64(s, 16, lc.maxseq);
-        sqlite3_bind_int64(s, 17, lc.maxts);
-        if (lc.minseq != INT64_MAX) sqlite3_bind_int64(s, 18, lc.minseq); else sqlite3_bind_null(s, 18);
-        bad(sqlite3_step(s));
-        sqlite3_reset(s);
-    }
-    for (uint32_t sid : sids) {
-        if (rc != SQLITE_OK) break;
-        SrcDef* d;
-        {
-            std::lock_guard<std::mutex> g(t_->mu);
-            d = t_->srcById(sid);
-        }
-        sqlite3_stmt* s = c->get(S_SRC_INS);
-        sqlite3_bind_int64(s, 1, sid);
-        sqlite3_bind_text(s, 2, d->provider.data(), int(d->provider.size()), SQLITE_STATIC);
-        sqlite3_bind_text(s, 3, d->source.data(), int(d->source.size()), SQLITE_STATIC);
-        bad(sqlite3_step(s));
-        sqlite3_reset(s);
-    }
-    if (rc == SQLITE_OK) rc = dv.save(c);
-    if (rc == SQLITE_OK) rc = writeMeta(c, o, now);
-    if (rc == SQLITE_OK) rc = c->exec("COMMIT");
-    if (rc != SQLITE_OK) {
-        lastErr_ = std::string(sqlite3_errmsg(c->db)) + " (" + std::to_string(rc) + ") " + f->path;
-        c->exec("ROLLBACK");
-        writerUnpin(e_, f);
-        if ((rc & 0xff) == SQLITE_CORRUPT || (rc & 0xff) == SQLITE_NOTADB) {
-            std::lock_guard<std::mutex> g(t_->mu);
-            f->quarantined = true;
-        }
-        return statusOfSqlite(rc);
-    }
-    int64_t freeBytes = 0;
-    const int64_t dbBytes = dbBytesOf(c, &freeBytes);
-    writerUnpin(e_, f);
-    e_->bump(kStGroupCommits);
-    // Publish this file's counters.
-    std::lock_guard<std::mutex> g(t_->mu);
-    if (dbBytes >= 0) {
-        f->dbBytes = dbBytes;
-        f->freeBytes = freeBytes;
-    }
-    countersTo(f, o);
-    for (auto& kv : o.lanes) {
-        if (kv.second.n <= 0) f->lanes.erase(kv.first);
-        else f->lanes[kv.first] = kv.second;
-    }
-    if (!f->created) e_->rpool.addFiles(1);
-    f->created = true;
-    f->touched = true;
-    return P4_OK;
 }
 
 void Group::fail(int32_t status, const std::string& err) {
@@ -1453,54 +679,68 @@ void Group::fail(int32_t status, const std::string& err) {
         }
 }
 
-void Group::publish(bool fileCommitted) {
-    std::lock_guard<std::mutex> g(t_->mu);
-    for (Rec& r : recs_) {
-        if (r.dupOf || !r.write) continue;
-        const bool committed = fileCommitted && r.inFile && !r.reject && !r.superseded;
-        if (r.reject && !r.inFile) continue;
-        if (committed) {
-            t_->pend.put(r.key, p_->pid, r.seq, 1);
-            if (r.action == P4_ACT_NEW || r.action == P4_ACT_MIGRATED) {
-                t_->uniq++;
-                t_->uniqBytes += r.dLen;
-            } else {
-                t_->copies++;
-            }
-            if (r.identNew) {
-                auto it = t_->identPend.find(identMapKey(r.identSrc, r.ident));
-                if (it != t_->identPend.end()) it->second.st = 1;
-            }
-        } else {
-            t_->pend.kill(r.key, p_->pid);
-            if (r.identNew) t_->identPend.erase(identMapKey(r.identSrc, r.ident));
-        }
+// CAT supersede-on-ingest (record_supersede.go): the scope feed's records of
+// the same object identity are retired from that feed in the same write.
+int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t scope) {
+    const auto key = std::make_pair(scope, r.supIdentity);
+    auto it = supOf_.find(key);
+    if (it != supOf_.end() && it->second != rs) {
+        w.dropFid(it->second, scope);
+        e_->bump(kStCatSuperseded);
     }
-    if (fileCommitted)
-        for (Del& d : dels_) {
-            t_->pend.kill(d.key, p_->pid);
-            t_->pend.put(d.key, p_->pid, d.seq, 2);
-            if (d.others) t_->copies--;
-            else {
-                t_->uniq--;
-                t_->uniqBytes -= d.len;
-            }
-        }
-    for (auto& r : inflight_) {
-        for (size_t i = 0; i < t_->inflight.size(); i++)
-            if (t_->inflight[i] == r) {
-                t_->inflight.erase(t_->inflight.begin() + long(i));
+    supOf_[key] = rs;
+    Feed* f;
+    bool usable;
+    {
+        std::lock_guard<std::mutex> g(t_->mu);
+        f = t_->feedById(scope);
+        usable = f && f->created && f->indexed && !f->quarantined;
+    }
+    if (!usable || rs->k.type == 0) return P4_OK;
+    int32_t st = P4_OK;
+    std::string er;
+    Conn* c = writerPin(e_, f, &st, &er);
+    if (!c) return st;
+    std::vector<int64_t> seqs;
+    sqlite3_stmt* q = c->sql("SELECT rid, seq FROM r INDEXED BY r_ke WHERE k=?1 AND seq<>?2");
+    int rc = SQLITE_ERROR;
+    std::vector<std::pair<int64_t, int64_t>> cand;
+    if (q) {
+        rs->k.bind(q, 1);
+        sqlite3_bind_int64(q, 2, rs->seq);
+        while ((rc = sqlite3_step(q)) == SQLITE_ROW) cand.push_back({sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 1)});
+        sqlite3_reset(q);
+    }
+    if (rc == SQLITE_DONE) {
+        sqlite3_stmt* dq = c->get(S_R_D);
+        int64_t last = 0;
+        for (auto& x : cand) {
+            if (x.second == last) continue;  // one row per record decides
+            sqlite3_bind_int64(dq, 1, x.first);
+            const int r2 = sqlite3_step(dq);
+            std::string id;
+            if (r2 == SQLITE_ROW)
+                id = identityOf(sp_->tc, static_cast<const uint8_t*>(sqlite3_column_blob(dq, 0)), size_t(sqlite3_column_bytes(dq, 0)));
+            sqlite3_reset(dq);
+            if (r2 != SQLITE_ROW && r2 != SQLITE_DONE) {
+                rc = r2;
                 break;
             }
+            last = x.second;
+            if (id == r.supIdentity) seqs.push_back(x.second);
+        }
     }
-    t_->visRecompute();
-    if (jfirst_) {
-        for (size_t i = 0; i < t_->jinflight.size(); i++)
-            if (t_->jinflight[i] == jfirst_) {
-                t_->jinflight.erase(t_->jinflight.begin() + long(i));
-                break;
-            }
+    writerUnpin(e_, f);
+    if (rc != SQLITE_DONE) return statusOfSqlite(rc);
+    for (int64_t s : seqs) {
+        int32_t lrc = P4_OK;
+        RecState* other = w.bySeq(s, &lrc);
+        if (!other) return lrc;
+        if (other == rs) continue;
+        w.dropFid(other, scope);
+        e_->bump(kStCatSuperseded);
     }
+    return P4_OK;
 }
 
 void Group::respond() {
@@ -1515,8 +755,7 @@ void Group::respond() {
         uint64_t nNew = 0, nCopy = 0, nRetag = 0, nDup = 0, nIdent = 0, nRej = 0;
         for (size_t gi : c.recs) {
             Rec& r = recs_[gi];
-            int action = r.reject ? P4_ACT_REJECTED : r.action;
-            if (action == P4_ACT_DUP && r.retagged) action = P4_ACT_RETAG;
+            const int action = r.reject ? P4_ACT_REJECTED : r.action;
             switch (action) {
                 case P4_ACT_NEW: case P4_ACT_MIGRATED: nNew++; break;
                 case P4_ACT_COPY: nCopy++; break;
@@ -1528,7 +767,7 @@ void Group::respond() {
             out.enc.beginRow();
             out.enc.i64(int64_t(i++));
             out.enc.i64(action);
-            if (r.reject) out.enc.i64(0); else out.enc.i64(r.seq);
+            out.enc.i64(r.reject || !r.rs ? 0 : r.rs->seq);
             out.enc.i64(r.reject);
             out.enc.endRow();
             out.rows++;
@@ -1546,6 +785,12 @@ void Group::respond() {
     }
 }
 
+bool liveRows(const RecState* r) {
+    for (const RowR& x : r->rows)
+        if (x.live()) return true;
+    return false;
+}
+
 void Group::run(std::vector<WriteTask*>& tasks) {
     sp_ = t_->spec();
     for (WriteTask* wt : tasks) {
@@ -1557,61 +802,10 @@ void Group::run(std::vector<WriteTask*>& tasks) {
     for (Call& c : calls_) {
         if (!parseCall(c)) continue;
         c.token = ps::producerToken(reinterpret_cast<const uint8_t*>(c.peer.data()), c.peer.size());
-        if (c.token != p_->producer) {
-            c.status = P4_E_ARG;
-            c.err = "peer does not map to this partition";
-        }
-    }
-    // Lanes of every call (type-wide ids; new ones are journaled with the group).
-    {
-        std::lock_guard<std::mutex> g(t_->mu);
-        partNew_ = !p_->journaled;
-        for (Call& c : calls_) {
-            if (c.status != P4_OK) continue;
-            for (TagIn& tag : c.tags) {
-                if (!tag.valid) continue;
-                const size_t ns = t_->srcs.size();
-                tag.lane = laneFor(t_, tag.f6, true);
-                if (!t_->laneJournaled[tag.lane->id - 1] &&
-                    std::find(newLanes_.begin(), newLanes_.end(), tag.lane->id) == newLanes_.end())
-                    newLanes_.push_back(tag.lane->id);
-                if (!t_->srcJournaled[tag.lane->sid - 1] &&
-                    std::find(newSrcs_.begin(), newSrcs_.end(), tag.lane->sid) == newSrcs_.end())
-                    newSrcs_.push_back(tag.lane->sid);
-                (void)ns;
-            }
-        }
     }
     for (Call& c : calls_) {
         if (c.status != P4_OK) continue;
-        uint32_t scope = 0;
-        for (const TagIn& tag : c.tags)
-            if (tag.valid && tag.lane && !scope) scope = tag.lane->sid;
-        for (size_t gi : c.recs) {
-            Rec& r = recs_[gi];
-            prepare(r, c);
-            if (c.mode == 1) {
-                uint32_t sc = 0;
-                bool mixed = false;
-                for (auto& ti : r.tagsIn) {
-                    if (ti.first >= c.tags.size() || !c.tags[ti.first].lane) continue;
-                    const uint32_t sid = c.tags[ti.first].lane->sid;
-                    if (sc && sc != sid) mixed = true;
-                    sc = sid;
-                }
-                r.supSid = mixed ? 0 : sc;
-            } else {
-                r.supSid = scope;
-            }
-        }
-    }
-    {
-        bool quarantined;
-        {
-            std::lock_guard<std::mutex> g(t_->mu);
-            quarantined = p_->quarantined;
-        }
-        if (quarantined) fail(P4_E_CORRUPT, "partition file quarantined: " + p_->path);
+        for (size_t gi : c.recs) prepare(recs_[gi], c);
     }
     bool any = false;
     for (Call& c : calls_) any = any || (c.status == P4_OK && !c.recs.empty());
@@ -1619,7 +813,7 @@ void Group::run(std::vector<WriteTask*>& tasks) {
         respond();
         return;
     }
-    // The type's T/ files exist from its first write (C-32).
+    // The type's T/ files exist from its first write.
     {
         std::string err;
         const int32_t frc = typeFilesEnsure(t_, &err);
@@ -1629,150 +823,238 @@ void Group::run(std::vector<WriteTask*>& tasks) {
             return;
         }
     }
-    int32_t rc = probe();
-    if (rc != P4_OK) {
-        fail(rc, "dedupe probe failed");
-        respond();
-        return;
-    }
-    Part* f = p_;
     {
         std::lock_guard<std::mutex> g(t_->mu);
-        for (Rec& r : recs_) {
-            if (r.reject || r.dupOf || !r.action) continue;
-            if (!r.write && r.inst.empty()) continue;
-            r.inFile = true;
-            writes_ = true;
-        }
-        if (calls_[0].mode == 1 && !f->created) f->indexed = false;
-    }
-    // Repeats inside the group that add tags write with their first record.
-    for (Rec& r : recs_)
-        if (r.dupOf && !r.inst.empty()) r.inFile = recs_[r.first].inFile;
-    // CAT supersede-on-ingest: this partition's rows of the same (source,
-    // object identity), retired in the same transaction (record_supersede.go).
-    if (sp_->hasSupersede && calls_[0].mode == 0) {
-        std::unordered_map<std::string, size_t> lastOf;
-        for (size_t i = 0; i < recs_.size(); i++) {
-            Rec& r = recs_[i];
-            if (r.reject || r.dupOf || !r.write || !r.hasSup) continue;
-            const std::string key = std::to_string(r.supSid) + '\x1f' + r.supIdentity;
-            auto it = lastOf.find(key);
-            if (it != lastOf.end()) recs_[it->second].superseded = true;
-            lastOf[key] = i;
-        }
-        bool created;
-        {
-            std::lock_guard<std::mutex> g(t_->mu);
-            created = f->created;
-        }
-        Conn* c = nullptr;
-        for (Rec& r : recs_) {
-            if (r.reject || r.dupOf || !r.write || !r.hasSup || r.superseded || !r.kType || !created) continue;
-            if (!c) {
-                int32_t prc = P4_OK;
-                c = writerPin(e_, f, &prc, nullptr);
-                if (!c) {
-                    fail(prc, "writer open failed");
-                    break;
+        if (t_->broken) {
+            const std::string why = t_->brokenWhy;
+            fail(P4_E_IO, "the type index is behind its feed files: " + why);
+        } else {
+            // The feeds of every call's tags, and each call's token (copy).
+            for (Call& c : calls_) {
+                if (c.status != P4_OK) continue;
+                c.tok = tokFor(t_, c.token, c.peer, true);
+                for (TagIn& tag : c.tags) {
+                    if (!tag.valid) continue;
+                    Feed* f = feedFor(t_, tag.f6[0], tag.f6[1], true);
+                    tag.fid = f->fid;
+                    if (f->quarantined) {
+                        c.status = P4_E_CORRUPT;
+                        c.err = "feed file quarantined: " + f->path;
+                    }
                 }
             }
-            sqlite3_stmt* s = c->get(S_SUP_K);
-            bindK(s, 1, r);
-            sqlite3_bind_int64(s, 2, 0);
-            std::vector<Del> cand;
-            while (sqlite3_step(s) == SQLITE_ROW) {
-                const bool scoped = sqlite3_column_type(s, 3) != SQLITE_NULL;
-                const uint32_t ssid = scoped ? uint32_t(sqlite3_column_int64(s, 3)) : 0;
-                if (scoped && ssid != r.supSid) continue;
-                if (sqlite3_column_bytes(s, 1) == 32 && std::memcmp(sqlite3_column_blob(s, 1), r.key, 32) == 0) continue;
-                const std::string id = identityOf(sp_->tc, static_cast<const uint8_t*>(sqlite3_column_blob(s, 4)),
-                                                  size_t(sqlite3_column_bytes(s, 4)));
-                if (id != r.supIdentity) continue;
-                Del d;
-                d.seq = sqlite3_column_int64(s, 0);
-                d.len = sqlite3_column_int64(s, 2);
-                d.w = sqlite3_column_int64(s, 5);
-                d.hasE = sqlite3_column_type(s, 6) != SQLITE_NULL;
-                d.e = sqlite3_column_int64(s, 6);
-                d.k.type = r.kType;
-                d.k.i = r.kInt;
-                d.k.s = r.kText;
-                std::memcpy(d.key, sqlite3_column_blob(s, 1), 32);
-                cand.push_back(std::move(d));
+        }
+    }
+    WriteCtx w(e_, t_);
+    w.migrate = false;
+    for (Call& c : calls_)
+        if (c.status == P4_OK) w.migrate = c.mode == 1;  // a group never mixes modes
+    std::map<std::string, RecState*> identOf;  // (src, h) -> its record in this group
+    std::vector<RecState*> fresh;
+    std::unordered_set<RecState*> freshSet;
+    std::unordered_set<int64_t> seqsIn;  // migrate: seqs new records of this group take
+    int32_t rc = P4_OK;
+    for (Call& c : calls_) {
+        if (c.status != P4_OK || rc != P4_OK) continue;
+        uint32_t scope = 0;
+        for (const TagIn& tag : c.tags)
+            if (tag.valid && !scope) scope = tag.fid;
+        for (size_t gi : c.recs) {
+            if (rc != P4_OK) break;
+            Rec& r = recs_[gi];
+            if (r.reject) continue;
+            RecState* rs = nullptr;
+            bool identDup = false;
+            uint64_t isrc = 0;
+            std::string ikey;
+            const bool ingestIdent = c.mode == 0 && sp_->identity && r.ident && !c.tags.empty() && c.tags[0].valid;
+            if (ingestIdent) {
+                isrc = identSrcOf(c.tags[0].f6[0], c.tags[0].f6[1]);
+                ikey.assign(reinterpret_cast<const char*>(&isrc), 8);
+                ikey.append(reinterpret_cast<const char*>(r.ident), 32);
+                auto it = identOf.find(ikey);
+                if (it != identOf.end()) {
+                    if (std::memcmp(it->second->key, r.key, 32) != 0) {
+                        rs = it->second;
+                        identDup = true;
+                    }
+                } else {
+                    int64_t hseq = 0;
+                    uint8_t hcid[32];
+                    rc = identGet(t_->idx, isrc, r.ident, &hseq, hcid);
+                    if (rc != P4_OK) break;
+                    if (hseq && std::memcmp(hcid, r.key, 32) != 0) {
+                        RecState* hr = w.byKey(hcid, &rc);
+                        if (!hr) break;
+                        // The identity's record, if it is still held.
+                        if (hr->existed && hr->seq == hseq && liveRows(hr)) {
+                            rs = hr;
+                            identDup = true;
+                        }
+                    }
+                }
             }
-            sqlite3_reset(s);
-            for (Del& d : cand) {
-                bool seen = false;
-                for (Del& x : dels_) seen = seen || x.seq == d.seq;
-                if (seen) continue;
-                sqlite3_stmt* q = c->get(S_RL_OF);
-                sqlite3_bind_int64(q, 1, d.seq);
-                while (sqlite3_step(q) == SQLITE_ROW)
-                    d.lanes.push_back({uint32_t(sqlite3_column_int64(q, 0)), uint32_t(sqlite3_column_int64(q, 1))});
-                sqlite3_reset(q);
-                dels_.push_back(std::move(d));
+            if (!rs) {
+                rs = w.byKey(r.key, &rc);
+                if (!rs) break;
+            }
+            const bool isNew = !rs->existed && !freshSet.count(rs);
+            if (c.mode == 1) {
+                if ((rs->existed || freshSet.count(rs)) && rs->seq != r.seqIn) {
+                    r.reject = P4_REJ_SEQ;
+                    continue;
+                }
+                if (isNew && !rs->seq) {
+                    // A new record's seq: format 1's rowid, unique per type.
+                    bool held = seqsIn.count(r.seqIn) > 0;
+                    if (!held && w.known(r.seqIn)) held = true;
+                    if (!held) {
+                        std::vector<XEnt> xs;
+                        rc = xOfSeq(t_->idx, r.seqIn, &xs);
+                        if (rc != P4_OK) break;
+                        held = !xs.empty();
+                    }
+                    if (held) {
+                        r.reject = P4_REJ_SEQ;
+                        continue;
+                    }
+                }
+            }
+            // The copy: a new record's (or a migrated copy's) own bytes; an
+            // ingest copy of a held record stores the holder's bytes and ts
+            // with this write's signature and peer (format 1's
+            // mirrorRoutedRecordFromExisting).
+            RowR copy;
+            copy.tok = c.tok;
+            copy.peer = r.peer.empty() ? c.peer : r.peer;
+            if (r.sigLen) copy.sig.assign(reinterpret_cast<const char*>(r.sig), r.sigLen);
+            const RowR* holder = nullptr;
+            if (!isNew && c.mode == 0)
+                for (const RowR& x : rs->rows)
+                    if (x.live() && (!holder || x.tok < holder->tok)) holder = &x;
+            if (holder) {
+                copy.len = holder->len;
+                copy.sealed = holder->sealed;
+                copy.fcols = holder->fcols;
+                if (holder->hasD) {
+                    copy.hasD = true;
+                    copy.d = holder->d;
+                } else {
+                    copy.srcFid = holder->loaded ? holder->fid : holder->srcFid;
+                    copy.srcRid = holder->loaded ? holder->rid : holder->srcRid;
+                }
+            } else {
+                copy.hasD = true;
+                copy.d.assign(reinterpret_cast<const char*>(r.d), r.dLen);
+                copy.len = r.dLen;
+                copy.sealed = r.sealed != nullptr;
+                copy.fcols = r.fCols;
+            }
+            if (isNew) {
+                rs->hasE = r.hasE;
+                rs->e = r.e;
+                rs->k = r.k;
+                rs->ts = r.ts;
+                rs->w = r.w;
+            }
+            std::vector<WriteCtx::Inst> insts;
+            if (c.mode == 1) {
+                for (auto& ti : r.tagsIn) {
+                    const TagIn& tag = c.tags[ti.first];
+                    insts.push_back(WriteCtx::Inst{tag.fid, tag.f6[2], tag.f6[4], tag.f6[5], tag.f6[3], tag.url, ti.second});
+                }
+            } else {
+                for (const TagIn& tag : c.tags)
+                    insts.push_back(WriteCtx::Inst{tag.fid, tag.f6[2], tag.f6[4], tag.f6[5], tag.f6[3], tag.url, c.at});
+            }
+            WriteCtx::Out out;
+            w.deliver(rs, copy, insts, &out);
+            if (identDup) r.action = P4_ACT_IDENT_DUP;
+            else if (isNew) r.action = c.mode == 1 ? P4_ACT_MIGRATED : P4_ACT_NEW;
+            else if (out.copyNew) r.action = P4_ACT_COPY;
+            else if (c.mode == 1) r.action = P4_ACT_MIGRATED;
+            else if (out.instNew) r.action = P4_ACT_RETAG;
+            else r.action = P4_ACT_DUP;
+            r.rs = rs;
+            if (isNew) {
+                fresh.push_back(rs);
+                freshSet.insert(rs);
+                if (c.mode == 1) {
+                    rs->seq = r.seqIn;  // placeholder until assignment (kept)
+                    seqsIn.insert(r.seqIn);
+                }
+            }
+            // Ingest identities (IQC): a new record registers its identity;
+            // a migrated record keeps format 1's (C-21) for later repeats.
+            if (ingestIdent && !identDup && isNew) {
+                IdentNew in;
+                in.src = isrc;
+                std::memcpy(in.h, r.ident, 32);
+                in.rec = rs;
+                w.idents.push_back(in);
+                identOf[ikey] = rs;
+            } else if (c.mode == 1 && sp_->identity && r.ident && !r.tagsIn.empty() && isNew) {
+                const TagIn& tag = c.tags[r.tagsIn[0].first];
+                IdentNew in;
+                in.src = identSrcOf(tag.f6[0], tag.f6[1]);
+                std::memcpy(in.h, r.ident, 32);
+                in.rec = rs;
+                w.idents.push_back(in);
+            }
+            // CAT supersede-on-ingest (C-20: ingest mode only).
+            if (c.mode == 0 && r.hasSup && scope && (isNew || out.copyNew) && !identDup) {
+                rc = supersedeOnIngest(w, r, rs, scope);
+                if (rc != P4_OK) break;
             }
         }
-        if (c) writerUnpin(e_, f);
-        if (!dels_.empty()) writes_ = true;
-        e_->bump(kStCatSuperseded, dels_.size());
     }
-    bool ok = true;
-    for (Call& c : calls_) ok = ok && c.status == P4_OK;
-    if (!ok && std::all_of(calls_.begin(), calls_.end(), [](const Call& c) { return c.status != P4_OK; })) {
-        respond();
-        return;
-    }
-    rc = assign();
     if (rc != P4_OK) {
-        fail(rc, "seq assignment failed");
-        publish(false);
+        fail(rc, "write planning failed: " + w.err);
         respond();
         return;
     }
-    rc = writeJournal();
-    if (rc != P4_OK) {
-        fail(rc, "journal commit failed: " + lastErr_);
-        publish(false);
-        respond();
-        return;
-    }
-    bool committed = false;
-    if (writes_) {
-        std::vector<size_t> idxs;
-        for (size_t i = 0; i < recs_.size(); i++)
-            if (recs_[i].inFile && !recs_[i].reject) idxs.push_back(i);
-        rc = writeFile(idxs);
-        committed = rc == P4_OK;
-        if (!committed)
-            for (Call& c : calls_)
-                for (size_t gi : c.recs)
-                    if (recs_[gi].inFile && c.status == P4_OK) {
-                        c.status = rc;
-                        c.err = "partition file commit failed: " + lastErr_;
-                    }
-    }
-    {
-        // A retired row's last-copy decision is atomic with the publish (dmu).
-        std::lock_guard<std::mutex> dg(t_->dmu);
-        if (committed)
-            for (Del& d : dels_) d.others = othersHolding(&L_, t_, d.key, p_->pid);
-        publish(committed);
-    }
-    respond();
-    bool kick;
+    // Seqs: new records in content-time order (ingest), format 1's (migrate).
+    std::vector<RecState*> assign;
+    for (RecState* rs : fresh)
+        if (!w.migrate) assign.push_back(rs);
+    std::sort(assign.begin(), assign.end(), [](const RecState* a, const RecState* b) {
+        if (a->w != b->w) return a->w < b->w;
+        return std::memcmp(a->key, b->key, 32) < 0;
+    });
+    std::pair<int64_t, int64_t> inflight(INT64_MAX, 0);
     {
         std::lock_guard<std::mutex> g(t_->mu);
-        kick = t_->pend.live() >= e_->cfg.flushEntries || t_->pend.bytes() >= e_->cfg.pendingBytes / 4;
+        for (RecState* rs : assign) rs->seq = t_->nextSeq++;
+        for (RecState* rs : fresh) {
+            if (rs->seq >= t_->nextSeq) t_->nextSeq = rs->seq + 1;
+            inflight.first = std::min(inflight.first, rs->seq);
+            inflight.second = std::max(inflight.second, rs->seq);
+        }
+        if (inflight.second) {
+            t_->inflight.push_back(inflight);
+            if (t_->inflight.size() > e_->stat[kStMaxInflight].load()) e_->stat[kStMaxInflight].store(t_->inflight.size());
+            t_->visRecompute();
+        }
     }
-    if (kick) e_->kickMaintenance();
+    rc = w.commit(true);
+    {
+        std::lock_guard<std::mutex> g(t_->mu);
+        for (size_t i = 0; i < t_->inflight.size(); i++)
+            if (t_->inflight[i] == inflight) {
+                t_->inflight.erase(t_->inflight.begin() + long(i));
+                break;
+            }
+        t_->visRecompute();
+    }
+    if (rc != P4_OK) fail(rc, "commit failed: " + w.err);
+    respond();
 }
 
 }  // namespace
 
-void putGroup(Engine* e, uint32_t writer, Part* p, std::vector<WriteTask*>& tasks) {
-    Group g(e, writer, p);
+void putGroup(Engine* e, uint32_t writer, Type* t, std::vector<WriteTask*>& tasks) {
+    (void)writer;
+    Group g(e, t);
     g.run(tasks);
 }
 

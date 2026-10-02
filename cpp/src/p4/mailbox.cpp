@@ -336,23 +336,23 @@ const std::vector<std::string>& colsOfWrite(uint32_t op) {
 
 }  // namespace
 
-void pushTask(Engine* e, Part* p, WriteTask* wt) {
-    WriterState& ws = *e->writers[p->owner];
+void pushTask(Engine* e, Type* t, WriteTask* wt) {
+    WriterState& ws = *e->writers[t->owner];
     {
         std::lock_guard<std::mutex> g(ws.mu);
-        p->backlog.push_back(wt);
-        p->backlogRecords += wt->records;
-        if (!p->ready) {
-            p->ready = true;
-            ws.ready.push_back(p);
+        t->backlog.push_back(wt);
+        t->backlogRecords += wt->records;
+        if (!t->ready) {
+            t->ready = true;
+            ws.ready.push_back(t);
         }
     }
-    e->wake(e->firstOfClass[1] + p->owner);
+    e->wake(e->firstOfClass[1] + t->owner);
 }
 
 namespace {
 
-void routeWrite(Engine* e, uint32_t wi, uint32_t slot, P4Lane* L) {
+void routeWrite(Engine* e, uint32_t wi, uint32_t slot) {
     SlotHeader* h = e->slot(slot);
     uint32_t expect = P4_SLOT_QUEUED;
     if (h->cancel.load(std::memory_order_acquire)) {
@@ -401,10 +401,9 @@ void routeWrite(Engine* e, uint32_t wi, uint32_t slot, P4Lane* L) {
         doneStatus(e, slot, colsOfWrite(op), P4_E_NOTYPE, "type not registered: " + typeName);
         return;
     }
+    uint64_t records = 0;
+    uint8_t mode = 0;
     if (op == P4_OPC_PUT) {
-        std::string peer;
-        tlvText(v, 50, &peer);
-        uint8_t mode = 0;
         bool bad = false;
         tlvU8(v, 52, &mode, &bad);
         const Tlv* recs = tlvFind(v, 53);
@@ -412,32 +411,25 @@ void routeWrite(Engine* e, uint32_t wi, uint32_t slot, P4Lane* L) {
             doneStatus(e, slot, colsOfWrite(op), P4_E_ARG, "PUT needs records (tag 53)");
             return;
         }
-        const std::string token = ps::producerToken(reinterpret_cast<const uint8_t*>(peer.data()), peer.size());
-        Part* p;
+        bool over;
         {
             std::lock_guard<std::mutex> g(t->mu);
-            if (t->overQuota) p = nullptr;
-            else p = partFor(t, token, peer, true);
+            over = t->overQuota;
         }
-        if (!p) {
+        if (over) {
             doneStatus(e, slot, colsOfWrite(op), P4_E_NOSPACE, "over quota");
             return;
         }
-        const uint64_t records = ld32(recs->v);
-        WriterState& ws = *e->writers[p->owner];
+        records = ld32(recs->v);
+        WriterState& ws = *e->writers[t->owner];
         bool busy;
         {
             std::lock_guard<std::mutex> g(ws.mu);
-            busy = p->backlogRecords > 0 && p->backlogRecords + records > e->cfg.backlogCredit;
+            busy = t->backlogRecords > 0 && t->backlogRecords + records > e->cfg.backlogCredit;
         }
-        // Backpressure: the type's pending index entries over their budget (a
-        // flush cannot keep up or a REBUILD holds it), or the WALs over twice
-        // their total (checkpoints cannot keep up).
-        const char* why = busy ? "partition backlog full" : nullptr;
-        if (!why) {
-            std::lock_guard<std::mutex> g(t->mu);
-            if (t->pend.bytes() + t->flushing.bytes() > e->cfg.pendingBytes) why = "type index flush behind (pending entries)";
-        }
+        // Backpressure: the type's backlog over its credit, or the WALs over
+        // twice their total (checkpoints cannot keep up).
+        const char* why = busy ? "type backlog full" : nullptr;
         if (!why && e->stat[kStWalBytes].load(std::memory_order_relaxed) > 2 * e->cfg.walTotal) why = "WAL checkpoints behind";
         if (why) {
             e->bump(kStBusy);
@@ -445,108 +437,47 @@ void routeWrite(Engine* e, uint32_t wi, uint32_t slot, P4Lane* L) {
             doneStatus(e, slot, colsOfWrite(op), P4_E_BUSY, why);
             return;
         }
-        WriteTask* wt = new (std::nothrow) WriteTask();
-        if (!wt) {
-            doneStatus(e, slot, colsOfWrite(op), P4_E_NOMEM, "out of memory");
-            return;
-        }
-        wt->slot = slot;
-        wt->op = op;
-        wt->mode = mode;
-        wt->records = records;
-        wt->part = p;
-        pushTask(e, p, wt);
-        return;
     }
-    Shared* s = new (std::nothrow) Shared();
-    if (!s) {
+    WriteTask* wt = new (std::nothrow) WriteTask();
+    if (!wt) {
         doneStatus(e, slot, colsOfWrite(op), P4_E_NOMEM, "out of memory");
         return;
     }
-    s->slot = slot;
-    s->type = t;
-    std::vector<std::pair<Part*, std::vector<int64_t>>> targets;
-    if (op == P4_OPC_SUPERSEDE) {
-        s->kind = Shared::kSupersede;
-        uint8_t apply = 0;
-        bool bad = false;
-        tlvText(v, 11, &s->provider);
-        tlvText(v, 12, &s->source);
-        tlvText(v, 60, &s->keep);
-        tlvU8(v, 61, &apply, &bad);
-        s->apply = apply != 0;
-        if (bad || s->provider.empty() || s->source.empty()) {
-            delete s;
-            doneStatus(e, slot, colsOfWrite(op), P4_E_ARG, "SUPERSEDE needs provider and source");
-            return;
-        }
-        std::lock_guard<std::mutex> g(t->mu);
-        for (auto& p : t->parts) targets.push_back({p.get(), {}});
-    } else {
-        s->kind = Shared::kDelete;
-        const Tlv* cids = tlvFind(v, 40);
-        if (!cids || cids->n < 4 || (cids->n - 4) != size_t(ld32(cids->v)) * kCidBin) {
-            delete s;
-            doneStatus(e, slot, colsOfWrite(op), P4_E_ARG, "DELETE needs CIDs (tag 40)");
-            return;
-        }
-        std::map<uint32_t, std::vector<int64_t>> byPid;
-        const uint32_t n = ld32(cids->v);
-        std::vector<Holder> hs;
-        for (uint32_t i = 0; i < n; i++) {
-            const uint8_t* c36 = cids->v + 4 + size_t(i) * kCidBin;
-            if (!cidBinValid(c36)) continue;
-            uint8_t key[32];
-            cidKeyFromDigest(c36 + 4, key);
-            if (holdersOf(L, t, key, &hs) != P4_OK) continue;
-            for (auto& h : hs) byPid[h.pid].push_back(h.seq);
-        }
-        std::lock_guard<std::mutex> g(t->mu);
-        for (auto& kv : byPid) {
-            Part* p = t->partById(kv.first);
-            if (p) targets.push_back({p, kv.second});
-        }
-    }
-    s->remaining.store(int(targets.size()) + 1);
-    for (auto& tg : targets) {
-        WriteTask* wt = new WriteTask();
-        wt->slot = slot;
-        wt->op = op;
-        wt->part = tg.first;
-        wt->shared = s;
-        wt->dels = std::move(tg.second);
-        pushTask(e, tg.first, wt);
-    }
+    wt->slot = slot;
+    wt->op = int(op);
+    wt->mode = mode;
+    wt->records = records;
+    wt->type = t;
     (void)wi;
-    finishShared(e, s);  // the dispatcher's own reference
+    pushTask(e, t, wt);
 }
 
-// Takes the next group of a partition's backlog: consecutive PUT calls of one
-// mode up to group-commit records, or one SUPERSEDE/DELETE.
-bool takeGroup(Engine* e, uint32_t wi, Part** pp, std::vector<WriteTask*>* out) {
+// Takes the next work of a type's backlog: consecutive PUT calls of one mode
+// up to group-commit records, or one other task.
+bool takeGroup(Engine* e, uint32_t wi, Type** tp, std::vector<WriteTask*>* out) {
     WriterState& ws = *e->writers[wi];
     std::lock_guard<std::mutex> g(ws.mu);
     while (!ws.ready.empty()) {
-        Part* p = ws.ready.front();
+        Type* t = ws.ready.front();
         ws.ready.pop_front();
-        p->ready = false;
-        if (p->backlog.empty()) continue;
+        t->ready = false;
+        if (t->backlog.empty()) continue;
         uint64_t recs = 0;
-        WriteTask* first = p->backlog.front();
+        WriteTask* first = t->backlog.front();
         do {
-            WriteTask* wt = p->backlog.front();
+            WriteTask* wt = t->backlog.front();
             if (!out->empty() && (wt->op != P4_OPC_PUT || first->op != P4_OPC_PUT || wt->mode != first->mode)) break;
             if (!out->empty() && recs + wt->records > e->cfg.groupRecords) break;
-            p->backlog.pop_front();
-            p->backlogRecords -= wt->records;
+            t->backlog.pop_front();
+            t->backlogRecords -= wt->records;
             recs += wt->records;
             out->push_back(wt);
-        } while (!p->backlog.empty() && first->op == P4_OPC_PUT);
-        if (!p->backlog.empty()) {
-            p->ready = true;
-            ws.ready.push_back(p);
+        } while (!t->backlog.empty() && first->op == P4_OPC_PUT);
+        if (!t->backlog.empty()) {
+            t->ready = true;
+            ws.ready.push_back(t);
         }
-        *pp = p;
+        *tp = t;
         return true;
     }
     return false;
@@ -555,10 +486,6 @@ bool takeGroup(Engine* e, uint32_t wi, Part** pp, std::vector<WriteTask*>* out) 
 void writerLoop(Engine* e, uint32_t wi) {
     tThread = e->firstOfClass[1] + wi;
     Bell& b = e->bells[tThread];
-    P4Lane L;
-    L.e = e;
-    L.thread = tThread;
-    L.cls = P4_CLASS_WRITE;
     for (;;) {
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
         bool did = false;
@@ -566,20 +493,28 @@ void writerLoop(Engine* e, uint32_t wi) {
         // Route everything queued before taking a group: a group is then every
         // call that arrived while the previous commit ran (group commit).
         for (uint32_t k = 0; k < e->nSlots[0] && e->queues[0].pop(&slot); k++) {
-            routeWrite(e, wi, slot, &L);
+            routeWrite(e, wi, slot);
             did = true;
         }
-        Part* p = nullptr;
+        Type* t = nullptr;
         std::vector<WriteTask*> tasks;
-        if (takeGroup(e, wi, &p, &tasks)) {
+        if (takeGroup(e, wi, &t, &tasks)) {
             did = true;
             const int op = tasks[0]->op;
             for (WriteTask* wt : tasks)
-                if (!wt->shared || !wt->shared->internal()) e->slot(wt->slot)->thread = tThread;
-            if (op == P4_OPC_PUT) putGroup(e, wi, p, tasks);
-            else if (op == P4_OPC_SUPERSEDE) supersedePart(e, p, tasks[0]);
-            else if (op == P4_OPC_REBUILD) repairPart(e, p, tasks[0]);
-            else deletePart(e, p, tasks[0]);
+                if (!wt->internal) e->slot(wt->slot)->thread = tThread;
+            if (tasks[0]->internal) {
+                Internal* in = tasks[0]->internal;
+                if (op == P4_OPC_QUOTA_GC) quotaWork(e, t, in);
+                else rebuildWork(e, t, in);
+                in->done.store(true, std::memory_order_release);
+            } else if (op == P4_OPC_PUT) {
+                putGroup(e, wi, t, tasks);
+            } else if (op == P4_OPC_SUPERSEDE) {
+                supersedeOp(e, t, tasks[0]);
+            } else {
+                deleteOp(e, t, tasks[0]);
+            }
             for (WriteTask* wt : tasks) delete wt;
         }
         if (did) continue;
@@ -768,12 +703,11 @@ int32_t engineStop(Engine* e, double deadlineMs) {
         std::lock_guard<std::mutex> g(e->typesMu);
         for (auto& t : e->types) types.push_back(t.get());
     }
-    for (Type* t : types) typeIndexFlush(t, true);
     // Close every writer connection with a TRUNCATE checkpoint.
     std::vector<Conn*> conns;
     {
         std::lock_guard<std::mutex> g(e->wconnMu);
-        for (Part* f : e->wlru) {
+        for (Feed* f : e->wlru) {
             conns.push_back(f->w);
             f->w = nullptr;
             f->inLru = false;
@@ -801,6 +735,16 @@ int32_t engineStop(Engine* e, double deadlineMs) {
             t->idx = nullptr;
         }
         if (t->jdb) {
+            // The rows the type index applied go (the index commits are durable).
+            if (t->jcut > 0) {
+                sqlite3_stmt* q = t->jdb->get(S_J_DEL);
+                if (q) {
+                    sqlite3_bind_int64(q, 1, t->jcut);
+                    sqlite3_step(q);
+                    sqlite3_reset(q);
+                }
+                t->jcut = 0;
+            }
             sqlite3_wal_checkpoint_v2(t->jdb->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
             delete t->jdb;
             t->jdb = nullptr;

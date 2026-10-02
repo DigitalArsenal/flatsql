@@ -1,8 +1,10 @@
 // The crash proof (C-33: end to end, few): t_kill, a kill -9 loop. A forked
-// engine ingests (three producers, copies, batch supersede, quota) until it
-// is killed at a random point; the parent reopens the store and checks it:
-// integrity_check on every file, every row found by CID, the record count,
-// REBUILD 8 (the type index against the files) and seqs above the old ones.
+// engine ingests (three producers, three feeds: two source feeds and the
+// local file, the same records in more than one feed, copies, batch
+// supersede, quota) until it is killed at a random point; the parent reopens
+// the store and checks it: integrity_check on every file, one seq per CID
+// across the feed files, every row found by CID, the record count, REBUILD 8
+// (the type index against the files) and seqs above the old ones.
 // The loop's two halves (t_kill_run, t_kill_check) are also tests of their
 // own, so the wasm build's host drives the same loop (scripts/p4-wasm-suite.mjs).
 #include <unistd.h>
@@ -26,9 +28,20 @@ namespace fp = flatsql::p4;
 
 namespace {
 
+// A read-only connection of the check's own, beside the engine's: through
+// FlatSQL's VFS with share=1, as every format-4 connection (it attaches to
+// the path's node: the engine's locks and WAL index). Without share=1 a
+// connection gets a private node (every lock granted, its own WAL index),
+// believes it is the file's last connection at close and may delete the WAL
+// under the engine's connections.
+int openSide(const std::string& path, sqlite3** db) {
+    const std::string uri = "file:" + path + "?share=1";
+    return sqlite3_open_v2(uri.c_str(), db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, flatsql::kFlatSqlVfsName);
+}
+
 std::string integrity(const std::string& path) {
     sqlite3* db = nullptr;
-    if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+    if (openSide(path, &db) != SQLITE_OK) {
         sqlite3_close(db);
         return "open failed";
     }
@@ -72,11 +85,14 @@ std::vector<uint8_t> killFrame(uint64_t id) {
                                    Field::raw("BODY", std::vector<uint8_t>(160, uint8_t(id)))});
 }
 
-Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from, int n) {
+// The feeds a call writes to (C-37): 0 prov@src, 1 prov@src2, 2 the local
+// file (no tag).
+Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from, int n, int feed = 0) {
     Batch b;
     b.type = "PNM";
     b.peer = peer;
-    b.tags.push_back(Tag{"prov", "src", "", batch, "", "", ""});
+    if (feed == 0) b.tags.push_back(Tag{"prov", "src", "", batch, "", "", ""});
+    if (feed == 1) b.tags.push_back(Tag{"prov", "src2", "", batch, "", "", ""});
     b.at = 1790000000;
     for (int i = 0; i < n; i++) {
         In in;
@@ -87,14 +103,16 @@ Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from
     return b;
 }
 
-// One step of the workload the kill lands in: 3 producers; every 5th call
-// repeats earlier records under another producer (copies); every 4th call
-// (from the second)
-// sends the same new records from two producers at once (concurrent copies:
-// one seq per CID, §3.8.2: 50-record calls from all three producers); every 13th call supersedes a batch and every 11th
-// deletes the oldest arrivals down to a 4 MiB quota.
+// One step of the workload the kill lands in: 3 producers, call c to feed
+// c % 3; every 5th call repeats earlier records under another producer and
+// often another feed (copies; the same record in two feed files); every 4th
+// call (from the second) sends the same new records from all three
+// producers at once, each to its own feed (concurrent copies across feed
+// files: one seq per CID, §3.8.2; 50-record calls); every 13th call
+// supersedes a batch of prov@src and every 11th deletes the oldest arrivals
+// down to a 4 MiB quota.
 void killWorkStep(int c, uint64_t* id) {
-    Batch b = killBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), *id, 500);
+    Batch b = killBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), *id, 500, c % 3);
     if (c % 5 == 4)
         for (int i = 0; i < 500; i++) b.recs[size_t(i)].frame = killFrame(*id - 1000 + uint64_t(i));
     *id += 500;
@@ -104,8 +122,7 @@ void killWorkStep(int c, uint64_t* id) {
         std::vector<uint32_t> slots;
         for (int at = 0; at < 500; at += 50)
             for (int pi = 0; pi < 3; pi++) {
-                Batch part = b;
-                part.peer = "producer" + std::to_string(pi);
+                Batch part = killBatch("producer" + std::to_string(pi), "b" + std::to_string(c / 7), 0, 0, pi);
                 part.recs.assign(b.recs.begin() + at, b.recs.begin() + at + 50);
                 slots.push_back(submit(P4_OPC_PUT, encodePut(part)));
             }
@@ -161,7 +178,9 @@ bool killCheck(const std::string& root, std::string* why) {
         return false;
     }
     std::unordered_set<std::string> distinct;
-    int64_t rows = 0, maxSeq = 0, missing = 0;
+    std::map<std::string, int64_t> diskSeq;  // one seq per CID in every feed file
+    int64_t rows = 0, maxSeq = 0, missing = 0, diskSplit = 0;
+    size_t files = 0;
     std::vector<std::vector<uint8_t>> sample;
     for (auto& f : partitionFiles(root, "PNM")) {
         if (integrity(f) != "ok") {
@@ -169,14 +188,17 @@ bool killCheck(const std::string& root, std::string* why) {
             closeEngine();
             return false;
         }
+        files++;
         sqlite3* db = nullptr;
-        sqlite3_open_v2(f.c_str(), &db, SQLITE_OPEN_READONLY, nullptr);
+        openSide(f, &db);
         sqlite3_stmt* q;
         sqlite3_prepare_v2(db, "SELECT seq, cid FROM r", -1, &q, nullptr);
         while (sqlite3_step(q) == SQLITE_ROW) {
             rows++;
             maxSeq = std::max<int64_t>(maxSeq, sqlite3_column_int64(q, 0));
             const std::string key(static_cast<const char*>(sqlite3_column_blob(q, 1)), 32);
+            const auto ds = diskSeq.emplace(key, sqlite3_column_int64(q, 0));
+            if (ds.first->second != sqlite3_column_int64(q, 0)) diskSplit++;
             if (distinct.insert(key).second) {
                 uint8_t d[32], c[36] = {0x01, 0x55, 0x12, 0x20};
                 fp::cidDigestFromKey(reinterpret_cast<const uint8_t*>(key.data()), d);
@@ -218,11 +240,12 @@ bool killCheck(const std::string& root, std::string* why) {
     const int64_t nodesLeft = flatsql::flatSqlIoVfsStats().nodes;
     if (nodesLeft) std::fprintf(stderr, "  check: %lld VFS nodes left open after close\n", (long long)nodesLeft);
     char buf[256];
-    std::snprintf(buf, sizeof buf, "rows %lld distinct %zu count %lld missing %lld split %lld mismatches %lld above %d nodes %lld",
-                  (long long)rows, distinct.size(), (long long)count, (long long)missing, (long long)split, (long long)mism,
-                  int(above), (long long)nodesLeft);
+    std::snprintf(buf, sizeof buf,
+                  "files %zu rows %lld distinct %zu count %lld missing %lld split %lld disk-split %lld mismatches %lld above %d nodes %lld",
+                  files, (long long)rows, distinct.size(), (long long)count, (long long)missing, (long long)split, (long long)diskSplit,
+                  (long long)mism, int(above), (long long)nodesLeft);
     *why = buf;
-    return missing == 0 && split == 0 && count == int64_t(distinct.size()) && mism == 0 && above && nodesLeft == 0;
+    return missing == 0 && split == 0 && diskSplit == 0 && count == int64_t(distinct.size()) && mism == 0 && above && nodesLeft == 0;
 }
 }  // namespace
 
@@ -263,6 +286,7 @@ P4_SLOW_TEST(t_kill) {
         std::string why;
         if (killCheck(root, &why)) {
             pass++;
+            if (round == 1 || round == rounds) std::printf("  round %d: %s\n", round, why.c_str());
         } else {
             fail++;
             std::printf("  round %d FAIL: %s\n", round, why.c_str());

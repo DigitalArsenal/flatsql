@@ -432,35 +432,81 @@ int64_t ioSize(const std::string& path) {
 // ---- SQLite connections ------------------------------------------------------------------
 const char* stmtSql(StmtId id) {
     switch (id) {
-        case S_INS: return "INSERT INTO r(seq,cid,e,k,ts,p,f,s,x,d) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)";
-        case S_RL_INS: return "INSERT OR IGNORE INTO rl(sid,seq,lane,at,u) VALUES(?1,?2,?3,?4,?5)";
-        case S_RL_ONE: return "SELECT at, u FROM rl WHERE sid=?1 AND seq=?2 AND lane=?3";
-        case S_RL_URL: return "UPDATE rl SET u=?4 WHERE sid=?1 AND seq=?2 AND lane=?3";
-        case S_RL_OF: return "SELECT sid, lane, at, u FROM rl WHERE seq=?1";
-        case S_RL_DEL_SEQ: return "DELETE FROM rl WHERE seq=?1";
-        case S_R_DEL: return "DELETE FROM r WHERE seq=?1";
-        case S_R_ROW: return "SELECT cid, e, k, ts, x, length(d), p, f, d FROM r WHERE seq=?1";
-        case S_R_GET: return "SELECT cid, e, k, ts, x, length(d), p, f, NULL FROM r WHERE seq=?1";
-        case S_R_LEN: return "SELECT length(d), cid, e, k, w FROM r WHERE seq=?1";
-        case S_R_HOLDER: return "SELECT d, ts, cid FROM r WHERE seq=?1";
-        case S_SUP_K: return "SELECT seq, cid, length(d), s, d, w, e FROM r WHERE k=?1 AND seq<>?2";
-        case S_LANE_UP:
-            return "INSERT OR REPLACE INTO lane(id,sid,batch,ckey,ppeer,pkey,url,url0,created,updated,maxat,n,bytes,"
-                   "minw,maxw,maxseq,maxts,minseq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)";
-        case S_LANE_DEL: return "DELETE FROM lane WHERE id=?1";
-        case S_SRC_INS: return "INSERT OR IGNORE INTO src(id,provider,source) VALUES(?1,?2,?3)";
+        // feed file: a record's rows are the rid range [seq << 16, seq << 16 | 0xffff]
+        case S_R_SEQ: return "SELECT rid, n, b, c, u, at, cid, e, k, ts, f, x, length(d) FROM r WHERE rid>=?1 AND rid<=?2";
+        case S_R_SEQD: return "SELECT rid, n, b, c, u, at, cid, e, k, ts, f, x, length(d), d FROM r WHERE rid>=?1 AND rid<=?2";
+        case S_R_D: return "SELECT d FROM r WHERE rid=?1";
+        case S_R_INS:
+            return "INSERT INTO r(rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,d) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)";
+        case S_R_DEL: return "DELETE FROM r WHERE rid=?1";
+        case S_R_URL: return "UPDATE r SET u=?2 WHERE rid=?1";
+        case S_R_MAXRID: return "SELECT max(rid) FROM r WHERE rid>=?1 AND rid<=?2";
         case S_META_SET: return "INSERT OR REPLACE INTO meta(k,v) VALUES(?1,?2)";
-        case S_C_GET: return "SELECT pid, seq FROM c WHERE cid=?1";
-        case S_C_INS: return "INSERT OR REPLACE INTO c(cid,pid,seq) VALUES(?1,?2,?3)";
-        case S_C_DEL: return "DELETE FROM c WHERE cid=?1 AND pid=?2";
+        case S_NODE_INS: return "INSERT INTO node(id,producer,peer) VALUES(?1,?2,?3)";
+        case S_BATCH_INS: return "INSERT INTO batch(id,batch,ppeer,pkey) VALUES(?1,?2,?3,?4)";
+        case S_CKEY_GET: return "SELECT id FROM ckey WHERE ckey=?1";
+        case S_CKEY_INS: return "INSERT INTO ckey(ckey) VALUES(?1)";
+        case S_CKEY_TEXT: return "SELECT ckey FROM ckey WHERE id=?1";
+        case S_URL_GET: return "SELECT id FROM url WHERE url=?1";
+        case S_URL_INS: return "INSERT INTO url(url) VALUES(?1)";
+        case S_URL_TEXT: return "SELECT url FROM url WHERE id=?1";
+        case S_INST_PUT:
+            return "INSERT OR REPLACE INTO inst(b,c,n,bytes,minw,maxw,minseq,maxseq,first,updated,maxat,maxts,url)"
+                   " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
+        case S_INST_DEL: return "DELETE FROM inst WHERE b=?1 AND c=?2";
+        // type index
+        case S_X_CID: return "SELECT seq, fid, len, w, k, e, cp FROM x INDEXED BY x_c WHERE cid=?1";
+        case S_X_SEQ: return "SELECT fid, cid, len, w, k, e, cp FROM x WHERE seq=?1";
+        case S_X_PUT: return "INSERT OR REPLACE INTO x(seq,fid,cid,len,w,k,e,cp) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)";
+        case S_X_DEL: return "DELETE FROM x WHERE seq=?1 AND fid=?2";
         case S_IDENT_GET: return "SELECT seq, cid FROM ident WHERE src=?1 AND h=?2";
         case S_IDENT_INS: return "INSERT OR REPLACE INTO ident(src,h,seq,cid) VALUES(?1,?2,?3,?4)";
-        case S_IDENT_DEL: return "DELETE FROM ident WHERE src=?1 AND h=?2";
-        case S_J_INS: return "INSERT INTO j(op,k,c,pid,seq,s,v) VALUES(?1,?2,?3,?4,?5,?6,?7)";
+        // journal
+        case S_J_INS: return "INSERT INTO j(op,fid,seq,k,s,v) VALUES(?1,?2,?3,?4,?5,?6)";
         case S_J_DEL: return "DELETE FROM j WHERE id<=?1";
         case S_JM_SET: return "INSERT OR REPLACE INTO jm(k,v) VALUES(?1,?2)";
         default: return nullptr;
     }
+}
+
+// ---- small encodings ---------------------------------------------------------------------
+void KVal::bind(sqlite3_stmt* q, int at) const {
+    if (type == 1) sqlite3_bind_int64(q, at, i);
+    else if (type == 3) sqlite3_bind_text(q, at, s.data(), int(s.size()), SQLITE_TRANSIENT);
+    else sqlite3_bind_null(q, at);
+}
+
+void KVal::from(sqlite3_stmt* q, int col) {
+    const int ct = sqlite3_column_type(q, col);
+    type = ct == SQLITE_INTEGER ? 1 : ct == SQLITE_TEXT ? 3 : 0;
+    i = type == 1 ? sqlite3_column_int64(q, col) : 0;
+    if (type == 3) s.assign(reinterpret_cast<const char*>(sqlite3_column_text(q, col)), size_t(sqlite3_column_bytes(q, col)));
+    else s.clear();
+}
+
+// cp: [u32 tok][u64 len] per copy, token ids ascending.
+std::string cpEncode(const std::vector<CopyLen>& cp) {
+    std::string out(cp.size() * 12, '\0');
+    uint8_t* p = reinterpret_cast<uint8_t*>(&out[0]);
+    for (const CopyLen& c : cp) {
+        st32(p, c.tok);
+        st64(p + 4, uint64_t(c.len));
+        p += 12;
+    }
+    return out;
+}
+
+bool cpDecode(const void* p, size_t n, std::vector<CopyLen>* out) {
+    out->clear();
+    if (n % 12) return false;
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; i += 12) out->push_back(CopyLen{ld32(b + i), int64_t(ld64(b + i + 4))});
+    return true;
+}
+
+std::string nodeKey(const std::string& producer, const std::string& peer) { return producer + '\x1f' + peer; }
+std::string batchKey(const std::string& batch, const std::string& ppeer, const std::string& pkey) {
+    return batch + '\x1f' + ppeer + '\x1f' + pkey;
 }
 
 Conn::~Conn() {
