@@ -5,9 +5,9 @@
   "size": 2246620,
   "files": {
     "flatsql-p4-threads.wasm": {
-      "sha256": "6e5b00d45ba825160f1f212f99561de3ac2634548bf5c0db944f2e87360b27f3",
-      "sri": "sha384-BTYraEmY5fUH6nykV6agw7iu+iLIi9VB+Fr7nU+pFOpLl+/b2LIkYhvRYnis71A3",
-      "size": 2846950
+      "sha256": "711b95f6c3d98c22695aa93e9dbe62922f10f006f7bad9d694662f80acb96376",
+      "sri": "sha384-xB6YDvvLIv0Ov5tBhffWmduSQFkVKm5ikvH8uDIUBzg3c1r4t4krWYbRYEt5wMri",
+      "size": 2847527
     },
     "flatsql-ps-threads.wasm": {
       "sha256": "b310425d5380dc549cfa010f6ea2dbc337d4faf356eb2b9b00eca3b30bb3259c",
