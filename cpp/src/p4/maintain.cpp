@@ -305,10 +305,9 @@ void why(const char* what, const std::string& path, int64_t a, int64_t b) {
 #endif
 }
 
-// Compares (and with fix, rewrites) the type index against the partition
-// files: its c rows against every file's CID index, merged in CID order (one
-// sequential walk of each side), and the files' counters and lane counts
-// against their rows.
+// Compares (and with fix, repairs) the type index against the partition
+// files: its c rows against every file's rows (point probes both ways), and
+// the files' counters and lane counts against their rows.
 int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
     (void)e;
     if (!t->hasFiles.load(std::memory_order_acquire)) return P4_OK;
@@ -418,107 +417,109 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
             f->touched = true;
         }
     }
-    // 2. CID entries: every file's (cid, seq) in CID order, merged by (cid,
-    //    pid), against c in (cid, pid) order (fix: c rewritten in that order,
-    //    one sequential append).
-    struct Cur {
-        sqlite3_stmt* s = nullptr;
-        uint32_t pid = 0;
-        uint8_t key[32];
-        int64_t seq = 0;
-        bool live = false;
-    };
-    std::vector<Cur> cur(files.size());
-    auto advance = [&](Cur& k) -> int {
-        const int r = sqlite3_step(k.s);
-        k.live = r == SQLITE_ROW && sqlite3_column_bytes(k.s, 0) == 32;
-        if (k.live) {
-            std::memcpy(k.key, sqlite3_column_blob(k.s, 0), 32);
-            k.seq = sqlite3_column_int64(k.s, 1);
+    // 2. CID entries (C-34: the type index is the one CID index). Every
+    //    file row has its c entry (cid, pid) -> seq, and every c entry names
+    //    a row of its file with that CID: two walks with point probes, no
+    //    sort. A fix inserts the missing entries and deletes the dangling
+    //    ones, a page at a time.
+    {
+        sqlite3_stmt* probe = x->sql("SELECT seq FROM c WHERE cid=?1 AND pid=?2");
+        sqlite3_stmt* put = x->get(S_C_INS);
+        if (!probe || !put) return fail(SQLITE_ERROR);
+        for (size_t fi = 0; fi < files.size(); fi++) {
+            where = files[fi]->path;
+            const uint32_t pid = files[fi]->part->pid;
+            sqlite3_stmt* s = conns[fi]->sql("SELECT seq, cid FROM r");
+            if (!s) return fail(SQLITE_ERROR);
+            int src;
+            while ((src = sqlite3_step(s)) == SQLITE_ROW) {
+                if (sqlite3_column_bytes(s, 1) != 32) continue;
+                const int64_t seq = sqlite3_column_int64(s, 0);
+                v->entries++;
+                sqlite3_bind_blob(probe, 1, sqlite3_column_blob(s, 1), 32, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(probe, 2, pid);
+                const int pr = sqlite3_step(probe);
+                const bool ok = pr == SQLITE_ROW && sqlite3_column_int64(probe, 0) == seq;
+                sqlite3_reset(probe);
+                if (pr != SQLITE_ROW && pr != SQLITE_DONE) {
+                    sqlite3_reset(s);
+                    return fail(pr);
+                }
+                if (ok) continue;
+                v->mismatches++;
+                why("c entry missing", where, seq, pid);
+                if (!fix) continue;
+                sqlite3_reset(put);
+                sqlite3_bind_blob(put, 1, sqlite3_column_blob(s, 1), 32, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(put, 2, pid);
+                sqlite3_bind_int64(put, 3, seq);
+                const int irc = sqlite3_step(put);
+                sqlite3_reset(put);
+                if (irc != SQLITE_DONE) {
+                    sqlite3_reset(s);
+                    return fail(irc);
+                }
+            }
+            sqlite3_reset(s);
+            if (src != SQLITE_DONE) return fail(src);
         }
-        return r == SQLITE_ROW || r == SQLITE_DONE ? SQLITE_OK : r;
-    };
-    for (size_t fi = 0; fi < files.size(); fi++) {
-        where = files[fi]->path;
-        cur[fi].pid = files[fi]->part->pid;
-        cur[fi].s = conns[fi]->sql("SELECT cid, seq FROM r ORDER BY cid");  // r_c (a sort before REBUILD 1)
-        if (!cur[fi].s) return fail(SQLITE_ERROR);
-        const int r = advance(cur[fi]);
-        if (r != SQLITE_OK) return fail(r);
+        std::unordered_map<uint32_t, Conn*> connOf;
+        for (size_t fi = 0; fi < files.size(); fi++) connOf[files[fi]->part->pid] = conns[fi];
+        sqlite3_stmt* page = x->sql("SELECT cid, pid, seq FROM c WHERE (cid, pid) > (?1, ?2) ORDER BY cid, pid LIMIT 65536");
+        sqlite3_stmt* del = x->get(S_C_DEL);
+        if (!page || !del) return fail(SQLITE_ERROR);
+        uint8_t lastKey[32] = {};
+        int64_t lastPid = 0;
+        for (bool more = true; more;) {
+            std::vector<std::pair<std::array<uint8_t, 32>, uint32_t>> dangling;
+            sqlite3_bind_blob(page, 1, lastKey, 32, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(page, 2, lastPid);
+            int src;
+            size_t got = 0;
+            while ((src = sqlite3_step(page)) == SQLITE_ROW) {
+                got++;
+                if (sqlite3_column_bytes(page, 0) != 32) continue;
+                std::array<uint8_t, 32> key;
+                std::memcpy(key.data(), sqlite3_column_blob(page, 0), 32);
+                const uint32_t pid = uint32_t(sqlite3_column_int64(page, 1));
+                const int64_t seq = sqlite3_column_int64(page, 2);
+                std::memcpy(lastKey, key.data(), 32);
+                lastPid = pid;
+                bool ok = false;
+                auto it = connOf.find(pid);
+                if (it != connOf.end()) {
+                    sqlite3_stmt* q = it->second->get(S_R_LEN);
+                    if (!q) {
+                        sqlite3_reset(page);
+                        return fail(SQLITE_ERROR);
+                    }
+                    sqlite3_bind_int64(q, 1, seq);
+                    const int r = sqlite3_step(q);
+                    ok = r == SQLITE_ROW && sqlite3_column_bytes(q, 1) == 32 && std::memcmp(sqlite3_column_blob(q, 1), key.data(), 32) == 0;
+                    sqlite3_reset(q);
+                    if (r != SQLITE_ROW && r != SQLITE_DONE) {
+                        sqlite3_reset(page);
+                        return fail(r);
+                    }
+                }
+                if (ok) continue;
+                v->mismatches++;
+                why("c entry dangling", t->name, seq, pid);
+                if (fix) dangling.push_back({key, pid});
+            }
+            sqlite3_reset(page);
+            if (src != SQLITE_DONE) return fail(src);
+            more = got == 65536;
+            for (auto& d : dangling) {
+                sqlite3_reset(del);
+                sqlite3_bind_blob(del, 1, d.first.data(), 32, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(del, 2, d.second);
+                const int r = sqlite3_step(del);
+                sqlite3_reset(del);
+                if (r != SQLITE_DONE) return fail(r);
+            }
+        }
     }
-    if (fix) {
-        const int src = x->exec("DELETE FROM c");
-        if (src != SQLITE_OK) return fail(src);
-    }
-    sqlite3_stmt* ci = nullptr;
-    bool ciLive = false;
-    uint8_t ciKey[32];
-    uint32_t ciPid = 0;
-    int64_t ciSeq = 0;
-    auto ciAdvance = [&]() -> int {
-        const int r = sqlite3_step(ci);
-        ciLive = r == SQLITE_ROW && sqlite3_column_bytes(ci, 0) == 32;
-        if (ciLive) {
-            std::memcpy(ciKey, sqlite3_column_blob(ci, 0), 32);
-            ciPid = uint32_t(sqlite3_column_int64(ci, 1));
-            ciSeq = sqlite3_column_int64(ci, 2);
-        }
-        return r == SQLITE_ROW || r == SQLITE_DONE ? SQLITE_OK : r;
-    };
-    if (!fix) {
-        ci = x->sql("SELECT cid, pid, seq FROM c ORDER BY cid, pid");
-        if (!ci) return fail(SQLITE_ERROR);
-        const int r = ciAdvance();
-        if (r != SQLITE_OK) return fail(r);
-    }
-    for (;;) {
-        int best = -1;
-        for (size_t fi = 0; fi < cur.size(); fi++) {
-            if (!cur[fi].live) continue;
-            if (best < 0) { best = int(fi); continue; }
-            const int c = std::memcmp(cur[fi].key, cur[size_t(best)].key, 32);
-            if (c < 0 || (c == 0 && cur[fi].pid < cur[size_t(best)].pid)) best = int(fi);
-        }
-        if (best < 0 && !ciLive) break;
-        if (fix) {
-            Cur& k = cur[size_t(best)];
-            sqlite3_stmt* ins = x->get(S_C_INS);
-            sqlite3_bind_blob(ins, 1, k.key, 32, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(ins, 2, k.pid);
-            sqlite3_bind_int64(ins, 3, k.seq);
-            const int irc = sqlite3_step(ins);
-            sqlite3_reset(ins);
-            if (irc != SQLITE_DONE) return fail(irc);
-            v->entries++;
-            where = files[size_t(best)]->path;
-            const int r = advance(k);
-            if (r != SQLITE_OK) return fail(r);
-            continue;
-        }
-        // verify: the smaller side advances; equal keys must agree on seq
-        int cmp;
-        if (best < 0) cmp = 1;
-        else if (!ciLive) cmp = -1;
-        else {
-            cmp = std::memcmp(cur[size_t(best)].key, ciKey, 32);
-            if (cmp == 0) cmp = cur[size_t(best)].pid < ciPid ? -1 : cur[size_t(best)].pid > ciPid ? 1 : 0;
-        }
-        if (cmp <= 0) v->entries++;
-        if (cmp != 0 || cur[size_t(best)].seq != ciSeq) {
-            v->mismatches++;
-            why("c entry", cmp < 0 ? files[size_t(best)]->path : t->name, cmp <= 0 ? cur[size_t(best)].seq : ciSeq, cmp);
-        }
-        if (cmp <= 0) {
-            const int r = advance(cur[size_t(best)]);
-            if (r != SQLITE_OK) return fail(r);
-        }
-        if (cmp >= 0) {
-            const int r = ciAdvance();
-            if (r != SQLITE_OK) return fail(r);
-        }
-    }
-    for (size_t fi = 0; fi < cur.size(); fi++) sqlite3_reset(cur[fi].s);
-    if (ci) sqlite3_reset(ci);
     for (Conn* c : conns) delete c;
     conns.clear();
     if (fix) {

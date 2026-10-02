@@ -12,8 +12,10 @@
 //                   a source filter walks rl(sid, seq) when it is selective;
 //   W (desc)        per-file pages on r_w, merged by w; equal-w groups put in
 //                   CID order; copies collapse by CID;
-//   CID             per-file pages on r_c, merged by (CID, pid); copies
-//                   collapse by CID.
+//   CID             the type index's c rows (C-34: the one CID index) in
+//                   (CID, pid) order, the unflushed entries merged over
+//                   them; a page's rows read by seq, one transaction per
+//                   file; copies collapse by CID.
 // The A18 bound (C-31) is the newest N of lane.source when set (rl_sid walked
 // newest first), else of the type (r_s). EPOCH points take one r_ke seek per
 // object per partition.
@@ -253,8 +255,6 @@ private:
         bool opened = false;
         size_t candPos = 0;     // object-key candidates taken so far
         uint64_t probed = 0, kept = 0;  // tag-first pages: rows probed, rows that matched
-        std::deque<std::pair<std::array<uint8_t, 32>, int64_t>> keys;  // CID order: (cid, seq) of r_c
-        std::array<uint8_t, 32> lastKey{};
     };
     int32_t collectCandidates();
     int32_t fetchCandidates(int fi, bool wOrder);
@@ -292,8 +292,27 @@ private:
     // W merge
     std::vector<Row> group_;
     size_t groupAt_ = 0;
-    // CID
-    int32_t fetchCidKeys(int fi);
+    // CID order: (key, pid, seq) entries of the type index and the pending
+    // layer, merged; a page of them resolved to rows.
+    struct CidEnt {
+        uint8_t key[32];
+        uint32_t pid;
+        int64_t seq;
+        uint8_t st;  // 1 live, 2 deleted (pending only)
+    };
+    int32_t cidStart();
+    int32_t cidNextEnt(CidEnt* out, bool* have);
+    int32_t cidPage();
+    bool cidStarted_ = false, cidIdxDone_ = false, cidPeeked_ = false;
+    std::vector<CidEnt> cidPend_;  // unflushed entries of the scan's files, (key, pid) order
+    size_t cidPendAt_ = 0;
+    std::deque<CidEnt> cidIdx_;   // a page of c rows
+    uint8_t cidIdxKey_[32] = {};
+    uint32_t cidIdxPid_ = 0;
+    CidEnt cidPeek_{};
+    std::unordered_map<uint32_t, int> fiOfPid_;
+    std::deque<Row> cidRows_;
+    bool cidDone_ = false;
     Row out_;
     uint64_t skipped_ = 0, emitted_ = 0, boundSeen_ = 0;
     int64_t lastSeq_ = INT64_MIN;
@@ -1495,100 +1514,227 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
     return P4_OK;
 }
 
-// CID order: each file's r_c keys in pages, merged by (CID, pid); the rows
-// are read by seq, so copies collapse to the lowest pid that matches.
-int32_t Scan::fetchCidKeys(int fi) {
-    FileCur& fc = cur_[size_t(fi)];
-    if (fc.done) return P4_OK;
+// CID order (C-34): the type index's c rows in (CID, pid) order with the
+// pending layer (unflushed inserts and deletes, snapshotted at the start)
+// merged over them, restricted to the scan's files. Entries past the
+// visible-through cut are skipped; a page's rows are read by seq, one read
+// transaction per file, and copies collapse to the lowest pid that matches.
+int32_t Scan::cidStart() {
+    cidStarted_ = true;
+    for (size_t fi = 0; fi < files_.size(); fi++) fiOfPid_[files_[fi].pid] = int(fi);
     if (s_.hasCid) {
-        // An exact CID: its holders (one type-index probe), this file's copy.
-        fc.done = true;
+        // An exact CID: its holders (one type-index probe).
         std::vector<Holder> hs;
         const int32_t rc = holdersOf(L_, t_, s_.cidKey, &hs);
         if (rc != P4_OK) return rc;
-        std::array<uint8_t, 32> k;
-        std::memcpy(k.data(), s_.cidKey, 32);
-        for (const Holder& h : hs)
-            if (h.pid == files_[size_t(fi)].pid) fc.keys.push_back({k, h.seq});
+        for (const Holder& h : hs) {
+            if (!fiOfPid_.count(h.pid)) continue;
+            CidEnt x;
+            std::memcpy(x.key, s_.cidKey, 32);
+            x.pid = h.pid;
+            x.seq = h.seq;
+            x.st = 1;
+            cidPend_.push_back(x);
+        }
+        cidIdxDone_ = true;
         return P4_OK;
     }
-    int rc = 0;
-    Conn* c = e_->rpool.acquire(files_[size_t(fi)].path, OpenKind::Reader, &rc, nullptr);
-    if (!c) return statusOfSqlite(rc);
-    sqlite3_stmt* q = c->sql("SELECT cid, seq FROM r INDEXED BY r_c WHERE cid>?1 ORDER BY cid LIMIT 1024");
-    if (!q) q = c->sql("SELECT cid, seq FROM r WHERE cid>?1 ORDER BY cid LIMIT 1024");  // before REBUILD 1
-    if (q) {
-        if (fc.started) sqlite3_bind_blob(q, 1, fc.lastKey.data(), 32, SQLITE_STATIC);
-        else sqlite3_bind_blob(q, 1, "", 0, SQLITE_STATIC);
+    {
+        std::lock_guard<std::mutex> g(t_->mu);
+        std::unordered_map<std::string, size_t> at;  // key + pid -> cidPend_ index
+        auto take = [&](const CEnt& x, bool newer) {
+            if (x.st != 1 && x.st != 2) return;
+            if (!fiOfPid_.count(x.pid)) return;
+            std::string k(reinterpret_cast<const char*>(x.key), 32);
+            k.append(reinterpret_cast<const char*>(&x.pid), 4);
+            CidEnt c;
+            std::memcpy(c.key, x.key, 32);
+            c.pid = x.pid;
+            c.seq = x.seq;
+            c.st = x.st;
+            auto it = at.find(k);
+            if (it == at.end()) {
+                at.emplace(std::move(k), cidPend_.size());
+                cidPend_.push_back(c);
+            } else if (newer) {
+                cidPend_[it->second] = c;
+            }
+        };
+        for (const CEnt& x : t_->flushing.raw()) take(x, false);
+        for (const CEnt& x : t_->pend.raw()) take(x, true);  // the newer state
     }
-    int r = SQLITE_ERROR;
-    size_t got = 0;
-    if (q) {
-        while ((r = sqlite3_step(q)) == SQLITE_ROW) {
-            got++;
-            if (sqlite3_column_bytes(q, 0) != 32) continue;
-            std::array<uint8_t, 32> k;
-            std::memcpy(k.data(), sqlite3_column_blob(q, 0), 32);
-            fc.keys.push_back({k, sqlite3_column_int64(q, 1)});
-            fc.lastKey = k;
+    std::sort(cidPend_.begin(), cidPend_.end(), [](const CidEnt& a, const CidEnt& b) {
+        const int c = std::memcmp(a.key, b.key, 32);
+        return c ? c < 0 : a.pid < b.pid;
+    });
+    return P4_OK;
+}
+
+// The next entry of the merge: *have = false at the end.
+int32_t Scan::cidNextEnt(CidEnt* out, bool* have) {
+    for (;;) {
+        if (cidIdx_.empty() && !cidIdxDone_) {
+            int32_t rc = P4_OK;
+            Conn* x = indexReader(L_, t_, &rc);
+            if (!x) {
+                if (rc != P4_OK) return rc;
+                cidIdxDone_ = true;
+            } else {
+                sqlite3_stmt* q = x->sql("SELECT cid, pid, seq FROM c WHERE (cid, pid) > (?1, ?2) ORDER BY cid, pid LIMIT 1024");
+                if (!q) return P4_E_INTERNAL;
+                sqlite3_bind_blob(q, 1, cidIdxKey_, 32, SQLITE_STATIC);
+                sqlite3_bind_int64(q, 2, cidIdxPid_);  // from (0^32, 0): pids start at 1
+                int r;
+                size_t got = 0;
+                while ((r = sqlite3_step(q)) == SQLITE_ROW) {
+                    got++;
+                    if (sqlite3_column_bytes(q, 0) != 32) continue;
+                    CidEnt c;
+                    std::memcpy(c.key, sqlite3_column_blob(q, 0), 32);
+                    c.pid = uint32_t(sqlite3_column_int64(q, 1));
+                    c.seq = sqlite3_column_int64(q, 2);
+                    c.st = 1;
+                    std::memcpy(cidIdxKey_, c.key, 32);
+                    cidIdxPid_ = c.pid;
+                    if (fiOfPid_.count(c.pid)) cidIdx_.push_back(c);
+                }
+                sqlite3_reset(q);
+                if (r != SQLITE_DONE) return statusOfSqlite(r);
+                if (got < 1024) cidIdxDone_ = true;
+                if (cidIdx_.empty() && !cidIdxDone_) continue;  // a page of other files' entries
+            }
         }
-        sqlite3_reset(q);
+        const bool hi = !cidIdx_.empty(), hp = cidPendAt_ < cidPend_.size();
+        if (!hi && !hp) {
+            *have = false;
+            return P4_OK;
+        }
+        int c = 0;
+        if (hi && hp) {
+            const CidEnt& a = cidIdx_.front();
+            const CidEnt& b = cidPend_[cidPendAt_];
+            c = std::memcmp(a.key, b.key, 32);
+            if (!c) c = a.pid < b.pid ? -1 : a.pid > b.pid ? 1 : 0;
+        } else {
+            c = hi ? -1 : 1;
+        }
+        if (c < 0) {
+            *out = cidIdx_.front();
+            cidIdx_.pop_front();
+        } else {
+            if (c == 0) cidIdx_.pop_front();  // the pending state replaces the index row
+            *out = cidPend_[cidPendAt_++];
+            if (out->st != 1) continue;  // deleted
+        }
+        *have = true;
+        return P4_OK;
     }
-    e_->rpool.release(c);
-    if (r != SQLITE_DONE) return statusOfSqlite(r);
-    fc.started = true;
-    if (got < 1024) fc.done = true;
+}
+
+// The next page of rows: whole CIDs (every copy of the last one), each
+// resolved to its lowest-pid copy that passes the filters.
+int32_t Scan::cidPage() {
+    const bool simple = !s_.lane && s_.preds.empty() && !s_.hasPeer && !s_.eNull && !s_.eNotNull && !fts_ && !s_.hasCid &&
+                        !s_.hasProducer;
+    std::vector<CidEnt> ents;
+    for (;;) {
+        CidEnt x;
+        bool have = false;
+        if (cidPeeked_) {
+            x = cidPeek_;
+            have = true;
+            cidPeeked_ = false;
+        } else {
+            const int32_t rc = cidNextEnt(&x, &have);
+            if (rc != P4_OK) return rc;
+        }
+        if (!have) {
+            cidDone_ = true;
+            break;
+        }
+        L_->rowsExamined++;
+        if (x.seq > hi_) continue;  // not yet visible
+        const bool sameCid = !ents.empty() && std::memcmp(ents.back().key, x.key, 32) == 0;
+        if (!sameCid && simple && skipped_ < s_.offset) {
+            // The offset of an unfiltered window: whole CIDs, no rows read.
+            if (!haveLast_ || std::memcmp(lastKey_, x.key, 32) != 0) skipped_++;
+            std::memcpy(lastKey_, x.key, 32);
+            haveLast_ = true;
+            continue;
+        }
+        if (haveLast_ && std::memcmp(lastKey_, x.key, 32) == 0 && ents.empty()) continue;  // a copy of a skipped CID
+        if (!sameCid && ents.size() >= 256) {
+            cidPeek_ = x;
+            cidPeeked_ = true;
+            break;
+        }
+        ents.push_back(x);
+        int32_t rc = check();
+        if (rc != P4_OK) return rc;
+    }
+    if (ents.empty()) return P4_OK;
+    // The rows, one read transaction per file.
+    std::map<int, std::vector<int64_t>> seqsOf;
+    for (const CidEnt& x : ents) seqsOf[fiOfPid_[x.pid]].push_back(x.seq);
+    std::map<std::pair<int, int64_t>, Row> rows;
+    for (auto& kv : seqsOf) {
+        std::sort(kv.second.begin(), kv.second.end());
+        kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+        int rc = 0;
+        Conn* c = e_->rpool.acquire(files_[size_t(kv.first)].path, OpenKind::Reader, &rc, nullptr);
+        if (!c) {
+            e_->bump(kStReadErrors);
+            return statusOfSqlite(rc);
+        }
+        c->exec("BEGIN");
+        std::deque<Row> got;
+        int32_t st = loadRows(c, kv.first, kv.second, &got);
+        if (st == P4_OK) st = loadTags(c, kv.first, got);
+        c->exec("COMMIT");
+        e_->rpool.release(c);
+        if (st != P4_OK) {
+            e_->bump(kStReadErrors);
+            return st;
+        }
+        for (Row& r : got) rows.emplace(std::make_pair(kv.first, r.seq), std::move(r));
+    }
+    for (size_t i = 0; i < ents.size();) {
+        size_t j = i;
+        while (j < ents.size() && std::memcmp(ents[j].key, ents[i].key, 32) == 0) j++;
+        for (size_t k = i; k < j; k++) {
+            auto it = rows.find({fiOfPid_[ents[k].pid], ents[k].seq});
+            if (it == rows.end() || std::memcmp(it->second.key, ents[k].key, 32) != 0) continue;
+            if (!rowMatches(it->second)) continue;  // a later copy of this CID may match
+            std::memcpy(lastKey_, ents[k].key, 32);
+            haveLast_ = true;
+            if (skipped_ < s_.offset) skipped_++;
+            else cidRows_.push_back(std::move(it->second));
+            break;
+        }
+        i = j;
+    }
     return P4_OK;
 }
 
 int32_t Scan::nextCid(Row** out) {
-    const bool simple = !s_.lane && s_.preds.empty() && !s_.hasPeer && !s_.eNull && !s_.eNotNull && !fts_ && !s_.hasCid &&
-                        !s_.hasProducer;
+    if (!cidStarted_) {
+        const int32_t rc = cidStart();
+        if (rc != P4_OK) return rc;
+    }
     for (;;) {
         int32_t rc = check();
         if (rc != P4_OK) return rc;
-        int best = -1;
-        for (size_t fi = 0; fi < files_.size(); fi++) {
-            FileCur& fc = cur_[fi];
-            if (fc.keys.empty() && !fc.done) {
-                rc = fetchCidKeys(int(fi));
-                if (rc != P4_OK) return rc;
-            }
-            if (fc.keys.empty()) continue;
-            if (best < 0) {
-                best = int(fi);
-                continue;
-            }
-            const int c = std::memcmp(fc.keys.front().first.data(), cur_[size_t(best)].keys.front().first.data(), 32);
-            if (c < 0 || (c == 0 && files_[fi].pid < files_[size_t(best)].pid)) best = int(fi);
+        if (!cidRows_.empty()) {
+            if (s_.limit && emitted_ >= s_.limit) return 0;
+            emitted_++;
+            out_ = std::move(cidRows_.front());
+            cidRows_.pop_front();
+            *out = &out_;
+            return 1;
         }
-        if (best < 0) return 0;
-        const auto x = cur_[size_t(best)].keys.front();
-        cur_[size_t(best)].keys.pop_front();
-        L_->rowsExamined++;
-        if (haveLast_ && std::memcmp(lastKey_, x.first.data(), 32) == 0) continue;  // a copy of a taken CID
-        if (x.second > hi_) continue;  // not yet visible
-        if (simple && skipped_ < s_.offset) {
-            std::memcpy(lastKey_, x.first.data(), 32);
-            haveLast_ = true;
-            skipped_++;
-            continue;
-        }
-        Row row;
-        const int32_t got = rowAt(best, x.second, &row);
-        if (got < 0) return got;
-        if (got == 0 || std::memcmp(row.key, x.first.data(), 32) != 0) continue;  // a later copy of this CID may match
-        std::memcpy(lastKey_, x.first.data(), 32);
-        haveLast_ = true;
-        if (skipped_ < s_.offset) {
-            skipped_++;
-            continue;
-        }
-        if (s_.limit && emitted_ >= s_.limit) return 0;
-        emitted_++;
-        out_ = std::move(row);
-        *out = &out_;
-        return 1;
+        if (cidDone_) return 0;
+        rc = cidPage();
+        if (rc != P4_OK) return rc;
     }
 }
 
