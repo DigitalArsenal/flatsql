@@ -286,6 +286,7 @@ private:
         bool done = false;
         bool opened = false;
         size_t candPos = 0;     // object-key candidates taken so far
+        int page = 0;           // W: entries of the next page (0: not fetched yet)
     };
     int32_t collectCandidates();
     int32_t collectEpochCandidates();
@@ -1474,7 +1475,14 @@ int32_t Scan::fetchW(int fi) {
     }
     c->exec("BEGIN");
     int32_t status = P4_OK;
-    const int page = 256;
+    // The first page holds about twice this file's share of what the window
+    // still needs (many files: a few entries each), the next ones double.
+    if (fc.page == 0) {
+        const uint64_t need = s_.limit + (skipped_ < s_.offset ? s_.offset - skipped_ : 0);
+        fc.page = s_.limit ? int(std::min<uint64_t>(256, need * 2 / files_.size() + 16)) : 256;
+    }
+    const int page = fc.page;
+    fc.page = std::min(256, page * 2);
     std::vector<WEnt> ws;  // in w order
     auto take = [&](sqlite3_stmt* q, int col0, const int64_t* w) {
         if (sqlite3_column_bytes(q, col0 + 1 - (w ? 1 : 0)) != 32) return;
