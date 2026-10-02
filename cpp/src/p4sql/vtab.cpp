@@ -198,7 +198,7 @@ int relDisconnect(sqlite3_vtab* v) {
 // idxStr: two characters per argv entry, in argv order: the target
 // (S seq, E _epoch, T _ts, A COL0, B COL1, R _source) and the operator
 // (= EQ, > GT, ) GE, < LT, ( LE). idxNum: kPlan* flags.
-enum : int { kPlanOrdered = 1, kPlanDesc = 2, kPlanHydrate = 4 };
+enum : int { kPlanOrdered = 1, kPlanDesc = 2, kPlanHydrate = 4, kPlanCounted = 8, kPlanTags = 16 };
 
 char opChar(int op) {
     switch (op) {
@@ -251,6 +251,10 @@ int relBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
     bool hydrate = colUsed(info->colUsed, vt->meta(kData));
     for (int i = 0; i < vt->ns && !hydrate; i++) hydrate = colUsed(info->colUsed, i);
     if (hydrate) flags |= kPlanHydrate;
+    if (colUsed(info->colUsed, vt->meta(kSource))) flags |= kPlanTags;
+    // No constraint, no order and no column read (COUNT(*) of a type): the
+    // rows need not be read, only counted.
+    if (argc == 0 && info->nOrderBy == 0 && info->colUsed == 0 && vt->kind != kRelAlias) flags |= kPlanCounted;
     if (rows < 1) rows = 1;
     info->idxNum = flags;
     info->idxStr = sqlite3_mprintf("%s", plan.c_str());
@@ -343,7 +347,19 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
     ScanArgs args;
     args.desc = (idxNum & kPlanDesc) != 0;
     args.hydrate = (idxNum & kPlanHydrate) != 0;
+    args.tags = (idxNum & kPlanTags) != 0;
     const std::string prefix = vt->t->name + "@";
+    if (idxNum & kPlanCounted) {
+        int64_t n;
+        {
+            EngineCall ec;
+            n = p4_type_rows(vt->ls->lane, vt->t->name.c_str());
+        }
+        if (n < 0) return fail(c, P4_E_NOTYPE, "type not registered");
+        if (vt->t->bound && uint64_t(n) > vt->t->bound) n = int64_t(vt->t->bound);  // A18: the newest N
+        c->scan.openCounted(n);
+        return SQLITE_OK;
+    }
 
     // Constraints.
     Bounds seq;
@@ -534,7 +550,16 @@ sqlite3_module gRelModule = {
 // ---------------------------------------------------------------------------
 // RelScan
 // ---------------------------------------------------------------------------
+void RelScan::openCounted(int64_t n) {
+    close();
+    counted_ = n;
+    row_ = P4Row{};
+    row_.seq = n;
+    eof_ = n <= 0;
+}
+
 void RelScan::close() {
+    counted_ = -1;
     if (c_) {
         EngineCall ec;
         p4_cursor_close(c_);
@@ -568,6 +593,7 @@ int32_t RelScan::open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, con
     spec_.nPreds = uint32_t(preds_.size());
     spec_.order = a.desc ? P4_ORDER_SEQ_DESC : P4_ORDER_SEQ_ASC;
     spec_.hydrate = a.hydrate ? 1 : 0;
+    spec_.noTags = a.tags ? 0 : 1;
     spec_.bound = t.bound;
     if (alias_) {
         strs_.push_back(rel.source);
@@ -588,6 +614,11 @@ int32_t RelScan::open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, con
 }
 
 int32_t RelScan::next() {
+    if (counted_ >= 0) {
+        row_.seq = --counted_;
+        if (counted_ <= 0) eof_ = true;
+        return P4_OK;
+    }
     if (!c_) {
         eof_ = true;
         return P4_OK;

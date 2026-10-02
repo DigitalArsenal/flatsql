@@ -1257,6 +1257,13 @@ P4_SLOW_TEST(reads_bench) {
         t2.text(1, ty).u64(3, 50).u64(4, 950);
         add(std::string("R11 INDEX_PAGE ") + ty + " page 20", P4_OPC_INDEX_PAGE, t2);
     }
+    for (const char* q : {"SELECT COUNT(*) FROM OMM", "SELECT COUNT(*) FROM MPE", "SELECT COUNT(*) FROM CAT",
+                          "SELECT COUNT(*) FROM IQC", "SELECT _source, COUNT(*) FROM MPE GROUP BY _source",
+                          "SELECT OBJECT_NAME, EPOCH, NORAD_CAT_ID FROM OMM WHERE NORAD_CAT_ID BETWEEN 25000 AND 25600"}) {
+        TlvW t;
+        t.text(70, q);
+        add(std::string("R19 SQL ") + q, P4_OPC_SQL, t);
+    }
     for (const char* pat : {"%7%", "%00%", "%25544%"})
         for (const char* ty : {"CAT", "OMM"}) {
             TlvW t;
@@ -1505,7 +1512,15 @@ P4_SLOW_TEST(reads_bench) {
         if (!argStr("dump", "").empty() && sh.name.find(argStr("dump", "")) != std::string::npos) {
             Result r = call(sh.op, sh.t.b, co);
             for (size_t i = 0; i < r.rows.size(); i++)
-                std::printf("  DUMP %s %s %lld\n", sh.name.c_str(), r.s(i, "cid").c_str(), (long long)r.i(i, "seq"));
+            {
+                std::string line;
+                for (size_t k = 0; k < r.rows[i].size(); k++) {
+                    const Cell& cl = r.rows[i][k];
+                    line += cl.type == 1 ? std::to_string(cl.i) : cl.s;
+                    line += '|';
+                }
+                std::printf("  DUMP %s %s\n", sh.name.c_str(), line.size() > 300 ? line.substr(0, 300).c_str() : line.c_str());
+            }
         }
         std::vector<double> warm(ms.begin() + 1, ms.end());
         std::sort(warm.begin(), warm.end());

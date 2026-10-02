@@ -207,6 +207,7 @@ struct ScanArgs {
     std::vector<ScanPred> preds;
     bool desc = false;                      // seq descending, else ascending
     bool hydrate = true;
+    bool tags = true;                       // _source is read
 };
 
 // The rows of one relation through one reader cursor with the type's A18
@@ -222,6 +223,8 @@ public:
     RelScan& operator=(const RelScan&) = delete;
     // Positions on the first row. P4_OK or a status.
     int32_t open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, const ScanArgs& a);
+    // A plan that reads no column: n rows without reading them (COUNT(*)).
+    void openCounted(int64_t n);
     int32_t next();   // P4_OK or a status
     bool eof() const { return eof_; }
     const P4Row& row() const { return row_; }
@@ -233,6 +236,7 @@ public:
 
 private:
     P4Cursor* c_ = nullptr;
+    int64_t counted_ = -1;   // rows left of a counted plan (-1: a cursor)
     P4Row row_{};
     bool eof_ = true;
     bool alias_ = false;

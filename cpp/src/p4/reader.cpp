@@ -3761,6 +3761,7 @@ int32_t p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out) {
     s.order = spec->order ? spec->order : P4_ORDER_SEQ_ASC;
     if (s.order < P4_ORDER_SEQ_ASC || s.order > P4_ORDER_CID) return P4_E_ARG;
     s.hydrate = spec->hydrate != 0;
+    s.needTags = spec->noTags == 0;
     s.limit = spec->limit;
     s.offset = spec->offset;
     s.bound = spec->bound;
@@ -3902,6 +3903,14 @@ int32_t p4_sources(P4Lane* lane, const char* type, const char* const** out, uint
     *out = lane->srcPtrs.data();
     *n = uint32_t(lane->srcPtrs.size());
     return P4_OK;
+}
+
+int64_t p4_type_rows(P4Lane* lane, const char* type) {
+    if (!lane || !type) return -1;
+    flatsql::p4::Type* t = lane->e->findType(type);
+    if (!t) return -1;
+    std::lock_guard<std::mutex> g(t->mu);
+    return t->uniq;
 }
 
 int64_t p4_visible_through(P4Engine* e, const char* type) {
