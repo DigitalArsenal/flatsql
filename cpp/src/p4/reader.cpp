@@ -516,9 +516,15 @@ int32_t Scan::open() {
         }
         if (!laneSql_.empty()) laneSql_ += " LIMIT 1";
     }
-    // Only the lane filter, checked on rl's key per entry (laneKeep), or none.
-    entryOnly_ = s_.preds.empty() && !s_.hasCid && !s_.hasPeer && s_.search.empty() && !s_.eNotNull && !s_.eNull &&
-                 (!s_.lane || !laneSql_.empty());
+    // Only the lane filter, checked on rl's key per entry (laneKeep), or none
+    // (records with / without an epoch: every file's records are of that kind).
+    bool allE = true, noE = true;
+    for (const FRef& fr : files_) {
+        allE = allE && fr.nnull == 0;
+        noE = noE && fr.nnull >= fr.n;
+    }
+    entryOnly_ = s_.preds.empty() && !s_.hasCid && !s_.hasPeer && s_.search.empty() && (!s_.eNotNull || allE) &&
+                 (!s_.eNull || noE) && (!s_.lane || !laneSql_.empty());
     cur_.resize(files_.size());
     order_.resize(files_.size());
     for (size_t i = 0; i < files_.size(); i++) order_[i] = int(i);
