@@ -1221,6 +1221,14 @@ P4_SLOW_TEST(reads_bench) {
         t.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u64(3, 50000);
         add("R16 EPOCH OMM nearest (no source)", P4_OPC_EPOCH, t);
     }
+    for (int prof : {2, 3}) {
+        TlvW t;
+        t.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b030").u8(30, uint8_t(prof)).i64(31, 1789371001).u64(3, 50000);
+        add(std::string("R18 EPOCH OMM@celestrak-gp b030 ") + (prof == 2 ? "nearest" : "as_of"), P4_OPC_EPOCH, t);
+        TlvW m;
+        m.text(1, "MPE").text(12, "celestrak-gp").u8(30, uint8_t(prof)).i64(31, 1789371001).u64(3, 50000);
+        add(std::string("R18 EPOCH MPE@celestrak-gp ") + (prof == 2 ? "nearest" : "as_of"), P4_OPC_EPOCH, m);
+    }
     {
         TlvW t;
         t.u8(45, 4);

@@ -1948,6 +1948,7 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
         c->exec("BEGIN");
         // The first e-group (in rank order) of one object's run that has a row
         // passing the filters: its lowest-CID passing row.
+        bool unchecked = false;  // pick() takes no filter (a lane-only filter checks the winner after)
         auto pick = [&](sqlite3_stmt* q, sqlite3_value* k, bool down, EpochPick* out) -> int32_t {
             const int64_t lim = down ? std::min(at, wHi) : std::max(at, wLo);
             if (down ? lim < wLo : lim > wHi) return 0;
@@ -1967,7 +1968,7 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
                 if (sqlite3_column_bytes(q, 2) != 32) continue;
                 const uint8_t* key = static_cast<const uint8_t*>(sqlite3_column_blob(q, 2));
                 const int64_t seq = sqlite3_column_int64(q, 1);
-                const int32_t got = passes(seq);
+                const int32_t got = unchecked ? 1 : passes(seq);
                 if (got < 0) {
                     sqlite3_reset(q);
                     return got;
@@ -2020,16 +2021,38 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
             }
             EpochPick b, a;
             int got = 0;
-            if (profile != 4) {
-                const int32_t r = pick(below, k, true, &b);
-                if (r < 0) return r;
-                got |= r;
+            auto both = [&]() -> int32_t {
+                got = 0;
+                if (profile != 4) {
+                    const int32_t r = pick(below, k, true, &b);
+                    if (r < 0) return r;
+                    got |= r;
+                }
+                if (profile != 3) {
+                    const int32_t r = pick(above, k, false, &a);
+                    if (r < 0) return r;
+                    got |= r << 1;
+                }
+                return P4_OK;
+            };
+            // A lane-only filter: the unfiltered winner, checked once. When it
+            // passes it is the filtered winner too (it is the lowest CID of the
+            // nearest group, and the filtered other side is no nearer); else
+            // the picks run again with the check on every candidate.
+            unchecked = laneQ != nullptr && !rowCheck;
+            int32_t r0 = both();
+            if (r0 < 0) return r0;
+            if (unchecked && got) {
+                const EpochPick& w = got == 1 ? b : got == 2 ? a : (better(b.e, b.key, a.e, a.key) ? b : a);
+                const int32_t ok = passes(w.seq);
+                if (ok < 0) return ok;
+                if (!ok) {
+                    unchecked = false;
+                    r0 = both();
+                    if (r0 < 0) return r0;
+                }
             }
-            if (profile != 3) {
-                const int32_t r = pick(above, k, false, &a);
-                if (r < 0) return r;
-                got |= r << 1;
-            }
+            unchecked = false;
             if (!got) return P4_OK;
             const EpochPick& p = got == 1 ? b : got == 2 ? a : (better(b.e, b.key, a.e, a.key) ? b : a);
             std::string ent;
