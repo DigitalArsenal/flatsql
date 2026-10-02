@@ -90,7 +90,7 @@ const char* kIndexSchema =
     "CREATE TABLE IF NOT EXISTS lanes(id INTEGER PRIMARY KEY, sid INTEGER NOT NULL, h INTEGER NOT NULL,"
     " batch TEXT, ckey TEXT, ppeer TEXT, pkey TEXT);"
     "CREATE TABLE IF NOT EXISTS lanecnt(lane INTEGER NOT NULL, pid INTEGER NOT NULL, h INTEGER,"
-    " n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts, PRIMARY KEY(lane, pid)) WITHOUT ROWID;"
+    " n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts, minseq, PRIMARY KEY(lane, pid)) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v) WITHOUT ROWID;";
 
 const char* ctext(sqlite3_stmt* s, int i) {
@@ -188,7 +188,8 @@ int32_t typeIndexOpen(Type* t, std::string* err) {
     sqlite3_reset(s);
     if (sr != SQLITE_DONE) return broken("read");
     s = c->sql(
-        "SELECT lane, pid, n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts FROM lanecnt WHERE n>0");
+        "SELECT lane, pid, n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts, minseq FROM lanecnt"
+        " WHERE n>0");
     if (!s) return broken("prepare");
     while ((sr = sqlite3_step(s)) == SQLITE_ROW) {
         Part* p = t->partById(uint32_t(sqlite3_column_int64(s, 1)));
@@ -205,6 +206,7 @@ int32_t typeIndexOpen(Type* t, std::string* err) {
         lc.url = ctext(s, 10);
         lc.url0 = ctext(s, 11);
         lc.maxts = sqlite3_column_int64(s, 12);
+        lc.minseq = sqlite3_column_type(s, 13) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 13);
         p->lanes[uint32_t(sqlite3_column_int64(s, 0))] = lc;
     }
     sqlite3_reset(s);
@@ -526,7 +528,7 @@ int32_t typeIndexFlush(Type* t, bool force) {
             const LaneCount& lc = kv.second;
             sqlite3_stmt* x = c->sql(
                 "INSERT OR REPLACE INTO lanecnt(lane, pid, h, n, bytes, minw, maxw, maxseq, created, updated, maxat,"
-                " url, url0, maxts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)");
+                " url, url0, maxts, minseq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)");
             uint64_t h = 0;
             if (kv.first >= 1 && kv.first <= lanes.size()) h = lanes[kv.first - 1].h;
             sqlite3_bind_int64(x, 1, kv.first);
@@ -543,6 +545,7 @@ int32_t typeIndexFlush(Type* t, bool force) {
             sqlite3_bind_text(x, 12, lc.url.data(), int(lc.url.size()), SQLITE_STATIC);
             sqlite3_bind_text(x, 13, lc.url0.data(), int(lc.url0.size()), SQLITE_STATIC);
             sqlite3_bind_int64(x, 14, lc.maxts);
+            if (lc.minseq != INT64_MAX) sqlite3_bind_int64(x, 15, lc.minseq); else sqlite3_bind_null(x, 15);
             step(x);
         }
     }

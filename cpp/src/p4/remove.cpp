@@ -192,6 +192,8 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
     }
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) c->exec("ROLLBACK");
+    int64_t freeBytes = 0;
+    const int64_t dbBytes = rc == SQLITE_OK ? dbBytesOf(c, &freeBytes) : -1;
     writerUnpin(e, f);
     // Whether a gone row was a CID's last copy is decided atomically with the
     // publish, against every other writer's published removals (dmu).
@@ -206,6 +208,10 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
         std::lock_guard<std::mutex> g(t->mu);
         jinflightDone(t, jfirst);
         if (rc == SQLITE_OK) {
+            if (dbBytes >= 0) {
+                f->dbBytes = dbBytes;
+                f->freeBytes = freeBytes;
+            }
             f->n = n;
             f->bytes = bytes;
             for (auto& kv : lanes) {

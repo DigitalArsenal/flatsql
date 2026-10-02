@@ -62,6 +62,18 @@ void checkpoint(Engine* e, MaintState& m, const std::string& path) {
 
 }  // namespace
 
+int64_t walBytesOf(const std::string& path) {
+    std::lock_guard<std::mutex> g(gWalMu);
+    auto it = gWalPages.find(path);
+    return it == gWalPages.end() ? 0 : it->second * 4096;
+}
+
+void typeFileBytes(Type* t) {
+    if (!t->hasFiles.load(std::memory_order_acquire)) return;
+    t->idxBytes.store(std::max<int64_t>(0, ioSize(t->pIdx)) + std::max<int64_t>(0, ioSize(t->pJnl)), std::memory_order_relaxed);
+    t->ftsBytes.store(std::max<int64_t>(0, ioSize(t->pFts)), std::memory_order_relaxed);
+}
+
 int walHook(void* arg, sqlite3* db, const char* zDb, int nPages) {
     Engine* e = static_cast<Engine*>(arg);
     const char* path = sqlite3_db_filename(db, zDb);
@@ -783,7 +795,7 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
     Bell& b = e->bells[thread];
     MaintState m;
     uint64_t lastTick = 0;
-    int quotaTicks = 0;
+    int quotaTicks = 0, sizeTicks = 0;
     for (;;) {
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
         for (;;) {
@@ -823,6 +835,10 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
             }
             for (Type* t : types) typeIndexFlush(t, pending >= e->cfg.pendingBytes);
             for (Type* t : types) ftsCatchUp(e, t, false);
+            if (++sizeTicks >= 10) {  // the T/ files' sizes for SUMMARY 4, once a second
+                sizeTicks = 0;
+                for (Type* t : types) typeFileBytes(t);
+            }
             const uint64_t q = e->quota.load();
             if (q && ++quotaTicks >= 10) {  // the configured quota, once a second
                 quotaTicks = 0;

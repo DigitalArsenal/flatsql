@@ -317,7 +317,7 @@ int32_t journalReplay(Type* t, std::string* err) {
         if (s) sqlite3_reset(s);
         f->lanes.clear();
         s = c->sql(
-            "SELECT id, n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts FROM lane WHERE n>0");
+            "SELECT id, n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts, minseq FROM lane WHERE n>0");
         while (s && sqlite3_step(s) == SQLITE_ROW) {
             LaneCount lc;
             lc.n = sqlite3_column_int64(s, 1);
@@ -331,6 +331,7 @@ int32_t journalReplay(Type* t, std::string* err) {
             lc.url = colText(s, 9);
             lc.url0 = colText(s, 10);
             lc.maxts = sqlite3_column_int64(s, 11);
+            lc.minseq = sqlite3_column_type(s, 12) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 12);
             f->lanes[uint32_t(sqlite3_column_int64(s, 0))] = lc;
         }
         if (s) sqlite3_reset(s);

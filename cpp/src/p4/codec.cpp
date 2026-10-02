@@ -433,7 +433,7 @@ const char* stmtSql(StmtId id) {
         case S_SUP_K: return "SELECT seq, cid, length(d), s, d, w, e FROM r WHERE k=?1 AND seq<>?2";
         case S_LANE_UP:
             return "INSERT OR REPLACE INTO lane(id,sid,batch,ckey,ppeer,pkey,url,url0,created,updated,maxat,n,bytes,"
-                   "minw,maxw,maxseq,maxts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)";
+                   "minw,maxw,maxseq,maxts,minseq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)";
         case S_LANE_DEL: return "DELETE FROM lane WHERE id=?1";
         case S_SRC_INS: return "INSERT OR IGNORE INTO src(id,provider,source) VALUES(?1,?2,?3)";
         case S_META_SET: return "INSERT OR REPLACE INTO meta(k,v) VALUES(?1,?2)";
@@ -488,6 +488,18 @@ sqlite3_stmt* Conn::sql(const std::string& text) {
 }
 
 int Conn::exec(const char* s) { return sqlite3_exec(db, s, nullptr, nullptr, nullptr); }
+
+int64_t dbBytesOf(Conn* c, int64_t* freeBytes) {
+    sqlite3_stmt* q = c->sql("SELECT page_count * page_size, freelist_count * page_size FROM pragma_page_count,"
+                             " pragma_freelist_count, pragma_page_size");
+    int64_t db = -1;
+    if (q && sqlite3_step(q) == SQLITE_ROW) {
+        db = sqlite3_column_int64(q, 0);
+        if (freeBytes) *freeBytes = sqlite3_column_int64(q, 1);
+    }
+    if (q) sqlite3_reset(q);
+    return db;
+}
 
 int32_t statusOfSqlite(int rc) {
     switch (rc & 0xff) {

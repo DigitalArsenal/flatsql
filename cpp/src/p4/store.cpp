@@ -235,6 +235,7 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
     const int32_t rc = typeFilesOpen(t, err);
     if (rc != P4_OK) return rc;
     t->hasFiles.store(true, std::memory_order_release);
+    typeFileBytes(t);
     return P4_OK;
 }
 }  // namespace

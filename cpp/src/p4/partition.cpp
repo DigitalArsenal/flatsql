@@ -27,7 +27,7 @@ const char* kFileSchema =
     "CREATE TABLE IF NOT EXISTS lane(id INTEGER PRIMARY KEY, sid INTEGER NOT NULL, batch TEXT NOT NULL,"
     " ckey TEXT NOT NULL, ppeer TEXT NOT NULL, pkey TEXT NOT NULL, url TEXT, url0 TEXT, created INTEGER,"
     " updated INTEGER, maxat INTEGER, n INTEGER, bytes INTEGER, minw INTEGER, maxw INTEGER, maxseq INTEGER,"
-    " maxts INTEGER);"
+    " maxts INTEGER, minseq INTEGER);"
     "CREATE TABLE IF NOT EXISTS r(seq INTEGER PRIMARY KEY, cid BLOB NOT NULL, e INTEGER, k, ts INTEGER NOT NULL,"
     " p TEXT, f BLOB, s INTEGER, x BLOB, d BLOB NOT NULL,"
     " w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL);"
@@ -1038,6 +1038,7 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
                 if (r.w < lc.minw) lc.minw = r.w;
                 if (r.w > lc.maxw) lc.maxw = r.w;
                 if (r.seq > lc.maxseq) lc.maxseq = r.seq;
+                if (r.seq < lc.minseq) lc.minseq = r.seq;
                 if (at > lc.maxat) lc.maxat = at;
                 if (r.ts > lc.maxts) lc.maxts = r.ts;
                 if (!r.write) r.retagged = true;
@@ -1123,6 +1124,7 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
         if (lc.maxw != INT64_MIN) sqlite3_bind_int64(s, 15, lc.maxw); else sqlite3_bind_null(s, 15);
         sqlite3_bind_int64(s, 16, lc.maxseq);
         sqlite3_bind_int64(s, 17, lc.maxts);
+        if (lc.minseq != INT64_MAX) sqlite3_bind_int64(s, 18, lc.minseq); else sqlite3_bind_null(s, 18);
         bad(sqlite3_step(s));
         sqlite3_reset(s);
     }
@@ -1166,10 +1168,16 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
         }
         return statusOfSqlite(rc);
     }
+    int64_t freeBytes = 0;
+    const int64_t dbBytes = dbBytesOf(c, &freeBytes);
     writerUnpin(e_, f);
     e_->bump(kStGroupCommits);
     // Publish this file's counters.
     std::lock_guard<std::mutex> g(t_->mu);
+    if (dbBytes >= 0) {
+        f->dbBytes = dbBytes;
+        f->freeBytes = freeBytes;
+    }
     f->n = o.n; f->bytes = o.bytes; f->ncopy = o.ncopy; f->minseq = o.minseq; f->maxseq = o.maxseq;
     f->minw = o.minw; f->maxw = o.maxw; f->maxts = o.maxts; f->nnull = o.nnull;
     f->mints = o.mints; f->mine = o.mine; f->maxe = o.maxe;

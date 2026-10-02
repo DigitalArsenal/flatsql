@@ -188,6 +188,9 @@ enum class OpenKind { Writer, Reader, IndexReader, Index, Journal, Maint };
 int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t pageSize, Conn** out,
              std::string* err);
 int32_t statusOfSqlite(int rc);  // SQLite result -> P4 status (BUSY and I/O errors are errors, never misses)
+// A connection's database bytes (pages x page size) and free bytes, from its
+// header (no file I/O on a connection that just committed).
+int64_t dbBytesOf(Conn* c, int64_t* freeBytes);
 
 // ---- engine objects ------------------------------------------------------------------------
 struct Type;
@@ -207,6 +210,7 @@ struct LaneDef {
 struct LaneCount {
     int64_t n = 0, bytes = 0, minw = INT64_MAX, maxw = INT64_MIN, maxseq = 0;
     int64_t created = 0, updated = 0, maxat = 0, maxts = 0;
+    int64_t minseq = INT64_MAX;  // a lower bound once rows go (exact after REBUILD 2)
     std::string url;   // the latest write's url (SUMMARY 3)
     std::string url0;  // an instance's url when its rl.u is NULL
 };
@@ -231,6 +235,7 @@ struct Part {
     bool indexed = true;       // secondary indexes present (false between a migration's append and REBUILD 1)
     bool touched = false;      // changed since the last flush
     bool journaled = false;    // its J_PART row is durable
+    int64_t dbBytes = -1, freeBytes = 0;  // the file's pages and free pages after its last commit (-1: not yet read)
     // writer connection (Engine::wconnMu)
     Conn* w = nullptr;
     int wPins = 0;
@@ -364,6 +369,7 @@ struct Type {
     Conn* idx = nullptr;
     bool migrateSeqsLoaded = false;  // dmu
     std::unordered_set<int64_t> migrateSeqs;
+    std::atomic<int64_t> idxBytes{0}, ftsBytes{0};  // T/ files (index + journal, full text), set by the maintenance thread
     std::mutex ftsMu;
     Conn* fts = nullptr;
     int64_t ftsThrough = 0;
@@ -646,6 +652,8 @@ int32_t rebuildOp(P4Engine* e, Type* only, uint32_t what, std::vector<std::array
                   std::vector<Type*>* rowTypes, std::string* firstBad = nullptr);
 int32_t ftsCatchUp(P4Engine* e, Type* t, bool all);
 int walHook(void* arg, sqlite3* db, const char* zDb, int nPages);
+int64_t walBytesOf(const std::string& path);  // the WAL's frames at its last commit, in bytes
+void typeFileBytes(Type* t);                  // refreshes idxBytes and ftsBytes (maintenance thread)
 
 // ---- mailbox.cpp --------------------------------------------------------------------------------------
 extern thread_local uint32_t tThread;  // the running service thread's index
