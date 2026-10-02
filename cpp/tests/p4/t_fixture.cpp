@@ -1031,7 +1031,13 @@ P4_SLOW_TEST(reads_bench) {
     }
     EngineOpts o;
     o.createMode = 0;
+    const uint64_t t0 = flatsql::ps::monoNs();
     REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
+    std::printf("  open %.1f ms (load %.1f)\n", double(flatsql::ps::monoNs() - t0) / 1e6, loadAvg());
+    if (argInt("open-only", 0)) {
+        closeEngine(600000);
+        return;
+    }
     auto text = [](uint8_t field, uint8_t op, const std::string& v) {
         std::vector<uint8_t> p = {field, op, 1, 0, 3};
         uint8_t n[4];
