@@ -1268,6 +1268,12 @@ P4_SLOW_TEST(reads_bench) {
         add("R11 INDEX_PAGE CAT norad LIKE", P4_OPC_INDEX_PAGE, t);
         add("R11 HEAD CAT norad LIKE", P4_OPC_HEAD, t);
     }
+    for (uint64_t off : {uint64_t(19950), uint64_t(99950), uint64_t(1690000)})
+        for (const char* ty : {"OMM", "MPE"}) {
+            TlvW t;
+            t.text(1, ty).u64(3, 50).u64(4, off);
+            add(std::string("R11 INDEX_PAGE ") + ty + " offset " + std::to_string(off), P4_OPC_INDEX_PAGE, t);
+        }
     {
         TlvW t;
         t.text(1, "CAT").text(12, "celestrak-satcat").u64(3, 50).u64(4, 100);

@@ -1544,7 +1544,11 @@ int32_t Scan::laneKeep(Conn* c, std::vector<std::pair<int64_t, int64_t>>* ws) {
 // its own CID when the scan has one file or the type has no copies.
 int32_t Scan::wSkip() {
     wSkipped_ = true;
-    const bool simple = !s_.lane && s_.preds.empty() && !s_.hasPeer && !s_.eNull && !s_.eNotNull && !fts_ &&
+    // Records with an epoch only (INDEX_PAGE phase 1) are every record when
+    // no file has one without: then the r_w count is theirs too.
+    bool allE = true;
+    for (const FRef& fr : files_) allE = allE && fr.nnull == 0;
+    const bool simple = !s_.lane && s_.preds.empty() && !s_.hasPeer && !s_.eNull && (!s_.eNotNull || allE) && !fts_ &&
                         !s_.hasCid && !s_.hasProducer && !kDriven_;
     if (!simple || s_.offset == 0 || files_.empty()) return P4_OK;
     {
@@ -1574,6 +1578,52 @@ int32_t Scan::wSkip() {
             break;
         }
         wc[fi].c->exec("BEGIN");
+    }
+    // Whole hours from the files' epoch histograms (every record has an
+    // epoch, so w is it; every row visible; no w bound): the walk starts at
+    // the top of the hour that holds the offset, the hours above it counted.
+    uint64_t skipped = 0;
+    int64_t walkHi = s_.wHi;
+    if (rc == P4_OK && !asc && allE && s_.wLo == INT64_MIN && s_.wHi == INT64_MAX && lo_ <= 0) {
+        std::map<int64_t, int64_t> hours;
+        bool ok = true;
+        for (size_t fi = 0; fi < files_.size() && ok; fi++) {
+            Conn* c = wc[fi].c;
+            sqlite3_stmt* m = c->sql("SELECT k, v FROM meta WHERE k IN ('wh','maxseq','nnull')");
+            int64_t wh = 0, mseq = INT64_MAX, nn = -1;
+            while (m && sqlite3_step(m) == SQLITE_ROW) {
+                if (sqlite3_column_type(m, 1) == SQLITE_NULL) continue;
+                const char* mk = reinterpret_cast<const char*>(sqlite3_column_text(m, 0));
+                const int64_t v = sqlite3_column_int64(m, 1);
+                if (!mk) continue;
+                if (std::strcmp(mk, "wh") == 0) wh = v;
+                else if (std::strcmp(mk, "maxseq") == 0) mseq = v;
+                else if (std::strcmp(mk, "nnull") == 0) nn = v;
+            }
+            if (m) sqlite3_reset(m);
+            ok = m && wh == 1 && nn == 0 && mseq <= hi_;
+            sqlite3_stmt* q = ok ? c->sql("SELECT b, n FROM wh") : nullptr;
+            ok = ok && q;
+            while (ok && sqlite3_step(q) == SQLITE_ROW) hours[sqlite3_column_int64(q, 0)] += sqlite3_column_int64(q, 1);
+            if (q) sqlite3_reset(q);
+        }
+        if (ok) {
+            int64_t acc = 0;
+            bool found = false;
+            for (auto it = hours.rbegin(); it != hours.rend(); ++it) {
+                if (uint64_t(acc + it->second) > s_.offset) {
+                    walkHi = it->first * 3600 + 3599;
+                    found = true;
+                    break;
+                }
+                acc += it->second;
+            }
+            skipped = uint64_t(acc);
+            L_->rowsExamined += hours.size();
+            if (!found) walkHi = INT64_MIN;  // the offset is past the end: nothing to walk
+        }
+    }
+    for (size_t fi = 0; fi < files_.size() && rc == P4_OK; fi++) {
         wc[fi].q = wc[fi].c->sql(asc ? "SELECT w FROM r INDEXED BY r_w WHERE w>=?1 AND w<=?2 AND seq>?3 AND seq<=?4 ORDER BY w ASC"
                                      : "SELECT w FROM r INDEXED BY r_w WHERE w>=?1 AND w<=?2 AND seq>?3 AND seq<=?4 ORDER BY w DESC");
         if (!wc[fi].q) {
@@ -1581,12 +1631,11 @@ int32_t Scan::wSkip() {
             break;
         }
         sqlite3_bind_int64(wc[fi].q, 1, s_.wLo);
-        sqlite3_bind_int64(wc[fi].q, 2, s_.wHi);
+        sqlite3_bind_int64(wc[fi].q, 2, walkHi);
         sqlite3_bind_int64(wc[fi].q, 3, lo_);
         sqlite3_bind_int64(wc[fi].q, 4, hi_);
         step(wc[fi]);
     }
-    uint64_t skipped = 0;
     bool boundary = false;
     int64_t bw = 0;
     while (rc == P4_OK) {
