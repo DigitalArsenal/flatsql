@@ -52,7 +52,7 @@ This file records what was built, how to run it, and what was measured.
 | the rowid and `r_s(seq)` | arrival: the datasync cursor; newest-N cuts and oldest-first quota read `r_s`, not the records' pages |
 | `rl_sid(sid, seq)` | source, newest first: `<TYPE>@<source>`, source pages, supersede |
 | `r_ke(k, e)` | object and epoch: EPOCH points, object predicates, CAT supersede |
-| `r_w(w DESC)` | epoch windows (`w DESC`, ties in CID order); epoch-day and epoch-range reads |
+| `r_w(w DESC, cid)` | epoch windows (`w DESC`, ties in CID order, in the index: a window reads only its page's rows); epoch-day and epoch-range reads |
 
 There is no per-file CID index (C-34): the type index's `c` is the one CID
 index (lookup, dedupe, CID-ordered windows, REBUILD 2).
@@ -67,6 +67,10 @@ from the rows; a file an older engine wrote has neither, and its readers walk.
 **Type index** (`.idx`, `synchronous=FULL`).
 - Tables:
   - `c(cid, pid, seq)`: every copy of a CID (dedupe, GET, TAGS, DELETE, exact-CID reads);
+  - `cb(b, n)`: distinct CIDs of `c` per bucket (the CID's first 12 bits, 4,096 buckets), moved by the
+    flush in its own transaction when a CID gains its first holder or loses its last; an unfiltered
+    CID window skips whole buckets of its offset. An index an older engine wrote gets them counted at
+    open (`meta cb`); REBUILD 8 compares them with `c`, REBUILD 2 rewrites them;
   - `ident(src, h, seq, cid)`: IQC ingest identities;
   - `part(pid, producer, peer, …counters)` (counters NULL until the file has its schema), `src`, `lanes`,
     `lanecnt(lane, pid, …)` and `meta(uniq, copies, next_seq)`.
@@ -206,8 +210,15 @@ Two background threads do this work, never on a caller's path.
 - **Seq** (datasync): per-file pages by rowid, merged. A single source's
   pages come from `rl_sid` (the filter's lanes checked inside the index),
   starting and ending at its lanes' seq bounds (`lane.minseq`, `maxseq`).
-- **w** (windows): `r_w`, with ties in CID order. With a lane filter, a page's
-  seqs are probed on `rl`'s key before any row is read.
+- **w** (windows): `r_w`, with ties in CID order. A page is whole w groups of
+  index entries (w, CID, seq); with a lane filter each entry's seq is probed
+  on `rl`'s key. With no filter on the rows (none, a lane filter, or records
+  with an epoch when every file's have one) copies collapse and the offset
+  is skipped on the entries, and only the page's rows are read (a chunk at a
+  time, a page ahead across small groups); otherwise the page's rows are read
+  in the fetch's read transaction. A file's first page holds about twice its
+  share of what the window still needs (many partitions: a few entries each),
+  later pages double.
 - **CID:** the type index's `c` in (CID, pid) order, the unflushed entries
   merged over it; a page's rows are read by seq, one read transaction per file.
 
@@ -254,7 +265,18 @@ OFFSET.
   type index's `c` and checks each entry's lane on `rl`'s key (no row): the
   offset is counted on it and only the page's rows are read.
 - The reader pool keeps at least one connection per partition file (a
-  type-wide read touches every file of its type).
+  type-wide read touches every file of its type). A file of records over
+  600 bytes on average gets a page cache that holds as many rows as the
+  default holds of 600-byte ones (up to 8x).
+- EPOCH nearest / as_of / forward read the picked records 4,096 picks at a
+  time, one read transaction per file. With a limit, the files are walked
+  biggest first and each file's object walk stops past the want-th pick so
+  far (an object after it cannot be in the answer).
+- The VFS keeps a format-4 file's size in its path node (one host fstat, not
+  one per read transaction) and a write generation; a reader's readahead
+  buffers serve across read transactions while no write to the file has
+  returned since they were filled (all of them under 32 MiB), and a stream's
+  fills grow from 64 KiB, halving when a fill served under an eighth of it.
 - At start the long-work thread reads each type index once, start to end
   (the host's page cache): the first writes' dedupe probes and the first
   reads' CID probes do not read it a page at a time.
