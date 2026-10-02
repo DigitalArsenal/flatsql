@@ -88,9 +88,10 @@ Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from
 }
 
 // One step of the workload the kill lands in: 3 producers; every 5th call
-// repeats earlier records under another producer (copies); every 7th call
+// repeats earlier records under another producer (copies); every 4th call
+// (from the second)
 // sends the same new records from two producers at once (concurrent copies:
-// one seq per CID, §3.8.2); every 13th call supersedes a batch and every 11th
+// one seq per CID, §3.8.2: 50-record calls from all three producers); every 13th call supersedes a batch and every 11th
 // deletes the oldest arrivals down to a 4 MiB quota.
 void killWorkStep(int c, uint64_t* id) {
     Batch b = killBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), *id, 500);
@@ -98,13 +99,20 @@ void killWorkStep(int c, uint64_t* id) {
         for (int i = 0; i < 500; i++) b.recs[size_t(i)].frame = killFrame(*id - 1000 + uint64_t(i));
     *id += 500;
     Result r;
-    if (c % 7 == 3) {
-        Batch b2 = b;
-        b2.peer = "producer" + std::to_string((c + 1) % 3);
-        const uint32_t s1 = submit(P4_OPC_PUT, encodePut(b)), s2 = submit(P4_OPC_PUT, encodePut(b2));
-        r = wait(s1);
-        Result r2 = wait(s2);
-        if (r.status == P4_OK) r = r2;
+    if (c % 4 == 1) {
+        // The same records from all three producers at once, in 50-record calls.
+        std::vector<uint32_t> slots;
+        for (int at = 0; at < 500; at += 50)
+            for (int pi = 0; pi < 3; pi++) {
+                Batch part = b;
+                part.peer = "producer" + std::to_string(pi);
+                part.recs.assign(b.recs.begin() + at, b.recs.begin() + at + 50);
+                slots.push_back(submit(P4_OPC_PUT, encodePut(part)));
+            }
+        for (uint32_t sl : slots) {
+            Result x = wait(sl);
+            if (r.status == P4_OK && x.status != P4_OK) r = x;
+        }
     } else {
         r = put(b);
     }
