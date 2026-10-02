@@ -29,14 +29,21 @@
 // (generation-suffixed file names), so a node keyed by path never attaches to
 // a dropped file.
 //
+// SIZE AND WRITES OF A SHARED PATH. Every write to a share=1 path goes
+// through its node (one instance holds every connection to it), so the node
+// keeps the file's size (one host fstat when the node is made, not one per
+// read transaction) and a write generation, bumped after each write or
+// truncate of the database file returns.
+//
 // READAHEAD. A connection opened with the URI parameter ra=1 (format 4's
 // readers) reads ahead sequentially: after three nearby reads in one
-// direction it reads up to `bytes` at once, forward or backward, in up to
-// `streams` streams per connection. The buffers are dropped whenever the
-// connection takes or releases a WAL read-mark lock, so a page from before a
-// checkpoint is never served: inside one read transaction SQLite reads from
-// the database file only pages that no checkpoint may overwrite (backfill
-// stops at the oldest reader's mark).
+// direction it reads 64 KiB, then twice as much per further fill of that
+// stream up to `bytes`, forward or backward, in up to `streams` streams per
+// connection. A buffer serves only while its node's write generation is the
+// one it was filled under: no checkpoint has written the database file since,
+// so its pages are the file's pages now, and SQLite reads from the database
+// file only pages the WAL does not hold for its snapshot. Buffers outlive the
+// read transaction while every connection's together stay under 32 MiB.
 //
 // DIRECTORY DURABILITY. A connection opened with the URI parameter dsync=1
 // creates its database, WAL and journal files with FLATSQL_IO_CREATE_PARENTS,
@@ -112,6 +119,9 @@ struct Node {
     int nshm = 0;  // files that mapped the WAL index
     int shmShared[kShmLocks] = {};
     FlatSqlFile* shmExcl[kShmLocks] = {};
+    // shared paths: the database file's size (-1: not known) and write generation
+    std::atomic<int64_t> size{-1};
+    std::atomic<uint64_t> wgen{0};
 };
 
 std::unordered_map<std::string, Node*>& nodes() {
@@ -126,11 +136,17 @@ std::atomic<int64_t> gRaHits{0};
 std::atomic<int64_t> gRaBytes{0};
 std::atomic<int> gRaStreams{2};
 std::atomic<int> gRaBytesPerRead{1 << 20};
+std::atomic<int64_t> gRaHeld{0};  // bytes of readahead buffers allocated
+constexpr int kRaFirst = 64 * 1024;
+constexpr int64_t kRaKeep = 32 << 20;
 
 struct RaStream {
     uint8_t* buf;
+    int cap;   // bytes allocated at buf
     sqlite3_int64 off;
     int len;
+    uint64_t gen;  // the node's write generation the buffer was filled under
+    int next;      // bytes of this stream's next fill
     sqlite3_int64 last;
     int dir;
     int streak;
@@ -208,9 +224,51 @@ int mapIoError(int32_t status, int fallback) {
 
 void raDrop(FlatSqlFile* f) {
     for (int i = 0; i < kRaMaxStreams; ++i) {
-        if (f->rs[i].buf) sqlite3_free(f->rs[i].buf);
-        f->rs[i] = RaStream{nullptr, 0, 0, -1, 0, 0, 0};
+        if (f->rs[i].buf) {
+            sqlite3_free(f->rs[i].buf);
+            gRaHeld.fetch_sub(f->rs[i].cap, std::memory_order_relaxed);
+        }
+        f->rs[i] = RaStream{nullptr, 0, 0, 0, 0, 0, -1, 0, 0, 0};
     }
+}
+
+// The database file's size: the shared node's, else the host's.
+int fileSize(FlatSqlFile* f, sqlite3_int64* out) {
+    Node* n = f->node;
+    if (n && n->shared) {
+        const int64_t s = n->size.load(std::memory_order_acquire);
+        if (s >= 0) {
+            *out = s;
+            return SQLITE_OK;
+        }
+    }
+    const uint64_t g0 = n ? n->wgen.load(std::memory_order_acquire) : 0;
+    const double size = flatsql_io_size(f->handle);
+    if (size < 0) return SQLITE_IOERR_FSTAT;
+    *out = static_cast<sqlite3_int64>(size);
+    if (n && n->shared) {
+        // Kept only when no write returned since the generation was read
+        // (a write's size change would be missing from it).
+        NodeLock g;
+        if (n->wgen.load(std::memory_order_relaxed) == g0 && n->size.load(std::memory_order_relaxed) < 0)
+            n->size.store(*out, std::memory_order_release);
+    }
+    return SQLITE_OK;
+}
+
+// After a write or truncate of a shared path's database file returned: the
+// file now ends at or past `end` (kGrow), at `end` (kSet), or is not known
+// (kUnknown: a failed write or truncate).
+enum SizeNote { kGrow, kSet, kUnknown };
+void noteWrite(FlatSqlFile* f, sqlite3_int64 end, SizeNote how) {
+    Node* n = f->node;
+    if (!n || !n->shared) return;
+    NodeLock g;
+    const int64_t s = n->size.load(std::memory_order_relaxed);
+    if (how == kSet) n->size.store(end, std::memory_order_release);
+    else if (how == kUnknown) n->size.store(-1, std::memory_order_release);
+    else if (s >= 0 && end > s) n->size.store(end, std::memory_order_release);
+    n->wgen.fetch_add(1, std::memory_order_acq_rel);
 }
 
 // Drops this file's shm locks and mapping. Node table mutex held.
@@ -272,8 +330,10 @@ int raRead(FlatSqlFile* f, void* buf, int amount, sqlite3_int64 offset) {
     const int streams = gRaStreams.load(std::memory_order_relaxed);
     const int raBytes = gRaBytesPerRead.load(std::memory_order_relaxed);
     f->tick++;
+    const uint64_t gen = f->node ? f->node->wgen.load(std::memory_order_acquire) : 0;
     for (int i = 0; i < streams; ++i) {
         RaStream* s = &f->rs[i];
+        if (s->len > 0 && s->gen != gen) s->len = 0;  // the file was written since
         if (s->len > 0 && offset >= s->off && offset + amount <= s->off + s->len) {
             std::memcpy(buf, s->buf + (offset - s->off), static_cast<size_t>(amount));
             s->last = offset;
@@ -305,6 +365,7 @@ int raRead(FlatSqlFile* f, void* buf, int amount, sqlite3_int64 offset) {
         s->last = offset;
         s->used = f->tick;
         s->len = 0;
+        s->next = kRaFirst;
         return ioRead(f, buf, amount, offset);
     }
     const sqlite3_int64 d = offset - s->last;
@@ -314,19 +375,36 @@ int raRead(FlatSqlFile* f, void* buf, int amount, sqlite3_int64 offset) {
     s->last = offset;
     s->used = f->tick;
     if (s->streak >= kRaStreak && amount <= raBytes / 4) {
-        sqlite3_int64 start = dir > 0 ? offset : offset + amount - raBytes;
+        int want = s->next < kRaFirst ? kRaFirst : s->next > raBytes ? raBytes : s->next;
+        if (want < amount * 4) want = amount * 4;
+        sqlite3_int64 start = dir > 0 ? offset : offset + amount - want;
         if (start < 0) start = 0;
-        const double size = flatsql_io_size(f->handle);
-        sqlite3_int64 end = start + raBytes;
-        if (size >= 0 && end > static_cast<sqlite3_int64>(size)) end = static_cast<sqlite3_int64>(size);
+        sqlite3_int64 size = -1;
+        if (fileSize(f, &size) != SQLITE_OK) size = -1;
+        sqlite3_int64 end = start + want;
+        if (size >= 0 && end > size) end = size;
         if (end >= offset + amount && end > start) {
-            if (!s->buf) s->buf = static_cast<uint8_t*>(sqlite3_malloc(raBytes));
+            if (s->buf && s->cap < want) {
+                sqlite3_free(s->buf);
+                gRaHeld.fetch_sub(s->cap, std::memory_order_relaxed);
+                s->buf = nullptr;
+                s->cap = 0;
+            }
+            if (!s->buf) {
+                s->buf = static_cast<uint8_t*>(sqlite3_malloc(want));
+                if (s->buf) {
+                    s->cap = want;
+                    gRaHeld.fetch_add(want, std::memory_order_relaxed);
+                }
+            }
             const int len = static_cast<int>(end - start);
             if (s->buf) {
                 const int32_t got = flatsql_io_read(f->handle, s->buf, len, static_cast<double>(start));
                 if (got == len) {
                     s->off = start;
                     s->len = len;
+                    s->gen = gen;
+                    s->next = want < raBytes / 2 ? want * 2 : raBytes;
                     gRaReads.fetch_add(1, std::memory_order_relaxed);
                     gRaBytes.fetch_add(len, std::memory_order_relaxed);
                     std::memcpy(buf, s->buf + (offset - start), static_cast<size_t>(amount));
@@ -356,10 +434,17 @@ int fsWrite(sqlite3_file* file, const void* buf, int amount,
         const int32_t n = flatsql_io_write(
             f->handle, static_cast<const uint8_t*>(buf) + written,
             amount - written, static_cast<double>(offset + written));
-        if (n < 0) return mapIoError(n, SQLITE_IOERR_WRITE);
-        if (n == 0) return SQLITE_IOERR_WRITE;  // no progress: refuse to spin
+        if (n < 0) {
+            noteWrite(f, 0, kUnknown);
+            return mapIoError(n, SQLITE_IOERR_WRITE);
+        }
+        if (n == 0) {
+            noteWrite(f, 0, kUnknown);
+            return SQLITE_IOERR_WRITE;  // no progress: refuse to spin
+        }
         written += n;
     }
+    noteWrite(f, offset + amount, kGrow);
     return SQLITE_OK;
 }
 
@@ -368,7 +453,12 @@ int fsTruncate(sqlite3_file* file, sqlite3_int64 size) {
     if (f->handle < 0) return SQLITE_IOERR_TRUNCATE;
     if (f->ra) raDrop(f);
     const int32_t rc = flatsql_io_truncate(f->handle, static_cast<double>(size));
-    return rc < 0 ? mapIoError(rc, SQLITE_IOERR_TRUNCATE) : SQLITE_OK;
+    if (rc < 0) {
+        noteWrite(f, 0, kUnknown);
+        return mapIoError(rc, SQLITE_IOERR_TRUNCATE);
+    }
+    noteWrite(f, size, kSet);
+    return SQLITE_OK;
 }
 
 int fsSync(sqlite3_file* file, int /*flags*/) {
@@ -381,10 +471,7 @@ int fsSync(sqlite3_file* file, int /*flags*/) {
 int fsFileSize(sqlite3_file* file, sqlite3_int64* outSize) {
     auto* f = reinterpret_cast<FlatSqlFile*>(file);
     if (f->handle < 0) return SQLITE_IOERR_FSTAT;
-    const double size = flatsql_io_size(f->handle);
-    if (size < 0) return SQLITE_IOERR_FSTAT;
-    *outSize = static_cast<sqlite3_int64>(size);
-    return SQLITE_OK;
+    return fileSize(f, outSize);
 }
 
 // Database-file locks in memory, with the unix VFS's inode rules.
@@ -502,9 +589,12 @@ int fsShmLock(sqlite3_file* file, int ofst, int nLocks, int flags) {
     auto* f = reinterpret_cast<FlatSqlFile*>(file);
     if (!f->node || !f->mapped || ofst < 0 || nLocks < 1 || ofst + nLocks > kShmLocks)
         return SQLITE_IOERR_SHMLOCK;
-    // A read-mark lock starts or ends a WAL read transaction: drop the
-    // readahead buffers (they may hold pages a checkpoint has rewritten since).
-    if (f->ra && ofst + nLocks > kReadMarkFirst) raDrop(f);
+    // A read transaction ends: its buffers are kept for the next one (the
+    // write generation tells whether they still hold the file's pages) while
+    // every connection's together stay under kRaKeep.
+    if (f->ra && ofst + nLocks > kReadMarkFirst && (flags & SQLITE_SHM_UNLOCK) &&
+        gRaHeld.load(std::memory_order_relaxed) > kRaKeep)
+        raDrop(f);
     NodeLock g;
     Node* n = f->node;
     if (flags & SQLITE_SHM_UNLOCK) {

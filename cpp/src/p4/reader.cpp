@@ -271,6 +271,9 @@ public:
     // 1, 0, or < 0 status. emit: with every tag and, when the request
     // hydrates, the bytes (the row is output).
     int32_t rowAt(int fi, int64_t seq, Row* out, bool emit = false, bool hydrate = false);
+    // The rows at (file, seqs) that pass the scan's filters, by seq, in one
+    // read transaction: P4_OK or < 0 status. emit, hydrate: as rowAt.
+    int32_t rowsAt(int fi, std::vector<int64_t> seqs, std::unordered_map<int64_t, Row>* out, bool emit, bool hydrate);
 
 private:
     struct FileCur {
@@ -1769,6 +1772,16 @@ int32_t Scan::nextW(Row** out) {
 }
 
 int32_t Scan::rowAt(int fi, int64_t seq, Row* out, bool emit, bool hydrate) {
+    std::unordered_map<int64_t, Row> rows;
+    const int32_t st = rowsAt(fi, {seq}, &rows, emit, hydrate);
+    if (st != P4_OK) return st;
+    auto it = rows.find(seq);
+    if (it == rows.end()) return 0;
+    *out = std::move(it->second);
+    return 1;
+}
+
+int32_t Scan::rowsAt(int fi, std::vector<int64_t> seqs, std::unordered_map<int64_t, Row>* out, bool emit, bool hydrate) {
     struct Restore {
         Spec2& s;
         bool tags, data;
@@ -1787,16 +1800,20 @@ int32_t Scan::rowAt(int fi, int64_t seq, Row* out, bool emit, bool hydrate) {
     if (!c) {
         return statusOfSqlite(rc);
     }
+    std::sort(seqs.begin(), seqs.end());
     c->exec("BEGIN");
     std::deque<Row> rows;
-    int32_t st = loadRows(c, fi, {seq}, &rows);
+    int32_t st = loadRows(c, fi, seqs, &rows);
     if (st == P4_OK) st = loadTags(c, fi, rows);
     c->exec("COMMIT");
     e_->rpool.release(c);
     if (st != P4_OK) return st;
-    if (rows.empty()) return 0;
-    *out = std::move(rows.front());
-    return rowMatches(*out) ? 1 : 0;
+    for (Row& r : rows)
+        if (rowMatches(r)) {
+            const int64_t sq = r.seq;
+            (*out)[sq] = std::move(r);
+        }
+    return P4_OK;
 }
 
 // EPOCH points (2 nearest, 3 as_of, 4 forward) for every object, one r_ke(k,
@@ -3662,26 +3679,32 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
             o.enc.endRow();
             rc = o.rowDone();
         } else {
-            uint64_t emitted = 0, skipped = 0;
-            for (auto& pk : picks) {
-                if (skipped < s.offset) {
-                    skipped++;
-                    continue;
+            // The records, with their matched tags, from the files they were
+            // picked in: a chunk of picks at a time, one read transaction per
+            // file per chunk, written in the picks' order.
+            constexpr size_t kChunk = 4096;
+            uint64_t emitted = 0;
+            size_t at = size_t(std::min<uint64_t>(s.offset, picks.size()));
+            while (rc == P4_OK && at < picks.size() && !(s.limit && emitted >= s.limit)) {
+                size_t want = kChunk;
+                if (s.limit) want = size_t(std::min<uint64_t>(want, s.limit - emitted));
+                const size_t end = std::min(picks.size(), at + want);
+                std::map<int, std::vector<int64_t>> byFile;
+                for (size_t i = at; i < end; i++) byFile[picks[i].second.fi].push_back(picks[i].second.seq);
+                std::map<int, std::unordered_map<int64_t, Row>> rows;
+                for (auto& kv : byFile) {
+                    rc = sc.rowsAt(kv.first, std::move(kv.second), &rows[kv.first], true, s.hydrate);
+                    if (rc != P4_OK) break;
                 }
-                if (s.limit && emitted >= s.limit) break;
-                // the record, with its matched tag, from the file it was picked in
-                Row rr;
-                const int32_t got = sc.rowAt(pk.second.fi, pk.second.seq, &rr, true, s.hydrate);
-                if (got < 0) {
-                    rc = got;
-                    break;
-                }
-                if (got == 1) {
-                    writeRec(o, sc, rr, &pk.first, false);
+                for (size_t i = at; rc == P4_OK && i < end; i++) {
+                    auto& m = rows[picks[i].second.fi];
+                    auto it = m.find(picks[i].second.seq);
+                    if (it == m.end()) continue;  // gone since the pick, or filtered out
+                    writeRec(o, sc, it->second, &picks[i].first, false);
                     rc = o.rowDone();
                     emitted++;
                 }
-                if (rc != P4_OK) break;
+                at = end;
             }
         }
     }

@@ -1173,7 +1173,7 @@ P4_SLOW_TEST(open_bench) {
 
 // The read gate's material shapes (GATES-r1), as the SDN backend sends them
 // to the engine, on a fixture store: one cold call and three warm ones each.
-//   flatsql_p4_test --test=reads_bench --store=<dir with fsql4> [--only=<substring>]
+//   flatsql_p4_test --test=reads_bench --store=<dir with fsql4> [--only=<substring>[|...]]
 P4_SLOW_TEST(reads_bench) {
     const std::string store = argStr("store", "");
     if (store.empty()) {
@@ -1751,8 +1751,18 @@ P4_SLOW_TEST(reads_bench) {
         CHECK_EQ(errors, 0, "every concurrent first read after open");
         return;
     }
+    auto onlyMatch = [&](const std::string& name) {  // --only=<substring>[|<substring>...]
+        if (only.empty()) return true;
+        for (size_t b = 0; b <= only.size();) {
+            size_t e = only.find('|', b);
+            if (e == std::string::npos) e = only.size();
+            if (e > b && name.find(only.substr(b, e - b)) != std::string::npos) return true;
+            b = e + 1;
+        }
+        return false;
+    };
     for (Shape& sh : shapes) {
-        if (!only.empty() && sh.name.find(only) == std::string::npos) continue;
+        if (!onlyMatch(sh.name)) continue;
         std::vector<double> ms;
         size_t rows = 0;
         int32_t st = 0;
