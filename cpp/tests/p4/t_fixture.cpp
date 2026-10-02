@@ -1273,6 +1273,22 @@ P4_SLOW_TEST(reads_bench) {
         t2.text(1, ty).u64(3, 50).u64(4, 950);
         add(std::string("R11 INDEX_PAGE ") + ty + " page 20", P4_OPC_INDEX_PAGE, t2);
     }
+    {
+        TlvW t;
+        t.text(1, "OMM").text(12, "celestrak-gp").u64(19, 33554432);
+        add("R15 HEAD OMM source cap", P4_OPC_HEAD, t);
+        TlvW u;
+        u.text(1, "OMM").u64(19, 33554432);
+        add("R15 HEAD OMM cap (no filter)", P4_OPC_HEAD, u);
+        TlvW c;
+        c.text(1, "CAT").text(12, "celestrak-satcat-csv").u64(19, 1048576);
+        add("R15 HEAD CAT csv cap", P4_OPC_HEAD, c);
+    }
+    for (const char* b : {"OMM-celestrak-gp-b052", "OMM-celestrak-gp-b010"}) {
+        TlvW t;
+        t.text(1, "OMM").text(12, "celestrak-gp").text(13, b).u64(19, 33554432);
+        add(std::string("R15 HEAD OMM source+batch cap ") + b, P4_OPC_HEAD, t);
+    }
     for (const char* q : {"SELECT COUNT(*) FROM OMM", "SELECT COUNT(*) FROM MPE", "SELECT COUNT(*) FROM CAT",
                           "SELECT COUNT(*) FROM IQC", "SELECT _source, COUNT(*) FROM MPE GROUP BY _source",
                           "SELECT OBJECT_NAME, EPOCH, NORAD_CAT_ID FROM OMM WHERE NORAD_CAT_ID BETWEEN 25000 AND 25600"}) {
