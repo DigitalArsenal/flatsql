@@ -1268,6 +1268,20 @@ P4_SLOW_TEST(reads_bench) {
         add("R11 INDEX_PAGE CAT norad LIKE", P4_OPC_INDEX_PAGE, t);
         add("R11 HEAD CAT norad LIKE", P4_OPC_HEAD, t);
     }
+    {
+        TlvW t;
+        t.text(1, "CAT").text(12, "celestrak-satcat").u64(3, 50).u64(4, 100);
+        add("R11 INDEX_PAGE CAT satcat page 3", P4_OPC_INDEX_PAGE, t);
+        TlvW h;
+        h.text(1, "CAT").text(12, "celestrak-satcat");
+        add("R11 HEAD CAT satcat", P4_OPC_HEAD, h);
+        TlvW c;
+        c.text(1, "CAT").u8(2, 1).u64(3, 100);
+        add("R12 WINDOW CAT off=0", P4_OPC_WINDOW, c);
+        TlvW c2;
+        c2.text(1, "CAT").u8(2, 1).u64(3, 100).u64(4, 1000);
+        add("R12 WINDOW CAT off=1000", P4_OPC_WINDOW, c2);
+    }
     for (const char* ty : {"CAT", "IQC", "MPE"}) {
         TlvW t;
         t.text(1, ty).u64(3, 50);
@@ -1737,7 +1751,8 @@ P4_SLOW_TEST(reads_bench) {
         size_t rows = 0;
         int32_t st = 0;
         uint64_t ex = 0;
-        for (int i = 0; i < 4; i++) {
+        const int calls = int(argInt("reps", 4));
+        for (int i = 0; i < calls; i++) {
             const uint64_t s = flatsql::ps::monoNs();
             Result r = call(sh.op, sh.t.b, co);
             ms.push_back(double(flatsql::ps::monoNs() - s) / 1e6);
@@ -1762,7 +1777,7 @@ P4_SLOW_TEST(reads_bench) {
         std::vector<double> warm(ms.begin() + 1, ms.end());
         std::sort(warm.begin(), warm.end());
         std::printf("  %-36s cold %9.3f ms  warm p50 %9.3f  max %9.3f  rows %zu  examined %llu  status %d (load %.1f)\n",
-                    sh.name.c_str(), ms[0], warm[1], warm[2], rows, (unsigned long long)ex, st, loadAvg());
+                    sh.name.c_str(), ms[0], warm[warm.size() / 2], warm.back(), rows, (unsigned long long)ex, st, loadAvg());
     }
     closeEngine(600000);
 }

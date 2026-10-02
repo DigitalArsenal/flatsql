@@ -854,12 +854,19 @@ int32_t Scan::collectSourceCandidates() {
 // the type index walk stays.
 int32_t Scan::collectLaneCandidates() {
     if (!s_.lane || laneIds_.empty() || sids_.empty()) return P4_OK;
-    int64_t total = 0;
+    int64_t total = 0, rowsAll = 0;
     for (const FRef& fr : files_) {
         if (!fr.indexed) return P4_OK;
         total += fr.laneN;
+        rowsAll += fr.n;
     }
     if (total > 200000) return P4_OK;
+    // A page of a lane that is a large part of the type: the type index's
+    // CID walk reaches it in (offset + limit) / (the lane's share) entries,
+    // fewer than the lane's rows the candidates would read.
+    if (s_.limit > 0 && total > 0 &&
+        double(s_.offset + s_.limit) * double(rowsAll) / double(total) * 2.0 < double(total))
+        return P4_OK;
     std::string in;
     if (laneIds_.size() <= 64)
         for (uint32_t id : laneIds_) in += (in.empty() ? " AND lane IN (" : ",") + std::to_string(id);
@@ -2395,6 +2402,60 @@ int32_t Scan::cidPage() {
         if (rc != P4_OK) return rc;
     }
     if (ents.empty()) return P4_OK;
+    // A lane filter alone: each entry's lane membership on rl's key (one
+    // probe, no row), the offset counted on it, and only the page's rows read.
+    const bool laneOnly = s_.lane && !laneSql_.empty() && s_.preds.empty() && !s_.hasPeer && !s_.eNull &&
+                          !s_.eNotNull && !fts_ && !s_.hasCid && !s_.hasProducer;
+    if (laneOnly) {
+        std::map<int, std::vector<size_t>> byFile;
+        for (size_t i = 0; i < ents.size(); i++) byFile[fiOfPid_[ents[i].pid]].push_back(i);
+        std::vector<char> member(ents.size(), 0);
+        for (auto& kv : byFile) {
+            int orc = 0;
+            Conn* c = e_->rpool.acquire(files_[size_t(kv.first)].path, OpenKind::Reader, &orc, nullptr);
+            if (!c) {
+                e_->bump(kStReadErrors);
+                return statusOfSqlite(orc);
+            }
+            sqlite3_stmt* q = c->sql(laneSql_);
+            int32_t st = q ? P4_OK : P4_E_INTERNAL;
+            c->exec("BEGIN");
+            for (size_t i : kv.second) {
+                if (st != P4_OK) break;
+                sqlite3_bind_int64(q, 1, ents[i].seq);
+                const int r = sqlite3_step(q);
+                sqlite3_reset(q);
+                if (r == SQLITE_ROW) member[i] = 1;
+                else if (r != SQLITE_DONE) st = statusOfSqlite(r);
+            }
+            c->exec("COMMIT");
+            e_->rpool.release(c);
+            if (st != P4_OK) {
+                e_->bump(kStReadErrors);
+                return st;
+            }
+        }
+        std::vector<CidEnt> kept;
+        for (size_t i = 0; i < ents.size();) {
+            size_t j = i;
+            while (j < ents.size() && std::memcmp(ents[j].key, ents[i].key, 32) == 0) j++;
+            size_t m = j;
+            for (size_t k = i; k < j && m == j; k++)
+                if (member[k]) m = k;
+            if (m < j) {
+                if (skipped_ < s_.offset) {
+                    skipped_++;
+                    std::memcpy(lastKey_, ents[m].key, 32);
+                    haveLast_ = true;
+                } else {
+                    kept.push_back(ents[m]);
+                }
+            }
+            i = j;
+        }
+        ents.swap(kept);
+        if (ents.empty()) return P4_OK;
+    }
     // The rows, one read transaction per file.
     std::map<int, std::vector<int64_t>> seqsOf;
     for (const CidEnt& x : ents) seqsOf[fiOfPid_[x.pid]].push_back(x.seq);
