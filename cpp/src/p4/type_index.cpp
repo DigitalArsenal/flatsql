@@ -1,6 +1,8 @@
 // Store format 4: the per-type index (design §3), derived and rebuildable.
 //
 //   c(cid, pid, seq)                CID -> every stored copy (dedupe, GET, TAGS, DELETE)
+//   cb(b, n)                        distinct CIDs of c per bucket (the CID's first 12 bits):
+//                                   an unfiltered CID window skips its offset by bucket
 //   ident(src, h, seq, cid)         IQC ingest identity -> holder
 //   part, src, lanes, lanecnt       the registry and each partition's counters, cached from its file
 //   meta                            uniq, uniq_bytes, copies, next_seq, fts_through
@@ -9,6 +11,7 @@
 // flushes them in key order (one transaction per flush). Entries of groups in
 // flight are visible to dedupe and never flushed.
 #include <algorithm>
+#include <set>
 
 #include "internal.h"
 
@@ -91,7 +94,8 @@ const char* kIndexSchema =
     " batch TEXT, ckey TEXT, ppeer TEXT, pkey TEXT);"
     "CREATE TABLE IF NOT EXISTS lanecnt(lane INTEGER NOT NULL, pid INTEGER NOT NULL, h INTEGER,"
     " n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts, minseq, PRIMARY KEY(lane, pid)) WITHOUT ROWID;"
-    "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v) WITHOUT ROWID;";
+    "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v) WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS cb(b INTEGER PRIMARY KEY, n INTEGER NOT NULL);";
 
 const char* ctext(sqlite3_stmt* s, int i) {
     const unsigned char* t = sqlite3_column_text(s, i);
@@ -108,6 +112,57 @@ int64_t metaGet(Conn* c, const char* k, int64_t dflt) {
 }
 }  // namespace
 
+// ---- CID buckets ------------------------------------------------------------------------------
+int cidBucket(const uint8_t* key) { return (int(key[0]) << 4) | (key[1] >> 4); }
+
+int cbCount(Conn* c, std::vector<int64_t>* n) {
+    n->assign(kCidBuckets, 0);
+    sqlite3_stmt* s = c->sql("SELECT cid FROM c ORDER BY cid");
+    if (!s) return SQLITE_ERROR;
+    uint8_t last[32];
+    bool have = false;
+    int r;
+    while ((r = sqlite3_step(s)) == SQLITE_ROW) {
+        if (sqlite3_column_bytes(s, 0) != 32) continue;
+        const uint8_t* k = static_cast<const uint8_t*>(sqlite3_column_blob(s, 0));
+        if (have && std::memcmp(last, k, 32) == 0) continue;  // a copy
+        std::memcpy(last, k, 32);
+        have = true;
+        (*n)[size_t(cidBucket(k))]++;
+    }
+    sqlite3_reset(s);
+    return r == SQLITE_DONE ? SQLITE_OK : r;
+}
+
+int cbRead(Conn* c, std::vector<int64_t>* n) {
+    n->assign(kCidBuckets, 0);
+    sqlite3_stmt* s = c->sql("SELECT b, n FROM cb");
+    if (!s) return SQLITE_ERROR;
+    int r;
+    while ((r = sqlite3_step(s)) == SQLITE_ROW) {
+        const int64_t b = sqlite3_column_int64(s, 0);
+        if (b >= 0 && b < kCidBuckets) (*n)[size_t(b)] = sqlite3_column_int64(s, 1);
+    }
+    sqlite3_reset(s);
+    return r == SQLITE_DONE ? SQLITE_OK : r;
+}
+
+int cbWrite(Conn* c, const std::vector<int64_t>& n) {
+    int rc = c->exec("DELETE FROM cb");
+    sqlite3_stmt* s = rc == SQLITE_OK ? c->sql("INSERT INTO cb(b, n) VALUES(?1, ?2)") : nullptr;
+    if (rc == SQLITE_OK && !s) rc = SQLITE_ERROR;
+    for (size_t b = 0; rc == SQLITE_OK && b < n.size(); b++) {
+        if (n[b] == 0) continue;
+        sqlite3_bind_int64(s, 1, int64_t(b));
+        sqlite3_bind_int64(s, 2, n[b]);
+        const int r = sqlite3_step(s);
+        sqlite3_reset(s);
+        if (r != SQLITE_DONE) rc = r;
+    }
+    if (rc == SQLITE_OK) rc = c->exec("INSERT OR REPLACE INTO meta(k, v) VALUES('cb', 1)");
+    return rc;
+}
+
 int32_t typeIndexOpen(Type* t, std::string* err) {
     Conn* c = nullptr;
     int rc = openConn(t->pIdx, OpenKind::Index, 8192, 4096, &c, err);
@@ -119,6 +174,20 @@ int32_t typeIndexOpen(Type* t, std::string* err) {
         return statusOfSqlite(rc);
     }
     sqlite3_wal_hook(c->db, walHook, t->e);  // its WAL is checkpointed by the maintenance thread
+    if (metaGet(c, "cb", 0) == 0) {
+        // An index an older engine wrote: its CID buckets, counted once.
+        std::vector<int64_t> n;
+        rc = c->exec("BEGIN IMMEDIATE");
+        if (rc == SQLITE_OK) rc = cbCount(c, &n);
+        if (rc == SQLITE_OK) rc = cbWrite(c, n);
+        if (rc == SQLITE_OK) rc = c->exec("COMMIT");
+        if (rc != SQLITE_OK) {
+            if (err) *err = std::string("type index: CID buckets: ") + sqlite3_errmsg(c->db);
+            c->exec("ROLLBACK");
+            delete c;
+            return statusOfSqlite(rc);
+        }
+    }
     t->idx = c;
     std::lock_guard<std::mutex> g(t->mu);
     // Every registry read either completes or fails the open (M9): a statement
@@ -440,20 +509,49 @@ int32_t typeIndexFlush(Type* t, bool force, bool wait) {
         if (r != SQLITE_DONE && rc == SQLITE_OK) rc = r;
         sqlite3_reset(s);
     };
-    for (const CEnt& x : ents) {
-        if (rc != SQLITE_OK) break;
-        if (x.st == 1) {
-            sqlite3_stmt* s = c->get(S_C_INS);
-            sqlite3_bind_blob(s, 1, x.key, 32, SQLITE_STATIC);
-            sqlite3_bind_int64(s, 2, x.pid);
-            sqlite3_bind_int64(s, 3, x.seq);
-            step(s);
-        } else {
-            sqlite3_stmt* s = c->get(S_C_DEL);
-            sqlite3_bind_blob(s, 1, x.key, 32, SQLITE_STATIC);
-            sqlite3_bind_int64(s, 2, x.pid);
-            step(s);
+    // Each CID's entries, with its bucket's count moved when it gains its
+    // first holder or loses its last (the holders before: one probe).
+    std::map<int, int64_t> cbDelta;
+    sqlite3_stmt* pids = c->sql("SELECT pid FROM c WHERE cid=?1");
+    if (!pids) rc = SQLITE_ERROR;
+    for (size_t i = 0; i < ents.size() && rc == SQLITE_OK;) {
+        size_t j = i;
+        while (j < ents.size() && std::memcmp(ents[j].key, ents[i].key, 32) == 0) j++;
+        std::set<uint32_t> holders;
+        sqlite3_bind_blob(pids, 1, ents[i].key, 32, SQLITE_STATIC);
+        int pr;
+        while ((pr = sqlite3_step(pids)) == SQLITE_ROW) holders.insert(uint32_t(sqlite3_column_int64(pids, 0)));
+        sqlite3_reset(pids);
+        if (pr != SQLITE_DONE) rc = pr;
+        const bool before = !holders.empty();
+        for (; i < j && rc == SQLITE_OK; i++) {
+            const CEnt& x = ents[i];
+            if (x.st == 1) {
+                sqlite3_stmt* s = c->get(S_C_INS);
+                sqlite3_bind_blob(s, 1, x.key, 32, SQLITE_STATIC);
+                sqlite3_bind_int64(s, 2, x.pid);
+                sqlite3_bind_int64(s, 3, x.seq);
+                step(s);
+                holders.insert(x.pid);
+            } else {
+                sqlite3_stmt* s = c->get(S_C_DEL);
+                sqlite3_bind_blob(s, 1, x.key, 32, SQLITE_STATIC);
+                sqlite3_bind_int64(s, 2, x.pid);
+                step(s);
+                holders.erase(x.pid);
+            }
         }
+        i = j;
+        if (before != !holders.empty()) cbDelta[cidBucket(ents[j - 1].key)] += before ? -1 : 1;
+    }
+    for (auto& d : cbDelta) {
+        if (rc != SQLITE_OK || d.second == 0) continue;
+        sqlite3_stmt* s = c->sql("INSERT INTO cb(b, n) VALUES(?1, ?2) ON CONFLICT(b) DO UPDATE SET n=n+excluded.n");
+        if (s) {
+            sqlite3_bind_int64(s, 1, d.first);
+            sqlite3_bind_int64(s, 2, d.second);
+        }
+        step(s);
     }
     for (const IdentEnt& x : idents) {
         if (rc != SQLITE_OK) break;

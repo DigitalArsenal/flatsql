@@ -2431,25 +2431,66 @@ int32_t Scan::cidStart() {
     if (simple && s_.offset > 0 && cidPend_.empty() && !quarantine) {
         // An unfiltered window's offset with nothing pending: the type
         // index skips it (whole CIDs, copies once) and the walk starts at
-        // the first CID of the page.
+        // the first CID of the page. The CID buckets (cb) skip whole
+        // buckets; the rest is counted in c from the bucket's first CID.
         int32_t rc = P4_OK;
         Conn* x = indexReader(L_, t_, &rc);
         if (!x) return rc;
-        sqlite3_stmt* q = x->sql("SELECT cid FROM c GROUP BY cid ORDER BY cid LIMIT 1 OFFSET ?1");
-        if (!q) return P4_E_INTERNAL;
-        sqlite3_bind_int64(q, 1, int64_t(s_.offset));
-        const int r = sqlite3_step(q);
-        if (r == SQLITE_ROW && sqlite3_column_bytes(q, 0) == 32) {
-            std::memcpy(cidIdxKey_, sqlite3_column_blob(q, 0), 32);
+        x->exec("BEGIN");
+        uint64_t rest = s_.offset;
+        uint8_t from[32] = {};
+        bool past = false;
+        sqlite3_stmt* m = x->sql("SELECT v FROM meta WHERE k='cb'");
+        bool haveCb = false;
+        if (m && sqlite3_step(m) == SQLITE_ROW) haveCb = sqlite3_column_int64(m, 0) == 1;
+        if (m) sqlite3_reset(m);
+        sqlite3_stmt* b = haveCb ? x->sql("SELECT b, n FROM cb ORDER BY b") : nullptr;
+        if (b) {
+            int r;
+            past = true;
+            while ((r = sqlite3_step(b)) == SQLITE_ROW) {
+                L_->rowsExamined++;
+                const uint64_t n = uint64_t(sqlite3_column_int64(b, 1));
+                if (n > rest) {
+                    const int64_t bk = sqlite3_column_int64(b, 0);
+                    from[0] = uint8_t(bk >> 4);
+                    from[1] = uint8_t((bk & 15) << 4);
+                    past = false;
+                    break;
+                }
+                rest -= n;
+            }
+            sqlite3_reset(b);
+            if (r != SQLITE_ROW && r != SQLITE_DONE) {
+                x->exec("COMMIT");
+                return statusOfSqlite(r);
+            }
+        }
+        int r = SQLITE_DONE;
+        if (!past) {
+            sqlite3_stmt* q = x->sql("SELECT cid FROM c WHERE cid>=?1 GROUP BY cid ORDER BY cid LIMIT 1 OFFSET ?2");
+            if (!q) {
+                x->exec("COMMIT");
+                return P4_E_INTERNAL;
+            }
+            sqlite3_bind_blob(q, 1, from, 32, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(q, 2, int64_t(rest));
+            r = sqlite3_step(q);
+            if (r == SQLITE_ROW && sqlite3_column_bytes(q, 0) == 32) std::memcpy(cidIdxKey_, sqlite3_column_blob(q, 0), 32);
+            else if (r == SQLITE_ROW) r = SQLITE_MISMATCH;  // not a CID: the walk counts the offset
+            sqlite3_reset(q);
+            L_->rowsExamined += rest;
+        }
+        x->exec("COMMIT");
+        if (r == SQLITE_ROW) {
             cidIdxPid_ = 0;  // (cid, pid) > (cid, 0): every copy of it
             skipped_ = s_.offset;
         } else if (r == SQLITE_DONE) {
             cidIdxDone_ = true;  // the offset is past the end
             skipped_ = s_.offset;
+        } else if (r != SQLITE_MISMATCH) {
+            return statusOfSqlite(r);
         }
-        sqlite3_reset(q);
-        if (r != SQLITE_ROW && r != SQLITE_DONE) return statusOfSqlite(r);
-        L_->rowsExamined += s_.offset;
     }
     return P4_OK;
 }

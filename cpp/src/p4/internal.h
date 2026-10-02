@@ -652,6 +652,13 @@ int32_t identHolder(P4Lane* L, Type* t, uint64_t src, const uint8_t h[32], int64
 // A type-index reader connection for the lane; nullptr with *rc = P4_OK when
 // the type has no index yet (no data).
 Conn* indexReader(P4Lane* L, Type* t, int32_t* rc);
+// CID buckets (the type index's cb): a CID's bucket, and every bucket's
+// distinct CIDs counted from c, read from cb, or written to cb (with meta cb).
+constexpr int kCidBuckets = 4096;
+int cidBucket(const uint8_t* key);
+int cbCount(Conn* c, std::vector<int64_t>* n);
+int cbRead(Conn* c, std::vector<int64_t>* n);
+int cbWrite(Conn* c, const std::vector<int64_t>& n);
 // The maintenance thread passes wait = false: a type whose flush lock a
 // REBUILD holds is skipped this tick (its entries stay pending).
 int32_t typeIndexFlush(Type* t, bool force, bool wait = true);

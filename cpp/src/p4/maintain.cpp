@@ -577,6 +577,20 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
             }
         }
     }
+    // 3. The CID buckets against c (a fix writes them from c).
+    {
+        where = t->name;
+        std::vector<int64_t> want, have;
+        int r = cbCount(x, &want);
+        if (r == SQLITE_OK) r = cbRead(x, &have);
+        if (r != SQLITE_OK) return fail(r);
+        for (int b = 0; b < kCidBuckets; b++)
+            if (want[size_t(b)] != have[size_t(b)]) {
+                v->mismatches++;
+                why("CID bucket", where, have[size_t(b)], want[size_t(b)]);
+            }
+        if (fix && want != have && (r = cbWrite(x, want)) != SQLITE_OK) return fail(r);
+    }
     for (Conn* c : conns) delete c;
     conns.clear();
     if (fix) {
