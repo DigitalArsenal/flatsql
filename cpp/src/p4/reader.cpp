@@ -2077,7 +2077,30 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
         auto it = best->find(ent);
         if (it == best->end() || better(p.e, p.key, it->second.e, it->second.key)) (*best)[ent] = p;
     };
-    for (size_t fi = 0; fi < files_.size(); fi++) {
+    // The first `want` objects only: the files with the most rows first;
+    // after each file, an object past the want-th of the picks so far (in the
+    // answer's text order, within maxDelta) can no longer be in the answer.
+    std::vector<size_t> fileOrder(files_.size());
+    for (size_t i = 0; i < fileOrder.size(); i++) fileOrder[i] = i;
+    if (want > 0)
+        std::stable_sort(fileOrder.begin(), fileOrder.end(), [&](size_t a, size_t b) { return files_[a].n > files_[b].n; });
+    constexpr int32_t kPastCut = 1;  // the object walk stops (not an error)
+    for (size_t fo = 0; fo < fileOrder.size(); fo++) {
+        const size_t fi = fileOrder[fo];
+        std::string cut;
+        bool haveCut = false;
+        if (want > 0 && best->size() >= want) {
+            uint64_t n = 0;
+            for (auto& kv : *best) {
+                const int64_t d = kv.second.e > at ? kv.second.e - at : at - kv.second.e;
+                if (maxDelta > 0 && d > maxDelta) continue;
+                if (++n == want) {
+                    cut = kv.first;
+                    haveCut = true;
+                    break;
+                }
+            }
+        }
         {
             std::lock_guard<std::mutex> g(t_->mu);
             if (!files_[fi].f->indexed) {  // a migration before REBUILD 1: no r_ke
@@ -2192,6 +2215,12 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
             }
         }
         auto object = [&](sqlite3_value* k) -> int32_t {
+            if (haveCut) {
+                std::string ent;
+                if (sqlite3_value_type(k) == SQLITE_INTEGER) ent = std::to_string(sqlite3_value_int64(k));
+                else ent.assign(reinterpret_cast<const char*>(sqlite3_value_text(k)), size_t(sqlite3_value_bytes(k)));
+                if (ent > cut) return kPastCut;
+            }
             if (existsOnly) {
                 bool has = anyRow;
                 if (!has && hasE) {
@@ -2275,6 +2304,7 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
         } else if (want > 0 && (rc = objectsInTextOrder(c, want, &offered, object)) != P4_E_UNSUPPORTED) {
             // The first `want` objects in the answer's order only (this
             // file's first `want` hold every one of the answer's).
+            if (rc == kPastCut) rc = P4_OK;
         } else {
             rc = P4_OK;
             // Every object: a seek to the next k after each.
