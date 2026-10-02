@@ -209,6 +209,14 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
     rc = journalReplay(t, err);
     if (rc != P4_OK) return rc;
     std::lock_guard<std::mutex> g(t->mu);
+    // Every partition the index says has a file, against the disk: a missing
+    // file without rows is made again by its next write; a missing file with
+    // rows is quarantined (P4_E_CORRUPT, named), never silently remade.
+    for (auto& p : t->parts) {
+        if (!p->created || ioExists(p->path)) continue;
+        if (p->n == 0) p->created = false;
+        else p->quarantined = true;
+    }
     if (t->nextSeq < int64_t(t->e->cfg.gseqFloor)) t->nextSeq = int64_t(t->e->cfg.gseqFloor);
     t->visRecompute();
     return P4_OK;

@@ -13,6 +13,7 @@
 
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <random>
 #include <unordered_set>
 
@@ -87,15 +88,26 @@ Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from
 }
 
 // One step of the workload the kill lands in: 3 producers; every 5th call
-// repeats earlier records under another producer (copies); every 13th call
-// supersedes a batch and every 11th deletes the oldest arrivals down to a
-// 4 MiB quota.
+// repeats earlier records under another producer (copies); every 7th call
+// sends the same new records from two producers at once (concurrent copies:
+// one seq per CID, §3.8.2); every 13th call supersedes a batch and every 11th
+// deletes the oldest arrivals down to a 4 MiB quota.
 void killWorkStep(int c, uint64_t* id) {
     Batch b = killBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), *id, 500);
     if (c % 5 == 4)
         for (int i = 0; i < 500; i++) b.recs[size_t(i)].frame = killFrame(*id - 1000 + uint64_t(i));
     *id += 500;
-    Result r = put(b);
+    Result r;
+    if (c % 7 == 3) {
+        Batch b2 = b;
+        b2.peer = "producer" + std::to_string((c + 1) % 3);
+        const uint32_t s1 = submit(P4_OPC_PUT, encodePut(b)), s2 = submit(P4_OPC_PUT, encodePut(b2));
+        r = wait(s1);
+        Result r2 = wait(s2);
+        if (r.status == P4_OK) r = r2;
+    } else {
+        r = put(b);
+    }
     if (r.status != P4_OK) {
         std::fprintf(stderr, "  put failed: %d %s\n", r.status, r.err.c_str());
         std::_Exit(1);
@@ -167,11 +179,17 @@ bool killCheck(const std::string& root, std::string* why) {
         sqlite3_finalize(q);
         sqlite3_close(db);
     }
-    // every row on disk is found by CID
+    // every row on disk is found by CID, and every copy of a CID has its one seq
+    int64_t split = 0;
     for (size_t i = 0; i < sample.size(); i += 512) {
         std::vector<std::vector<uint8_t>> part(sample.begin() + long(i), sample.begin() + long(std::min(sample.size(), i + 512)));
-        Result g = get("PNM", part, false);
-        missing += int64_t(part.size()) - int64_t(g.rows.size());
+        Result g = get("PNM", part, false, true);
+        std::map<std::string, int64_t> seqOf;
+        for (size_t k = 0; k < g.rows.size(); k++) {
+            auto it = seqOf.emplace(g.s(k, "cid"), g.i(k, "seq")).first;
+            if (it->second != g.i(k, "seq")) split++;
+        }
+        missing += int64_t(part.size()) - int64_t(seqOf.size());
     }
     Result s = summary1("PNM");
     const int64_t count = s.rows.size() == 1 ? s.i(0, "records") : (distinct.empty() ? 0 : -1);
@@ -192,11 +210,11 @@ bool killCheck(const std::string& root, std::string* why) {
     const int64_t nodesLeft = flatsql::flatSqlIoVfsStats().nodes;
     if (nodesLeft) std::fprintf(stderr, "  check: %lld VFS nodes left open after close\n", (long long)nodesLeft);
     char buf[256];
-    std::snprintf(buf, sizeof buf, "rows %lld distinct %zu count %lld missing %lld mismatches %lld above %d nodes %lld",
-                  (long long)rows, distinct.size(), (long long)count, (long long)missing, (long long)mism, int(above),
-                  (long long)nodesLeft);
+    std::snprintf(buf, sizeof buf, "rows %lld distinct %zu count %lld missing %lld split %lld mismatches %lld above %d nodes %lld",
+                  (long long)rows, distinct.size(), (long long)count, (long long)missing, (long long)split, (long long)mism,
+                  int(above), (long long)nodesLeft);
     *why = buf;
-    return missing == 0 && count == int64_t(distinct.size()) && mism == 0 && above && nodesLeft == 0;
+    return missing == 0 && split == 0 && count == int64_t(distinct.size()) && mism == 0 && above && nodesLeft == 0;
 }
 }  // namespace
 

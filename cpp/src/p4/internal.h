@@ -29,6 +29,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -446,7 +447,9 @@ struct WriteTask {
 // The common state of a fan-out op: the slot completes when every partition's
 // part has committed. A quota pass has no slot: its waiter sees done.
 struct Shared {
-    enum Kind { kSupersede, kDelete, kQuota } kind = kSupersede;
+    // kQuota and kRepair have no slot: their waiter (the maintenance work) sees done.
+    enum Kind { kSupersede, kDelete, kQuota, kRepair } kind = kSupersede;
+    bool internal() const { return kind == kQuota || kind == kRepair; }
     std::atomic<bool> done{false};
     std::atomic<int> remaining{0};
     std::atomic<int64_t> a{0}, b{0}, c{0};
@@ -546,6 +549,14 @@ struct P4Engine {
     std::mutex maintMu;
     std::deque<flatsql::p4::MaintTask> maintQ;
     uint32_t maintThread = 0;
+    // Long maintenance (REBUILD and QUOTA_GC slots, the configured quota, the
+    // full-text index) runs on its own thread, so WAL checkpoints and
+    // type-index flushes never wait behind it.
+    std::thread slowThread;
+    std::mutex slowMu;
+    std::condition_variable slowCv;
+    std::deque<uint32_t> slowQ;
+    bool slowStop = false;
 
     flatsql::p4::SlotHeader* slot(uint32_t i) {
         const int p = i < nSlots[0] ? 0 : 1;
@@ -627,7 +638,9 @@ int32_t identHolder(P4Lane* L, Type* t, uint64_t src, const uint8_t h[32], int64
 // A type-index reader connection for the lane; nullptr with *rc = P4_OK when
 // the type has no index yet (no data).
 Conn* indexReader(P4Lane* L, Type* t, int32_t* rc);
-int32_t typeIndexFlush(Type* t, bool force);  // maintenance thread
+// The maintenance thread passes wait = false: a type whose flush lock a
+// REBUILD holds is skipped this tick (its entries stay pending).
+int32_t typeIndexFlush(Type* t, bool force, bool wait = true);
 
 // ---- partition.cpp -------------------------------------------------------------------------------
 // The writer connection of a file (created on first use), pinned for the caller.
@@ -649,6 +662,9 @@ void putGroup(P4Engine* e, uint32_t writer, Part* p, std::vector<WriteTask*>& ta
 void supersedePart(P4Engine* e, Part* p, WriteTask* task);
 // DELETE and quota: the given seqs of this partition's file.
 void deletePart(P4Engine* e, Part* p, WriteTask* task);
+// REBUILD 2 on the partition's writer: its counters and lane rows recounted
+// from its rows and tag instances, written back to the file and published.
+void repairPart(P4Engine* e, Part* p, WriteTask* task);
 void finishShared(P4Engine* e, Shared* s);
 
 // ---- reader.cpp -----------------------------------------------------------------------------------
@@ -656,6 +672,7 @@ int32_t runRead(P4Lane* L, uint32_t op);  // ops 10-17 on a lane
 
 // ---- maintain.cpp ----------------------------------------------------------------------------------
 void maintenanceLoop(P4Engine* e, uint32_t thread);
+void slowLoop(P4Engine* e);
 int32_t quotaGc(P4Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytes, bool enforce);
 int32_t rebuildOp(P4Engine* e, Type* only, uint32_t what, std::vector<std::array<int64_t, 2>>* rows,
                   std::vector<Type*>* rowTypes, std::string* firstBad = nullptr);

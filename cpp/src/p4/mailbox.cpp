@@ -430,9 +430,19 @@ void routeWrite(Engine* e, uint32_t wi, uint32_t slot, P4Lane* L) {
             std::lock_guard<std::mutex> g(ws.mu);
             busy = p->backlogRecords > 0 && p->backlogRecords + records > e->cfg.backlogCredit;
         }
-        if (busy) {
+        // Backpressure: the type's pending index entries over their budget (a
+        // flush cannot keep up or a REBUILD holds it), or the WALs over twice
+        // their total (checkpoints cannot keep up).
+        const char* why = busy ? "partition backlog full" : nullptr;
+        if (!why) {
+            std::lock_guard<std::mutex> g(t->mu);
+            if (t->pend.bytes() + t->flushing.bytes() > e->cfg.pendingBytes) why = "type index flush behind (pending entries)";
+        }
+        if (!why && e->stat[kStWalBytes].load(std::memory_order_relaxed) > 2 * e->cfg.walTotal) why = "WAL checkpoints behind";
+        if (why) {
             e->bump(kStBusy);
-            doneStatus(e, slot, colsOfWrite(op), P4_E_BUSY, "partition backlog full");
+            e->kickMaintenance();
+            doneStatus(e, slot, colsOfWrite(op), P4_E_BUSY, why);
             return;
         }
         WriteTask* wt = new (std::nothrow) WriteTask();
@@ -565,9 +575,10 @@ void writerLoop(Engine* e, uint32_t wi) {
             did = true;
             const int op = tasks[0]->op;
             for (WriteTask* wt : tasks)
-                if (!wt->shared || wt->shared->kind != Shared::kQuota) e->slot(wt->slot)->thread = tThread;
+                if (!wt->shared || !wt->shared->internal()) e->slot(wt->slot)->thread = tThread;
             if (op == P4_OPC_PUT) putGroup(e, wi, p, tasks);
             else if (op == P4_OPC_SUPERSEDE) supersedePart(e, p, tasks[0]);
+            else if (op == P4_OPC_REBUILD) repairPart(e, p, tasks[0]);
             else deletePart(e, p, tasks[0]);
             for (WriteTask* wt : tasks) delete wt;
         }
@@ -711,6 +722,7 @@ int32_t startThreads(Engine* e) {
         else if (cls == P4_CLASS_MAINTENANCE) e->threads.emplace_back(maintenanceLoop, e, i);
         else e->threads.emplace_back(laneLoop, e, i, cls);
     }
+    e->slowThread = std::thread(slowLoop, e);
     e->started = true;
     return int32_t(e->nThreads);
 }
@@ -723,6 +735,12 @@ int32_t engineStop(Engine* e, double deadlineMs) {
         for (uint32_t i = 0; i < e->nThreads; i++) e->wake(i);
     const uint64_t until = monoNs() + uint64_t(deadlineMs > 0 ? deadlineMs : 0) * 1000000ull;
     if (e->started) {
+        {
+            std::lock_guard<std::mutex> g(e->slowMu);
+            e->slowStop = true;
+            e->slowCv.notify_all();
+        }
+        if (e->slowThread.joinable()) e->slowThread.join();
         for (;;) {
             bool all = true;
             for (uint32_t i = 0; i < e->nThreads; i++) all = all && e->bells[i].state.load() == 2;

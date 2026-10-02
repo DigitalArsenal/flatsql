@@ -351,10 +351,12 @@ struct FileSnap {
 };
 }  // namespace
 
-int32_t typeIndexFlush(Type* t, bool force) {
+int32_t typeIndexFlush(Type* t, bool force, bool wait) {
     Engine* e = t->e;
     if (!t->hasFiles.load(std::memory_order_acquire)) return P4_OK;  // no data yet
-    std::lock_guard<std::mutex> fg(t->flushMu);
+    std::unique_lock<std::mutex> fg(t->flushMu, std::defer_lock);
+    if (wait) fg.lock();
+    else if (!fg.try_lock()) return P4_OK;  // a REBUILD holds it: the next tick
     std::vector<CEnt> ents;
     std::vector<IdentEnt> idents;
     std::vector<FileSnap> files;

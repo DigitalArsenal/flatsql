@@ -145,6 +145,7 @@ struct Row {
     int fi = -1;  // FRef index
     std::vector<TagInst> tags;
     int sel = -1;  // the matched tag (index into tags)
+    bool ftsHit = true;  // a full-text search matched it (set per page)
 };
 
 struct Spec2 {
@@ -275,6 +276,7 @@ private:
     int32_t fetchSeq(int fi);
     int32_t fetchW(int fi);
     int32_t loadRows(Conn* c, int fi, const std::vector<int64_t>& seqs, std::deque<Row>* out);
+    int32_t loadRowsOnly(Conn* c, int fi, const std::vector<int64_t>& seqs, std::deque<Row>* out);
     void rowFrom(sqlite3_stmt* q, int col0, int fi, bool needData, Row* row);
     bool needData() const;
     int32_t loadTags(Conn* c, int fi, std::deque<Row>& rows);
@@ -333,8 +335,8 @@ private:
     int64_t lastSeq_ = INT64_MIN;
     uint8_t lastKey_[32] = {};
     bool haveLast_ = false;
-    std::unordered_set<int64_t> ftsSeqs_;
     bool fts_ = false;
+    int32_t ftsMark(std::deque<Row>& rows, size_t from);
 };
 
 int32_t Scan::check() {
@@ -455,16 +457,8 @@ int32_t Scan::open() {
     order_.resize(files_.size());
     for (size_t i = 0; i < files_.size(); i++) order_[i] = int(i);
     if (!s_.search.empty()) {
-        // FTS5: the matching seqs (background index; C-4's exception).
-        std::lock_guard<std::mutex> g(t_->ftsMu);
-        if (!t_->fts) return P4_E_UNSUPPORTED;
-        sqlite3_stmt* q = t_->fts->sql("SELECT rowid FROM fts WHERE fts MATCH ?1");
-        if (!q) return P4_E_SQL;
-        sqlite3_bind_text(q, 1, s_.search.data(), int(s_.search.size()), SQLITE_STATIC);
-        int r;
-        while ((r = sqlite3_step(q)) == SQLITE_ROW) ftsSeqs_.insert(sqlite3_column_int64(q, 0));
-        sqlite3_reset(q);
-        if (r != SQLITE_DONE) return P4_E_SQL;
+        // FTS5 (background index; C-4's exception), checked a page at a time.
+        if (!sp_->fullText || !ioExists(t_->pFts)) return P4_E_UNSUPPORTED;
         fts_ = true;
     }
     if (s_.order == P4_ORDER_SEQ_DESC || s_.bound) {
@@ -895,7 +889,7 @@ bool Scan::rowMatches(Row& r) {
     if (s_.hasPeer && peerOf(r) != s_.peer) return false;
     if (s_.eNotNull && !r.hasE) return false;
     if (s_.eNull && r.hasE) return false;
-    if (fts_ && !ftsSeqs_.count(r.seq)) return false;
+    if (fts_ && !r.ftsHit) return false;
     // matched tag
     r.sel = -1;
     if (s_.lane) {
@@ -997,6 +991,57 @@ bool Scan::needData() const {
 }
 
 int32_t Scan::loadRows(Conn* c, int fi, const std::vector<int64_t>& seqs, std::deque<Row>* out) {
+    const size_t from = out->size();
+    const int32_t rc = loadRowsOnly(c, fi, seqs, out);
+    return rc == P4_OK ? ftsMark(*out, from) : rc;
+}
+
+// rows[from..]: whether the search matches each, from the full-text index
+// (one range read when the page's seqs are dense, else a probe per seq), so
+// memory stays one page whatever the number of matches.
+int32_t Scan::ftsMark(std::deque<Row>& rows, size_t from) {
+    if (!fts_ || from >= rows.size()) return P4_OK;
+    int rc = 0;
+    Conn* c = e_->rpool.acquire(t_->pFts, OpenKind::Reader, &rc, nullptr);
+    if (!c) return statusOfSqlite(rc);
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    for (size_t i = from; i < rows.size(); i++) {
+        lo = std::min(lo, rows[i].seq);
+        hi = std::max(hi, rows[i].seq);
+    }
+    int32_t status = P4_OK;
+    const size_t n = rows.size() - from;
+    if (uint64_t(hi - lo) <= uint64_t(n) * 4) {
+        std::unordered_set<int64_t> hit;
+        sqlite3_stmt* q = c->sql("SELECT rowid FROM fts WHERE fts MATCH ?1 AND rowid>=?2 AND rowid<=?3");
+        if (!q) status = P4_E_SQL;
+        else {
+            sqlite3_bind_text(q, 1, s_.search.data(), int(s_.search.size()), SQLITE_STATIC);
+            sqlite3_bind_int64(q, 2, lo);
+            sqlite3_bind_int64(q, 3, hi);
+            int r;
+            while ((r = sqlite3_step(q)) == SQLITE_ROW) hit.insert(sqlite3_column_int64(q, 0));
+            sqlite3_reset(q);
+            if (r != SQLITE_DONE) status = P4_E_SQL;
+        }
+        for (size_t i = from; i < rows.size(); i++) rows[i].ftsHit = hit.count(rows[i].seq) > 0;
+    } else {
+        sqlite3_stmt* q = c->sql("SELECT 1 FROM fts WHERE fts MATCH ?1 AND rowid=?2");
+        if (!q) status = P4_E_SQL;
+        for (size_t i = from; q && i < rows.size() && status == P4_OK; i++) {
+            sqlite3_bind_text(q, 1, s_.search.data(), int(s_.search.size()), SQLITE_STATIC);
+            sqlite3_bind_int64(q, 2, rows[i].seq);
+            const int r = sqlite3_step(q);
+            sqlite3_reset(q);
+            if (r != SQLITE_ROW && r != SQLITE_DONE) status = P4_E_SQL;
+            rows[i].ftsHit = r == SQLITE_ROW;
+        }
+    }
+    e_->rpool.release(c);
+    return status;
+}
+
+int32_t Scan::loadRowsOnly(Conn* c, int fi, const std::vector<int64_t>& seqs, std::deque<Row>* out) {
     const bool nd = needData();
     sqlite3_stmt* q = c->get(nd ? S_R_ROW : S_R_GET);
     if (!q) return P4_E_INTERNAL;
@@ -1154,6 +1199,7 @@ int32_t Scan::fetchSeq(int fi) {
             sqlite3_reset(q);
             if (r != SQLITE_DONE) status = statusOfSqlite(r);
             if (status == P4_OK && got == 0) fc.done = true;
+            if (status == P4_OK) status = ftsMark(rows, 0);
             if (status == P4_OK) status = loadTags(c, fi, rows);
         }
     }

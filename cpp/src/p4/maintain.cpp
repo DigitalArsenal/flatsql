@@ -3,6 +3,7 @@
 // evicted writer connections (a close may checkpoint), QUOTA_GC and REBUILD,
 // and the background FTS index.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -355,24 +356,19 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
         conns.push_back(c);
     }
     if (fix && x->exec("BEGIN IMMEDIATE") != SQLITE_OK) return fail(SQLITE_BUSY);
-    // 1. Each file's counters and lanes from its own rows.
-    for (size_t fi = 0; fi < files.size(); fi++) {
+    // 1. Verify: each file's counters and lanes against its own rows (a fix
+    //    recounts them on each partition's writer first: repairPartitions).
+    for (size_t fi = 0; fi < files.size() && !fix; fi++) {
         Part* f = files[fi];
         Conn* c = conns[fi];
         where = f->path;
-        sqlite3_stmt* s = c->sql("SELECT seq, length(d), w, e FROM r");
+        sqlite3_stmt* s = c->sql("SELECT count(*), coalesce(sum(length(d)),0) FROM r");
         if (!s) return fail(SQLITE_ERROR);
-        int64_t n = 0, bytes = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN, nnull = 0;
+        int64_t n = 0, bytes = 0;
         int src;
         while ((src = sqlite3_step(s)) == SQLITE_ROW) {
-            const int64_t seq = sqlite3_column_int64(s, 0);
-            n++;
-            bytes += sqlite3_column_int64(s, 1);
-            minseq = std::min(minseq, seq);
-            maxseq = std::max(maxseq, seq);
-            minw = std::min(minw, sqlite3_column_int64(s, 2));
-            maxw = std::max(maxw, sqlite3_column_int64(s, 2));
-            if (sqlite3_column_type(s, 3) == SQLITE_NULL && sp->hasEpochRule) nnull++;
+            n = sqlite3_column_int64(s, 0);
+            bytes = sqlite3_column_int64(s, 1);
         }
         sqlite3_reset(s);
         if (src != SQLITE_DONE) return fail(src);
@@ -384,7 +380,7 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
             fbytes = f->bytes;
             mem = f->lanes;
         }
-        if (!fix && (fn != n || fbytes != bytes)) {
+        if (fn != n || fbytes != bytes) {
             v->mismatches++;
             why("file counters n", f->path, fn, n);
             why("file counters bytes", f->path, fbytes, bytes);
@@ -402,39 +398,19 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
         }
         sqlite3_reset(s);
         if (src != SQLITE_DONE) return fail(src);
-        if (!fix) {
-            for (auto& kv : real) {
-                auto it = mem.find(kv.first);
-                if (it == mem.end() || it->second.n != kv.second.first || it->second.bytes != kv.second.second) {
-                    v->mismatches++;
-                    why("lane n", f->path, it == mem.end() ? -1 : it->second.n, kv.second.first);
-                    why("lane bytes", f->path, it == mem.end() ? -1 : it->second.bytes, kv.second.second);
-                }
+        for (auto& kv : real) {
+            auto it = mem.find(kv.first);
+            if (it == mem.end() || it->second.n != kv.second.first || it->second.bytes != kv.second.second) {
+                v->mismatches++;
+                why("lane n", f->path, it == mem.end() ? -1 : it->second.n, kv.second.first);
+                why("lane bytes", f->path, it == mem.end() ? -1 : it->second.bytes, kv.second.second);
             }
-            for (auto& kv : mem)
-                if (!real.count(kv.first)) {
-                    v->mismatches++;
-                    why("lane in memory only", f->path, kv.first, kv.second.n);
-                }
-        } else {
-            std::lock_guard<std::mutex> g(t->mu);
-            f->n = n;
-            f->bytes = bytes;
-            f->minseq = minseq;
-            f->maxseq = maxseq;
-            f->minw = minw;
-            f->maxw = maxw;
-            f->nnull = nnull;
-            for (auto& kv : real) {
-                LaneCount& lc = f->lanes[kv.first];
-                lc.n = kv.second.first;
-                lc.bytes = kv.second.second;
-            }
-            for (auto it = f->lanes.begin(); it != f->lanes.end();)
-                if (!real.count(it->first)) it = f->lanes.erase(it);
-                else ++it;
-            f->touched = true;
         }
+        for (auto& kv : mem)
+            if (!real.count(kv.first)) {
+                v->mismatches++;
+                why("lane in memory only", f->path, kv.first, kv.second.n);
+            }
     }
     // 2. CID entries (C-34: the type index is the one CID index). Every
     //    file row has its c entry (cid, pid) -> seq, and every c entry names
@@ -550,6 +526,32 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
 }  // namespace
 
 namespace {
+// REBUILD 2's recount: each partition's counters and lane rows from its own
+// rows and tag instances, on the partition's writer (per-partition writers),
+// written back to its file; the waiter is this maintenance work.
+int32_t repairPartitions(Engine* e, Type* t, Verify* v) {
+    std::vector<Part*> parts = createdFiles(t);
+    if (parts.empty()) return P4_OK;
+    Shared* s = new (std::nothrow) Shared();
+    if (!s) return P4_E_NOMEM;
+    s->kind = Shared::kRepair;
+    s->type = t;
+    s->remaining.store(int(parts.size()) + 1);
+    for (Part* p : parts) {
+        WriteTask* wt = new WriteTask();
+        wt->op = P4_OPC_REBUILD;
+        wt->part = p;
+        wt->shared = s;
+        pushTask(e, p, wt);
+    }
+    finishShared(e, s);  // this thread's own reference
+    while (!s->done.load(std::memory_order_acquire)) ps::sleepNs(1000000);
+    const int32_t status = s->status.load();
+    v->mismatches += s->b.load();
+    delete s;
+    return status;
+}
+
 // C-27: PRAGMA integrity_check through the engine (a maintenance connection,
 // which also recovers a WAL first). Anything but "ok" (or an open failure) is
 // a damaged file.
@@ -595,7 +597,9 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
             e->bump(kStRebuilds);
         }
         if (what & 2) {
-            int32_t rc = indexAgainstFiles(e, t, true, &v);
+            int32_t rc = repairPartitions(e, t, &v);
+            if (rc != P4_OK) return rc;
+            rc = indexAgainstFiles(e, t, true, &v);
             if (rc != P4_OK) return rc;
             rc = typeIndexFlush(t, true);
             if (rc != P4_OK) return rc;
@@ -802,7 +806,7 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
     Bell& b = e->bells[thread];
     MaintState m;
     uint64_t lastTick = 0;
-    int quotaTicks = 0, sizeTicks = 0;
+    int sizeTicks = 0;
     for (;;) {
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
         for (;;) {
@@ -824,10 +828,12 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
                     }
                     checkpoint(e, m, mt.path);
                     break;
-                case MaintTask::kSlot:
-                    e->slot(mt.slot)->thread = thread;
-                    runMaintSlot(e, mt.slot);
+                case MaintTask::kSlot: {
+                    std::lock_guard<std::mutex> g(e->slowMu);
+                    e->slowQ.push_back(mt.slot);
+                    e->slowCv.notify_one();
                     break;
+                }
             }
         }
         if (e->stopping.load()) break;
@@ -840,17 +846,10 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
                 std::lock_guard<std::mutex> g(t->mu);
                 pending += t->pend.bytes();
             }
-            for (Type* t : types) typeIndexFlush(t, pending >= e->cfg.pendingBytes);
-            for (Type* t : types) ftsCatchUp(e, t, false);
+            for (Type* t : types) typeIndexFlush(t, pending >= e->cfg.pendingBytes, false);
             if (++sizeTicks >= 10) {  // the T/ files' sizes for SUMMARY 4, once a second
                 sizeTicks = 0;
                 for (Type* t : types) typeFileBytes(t);
-            }
-            const uint64_t q = e->quota.load();
-            if (q && ++quotaTicks >= 10) {  // the configured quota, once a second
-                quotaTicks = 0;
-                int64_t a, bb;
-                quotaGc(e, q, &a, &bb, true);
             }
         }
         b.state.store(0, std::memory_order_seq_cst);
@@ -867,6 +866,55 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
     for (auto& kv : m.conns) delete kv.second;
     m.conns.clear();
     b.state.store(2);
+}
+
+// The long work: REBUILD and QUOTA_GC slots in arrival order, then every
+// 100 ms the full-text catch-up and once a second the configured quota.
+void slowLoop(Engine* e) {
+    uint64_t lastTick = 0;
+    int quotaTicks = 0;
+    for (;;) {
+        uint32_t slot = 0;
+        bool have = false;
+        std::vector<uint32_t> refused;
+        {
+            std::unique_lock<std::mutex> g(e->slowMu);
+            if (e->slowQ.empty() && !e->slowStop) e->slowCv.wait_for(g, std::chrono::milliseconds(100));
+            if (e->slowStop) {
+                refused.assign(e->slowQ.begin(), e->slowQ.end());
+                e->slowQ.clear();
+            } else if (!e->slowQ.empty()) {
+                slot = e->slowQ.front();
+                e->slowQ.pop_front();
+                have = true;
+            }
+        }
+        if (e->slowStop) {
+            // Stopping: queued REBUILD / QUOTA_GC calls are refused, not run.
+            for (uint32_t s : refused) {
+                SlotOut out(e, s);
+                out.enc.header({});
+                out.end(P4_E_STOPPED, "stopping");
+            }
+            return;
+        }
+        if (have) {
+            e->slot(slot)->thread = e->maintThread;
+            runMaintSlot(e, slot);
+            continue;
+        }
+        if (e->stopping.load()) continue;  // stop drains the queue, then returns
+        const uint64_t now = monoNs();
+        if (now - lastTick < 100ull * 1000 * 1000) continue;
+        lastTick = now;
+        for (Type* t : typesWithFiles(e)) ftsCatchUp(e, t, false);
+        const uint64_t q = e->quota.load();
+        if (q && ++quotaTicks >= 10) {
+            quotaTicks = 0;
+            int64_t a, bb;
+            quotaGc(e, q, &a, &bb, true);
+        }
+    }
 }
 
 }  // namespace p4

@@ -258,7 +258,7 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
 
 void finishShared(Engine* e, Shared* s) {
     if (s->remaining.fetch_sub(1) != 1) return;
-    if (s->kind == Shared::kQuota) {
+    if (s->internal()) {
         s->done.store(true, std::memory_order_release);  // the waiter reads the counts and deletes it
         return;
     }
@@ -401,6 +401,181 @@ void supersedePart(Engine* e, Part* p, WriteTask* task) {
         e->bump(kStSupersedeTags, insts.size());
         e->bump(kStSupersedeRecords, gone.size());
         if (insts.size() < 32768) break;
+    }
+    finishShared(e, s);
+}
+
+void repairPart(Engine* e, Part* p, WriteTask* task) {
+    Shared* s = task->shared;
+    Type* t = p->type;
+    bool created;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        created = p->created && !p->quarantined;
+    }
+    if (!created) {
+        finishShared(e, s);
+        return;
+    }
+    const bool epochRule = t->spec()->hasEpochRule;
+    int32_t status = P4_OK;
+    Conn* c = writerPin(e, p, &status, nullptr);
+    if (!c) {
+        sharedFail(s, status, "open " + p->path);
+        finishShared(e, s);
+        return;
+    }
+    Counters k, old;
+    std::map<uint32_t, LaneCount> before, lanes;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        old = countersOf(p);
+        before = p->lanes;
+    }
+    int rc = c->exec("BEGIN IMMEDIATE");
+    auto bad = [&](int r) {
+        if (rc == SQLITE_OK && r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) rc = r;
+    };
+    // The file's counters from its rows.
+    sqlite3_stmt* q = rc == SQLITE_OK ? c->sql(
+        "SELECT count(*), coalesce(sum(length(d)),0), min(seq), max(seq), min(w), max(w), coalesce(max(ts),0),"
+        " coalesce(sum(e IS NULL),0), min(ts), min(e), max(e) FROM r") : nullptr;
+    if (rc == SQLITE_OK && !q) rc = SQLITE_ERROR;
+    if (q) {
+        const int r = sqlite3_step(q);
+        if (r == SQLITE_ROW) {
+            auto opt = [&](int i, int64_t none) { return sqlite3_column_type(q, i) == SQLITE_NULL ? none : sqlite3_column_int64(q, i); };
+            k.n = sqlite3_column_int64(q, 0);
+            k.bytes = sqlite3_column_int64(q, 1);
+            k.minseq = opt(2, INT64_MAX);
+            k.maxseq = std::max<int64_t>(opt(3, 0), old.maxseq);  // seqs never go back
+            k.minw = opt(4, INT64_MAX);
+            k.maxw = opt(5, INT64_MIN);
+            k.maxts = sqlite3_column_int64(q, 6);
+            k.nnull = epochRule ? sqlite3_column_int64(q, 7) : 0;
+            k.mints = opt(8, INT64_MAX);
+            k.mine = opt(9, INT64_MAX);
+            k.maxe = opt(10, INT64_MIN);
+            k.ncopy = old.ncopy;
+        }
+        bad(r);
+        sqlite3_reset(q);
+    }
+    // The lane rows: identity and url fields from the file's lane table (or
+    // memory), the counts from the tag instances (aggregated here, no sorter).
+    std::map<uint32_t, LaneCount> table;
+    q = rc == SQLITE_OK ? c->sql("SELECT id, url, url0, created, updated FROM lane") : nullptr;
+    while (q && rc == SQLITE_OK) {
+        const int r = sqlite3_step(q);
+        if (r != SQLITE_ROW) {
+            bad(r);
+            break;
+        }
+        LaneCount lc;
+        auto txt = [&](int i) {
+            const unsigned char* x = sqlite3_column_text(q, i);
+            return x ? std::string(reinterpret_cast<const char*>(x)) : std::string();
+        };
+        lc.url = txt(1);
+        lc.url0 = txt(2);
+        lc.created = sqlite3_column_int64(q, 3);
+        lc.updated = sqlite3_column_int64(q, 4);
+        table[uint32_t(sqlite3_column_int64(q, 0))] = lc;
+    }
+    if (q) sqlite3_reset(q);
+    q = rc == SQLITE_OK ? c->sql("SELECT rl.lane, rl.at, r.seq, length(r.d), r.w, r.ts FROM rl JOIN r ON r.seq=rl.seq") : nullptr;
+    while (q && rc == SQLITE_OK) {
+        const int r = sqlite3_step(q);
+        if (r != SQLITE_ROW) {
+            bad(r);
+            break;
+        }
+        const uint32_t id = uint32_t(sqlite3_column_int64(q, 0));
+        auto it = lanes.find(id);
+        if (it == lanes.end()) {
+            LaneCount lc;
+            auto ti = table.find(id);
+            auto bi = before.find(id);
+            if (ti != table.end()) lc = ti->second;
+            else if (bi != before.end()) lc = bi->second;
+            lc.n = lc.bytes = lc.maxseq = lc.maxat = lc.maxts = 0;
+            lc.minw = lc.minseq = INT64_MAX;
+            lc.maxw = INT64_MIN;
+            it = lanes.emplace(id, lc).first;
+        }
+        LaneCount& lc = it->second;
+        const int64_t at = sqlite3_column_int64(q, 1), seq = sqlite3_column_int64(q, 2), w = sqlite3_column_int64(q, 4),
+                      ts = sqlite3_column_int64(q, 5);
+        lc.n++;
+        lc.bytes += sqlite3_column_int64(q, 3);
+        lc.minw = std::min(lc.minw, w);
+        lc.maxw = std::max(lc.maxw, w);
+        lc.minseq = std::min(lc.minseq, seq);
+        lc.maxseq = std::max(lc.maxseq, seq);
+        lc.maxat = std::max(lc.maxat, at);
+        lc.maxts = std::max(lc.maxts, ts);
+        if (!lc.created || at < lc.created) lc.created = at;  // the lane's first instance here
+    }
+    if (q) sqlite3_reset(q);
+    int64_t changed = 0;
+    for (auto& kv : lanes) {
+        if (rc != SQLITE_OK) break;
+        LaneDef* l;
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            l = t->laneById(kv.first);
+        }
+        if (!l) {
+            rc = SQLITE_CORRUPT;  // a tag instance of an unknown lane
+            break;
+        }
+        const LaneCount& lc = kv.second;
+        auto bi = before.find(kv.first);
+        if (bi == before.end() || bi->second.n != lc.n || bi->second.bytes != lc.bytes) changed++;
+        sqlite3_stmt* u = c->get(S_LANE_UP);
+        sqlite3_bind_int64(u, 1, kv.first);
+        sqlite3_bind_int64(u, 2, l->sid);
+        sqlite3_bind_text(u, 3, l->batch.data(), int(l->batch.size()), SQLITE_STATIC);
+        sqlite3_bind_text(u, 4, l->ckey.data(), int(l->ckey.size()), SQLITE_STATIC);
+        sqlite3_bind_text(u, 5, l->ppeer.data(), int(l->ppeer.size()), SQLITE_STATIC);
+        sqlite3_bind_text(u, 6, l->pkey.data(), int(l->pkey.size()), SQLITE_STATIC);
+        sqlite3_bind_text(u, 7, lc.url.data(), int(lc.url.size()), SQLITE_STATIC);
+        sqlite3_bind_text(u, 8, lc.url0.data(), int(lc.url0.size()), SQLITE_STATIC);
+        sqlite3_bind_int64(u, 9, lc.created);
+        sqlite3_bind_int64(u, 10, lc.updated);
+        sqlite3_bind_int64(u, 11, lc.maxat);
+        sqlite3_bind_int64(u, 12, lc.n);
+        sqlite3_bind_int64(u, 13, lc.bytes);
+        sqlite3_bind_int64(u, 14, lc.minw);
+        sqlite3_bind_int64(u, 15, lc.maxw);
+        sqlite3_bind_int64(u, 16, lc.maxseq);
+        sqlite3_bind_int64(u, 17, lc.maxts);
+        sqlite3_bind_int64(u, 18, lc.minseq);
+        bad(sqlite3_step(u));
+        sqlite3_reset(u);
+    }
+    for (auto& kv : table) {
+        if (rc != SQLITE_OK || lanes.count(kv.first)) continue;
+        changed++;
+        sqlite3_stmt* d = c->get(S_LANE_DEL);
+        sqlite3_bind_int64(d, 1, kv.first);
+        bad(sqlite3_step(d));
+        sqlite3_reset(d);
+    }
+    if (k.n != old.n || k.bytes != old.bytes || k.nnull != old.nnull) changed++;
+    if (rc == SQLITE_OK) rc = writeMeta(c, k, nowSec());
+    if (rc == SQLITE_OK) rc = c->exec("COMMIT");
+    if (rc != SQLITE_OK) c->exec("ROLLBACK");
+    writerUnpin(e, p);
+    if (rc != SQLITE_OK) {
+        sharedFail(s, statusOfSqlite(rc), "repair " + p->path);
+    } else {
+        std::lock_guard<std::mutex> g(t->mu);
+        countersTo(p, k);
+        p->lanes = std::move(lanes);
+        p->touched = true;
+        s->a += 1;
+        s->b += changed;
     }
     finishShared(e, s);
 }

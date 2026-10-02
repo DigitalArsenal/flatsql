@@ -1393,6 +1393,14 @@ void Group::run(std::vector<WriteTask*>& tasks) {
             }
         }
     }
+    {
+        bool quarantined;
+        {
+            std::lock_guard<std::mutex> g(t_->mu);
+            quarantined = p_->quarantined;
+        }
+        if (quarantined) fail(P4_E_CORRUPT, "partition file quarantined: " + p_->path);
+    }
     bool any = false;
     for (Call& c : calls_) any = any || (c.status == P4_OK && !c.recs.empty());
     if (!any) {
