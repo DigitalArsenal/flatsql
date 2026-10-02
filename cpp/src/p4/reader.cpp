@@ -54,6 +54,25 @@ Conn* ReaderPool::acquire(const std::string& path, OpenKind kind, int* rc, std::
         return nullptr;
     }
     open_.fetch_add(1);
+    // A partition file of large records (IQC: ~1.9 KB) gets a page cache
+    // that holds as many rows as the default holds of 600-byte ones (up to
+    // 8x the default).
+    const bool partFile = path.size() > 3 && path.compare(path.size() - 3, 3, ".db") == 0;
+    if (sqlite3_stmt* m = partFile ? c->sql("SELECT k, v FROM meta WHERE k IN ('n','bytes')") : nullptr) {
+        int64_t n = 0, bytes = 0;
+        while (sqlite3_step(m) == SQLITE_ROW) {
+            const char* k = reinterpret_cast<const char*>(sqlite3_column_text(m, 0));
+            if (k && std::strcmp(k, "n") == 0) n = sqlite3_column_int64(m, 1);
+            else if (k && std::strcmp(k, "bytes") == 0) bytes = sqlite3_column_int64(m, 1);
+        }
+        sqlite3_reset(m);
+        if (n > 0 && bytes / n > 600) {
+            const int64_t kib = std::min<int64_t>(int64_t(cacheKiB_) * 8, int64_t(cacheKiB_) * (bytes / n) / 600);
+            char sql[64];
+            std::snprintf(sql, sizeof sql, "PRAGMA cache_size=-%lld", (long long)kib);
+            c->exec(sql);
+        }
+    }
     return c;
 }
 

@@ -1183,6 +1183,11 @@ P4_SLOW_TEST(reads_bench) {
     }
     EngineOpts o;
     o.createMode = 0;
+    if (argInt("reader-cache-kib", 0) > 0) {  // config tag 24
+        TlvW x;
+        x.u32(24, uint32_t(argInt("reader-cache-kib", 0)));
+        o.extra = x.b;
+    }
     const uint64_t t0 = flatsql::ps::monoNs();
     REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
     std::printf("  open %.1f ms (load %.1f)\n", double(flatsql::ps::monoNs() - t0) / 1e6, loadAvg());
