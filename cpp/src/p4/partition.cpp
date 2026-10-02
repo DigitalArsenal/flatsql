@@ -686,15 +686,9 @@ int32_t Group::probe() {
         for (const Holder& h : hs) {
             if (migrate) {
                 if (r.seqIn != h.seq) { r.reject = P4_REJ_SEQ; break; }
-                // C-22: the copy stores the holder's d and ts, as an ingest
-                // COPY (a holder still in flight: the call's own, same bytes).
-                const int32_t got = readHolder(h, r);
-                if (got < 0) return got;
-                if (got == 1) {
-                    r.d = r.own.data();
-                    r.dLen = uint32_t(r.own.size());
-                    r.sealed = nullptr;
-                }
+                // C-35: a migrated copy stores its OWN bytes and ts (that
+                // format-1 table's stored bytes; a sealed envelope differs per
+                // copy). Stored bytes never change.
                 r.seq = h.seq;
                 r.action = P4_ACT_COPY;
                 r.write = true;
@@ -1013,6 +1007,9 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
     };
     std::unordered_set<uint32_t> sids;
     const int64_t now = nowSec();
+    // A migration carries format 1's lane times: first seen = the earliest
+    // tag instance, updated = the latest (format 1's source summary).
+    const bool migrateTimes = !calls_.empty() && calls_[0].mode == 1;
     std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) { return recs_[a].seq < recs_[b].seq; });
     for (size_t gi : idxs) {
         if (rc != SQLITE_OK) break;
@@ -1124,7 +1121,12 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
                 }
             }
             lc.url = tag.url;
-            if (now > lc.updated) lc.updated = now;
+            if (migrateTimes) {
+                if (at > lc.updated) lc.updated = at;
+                if (at < lc.created || lc.created == 0) lc.created = at;
+            } else if (now > lc.updated) {
+                lc.updated = now;
+            }
         }
     }
     // CAT supersede (and batch deletes): rows retired in this transaction.
