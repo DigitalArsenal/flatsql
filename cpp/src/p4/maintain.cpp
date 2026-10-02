@@ -22,7 +22,7 @@ struct MaintState {
 };
 
 std::mutex gWalMu;
-std::unordered_map<std::string, int64_t> gWalPages;  // writer connections' WAL frames
+std::unordered_map<std::string, int64_t> gWalPages;  // each WAL's frames not yet checkpointed
 std::unordered_set<std::string> gCkptQueued;
 
 Conn* maintConn(MaintState& m, const std::string& path) {
@@ -47,6 +47,7 @@ void checkpoint(Engine* e, MaintState& m, const std::string& path) {
     int log = 0, ck = 0;
     sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_PASSIVE, &log, &ck);
     e->bump(kStPassive);
+    walNote(path, log >= ck ? log - ck : 0);
     const int64_t walBytes = ioSize(path + "-wal");
     int64_t total = 0;
     {
@@ -57,10 +58,16 @@ void checkpoint(Engine* e, MaintState& m, const std::string& path) {
         // The writer waits; readers do not (their transactions are one page long).
         sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_RESTART, &log, &ck);
         e->bump(kStRestart);
+        walNote(path, log >= ck ? log - ck : 0);
     }
 }
 
 }  // namespace
+
+void walNote(const std::string& path, int64_t frames) {
+    std::lock_guard<std::mutex> g(gWalMu);
+    gWalPages[path] = frames;
+}
 
 int64_t walBytesOf(const std::string& path) {
     std::lock_guard<std::mutex> g(gWalMu);

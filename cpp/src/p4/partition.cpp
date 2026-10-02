@@ -91,6 +91,83 @@ int32_t fileSchema(Type* t, Conn* c, Part* f, bool indexes) {
     return P4_OK;
 }
 
+// ---- the file's counters ------------------------------------------------------------------------
+Counters countersOf(const Part* f) {
+    Counters k;
+    k.n = f->n; k.bytes = f->bytes; k.ncopy = f->ncopy; k.minseq = f->minseq; k.maxseq = f->maxseq;
+    k.minw = f->minw; k.maxw = f->maxw; k.maxts = f->maxts; k.nnull = f->nnull;
+    k.mints = f->mints; k.mine = f->mine; k.maxe = f->maxe;
+    return k;
+}
+
+void countersTo(Part* f, const Counters& k) {
+    f->n = k.n; f->bytes = k.bytes; f->ncopy = k.ncopy; f->minseq = k.minseq; f->maxseq = k.maxseq;
+    f->minw = k.minw; f->maxw = k.maxw; f->maxts = k.maxts; f->nnull = k.nnull;
+    f->mints = k.mints; f->mine = k.mine; f->maxe = k.maxe;
+}
+
+int writeMeta(Conn* c, const Counters& k, int64_t now) {
+    const bool any = k.n > 0;
+    const struct {
+        const char* k;
+        bool set;
+        int64_t v;
+    } kv[] = {{"n", true, k.n},
+              {"bytes", true, k.bytes},
+              {"ncopy", true, k.ncopy},
+              {"minseq", any && k.minseq != INT64_MAX, k.minseq},
+              {"maxseq", true, k.maxseq},
+              {"minw", any && k.minw != INT64_MAX, k.minw},
+              {"maxw", any && k.maxw != INT64_MIN, k.maxw},
+              {"maxts", true, k.maxts},
+              {"nnull", true, k.nnull},
+              {"mints", any && k.mints != INT64_MAX, k.mints},
+              {"mine", k.mine != INT64_MAX, k.mine},
+              {"maxe", k.maxe != INT64_MIN, k.maxe},
+              {"updated", true, now}};
+    for (auto& x : kv) {
+        sqlite3_stmt* s = c->get(S_META_SET);
+        if (!s) return SQLITE_ERROR;
+        sqlite3_bind_text(s, 1, x.k, -1, SQLITE_STATIC);
+        if (x.set) sqlite3_bind_int64(s, 2, x.v);
+        else sqlite3_bind_null(s, 2);
+        const int r = sqlite3_step(s);
+        sqlite3_reset(s);
+        if (r != SQLITE_DONE) return r;
+    }
+    return SQLITE_OK;
+}
+
+int readMeta(Conn* c, Counters* k, bool* indexed) {
+    *k = Counters();
+    *indexed = true;
+    sqlite3_stmt* s = c->sql("SELECT k, v FROM meta");
+    if (!s) return SQLITE_ERROR;
+    int r;
+    while ((r = sqlite3_step(s)) == SQLITE_ROW) {
+        if (sqlite3_column_type(s, 1) == SQLITE_NULL) continue;
+        const char* key = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
+        const int64_t v = sqlite3_column_int64(s, 1);
+        if (!key) continue;
+        const std::string n(key);
+        if (n == "n") k->n = v;
+        else if (n == "bytes") k->bytes = v;
+        else if (n == "ncopy") k->ncopy = v;
+        else if (n == "minseq") k->minseq = v;
+        else if (n == "maxseq") k->maxseq = v;
+        else if (n == "minw") k->minw = v;
+        else if (n == "maxw") k->maxw = v;
+        else if (n == "maxts") k->maxts = v;
+        else if (n == "nnull") k->nnull = v;
+        else if (n == "mints") k->mints = v;
+        else if (n == "mine") k->mine = v;
+        else if (n == "maxe") k->maxe = v;
+        else if (n == "ix") *indexed = v != 0;
+    }
+    sqlite3_reset(s);
+    return r == SQLITE_DONE ? SQLITE_OK : r;
+}
+
 // ---- writer connections (≤ writer conns open; the LRU never closes a pinned one) ----------------
 Conn* writerPin(Engine* e, Part* f, int32_t* rc, std::string* err) {
     {
@@ -751,37 +828,21 @@ int32_t Group::assign() {
             }
             const int32_t got = readHolder(hs[0], r);
             if (got < 0) return got;
+            r.action = P4_ACT_COPY;
+            r.seq = hs[0].seq;
             if (got == 1) {
-                r.action = P4_ACT_COPY;
-                r.seq = hs[0].seq;
                 r.d = r.own.data();
                 r.dLen = uint32_t(r.own.size());
                 r.sealed = nullptr;
                 r.fCols.clear();
-                continue;
             }
+            // got == 0: the holder is in flight (another producer's group,
+            // its file not committed yet). The CID still has one seq
+            // (§3.8.2): this copy takes it and keeps its own bytes (the same
+            // CID is the same plaintext).
+            continue;
         }
         fresh.push_back(i);
-    }
-    if (migrate && !t_->migrateSeqsLoaded) {
-        // The seqs already stored in this type's files (a resumed migration).
-        std::vector<std::string> paths;
-        {
-            std::lock_guard<std::mutex> g(t_->mu);
-            for (auto& p : t_->parts)
-                if (p->created) paths.push_back(p->path);
-        }
-        for (const std::string& path : paths) {
-            int rc = 0;
-            Conn* c = e_->rpool.acquire(path, OpenKind::Reader, &rc, nullptr);
-            if (!c) return statusOfSqlite(rc);
-            sqlite3_stmt* s = c->sql("SELECT seq FROM r INDEXED BY r_s");
-            if (!s) s = c->sql("SELECT seq FROM r");  // before REBUILD 1
-            while (s && sqlite3_step(s) == SQLITE_ROW) t_->migrateSeqs.insert(sqlite3_column_int64(s, 0));
-            if (s) sqlite3_reset(s);
-            e_->rpool.release(c);
-        }
-        t_->migrateSeqsLoaded = true;
     }
     std::sort(fresh.begin(), fresh.end(), [&](size_t a, size_t b) {
         const Rec& x = recs_[a];
@@ -795,9 +856,10 @@ int32_t Group::assign() {
         for (size_t i : fresh) {
             Rec& r = recs_[i];
             if (migrate) {
-                if (t_->migrateSeqs.count(r.seqIn)) { r.reject = P4_REJ_SEQ; continue; }
+                // Format 1's rowid, unique per type: a seq another row of this
+                // file holds is refused by the insert (P4_REJ_SEQ); a repeat of
+                // a migrated record is found by its CID above.
                 r.seq = r.seqIn;
-                t_->migrateSeqs.insert(r.seq);
                 if (r.seq >= t_->nextSeq) t_->nextSeq = r.seq + 1;
             } else {
                 r.seq = t_->nextSeq++;
@@ -915,8 +977,7 @@ int32_t Group::writeJournal() {
 }
 
 
-struct FileOut {
-    int64_t n, bytes, ncopy, minseq, maxseq, minw, maxw, maxts, nnull, mints, mine, maxe;
+struct FileOut : Counters {
     std::map<uint32_t, LaneCount> lanes;  // touched lanes, their new counts
 };
 
@@ -933,9 +994,7 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
     FileOut o;
     {
         std::lock_guard<std::mutex> g(t_->mu);
-        o.n = f->n; o.bytes = f->bytes; o.ncopy = f->ncopy; o.minseq = f->minseq; o.maxseq = f->maxseq;
-        o.minw = f->minw; o.maxw = f->maxw; o.maxts = f->maxts; o.nnull = f->nnull;
-        o.mints = f->mints; o.mine = f->mine; o.maxe = f->maxe;
+        static_cast<Counters&>(o) = countersOf(f);
     }
     auto laneCount = [&](uint32_t id) -> LaneCount& {
         auto it = o.lanes.find(id);
@@ -1142,21 +1201,7 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
         bad(sqlite3_step(s));
         sqlite3_reset(s);
     }
-    {
-        const std::pair<const char*, int64_t> kv[] = {
-            {"n", o.n}, {"bytes", o.bytes}, {"ncopy", o.ncopy}, {"minseq", o.n ? o.minseq : 0}, {"maxseq", o.maxseq},
-            {"minw", o.n ? o.minw : 0}, {"maxw", o.n ? o.maxw : 0}, {"maxts", o.maxts}, {"nnull", o.nnull},
-            {"mints", o.n ? o.mints : 0}, {"mine", o.mine == INT64_MAX ? 0 : o.mine},
-            {"maxe", o.maxe == INT64_MIN ? 0 : o.maxe}, {"updated", now}};
-        for (auto& x : kv) {
-            if (rc != SQLITE_OK) break;
-            sqlite3_stmt* s = c->get(S_META_SET);
-            sqlite3_bind_text(s, 1, x.first, -1, SQLITE_STATIC);
-            sqlite3_bind_int64(s, 2, x.second);
-            bad(sqlite3_step(s));
-            sqlite3_reset(s);
-        }
-    }
+    if (rc == SQLITE_OK) rc = writeMeta(c, o, now);
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) {
         lastErr_ = std::string(sqlite3_errmsg(c->db)) + " (" + std::to_string(rc) + ") " + f->path;
@@ -1178,9 +1223,7 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
         f->dbBytes = dbBytes;
         f->freeBytes = freeBytes;
     }
-    f->n = o.n; f->bytes = o.bytes; f->ncopy = o.ncopy; f->minseq = o.minseq; f->maxseq = o.maxseq;
-    f->minw = o.minw; f->maxw = o.maxw; f->maxts = o.maxts; f->nnull = o.nnull;
-    f->mints = o.mints; f->mine = o.mine; f->maxe = o.maxe;
+    countersTo(f, o);
     for (auto& kv : o.lanes) {
         if (kv.second.n <= 0) f->lanes.erase(kv.first);
         else f->lanes[kv.first] = kv.second;

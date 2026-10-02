@@ -7,7 +7,8 @@
 // reserved in jm before any seq of the block can commit. The type index is
 // derived and flushed lazily; open replays the journal tail into it, keeping
 // each CID entry only if its row exists in its file (read by rowid, CID
-// compared), and recounts every touched file from its own rows.
+// compared), and reloads every touched file's counters from its meta and lane
+// rows, which commit with the rows (O(touched files), not O(rows)).
 //
 // Journal ids are AUTOINCREMENT, so they never restart when the table empties
 // (a restart once let a flush delete rows it had not merged).
@@ -279,42 +280,23 @@ int32_t journalReplay(Type* t, std::string* err) {
         ie.st = 1;
         t->identPend[identMapKey(ie.src, ie.h)] = ie;
     }
-    // 3. Recount every touched file from its own rows and lane rows.
+    // 3. Every touched file's counters from its meta and lane rows (committed
+    //    with its rows by every write and removal).
     for (auto& p : t->parts) {
         Part* f = &*p;
         if (!f->touched) continue;
         Conn* c = connOf(f);
         if (!c) continue;
-        f->n = f->bytes = f->ncopy = f->nnull = f->maxts = 0;
-        f->minseq = INT64_MAX;
-        f->maxseq = 0;
-        f->minw = INT64_MAX;
-        f->maxw = INT64_MIN;
-        sqlite3_stmt* s = c->sql(
-            "SELECT count(*), coalesce(sum(length(d)),0), min(seq), max(seq), min(w), max(w), coalesce(max(ts),0),"
-            " coalesce(sum(e IS NULL),0), min(ts), min(e), max(e) FROM r");
-        if (s && sqlite3_step(s) == SQLITE_ROW) {
-            f->n = sqlite3_column_int64(s, 0);
-            f->bytes = sqlite3_column_int64(s, 1);
-            if (f->n) {
-                f->minseq = sqlite3_column_int64(s, 2);
-                f->maxseq = sqlite3_column_int64(s, 3);
-                f->minw = sqlite3_column_int64(s, 4);
-                f->maxw = sqlite3_column_int64(s, 5);
-            }
-            f->maxts = sqlite3_column_int64(s, 6);
-            f->nnull = sqlite3_column_int64(s, 7);
-            f->mints = sqlite3_column_type(s, 8) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 8);
-            f->mine = sqlite3_column_type(s, 9) == SQLITE_NULL ? INT64_MAX : sqlite3_column_int64(s, 9);
-            f->maxe = sqlite3_column_type(s, 10) == SQLITE_NULL ? INT64_MIN : sqlite3_column_int64(s, 10);
+        Counters k;
+        bool indexed = true;
+        if (readMeta(c, &k, &indexed) != SQLITE_OK) {
+            if (err) *err = "meta of " + f->path + ": " + sqlite3_errmsg(c->db);
+            for (auto& kv : conns) delete kv.second;
+            return P4_E_IO;
         }
-        if (s) sqlite3_reset(s);
-        s = c->sql("SELECT v FROM meta WHERE k='ncopy'");
-        if (s && sqlite3_step(s) == SQLITE_ROW) f->ncopy = sqlite3_column_int64(s, 0);
-        if (s) sqlite3_reset(s);
-        s = c->sql("SELECT v FROM meta WHERE k='ix'");
-        if (s && sqlite3_step(s) == SQLITE_ROW) f->indexed = sqlite3_column_int64(s, 0) != 0;
-        if (s) sqlite3_reset(s);
+        countersTo(f, k);
+        f->indexed = indexed;
+        sqlite3_stmt* s = nullptr;
         f->lanes.clear();
         s = c->sql(
             "SELECT id, n, bytes, minw, maxw, maxseq, created, updated, maxat, url, url0, maxts, minseq FROM lane WHERE n>0");

@@ -1072,6 +1072,11 @@ P4_SLOW_TEST(reads_bench) {
     }
     {
         TlvW t;
+        t.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u64(3, 50000);
+        add("R16 EPOCH OMM nearest (no source)", P4_OPC_EPOCH, t);
+    }
+    {
+        TlvW t;
         t.u8(45, 4);
         add("R20 SUMMARY 4 (DiskUsage)", P4_OPC_SUMMARY, t);
     }

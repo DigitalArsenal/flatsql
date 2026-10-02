@@ -89,6 +89,7 @@ int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::s
         line = trimLine(line);
         if (line.rfind("object ", 0) == 0) s->hasObject = true;
         if (line.rfind("epoch ", 0) == 0) s->epochRule += line + "\n";
+        if (line.rfind("object ", 0) == 0 || line.rfind("col ", 0) == 0) s->keyRules += line + "\n";
         at = nl + 1;
     }
     s->ek = s->hasEpochRule && s->hasObject;
@@ -431,6 +432,12 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
             *err = "the epoch rule of a type with data cannot change (C-5)";
             return P4_E_FORMAT;
         }
+        // Rows keep the object key (r.k, r_ke) and sealed records their COL
+        // values from the rules they were written under.
+        if (hasData && cur->keyRules != spec->keyRules) {
+            *err = "the object and col rules of a type with data cannot change (C-5)";
+            return P4_E_FORMAT;
+        }
         const std::vector<uint8_t> fb = specFileBytes(spec->bytes);
         rc = ioWriteNew(t->pSpec, fb.data(), fb.size());
         if (rc != P4_OK) { *err = "spec write failed"; return rc; }
@@ -488,6 +495,7 @@ int32_t engineActivate(Engine* e) {
             const int r = sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &log, &ck);
             delete c;
             if (r != SQLITE_OK) return statusOfSqlite(r);
+            walNote(path, 0);
             e->bump(kStTruncate);
         }
     }

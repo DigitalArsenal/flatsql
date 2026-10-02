@@ -15,6 +15,7 @@ namespace {
 struct Gone {
     int64_t seq = 0, len = 0;
     uint8_t key[32];
+    bool eNull = false;
     int others = 0;
 };
 struct Inst {
@@ -84,6 +85,7 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
         if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_bytes(s, 1) == 32) {
             std::memcpy(g.key, sqlite3_column_blob(s, 1), 32);
             g.len = sqlite3_column_int64(s, 0);
+            g.eNull = sqlite3_column_type(s, 2) == SQLITE_NULL;
         } else {
             g.seq = 0;  // already gone
         }
@@ -105,12 +107,12 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
         writerUnpin(e, f);
         return status;
     }
-    int64_t n, bytes;
+    Counters k;
     std::map<uint32_t, LaneCount> lanes;
+    const bool epochRule = t->spec()->hasEpochRule;
     {
         std::lock_guard<std::mutex> g(t->mu);
-        n = f->n;
-        bytes = f->bytes;
+        k = countersOf(f);
         lanes = f->lanes;
     }
     std::unordered_map<int64_t, int64_t> lenOf;  // seq -> stored length (instances)
@@ -162,8 +164,34 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
         sqlite3_bind_int64(s, 1, g.seq);
         bad(sqlite3_step(s));
         sqlite3_reset(s);
-        n--;
-        bytes -= g.len;
+        k.n--;
+        k.bytes -= g.len;
+        if (g.eNull && epochRule) k.nnull--;
+    }
+    if (rc == SQLITE_OK && !gone.empty()) {
+        // The seq and w bounds again (rowid and r_w ends: O(log n)); the
+        // epoch bounds equal w's when every row has an epoch. mints/maxts
+        // (no index) and an epoch bound beside rows without one stay bounds.
+        sqlite3_stmt* s = c->sql("SELECT min(seq), max(seq) FROM r");
+        if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) {
+            k.minseq = sqlite3_column_int64(s, 0);
+            k.maxseq = sqlite3_column_int64(s, 1);
+        }
+        if (s) sqlite3_reset(s);
+        s = c->sql("SELECT min(w) FROM r");
+        if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) k.minw = sqlite3_column_int64(s, 0);
+        if (s) sqlite3_reset(s);
+        s = c->sql("SELECT max(w) FROM r");
+        if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) k.maxw = sqlite3_column_int64(s, 0);
+        if (s) sqlite3_reset(s);
+        if (k.n == 0) {
+            const int64_t keepMaxseq = k.maxseq;
+            k = Counters();
+            k.maxseq = keepMaxseq;  // seqs never go back
+        } else if (k.nnull == 0 && epochRule) {
+            k.mine = k.minw;
+            k.maxe = k.maxw;
+        }
     }
     for (auto& kv : lanes) {
         if (rc != SQLITE_OK) break;
@@ -181,15 +209,7 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
             sqlite3_reset(s);
         }
     }
-    const std::pair<const char*, int64_t> meta[] = {{"n", n}, {"bytes", bytes}, {"updated", nowSec()}};
-    for (auto& m : meta) {
-        if (rc != SQLITE_OK) break;
-        sqlite3_stmt* s = c->get(S_META_SET);
-        sqlite3_bind_text(s, 1, m.first, -1, SQLITE_STATIC);
-        sqlite3_bind_int64(s, 2, m.second);
-        bad(sqlite3_step(s));
-        sqlite3_reset(s);
-    }
+    if (rc == SQLITE_OK) rc = writeMeta(c, k, nowSec());
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) c->exec("ROLLBACK");
     int64_t freeBytes = 0;
@@ -212,8 +232,7 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
                 f->dbBytes = dbBytes;
                 f->freeBytes = freeBytes;
             }
-            f->n = n;
-            f->bytes = bytes;
+            countersTo(f, k);
             for (auto& kv : lanes) {
                 if (kv.second.n <= 0) f->lanes.erase(kv.first);
                 else f->lanes[kv.first] = kv.second;

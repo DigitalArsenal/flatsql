@@ -323,6 +323,7 @@ struct Spec {
     bool hasSupersede = false;  // supersede-on-ingest (CAT): r.s scope
     bool ek = false;            // epoch + object: EPOCH points by one r_ke seek per object
     std::string epochRule;      // the epoch line (C-5)
+    std::string keyRules;       // the object and col lines: fixed in a type's rows once it has data (C-5)
     std::string rules;
 };
 int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::string* err);
@@ -367,8 +368,6 @@ struct Type {
     std::vector<int64_t> jinflight;  // first journal id of each group journaled and not yet committed (mu)
     std::mutex flushMu;              // the type index writer (maintenance)
     Conn* idx = nullptr;
-    bool migrateSeqsLoaded = false;  // dmu
-    std::unordered_set<int64_t> migrateSeqs;
     std::atomic<int64_t> idxBytes{0}, ftsBytes{0};  // T/ files (index + journal, full text), set by the maintenance thread
     std::mutex ftsMu;
     Conn* fts = nullptr;
@@ -636,6 +635,16 @@ Conn* writerPin(P4Engine* e, Part* f, int32_t* rc, std::string* err);
 void writerUnpin(P4Engine* e, Part* f);
 int32_t fileSchema(Type* t, Conn* c, Part* f, bool indexes);
 int32_t fileCreateIndexes(Type* t, Conn* c);
+// A partition file's counters: its meta rows (committed with its rows) and
+// their copy in Part (Type::mu). Bounds: none is INT64_MAX / INT64_MIN.
+struct Counters {
+    int64_t n = 0, bytes = 0, ncopy = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN,
+            maxts = 0, nnull = 0, mints = INT64_MAX, mine = INT64_MAX, maxe = INT64_MIN;
+};
+Counters countersOf(const Part* f);              // Type::mu held
+void countersTo(Part* f, const Counters& k);     // Type::mu held
+int writeMeta(Conn* c, const Counters& k, int64_t now);  // in the caller's write transaction; SQLite rc
+int readMeta(Conn* c, Counters* k, bool* indexed);       // SQLite rc
 void putGroup(P4Engine* e, uint32_t writer, Part* p, std::vector<WriteTask*>& tasks);
 void supersedePart(P4Engine* e, Part* p, WriteTask* task);
 // DELETE and quota: the given seqs of this partition's file.
@@ -652,7 +661,8 @@ int32_t rebuildOp(P4Engine* e, Type* only, uint32_t what, std::vector<std::array
                   std::vector<Type*>* rowTypes, std::string* firstBad = nullptr);
 int32_t ftsCatchUp(P4Engine* e, Type* t, bool all);
 int walHook(void* arg, sqlite3* db, const char* zDb, int nPages);
-int64_t walBytesOf(const std::string& path);  // the WAL's frames at its last commit, in bytes
+int64_t walBytesOf(const std::string& path);  // the WAL's frames not yet checkpointed, in bytes (4 KiB pages)
+void walNote(const std::string& path, int64_t frames);  // after a checkpoint: the frames it left
 void typeFileBytes(Type* t);                  // refreshes idxBytes and ftsBytes (maintenance thread)
 
 // ---- mailbox.cpp --------------------------------------------------------------------------------------
