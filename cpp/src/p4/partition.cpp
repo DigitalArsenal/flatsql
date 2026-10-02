@@ -202,29 +202,69 @@ int Derived::save(Conn* c) {
     return SQLITE_OK;
 }
 
-int derivedRecount(Type* t, Conn* c) {
-    const bool objects = t->spec()->hasObject;
-    int rc = c->exec("CREATE TABLE IF NOT EXISTS wh(b INTEGER PRIMARY KEY, n INTEGER NOT NULL); DELETE FROM wh;");
-    if (rc != SQLITE_OK) return rc;
-    // One pass: r_ke's (k, e) keys when the file has them, else the rows.
+namespace {
+// Both counts from the rows: one pass over r_ke's (k, e) keys when the file
+// has them, else over the rows.
+int derivedCount(bool objects, Conn* c, std::map<int64_t, int64_t>* hours, int64_t* nobj) {
     sqlite3_stmt* q = c->sql(objects ? "SELECT k, e FROM r INDEXED BY r_ke" : "SELECT NULL, e FROM r WHERE e IS NOT NULL");
     if (!q) return SQLITE_ERROR;
-    std::map<int64_t, int64_t> hours;
-    int64_t nobj = 0;
+    *nobj = 0;
     KVal prev, cur;
     int r;
     while ((r = sqlite3_step(q)) == SQLITE_ROW) {
         if (objects) {
             cur.from(q, 0);
             if (cur.type != 0 && (cur.type != prev.type || cur.i != prev.i || cur.s != prev.s)) {
-                nobj++;
+                (*nobj)++;
                 std::swap(prev, cur);
             }
         }
-        if (sqlite3_column_type(q, 1) != SQLITE_NULL) hours[hourOf(sqlite3_column_int64(q, 1))]++;
+        if (sqlite3_column_type(q, 1) != SQLITE_NULL) (*hours)[hourOf(sqlite3_column_int64(q, 1))]++;
     }
     sqlite3_reset(q);
-    if (r != SQLITE_DONE) return r;
+    return r == SQLITE_DONE ? SQLITE_OK : r;
+}
+}  // namespace
+
+bool derivedIntact(Type* t, const std::string& path) {
+    Conn* c = nullptr;
+    if (openConn(path, OpenKind::Maint, 4096, 0, &c, nullptr) != SQLITE_OK) return false;
+    bool ok = c->exec("BEGIN") == SQLITE_OK;
+    Derived d;
+    bool ix = true;
+    {
+        sqlite3_stmt* m = c->sql("SELECT v FROM meta WHERE k='ix'");
+        if (m && sqlite3_step(m) == SQLITE_ROW && sqlite3_column_type(m, 0) != SQLITE_NULL) ix = sqlite3_column_int64(m, 0) != 0;
+        if (m) sqlite3_reset(m);
+    }
+    const bool objects = t->spec()->hasObject && ix;
+    if (ok) ok = d.load(c, objects) == SQLITE_OK;
+    if (ok && (d.wh || d.nobj >= 0)) {
+        std::map<int64_t, int64_t> hours, stored;
+        int64_t nobj = 0;
+        ok = derivedCount(objects, c, &hours, &nobj) == SQLITE_OK;
+        if (ok && d.nobj >= 0) ok = nobj == d.nobj;
+        if (ok && d.wh) {
+            sqlite3_stmt* q = c->sql("SELECT b, n FROM wh");
+            ok = q != nullptr;
+            while (ok && sqlite3_step(q) == SQLITE_ROW) stored[sqlite3_column_int64(q, 0)] = sqlite3_column_int64(q, 1);
+            if (q) sqlite3_reset(q);
+            ok = ok && stored == hours;
+        }
+    }
+    c->exec("COMMIT");
+    delete c;
+    return ok;
+}
+
+int derivedRecount(Type* t, Conn* c) {
+    const bool objects = t->spec()->hasObject;
+    int rc = c->exec("CREATE TABLE IF NOT EXISTS wh(b INTEGER PRIMARY KEY, n INTEGER NOT NULL); DELETE FROM wh;");
+    if (rc != SQLITE_OK) return rc;
+    std::map<int64_t, int64_t> hours;
+    int64_t nobj = 0;
+    int r = derivedCount(objects, c, &hours, &nobj);
+    if (r != SQLITE_OK) return r;
     sqlite3_stmt* ins = c->sql("INSERT INTO wh(b, n) VALUES(?1, ?2)");
     if (!ins) return SQLITE_ERROR;
     for (auto& kv : hours) {

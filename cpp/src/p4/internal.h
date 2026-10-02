@@ -695,6 +695,7 @@ struct Derived {
     int save(Conn* c);
 };
 int derivedRecount(Type* t, Conn* c);  // counts both from the rows, in the caller's write transaction
+bool derivedIntact(Type* t, const std::string& path);  // REBUILD 8: what the file keeps equals its rows
 void putGroup(P4Engine* e, uint32_t writer, Part* p, std::vector<WriteTask*>& tasks);
 void supersedePart(P4Engine* e, Part* p, WriteTask* task);
 // DELETE and quota: the given seqs of this partition's file.

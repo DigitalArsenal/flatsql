@@ -693,6 +693,12 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
                     v.mismatches++;
                     if (firstBad && firstBad->empty()) *firstBad = path;
                 }
+            // Each partition's object count and epoch histogram against its rows.
+            for (Part* f : createdFiles(t))
+                if (!derivedIntact(t, f->path)) {
+                    v.mismatches++;
+                    if (firstBad && firstBad->empty()) *firstBad = f->path + " (object count / epoch histogram)";
+                }
         }
         rows->push_back({v.entries, v.mismatches});
         rowTypes->push_back(t);
