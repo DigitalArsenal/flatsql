@@ -50,8 +50,10 @@ This file records what was built, how to run it, and what was measured.
 | the rowid and `r_s(seq)` | arrival: the datasync cursor; newest-N cuts and oldest-first quota read `r_s`, not the records' pages |
 | `rl_sid(sid, seq)` | source, newest first: `<TYPE>@<source>`, source pages, supersede |
 | `r_ke(k, e)` | object and epoch: EPOCH points, object predicates, CAT supersede |
-| `r_w(w DESC)` | epoch windows (`w DESC`, ties in CID order) |
-| `r_c(cid)` | CID order, merged over the partitions |
+| `r_w(w DESC)` | epoch windows (`w DESC`, ties in CID order); epoch-day and epoch-range reads |
+
+There is no per-file CID index (C-34): the type index's `c` is the one CID
+index (lookup, dedupe, CID-ordered windows, REBUILD 2).
 
 - Writers open with `synchronous=FULL`, WAL, and no autocheckpoint.
 
@@ -59,13 +61,16 @@ This file records what was built, how to run it, and what was measured.
 - Tables:
   - `c(cid, pid, seq)`: every copy of a CID (dedupe, GET, TAGS, DELETE, exact-CID reads);
   - `ident(src, h, seq, cid)`: IQC ingest identities;
-  - `part`, `src`, `lanes`, `file(pid, …)`, `lanecnt(lane, pid, …)` and `meta(uniq, copies, next_seq)`.
+  - `part(pid, producer, peer, …counters)` (counters NULL until the file has its schema), `src`, `lanes`,
+    `lanecnt(lane, pid, …)` and `meta(uniq, copies, next_seq)`.
 - It is a cache of the files plus the journal. Every row except `ident` can
   be rebuilt from the files (REBUILD 2).
 
 **Intent journal** (`.jnl`).
 - Tables: `j(id AUTOINCREMENT, op, k, c, pid, seq, s, v)` and `jm(seq_reserved)`.
 - Ops: partition, lane, source, file (J_FILE), entry (J_C), identity, and removal (J_DEL).
+  J_FILE marks a file a group changed: a retag-only group or a tag-only
+  supersede chunk changes lane counters with no J_C or J_DEL row.
 - A group journals its entries before its partition file commits. A flush
   merges committed entries into the type index and cuts the journal behind them.
 
@@ -107,7 +112,13 @@ it checks, which recovers that file's WAL.
    a kill between the empty file and its schema.
 2. **Entries:** each J_C or J_DEL is checked against its file by seq and CID.
    Counters move only for entries the index lacks.
-3. **Recount:** touched files are recounted from their own rows.
+3. **Counters:** each touched file's counters are loaded from its `meta` and
+   lane rows, which commit with its rows (writes and removals both keep them;
+   `mints`/`maxts` are bounds after removals). No row is recounted, so the
+   cost is the journal tail's, not the partition's size.
+4. **Files against the disk:** a partition the index says has a file whose
+   file is missing is made again by its next write when it had no rows, and
+   quarantined otherwise (writes answer `P4_E_CORRUPT`, naming the file).
 
 The type index never records a file whose schema has not committed. Nothing
 unlinks or replaces a partition file.
@@ -120,19 +131,24 @@ The month layout's wasm-only kill anomaly cannot arise in this layout.
   state needed a month file that a supersede had emptied, retired and
   unlinked many times over: generation 163 of one month.
 - **Why it is gone.** Nothing retires, unlinks or replaces a partition file
-  in this layout, so the state cannot occur. The heal is deleted. The wasm
-  kill loop passes 100 of 100 rounds without it.
+  in this layout, so under kill -9 the state needs a committed file to
+  vanish. Step 4 above checks it at every open anyway, so it can never wedge
+  a partition.
 
 ## 5. Maintenance
 
-One background thread does this work, never on a caller's path:
-- type-index flushes;
-- PASSIVE and RESTART checkpoints from the WAL hook, for partition files, the
-  type index, the journal and full text;
-- closing evicted writer connections;
-- the configured quota, once a second;
-- full text;
-- a journal VACUUM when a flush empties it.
+Two background threads do this work, never on a caller's path.
+- **The maintenance thread:** type-index flushes (a type whose flush lock a
+  REBUILD holds is skipped that tick, never waited for); PASSIVE and RESTART
+  checkpoints from the WAL hook, for partition files, the type index, the
+  journal and full text; closing evicted writer connections; the T/ files'
+  sizes for SUMMARY 4, once a second.
+- **The long-work thread:** REBUILD and QUOTA_GC calls, the configured quota
+  once a second, and full text. Nothing it does delays a checkpoint or a
+  flush.
+- **Backpressure:** a PUT answers `P4_E_BUSY` when its partition's backlog is
+  full, the type's pending index entries pass `pendingBytes`, or the WALs pass
+  twice `walTotal`.
 
 - **QUOTA_GC** (C-32) deletes the oldest records by arrival.
   - The victim is the type whose oldest record arrived first.
@@ -148,11 +164,14 @@ One background thread does this work, never on a caller's path:
   - `files_dropped` is always 0.
 - **REBUILD:**
   - **1** builds the partition secondary indexes, after a migration's bulk append.
-  - **2** rebuilds the type index from the files: `c` is rewritten in CID
-    order, from every file's `(cid, seq)` merged.
+  - **2** recounts each partition on its own writer (counters from its rows,
+    lane rows from `rl JOIN r`, url, url0, created and updated kept from the
+    file's lane table), writes them back to the file in one transaction, then
+    checks `c` against the files (point probes both ways) and repairs only
+    what differs.
   - **4** rebuilds full text.
   - **8** verifies, changing nothing:
-    - `c` against the files' CIDs, merged (one sequential walk of each side);
+    - `c` against the files' rows (point probes both ways, no sort);
     - the counters and lanes against the rows;
     - `PRAGMA integrity_check` on every live file, the type index and the
       journal (C-27). A damaged file is a mismatch, named in the slot err.
@@ -160,17 +179,23 @@ One background thread does this work, never on a caller's path:
 ## 6. Reads
 
 **Orders.**
-- **Seq** (datasync): per-file pages by rowid, merged.
-- **w** (windows): `r_w`, with ties in CID order.
-- **CID:** each file's `r_c`, merged by (CID, pid).
+- **Seq** (datasync): per-file pages by rowid, merged. A single source's
+  pages come from `rl_sid` (the filter's lanes checked inside the index),
+  starting and ending at its lanes' seq bounds (`lane.minseq`, `maxseq`).
+- **w** (windows): `r_w`, with ties in CID order. With a lane filter, a page's
+  seqs are probed on `rl`'s key before any row is read.
+- **CID:** the type index's `c` in (CID, pid) order, the unflushed entries
+  merged over it; a page's rows are read by seq, one read transaction per file.
 
 Copies collapse to one row per CID: the lowest pid that matches, also under
 OFFSET.
 
 **A18 bound (C-31).**
-- With `lane.source` set, the bound is that source's newest N records: one
-  newest-first walk of each partition's `rl_sid`, merged, stopping at N. The
-  scan then reads through `rl_sid` above the cut.
+- With `lane.source` set, the bound is that source's newest N records: a
+  newest-first walk of `rl_sid` in only the partitions holding the source,
+  merged by their in-memory bounds (a partition is opened only once its
+  newest seq could be above the cut; pages start at 64 seqs), stopping at N.
+  The scan then reads through `rl_sid` above the cut.
 - Without a source, the bound is the type's newest N (`r_s`).
 - Every other filter applies above the cut.
 - `<TYPE>@<source>` therefore returns that source's records. This is an
@@ -179,8 +204,26 @@ OFFSET.
 
 **Candidates instead of a walk.**
 - An exact CID (tag 8) is one type-index probe.
-- An equality, IN or range predicate on the object rule's first column reads
-  `r_ke`.
+- An equality, IN, range or LIKE predicate on the object rule's first column
+  reads `r_ke` (in CID order too: the candidates' CIDs are sorted).
+- An epoch window (EPOCH, W, EPOCH_DAY bounds) of a seq-ordered read takes
+  its seqs from `r_w` (up to 200,000).
+- An epoch-ordered window of a small source (at most 20,000 rows and a
+  quarter of each file) reads that source's seqs from `rl_sid`.
+
+**Counters instead of a read.**
+- HEAD with no filter answers from the type's counters; with only a lane
+  filter, from the selected lanes' counters summed over the partitions (as
+  format 2).
+- SUMMARY 4 (disk usage) answers from maintained sizes: each file's pages
+  after its writer's last commit, the WALs' uncheckpointed frames, the T/
+  files' sizes refreshed once a second.
+- EPOCH coverage and window counts with at most an epoch range read the
+  epochs from `r_ke` (or `r_w`) alone when the type has no copies in several
+  partitions.
+
+**Full text** is checked a page at a time against FTS5 (a rowid range or a
+probe per seq), on a pooled reader connection: no set of every match.
 
 **EPOCH nearest / as_of / forward** (C-32) take one `r_ke` seek per object
 per partition.
@@ -228,11 +271,12 @@ cpp/build/flatsql_p4_test --test=g2_fixture --fixture=<format-1 control.flatsqld
 bash scripts/build-wasm.sh --ps-tests && node scripts/p4-wasm-suite.mjs [--kill-rounds 100]
 ```
 
-- **`t_kill`.** A forked engine ingests from three producers, with copies, a
-  batch supersede every 13th call and a quota of 4 MiB every 11th. It is
+- **`t_kill`** (`t_kill.cpp`). A forked engine ingests from three producers,
+  with copies, the same new records from two producers at once every 7th call,
+  a batch supersede every 13th call and a quota of 4 MiB every 11th. It is
   killed with SIGKILL at a random point, then the check runs:
   - every file passes `integrity_check`;
-  - every row on disk is found by CID;
+  - every row on disk is found by CID, and every copy of a CID has one seq;
   - the count equals the distinct CIDs on disk;
   - REBUILD 8 finds no mismatch;
   - new seqs are above every seq on disk;
@@ -252,7 +296,12 @@ bash scripts/build-wasm.sh --ps-tests && node scripts/p4-wasm-suite.mjs [--kill-
   - `g3_bench`, modes `producers`, `w01`, `w06` and `w10`;
   - `a18_probe`;
   - `g6_bench`;
-  - `open_bench`.
+  - `open_bench`;
+  - `reads_bench` (the read gate's material shapes on a fixture store;
+    `--open-only=1` times the open, e.g. after a kill).
+- There are no per-package unit tests (C-33): the proof is these loops, the
+  fixture equivalence and the SDN end-to-end harness. The SQL surface's two
+  engine-backed tests (`tests/p4sql`) run in the suite when it is built in.
 
 ## 10. Measured
 
@@ -279,17 +328,11 @@ bash scripts/build-wasm.sh --ps-tests && node scripts/p4-wasm-suite.mjs [--kill-
 | First open | 232 registered types, as the daemon registers them. **First open:** open 37 ms, registration 3.45 s (232 durable spec writes, load 34), close 41 ms, 235 files in T/. **Reopen:** 20 ms, re-registration 0.5 ms. The month build took 62-81 s and wrote 940 type files. |
 | Crash | Native t_kill 100 of 100 and t_power_loss 100 of 100. Wasm kill 100 of 100. Load 23-39. |
 
-## 11. Open: the per-file CID index
+## 11. The per-file CID index is gone (C-34)
 
-C-32 puts a CID index in every partition file, as `r_c`.
-- **The cost.** A record's CID is a random key, so a 4,096-record commit
-  dirties about one `r_c` leaf page per record. On the fixture's OMM file,
-  W01 runs about 3× slower with `r_c` than without it (§10).
-- **Prior evidence.** The design's prototype measured the same cost (v1:
-  "A random 32-byte key per row made writes 10–25× worse").
-- **What `r_c` serves.** It serves only CID-ordered windows and REBUILD 2.
-  The type index already maps every CID to its copies.
-- **Where the gate stands.** Warm ingest p99 stays under format 2's
-  306-494 ms. The cold first call after an open does not.
-- **Proposed.** Dropping `r_c`, and serving CID order from the type index, is
-  a contract change for the coordinator.
+C-32 first put a CID index in every partition file (`r_c`). A record's CID
+is a random key, so each commit dirtied about one `r_c` leaf page per record.
+On a g2 clone, W01 (20 calls x 4,096 records, load 22-25): with `r_c` 12.2k
+rec/s, call p50 177 ms, first call 1,194 ms; without it 28.0k rec/s, p50
+129 ms, first call 576 ms. The type index already mapped every CID to its
+copies, so `r_c` is dropped and CID order is served from `c`.
