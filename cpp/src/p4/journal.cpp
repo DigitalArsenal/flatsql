@@ -12,6 +12,8 @@
 //
 // Journal ids are AUTOINCREMENT, so they never restart when the table empties
 // (a restart once let a flush delete rows it had not merged).
+#include <algorithm>
+
 #include "internal.h"
 
 namespace flatsql {
@@ -210,40 +212,79 @@ int32_t journalReplay(Type* t, std::string* err) {
     Conn* idx = t->idx;
     std::unordered_set<int64_t> liveSeqs;
     std::shared_ptr<const Spec> sp = t->spec_;
-    for (const JE& x : rows) {
-        if (x.op != J_C && x.op != J_DEL) continue;
+    // The entries in CID order (journal order within a CID: a CID's entries
+    // are what its outcome depends on), so the index probes walk the type
+    // index once instead of reading a random page per entry. One probe per
+    // CID gives both this partition's index row and the other holders.
+    std::vector<size_t> order;
+    for (size_t i = 0; i < rows.size(); i++)
+        if (rows[i].op == J_C || rows[i].op == J_DEL) order.push_back(i);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return std::memcmp(rows[a].k, rows[b].k, 32) < 0; });
+    // Each entry's row, probed in (file, seq) order (the files' pages in turn).
+    std::vector<size_t> byRow(order);
+    std::sort(byRow.begin(), byRow.end(), [&](size_t a, size_t b) {
+        return rows[a].pid != rows[b].pid ? rows[a].pid < rows[b].pid : rows[a].seq < rows[b].seq;
+    });
+    std::vector<int64_t> rowLen(rows.size(), -1);  // -1: the entry's row is not in its file
+    for (size_t oi : byRow) {
+        const JE& x = rows[oi];
         Part* f = fileOf(x.pid);
         Conn* c = f ? connOf(f) : nullptr;
-        bool present = false;
-        int64_t len = 0;
-        if (c) {
-            sqlite3_stmt* s = c->get(S_R_LEN);
+        if (!c) continue;
+        sqlite3_stmt* s = c->get(S_R_LEN);
+        if (!s) continue;
+        sqlite3_bind_int64(s, 1, x.seq);
+        if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_bytes(s, 1) == 32 &&
+            std::memcmp(sqlite3_column_blob(s, 1), x.k, 32) == 0)
+            rowLen[oi] = sqlite3_column_int64(s, 0);
+        sqlite3_reset(s);
+    }
+    std::vector<std::pair<uint32_t, int64_t>> inIdx;  // the CID's index rows (pid, seq)
+    const uint8_t* inIdxKey = nullptr;
+    for (size_t oi : order) {
+        const JE& x = rows[oi];
+        const bool present = rowLen[oi] >= 0;
+        const int64_t len = present ? rowLen[oi] : 0;
+        if (!inIdxKey || std::memcmp(inIdxKey, x.k, 32) != 0) {
+            inIdx.clear();
+            inIdxKey = x.k;
+            sqlite3_stmt* s = idx->get(S_C_GET);
             if (s) {
-                sqlite3_bind_int64(s, 1, x.seq);
-                if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_bytes(s, 1) == 32 &&
-                    std::memcmp(sqlite3_column_blob(s, 1), x.k, 32) == 0) {
-                    present = true;
-                    len = sqlite3_column_int64(s, 0);
-                }
+                sqlite3_bind_blob(s, 1, x.k, 32, SQLITE_STATIC);
+                while (sqlite3_step(s) == SQLITE_ROW)
+                    inIdx.push_back({uint32_t(sqlite3_column_int64(s, 0)), sqlite3_column_int64(s, 1)});
                 sqlite3_reset(s);
             }
         }
         bool inIndex = false;
-        {
-            sqlite3_stmt* s = idx->sql("SELECT 1 FROM c WHERE cid=?1 AND pid=?2");
-            if (s) {
-                sqlite3_bind_blob(s, 1, x.k, 32, SQLITE_STATIC);
-                sqlite3_bind_int64(s, 2, x.pid);
-                inIndex = sqlite3_step(s) == SQLITE_ROW;
-                sqlite3_reset(s);
-            }
-        }
-        // Other holders: the pending layer over the index (a pending delete hides its row).
+        for (auto& r : inIdx) inIndex = inIndex || r.first == x.pid;
+        // Other holders: the pending layer over the index (a pending delete
+        // hides its row), as holdersWith.
         int others = 0;
         {
-            std::vector<Holder> hs;
-            holdersWith(t, idx, x.k, &hs, true);
-            for (auto& h : hs) others += h.pid != x.pid;
+            uint32_t seen[16];
+            bool del[16];
+            int ns = 0;
+            auto note = [&](const CEnt& ce) {
+                for (int i = 0; i < ns; i++)
+                    if (seen[i] == ce.pid) return;
+                if (ns < 16) {
+                    seen[ns] = ce.pid;
+                    del[ns++] = ce.st == 2;
+                }
+            };
+            t->pend.each(x.k, note);
+            t->flushing.each(x.k, note);
+            for (auto& r : inIdx) {
+                bool dup = false;
+                for (int i = 0; i < ns; i++) dup = dup || seen[i] == r.first;
+                if (!dup && ns < 16) {
+                    seen[ns] = r.first;
+                    del[ns++] = false;
+                }
+            }
+            for (int i = 0; i < ns; i++) others += !del[i] && seen[i] != x.pid;
         }
         if (x.op == J_C) {
             if (!present) continue;  // its file never committed
