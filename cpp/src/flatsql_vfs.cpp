@@ -39,7 +39,8 @@
 // readers) reads ahead sequentially: after three nearby reads in one
 // direction it reads 64 KiB, then twice as much per further fill of that
 // stream up to `bytes`, forward or backward, in up to `streams` streams per
-// connection. A buffer serves only while its node's write generation is the
+// connection; a fill that served under an eighth of its bytes halves the
+// next one (down to 16 KiB). A buffer serves only while its node's write generation is the
 // one it was filled under: no checkpoint has written the database file since,
 // so its pages are the file's pages now, and SQLite reads from the database
 // file only pages the WAL does not hold for its snapshot. Buffers outlive the
@@ -137,7 +138,8 @@ std::atomic<int64_t> gRaBytes{0};
 std::atomic<int> gRaStreams{2};
 std::atomic<int> gRaBytesPerRead{1 << 20};
 std::atomic<int64_t> gRaHeld{0};  // bytes of readahead buffers allocated
-constexpr int kRaFirst = 64 * 1024;
+constexpr int kRaFirst = 64 * 1024;  // a stream's first fill
+constexpr int kRaMin = 16 * 1024;
 constexpr int64_t kRaKeep = 32 << 20;
 
 struct RaStream {
@@ -147,6 +149,7 @@ struct RaStream {
     int len;
     uint64_t gen;  // the node's write generation the buffer was filled under
     int next;      // bytes of this stream's next fill
+    int64_t served;  // bytes served from the buffer since its fill
     sqlite3_int64 last;
     int dir;
     int streak;
@@ -228,7 +231,7 @@ void raDrop(FlatSqlFile* f) {
             sqlite3_free(f->rs[i].buf);
             gRaHeld.fetch_sub(f->rs[i].cap, std::memory_order_relaxed);
         }
-        f->rs[i] = RaStream{nullptr, 0, 0, 0, 0, 0, -1, 0, 0, 0};
+        f->rs[i] = RaStream{nullptr, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0};
     }
 }
 
@@ -338,6 +341,7 @@ int raRead(FlatSqlFile* f, void* buf, int amount, sqlite3_int64 offset) {
             std::memcpy(buf, s->buf + (offset - s->off), static_cast<size_t>(amount));
             s->last = offset;
             s->used = f->tick;
+            s->served += amount;
             gRaHits.fetch_add(1, std::memory_order_relaxed);
             return SQLITE_OK;
         }
@@ -375,7 +379,15 @@ int raRead(FlatSqlFile* f, void* buf, int amount, sqlite3_int64 offset) {
     s->last = offset;
     s->used = f->tick;
     if (s->streak >= kRaStreak && amount <= raBytes / 4) {
-        int want = s->next < kRaFirst ? kRaFirst : s->next > raBytes ? raBytes : s->next;
+        // The fill size follows the last fill's use: doubled when it served
+        // half its bytes, halved when it served under an eighth (a sparse
+        // walk reads less than it would page by page).
+        if (s->len > 0) {
+            if (s->served * 2 >= s->len) s->next = s->len * 2;
+            else if (s->served * 8 < s->len) s->next = s->len / 2;
+            else s->next = s->len;
+        }
+        int want = s->next < kRaMin ? kRaMin : s->next > raBytes ? raBytes : s->next;
         if (want < amount * 4) want = amount * 4;
         sqlite3_int64 start = dir > 0 ? offset : offset + amount - want;
         if (start < 0) start = 0;
@@ -404,7 +416,7 @@ int raRead(FlatSqlFile* f, void* buf, int amount, sqlite3_int64 offset) {
                     s->off = start;
                     s->len = len;
                     s->gen = gen;
-                    s->next = want < raBytes / 2 ? want * 2 : raBytes;
+                    s->served = amount;
                     gRaReads.fetch_add(1, std::memory_order_relaxed);
                     gRaBytes.fetch_add(len, std::memory_order_relaxed);
                     std::memcpy(buf, s->buf + (offset - start), static_cast<size_t>(amount));

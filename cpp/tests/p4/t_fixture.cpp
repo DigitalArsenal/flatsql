@@ -22,6 +22,7 @@
 
 #include <flatbuffers/reflection.h>
 
+#include "flatsql/flatsql_io.h"
 #include "internal.h"
 #include "p4/p4_test.h"
 
@@ -1768,6 +1769,7 @@ P4_SLOW_TEST(reads_bench) {
         int32_t st = 0;
         uint64_t ex = 0;
         const int calls = int(argInt("reps", 4));
+        const flatsql::FlatSqlIoVfsStats v0 = flatsql::flatSqlIoVfsStats();
         for (int i = 0; i < calls; i++) {
             const uint64_t s = flatsql::ps::monoNs();
             Result r = call(sh.op, sh.t.b, co);
@@ -1792,8 +1794,12 @@ P4_SLOW_TEST(reads_bench) {
         }
         std::vector<double> warm(ms.begin() + 1, ms.end());
         std::sort(warm.begin(), warm.end());
-        std::printf("  %-36s cold %9.3f ms  warm p50 %9.3f  max %9.3f  rows %zu  examined %llu  status %d (load %.1f)\n",
-                    sh.name.c_str(), ms[0], warm[warm.size() / 2], warm.back(), rows, (unsigned long long)ex, st, loadAvg());
+        const flatsql::FlatSqlIoVfsStats v1 = flatsql::flatSqlIoVfsStats();
+        std::printf("  %-36s cold %9.3f ms  warm p50 %9.3f  max %9.3f  rows %zu  examined %llu  status %d (load %.1f)"
+                    "  readahead/call %.1f MiB in %.0f reads, %.0f hits\n",
+                    sh.name.c_str(), ms[0], warm[warm.size() / 2], warm.back(), rows, (unsigned long long)ex, st, loadAvg(),
+                    double(v1.readaheadBytes - v0.readaheadBytes) / 1048576.0 / calls,
+                    double(v1.readaheadReads - v0.readaheadReads) / calls, double(v1.readaheadHits - v0.readaheadHits) / calls);
     }
     closeEngine(600000);
 }
