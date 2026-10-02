@@ -1582,9 +1582,10 @@ int32_t Scan::wSkip() {
     // Whole hours from the files' epoch histograms (every record has an
     // epoch, so w is it; every row visible; no w bound): the walk starts at
     // the top of the hour that holds the offset, the hours above it counted.
+    // A small offset walks (cheaper than reading the histograms).
     uint64_t skipped = 0;
     int64_t walkHi = s_.wHi;
-    if (rc == P4_OK && !asc && allE && s_.wLo == INT64_MIN && s_.wHi == INT64_MAX && lo_ <= 0) {
+    if (rc == P4_OK && !asc && allE && s_.wLo == INT64_MIN && s_.wHi == INT64_MAX && lo_ <= 0 && s_.offset >= 4096) {
         std::map<int64_t, int64_t> hours;
         bool ok = true;
         for (size_t fi = 0; fi < files_.size() && ok; fi++) {
