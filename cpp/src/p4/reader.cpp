@@ -298,6 +298,8 @@ private:
     bool countRow(const Row& r);
     int32_t nextSeq(Row** out);
     int32_t nextW(Row** out);
+    int32_t wSkip();       // an unfiltered W window's offset, counted in r_w (index only)
+    bool wSkipped_ = false;
     int32_t nextCid(Row** out);
     int32_t check();
 
@@ -1452,8 +1454,105 @@ int32_t Scan::laneKeep(Conn* c, std::vector<std::pair<int64_t, int64_t>>* ws) {
     return P4_OK;
 }
 
+// An unfiltered W window with an offset: whole w groups before the offset
+// are counted in each file's r_w (index only, merged across files by w) and
+// never read; the scan starts at the group the offset falls in. Each row is
+// its own CID when the scan has one file or the type has no copies.
+int32_t Scan::wSkip() {
+    wSkipped_ = true;
+    const bool simple = !s_.lane && s_.preds.empty() && !s_.hasPeer && !s_.eNull && !s_.eNotNull && !fts_ &&
+                        !s_.hasCid && !s_.hasProducer && !kDriven_;
+    if (!simple || s_.offset == 0 || files_.empty()) return P4_OK;
+    {
+        std::lock_guard<std::mutex> g(t_->mu);
+        if (files_.size() > 1 && t_->copies > 0) return P4_OK;
+    }
+    const bool asc = s_.wAsc;
+    struct WC {
+        Conn* c = nullptr;
+        sqlite3_stmt* q = nullptr;
+        bool have = false;
+        int64_t w = 0;
+    };
+    std::vector<WC> wc(files_.size());
+    int32_t rc = P4_OK;
+    auto step = [&](WC& x) {
+        const int r = sqlite3_step(x.q);
+        x.have = r == SQLITE_ROW;
+        if (x.have) x.w = sqlite3_column_int64(x.q, 0);
+        else if (r != SQLITE_DONE && rc == P4_OK) rc = statusOfSqlite(r);
+    };
+    for (size_t fi = 0; fi < files_.size() && rc == P4_OK; fi++) {
+        int orc = 0;
+        wc[fi].c = e_->rpool.acquire(files_[fi].path, OpenKind::Reader, &orc, nullptr);
+        if (!wc[fi].c) {
+            rc = statusOfSqlite(orc);
+            break;
+        }
+        wc[fi].c->exec("BEGIN");
+        wc[fi].q = wc[fi].c->sql(asc ? "SELECT w FROM r INDEXED BY r_w WHERE w>=?1 AND w<=?2 AND seq>?3 AND seq<=?4 ORDER BY w ASC"
+                                     : "SELECT w FROM r INDEXED BY r_w WHERE w>=?1 AND w<=?2 AND seq>?3 AND seq<=?4 ORDER BY w DESC");
+        if (!wc[fi].q) {
+            rc = P4_E_INTERNAL;
+            break;
+        }
+        sqlite3_bind_int64(wc[fi].q, 1, s_.wLo);
+        sqlite3_bind_int64(wc[fi].q, 2, s_.wHi);
+        sqlite3_bind_int64(wc[fi].q, 3, lo_);
+        sqlite3_bind_int64(wc[fi].q, 4, hi_);
+        step(wc[fi]);
+    }
+    uint64_t skipped = 0;
+    bool boundary = false;
+    int64_t bw = 0;
+    while (rc == P4_OK) {
+        bool have = false;
+        int64_t top = 0;
+        for (auto& x : wc)
+            if (x.have && (!have || (asc ? x.w < top : x.w > top))) {
+                top = x.w;
+                have = true;
+            }
+        if (!have) break;
+        uint64_t n = 0;
+        for (auto& x : wc)
+            while (rc == P4_OK && x.have && x.w == top) {
+                n++;
+                step(x);
+            }
+        L_->rowsExamined += n;
+        if (skipped + n > s_.offset) {
+            boundary = true;
+            bw = top;
+            break;
+        }
+        skipped += n;
+    }
+    for (auto& x : wc) {
+        if (x.q) sqlite3_reset(x.q);
+        if (x.c) {
+            x.c->exec("COMMIT");
+            e_->rpool.release(x.c);
+        }
+    }
+    if (rc != P4_OK) return rc;
+    skipped_ = skipped;
+    for (size_t fi = 0; fi < files_.size(); fi++) {
+        FileCur& fc = cur_[fi];
+        fc.started = true;
+        fc.resumeSeq = INT64_MIN;
+        if (!boundary) fc.done = true;  // the offset is past the end
+        else fc.resumeW = asc ? bw - 1 : bw + 1;
+    }
+    return P4_OK;
+}
+
 int32_t Scan::nextW(Row** out) {
     const bool asc = s_.wAsc;
+    if (!wSkipped_) {
+        const int32_t rc = wSkip();
+        if (rc != P4_OK) return rc;
+    }
     for (;;) {
         int32_t rc = check();
         if (rc != P4_OK) return rc;

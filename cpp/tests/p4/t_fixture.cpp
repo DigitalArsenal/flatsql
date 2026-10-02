@@ -1256,7 +1256,7 @@ P4_SLOW_TEST(reads_bench) {
         t.raw(17, p.data(), p.size());
         add("R12 WINDOW OMM day", P4_OPC_WINDOW, t);
     }
-    for (const char* ty : {"CAT", "OMM"}) {
+    for (const char* ty : {"CAT", "OMM", "MPE", "IQC"}) {
         TlvW t;
         t.text(1, ty).u8(2, 1).u64(3, 100).u64(4, 20000);
         add(std::string("R12 WINDOW ") + ty + " off=20000", P4_OPC_WINDOW, t);
