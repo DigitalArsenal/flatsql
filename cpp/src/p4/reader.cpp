@@ -58,6 +58,12 @@ Conn* ReaderPool::acquire(const std::string& path, OpenKind kind, int* rc, std::
 
 void ReaderPool::release(Conn* c) {
     if (!c) return;
+    // An idle connection holds no read transaction: a statement left
+    // mid-step (a read that stopped at its limit) would pin its WAL snapshot
+    // and hold every checkpoint of the file behind it.
+    for (sqlite3_stmt* s = sqlite3_next_stmt(c->db, nullptr); s; s = sqlite3_next_stmt(c->db, s))
+        if (sqlite3_stmt_busy(s)) sqlite3_reset(s);
+    if (!sqlite3_get_autocommit(c->db)) c->exec("ROLLBACK");
     std::vector<Conn*> close;
     {
         std::lock_guard<std::mutex> g(mu_);
@@ -3169,10 +3175,10 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
             {
                 std::lock_guard<std::mutex> g(t->mu);
                 for (auto& p : t->parts)
-                    if (p->created) wal += walBytesOf(p->path);
+                    if (p->created) wal += walBytesOf(t->e, p->path);
             }
-            const int64_t idx = t->idxBytes.load(std::memory_order_relaxed) + walBytesOf(t->pIdx) + walBytesOf(t->pJnl);
-            const int64_t fts = t->ftsBytes.load(std::memory_order_relaxed) + walBytesOf(t->pFts);
+            const int64_t idx = t->idxBytes.load(std::memory_order_relaxed) + walBytesOf(t->e, t->pIdx) + walBytesOf(t->e, t->pJnl);
+            const int64_t fts = t->ftsBytes.load(std::memory_order_relaxed) + walBytesOf(t->e, t->pFts);
             o.enc.beginRow();
             putText(o.enc, t->name);
             o.enc.i64(int64_t(files));

@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <mutex>
 #include <cstring>
 #include <map>
 #include <random>
@@ -715,6 +717,119 @@ P4_SLOW_TEST(g3_bench) {
         CHECK_EQ(failures.load(), 0, "every call");
         closeEngine(600000);
         removeTree(root.substr(0, root.size() - 6));
+        return;
+    }
+    if (mode == "growth") {
+        // The count-scaled growth step's write shape (sds-tb-gen): --producers
+        // (8) callers, each call 4,096 new OMM records from one of --peers
+        // (1,024) producers picked by Zipf(1.1), until --records. A call that
+        // answers P4_E_BUSY is retried; one that makes no progress for
+        // --stuck-s (60) seconds fails the run (a hang, not slowness).
+        const std::string root = argStr("store", "").empty() ? scratchDir("g3g") + "/fsql4" : argStr("store", "") + "/fsql4";
+        EngineOpts o;
+        o.writers = uint32_t(argInt("writers", 8));
+        o.writeSlots = 64;
+        if (argInt("wal-total-mib", 0) > 0) {
+            TlvW x;
+            x.u64(32, uint64_t(argInt("wal-total-mib", 0)) << 20);
+            o.extra = x.b;
+        }
+        REQUIRE(openEngine(root, o) == P4_OK, "open");
+        REQUIRE(registerType(ommType()) == P4_OK, "register");
+        const int producers = int(argInt("producers", 8));
+        const int peers = int(argInt("peers", 1024));
+        const int64_t target = argInt("records", 8000000);
+        const int per = int(argInt("call", 4096));
+        const int64_t stuckNs = int64_t(argInt("stuck-s", 60)) * 1000000000ll;
+        std::vector<double> cdf(static_cast<size_t>(peers));
+        double sum = 0;
+        const double zipf = double(argInt("zipf-milli", 1100)) / 1000.0;
+        for (int k = 0; k < peers; k++) cdf[size_t(k)] = (sum += 1.0 / std::pow(double(k + 1), zipf));
+        for (double& x : cdf) x /= sum;
+        std::atomic<int64_t> written{0}, busy{0}, calls{0};
+        std::atomic<bool> stop{false}, stuck{false};
+        std::atomic<double> maxMs{0};
+        std::vector<std::atomic<bool>> used(static_cast<size_t>(peers));
+        std::atomic<int> partitions{0};
+        std::mutex latMu;
+        std::vector<double> lat;
+        const uint64_t t0 = flatsql::ps::monoNs();
+        std::vector<std::thread> th;
+        for (int pi = 0; pi < producers; pi++)
+            th.emplace_back([&, pi] {
+                std::mt19937_64 rng(uint64_t(pi) * 7919 + 1);
+                std::uniform_real_distribution<double> u(0, 1);
+                for (int64_t c = 0; !stop.load() && written.load() < target; c++) {
+                    const int peer = int(std::lower_bound(cdf.begin(), cdf.end(), u(rng)) - cdf.begin());
+                    if (!used[size_t(peer)].exchange(true)) partitions++;
+                    Batch b;
+                    b.type = "OMM";
+                    b.peer = "12D3KooWGrowthPeer" + std::to_string(peer);
+                    b.tags.push_back(Tag{"prov", "src" + std::to_string(peer % 16), "", "b" + std::to_string(c), "", "", ""});
+                    b.at = 1790000000 + c;
+                    for (int i = 0; i < per; i++) {
+                        In in;
+                        const uint64_t uniq = (uint64_t(pi) << 40) | (uint64_t(c) << 13) | uint64_t(i);
+                        in.frame = ommFrame(uint32_t(10000 + uniq % 60000), "2026-001A",
+                                            isoTime(unixOf(2026, 9, 1) + int64_t(uniq % 86400000)), 15.5 + double(uniq >> 13) * 1e-9,
+                                            300);
+                        in.ts = 1790000000 + c;
+                        b.recs.push_back(std::move(in));
+                    }
+                    const uint64_t s = flatsql::ps::monoNs();
+                    Result r;
+                    for (;;) {
+                        r = put(b);
+                        if (r.status != P4_E_BUSY) break;
+                        busy++;
+                        if (int64_t(flatsql::ps::monoNs() - s) > stuckNs || stop.load()) break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                    const double ms = double(flatsql::ps::monoNs() - s) / 1e6;
+                    if (r.status != P4_OK) {
+                        std::fprintf(stderr, "  call failed after %.0f ms: %d %s\n", ms, r.status, r.err.c_str());
+                        stuck = true;
+                        stop = true;
+                        return;
+                    }
+                    written += per;
+                    calls++;
+                    double m = maxMs.load();
+                    while (ms > m && !maxMs.compare_exchange_weak(m, ms)) {
+                    }
+                    std::lock_guard<std::mutex> g(latMu);
+                    lat.push_back(ms);
+                }
+            });
+        uint64_t lastPrint = t0;
+        while (!stop.load() && written.load() < target) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            const uint64_t now = flatsql::ps::monoNs();
+            if (now - lastPrint >= 5000000000ull) {
+                lastPrint = now;
+                const std::vector<uint64_t> st = stats();
+                std::printf("  t=%.0fs records=%lld calls=%lld partitions=%d busy=%lld max=%.0fms wal=%.0fMiB load=%.1f\n",
+                            double(now - t0) / 1e9, (long long)written.load(), (long long)calls.load(), partitions.load(),
+                            (long long)busy.load(), maxMs.load(), st.size() > 19 ? double(st[19]) / 1048576.0 : -1.0,
+                            loadAvg());
+                std::fflush(stdout);
+            }
+        }
+        for (auto& t : th) t.join();
+        const double secs = double(flatsql::ps::monoNs() - t0) / 1e9;
+        std::sort(lat.begin(), lat.end());
+        report("growth.records", double(written.load()), "records");
+        report("growth.partitions", double(partitions.load()), "partitions");
+        report("growth.rate", double(written.load()) / secs, "rec/s");
+        if (!lat.empty()) {
+            report("growth.call_p50", lat[lat.size() / 2], "ms");
+            report("growth.call_p99", lat[size_t(double(lat.size() - 1) * 0.99)], "ms");
+            report("growth.call_max", lat.back(), "ms");
+        }
+        report("growth.busy", double(busy.load()), "answers");
+        CHECK(!stuck.load(), "every call completes (no hang)");
+        closeEngine(600000);
+        if (argStr("store", "").empty() && !argInt("keep", 0)) removeTree(root.substr(0, root.size() - 6));
         return;
     }
     const std::string store = argStr("store", "");

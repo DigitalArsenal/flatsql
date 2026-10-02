@@ -503,7 +503,7 @@ int32_t engineActivate(Engine* e) {
             const int r = sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &log, &ck);
             delete c;
             if (r != SQLITE_OK) return statusOfSqlite(r);
-            walNote(path, 0);
+            walNote(e, path, 0);
             e->bump(kStTruncate);
         }
     }

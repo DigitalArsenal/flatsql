@@ -545,6 +545,11 @@ struct P4Engine {
     uint32_t nWConn = 0;
     // reader connections
     flatsql::p4::ReaderPool rpool;
+    // WAL accounting (walMu): frames not yet checkpointed, by path
+    std::mutex walMu;
+    std::unordered_map<std::string, int64_t> walPages;
+    int64_t walSum = 0;
+    std::unordered_set<std::string> ckptQueued;
     // maintenance
     std::mutex maintMu;
     std::deque<flatsql::p4::MaintTask> maintQ;
@@ -678,8 +683,10 @@ int32_t rebuildOp(P4Engine* e, Type* only, uint32_t what, std::vector<std::array
                   std::vector<Type*>* rowTypes, std::string* firstBad = nullptr);
 int32_t ftsCatchUp(P4Engine* e, Type* t, bool all);
 int walHook(void* arg, sqlite3* db, const char* zDb, int nPages);
-int64_t walBytesOf(const std::string& path);  // the WAL's frames not yet checkpointed, in bytes (4 KiB pages)
-void walNote(const std::string& path, int64_t frames);  // after a checkpoint: the frames it left
+// Each WAL's frames not yet checkpointed (4 KiB pages), per engine; their sum
+// is the WAL stat, refreshed on every change (commits and checkpoints).
+int64_t walBytesOf(P4Engine* e, const std::string& path);
+void walNote(P4Engine* e, const std::string& path, int64_t frames);  // 0 forgets the path
 void typeFileBytes(Type* t);                  // refreshes idxBytes and ftsBytes (maintenance thread)
 
 // ---- mailbox.cpp --------------------------------------------------------------------------------------

@@ -22,58 +22,71 @@ struct MaintState {
     std::list<std::string> lru;
 };
 
-std::mutex gWalMu;
-std::unordered_map<std::string, int64_t> gWalPages;  // each WAL's frames not yet checkpointed
-std::unordered_set<std::string> gCkptQueued;
-
-Conn* maintConn(MaintState& m, const std::string& path) {
+Conn* maintConn(Engine* e, MaintState& m, const std::string& path) {
     auto it = m.conns.find(path);
     if (it != m.conns.end()) return it->second;
     if (m.conns.size() >= 32) {
         const std::string victim = m.lru.back();
         m.lru.pop_back();
-        delete m.conns[victim];
+        delete m.conns[victim];  // the file's last connection deletes its WAL
         m.conns.erase(victim);
+        if (!ioExists(victim + "-wal")) walNote(e, victim, 0);
     }
     Conn* c = nullptr;
     if (openConn(path, OpenKind::Maint, 1024, 0, &c, nullptr) != SQLITE_OK) return nullptr;
+    sqlite3_busy_timeout(c->db, 0);  // a checkpoint never waits (see checkpoint)
     m.conns[path] = c;
     m.lru.push_front(path);
     return c;
 }
 
+// A checkpoint never waits for the file's writer. PASSIVE passes copy the WAL
+// into the file while the writer keeps committing (no writer lock); once a
+// pass leaves little behind, RESTART with no busy handler takes the writer
+// lock only if it is free at that moment, copies the last few frames and
+// makes the writer's next transaction start the WAL over (which bounds the
+// WAL file). A reader inside the WAL or a busy writer: the next kick retries.
 void checkpoint(Engine* e, MaintState& m, const std::string& path) {
-    Conn* c = maintConn(m, path);
+    Conn* c = maintConn(e, m, path);
     if (!c) return;
-    int log = 0, ck = 0;
-    sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_PASSIVE, &log, &ck);
-    e->bump(kStPassive);
-    walNote(path, log >= ck ? log - ck : 0);
-    const int64_t walBytes = ioSize(path + "-wal");
-    int64_t total = 0;
-    {
-        std::lock_guard<std::mutex> g(gWalMu);
-        for (auto& kv : gWalPages) total += kv.second * 4096;
+    int log = 0, ck = 0, prev = -1;
+    for (int pass = 0; pass < 4; pass++) {
+        const int r = sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_PASSIVE, &log, &ck);
+        e->bump(kStPassive);
+        if (r != SQLITE_OK) return;
+        walNote(e, path, log >= ck ? log - ck : 0);
+        if (log > ck) return;  // a reader holds frames back: nothing to restart yet
+        if (prev >= 0 && log - prev <= 256) break;  // the writer added little during the pass
+        prev = log;
     }
-    if (walBytes > int64_t(e->cfg.restartBytes) || total > int64_t(e->cfg.walTotal)) {
-        // The writer waits; readers do not (their transactions are one page long).
-        sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_RESTART, &log, &ck);
+    if (log < int(e->cfg.passivePages / 4)) return;  // small WAL: not worth a restart
+    if (sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_RESTART, &log, &ck) == SQLITE_OK) {
         e->bump(kStRestart);
-        walNote(path, log >= ck ? log - ck : 0);
+        walNote(e, path, log >= ck ? log - ck : 0);
     }
 }
 
 }  // namespace
 
-void walNote(const std::string& path, int64_t frames) {
-    std::lock_guard<std::mutex> g(gWalMu);
-    gWalPages[path] = frames;
+void walNote(Engine* e, const std::string& path, int64_t frames) {
+    std::lock_guard<std::mutex> g(e->walMu);
+    auto it = e->walPages.find(path);
+    const int64_t old = it == e->walPages.end() ? 0 : it->second;
+    if (frames <= 0) {
+        if (it != e->walPages.end()) e->walPages.erase(it);
+    } else if (it != e->walPages.end()) {
+        it->second = frames;
+    } else {
+        e->walPages.emplace(path, frames);
+    }
+    e->walSum += std::max<int64_t>(0, frames) - old;
+    e->stat[kStWalBytes].store(uint64_t(std::max<int64_t>(0, e->walSum)) * 4096, std::memory_order_relaxed);
 }
 
-int64_t walBytesOf(const std::string& path) {
-    std::lock_guard<std::mutex> g(gWalMu);
-    auto it = gWalPages.find(path);
-    return it == gWalPages.end() ? 0 : it->second * 4096;
+int64_t walBytesOf(Engine* e, const std::string& path) {
+    std::lock_guard<std::mutex> g(e->walMu);
+    auto it = e->walPages.find(path);
+    return it == e->walPages.end() ? 0 : it->second * 4096;
 }
 
 void typeFileBytes(Type* t) {
@@ -86,17 +99,14 @@ int walHook(void* arg, sqlite3* db, const char* zDb, int nPages) {
     Engine* e = static_cast<Engine*>(arg);
     const char* path = sqlite3_db_filename(db, zDb);
     if (!path) return SQLITE_OK;
+    walNote(e, path, nPages);
+    // A WAL past the PASSIVE pages, or any WAL of 4 MiB or more while the
+    // instance's WALs are over their total, is checkpointed.
     bool kick = false;
     {
-        std::lock_guard<std::mutex> g(gWalMu);
-        gWalPages[path] = nPages;
-        int64_t total = 0;
-        for (auto& kv : gWalPages) total += kv.second;
-        e->stat[kStWalBytes].store(uint64_t(total) * 4096, std::memory_order_relaxed);
-        if (uint32_t(nPages) >= e->cfg.passivePages && !gCkptQueued.count(path)) {
-            gCkptQueued.insert(path);
-            kick = true;
-        }
+        std::lock_guard<std::mutex> g(e->walMu);
+        const bool over = uint64_t(e->walSum) * 4096 > e->cfg.walTotal && nPages >= 1024;
+        if ((uint32_t(nPages) >= e->cfg.passivePages || over) && e->ckptQueued.insert(path).second) kick = true;
     }
     if (kick) {
         {
@@ -818,13 +828,23 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
                 e->maintQ.pop_front();
             }
             switch (mt.kind) {
-                case MaintTask::kClose:
+                case MaintTask::kClose: {
+                    // An evicted writer connection: its WAL copied first, so a
+                    // close that is not the file's last leaves nothing behind
+                    // (the last one deletes the WAL).
+                    const char* fn = sqlite3_db_filename(mt.conn->db, "main");
+                    const std::string path = fn ? fn : mt.conn->path;
+                    int log = 0, ck = 0;
+                    const int r = sqlite3_wal_checkpoint_v2(mt.conn->db, nullptr, SQLITE_CHECKPOINT_PASSIVE, &log, &ck);
                     delete mt.conn;
+                    if (!ioExists(path + "-wal")) walNote(e, path, 0);
+                    else if (r == SQLITE_OK) walNote(e, path, log >= ck ? log - ck : 0);
                     break;
+                }
                 case MaintTask::kCheckpoint:
                     {
-                        std::lock_guard<std::mutex> g(gWalMu);
-                        gCkptQueued.erase(mt.path);
+                        std::lock_guard<std::mutex> g(e->walMu);
+                        e->ckptQueued.erase(mt.path);
                     }
                     checkpoint(e, m, mt.path);
                     break;
@@ -840,6 +860,34 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
         const uint64_t now = monoNs();
         if (now - lastTick >= 100ull * 1000 * 1000) {
             lastTick = now;
+            // Over the WAL total with files that no longer commit (their
+            // hook never fires again): the largest WALs, down to half the total.
+            std::vector<std::string> idle;
+            {
+                std::lock_guard<std::mutex> g(e->walMu);
+                if (uint64_t(e->walSum) * 4096 > e->cfg.walTotal) {
+                    std::vector<std::pair<int64_t, std::string>> big;
+                    for (auto& kv : e->walPages)
+                        if (!e->ckptQueued.count(kv.first)) big.push_back({kv.second, kv.first});
+                    std::sort(big.begin(), big.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                    int64_t sum = e->walSum;
+                    for (auto& b2 : big) {
+                        if (uint64_t(sum) * 4096 <= e->cfg.walTotal / 2) break;
+                        sum -= b2.first;
+                        e->ckptQueued.insert(b2.second);
+                        idle.push_back(b2.second);
+                    }
+                }
+            }
+            if (!idle.empty()) {
+                std::lock_guard<std::mutex> g(e->maintMu);
+                for (auto& pth : idle) {
+                    MaintTask mt;
+                    mt.kind = MaintTask::kCheckpoint;
+                    mt.path = pth;
+                    e->maintQ.push_back(mt);
+                }
+            }
             const std::vector<Type*> types = typesWithFiles(e);
             uint64_t pending = 0;
             for (Type* t : types) {
