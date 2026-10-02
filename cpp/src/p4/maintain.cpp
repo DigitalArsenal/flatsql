@@ -208,11 +208,32 @@ std::vector<Feed*> createdFeeds(Type* t) {
     return files;
 }
 
+// A SQLite file's pages less its free pages (SQLite reuses them; pages still
+// in the WAL are counted by page_count). The file's size when it cannot be
+// opened.
+int64_t pagesInUse(Conn* c) {
+    sqlite3_stmt* q = c->sql("SELECT ((SELECT page_count FROM pragma_page_count) - (SELECT freelist_count FROM"
+                             " pragma_freelist_count)) * (SELECT page_size FROM pragma_page_size)");
+    int64_t n = -1;
+    if (q && sqlite3_step(q) == SQLITE_ROW) n = sqlite3_column_int64(q, 0);
+    if (q) sqlite3_reset(q);
+    return n;
+}
+
+int64_t typeFileInUse(const std::string& path) {
+    if (sizeOf(path) == 0) return 0;
+    Conn* c = nullptr;
+    if (openConn(path, OpenKind::IndexReader, 64, 0, &c, nullptr) != SQLITE_OK) return sizeOf(path) + sizeOf(path + "-wal");
+    const int64_t n = pagesInUse(c);
+    delete c;
+    return n >= 0 ? n : sizeOf(path) + sizeOf(path + "-wal");
+}
+
 // Bytes the store occupies. On disk: every file with its WAL and rollback
-// journal (an upper bound, no page counts). In use: each feed file's pages
-// less its free pages (SQLite reuses them; pages still in the WAL are counted
-// by page_count, so the WAL file itself is not added), plus the type files
-// and any rollback journal.
+// journal (an upper bound, no page counts). In use: every file's pages less
+// its free pages (the WAL files are not added), feed files and type files
+// alike (the type index frees its entries' pages as records go, so a quota
+// pass measures what it freed there too), plus any rollback journal.
 int64_t storeBytes(Engine* e, bool inUse) {
     int64_t total = 0;
     for (Type* t : typesWithFiles(e)) {
@@ -228,16 +249,14 @@ int64_t storeBytes(Engine* e, bool inUse) {
                 total += sizeOf(f->path) + sizeOf(f->path + "-wal");
                 continue;
             }
-            sqlite3_stmt* q = c->sql("SELECT ((SELECT page_count FROM pragma_page_count) - (SELECT freelist_count FROM"
-                                     " pragma_freelist_count)) * (SELECT page_size FROM pragma_page_size)");
-            if (q && sqlite3_step(q) == SQLITE_ROW) total += sqlite3_column_int64(q, 0);
-            if (q) sqlite3_reset(q);
+            const int64_t n = pagesInUse(c);
+            total += n >= 0 ? n : sizeOf(f->path) + sizeOf(f->path + "-wal");
             e->rpool.release(c);
         }
-        for (const std::string* p : {&t->pIdx, &t->pJnl, &t->pFts})
-            for (const char* sfx : {"", "-journal"}) total += sizeOf(*p + sfx);
-        if (!inUse)
-            for (const std::string* p : {&t->pIdx, &t->pJnl, &t->pFts}) total += sizeOf(*p + "-wal");
+        for (const std::string* p : {&t->pIdx, &t->pJnl, &t->pFts}) {
+            total += sizeOf(*p + "-journal");
+            total += inUse ? typeFileInUse(*p) : sizeOf(*p) + sizeOf(*p + "-wal");
+        }
     }
     return total;
 }
@@ -348,6 +367,7 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFr
         if (rc != P4_OK) return rc;
         *records += in.a;
         if (in.a == 0) break;
+        ftsCatchUp(e, victim, false);  // the evicted records' full-text rows go before the next measure
         used = storeBytes(e, true);
     }
     *bytesFreed = std::max<int64_t>(0, before - used);
@@ -409,6 +429,31 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         if (s) sqlite3_reset(s);
         sqlite3_wal_hook(c->db, walHook, e);
         t->fts = c;
+    }
+    // Records gone since the last pass (no row in any feed file): their
+    // full-text rows go, for those the full text holds (a record past
+    // ftsThrough was never added, and catching up skips it: no index entry).
+    std::vector<int64_t> gone;
+    {
+        std::lock_guard<std::mutex> gg(t->ftsGoneMu);
+        gone.swap(t->ftsGone);
+    }
+    if (!gone.empty()) {
+        sqlite3_stmt* del = t->fts->sql("DELETE FROM fts WHERE rowid=?1");
+        bool ok = del && t->fts->exec("BEGIN IMMEDIATE") == SQLITE_OK;
+        for (size_t i = 0; ok && i < gone.size(); i++) {
+            if (gone[i] > t->ftsThrough) continue;
+            sqlite3_bind_int64(del, 1, gone[i]);
+            const int r = sqlite3_step(del);
+            sqlite3_reset(del);
+            ok = r == SQLITE_DONE;
+        }
+        if (ok) ok = t->fts->exec("COMMIT") == SQLITE_OK;
+        if (!ok) {
+            if (del) t->fts->exec("ROLLBACK");
+            std::lock_guard<std::mutex> gg(t->ftsGoneMu);  // the next pass retries
+            t->ftsGone.insert(t->ftsGone.end(), gone.begin(), gone.end());
+        }
     }
     const int64_t vis = t->vis.load(std::memory_order_acquire);
     if (t->ftsThrough >= vis) {

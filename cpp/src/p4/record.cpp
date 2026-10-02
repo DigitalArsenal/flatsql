@@ -1031,6 +1031,7 @@ int32_t WriteCtx::indexCommit() {
     }
     int rc = x->exec("BEGIN IMMEDIATE");
     int64_t entries = 0;
+    std::vector<int64_t> gone;  // records left with no row anywhere
     for (RecState* r : order_) {
         if (rc != SQLITE_OK) break;
         if (r->touched.empty() || !r->seq) continue;
@@ -1053,6 +1054,7 @@ int32_t WriteCtx::indexCommit() {
         xCount(xc, &tc);
         rc = xWrite(x, xc);
         entries += int64_t(xc.after.size());
+        if (!xc.before.empty() && xc.after.empty()) gone.push_back(r->seq);
     }
     for (const IdentNew& id : idents) {
         if (rc != SQLITE_OK) break;
@@ -1098,6 +1100,10 @@ int32_t WriteCtx::indexCommit() {
     }
     e->bump(kStIndexFlushes);
     e->bump(kStIndexFlushEntries, uint64_t(entries));
+    if (!gone.empty() && sp->fullText) {
+        std::lock_guard<std::mutex> g(t->ftsGoneMu);
+        t->ftsGone.insert(t->ftsGone.end(), gone.begin(), gone.end());
+    }
     std::lock_guard<std::mutex> g(t->mu);
     typeCountsTo(t, tc);
     if (jlast > 0) t->jcut = jlast;

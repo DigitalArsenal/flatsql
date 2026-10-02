@@ -73,9 +73,14 @@ Result summary1(const std::string& type) {
 }  // namespace
 
 namespace {
-// The kill loop's type: PNM, one file per partition.
+// The kill loop's type: PNM with full text (catching up and the rows of
+// superseded and evicted records deleted, in the background).
 TestType& killType() {
-    static TestType t = pnmLikeType("PNM");
+    static TestType t = [] {
+        TestType x = pnmLikeType("PNM");
+        x.fullText = true;
+        return x;
+    }();
     return t;
 }
 

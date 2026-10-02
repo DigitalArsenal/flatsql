@@ -359,6 +359,10 @@ struct Type {
     struct Conn* fts = nullptr;
     int64_t ftsThrough = 0;
     uint8_t ftsState = 0;  // 0 off, 1 building, 2 ready
+    // Records gone (no row in any feed file) since the full text last caught
+    // up: their full-text rows are deleted by the long-work thread.
+    std::mutex ftsGoneMu;
+    std::vector<int64_t> ftsGone;
 
     // the writer backlog (WriterState::mu of the owner)
     std::deque<WriteTask*> backlog;
