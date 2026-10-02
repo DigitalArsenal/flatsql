@@ -1191,6 +1191,7 @@ P4_SLOW_TEST(reads_bench) {
     const uint64_t t0 = flatsql::ps::monoNs();
     REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
     std::printf("  open %.1f ms (load %.1f)\n", double(flatsql::ps::monoNs() - t0) / 1e6, loadAvg());
+    if (argInt("settle-ms", 0) > 0) flatsql::ps::sleepNs(uint64_t(argInt("settle-ms", 0)) * 1000000ull);  // the start-up work first
     if (argInt("open-only", 0)) {
         closeEngine(600000);
         return;
