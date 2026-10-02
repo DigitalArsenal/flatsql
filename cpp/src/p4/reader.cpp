@@ -20,6 +20,7 @@
 // newest first), else of the type (r_s). EPOCH points take one r_ke seek per
 // object per partition.
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <queue>
 #include <set>
@@ -257,7 +258,11 @@ public:
     };
     // EPOCH point profiles (2 nearest, 3 as_of, 4 forward) through the type's
     // object directory; *handled = false when the scan must answer instead.
-    int32_t epochByObject(int profile, int64_t at, std::map<std::string, EpochPick>* best, bool* handled);
+    // want > 0: only the first `want` objects in the answer's order (the
+    // objects' text order) are needed, each with a pick within maxDelta.
+    // countOnly: only which objects have a pick (the count), not the picks.
+    int32_t epochByObject(int profile, int64_t at, std::map<std::string, EpochPick>* best, bool* handled,
+                          uint64_t want = 0, int64_t maxDelta = 0, bool countOnly = false);
     // The row at (file, seq) with its tags, if it passes the scan's filters:
     // 1, 0, or < 0 status. emit: with every tag and, when the request
     // hydrates, the bytes (the row is output).
@@ -1502,7 +1507,129 @@ int32_t Scan::rowAt(int fi, int64_t seq, Row* out, bool emit, bool hydrate) {
 // best epoch go to the lowest CID (format 1's ranking). Records without an
 // object are their own entities (their CID), read from r_ke's NULL prefix.
 // *handled = false when the scan must answer instead.
-int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, EpochPick>* best, bool* handled) {
+namespace {
+// A file's objects (r_ke's k) in the text order of their names (an integer's
+// decimal digits; text as is), calling object(k) until `offered` reaches
+// want. Integers are walked in decimal-string order by prefix: a prefix's
+// subtree is the prefix itself and, for every length, the range of integers
+// that start with it (one seek each). P4_E_UNSUPPORTED: k holds something
+// else (a negative integer, a real or a blob); the caller walks every object.
+template <class F>
+int32_t objectsInTextOrder(Conn* c, uint64_t want, const uint64_t* offered, F object) {
+    sqlite3_stmt* lo = c->sql("SELECT k FROM r INDEXED BY r_ke WHERE k IS NOT NULL ORDER BY k LIMIT 1");
+    sqlite3_stmt* hi = c->sql("SELECT k FROM r INDEXED BY r_ke WHERE k IS NOT NULL ORDER BY k DESC LIMIT 1");
+    sqlite3_stmt* inRange = c->sql("SELECT 1 FROM r INDEXED BY r_ke WHERE k>=?1 AND k<=?2 LIMIT 1");
+    sqlite3_stmt* textNext = c->sql("SELECT k FROM r INDEXED BY r_ke WHERE k>?1 ORDER BY k LIMIT 1");
+    sqlite3_stmt* textFirst = c->sql("SELECT k FROM r INDEXED BY r_ke WHERE k>='' ORDER BY k LIMIT 1");
+    sqlite3_stmt* lit = c->sql("SELECT ?1");
+    if (!lo || !hi || !inRange || !textNext || !textFirst || !lit) return P4_E_UNSUPPORTED;
+    int typeLo = SQLITE_NULL, typeHi = SQLITE_NULL;
+    int64_t minK = 0, maxK = -1;
+    if (sqlite3_step(lo) == SQLITE_ROW) {
+        typeLo = sqlite3_column_type(lo, 0);
+        minK = sqlite3_column_int64(lo, 0);
+    }
+    sqlite3_reset(lo);
+    if (sqlite3_step(hi) == SQLITE_ROW) typeHi = sqlite3_column_type(hi, 0);
+    sqlite3_reset(hi);
+    if (typeLo == SQLITE_NULL) return P4_OK;  // no object
+    if (typeLo == SQLITE_FLOAT || typeLo == SQLITE_BLOB || typeHi == SQLITE_FLOAT || typeHi == SQLITE_BLOB ||
+        (typeLo == SQLITE_INTEGER && minK < 0))
+        return P4_E_UNSUPPORTED;
+    const bool ints = typeLo == SQLITE_INTEGER;
+    if (ints) {
+        sqlite3_stmt* mx = c->sql("SELECT max(k) FROM r INDEXED BY r_ke WHERE k<=9223372036854775807");
+        if (!mx) return P4_E_UNSUPPORTED;
+        if (sqlite3_step(mx) == SQLITE_ROW) maxK = sqlite3_column_int64(mx, 0);
+        sqlite3_reset(mx);
+    }
+    int32_t rc = P4_OK;
+    auto exists = [&](int64_t a, int64_t b) -> bool {
+        sqlite3_bind_int64(inRange, 1, a);
+        sqlite3_bind_int64(inRange, 2, b);
+        const int r = sqlite3_step(inRange);
+        sqlite3_reset(inRange);
+        if (r != SQLITE_ROW && r != SQLITE_DONE && rc == P4_OK) rc = statusOfSqlite(r);
+        return r == SQLITE_ROW;
+    };
+    // Any integer in prefix q's subtree (q itself or q followed by digits)?
+    auto anyIn = [&](int64_t q) -> bool {
+        if (q > maxK) return false;
+        if (q == 0) return exists(0, 0);
+        __int128 a = q, b = q;
+        while (a <= maxK) {
+            if (exists(int64_t(a), int64_t(b > maxK ? maxK : b))) return true;
+            a *= 10;
+            b = b * 10 + 9;
+        }
+        return false;
+    };
+    // The text-order first existing integer in q's subtree (anyIn(q) holds).
+    std::function<int64_t(int64_t)> first = [&](int64_t q) -> int64_t {
+        if (exists(q, q)) return q;
+        if (q == 0) return -1;
+        for (int d = 0; d <= 9 && rc == P4_OK; d++) {
+            const __int128 cq = __int128(q) * 10 + d;
+            if (cq <= maxK && anyIn(int64_t(cq))) return first(int64_t(cq));
+        }
+        return -1;
+    };
+    // The text-order next existing integer after x (-1: none).
+    auto nextInt = [&](int64_t x) -> int64_t {
+        if (x != 0)
+            for (int d = 0; d <= 9 && rc == P4_OK; d++) {
+                const __int128 cq = __int128(x) * 10 + d;
+                if (cq <= maxK && anyIn(int64_t(cq))) return first(int64_t(cq));
+            }
+        for (int64_t s = x; rc == P4_OK;) {
+            const int64_t parent = s / 10, digit = s % 10;
+            const bool top = s < 10;
+            for (int64_t d = digit + 1; d <= 9 && rc == P4_OK; d++) {
+                const int64_t q = top ? d : parent * 10 + d;
+                if (anyIn(q)) return first(q);
+            }
+            if (top) return -1;
+            s = parent;
+        }
+        return -1;
+    };
+    int64_t iv = -1;
+    if (ints) {
+        for (int64_t d = 0; d <= 9 && iv < 0 && rc == P4_OK; d++)
+            if (anyIn(d)) iv = first(d);
+    }
+    std::string tv;
+    bool haveText = false;
+    auto textAfter = [&](const std::string* after) {
+        sqlite3_stmt* q = after ? textNext : textFirst;
+        if (after) sqlite3_bind_text(q, 1, after->data(), int(after->size()), SQLITE_TRANSIENT);
+        const int r = sqlite3_step(q);
+        haveText = r == SQLITE_ROW && sqlite3_column_type(q, 0) == SQLITE_TEXT;
+        if (haveText) tv.assign(reinterpret_cast<const char*>(sqlite3_column_text(q, 0)), size_t(sqlite3_column_bytes(q, 0)));
+        sqlite3_reset(q);
+        if (r != SQLITE_ROW && r != SQLITE_DONE && rc == P4_OK) rc = statusOfSqlite(r);
+    };
+    textAfter(nullptr);
+    while (rc == P4_OK && *offered < want && (iv >= 0 || haveText)) {
+        const std::string is = iv >= 0 ? std::to_string(iv) : std::string();
+        const bool takeInt = iv >= 0 && (!haveText || is < tv);
+        if (takeInt) sqlite3_bind_int64(lit, 1, iv);
+        else sqlite3_bind_text(lit, 1, tv.data(), int(tv.size()), SQLITE_TRANSIENT);
+        if (sqlite3_step(lit) == SQLITE_ROW) rc = object(sqlite3_column_value(lit, 0));
+        sqlite3_reset(lit);
+        if (rc != P4_OK) break;
+        if (takeInt) iv = nextInt(iv);
+        else {
+            const std::string prev = tv;
+            textAfter(&prev);
+        }
+    }
+    return rc;
+}
+}  // namespace
+
+int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, EpochPick>* best, bool* handled,
+                            uint64_t want, int64_t maxDelta, bool countOnly) {
     *handled = false;
     if (!sp_->ek || !s_.search.empty() || profile < 2 || profile > 4) return P4_OK;
     const int oc = sp_->tc.firstObjectCol();
@@ -1621,7 +1748,38 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
             if (r != SQLITE_ROW && r != SQLITE_DONE) return statusOfSqlite(r);
             return have ? 1 : 0;
         };
+        uint64_t offered = 0;  // objects of this file with a pick within maxDelta
+        // A count with nothing to check on the rows: an object counts when it
+        // has a record in the profile's epoch range (one seek; none at all
+        // for nearest over every epoch when every record has one).
+        const bool existsOnly = countOnly && maxDelta <= 0 && !laneQ && !rowCheck;
+        const int64_t xLo = profile == 4 ? std::max(at, wLo) : wLo, xHi = profile == 3 ? std::min(at, wHi) : wHi;
+        const bool anyRow = existsOnly && profile == 2 && wLo == INT64_MIN && wHi == INT64_MAX && files_[fi].nnull == 0 &&
+                            lo_ <= 0 && hi_ >= files_[fi].maxseq;
+        sqlite3_stmt* hasE = existsOnly && !anyRow ? c->sql(
+            "SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 AND e>=?2 AND e<=?3 AND seq>?4 AND seq<=?5 LIMIT 1") : nullptr;
         auto object = [&](sqlite3_value* k) -> int32_t {
+            if (existsOnly) {
+                bool has = anyRow;
+                if (!has && hasE) {
+                    sqlite3_bind_value(hasE, 1, k);
+                    sqlite3_bind_int64(hasE, 2, xLo);
+                    sqlite3_bind_int64(hasE, 3, xHi);
+                    sqlite3_bind_int64(hasE, 4, lo_);
+                    sqlite3_bind_int64(hasE, 5, hi_);
+                    const int r = sqlite3_step(hasE);
+                    sqlite3_reset(hasE);
+                    if (r != SQLITE_ROW && r != SQLITE_DONE) return statusOfSqlite(r);
+                    has = r == SQLITE_ROW;
+                }
+                L_->rowsExamined++;
+                if (!has) return P4_OK;
+                std::string ent;
+                if (sqlite3_value_type(k) == SQLITE_INTEGER) ent = std::to_string(sqlite3_value_int64(k));
+                else ent.assign(reinterpret_cast<const char*>(sqlite3_value_text(k)), size_t(sqlite3_value_bytes(k)));
+                (*best)[ent] = EpochPick();
+                return check();
+            }
             EpochPick b, a;
             int got = 0;
             if (profile != 4) {
@@ -1640,6 +1798,7 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
             if (sqlite3_value_type(k) == SQLITE_INTEGER) ent = std::to_string(sqlite3_value_int64(k));
             else ent.assign(reinterpret_cast<const char*>(sqlite3_value_text(k)), size_t(sqlite3_value_bytes(k)));
             offer(ent, p);
+            if (maxDelta <= 0 || (p.e > at ? p.e - at : at - p.e) <= maxDelta) offered++;
             return check();
         };
         if (kp) {
@@ -1656,7 +1815,11 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
                 sqlite3_reset(lit);
                 if (rc != P4_OK) break;
             }
+        } else if (want > 0 && (rc = objectsInTextOrder(c, want, &offered, object)) != P4_E_UNSUPPORTED) {
+            // The first `want` objects in the answer's order only (this
+            // file's first `want` hold every one of the answer's).
         } else {
+            rc = P4_OK;
             // Every object: a seek to the next k after each.
             sqlite3_value* k = nullptr;
             int r = sqlite3_step(firstK);
@@ -2916,7 +3079,8 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
     bool handled = false;
     if (rc == P4_OK) {
         std::map<std::string, Scan::EpochPick> viaDir;
-        rc = sc.epochByObject(profile, at, &viaDir, &handled);
+        const uint64_t want = countOnly || !s.limit ? 0 : s.offset + s.limit;
+        rc = sc.epochByObject(profile, at, &viaDir, &handled, want, maxDelta, countOnly != 0);
         if (rc == P4_OK && handled)
             for (auto& kv : viaDir) {
                 Pick p{kv.second.e, kv.second.seq, {}, kv.second.fi, kv.second.pid};

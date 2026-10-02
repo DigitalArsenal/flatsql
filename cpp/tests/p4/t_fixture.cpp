@@ -842,6 +842,24 @@ P4_SLOW_TEST(g3_bench) {
     REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
     CallOpts slow{0, 0, 0, 0, 0, 0, false, 3600000};
 #if !defined(__wasm__)
+    // The WAL while the op runs: the engine's stat and the -wal files on disk.
+    std::atomic<bool> walStop{false};
+    std::atomic<int64_t> walStatMax{0}, walFilesMax{0};
+    std::thread walSampler([&] {
+        while (!walStop.load()) {
+            const std::vector<uint64_t> st = stats();
+            if (st.size() > 19 && int64_t(st[19]) > walStatMax.load()) walStatMax = int64_t(st[19]);
+            int64_t files = 0;
+            std::error_code ec;
+            for (auto it = std::filesystem::recursive_directory_iterator(store + "/fsql4", ec);
+                 !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                const std::string pth = it->path().string();
+                if (pth.size() > 4 && pth.compare(pth.size() - 4, 4, "-wal") == 0) files += int64_t(it->file_size(ec));
+            }
+            if (files > walFilesMax.load()) walFilesMax = files;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
     if (mode == "w01") {
         // Benchset W01's OMM shape: --records (32,015) new OMM records into
         // the fixture's OMM partition (its peer), in --call (4,096) record
@@ -937,6 +955,12 @@ P4_SLOW_TEST(g3_bench) {
         report("w10.files_dropped", double(r.i(0, "files_dropped")), "files");
         report("w10.records_dropped", double(r.i(0, "records_dropped")), "records");
     }
+#if !defined(__wasm__)
+    walStop = true;
+    walSampler.join();
+    report("wal.stat_max", double(walStatMax.load()) / 1048576.0, "MiB");
+    report("wal.files_max", double(walFilesMax.load()) / 1048576.0, "MiB");
+#endif
     if (argInt("exit-dirty", 0)) std::_Exit(0);  // as a kill: WALs left for the next open
     TlvW v8;
     v8.u32(63, 8);
@@ -1296,8 +1320,66 @@ P4_SLOW_TEST(reads_bench) {
         t.text(1, "OMM").u64(3, 50);
         add("R11 INDEX_PAGE OMM page 1", P4_OPC_INDEX_PAGE, t);
     }
+    for (int prof : {2, 3}) {
+        TlvW t;
+        t.text(1, "OMM").u8(30, uint8_t(prof)).i64(31, 1789371001).u8(33, 1);
+        add(std::string("R16 EPOCH OMM count ") + (prof == 2 ? "nearest" : "as_of"), P4_OPC_EPOCH, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u64(3, 2000);
+        add("R16 EPOCH OMM nearest limit=2000", P4_OPC_EPOCH, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM");
+        add("R10 HEAD OMM (no filter)", P4_OPC_HEAD, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").u8(2, 1).u64(3, 100).u64(4, 1000);
+        add("R12 WINDOW OMM off=1000", P4_OPC_WINDOW, t);
+    }
     const std::string only = argStr("only", "");
     CallOpts co{0, 0, 0, 0, 0, 0, false, 600000};
+    if (argInt("check-limit", 0)) {
+        // EPOCH with a limit (and an offset) answers the no-limit answer's
+        // first rows: OMM, MPE and CAT, every point profile.
+        int bad = 0;
+        for (const char* ty : {"OMM", "MPE", "CAT"})
+            for (int prof : {2, 3, 4})
+                for (uint64_t off : {uint64_t(0), uint64_t(137)}) {
+                    TlvW all, lim;
+                    all.text(1, ty).u8(30, uint8_t(prof)).i64(31, 1789371001);
+                    lim.text(1, ty).u8(30, uint8_t(prof)).i64(31, 1789371001).u64(3, 200).u64(4, off);
+                    Result ra = call(P4_OPC_EPOCH, all.b, co), rl = call(P4_OPC_EPOCH, lim.b, co);
+                    bool same = ra.status == P4_OK && rl.status == P4_OK;
+                    size_t want = ra.rows.size() > off ? std::min<size_t>(200, ra.rows.size() - off) : 0;
+                    same = same && rl.rows.size() == want;
+                    for (size_t i = 0; same && i < rl.rows.size(); i++) same = rl.s(i, "cid") == ra.s(i + off, "cid");
+                    std::printf("  %s profile %d offset %llu: %zu of %zu rows %s\n", ty, prof, (unsigned long long)off,
+                                rl.rows.size(), ra.rows.size(), same ? "equal" : "DIFFER");
+                    if (!same) bad++;
+                    if (off) continue;
+                    for (int64_t win : {int64_t(0), int64_t(86400 * 3)}) {
+                        TlvW cnt, rows;
+                        cnt.text(1, ty).u8(30, uint8_t(prof)).i64(31, 1789371001).u8(33, 1);
+                        rows.text(1, ty).u8(30, uint8_t(prof)).i64(31, 1789371001);
+                        if (win) {
+                            cnt.i64(32, win);
+                            rows.i64(32, win);
+                        }
+                        Result rc = call(P4_OPC_EPOCH, cnt.b, co), rr = call(P4_OPC_EPOCH, rows.b, co);
+                        const bool ok = rc.status == P4_OK && rc.rows.size() == 1 && rc.i(0, "n") == int64_t(rr.rows.size());
+                        std::printf("  %s profile %d count (max delta %lld): %lld vs %zu rows %s\n", ty, prof, (long long)win,
+                                    (long long)(rc.rows.empty() ? -1 : rc.i(0, "n")), rr.rows.size(), ok ? "equal" : "DIFFER");
+                        if (!ok) bad++;
+                    }
+                }
+        CHECK_EQ(bad, 0, "EPOCH limit/offset = the full answer's rows");
+        closeEngine(600000);
+        return;
+    }
     if (const long rounds = argInt("burst", 0)) {
         // Open, then every shape at once from its own caller (M01's first
         // reads after open), --burst rounds: every answer must be P4_OK.
