@@ -50,16 +50,19 @@ void checkpoint(Engine* e, MaintState& m, const std::string& path) {
     Conn* c = maintConn(e, m, path);
     if (!c) return;
     int log = 0, ck = 0, prev = -1;
-    for (int pass = 0; pass < 4; pass++) {
+    bool settled = false;  // the last pass found little new: a RESTART copies only a few frames
+    for (int pass = 0; pass < 4 && !settled; pass++) {
         const int r = sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_PASSIVE, &log, &ck);
         e->bump(kStPassive);
         if (r != SQLITE_OK) return;
         walNote(e, path, log >= ck ? log - ck : 0);
         if (log > ck) return;  // a reader holds frames back: nothing to restart yet
-        if (prev >= 0 && log - prev <= 256) break;  // the writer added little during the pass
+        settled = prev >= 0 && log - prev <= 256;
         prev = log;
     }
-    if (log < int(e->cfg.passivePages / 4)) return;  // small WAL: not worth a restart
+    // Still busy (or a small WAL): no restart now, so the writer lock is never
+    // held across a large copy; the next kick tries again.
+    if (!settled || log < int(e->cfg.passivePages / 4)) return;
     if (sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_RESTART, &log, &ck) == SQLITE_OK) {
         e->bump(kStRestart);
         walNote(e, path, log >= ck ? log - ck : 0);
