@@ -173,6 +173,13 @@ else
 fi
 
 cd "$PROJECT_ROOT"
+# The p4 artifact ships with the SQL surface: p4sql's error texts are in it
+# (the engine's weak defaults answer ops 30/31 with P4_E_UNSUPPORTED and carry
+# none of them).
+if ! LC_ALL=C grep -aq "sandbox: not-authorized" "$PROJECT_ROOT/wasm/flatsql-p4-threads.wasm"; then
+    echo "Error: wasm/flatsql-p4-threads.wasm has no SQL surface (cpp/src/p4sql was not built in)"
+    exit 1
+fi
 node scripts/check-wasm-imports.mjs
 node scripts/write-integrity.mjs
 

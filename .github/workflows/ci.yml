@@ -201,13 +201,12 @@ jobs:
         ./build-p4/flatsql_p4_test --test=t_kill --rounds=300 --seed=$GITHUB_RUN_NUMBER
         ./build-p4/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=200 --seed=$GITHUB_RUN_NUMBER
 
-    - name: The SQL surface's suite (format 1 as the oracle)
-      if: hashFiles('cpp/tests/p4sql/CMakeLists.txt') != ''
+    - name: The SQL surface is built in (its engine-backed tests ran in the suite above)
       run: |
-        cmake -S cpp/tests/p4sql -B build-p4sql -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-          -DFLATBUFFERS_DIR=$GITHUB_WORKSPACE/../flatbuffers
-        cmake --build build-p4sql --target flatsql_p4sql_fake_test -j 4
-        ./build-p4sql/flatsql_p4sql_fake_test
+        # The p4 engine ships with the SQL surface: without cpp/src/p4sql its
+        # weak defaults answer ops 30/31 with P4_E_UNSUPPORTED. Fail, never skip.
+        ls cpp/src/p4sql/*.cpp >/dev/null 2>&1 || { echo "::error::cpp/src/p4sql is absent: the p4 engine ships with the SQL surface"; exit 1; }
+        ls cpp/tests/p4sql/*.cpp >/dev/null 2>&1 || { echo "::error::cpp/tests/p4sql has no engine-backed SQL tests"; exit 1; }
 
     - name: Build the wasi-threads artifacts and test commands
       run: bash scripts/build-wasm.sh --ps-tests
