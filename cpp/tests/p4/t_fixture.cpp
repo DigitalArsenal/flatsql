@@ -1293,10 +1293,16 @@ P4_SLOW_TEST(reads_bench) {
         t.text(1, "OMM").text(11, "space-data-network-02").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(2, 1).u64(3, 1000);
         add("R09 SCAN OMM batch b052", P4_OPC_SCAN, t);
     }
+    for (uint64_t off : {uint64_t(0), uint64_t(1000)})
+        for (const char* src : {"celestrak-satcat-csv", "celestrak-satcat"}) {
+            TlvW t;
+            t.text(1, "CAT").text(12, src).u8(2, 1).u64(3, 100).u64(4, off);
+            add(std::string("R14 WINDOW CAT ") + src + " off=" + std::to_string(off), P4_OPC_WINDOW, t);
+        }
     {
         TlvW t;
-        t.text(1, "CAT").text(12, "celestrak-satcat-csv").u8(2, 1).u64(3, 100).u64(4, 1000);
-        add("R14 WINDOW CAT source off=1000", P4_OPC_WINDOW, t);
+        t.text(1, "IQC").text(12, "IQEngine").u8(2, 1).u64(3, 100).u64(4, 1000);
+        add("R14 WINDOW IQC IQEngine off=1000", P4_OPC_WINDOW, t);
     }
     {
         TlvW t;
@@ -1376,6 +1382,37 @@ P4_SLOW_TEST(reads_bench) {
                         if (!ok) bad++;
                     }
                 }
+        // A CID-ordered window under a lane filter = the lane's rows sorted by CID.
+        for (uint64_t off : {uint64_t(0), uint64_t(1500)}) {
+            TlvW all, win;
+            all.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(2, 1).u64(3, 1000000);
+            win.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(5, P4_ORDER_CID).u8(2, 1).u64(3, 1000).u64(4, off);
+            Result ra = call(P4_OPC_SCAN, all.b, co), rw = call(P4_OPC_WINDOW, win.b, co);
+            std::vector<std::string> cids;
+            for (size_t i = 0; i < ra.rows.size(); i++) cids.push_back(ra.s(i, "cid"));
+            std::sort(cids.begin(), cids.end());
+            cids.erase(std::unique(cids.begin(), cids.end()), cids.end());
+            bool same = ra.status == P4_OK && rw.status == P4_OK;
+            const size_t want = cids.size() > off ? std::min<size_t>(1000, cids.size() - off) : 0;
+            same = same && rw.rows.size() == want;
+            for (size_t i = 0; same && i < rw.rows.size(); i++) same = rw.s(i, "cid") == cids[i + off];
+            std::printf("  R13 OMM b052 cid window offset %llu: %zu rows of %zu lane CIDs %s\n", (unsigned long long)off,
+                        rw.rows.size(), cids.size(), same ? "equal" : "DIFFER");
+            if (!same) bad++;
+        }
+        // An unfiltered CID window at an offset = the walk from the start.
+        for (auto tw : {std::make_pair("CAT", uint64_t(60000)), std::make_pair("IQC", uint64_t(100000))}) {
+            TlvW all, win;
+            all.text(1, tw.first).u8(5, P4_ORDER_CID).u8(2, 0).u64(3, tw.second + 200);
+            win.text(1, tw.first).u8(5, P4_ORDER_CID).u8(2, 0).u64(3, 200).u64(4, tw.second);
+            Result ra = call(P4_OPC_WINDOW, all.b, co), rw = call(P4_OPC_WINDOW, win.b, co);
+            bool same = ra.status == P4_OK && rw.status == P4_OK && ra.rows.size() == tw.second + rw.rows.size() &&
+                        rw.rows.size() == 200;
+            for (size_t i = 0; same && i < rw.rows.size(); i++) same = rw.s(i, "cid") == ra.s(i + tw.second, "cid");
+            std::printf("  R13 %s cid window offset %llu: %zu rows %s\n", tw.first, (unsigned long long)tw.second,
+                        rw.rows.size(), same ? "equal" : "DIFFER");
+            if (!same) bad++;
+        }
         CHECK_EQ(bad, 0, "EPOCH limit/offset = the full answer's rows");
         closeEngine(600000);
         return;
@@ -1447,6 +1484,11 @@ P4_SLOW_TEST(reads_bench) {
             st = r.status;
             ex = r.rowsExamined;
             if (sh.op == P4_OPC_HEAD && r.rows.size() == 1 && i == 0) rows = size_t(r.i(0, "n"));
+        }
+        if (!argStr("dump", "").empty() && sh.name.find(argStr("dump", "")) != std::string::npos) {
+            Result r = call(sh.op, sh.t.b, co);
+            for (size_t i = 0; i < r.rows.size(); i++)
+                std::printf("  DUMP %s %s %lld\n", sh.name.c_str(), r.s(i, "cid").c_str(), (long long)r.i(i, "seq"));
         }
         std::vector<double> warm(ms.begin() + 1, ms.end());
         std::sort(warm.begin(), warm.end());

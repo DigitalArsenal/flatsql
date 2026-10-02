@@ -130,6 +130,7 @@ struct FRef {
     int64_t n = 0, minseq = 0, maxseq = 0, minw = 0, maxw = 0, nnull = 0;
     int64_t laneN = 0;  // rows of the filter's lanes
     int64_t laneMin = INT64_MAX, laneMax = 0;  // the filter's lanes' seq bounds here
+    int64_t laneMinW = INT64_MAX, laneMaxW = INT64_MIN;  // and their w bounds
     bool indexed = true;  // secondary indexes present (false before a migration's REBUILD 1)
     std::map<uint32_t, std::string> url0;  // lane id -> url of an instance whose rl.u is NULL
 };
@@ -281,6 +282,7 @@ private:
     int32_t collectCandidates();
     int32_t collectEpochCandidates();
     int32_t collectSourceCandidates();
+    int32_t collectLaneCandidates();
     int32_t fetchCandidates(int fi, bool wOrder);
     bool kDriven_ = false;                    // rows come from object-key candidates
     std::vector<std::vector<int64_t>> cand_;  // per file, ascending seqs
@@ -414,12 +416,19 @@ int32_t Scan::open() {
                 r.laneN += lk.second.n;
                 r.laneMin = std::min(r.laneMin, lk.second.minseq);
                 r.laneMax = std::max(r.laneMax, lk.second.maxseq);
+                r.laneMinW = std::min(r.laneMinW, lk.second.minw);
+                r.laneMaxW = std::max(r.laneMaxW, lk.second.maxw);
             }
             if (s_.lane) {
                 if (r.laneN == 0) continue;  // no instance of the filter's lanes here
-                // The filter's rows lie inside its lanes' seq bounds.
+                // The filter's rows lie inside its lanes' seq and w bounds.
                 r.minseq = std::max(r.minseq, r.laneMin);
                 r.maxseq = std::min(r.maxseq, r.laneMax);
+                if (r.laneMinW <= r.laneMaxW) {
+                    r.minw = std::max(r.minw, r.laneMinW);
+                    r.maxw = std::min(r.maxw, r.laneMaxW);
+                }
+                if (s_.order == P4_ORDER_W_DESC && (r.maxw < s_.wLo || r.minw > s_.wHi)) continue;
             }
             if (s_.order != P4_ORDER_CID && !s_.bound && (r.maxseq <= lo_ || r.minseq > hi_)) continue;
             files_.push_back(std::move(r));
@@ -647,6 +656,7 @@ int32_t Scan::collectCandidates() {
     if (!kp) {
         const int32_t rc = collectEpochCandidates();
         if (rc != P4_OK || kDriven_) return rc;
+        if (s_.order == P4_ORDER_CID) return collectLaneCandidates();
         return collectSourceCandidates();
     }
     if (kp)
@@ -753,6 +763,53 @@ int32_t Scan::collectSourceCandidates() {
         }
         e_->rpool.release(c);
         if (status != P4_OK) return status;
+    }
+    cand_ = std::move(cand);
+    kDriven_ = true;
+    return P4_OK;
+}
+
+// A CID-ordered window under a lane filter: the filter's own seqs from
+// rl_sid inside its lanes' seq bounds (cidStart then reads their CIDs and
+// sorts them), not the type index's whole CID order. Over 200,000 lane rows
+// the type index walk stays.
+int32_t Scan::collectLaneCandidates() {
+    if (!s_.lane || laneIds_.empty() || sids_.empty()) return P4_OK;
+    int64_t total = 0;
+    for (const FRef& fr : files_) {
+        if (!fr.indexed) return P4_OK;
+        total += fr.laneN;
+    }
+    if (total > 200000) return P4_OK;
+    std::string in;
+    if (laneIds_.size() <= 64)
+        for (uint32_t id : laneIds_) in += (in.empty() ? " AND lane IN (" : ",") + std::to_string(id);
+    if (!in.empty()) in += ")";
+    const std::string sql = "SELECT seq FROM rl INDEXED BY rl_sid WHERE sid=?1 AND seq>?2 AND seq<=?3" + in;
+    std::vector<std::vector<int64_t>> cand(files_.size());
+    for (size_t fi = 0; fi < files_.size(); fi++) {
+        const FRef& fr = files_[fi];
+        int rc = 0;
+        Conn* c = e_->rpool.acquire(fr.path, OpenKind::Reader, &rc, nullptr);
+        if (!c) return statusOfSqlite(rc);
+        sqlite3_stmt* q = c->sql(sql);
+        int32_t status = q ? P4_OK : P4_E_INTERNAL;
+        c->exec("BEGIN");
+        for (uint32_t sid : sids_) {
+            if (status != P4_OK) break;
+            sqlite3_bind_int64(q, 1, sid);
+            sqlite3_bind_int64(q, 2, std::max(lo_, fr.minseq - 1));
+            sqlite3_bind_int64(q, 3, std::min(hi_, fr.maxseq));
+            int r;
+            while ((r = sqlite3_step(q)) == SQLITE_ROW) cand[fi].push_back(sqlite3_column_int64(q, 0));
+            sqlite3_reset(q);
+            if (r != SQLITE_DONE) status = statusOfSqlite(r);
+        }
+        c->exec("COMMIT");
+        e_->rpool.release(c);
+        if (status != P4_OK) return status;
+        std::sort(cand[fi].begin(), cand[fi].end());
+        cand[fi].erase(std::unique(cand[fi].begin(), cand[fi].end()), cand[fi].end());
     }
     cand_ = std::move(cand);
     kDriven_ = true;
@@ -1292,8 +1349,13 @@ int32_t Scan::fetchW(int fi) {
     FRef& fr = files_[size_t(fi)];
     if (fc.done) return P4_OK;
     const bool asc = s_.wAsc;
+    // A lane filter: its rows lie inside its lanes' w and seq bounds here.
+    const int64_t wLo = s_.lane ? std::max(s_.wLo, fr.minw) : s_.wLo;
+    const int64_t wHi = s_.lane ? std::min(s_.wHi, fr.maxw) : s_.wHi;
+    const int64_t sLo = s_.lane ? std::max(lo_, fr.minseq - 1) : lo_;
+    const int64_t sHi = s_.lane ? std::min(hi_, fr.maxseq) : hi_;
     if (!fc.started) {
-        fc.resumeW = asc ? (s_.wLo == INT64_MIN ? INT64_MIN : s_.wLo - 1) : (s_.wHi == INT64_MAX ? INT64_MAX : s_.wHi + 1);
+        fc.resumeW = asc ? (wLo == INT64_MIN ? INT64_MIN : wLo - 1) : (wHi == INT64_MAX ? INT64_MAX : wHi + 1);
         fc.resumeSeq = asc ? INT64_MIN : INT64_MIN;
         fc.started = true;
     }
@@ -1307,20 +1369,23 @@ int32_t Scan::fetchW(int fi) {
     const int page = 256;
     std::vector<std::pair<int64_t, int64_t>> ws;  // (w, seq) in scan order
     // Rows of the resume w with a larger seq, then the rows past it.
-    sqlite3_stmt* q = c->sql("SELECT seq FROM r INDEXED BY r_w WHERE w=?1 AND seq>?2 ORDER BY seq");
+    sqlite3_stmt* q = c->sql("SELECT seq FROM r INDEXED BY r_w WHERE w=?1 AND seq>?2 AND seq<=?3 ORDER BY seq");
     if (q && fc.resumeSeq != INT64_MIN) {
         sqlite3_bind_int64(q, 1, fc.resumeW);
-        sqlite3_bind_int64(q, 2, fc.resumeSeq);
+        sqlite3_bind_int64(q, 2, std::max(fc.resumeSeq, sLo));
+        sqlite3_bind_int64(q, 3, sHi);
         while (sqlite3_step(q) == SQLITE_ROW) ws.push_back({fc.resumeW, sqlite3_column_int64(q, 0)});
         sqlite3_reset(q);
     }
-    q = c->sql(asc ? "SELECT w, seq FROM r INDEXED BY r_w WHERE w>?1 AND w<=?2 ORDER BY w ASC, seq ASC LIMIT ?3"
-                   : "SELECT w, seq FROM r INDEXED BY r_w WHERE w<?1 AND w>=?2 ORDER BY w DESC, seq ASC LIMIT ?3");
+    q = c->sql(asc ? "SELECT w, seq FROM r INDEXED BY r_w WHERE w>?1 AND w<=?2 AND seq>?4 AND seq<=?5 ORDER BY w ASC, seq ASC LIMIT ?3"
+                   : "SELECT w, seq FROM r INDEXED BY r_w WHERE w<?1 AND w>=?2 AND seq>?4 AND seq<=?5 ORDER BY w DESC, seq ASC LIMIT ?3");
     if (!q) status = P4_E_INTERNAL;
     else {
         sqlite3_bind_int64(q, 1, fc.resumeW);
-        sqlite3_bind_int64(q, 2, asc ? s_.wHi : s_.wLo);
+        sqlite3_bind_int64(q, 2, asc ? wHi : wLo);
         sqlite3_bind_int64(q, 3, page);
+        sqlite3_bind_int64(q, 4, sLo);
+        sqlite3_bind_int64(q, 5, sHi);
         int r;
         int got = 0;
         while ((r = sqlite3_step(q)) == SQLITE_ROW) {
@@ -1332,9 +1397,10 @@ int32_t Scan::fetchW(int fi) {
         // Finish the last w group, so a group never spans pages.
         if (status == P4_OK && got == page) {
             const int64_t lw = ws.back().first, ls = ws.back().second;
-            sqlite3_stmt* g = c->sql("SELECT seq FROM r INDEXED BY r_w WHERE w=?1 AND seq>?2 ORDER BY seq");
+            sqlite3_stmt* g = c->sql("SELECT seq FROM r INDEXED BY r_w WHERE w=?1 AND seq>?2 AND seq<=?3 ORDER BY seq");
             sqlite3_bind_int64(g, 1, lw);
             sqlite3_bind_int64(g, 2, ls);
+            sqlite3_bind_int64(g, 3, sHi);
             while (sqlite3_step(g) == SQLITE_ROW) ws.push_back({lw, sqlite3_column_int64(g, 0)});
             sqlite3_reset(g);
         }
@@ -1964,6 +2030,36 @@ int32_t Scan::cidStart() {
         const int c = std::memcmp(a.key, b.key, 32);
         return c ? c < 0 : a.pid < b.pid;
     });
+    const bool simple = !s_.lane && s_.preds.empty() && !s_.hasPeer && !s_.eNull && !s_.eNotNull && !fts_ &&
+                        !s_.hasProducer;
+    bool quarantine = false;
+    {
+        std::lock_guard<std::mutex> g(t_->mu);
+        for (auto& p : t_->parts) quarantine = quarantine || (p->created && p->quarantined);
+    }
+    if (simple && s_.offset > 0 && cidPend_.empty() && !quarantine) {
+        // An unfiltered window's offset with nothing pending: the type
+        // index skips it (whole CIDs, copies once) and the walk starts at
+        // the first CID of the page.
+        int32_t rc = P4_OK;
+        Conn* x = indexReader(L_, t_, &rc);
+        if (!x) return rc;
+        sqlite3_stmt* q = x->sql("SELECT cid FROM c GROUP BY cid ORDER BY cid LIMIT 1 OFFSET ?1");
+        if (!q) return P4_E_INTERNAL;
+        sqlite3_bind_int64(q, 1, int64_t(s_.offset));
+        const int r = sqlite3_step(q);
+        if (r == SQLITE_ROW && sqlite3_column_bytes(q, 0) == 32) {
+            std::memcpy(cidIdxKey_, sqlite3_column_blob(q, 0), 32);
+            cidIdxPid_ = 0;  // (cid, pid) > (cid, 0): every copy of it
+            skipped_ = s_.offset;
+        } else if (r == SQLITE_DONE) {
+            cidIdxDone_ = true;  // the offset is past the end
+            skipped_ = s_.offset;
+        }
+        sqlite3_reset(q);
+        if (r != SQLITE_ROW && r != SQLITE_DONE) return statusOfSqlite(r);
+        L_->rowsExamined += s_.offset;
+    }
     return P4_OK;
 }
 
