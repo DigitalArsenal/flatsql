@@ -626,6 +626,60 @@ int32_t Scan::open() {
 // e). The candidates are rechecked by rowMatches. A COL0 equality inside OMM's
 // 400,000 bound reads its object's rows, not the window (R17/R19); an
 // exact-CID HEAD is one probe, not a type scan.
+namespace {
+// For a LIKE '%<digits>%' over a file whose object keys are all non-negative
+// integers: the key ranges holding every integer whose decimal digits contain
+// <digits> (at most 4,096 ranges). false: not that shape; the LIKE runs.
+bool digitRanges(Conn* c, const ps::rb1::Cell& pat, std::vector<std::pair<int64_t, int64_t>>* out) {
+    if (pat.type != ps::rb1::kText || pat.s.size() < 3 || pat.s.front() != '%' || pat.s.back() != '%') return false;
+    const std::string d = pat.s.substr(1, pat.s.size() - 2);
+    if (d.empty() || d.size() > 18) return false;
+    for (char ch : d)
+        if (ch < '0' || ch > '9') return false;
+    sqlite3_stmt* lo = c->sql("SELECT k FROM r INDEXED BY r_ke WHERE k IS NOT NULL ORDER BY k LIMIT 1");
+    sqlite3_stmt* hi = c->sql("SELECT k FROM r INDEXED BY r_ke WHERE k IS NOT NULL ORDER BY k DESC LIMIT 1");
+    if (!lo || !hi) return false;
+    bool ok = false;
+    int64_t maxK = 0;
+    if (sqlite3_step(lo) == SQLITE_ROW) ok = sqlite3_column_type(lo, 0) == SQLITE_INTEGER && sqlite3_column_int64(lo, 0) >= 0;
+    sqlite3_reset(lo);
+    if (ok && sqlite3_step(hi) == SQLITE_ROW) {
+        ok = sqlite3_column_type(hi, 0) == SQLITE_INTEGER;
+        maxK = sqlite3_column_int64(hi, 0);
+    } else {
+        ok = false;
+    }
+    sqlite3_reset(hi);
+    if (!ok) return false;  // no key, or a text / real / blob key
+    const int n = int(d.size());
+    const int maxLen = int(std::to_string(maxK).size());
+    int64_t dv = 0;
+    for (char ch : d) dv = dv * 10 + (ch - '0');
+    std::vector<std::pair<int64_t, int64_t>> rs;
+    auto p10 = [](int e) {
+        int64_t v = 1;
+        while (e-- > 0) v *= 10;
+        return v;
+    };
+    for (int len = n; len <= maxLen; len++)
+        for (int pre = 0; pre + n <= len; pre++) {
+            const int suf = len - pre - n;
+            if (pre == 0 && d[0] == '0' && len > 1) continue;  // no leading zero
+            const int64_t span = p10(suf);
+            const int64_t pLo = pre == 0 ? 0 : p10(pre - 1), pHi = pre == 0 ? 0 : p10(pre) - 1;
+            for (int64_t P = pLo; P <= pHi; P++) {
+                const __int128 base = (__int128(P) * p10(n) + dv) * span;
+                if (base > maxK) break;
+                if (rs.size() >= 4096) return false;
+                const __int128 top = base + span - 1;
+                rs.push_back({int64_t(base), int64_t(top > maxK ? maxK : top)});
+            }
+        }
+    *out = std::move(rs);
+    return true;
+}
+}  // namespace
+
 int32_t Scan::collectCandidates() {
     if (files_.empty()) return P4_OK;
     if (s_.hasCid) {
@@ -710,8 +764,27 @@ int32_t Scan::collectCandidates() {
                 collect();
             }
         } else if (like) {
-            bindCell(q, 1, kp->vals[0]);
-            collect();
+            // '%<digits>%' over integer objects: the integers that contain
+            // the digits, as key ranges (one seek each), not a LIKE over
+            // every key. A text object key means a NULL col0 (no match).
+            std::vector<std::pair<int64_t, int64_t>> ranges;
+            if (digitRanges(c, kp->vals[0], &ranges)) {
+                sqlite3_stmt* rq = c->sql("SELECT seq FROM r INDEXED BY r_ke WHERE k>=?1 AND k<=?2 AND seq>?3 AND seq<=?4");
+                if (!rq) status = P4_E_INTERNAL;
+                for (size_t i = 0; status == P4_OK && i < ranges.size(); i++) {
+                    sqlite3_bind_int64(rq, 1, ranges[i].first);
+                    sqlite3_bind_int64(rq, 2, ranges[i].second);
+                    sqlite3_bind_int64(rq, 3, lo_);
+                    sqlite3_bind_int64(rq, 4, hi_);
+                    int r;
+                    while ((r = sqlite3_step(rq)) == SQLITE_ROW) out.push_back(sqlite3_column_int64(rq, 0));
+                    sqlite3_reset(rq);
+                    if (r != SQLITE_DONE) status = statusOfSqlite(r);
+                }
+            } else {
+                bindCell(q, 1, kp->vals[0]);
+                collect();
+            }
         } else {
             if (hasLo) bindCell(q, 1, kp->vals[0]);
             if (hasHi) bindCell(q, 2, kp->vals[kp->op == P4_OP_BETWEEN ? 1 : 0]);
