@@ -43,13 +43,14 @@ const char* kFileSchema =
 // the seqs alone, 12 B a row, for newest-N cuts and oldest-first quota);
 // source newest-first (rl_sid); object + epoch (r_ke: one seek per object for
 // EPOCH nearest / as_of / forward, object predicates, CAT supersede); epoch
-// windows (r_w on w = coalesce(e, ts)). The type index is the one CID index
-// (C-34): a file keeps none.
+// windows (r_w on w = coalesce(e, ts), then the CID: a window's equal-w
+// group is in its CID order in the index, so a page reads only its own rows).
+// The type index is the one CID index (C-34): r_w is no CID lookup.
 int32_t fileCreateIndexes(Type* t, Conn* c) {
     std::shared_ptr<const Spec> sp = t->spec();
     std::string ddl =
         "BEGIN IMMEDIATE;"
-        "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC);"
+        "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC, cid);"
         "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
         "CREATE INDEX IF NOT EXISTS rl_sid ON rl(sid, seq);";
     if (sp->hasObject) ddl += "CREATE INDEX IF NOT EXISTS r_ke ON r(k, e);";

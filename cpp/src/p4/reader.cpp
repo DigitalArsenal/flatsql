@@ -155,6 +155,8 @@ struct Row {
     std::vector<TagInst> tags;
     int sel = -1;  // the matched tag (index into tags)
     bool ftsHit = true;  // a full-text search matched it (set per page)
+    bool loaded = true;  // false: an index entry only (seq, w, key, fi), its row not read yet
+    bool tried = false;  // an entry whose row was read and is gone or does not match
 };
 
 struct Spec2 {
@@ -307,6 +309,14 @@ private:
     int32_t nextW(Row** out);
     int32_t wSkip();       // an unfiltered W window's offset, counted in r_w (index only)
     bool wSkipped_ = false;
+    // W merge: the current w group's entries in (CID, pid) order, resolved
+    // into rows a chunk at a time (resolveGroup).
+    int32_t resolveGroup();
+    std::vector<Row> gEnt_;
+    size_t gAt_ = 0;
+    bool gTaken_ = false;
+    uint8_t gTakenKey_[32] = {};
+    bool entryOnly_ = false;  // no filter needs the row: an offset is skipped on entries alone
     int32_t nextCid(Row** out);
     int32_t check();
 
@@ -322,7 +332,11 @@ private:
     std::unordered_set<uint32_t> sids_;     // their sources
     std::string srcSql_[2];                 // one source: its seqs from rl_sid (asc, desc); empty otherwise
     std::string laneSql_;                   // 1 row when seq ?1 has a tag of the filter (empty: read the row)
-    int32_t laneKeep(Conn* c, std::vector<std::pair<int64_t, int64_t>>* ws);
+    struct WEnt {
+        int64_t w, seq;
+        uint8_t key[32];
+    };
+    int32_t laneKeep(Conn* c, std::vector<WEnt>* ws);
     int64_t vis_ = 0, lo_ = 0, hi_ = 0;     // seq range (lo exclusive, hi inclusive)
     std::vector<int> order_;                // files in opening order
     size_t nextOpen_ = 0;
@@ -482,6 +496,9 @@ int32_t Scan::open() {
         }
         if (!laneSql_.empty()) laneSql_ += " LIMIT 1";
     }
+    // Only the lane filter, checked on rl's key per entry (laneKeep), or none.
+    entryOnly_ = s_.preds.empty() && !s_.hasCid && !s_.hasPeer && s_.search.empty() && !s_.eNotNull && !s_.eNull &&
+                 (!s_.lane || !laneSql_.empty());
     cur_.resize(files_.size());
     order_.resize(files_.size());
     for (size_t i = 0; i < files_.size(); i++) order_[i] = int(i);
@@ -1431,7 +1448,10 @@ int32_t Scan::nextSeq(Row** out) {
     }
 }
 
-// One page of a file in w order (descending, or ascending for EPOCH windows).
+// One page of a file in w order (descending, or ascending for EPOCH windows):
+// the index entries (w, CID, seq) of whole w groups, no row (nextW reads the
+// rows it needs). r_w is (w DESC, cid): a group's entries are read from the
+// index alone.
 int32_t Scan::fetchW(int fi) {
     if (kDriven_) return fetchCandidates(fi, true);
     FileCur& fc = cur_[size_t(fi)];
@@ -1445,7 +1465,6 @@ int32_t Scan::fetchW(int fi) {
     const int64_t sHi = s_.lane ? std::min(hi_, fr.maxseq) : hi_;
     if (!fc.started) {
         fc.resumeW = asc ? (wLo == INT64_MIN ? INT64_MIN : wLo - 1) : (wHi == INT64_MAX ? INT64_MAX : wHi + 1);
-        fc.resumeSeq = asc ? INT64_MIN : INT64_MIN;
         fc.started = true;
     }
     int rc = 0;
@@ -1456,18 +1475,18 @@ int32_t Scan::fetchW(int fi) {
     c->exec("BEGIN");
     int32_t status = P4_OK;
     const int page = 256;
-    std::vector<std::pair<int64_t, int64_t>> ws;  // (w, seq) in scan order
-    // Rows of the resume w with a larger seq, then the rows past it.
-    sqlite3_stmt* q = c->sql("SELECT seq FROM r INDEXED BY r_w WHERE w=?1 AND seq>?2 AND seq<=?3 ORDER BY seq");
-    if (q && fc.resumeSeq != INT64_MIN) {
-        sqlite3_bind_int64(q, 1, fc.resumeW);
-        sqlite3_bind_int64(q, 2, std::max(fc.resumeSeq, sLo));
-        sqlite3_bind_int64(q, 3, sHi);
-        while (sqlite3_step(q) == SQLITE_ROW) ws.push_back({fc.resumeW, sqlite3_column_int64(q, 0)});
-        sqlite3_reset(q);
-    }
-    q = c->sql(asc ? "SELECT w, seq FROM r INDEXED BY r_w WHERE w>?1 AND w<=?2 AND seq>?4 AND seq<=?5 ORDER BY w ASC, seq ASC LIMIT ?3"
-                   : "SELECT w, seq FROM r INDEXED BY r_w WHERE w<?1 AND w>=?2 AND seq>?4 AND seq<=?5 ORDER BY w DESC, seq ASC LIMIT ?3");
+    std::vector<WEnt> ws;  // in w order
+    auto take = [&](sqlite3_stmt* q, int col0, const int64_t* w) {
+        if (sqlite3_column_bytes(q, col0 + 1 - (w ? 1 : 0)) != 32) return;
+        WEnt e;
+        e.w = w ? *w : sqlite3_column_int64(q, col0);
+        const int kc = w ? col0 : col0 + 1;
+        std::memcpy(e.key, sqlite3_column_blob(q, kc), 32);
+        e.seq = sqlite3_column_int64(q, kc + 1);
+        ws.push_back(e);
+    };
+    sqlite3_stmt* q = c->sql(asc ? "SELECT w, cid, seq FROM r INDEXED BY r_w WHERE w>?1 AND w<=?2 AND seq>?4 AND seq<=?5 ORDER BY w ASC LIMIT ?3"
+                                 : "SELECT w, cid, seq FROM r INDEXED BY r_w WHERE w<?1 AND w>=?2 AND seq>?4 AND seq<=?5 ORDER BY w DESC LIMIT ?3");
     if (!q) status = P4_E_INTERNAL;
     else {
         sqlite3_bind_int64(q, 1, fc.resumeW);
@@ -1478,59 +1497,77 @@ int32_t Scan::fetchW(int fi) {
         int r;
         int got = 0;
         while ((r = sqlite3_step(q)) == SQLITE_ROW) {
-            ws.push_back({sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 1)});
+            take(q, 0, nullptr);
             got++;
         }
         sqlite3_reset(q);
         if (r != SQLITE_DONE) status = statusOfSqlite(r);
-        // Finish the last w group, so a group never spans pages.
-        if (status == P4_OK && got == page) {
-            const int64_t lw = ws.back().first, ls = ws.back().second;
-            sqlite3_stmt* g = c->sql("SELECT seq FROM r INDEXED BY r_w WHERE w=?1 AND seq>?2 AND seq<=?3 ORDER BY seq");
-            sqlite3_bind_int64(g, 1, lw);
-            sqlite3_bind_int64(g, 2, ls);
-            sqlite3_bind_int64(g, 3, sHi);
-            while (sqlite3_step(g) == SQLITE_ROW) ws.push_back({lw, sqlite3_column_int64(g, 0)});
-            sqlite3_reset(g);
+        // The last w group whole (it may go past the page): read again.
+        if (status == P4_OK && got == page && !ws.empty()) {
+            const int64_t lw = ws.back().w;
+            while (!ws.empty() && ws.back().w == lw) ws.pop_back();
+            sqlite3_stmt* g = c->sql("SELECT cid, seq FROM r INDEXED BY r_w WHERE w=?1 AND seq>?2 AND seq<=?3");
+            if (!g) status = P4_E_INTERNAL;
+            else {
+                sqlite3_bind_int64(g, 1, lw);
+                sqlite3_bind_int64(g, 2, sLo);
+                sqlite3_bind_int64(g, 3, sHi);
+                while ((r = sqlite3_step(g)) == SQLITE_ROW) take(g, 0, &lw);
+                sqlite3_reset(g);
+                if (r != SQLITE_DONE) status = statusOfSqlite(r);
+            }
         }
         if (status == P4_OK && got < page) fc.done = true;
     }
     if (status == P4_OK && !ws.empty()) {
-        fc.resumeW = ws.back().first;
-        fc.resumeSeq = ws.back().second;
-        // A lane filter: only the seqs with a matching tag are read.
+        fc.resumeW = ws.back().w;
+        // A lane filter: only the seqs with a matching tag are kept.
         if (!laneSql_.empty()) status = laneKeep(c, &ws);
     }
-    if (status == P4_OK && !ws.empty()) {
+    // A filter on the rows: the page's rows now, in this read transaction
+    // (each checked); else entries only.
+    std::unordered_map<int64_t, Row*> bySeq;
+    std::deque<Row> rows;
+    if (status == P4_OK && !entryOnly_ && !ws.empty()) {
         std::vector<int64_t> seqs;
-        for (auto& x : ws) seqs.push_back(x.second);
-        std::vector<int64_t> asc2 = seqs;
-        std::sort(asc2.begin(), asc2.end());
-        std::deque<Row> rows;
-        status = loadRows(c, fi, asc2, &rows);
+        for (const WEnt& e : ws) seqs.push_back(e.seq);
+        std::sort(seqs.begin(), seqs.end());
+        status = loadRows(c, fi, seqs, &rows);
         if (status == P4_OK) status = loadTags(c, fi, rows);
-        if (status == P4_OK) {
-            std::unordered_map<int64_t, Row*> bySeq;
-            for (auto& rw : rows) bySeq[rw.seq] = &rw;
-            for (auto& x : ws) {
-                auto it = bySeq.find(x.second);
-                if (it != bySeq.end()) fc.rows.push_back(std::move(*it->second));
-            }
-        }
+        for (Row& r : rows) bySeq[r.seq] = &r;
     }
     c->exec("COMMIT");
     e_->rpool.release(c);
-    return status;
+    if (status != P4_OK) return status;
+    for (const WEnt& e : ws) {
+        if (!entryOnly_) {
+            auto it = bySeq.find(e.seq);
+            if (it == bySeq.end()) continue;  // gone
+            Row& r = *it->second;
+            r.tried = !rowMatches(r);
+            r.loaded = !r.tried;
+            fc.rows.push_back(std::move(r));
+            continue;
+        }
+        Row r;
+        r.seq = e.seq;
+        r.w = e.w;
+        std::memcpy(r.key, e.key, 32);
+        r.fi = fi;
+        r.loaded = false;
+        fc.rows.push_back(std::move(r));
+    }
+    return P4_OK;
 }
 
 // Keeps the (w, seq) entries whose seq has a tag of the filter (one probe of
 // rl's key each); the others count as examined.
-int32_t Scan::laneKeep(Conn* c, std::vector<std::pair<int64_t, int64_t>>* ws) {
+int32_t Scan::laneKeep(Conn* c, std::vector<WEnt>* ws) {
     sqlite3_stmt* q = c->sql(laneSql_);
     if (!q) return P4_E_INTERNAL;
     size_t k = 0;
     for (size_t i = 0; i < ws->size(); i++) {
-        sqlite3_bind_int64(q, 1, (*ws)[i].second);
+        sqlite3_bind_int64(q, 1, (*ws)[i].seq);
         const int r = sqlite3_step(q);
         sqlite3_reset(q);
         if (r != SQLITE_ROW && r != SQLITE_DONE) return statusOfSqlite(r);
@@ -1703,6 +1740,15 @@ int32_t Scan::nextW(Row** out) {
         }
         group_.clear();
         groupAt_ = 0;
+        if (s_.limit && emitted_ >= s_.limit) return 0;
+        if (gAt_ < gEnt_.size()) {
+            rc = resolveGroup();
+            if (rc != P4_OK) return rc;
+            continue;
+        }
+        gEnt_.clear();
+        gAt_ = 0;
+        gTaken_ = false;
         // The next w across files; open files lazily by their w range.
         auto headW = [&](int fi) { return cur_[size_t(fi)].rows.front().w; };
         int64_t top = 0;
@@ -1752,23 +1798,71 @@ int32_t Scan::nextW(Row** out) {
             if (c) return c < 0;
             return files_[size_t(a.fi)].pid < files_[size_t(b.fi)].pid;
         });
-        // Copies are adjacent (CID order): one row per CID, the lowest pid
-        // that matches; a copy of a skipped (offset) CID is skipped with it.
-        bool taken = false;
-        uint8_t takenKey[32];
-        for (size_t i = 0; i < g.size(); i++) {
+        gEnt_ = std::move(g);
+    }
+}
+
+// The current w group's next entries into group_. Copies are adjacent (CID
+// order): one row per CID, the lowest pid that matches; a copy of a skipped
+// (offset) CID is skipped with it. With no filter on the rows the offset is
+// skipped on the entries; then a chunk's rows are read (one read transaction
+// per file) and checked.
+int32_t Scan::resolveGroup() {
+    if (entryOnly_)
+        while (gAt_ < gEnt_.size() && skipped_ < s_.offset) {
+            const Row& e = gEnt_[gAt_++];
             L_->rowsExamined++;
-            if (taken && std::memcmp(takenKey, g[i].key, 32) == 0) continue;
-            if (!rowMatches(g[i])) continue;
-            std::memcpy(takenKey, g[i].key, 32);
-            taken = true;
-            if (skipped_ < s_.offset) {
-                skipped_++;
-                continue;
+            if (gTaken_ && std::memcmp(gTakenKey_, e.key, 32) == 0) continue;
+            std::memcpy(gTakenKey_, e.key, 32);
+            gTaken_ = true;
+            skipped_++;
+        }
+    size_t want = 256;
+    if (s_.limit && skipped_ >= s_.offset) want = size_t(std::min<uint64_t>(256, std::max<uint64_t>(16, s_.limit - emitted_)));
+    const size_t end = std::min(gEnt_.size(), gAt_ + want);
+    // The rows to read: this chunk's, then (small groups: a page at a time)
+    // the files' next queued entries, up to `want` in all.
+    std::map<int, std::vector<Row*>> need;
+    size_t n = 0;
+    for (size_t i = gAt_; i < end; i++)
+        if (!gEnt_[i].loaded && !gEnt_[i].tried) {
+            need[gEnt_[i].fi].push_back(&gEnt_[i]);
+            n++;
+        }
+    if (n > 0)
+        for (int fi : heap_)
+            for (Row& e : cur_[size_t(fi)].rows) {
+                if (n >= want) break;
+                if (e.loaded || e.tried) continue;
+                need[fi].push_back(&e);
+                n++;
             }
-            group_.push_back(std::move(g[i]));
+    for (auto& kv : need) {
+        std::vector<int64_t> seqs;
+        for (Row* e : kv.second) seqs.push_back(e->seq);
+        std::unordered_map<int64_t, Row> rows;  // the rows that pass the filters
+        const int32_t rc = rowsAt(kv.first, std::move(seqs), &rows, false, false);
+        if (rc != P4_OK) return rc;
+        for (Row* e : kv.second) {
+            auto it = rows.find(e->seq);
+            if (it == rows.end()) e->tried = true;  // gone, or it does not match
+            else *e = std::move(it->second);
         }
     }
+    for (; gAt_ < end; gAt_++) {
+        Row& r = gEnt_[gAt_];
+        L_->rowsExamined++;
+        if (gTaken_ && std::memcmp(gTakenKey_, r.key, 32) == 0) continue;
+        if (!r.loaded) continue;
+        std::memcpy(gTakenKey_, r.key, 32);
+        gTaken_ = true;
+        if (skipped_ < s_.offset) {
+            skipped_++;
+            continue;
+        }
+        group_.push_back(std::move(r));
+    }
+    return P4_OK;
 }
 
 int32_t Scan::rowAt(int fi, int64_t seq, Row* out, bool emit, bool hydrate) {
