@@ -1,15 +1,21 @@
-# FlatSQL store format 4: one SQLite file per partition
+# FlatSQL store format 4: one SQLite file per source feed x standard
 
-Store format 4 keeps each partition's records in one SQLite file. A partition
-is one producer and one record type. SQLite 3.53.4 is unmodified: only the
-VFS, WAL and configuration are FlatSQL's. The engine is `cpp/src/p4`; it ships
-as `wasm/flatsql-p4-threads.wasm` (wasm32-wasip1-threads).
+Store format 4 keeps each standard's records in one SQLite file per source
+feed. A feed is a record's (provider, source) tag pair, for example
+`OMM/space-data-network-02@celestrak-gp.db`; a record with no source lives in
+`<TYPE>/local.db`. SQLite 3.53.4 is unmodified: only the VFS, WAL and
+configuration are FlatSQL's. The engine is `cpp/src/p4`; it ships as
+`wasm/flatsql-p4-threads.wasm` (wasm32-wasip1-threads).
 
 - **Design:** the stack's `docs/architecture/flatsql-sqlite-partitions.md`,
-  with its owner revision of 2026-10-01.
-- **Interfaces:** the build-out contract (`CONTRACT.md`, version 11):
+  with its owner revisions of 2026-10-01 and 2026-10-02.
+- **Interfaces:** the build-out contract (`CONTRACT.md`, version 15; C-37 is
+  this layout):
   - the ABI in `cpp/include/flatsql/p4/flatsql_p4.h`;
   - the reader API for the SQL surface in `cpp/include/flatsql/p4/p4_reader.h`.
+  Both are unchanged by the feed layout: a PUT's tag names its feed file, and
+  the lane-style summaries are answered from each feed file's instance
+  counters.
 
 This file records what was built, how to run it, and what was measured.
 
@@ -21,378 +27,287 @@ This file records what was built, how to run it, and what was measured.
   MIGRATED              40 B, magic FSQM, format 4
   T/TYPES               the registered types (crc'd records)
   T/<TYPE>.spec         the registered spec TLV (C-5); a reopen serves before re-registration
-  T/<TYPE>.idx          the type index (derived; rebuilt from the files)
+  T/<TYPE>.idx          the type index (derived from the feed files)
   T/<TYPE>.jnl          the intent journal
   T/<TYPE>.fts          full text (FTS5, contentless-delete; background)
-  P/<TYPE>/<pid>.db     the partition's one file, for its life
+  P/<TYPE>/<feed>.db    one file per source feed of the type; local.db for records with no source
 ```
 
-- **Partition:** (type, producer token). The token comes from the peer (C-13).
-- **No months and no generations** (C-32). A partition never changes or
-  drops its file. An emptied partition keeps its file, and SQLite reuses the
-  free pages.
+- **A feed file is the feed.** Its provider and source are in its `meta` and
+  in the type index's `feed` table; no row holds a provider or source
+  string. The file name is the provider and source, URL-escaped outside
+  `[A-Za-z0-9._-]` and joined by `@`; a name that would collide with another
+  feed's on a case-insensitive file system, or is long, carries the feed id.
+- **The same record from two feeds is a row in each feed's file**, under one
+  seq (dedupe is per type: one seq per CID).
 - **Lazy type files:** a type's `.idx`, `.jnl` and `.fts` are made by its
-  first write. A registered type without data has only its `.spec`, so an
-  open costs O(types with data).
+  first write. A registered type without data has only its `.spec`.
 
 ## 2. Files
 
-**Partition file.**
-- Tables:
-  - `meta`: format, type, producer, peer, pid, ix, the counters, and `nobj` (the
-    file's distinct objects, files with `r_ke`) and `wh` = 1 (the histogram is kept);
-  - `wh(b, n)`: the rows with an epoch per hour (`b` = floor(e / 3600));
-  - `src` and `lane`: a lane is format 1's tag key (C-3), with its counters;
-  - `r(seq PK, cid, e, k, ts, p, f, s, x, d, w)`, where `w` = `coalesce(e, ts)`;
-  - tag instances `rl(sid, seq, lane, at, u)`, WITHOUT ROWID, keyed
-    `(seq, sid, lane)`.
+**Feed file.**
+
+`r(rid, seq, n, b, c, u, at, cid, e, k, ts, f, x, d, w)`, one row per
+delivery of a record to the feed:
+
+| Column | Meaning |
+|---|---|
+| `rid` | `seq << 16 \| j`: a record's rows are one rowid range, in arrival order |
+| `seq` | the type-wide arrival number (the datasync cursor); every row of a record has it |
+| `n` | the publishing node: `node(id, producer, peer)`, the copy's producer token and peer |
+| `b` | the batch: `batch(id, batch, ppeer, pkey)`, format 1's summary key inside the feed (0 on local rows) |
+| `c`, `u` | the content key and the url: `ckey(id, ckey)`, `url(id, url)` (0 = "") |
+| `at` | when this feed delivered it (format 1's tag `created_at`) |
+| `cid`, `e`, `k`, `ts` | the CID, epoch, object key and source timestamp |
+| `d`, `x`, `f` | the record bytes verbatim (sealed bytes when sealed), the signature, a sealed record's extracted COL values |
+| `w` | `coalesce(e, ts)` (virtual) |
+
+A record's rows are its copies x its instances: every copy (producer token)
+of the record appears with every one of its instances (batch, content key,
+producer peer and key) in each feed it has. A batch supersede of one feed
+file therefore never loses a copy the record keeps through another feed, and
+a record with no instance has one row per copy in `local.db`.
 
 | Index | Purpose |
 |---|---|
-| the rowid and `r_s(seq)` | arrival: the datasync cursor; newest-N cuts and oldest-first quota read `r_s`, not the records' pages |
-| `rl_sid(sid, seq)` | source, newest first: `<TYPE>@<source>`, source pages, supersede |
-| `r_ke(k, e)` | object and epoch: EPOCH points, object predicates, CAT supersede |
-| `r_w(w DESC, cid)` | epoch windows (`w DESC`, ties in CID order, in the index: a window reads only its page's rows); epoch-day and epoch-range reads |
+| `r_s(seq)` | arrival: the newest-N cut of `<TYPE>@<source>` (C-31) and the one-feed datasync walk, without the rows' pages |
+| `r_c(cid)` | CID order inside a feed |
+| `r_ke(k, e)` | object and epoch: EPOCH nearest / as_of / forward per object, object predicates, CAT supersede |
+| `r_w(w DESC, cid)` | epoch windows, ties in CID order |
+| `r_b(b)` | batch supersede and batch-filtered reads |
 
-There is no per-file CID index (C-34): the type index's `c` is the one CID
-index (lookup, dedupe, CID-ordered windows, REBUILD 2).
+Also `inst(b, c, n, bytes, ...)`: each instance's records (each once), their
+bytes (each record's smallest copy) and format 1's summary times (`first`,
+`updated`, `maxat`, url), and `meta`: the file's counters (rows, records,
+bytes, records without an epoch, and bounds). Both commit with the rows.
 
-`nobj` and `wh` are exact when present: every writer changes them in the
-transaction that changes the rows (an object's existence is probed next to
-the `(k, e)` entry the insert or delete touches). REBUILD 1 and 2 count them
-from the rows; a file an older engine wrote has neither, and its readers walk.
+Writers open with `synchronous=FULL`, WAL, and no autocheckpoint.
 
-- Writers open with `synchronous=FULL`, WAL, and no autocheckpoint.
+**Type index** (`.idx`, `synchronous=FULL`), the per-standard index of
+C-37 (5):
 
-**Type index** (`.idx`, `synchronous=FULL`).
-- Tables:
-  - `c(cid, pid, seq)`: every copy of a CID (dedupe, GET, TAGS, DELETE, exact-CID reads);
-  - `cb(b, n)`: distinct CIDs of `c` per bucket (the CID's first 12 bits, 4,096 buckets), moved by the
-    flush in its own transaction when a CID gains its first holder or loses its last; an unfiltered
-    CID window skips whole buckets of its offset. An index an older engine wrote gets them counted at
-    open (`meta cb`); REBUILD 8 compares them with `c`, REBUILD 2 rewrites them;
-  - `ident(src, h, seq, cid)`: IQC ingest identities;
-  - `part(pid, producer, peer, …counters)` (counters NULL until the file has its schema), `src`, `lanes`,
-    `lanecnt(lane, pid, …)` and `meta(uniq, copies, next_seq)`.
-- It is a cache of the files plus the journal. Every row except `ident` can
-  be rebuilt from the files (REBUILD 2).
+| Table | Purpose |
+|---|---|
+| `feed(fid, provider, source, name, counters)` | feed id <-> (provider, source) and file; each file's counters, mirrored |
+| `inst(fid, b, c, ...)` | each file's live instances and counters, mirrored (SUMMARY 3 without opening files) |
+| `tok(id, token, peer, counters)` | the type's producer tokens and their copies' counters (SUMMARY 2) |
+| `x(seq, fid, cid, len, w, k, e, cp)` | one entry per (record, feed file holding it); `cp` = the copies in that file |
+| `x_c(cid, seq, fid, e)` | CID -> (seq, feed): lookup, dedupe, CID-ordered windows |
+| `x_w(w DESC, cid, seq, fid, e)` | type windows, index pages, epoch windows |
+| `x_k(k, e, cid, seq, fid)` | EPOCH per object (types with an object rule) |
+| `ident(src, h, seq, cid)` | IQC ingest identities |
+| `meta` | records, bytes, copies, copy bytes, bounds, next seq, full text through |
 
-**Intent journal** (`.jnl`).
-- Tables: `j(id AUTOINCREMENT, op, k, c, pid, seq, s, v)` and `jm(seq_reserved)`.
-- Ops: partition, lane, source, file (J_FILE), entry (J_C), identity, and removal (J_DEL).
-  J_FILE marks a file a group changed: a retag-only group or a tag-only
-  supersede chunk changes lane counters with no J_C or J_DEL row.
-- A group journals its entries before its partition file commits. A flush
-  merges committed entries into the type index and cuts the journal behind them.
+A type-wide read walks `x` and reads only the feed files that hold the
+page's records; it never opens every feed file of the type.
+
+**Intent journal** (`.jnl`): `j(id AUTOINCREMENT, op, fid, seq, k, s, v)` and
+`jm(seq_reserved)`. Ops: `J_FEED` and `J_TOK` (new feed and token ids),
+`J_TOUCH` (a (feed file, record) a write changes), `J_IDENT` (an ingest
+identity).
 
 ## 3. Writes
 
-- **Calls and writers.**
-  - Calls arrive in mailbox slots, in two pools (C-6): 8 MiB write requests
-    and 64 KiB read requests.
-  - Writer threads own partitions: each is pinned to one writer, with a
-    credit. A full backlog answers `P4_E_BUSY`.
-- **A group.** A writer takes every queued call of a partition, up to
-  `groupRecords`, and runs these steps:
-  1. parse and extract;
-  2. probe dedupe against the type index and the pending map;
-  3. assign seqs, from durable seq blocks;
-  4. journal;
-  5. commit one transaction on the partition's file;
-  6. publish;
-  7. ack.
-  The ack follows the commit and the visible-through publish (C-4).
-- **Removals.** These are all journaled removals:
-  - copies (a CID held by another producer) and retags;
-  - CAT supersede-on-ingest (ingest mode only, C-20);
-  - IQC ingest identities (IDENT_DUP tags the held record, C-26);
-  - batch supersede, deletes and quota deletions.
-- **Migrate mode** (PUT mode 1, create mode 2):
-  - seqs and tag instances are the caller's (format 1's rowids and `created_at`);
-  - a COPY keeps the holder's bytes and ts (C-22);
-  - identities are registered (C-21);
-  - secondary indexes wait for REBUILD 1, and full text waits for activation.
+- **One writer per file.** Every feed file of a type is written by the
+  type's one writer thread (types are spread over the writer threads); a
+  file has one writer connection. A record's rows across its feed files
+  (a copy into every feed of the record, an untagged record that gains a
+  tag) commit in order on that thread.
+- **Calls** arrive in mailbox slots, in two pools (C-6): 8 MiB write
+  requests and 64 KiB read requests. A type's backlog has a record credit;
+  a full backlog answers `P4_E_BUSY`.
+- **A PUT group** (the queued PUT calls of a type, up to `groupRecords`):
+  1. parse, check and extract;
+  2. load each record from the type index (`x_c`) and its feed files (its
+     rows: one rid range per file);
+  3. plan its delivery: a new record (NEW), a new copy (COPY: the holder's
+     bytes and ts with this write's signature and peer; in migrate mode its
+     own bytes, C-35), a new instance (RETAG), a repeat (DUP: the url follows
+     the latest write, C-3), an ingest-identity repeat (IDENT_DUP, C-26);
+     every copy is then put with every instance;
+  4. CAT supersede-on-ingest (ingest mode only, C-20): the scope feed's
+     records of the same object identity are retired from that feed;
+  5. seqs for new records in content-time order (durable seq blocks);
+  6. the journal (`synchronous=FULL`);
+  7. each feed file in one transaction (rows, its counters, its instances),
+     feed files before local;
+  8. the type index in one transaction (the records' entries, the type's
+     and tokens' counters, the feeds' mirrors);
+  9. publish (visible-through) and ack: the ack follows the commits (C-4).
+- **SUPERSEDE** (`provider`, `source`, keep): one feed file; its rows whose
+  batch is not the kept one go, a chunk of 32,768 rows per transaction; a
+  record left with no row anywhere is gone.
+- **DELETE**: every row of the CIDs in every feed file.
+- **QUOTA_GC**: the type's oldest records by arrival (the type index's seq
+  order), every row of each.
+- **Migrate mode** (PUT mode 1, create mode 2): seqs and tag instances are
+  the caller's (format 1's rowids and `created_at`; each format-1 tag
+  instance becomes rows in its feed's file); a copy keeps its own bytes;
+  identities are registered (C-21); a new feed file is made without its
+  secondary indexes, which REBUILD 1 adds; full text waits for activation.
 
 ## 4. Crash safety
 
-Every open replays the journal before it serves (M8). Replay opens each file
-it checks, which recovers that file's WAL.
+Every open replays the journal before it serves (M8):
 
-1. **Registry:** partitions, sources, lanes and files. A J_FILE whose file has
-   no committed schema is not trusted: the writer completes it. That state is
-   a kill between the empty file and its schema.
-2. **Entries:** each J_C or J_DEL is checked against its file by seq and CID.
-   Counters move only for entries the index lacks.
-3. **Counters:** each touched file's counters are loaded from its `meta` and
-   lane rows, which commit with its rows (writes and removals both keep them;
-   `mints`/`maxts` are bounds after removals). No row is recounted, so the
-   cost is the journal tail's, not the partition's size.
-4. **Files against the disk:** a partition the index says has a file whose
-   file is missing is made again by its next write when it had no rows, and
-   quarantined otherwise (writes answer `P4_E_CORRUPT`, naming the file).
+1. the feed and token ids it names are registered;
+2. every touched feed file's counters are reloaded from its `meta` and
+   `inst` (they commit with its rows);
+3. every touched record is read from its feed files and brought in line
+   (every copy with every instance; local rows only without one): a write
+   cut between two feed files leaves rows that only add, completed here;
+4. its type-index entries, the type's and tokens' counters and the feeds'
+   mirrors are set from its rows, in one index transaction;
+5. the journal's rows go.
 
-The type index never records a file whose schema has not committed. Nothing
-unlinks or replaces a partition file.
+The cost is the journal tail's (one write), not the store's. A write whose
+type-index commit fails runs the same replay at once; if that fails too,
+the type refuses writes (`P4_E_IO`) until a reopen. A feed file the index
+says has records and that is missing is quarantined (`P4_E_CORRUPT`, named).
+Nothing unlinks or replaces a feed file.
 
-The month layout's wasm-only kill anomaly cannot arise in this layout.
-- **What it was.** About 1% of wasm kill rounds left a type-index row naming
-  an empty file that no longer existed (`P/PNM/3/202609.163.db`). 562276b
-  remade such a file at open.
-- **Root cause.** Not reproduced; the exact interleaving is unknown. The
-  state needed a month file that a supersede had emptied, retired and
-  unlinked many times over: generation 163 of one month.
-- **Why it is gone.** Nothing retires, unlinks or replaces a partition file
-  in this layout, so under kill -9 the state needs a committed file to
-  vanish. Step 4 above checks it at every open anyway, so it can never wedge
-  a partition.
+Every connection to a format-4 file is opened with `share=1` through
+FlatSQL's VFS (`openConn`): it attaches to the path's node, so the engine's
+connections see each other's locks and one WAL index. A connection opened
+beside a running engine without `share=1` gets a private node (every lock
+granted, a WAL index of its own); at close it takes itself for the file's
+last connection and, when the WAL is empty, deletes it under the engine's
+connections, after which their WAL handles and the WAL index no longer
+describe one file. The wasm kill loop found this in its own check (read-only
+connections for `integrity_check`, opened the default way: on wasm the
+default VFS is FlatSQL's), as a feed file whose page 1 was another page
+after 28-153 rounds; the check now opens them with `share=1`. The engine and
+the SQL surface open no other connection (the SQL surface's own database is
+`:memory:` with ATTACH refused).
 
 ## 5. Maintenance
 
-Two background threads do this work, never on a caller's path.
-- **The maintenance thread:** type-index flushes (a type whose flush lock a
-  REBUILD holds is skipped that tick, never waited for); checkpoints for
-  partition files, the type index, the journal and full text; closing evicted
-  writer connections (each checkpointed first); the T/ files' sizes for
-  SUMMARY 4, once a second.
-- **Checkpoints never wait for a writer.** PASSIVE passes copy a WAL into its
-  file while the writer keeps committing; once a pass leaves little behind, a
-  TRUNCATE with no busy handler takes the writer lock only if it is free that
-  instant, copies the last frames and empties the WAL. A WAL is checkpointed
-  when it passes the PASSIVE pages (config tag 30, at most 32 MiB), and while
-  the instance's WALs are over `walTotal`, every committing WAL of 4 MiB or
-  more and the largest idle ones (down to half the total). The WAL stat is
-  each path's frames not yet checkpointed, kept with every commit, checkpoint
-  and close.
-- **The WAL file's bound.** Under steady commits no PASSIVE pass ends exactly
-  when the writer starts its next transaction, so a WAL never starts over by
-  itself. The file's one writer, right after a commit that leaves its WAL at
-  a quarter of `walTotal` or more (or at 32 MiB while the instance's WALs
-  pass three quarters of it), runs a TRUNCATE checkpoint itself: no frame is
-  added meanwhile, the PASSIVE passes have copied most of it, and it waits
-  (2 s at most) only for readers still inside the WAL.
-- **The long-work thread:** REBUILD and QUOTA_GC calls, the configured quota
-  once a second, and full text. Nothing it does delays a checkpoint or a
-  flush.
-- **Backpressure:** a PUT answers `P4_E_BUSY` when its partition's backlog is
-  full, the type's pending index entries pass `pendingBytes`, or the WALs pass
-  twice `walTotal`.
-
-- **QUOTA_GC** (C-32) deletes the oldest records by arrival.
-  - The victim is the type whose oldest record arrived first.
-  - The cut is merged over that type's `r_s` indexes, and each partition's
-    writer deletes its rows (per-partition writers).
-  - Each pass deletes at most 32,768 records, sized to the excess at the
-    store's mean bytes per record, until the bytes in use fit.
-  - Bytes in use count each partition file's pages less its free pages
-    (pages still in the WAL are counted by `page_count`), plus the type files
-    and any rollback journal.
-  - When nothing is left to delete and the store is still over quota, writes
-    refuse with `P4_E_NOSPACE` while reads continue.
-  - `files_dropped` is always 0.
-- **REBUILD:**
-  - **1** builds the partition secondary indexes, after a migration's bulk append.
-  - **2** recounts each partition on its own writer (counters from its rows,
-    lane rows from `rl JOIN r`, url, url0, created and updated kept from the
-    file's lane table), writes them back to the file in one transaction, then
-    checks `c` against the files (point probes both ways) and repairs only
-    what differs.
-  - **4** rebuilds full text.
-  - **8** verifies, changing nothing:
-    - `c` against the files' rows (point probes both ways, no sort);
-    - the counters and lanes against the rows;
-    - `PRAGMA integrity_check` on every live file, the type index and the
-      journal (C-27). A damaged file is a mismatch, named in the slot err;
-    - each partition's `nobj` and `wh` against its rows.
+- **The maintenance thread:** checkpoints for feed files, the type index,
+  the journal and full text; closing evicted writer connections; the T/
+  files' sizes for SUMMARY 4.
+- **Checkpoints never wait for a writer.** PASSIVE passes copy a WAL while
+  the writer keeps committing; a TRUNCATE takes the writer lock only if it
+  is free that instant. A file's one writer truncates its own WAL after a
+  commit that leaves it at a quarter of `walTotal` (or 32 MiB while the
+  instance's WALs pass three quarters of it).
+- **The long-work thread:** REBUILD and QUOTA_GC calls, the configured
+  quota once a second, and full text; their per-type work runs on the
+  type's writer thread.
+- **Quota** measures every file by its pages in use (pages less free pages:
+  feed files, the type index, the journal and full text alike), so the
+  index entries a pass deletes count as freed, and deletes the oldest
+  records by arrival until the store fits.
+- **Full text** follows the records: catching up adds the records past
+  `through` (one row per record, from one of its feed files), and the rows
+  of records gone since the last pass (supersede, delete, quota, CAT
+  supersede-on-ingest: no row left in any feed file) are deleted first.
+  The gone list is in memory: a crash leaves those rows (a search drops
+  them, as it drops any hit without a live record), and REBUILD 4 removes
+  them.
+- **REBUILD:** 1 adds the feed files' secondary indexes (after a migration's
+  bulk append); 2 recounts every feed file's counters and instances from
+  its rows, sets every type-index entry from the files (dangling entries go)
+  and the type's counters from the entries; 4 rebuilds full text; 8 makes
+  the same comparisons and changes nothing, and runs `PRAGMA
+  integrity_check` on every feed file, the type index and the journal
+  (C-27). A record whose rows are not its copies x its instances is a
+  mismatch.
 
 ## 6. Reads
 
-**Orders.**
-- **Seq** (datasync): per-file pages by rowid, merged. A single source's
-  pages come from `rl_sid` (the filter's lanes checked inside the index),
-  starting and ending at its lanes' seq bounds (`lane.minseq`, `maxseq`).
-- **w** (windows): `r_w`, with ties in CID order. A page is whole w groups of
-  index entries (w, CID, seq); with a lane filter each entry's seq is probed
-  on `rl`'s key. With no filter on the rows (none, a lane filter, or records
-  with an epoch when every file's have one) copies collapse and the offset
-  is skipped on the entries, and only the page's rows are read (a chunk at a
-  time, a page ahead across small groups); otherwise the page's rows are read
-  in the fetch's read transaction. A file's first page holds about twice its
-  share of what the window still needs (many partitions: a few entries each),
-  later pages double.
-- **CID:** the type index's `c` in (CID, pid) order, the unflushed entries
-  merged over it; a page's rows are read by seq, one read transaction per file.
+A scan first picks its feed files: the lane filter's (provider and source
+name a feed file; a batch, content key or producer peer narrows to the feeds
+holding such an instance), else every feed of the type. Then:
 
-Copies collapse to one row per CID: the lowest pid that matches, also under
-OFFSET.
+- **One feed file** (a `<TYPE>@<source>` read, or a type with one feed): that
+  file's own indexes (`r_s` arrival, `r_w` epoch, `r_c` CID, `r_ke` object).
+- **Several:** the type index (`x` seq, `x_w` epoch, `x_c` CID, `x_k`
+  object), which names the feed files holding each record; only those are
+  read.
 
-**A18 bound (C-31).**
-- With `lane.source` set, the bound is that source's newest N records: a
-  newest-first walk of `rl_sid` in only the partitions holding the source,
-  merged by their in-memory bounds (a partition is opened only once its
-  newest seq could be above the cut; pages start at 64 seqs), stopping at N.
-  The scan then reads through `rl_sid` above the cut.
-- Without a source, the bound is the type's newest N (`r_s`).
-- Every other filter applies above the cut.
-- `<TYPE>@<source>` therefore returns that source's records. This is an
-  intended difference from format 1, whose per-type in-memory window answered
-  `CAT@celestrak-satcat-csv` with 0 frames.
+A page of candidates is resolved by reading each record's rows (one rid
+range per feed file, one read transaction per file). A record answers once
+(C-10). Its copy is the lowest token's matching row (C-12); its tag the
+earliest instance that matches the lane filter (§3.6), with provider and
+source from the row's feed file and the rest from its ids: never blank when
+the record has a tag.
 
-**Candidates instead of a walk.**
-- An exact CID (tag 8) is one type-index probe.
-- An equality, IN, range or LIKE predicate on the object rule's first column
-  reads `r_ke` (in CID order too: the candidates' CIDs are sorted).
-- An epoch window (EPOCH, W, EPOCH_DAY bounds) of a seq-ordered read takes
-  its seqs from `r_w` (up to 200,000).
-- An epoch-ordered window of a small source (at most 20,000 rows and a
-  quarter of each file) reads that source's seqs from `rl_sid`.
-
-**Counters instead of a read.**
-- HEAD with no filter answers from the type's counters; with only a lane
-  filter, from the selected lanes' counters summed over the partitions (as
-  format 2).
-- SUMMARY 4 (disk usage) answers from maintained sizes: each file's pages
-  after its writer's last commit, the WALs' uncheckpointed frames, the T/
-  files' sizes refreshed once a second.
-- EPOCH coverage and window counts with at most an epoch range read the
-  epochs from `r_ke` (or `r_w`) alone when the type has no copies in several
-  partitions. A window or day count (epoch or epoch-day range) sums the
-  whole hours from `wh` and counts the two edge hours on `r_w`, when every
-  row of the file is visible.
-- An unfiltered W window's offset of 4,096 or more (and INDEX_PAGE's epoch
-  phase when every record has an epoch) sums the hours above it from `wh`;
-  `r_w` is counted from the top of the hour that holds it.
-- A lane-filtered CID page whose lane is a large share of the type walks the
-  type index's `c` and checks each entry's lane on `rl`'s key (no row): the
-  offset is counted on it and only the page's rows are read.
-- The reader pool keeps at least one connection per partition file (a
-  type-wide read touches every file of its type). A file of records over
-  600 bytes on average gets a page cache that holds as many rows as the
-  default holds of 600-byte ones (up to 8x).
-- EPOCH nearest / as_of / forward read the picked records 4,096 picks at a
-  time, one read transaction per file. With a limit, the files are walked
-  biggest first and each file's object walk stops past the want-th pick so
-  far (an object after it cannot be in the answer).
-- The VFS keeps a format-4 file's size in its path node (one host fstat, not
-  one per read transaction) and a write generation; a reader's readahead
-  buffers serve across read transactions while no write to the file has
-  returned since they were filled (all of them under 32 MiB), and a stream's
-  fills grow from 64 KiB, halving when a fill served under an eighth of it.
-- At start the long-work thread reads each type index once, start to end
-  (the host's page cache): the first writes' dedupe probes and the first
-  reads' CID probes do not read it a page at a time.
-
-**Full text** is checked a page at a time against FTS5 (a rowid range or a
-probe per seq), on a pooled reader connection: no set of every match.
-
-**EPOCH nearest / as_of / forward** (C-32) take one `r_ke` seek per object
-per partition. The count of nearest over every epoch of a one-file type is
-the file's `nobj` (read in the same transaction).
-- The objects are walked in k order: a seek to the next k.
-- Each object's run is read from the target, in rank order, until an epoch
-  group has a row that passes the filters. The lowest CID of that group
-  wins, which is format 1's ranking.
-- A record without an object is its own entity, keyed by its CID.
+- **A18 (C-31):** `<TYPE>@<source>` is the newest N records of that type from
+  that source (the source's feed files' `r_s`, newest first, merged); `<TYPE>`
+  the type's newest N (`x`). Every other filter applies above the cut.
+- **Candidates instead of a walk:** an exact CID (`x_c` / `r_c`), an
+  equality or IN on the object rule's first column (`x_k` / `r_ke`).
+- **EPOCH nearest / as_of / forward:** one seek per object in `x_k` (or
+  `r_ke`), read from the target in rank order until an epoch group has a
+  record that passes the filters; ties at the best epoch go to the lowest
+  CID (format 1's ranking). A record without an object is its own entity.
+- **Counters:** HEAD with no filter, SUMMARY 1 (records, copies, bytes),
+  SUMMARY 2 (one row per producer token: its copies and bytes), SUMMARY 3
+  (one row per feed file and instance: provider, source, batch, content key,
+  producer peer and key, records, bytes, first, updated) and SUMMARY 4 are
+  answered from counters without reading rows.
+- **Full text** is checked a page at a time against FTS5.
 
 **Caps** end a read with its status: rows examined, bytes read, result rows
 and bytes, and cancel. RB1 streams always end with RB1E.
 
 **SQL surface.** `src/p4sql` answers ops 30 and 31 through `p4_reader.h`, and
-the engine writes their RB1E (C-28). Without the surface, ops 30 and 31
-answer `P4_E_UNSUPPORTED`.
+the engine writes their RB1E (C-28).
 
 ## 7. Memory
 
-There is one engine-wide budget (design §9).
+There is one engine-wide budget (design §9), whatever the number of feed
+files.
 - SQLite is built without memory statistics (C-30). The SQL surface's
   allocator enforces the hard heap limit (config tag 27, 640 MiB) and serves
   stats 29 and 30.
-- Reader connections are pooled (tag 23), with a 512 KiB cache each (tag 24).
-- Writer connections are an LRU (tag 21).
-- Pending type-index entries flush at `pendingBytes` (64 MiB).
+- Reader connections are one pool (tag 23) inside a shared cache budget
+  (tags 23 x 24): idle connections close, least recently used first, while
+  the pool is over its count or its caches pass the budget, and while the
+  heap is past three quarters of the soft limit. A `SQLITE_NOMEM` open
+  closes the idle readers and tries once more.
+- Writer connections are an LRU (tag 21); the LRU never closes a pinned one.
+- The type index is written with every write: nothing is pending in memory.
 
 ## 8. The artifact
 
 | | |
 |---|---|
-| Build | `bash scripts/build-wasm.sh --ps` builds it with `flatsql-ps-threads.wasm`. `--ps-tests` also builds `cpp/build-ps-wasm/flatsql-p4-test.wasm`. Released bytes: `--ps --linux` (Docker, Linux wasi-sdk 30). CMake: `cpp/cmake/flatsql_p4_wasm.cmake`, globbing `src/p4`, `src/p4sql`, `tests/p4` and `tests/p4sql`. |
+| Build | `bash scripts/build-wasm.sh --ps --linux` (Docker, Linux wasi-sdk 30) builds the released bytes with `flatsql-ps-threads.wasm`. CMake: `cpp/cmake/flatsql_p4_wasm.cmake`, globbing `src/p4`, `src/p4sql`, `tests/p4` and `tests/p4sql`. |
 | SQLite | The 3.53.4 amalgamation, byte-identical (CMake checks its sha256). Options: `THREADSAFE=2`, WAL, FTS5, `DEFAULT_MEMSTATUS=0`, `TEMP_STORE=3`, `SQLITE_OS_OTHER`. The only VFS is `flatsql_io`. |
 | Imports | `wasi_snapshot_preview1`, `wasi.thread-spawn`, `env.memory` (shared, at most 32768 pages) and the seven `env.flatsql_io_*`. `scripts/check-wasm-imports.mjs` fails on any change. |
 | Exports | `flatsql_p4_init start stop wake layout register_type activate set_quota stats alloc free`, `wasi_thread_start`, `_initialize` and `memory`. |
-| Host | As for the partition store (docs/PARTITION-STORE-WASM.md): grow the shared heap before `flatsql_p4_start`. The Node host is `wasm/ps-node-host.mjs`. |
 
 ## 9. Tests
 
 ```
 FLATBUFFERS_DIR=<flatbuffers> cmake -S cpp -B cpp/build && cmake --build cpp/build --target flatsql_p4_test flatsql_p4_fault_test -j 6
-cpp/build/flatsql_p4_test                                     # the fast suite
-cpp/build/flatsql_p4_test --test=t_kill --rounds=100          # kill -9 loop
-cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=100
-cpp/build/flatsql_p4_test --test=g2_fixture --fixture=<format-1 control.flatsqldb> --bfbs=<search-schemas> [--store=<dir> --keep=1]
-bash scripts/build-wasm.sh --ps-tests && node scripts/p4-wasm-suite.mjs [--kill-rounds 100]
+cpp/build/flatsql_p4_test                                     # the SQL surface's engine tests
+cpp/build/flatsql_p4_test --test=t_kill --rounds=30           # kill -9 loop
+cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=30
 ```
 
-- **`t_kill`** (`t_kill.cpp`). A forked engine ingests from three producers,
-  with copies, the same new records from two producers at once every 7th call,
-  a batch supersede every 13th call and a quota of 4 MiB every 11th. It is
-  killed with SIGKILL at a random point, then the check runs:
-  - every file passes `integrity_check`;
-  - every row on disk is found by CID, and every copy of a CID has one seq;
-  - the count equals the distinct CIDs on disk;
-  - REBUILD 8 finds no mismatch;
-  - new seqs are above every seq on disk;
-  - no file is left open.
-  The wasm loop kills the guest's workers in the Node host.
-- **`t_power_loss`.** The engine runs over FaultFs, frozen at a random I/O
-  call per round, with five crash modes. After the crash, every acknowledged
-  record must be there, REBUILD 8 must be clean, and the count must equal a
-  full scan's distinct CIDs.
-- **`g2_fixture`.**
-  - It loads the host-02-sized format-1 fixture as store-migrate does.
-  - It compares GET, TAGS, SCAN, WINDOW and INDEX_PAGE with format 1 per type.
-  - It compares EPOCH nearest, as_of and forward for every OMM and MPE
-    object with format 1's `queryPointEpochRecords` ranking SQL, run on the
-    fixture.
-- **Benches** (`t_fixture.cpp`):
-  - `g3_bench`, modes `producers`, `w01`, `w06` and `w10`;
-  - `a18_probe`;
-  - `g6_bench`;
-  - `open_bench`;
-  - `reads_bench` (the read gate's material shapes on a fixture store;
-    `--open-only=1` times the open, e.g. after a kill).
-- There are no per-package unit tests (C-33): the proof is these loops, the
-  fixture equivalence and the SDN end-to-end harness. The SQL surface's two
-  engine-backed tests (`tests/p4sql`) run in the suite when it is built in.
+- **`t_kill`** (`t_kill.cpp`): a forked engine ingests from three producers
+  into three feeds (`prov@src`, `prov@src2` and `local`; repeats of earlier
+  records land in another feed, so records sit in two or three feed files;
+  the same new records from three producers at once, each to its own feed;
+  a batch supersede every 13th call; a 4 MiB quota every 11th), is killed
+  with SIGKILL at a random point, and the store is checked: every file
+  passes `integrity_check`; a CID has one seq in every feed file; every row
+  on disk is found by CID with that seq; the count equals the distinct CIDs
+  on disk; REBUILD 8 finds no mismatch; new seqs are above every seq on
+  disk; no file is left open. The wasm test command runs the same loop
+  under the Node wasi-threads host (`scripts/p4-wasm-suite.mjs
+  --kill-rounds N`).
+- **`t_power_loss`:** the engine over FaultFs, frozen at a random I/O call,
+  five crash modes, the same three feeds; every acknowledged record is
+  there and every acknowledged tag instance still lists its source,
+  REBUILD 8 is clean, the count equals a full scan's distinct CIDs.
+- The proof is end to end (C-33): the SDN harness on the real engine
+  (`sdn-server/internal/storage/format4proof`): `store-migrate --to 4`, every
+  benchset read and the coverage classes against format 1 field by field,
+  W01-W10, kill -9 and LazyFS power loss, and the growth step.
 
 ## 10. Measured
 
-**Conditions.**
-- Mac Studio, 28 threads, shared with other sessions. The load is the
-  1-minute average.
-- Native unless marked wasm. The wasm runs used V8 under the Node host.
-- The brief's gates are judged in WasmEdge AOT through SDN, back to back
-  with formats 1 and 2, at low load. These numbers are the engine's side, at
-  high load, with few samples per shape.
-
-| | |
-|---|---|
-| Fixture load (G2) | 4,364,873 copies of 3,945,845 records (OMM, MPE, CAT, IQC) in 138 s (31.5k copies/s, load 31). REBUILD 1 took 19.2 s. **827.6 B per copy** (915.5 B per record), against format 2's 1,742 and format 1's 2,366. 0 differences from format 1 in GET bytes/seq/ts/peer, TAGS, SCAN order, WINDOW and INDEX_PAGE, and in the 18 EPOCH point queries below. REBUILD 8 is clean. |
-| EPOCH, every object | Fixture, 3 epochs per profile, load 29-37. **OMM, 32,015 objects:** as_of and forward 133-136 ms, nearest 165-171 ms. **MPE, 32,486 objects:** as_of and forward 149-163 ms, nearest 195-418 ms. Format 1's ranking SQL on the same fixture (native SQLite, not the deployed engine): 0.35-8.6 s. |
-| A18 (C-31), warm | `p4_cursor_open`, fixture, load 30-46. **OMM@celestrak-gp NORAD=25544** inside the 400,000 bound: 13 frames, 17-18 ms (format 1: 181 cold / 149 warm). **IQC@IQEngine:** 9-11 ms. **CAT@celestrak-satcat:** 7.8-8.2 ms. **CAT@celestrak-satcat-csv:** 10,000 records under C-31, 7.7-8.6 ms. **MPE@celestrak-gp:** 7-8.9 ms. An 8 MiB reader cache, instead of 512 KiB, takes CAT to 6.6 ms. |
-| HEAD by exact CID | 0.67 ms first, 17-33 µs after, on the fixture (was a ~5 s type scan). |
-| W01, OMM ingest | 32,015 records into the fixture's OMM partition (1.7M rows), 4,096-record calls. The first call after open is cold: 1,038 ms. After that: 20.6-21.2k rec/s, call p50 195-225 ms, p99 229-271 ms (load 38-45). **The same clone with `r_c` dropped:** 61-64k rec/s, p50 55-59 ms, p99 71-81 ms, first call 364 ms (load 23-29). The per-file CID index costs about 3× on ingest (§11). |
-| Ingest growth | 640,300 OMM records: 20 GP-like batches over the fixture's 32,015 objects, OMM growing from 1.7M to 2.3M rows. 27.9k rec/s. Call p50: 154 ms in the first tenth, 115 ms in the last (load 26), so no slope. In a 10-batch run the cold first call took 1,688 ms; the other calls had a median of 125 ms with spikes of 250-430 ms (load 29). |
-| REBUILD | On a fixture clone (load 22-28): REBUILD 2 (the type index from the files, `c` in CID order) 9.0 s; the month build took 4m04s. REBUILD 8 (verify, with `integrity_check` of every file) 19.7 s. |
-| G3, fresh store | OMM, 4,096-record calls. One producer: 52.8k rec/s, call p50 65 / p99 87 ms (load 31). Eight producers: 140k rec/s, p99 894 ms (load 33). Format 2: 17.4k with one writer and 6.6k with four, call p99 306-494 ms. |
-| W06 | Batch supersede of all 1,696,780 OMM records on a fixture clone: 31.4 s (load 26). The month layout took 42.7 s and the prototype 9.7 s. It is I/O-bound: the deletes rewrite pages of the random-key indexes (`r_c`, `r_ke`). |
-| W10 | Quota to 90% of the fixture clone's bytes: 196,608 oldest records deleted in 6.4 s (load 42). REBUILD 8 is clean. |
-| First open | 232 registered types, as the daemon registers them. **First open:** open 37 ms, registration 3.45 s (232 durable spec writes, load 34), close 41 ms, 235 files in T/. **Reopen:** 20 ms, re-registration 0.5 ms. The month build took 62-81 s and wrote 940 type files. |
-| Crash | Native t_kill 100 of 100 and t_power_loss 100 of 100. Wasm kill 100 of 100. Load 23-39. |
-
-## 11. The per-file CID index is gone (C-34)
-
-C-32 first put a CID index in every partition file (`r_c`). A record's CID
-is a random key, so each commit dirtied about one `r_c` leaf page per record.
-On a g2 clone, W01 (20 calls x 4,096 records, load 22-25): with `r_c` 12.2k
-rec/s, call p50 177 ms, first call 1,194 ms; without it 28.0k rec/s, p50
-129 ms, first call 576 ms. The type index already mapped every CID to its
-copies, so `r_c` is dropped and CID order is served from `c`.
+See the build-out report (`ENGINE-REPORT.md`, section "Feed tables").
