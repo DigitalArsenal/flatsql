@@ -1117,8 +1117,10 @@ P4_SLOW_TEST(store_check) {
     const int32_t rc = openEngine(store + "/fsql4", o);
     REQUIRE(rc == P4_OK, "open: " + std::to_string(rc));
     TlvW rb;
-    rb.u32(63, 8);
+    rb.u32(63, uint32_t(argInt("what", 8)));
+    const uint64_t t0 = flatsql::ps::monoNs();
     Result v = call(P4_OPC_REBUILD, rb.b, CallOpts{0, 0, 0, 0, 0, 0, false, 3600000});
+    std::printf("  REBUILD %ld: %.0f ms (load %.1f)\n", argInt("what", 8), double(flatsql::ps::monoNs() - t0) / 1e6, loadAvg());
     CHECK_EQ(v.status, P4_OK, v.err);
     for (size_t i = 0; i < v.rows.size(); i++) {
         std::printf("  %s: %lld entries, %lld mismatches\n", v.s(i, "type").c_str(), (long long)v.i(i, "entries"),
@@ -1396,6 +1398,27 @@ P4_SLOW_TEST(reads_bench) {
         TlvW t;
         t.text(1, "OMM");
         add("R10 HEAD OMM (no filter)", P4_OPC_HEAD, t);
+    }
+    {
+        // The /epoch handler's counts: epoch.window (from .. to) and epoch.day.
+        std::vector<uint8_t> p = {P4_F_EPOCH, P4_OP_BETWEEN, 2, 0};
+        for (int64_t v : {int64_t(1788314401), int64_t(1793491200)}) {
+            p.push_back(1);
+            uint8_t b[8];
+            fp::st64(b, uint64_t(v));
+            p.insert(p.end(), b, b + 8);
+        }
+        for (const char* ty : {"OMM", "MPE"}) {
+            TlvW t;
+            t.text(1, ty).u8(30, 1).u8(33, 1);
+            t.raw(17, p.data(), p.size());
+            add(std::string("R16 EPOCH ") + ty + " window count", P4_OPC_EPOCH, t);
+            TlvW d;
+            d.text(1, ty).u8(30, 1).u8(33, 1);
+            auto q = text(P4_F_EPOCH_DAY, P4_OP_EQ, day20);
+            d.raw(17, q.data(), q.size());
+            add(std::string("R16 EPOCH ") + ty + " day count", P4_OPC_EPOCH, d);
+        }
     }
     {
         TlvW t;

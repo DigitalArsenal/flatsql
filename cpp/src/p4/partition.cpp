@@ -34,7 +34,9 @@ const char* kFileSchema =
     // Tag instances keyed by seq first: a page's tags are one key range (no
     // lookups); rl_sid(sid, seq) serves source-ordered scans and supersede.
     "CREATE TABLE IF NOT EXISTS rl(sid INTEGER NOT NULL, seq INTEGER NOT NULL, lane INTEGER NOT NULL,"
-    " at INTEGER NOT NULL, u TEXT, PRIMARY KEY(seq, sid, lane)) WITHOUT ROWID;";
+    " at INTEGER NOT NULL, u TEXT, PRIMARY KEY(seq, sid, lane)) WITHOUT ROWID;"
+    // Rows with an epoch per hour (Derived): epoch window and day counts.
+    "CREATE TABLE IF NOT EXISTS wh(b INTEGER PRIMARY KEY, n INTEGER NOT NULL);";
 }  // namespace
 
 // The file's indexes (owner layout, C-32): arrival seq (the rowid, and r_s:
@@ -46,12 +48,16 @@ const char* kFileSchema =
 int32_t fileCreateIndexes(Type* t, Conn* c) {
     std::shared_ptr<const Spec> sp = t->spec();
     std::string ddl =
+        "BEGIN IMMEDIATE;"
         "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC);"
         "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
         "CREATE INDEX IF NOT EXISTS rl_sid ON rl(sid, seq);";
     if (sp->hasObject) ddl += "CREATE INDEX IF NOT EXISTS r_ke ON r(k, e);";
     ddl += "INSERT OR REPLACE INTO meta(k, v) VALUES('ix', 1);";
-    const int rc = c->exec(ddl.c_str());
+    int rc = c->exec(ddl.c_str());
+    if (rc == SQLITE_OK) rc = derivedRecount(t, c);
+    if (rc == SQLITE_OK) rc = c->exec("COMMIT");
+    if (rc != SQLITE_OK) c->exec("ROLLBACK");
     return rc == SQLITE_OK ? P4_OK : statusOfSqlite(rc);
 }
 
@@ -72,7 +78,7 @@ int32_t fileSchema(Type* t, Conn* c, Part* f, bool indexes) {
         return r == SQLITE_DONE;
     };
     bool ok = meta("format", "4") && meta("type", t->name) && meta("producer", f->producer) &&
-              meta("peer", f->peer) && meta("pid", std::to_string(f->pid));
+              meta("peer", f->peer) && meta("pid", std::to_string(f->pid)) && meta("wh", "1");
     if (ok && !indexes) {
         sqlite3_stmt* s = c->sql("INSERT OR IGNORE INTO meta(k, v) VALUES('ix', 0)");
         ok = s && sqlite3_step(s) == SQLITE_DONE;
@@ -89,6 +95,137 @@ int32_t fileSchema(Type* t, Conn* c, Part* f, bool indexes) {
     }
     if (indexes) return fileCreateIndexes(t, c);
     return P4_OK;
+}
+
+// ---- the object count and the epoch histogram -----------------------------------------------------
+void KVal::bind(sqlite3_stmt* q, int at) const {
+    if (type == 1) sqlite3_bind_int64(q, at, i);
+    else if (type == 3) sqlite3_bind_text(q, at, s.data(), int(s.size()), SQLITE_TRANSIENT);
+    else sqlite3_bind_null(q, at);
+}
+
+void KVal::from(sqlite3_stmt* q, int col) {
+    const int ct = sqlite3_column_type(q, col);
+    type = ct == SQLITE_INTEGER ? 1 : ct == SQLITE_TEXT ? 3 : 0;
+    i = type == 1 ? sqlite3_column_int64(q, col) : 0;
+    if (type == 3) s.assign(reinterpret_cast<const char*>(sqlite3_column_text(q, col)), size_t(sqlite3_column_bytes(q, col)));
+    else s.clear();
+}
+
+int Derived::load(Conn* c, bool objects) {
+    nobj = -1;
+    wh = false;
+    dh.clear();
+    sqlite3_stmt* q = c->sql("SELECT k, v FROM meta WHERE k IN ('nobj','wh')");
+    if (!q) return SQLITE_ERROR;
+    int r;
+    while ((r = sqlite3_step(q)) == SQLITE_ROW) {
+        if (sqlite3_column_type(q, 1) == SQLITE_NULL) continue;
+        const char* k = reinterpret_cast<const char*>(sqlite3_column_text(q, 0));
+        if (k && std::strcmp(k, "nobj") == 0 && objects) nobj = sqlite3_column_int64(q, 1);
+        else if (k && std::strcmp(k, "wh") == 0) wh = sqlite3_column_int64(q, 1) == 1;
+    }
+    sqlite3_reset(q);
+    return r == SQLITE_DONE ? SQLITE_OK : r;
+}
+
+bool Derived::fresh(Conn* c, const KVal& k) {
+    if (nobj < 0 || k.type == 0) return false;
+    sqlite3_stmt* q = c->sql("SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 LIMIT 1");
+    if (!q) {
+        nobj = -2;  // cannot keep it: dropped at save
+        return false;
+    }
+    k.bind(q, 1);
+    const int r = sqlite3_step(q);
+    sqlite3_reset(q);
+    if (r != SQLITE_ROW && r != SQLITE_DONE) nobj = -2;
+    return r == SQLITE_DONE;
+}
+
+void Derived::added(bool freshK, bool hasE, int64_t e) {
+    if (freshK && nobj >= 0) nobj++;
+    if (wh && hasE) dh[hourOf(e)]++;
+}
+
+int Derived::removed(Conn* c, const KVal& k, bool hasE, int64_t e) {
+    if (wh && hasE) dh[hourOf(e)]--;
+    if (nobj >= 0 && k.type != 0 && fresh(c, k)) nobj--;
+    return SQLITE_OK;
+}
+
+int Derived::save(Conn* c) {
+    if (wh) {
+        sqlite3_stmt* up = c->sql("INSERT INTO wh(b, n) VALUES(?1, ?2) ON CONFLICT(b) DO UPDATE SET n=n+excluded.n");
+        sqlite3_stmt* gone = c->sql("DELETE FROM wh WHERE b=?1 AND n<=0");
+        if (!up || !gone) return SQLITE_ERROR;
+        for (auto& kv : dh) {
+            if (kv.second == 0) continue;
+            sqlite3_bind_int64(up, 1, kv.first);
+            sqlite3_bind_int64(up, 2, kv.second);
+            int r = sqlite3_step(up);
+            sqlite3_reset(up);
+            if (r != SQLITE_DONE) return r;
+            if (kv.second > 0) continue;
+            sqlite3_bind_int64(gone, 1, kv.first);
+            r = sqlite3_step(gone);
+            sqlite3_reset(gone);
+            if (r != SQLITE_DONE) return r;
+        }
+        dh.clear();
+    }
+    if (nobj == -2) {  // a check failed: the count is no longer known
+        const int r = c->exec("DELETE FROM meta WHERE k='nobj'");
+        nobj = -1;
+        return r;
+    }
+    if (nobj >= 0) {
+        sqlite3_stmt* s = c->get(S_META_SET);
+        if (!s) return SQLITE_ERROR;
+        sqlite3_bind_text(s, 1, "nobj", -1, SQLITE_STATIC);
+        sqlite3_bind_int64(s, 2, nobj);
+        const int r = sqlite3_step(s);
+        sqlite3_reset(s);
+        if (r != SQLITE_DONE) return r;
+    }
+    return SQLITE_OK;
+}
+
+int derivedRecount(Type* t, Conn* c) {
+    const bool objects = t->spec()->hasObject;
+    int rc = c->exec("CREATE TABLE IF NOT EXISTS wh(b INTEGER PRIMARY KEY, n INTEGER NOT NULL); DELETE FROM wh;");
+    if (rc != SQLITE_OK) return rc;
+    // One pass: r_ke's (k, e) keys when the file has them, else the rows.
+    sqlite3_stmt* q = c->sql(objects ? "SELECT k, e FROM r INDEXED BY r_ke" : "SELECT NULL, e FROM r WHERE e IS NOT NULL");
+    if (!q) return SQLITE_ERROR;
+    std::map<int64_t, int64_t> hours;
+    int64_t nobj = 0;
+    KVal prev, cur;
+    int r;
+    while ((r = sqlite3_step(q)) == SQLITE_ROW) {
+        if (objects) {
+            cur.from(q, 0);
+            if (cur.type != 0 && (cur.type != prev.type || cur.i != prev.i || cur.s != prev.s)) {
+                nobj++;
+                std::swap(prev, cur);
+            }
+        }
+        if (sqlite3_column_type(q, 1) != SQLITE_NULL) hours[hourOf(sqlite3_column_int64(q, 1))]++;
+    }
+    sqlite3_reset(q);
+    if (r != SQLITE_DONE) return r;
+    sqlite3_stmt* ins = c->sql("INSERT INTO wh(b, n) VALUES(?1, ?2)");
+    if (!ins) return SQLITE_ERROR;
+    for (auto& kv : hours) {
+        sqlite3_bind_int64(ins, 1, kv.first);
+        sqlite3_bind_int64(ins, 2, kv.second);
+        r = sqlite3_step(ins);
+        sqlite3_reset(ins);
+        if (r != SQLITE_DONE) return r;
+    }
+    std::string meta = "INSERT OR REPLACE INTO meta(k, v) VALUES('wh', 1);";
+    if (objects) meta += "INSERT OR REPLACE INTO meta(k, v) VALUES('nobj', " + std::to_string(nobj) + ");";
+    return c->exec(meta.c_str());
 }
 
 // ---- the file's counters ------------------------------------------------------------------------
@@ -334,6 +471,9 @@ struct Call {
 // A deletion: a row of this partition's file.
 struct Del {
     int64_t seq, len, w;
+    bool hasE = false;
+    int64_t e = 0;
+    KVal k;
     uint8_t key[32];
     std::vector<std::pair<uint32_t, uint32_t>> lanes;  // (sid, lane) of its tags
     int others = 0;  // other holders of the CID
@@ -1005,6 +1145,15 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
     auto bad = [&](int r) {
         if (rc == SQLITE_OK && r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) rc = r;
     };
+    Derived dv;
+    if (rc == SQLITE_OK) {
+        bool ix;
+        {
+            std::lock_guard<std::mutex> g(t_->mu);
+            ix = f->indexed;
+        }
+        bad(dv.load(c, sp_->hasObject && ix));
+    }
     std::unordered_set<uint32_t> sids;
     const int64_t now = nowSec();
     // A migration carries format 1's lane times: first seen = the earliest
@@ -1017,6 +1166,11 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
         const Call* call = &calls_[callOf_[gi]];
         int64_t rowLen = r.dLen;
         if (r.write && !r.superseded) {
+            KVal kv;
+            kv.type = r.kType;
+            kv.i = r.kInt;
+            kv.s = r.kText;
+            const bool freshK = dv.fresh(c, kv);
             sqlite3_stmt* s = c->get(S_INS);
             sqlite3_bind_int64(s, 1, r.seq);
             sqlite3_bind_blob(s, 2, r.key, 32, SQLITE_STATIC);
@@ -1040,6 +1194,7 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
             }
             bad(ir);
             if (rc != SQLITE_OK) break;
+            dv.added(freshK, r.hasE, r.e);
             o.n++;
             o.bytes += r.dLen;
             if (r.action == P4_ACT_COPY || (r.action == P4_ACT_IDENT_DUP && r.write)) o.ncopy++;
@@ -1142,6 +1297,7 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
         const bool gone = sqlite3_changes(c->db) > 0;
         sqlite3_reset(s);
         if (!gone) continue;
+        bad(dv.removed(c, d.k, d.hasE, d.e));
         o.n--;
         o.bytes -= d.len;
         for (auto& sl : d.lanes) {
@@ -1203,6 +1359,7 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
         bad(sqlite3_step(s));
         sqlite3_reset(s);
     }
+    if (rc == SQLITE_OK) rc = dv.save(c);
     if (rc == SQLITE_OK) rc = writeMeta(c, o, now);
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) {
@@ -1483,6 +1640,11 @@ void Group::run(std::vector<WriteTask*>& tasks) {
                 d.seq = sqlite3_column_int64(s, 0);
                 d.len = sqlite3_column_int64(s, 2);
                 d.w = sqlite3_column_int64(s, 5);
+                d.hasE = sqlite3_column_type(s, 6) != SQLITE_NULL;
+                d.e = sqlite3_column_int64(s, 6);
+                d.k.type = r.kType;
+                d.k.i = r.kInt;
+                d.k.s = r.kText;
                 std::memcpy(d.key, sqlite3_column_blob(s, 1), 32);
                 cand.push_back(std::move(d));
             }

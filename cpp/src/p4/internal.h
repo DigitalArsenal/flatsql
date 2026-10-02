@@ -667,6 +667,29 @@ Counters countersOf(const Part* f);              // Type::mu held
 void countersTo(Part* f, const Counters& k);     // Type::mu held
 int writeMeta(Conn* c, const Counters& k, int64_t now);  // in the caller's write transaction; SQLite rc
 int readMeta(Conn* c, Counters* k, bool* indexed);       // SQLite rc
+// A file's object count (meta 'nobj', files with r_ke) and epoch histogram
+// (table wh: rows with an epoch per hour, meta 'wh' = 1). Exact when present:
+// every writer keeps them in the transaction that changes the rows. A file
+// an older engine wrote has neither (readers walk) until REBUILD 1 or 2.
+struct KVal {
+    int type = 0;  // 0 none, 1 integer, 3 text
+    int64_t i = 0;
+    std::string s;
+    void bind(sqlite3_stmt* q, int at) const;
+    void from(sqlite3_stmt* q, int col);
+};
+inline int64_t hourOf(int64_t e) { return floorDiv(e, 3600); }
+struct Derived {
+    int64_t nobj = -1;  // -1: not kept by this file
+    bool wh = false;
+    std::map<int64_t, int64_t> dh;  // hour -> rows added (removed < 0)
+    int load(Conn* c, bool objects);  // in the write transaction; objects: the file has r_ke
+    bool fresh(Conn* c, const KVal& k);  // before a row's insert: k has no row yet
+    void added(bool freshK, bool hasE, int64_t e);
+    int removed(Conn* c, const KVal& k, bool hasE, int64_t e);  // after the row's delete
+    int save(Conn* c);
+};
+int derivedRecount(Type* t, Conn* c);  // counts both from the rows, in the caller's write transaction
 void putGroup(P4Engine* e, uint32_t writer, Part* p, std::vector<WriteTask*>& tasks);
 void supersedePart(P4Engine* e, Part* p, WriteTask* task);
 // DELETE and quota: the given seqs of this partition's file.

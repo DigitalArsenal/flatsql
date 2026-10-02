@@ -13,9 +13,10 @@ namespace p4 {
 namespace {
 
 struct Gone {
-    int64_t seq = 0, len = 0;
+    int64_t seq = 0, len = 0, e = 0;
     uint8_t key[32];
     bool eNull = false;
+    KVal k;
     int others = 0;
 };
 struct Inst {
@@ -86,6 +87,8 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
             std::memcpy(g.key, sqlite3_column_blob(s, 1), 32);
             g.len = sqlite3_column_int64(s, 0);
             g.eNull = sqlite3_column_type(s, 2) == SQLITE_NULL;
+            g.e = sqlite3_column_int64(s, 2);
+            g.k.from(s, 3);
         } else {
             g.seq = 0;  // already gone
         }
@@ -120,6 +123,15 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
     auto bad = [&](int r) {
         if (rc == SQLITE_OK && r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) rc = r;
     };
+    Derived dv;
+    if (rc == SQLITE_OK && !gone.empty()) {
+        bool ix;
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            ix = f->indexed;
+        }
+        bad(dv.load(c, t->spec()->hasObject && ix));
+    }
     for (const Inst& in : insts) {
         if (rc != SQLITE_OK) break;
         auto lit = lenOf.find(in.seq);
@@ -164,6 +176,7 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
         sqlite3_bind_int64(s, 1, g.seq);
         bad(sqlite3_step(s));
         sqlite3_reset(s);
+        bad(dv.removed(c, g.k, !g.eNull, g.e));
         k.n--;
         k.bytes -= g.len;
         if (g.eNull && epochRule) k.nnull--;
@@ -209,6 +222,7 @@ int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::
             sqlite3_reset(s);
         }
     }
+    if (rc == SQLITE_OK) rc = dv.save(c);
     if (rc == SQLITE_OK) rc = writeMeta(c, k, nowSec());
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) c->exec("ROLLBACK");
@@ -563,6 +577,16 @@ void repairPart(Engine* e, Part* p, WriteTask* task) {
         sqlite3_reset(d);
     }
     if (k.n != old.n || k.bytes != old.bytes || k.nnull != old.nnull) changed++;
+    if (rc == SQLITE_OK) {
+        bool ix;
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            ix = p->indexed;
+        }
+        // The object count and epoch histogram from the rows (also gives a
+        // file an older engine wrote both).
+        if (ix) rc = derivedRecount(t, c);
+    }
     if (rc == SQLITE_OK) rc = writeMeta(c, k, nowSec());
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) c->exec("ROLLBACK");

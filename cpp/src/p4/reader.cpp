@@ -264,6 +264,8 @@ public:
     // countOnly: only which objects have a pick (the count), not the picks.
     int32_t epochByObject(int profile, int64_t at, std::map<std::string, EpochPick>* best, bool* handled,
                           uint64_t want = 0, int64_t maxDelta = 0, bool countOnly = false);
+    // A count's objects taken from the file's object count (not in best).
+    int64_t objCount() const { return objCount_; }
     // The row at (file, seq) with its tags, if it passes the scan's filters:
     // 1, 0, or < 0 status. emit: with every tag and, when the request
     // hydrates, the bytes (the row is output).
@@ -284,6 +286,7 @@ private:
     int32_t collectSourceCandidates();
     int32_t collectLaneCandidates();
     int32_t fetchCandidates(int fi, bool wOrder);
+    int64_t objCount_ = 0;
     bool kDriven_ = false;                    // rows come from object-key candidates
     std::vector<std::vector<int64_t>> cand_;  // per file, ascending seqs
     int32_t fetchSeq(int fi);
@@ -1997,6 +2000,28 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
                             lo_ <= 0 && hi_ >= files_[fi].maxseq;
         sqlite3_stmt* hasE = existsOnly && !anyRow ? c->sql(
             "SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 AND e>=?2 AND e<=?3 AND seq>?4 AND seq<=?5 LIMIT 1") : nullptr;
+        // Nearest over every epoch in the type's one file, every row visible
+        // and with an epoch (this read's snapshot): the file's object count.
+        bool counted = false;
+        if (anyRow && !kp && files_.size() == 1) {
+            sqlite3_stmt* m = c->sql("SELECT k, v FROM meta WHERE k IN ('nobj','maxseq','nnull')");
+            int64_t nobj = -1, mseq = INT64_MAX, nn = -1;
+            while (m && sqlite3_step(m) == SQLITE_ROW) {
+                if (sqlite3_column_type(m, 1) == SQLITE_NULL) continue;
+                const char* mk = reinterpret_cast<const char*>(sqlite3_column_text(m, 0));
+                const int64_t v = sqlite3_column_int64(m, 1);
+                if (!mk) continue;
+                if (std::strcmp(mk, "nobj") == 0) nobj = v;
+                else if (std::strcmp(mk, "maxseq") == 0) mseq = v;
+                else if (std::strcmp(mk, "nnull") == 0) nn = v;
+            }
+            if (m) sqlite3_reset(m);
+            if (nobj >= 0 && nn == 0 && mseq <= hi_) {
+                objCount_ += nobj;
+                L_->rowsExamined++;
+                counted = true;
+            }
+        }
         auto object = [&](sqlite3_value* k) -> int32_t {
             if (existsOnly) {
                 bool has = anyRow;
@@ -2062,7 +2087,9 @@ int32_t Scan::epochByObject(int profile, int64_t at, std::map<std::string, Epoch
             if (maxDelta <= 0 || (p.e > at ? p.e - at : at - p.e) <= maxDelta) offered++;
             return check();
         };
-        if (kp) {
+        if (counted) {
+            // the objects are counted; the records without one follow
+        } else if (kp) {
             // The predicate's objects only.
             for (const auto& v : kp->vals) {
                 sqlite3_stmt* lit = c->sql("SELECT ?1");
@@ -3203,6 +3230,65 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
 }
 
 // ---- EPOCH ------------------------------------------------------------------------------------------
+// The rows with an epoch in [lo, hi] of one file from its histogram (wh):
+// *out = -1 when the file keeps none or has rows past the visible-through cut.
+int32_t epochCountByHours(P4Lane* L, Conn* c, int64_t lo, int64_t hi, int64_t vis, int64_t* out) {
+    *out = -1;
+    if (c->exec("BEGIN") != SQLITE_OK) return P4_OK;
+    int32_t st = P4_OK;
+    auto done = [&]() {
+        c->exec("COMMIT");
+        return st;
+    };
+    sqlite3_stmt* m = c->sql("SELECT k, v FROM meta WHERE k IN ('wh','maxseq','nnull')");
+    if (!m) return done();
+    int64_t wh = 0, mseq = INT64_MAX, nn = -1;
+    int r;
+    while ((r = sqlite3_step(m)) == SQLITE_ROW) {
+        if (sqlite3_column_type(m, 1) == SQLITE_NULL) continue;
+        const char* mk = reinterpret_cast<const char*>(sqlite3_column_text(m, 0));
+        const int64_t v = sqlite3_column_int64(m, 1);
+        if (!mk) continue;
+        if (std::strcmp(mk, "wh") == 0) wh = v;
+        else if (std::strcmp(mk, "maxseq") == 0) mseq = v;
+        else if (std::strcmp(mk, "nnull") == 0) nn = v;
+    }
+    sqlite3_reset(m);
+    if (r != SQLITE_DONE) {
+        st = statusOfSqlite(r);
+        return done();
+    }
+    if (wh != 1 || mseq > vis || nn < 0) return done();
+    sqlite3_stmt* sum = c->sql("SELECT coalesce(sum(n), 0) FROM wh WHERE b>?1 AND b<?2");
+    sqlite3_stmt* edge = c->sql(nn == 0 ? "SELECT count(*) FROM r INDEXED BY r_w WHERE w>=?1 AND w<=?2"
+                                        : "SELECT count(*) FROM r INDEXED BY r_w WHERE w>=?1 AND w<=?2 AND e IS NOT NULL");
+    if (!sum || !edge) return done();
+    auto one = [&](sqlite3_stmt* q, int64_t a, int64_t b) -> int64_t {
+        sqlite3_bind_int64(q, 1, a);
+        sqlite3_bind_int64(q, 2, b);
+        const int x = sqlite3_step(q);
+        const int64_t v = x == SQLITE_ROW ? sqlite3_column_int64(q, 0) : -1;
+        sqlite3_reset(q);
+        if (x != SQLITE_ROW && st == P4_OK) st = statusOfSqlite(x);
+        return v;
+    };
+    const bool hasLo = lo != INT64_MIN, hasHi = hi != INT64_MAX;
+    const int64_t bLo = hasLo ? hourOf(lo) : INT64_MIN, bHi = hasHi ? hourOf(hi) : INT64_MAX;
+    int64_t n = 0;
+    if (lo > hi) {
+        n = 0;
+    } else if (hasLo && hasHi && bLo == bHi) {
+        n = one(edge, lo, hi);
+    } else {
+        n = one(sum, bLo, bHi);
+        if (hasLo) n += one(edge, lo, bLo * 3600 + 3599);
+        if (hasHi) n += one(edge, bHi * 3600, hi);
+    }
+    L->rowsExamined += 3;
+    if (st == P4_OK) *out = n;
+    return done();
+}
+
 // The epochs of an unfiltered EPOCH window count or coverage (an epoch range
 // at most) from an index alone: r_ke's (k, e) keys, or r_w's when every row
 // has an epoch; no row is read. Copies would count twice, so a type with
@@ -3212,7 +3298,11 @@ int32_t epochsByIndex(P4Lane* L, Type* t, const Spec2& w, int64_t* count,
     *handled = false;
     bool rangeOnly = !w.lane && !w.hasCid && !w.hasPeer && !w.hasProducer && w.search.empty() && w.seqAfter == 0 &&
                      w.seqThrough == 0;
-    for (const auto& p : w.preds) rangeOnly = rangeOnly && (p.field == P4_F_EPOCH || p.field == P4_F_W);
+    // An epoch day predicate is the exact range of its days (IN: not a range).
+    for (const auto& p : w.preds)
+        rangeOnly = rangeOnly && (p.field == P4_F_EPOCH || p.field == P4_F_W ||
+                                  (p.field == P4_F_EPOCH_DAY && p.op != P4_OP_IN && p.op != P4_OP_NE &&
+                                   p.op != P4_OP_LIKE && p.op != P4_OP_NOTNULL));
     if (!rangeOnly) return P4_OK;
     std::shared_ptr<const Spec> sp = t->spec();
     if (!sp->hasEpochRule) return P4_OK;
@@ -3236,10 +3326,28 @@ int32_t epochsByIndex(P4Lane* L, Type* t, const Spec2& w, int64_t* count,
     }
     const int64_t vis = t->vis.load(std::memory_order_acquire);
     std::map<int64_t, std::array<int64_t, 3>> byDay;
+    int64_t hours = 0;  // counted from histograms (not examined)
     for (const F& f : files) {
         int orc = 0;
         Conn* c = L->e->rpool.acquire(f.path, OpenKind::Reader, &orc, nullptr);
         if (!c) return statusOfSqlite(orc);
+        if (!days) {
+            // A count from the file's epoch histogram: whole hours summed,
+            // the two partial hours at the ends counted on r_w. One snapshot,
+            // every row of it visible.
+            int64_t got = -1;
+            int32_t st = epochCountByHours(L, c, w.wLo, w.wHi, vis, &got);
+            if (st != P4_OK) {
+                L->e->rpool.release(c);
+                return st;
+            }
+            if (got >= 0) {
+                *count += got;
+                hours += got;
+                L->e->rpool.release(c);
+                continue;
+            }
+        }
         sqlite3_stmt* q = c->sql(f.byKe ? "SELECT e FROM r INDEXED BY r_ke WHERE e>=?1 AND e<=?2 AND seq<=?3"
                                         : "SELECT w FROM r INDEXED BY r_w WHERE w>=?1 AND w<=?2 AND seq<=?3");
         int r = SQLITE_ERROR;
@@ -3264,7 +3372,7 @@ int32_t epochsByIndex(P4Lane* L, Type* t, const Spec2& w, int64_t* count,
         L->e->rpool.release(c);
         if (r != SQLITE_DONE) return q ? statusOfSqlite(r) : P4_E_INTERNAL;
     }
-    L->rowsExamined += uint64_t(*count);
+    L->rowsExamined += uint64_t(*count - hours);
     if (days)
         for (auto& kv : byDay) {
             char d[11];
@@ -3438,7 +3546,7 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
         }
         if (countOnly) {
             o.enc.beginRow();
-            o.enc.i64(int64_t(picks.size()));
+            o.enc.i64(int64_t(picks.size()) + sc.objCount());
             o.enc.endRow();
             rc = o.rowDone();
         } else {
