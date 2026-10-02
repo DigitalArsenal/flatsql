@@ -139,10 +139,19 @@ The month layout's wasm-only kill anomaly cannot arise in this layout.
 
 Two background threads do this work, never on a caller's path.
 - **The maintenance thread:** type-index flushes (a type whose flush lock a
-  REBUILD holds is skipped that tick, never waited for); PASSIVE and RESTART
-  checkpoints from the WAL hook, for partition files, the type index, the
-  journal and full text; closing evicted writer connections; the T/ files'
-  sizes for SUMMARY 4, once a second.
+  REBUILD holds is skipped that tick, never waited for); checkpoints for
+  partition files, the type index, the journal and full text; closing evicted
+  writer connections (each checkpointed first); the T/ files' sizes for
+  SUMMARY 4, once a second.
+- **Checkpoints never wait for a writer.** PASSIVE passes copy a WAL into its
+  file while the writer keeps committing; once a pass leaves little behind, a
+  RESTART with no busy handler takes the writer lock only if it is free that
+  instant, copies the last frames, and the writer's next transaction starts
+  the WAL over. A WAL is checkpointed when it passes the PASSIVE pages
+  (config tag 30), and while the instance's WALs are over `walTotal`, every
+  committing WAL of 4 MiB or more and the largest idle ones (down to half the
+  total). The WAL stat is each path's frames not yet checkpointed, kept with
+  every commit, checkpoint and close.
 - **The long-work thread:** REBUILD and QUOTA_GC calls, the configured quota
   once a second, and full text. Nothing it does delays a checkpoint or a
   flush.
