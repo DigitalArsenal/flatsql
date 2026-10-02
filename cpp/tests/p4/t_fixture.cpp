@@ -1249,6 +1249,14 @@ P4_SLOW_TEST(reads_bench) {
         add("R11 INDEX_PAGE CAT norad LIKE", P4_OPC_INDEX_PAGE, t);
         add("R11 HEAD CAT norad LIKE", P4_OPC_HEAD, t);
     }
+    for (const char* ty : {"CAT", "IQC", "MPE"}) {
+        TlvW t;
+        t.text(1, ty).u64(3, 50);
+        add(std::string("R11 INDEX_PAGE ") + ty + " page 1", P4_OPC_INDEX_PAGE, t);
+        TlvW t2;
+        t2.text(1, ty).u64(3, 50).u64(4, 950);
+        add(std::string("R11 INDEX_PAGE ") + ty + " page 20", P4_OPC_INDEX_PAGE, t2);
+    }
     for (const char* pat : {"%7%", "%00%", "%25544%"})
         for (const char* ty : {"CAT", "OMM"}) {
             TlvW t;

@@ -2328,7 +2328,13 @@ int32_t Scan::cidPage() {
             continue;
         }
         if (haveLast_ && std::memcmp(lastKey_, x.key, 32) == 0 && ents.empty()) continue;  // a copy of a skipped CID
-        if (!sameCid && ents.size() >= 256) {
+        // A page is 256 CIDs; an unfiltered one is what the limit still needs.
+        size_t pageCids = 256;
+        if (simple && s_.limit) {
+            const uint64_t need = s_.limit > emitted_ + cidRows_.size() ? s_.limit - emitted_ - cidRows_.size() : 0;
+            pageCids = size_t(std::min<uint64_t>(256, std::max<uint64_t>(16, need)));
+        }
+        if (!sameCid && ents.size() >= pageCids) {
             cidPeek_ = x;
             cidPeeked_ = true;
             break;
@@ -3104,18 +3110,36 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
                 for (auto& p : t->parts) nnull += p->nnull;
             }
             if (nnull > 0) {
-                // the phase-1 total decides the phase-2 offset
+                // the phase-1 total decides the phase-2 offset: the counters
+                // when nothing filters (one file, or a type without copies)
+                bool counted = false;
+                uint64_t total = 0;
+                if (!s.lane && s.preds.empty() && !s.hasPeer && !s.hasProducer && !s.hasCid && s.search.empty()) {
+                    std::lock_guard<std::mutex> g(t->mu);
+                    size_t files = 0;
+                    int64_t withE = 0;
+                    for (auto& p : t->parts)
+                        if (p->created && p->n > 0) {
+                            files++;
+                            withE += p->n - p->nnull;
+                        }
+                    if (files <= 1 || t->copies == 0) {
+                        total = uint64_t(std::max<int64_t>(0, withE));
+                        counted = true;
+                    }
+                }
                 Spec2 cnt = s;
                 cnt.order = P4_ORDER_W_DESC;
                 cnt.eNotNull = true;
                 cnt.offset = 0;
                 cnt.limit = 0;
                 cnt.needTags = s.lane;
-                Scan cs(L, t, cnt);
-                rc = cs.open();
-                uint64_t total = 0;
-                Row* rr;
-                while (rc == P4_OK && cs.next(&rr) == 1) total++;
+                if (!counted) {
+                    Scan cs(L, t, cnt);
+                    rc = cs.open();
+                    Row* rr;
+                    while (rc == P4_OK && cs.next(&rr) == 1) total++;
+                }
                 Spec2 p2 = s;
                 p2.order = P4_ORDER_CID;
                 p2.eNull = true;
