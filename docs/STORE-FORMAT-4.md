@@ -39,7 +39,9 @@ This file records what was built, how to run it, and what was measured.
 
 **Partition file.**
 - Tables:
-  - `meta`: format, type, producer, peer, pid, ix, and the counters;
+  - `meta`: format, type, producer, peer, pid, ix, the counters, and `nobj` (the
+    file's distinct objects, files with `r_ke`) and `wh` = 1 (the histogram is kept);
+  - `wh(b, n)`: the rows with an epoch per hour (`b` = floor(e / 3600));
   - `src` and `lane`: a lane is format 1's tag key (C-3), with its counters;
   - `r(seq PK, cid, e, k, ts, p, f, s, x, d, w)`, where `w` = `coalesce(e, ts)`;
   - tag instances `rl(sid, seq, lane, at, u)`, WITHOUT ROWID, keyed
@@ -54,6 +56,11 @@ This file records what was built, how to run it, and what was measured.
 
 There is no per-file CID index (C-34): the type index's `c` is the one CID
 index (lookup, dedupe, CID-ordered windows, REBUILD 2).
+
+`nobj` and `wh` are exact when present: every writer changes them in the
+transaction that changes the rows (an object's existence is probed next to
+the `(k, e)` entry the insert or delete touches). REBUILD 1 and 2 count them
+from the rows; a file an older engine wrote has neither, and its readers walk.
 
 - Writers open with `synchronous=FULL`, WAL, and no autocheckpoint.
 
@@ -190,7 +197,8 @@ Two background threads do this work, never on a caller's path.
     - `c` against the files' rows (point probes both ways, no sort);
     - the counters and lanes against the rows;
     - `PRAGMA integrity_check` on every live file, the type index and the
-      journal (C-27). A damaged file is a mismatch, named in the slot err.
+      journal (C-27). A damaged file is a mismatch, named in the slot err;
+    - each partition's `nobj` and `wh` against its rows.
 
 ## 6. Reads
 
@@ -236,13 +244,27 @@ OFFSET.
   files' sizes refreshed once a second.
 - EPOCH coverage and window counts with at most an epoch range read the
   epochs from `r_ke` (or `r_w`) alone when the type has no copies in several
-  partitions.
+  partitions. A window or day count (epoch or epoch-day range) sums the
+  whole hours from `wh` and counts the two edge hours on `r_w`, when every
+  row of the file is visible.
+- An unfiltered W window's offset of 4,096 or more (and INDEX_PAGE's epoch
+  phase when every record has an epoch) sums the hours above it from `wh`;
+  `r_w` is counted from the top of the hour that holds it.
+- A lane-filtered CID page whose lane is a large share of the type walks the
+  type index's `c` and checks each entry's lane on `rl`'s key (no row): the
+  offset is counted on it and only the page's rows are read.
+- The reader pool keeps at least one connection per partition file (a
+  type-wide read touches every file of its type).
+- At start the long-work thread reads each type index once, start to end
+  (the host's page cache): the first writes' dedupe probes and the first
+  reads' CID probes do not read it a page at a time.
 
 **Full text** is checked a page at a time against FTS5 (a rowid range or a
 probe per seq), on a pooled reader connection: no set of every match.
 
 **EPOCH nearest / as_of / forward** (C-32) take one `r_ke` seek per object
-per partition.
+per partition. The count of nearest over every epoch of a one-file type is
+the file's `nobj` (read in the same transaction).
 - The objects are walked in k order: a seek to the next k.
 - Each object's run is read from the target, in rank order, until an epoch
   group has a row that passes the filters. The lowest CID of that group
