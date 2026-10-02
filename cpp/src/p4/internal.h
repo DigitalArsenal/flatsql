@@ -483,6 +483,10 @@ public:
     void dropPath(const std::string& path);  // closes idle connections to path
     void closeAll();
     uint32_t open() const { return open_.load(std::memory_order_relaxed); }
+    // The pool keeps at least one idle connection per partition file (a
+    // type-wide read touches every file of its type; a cap below the file
+    // count reopens files on every such read).
+    void addFiles(uint32_t n) { files_.fetch_add(n, std::memory_order_relaxed); }
 
 private:
     std::mutex mu_;
@@ -490,7 +494,7 @@ private:
     std::list<Conn*> lru_;  // idle, oldest at the back
     std::unordered_map<Conn*, std::list<Conn*>::iterator> pos_;
     uint32_t cap_ = 256, cacheKiB_ = 512;
-    std::atomic<uint32_t> open_{0};
+    std::atomic<uint32_t> open_{0}, files_{0};
 };
 
 // Maintenance work items.

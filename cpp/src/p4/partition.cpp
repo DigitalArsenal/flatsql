@@ -1387,6 +1387,7 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
         if (kv.second.n <= 0) f->lanes.erase(kv.first);
         else f->lanes[kv.first] = kv.second;
     }
+    if (!f->created) e_->rpool.addFiles(1);
     f->created = true;
     f->touched = true;
     return P4_OK;

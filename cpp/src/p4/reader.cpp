@@ -71,7 +71,8 @@ void ReaderPool::release(Conn* c) {
         idle_.emplace(c->path, c);
         lru_.push_front(c);
         pos_[c] = lru_.begin();
-        while (open_.load() > cap_ && !lru_.empty()) {
+        const uint32_t cap = std::max<uint32_t>(cap_, files_.load(std::memory_order_relaxed) + 32);
+        while (open_.load() > cap && !lru_.empty()) {
             Conn* v = lru_.back();
             lru_.pop_back();
             pos_.erase(v);

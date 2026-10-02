@@ -219,11 +219,15 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
     // Every partition the index says has a file, against the disk: a missing
     // file without rows is made again by its next write; a missing file with
     // rows is quarantined (P4_E_CORRUPT, named), never silently remade.
+    uint32_t files = 0;
     for (auto& p : t->parts) {
-        if (!p->created || ioExists(p->path)) continue;
-        if (p->n == 0) p->created = false;
-        else p->quarantined = true;
+        if (p->created && !ioExists(p->path)) {
+            if (p->n == 0) p->created = false;
+            else p->quarantined = true;
+        }
+        files += p->created;
     }
+    t->e->rpool.addFiles(files);
     if (t->nextSeq < int64_t(t->e->cfg.gseqFloor)) t->nextSeq = int64_t(t->e->cfg.gseqFloor);
     t->visRecompute();
     return P4_OK;
