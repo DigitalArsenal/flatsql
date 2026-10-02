@@ -501,6 +501,8 @@ int64_t dbBytesOf(Conn* c, int64_t* freeBytes) {
     return db;
 }
 
+thread_local char tSqlLog[200] = {0};
+
 int32_t statusOfSqlite(int rc) {
     switch (rc & 0xff) {
         case SQLITE_OK:

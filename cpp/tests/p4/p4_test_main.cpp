@@ -625,9 +625,35 @@ bool Result::null(size_t row, const std::string& c) const {
 
 int main(int argc, char** argv) {
 #if defined(__wasm__)
-    // Grow the heap before any engine thread runs (a host may refresh a shared
-    // memory's size lazily per thread): allocate and free one large block.
-    if (void* p = std::malloc(size_t(1536) << 20)) std::free(p);
+    // Grow the heap to the memory's maximum, on this thread, before any engine
+    // thread starts, so that memory never grows while threads run. V8 (Node,
+    // browsers) bounds-checks memory.fill/copy and atomics against each
+    // thread's cached memory size, which another thread's memory.grow updates
+    // only at this thread's next stack check. The wasm kill loop's lane-thread
+    // trap with the SQL surface built in was this: each lane opens its SQLite
+    // connection at start, and the memory.fill in openDatabase
+    // (sqlite3SchemaGet, sqlite3FindFunction) landed in memory a writer had
+    // just grown past the old 1,536 MiB pre-grow. The same fix as the ps test
+    // main (668f0e6); WasmEdge (SDN) is immune. P4_WASM_HEAP_MB caps it.
+    {
+        const char* mb = std::getenv("P4_WASM_HEAP_MB");
+        const size_t cap = mb ? size_t(std::atol(mb)) << 20 : SIZE_MAX;
+        const uint64_t limit = (uint64_t(1) << 32) - (uint64_t(16) << 20);
+        void* volatile held[64];  // volatile: the allocations are not elided
+        int n = 0;
+        size_t got = 0;
+        for (size_t step = size_t(1) << 30; step >= (size_t(1) << 20) && n < 64;) {
+            const uint64_t mem = uint64_t(__builtin_wasm_memory_size(0)) << 16;
+            void* p = step <= cap - got && mem + step + (1u << 20) <= limit ? std::malloc(step) : nullptr;
+            if (!p) {
+                step >>= 1;
+                continue;
+            }
+            held[n++] = p;
+            got += step;
+        }
+        for (int i = 0; i < n; i++) std::free(held[i]);
+    }
 #endif
     for (int i = 1; i < argc; i++) p4t::gArgs.push_back(argv[i]);
     const std::string filter = p4t::argStr("test", "");

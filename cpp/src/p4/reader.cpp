@@ -2139,7 +2139,9 @@ struct Out {
         if (enc.blockBytes() == 0 && !L->out.empty()) return flushOut(L);
         return L->trip;
     }
-    void finish(int32_t status, const std::string& err) {
+    void finish(int32_t status, const std::string& err0) {
+        // An I/O-class failure names SQLite's last error on this thread.
+        const std::string err = status == P4_E_IO && tSqlLog[0] ? err0 + ": " + tSqlLog : err0;
         // Blocks still buffered when a cap or cancel tripped are dropped; the
         // RB1E always goes.
         if (L->trip) L->out.clear();
@@ -3220,6 +3222,7 @@ int32_t runRead(P4Lane* L, uint32_t op) {
         respondEmpty(L, {}, P4_E_ARG, "malformed request");
         return P4_E_ARG;
     }
+    tSqlLog[0] = 0;
     switch (op) {
         case P4_OPC_GET: return opGet(L, v);
         case P4_OPC_TAGS: return opTags(L, v);

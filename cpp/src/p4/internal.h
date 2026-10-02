@@ -189,6 +189,7 @@ enum class OpenKind { Writer, Reader, IndexReader, Index, Journal, Maint };
 int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t pageSize, Conn** out,
              std::string* err);
 int32_t statusOfSqlite(int rc);  // SQLite result -> P4 status (BUSY and I/O errors are errors, never misses)
+extern thread_local char tSqlLog[200];  // this thread's last SQLite error log line (SQLITE_CONFIG_LOG)
 // A connection's database bytes (pages x page size) and free bytes, from its
 // header (no file I/O on a connection that just committed).
 int64_t dbBytesOf(Conn* c, int64_t* freeBytes);

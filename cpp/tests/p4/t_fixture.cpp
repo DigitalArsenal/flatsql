@@ -937,6 +937,7 @@ P4_SLOW_TEST(g3_bench) {
         report("w10.files_dropped", double(r.i(0, "files_dropped")), "files");
         report("w10.records_dropped", double(r.i(0, "records_dropped")), "records");
     }
+    if (argInt("exit-dirty", 0)) std::_Exit(0);  // as a kill: WALs left for the next open
     TlvW v8;
     v8.u32(63, 8);
     Result v = call(P4_OPC_REBUILD, v8.b, slow);
@@ -1280,8 +1281,76 @@ P4_SLOW_TEST(reads_bench) {
         t.raw(17, p.data(), p.size());
         add("R08 SCAN OMM day", P4_OPC_SCAN, t);
     }
+    {
+        TlvW t;
+        t.text(1, "OMM").u8(2, 1).u64(3, 100);
+        add("R05 SCAN OMM limit=100", P4_OPC_SCAN, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u64(3, 200);
+        add("R16 EPOCH OMM nearest limit=200", P4_OPC_EPOCH, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").u64(3, 50);
+        add("R11 INDEX_PAGE OMM page 1", P4_OPC_INDEX_PAGE, t);
+    }
     const std::string only = argStr("only", "");
     CallOpts co{0, 0, 0, 0, 0, 0, false, 600000};
+    if (const long rounds = argInt("burst", 0)) {
+        // Open, then every shape at once from its own caller (M01's first
+        // reads after open), --burst rounds: every answer must be P4_OK.
+        int errors = 0;
+        for (long round = 0; round < rounds; round++) {
+            if (round > 0) REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "reopen");
+            std::vector<std::thread> th;
+            std::vector<Result> res(shapes.size());
+            Result wr;
+#if !defined(__wasm__)
+            if (!argStr("bfbs", "").empty()) {
+                // With a write starting at the same moment (M01's W01).
+                th.emplace_back([&, round] {
+                    TestType real = realType(argStr("bfbs", ""), "OMM");
+                    real.schema = reflection::GetSchema(real.bfbs.data());
+                    Batch b;
+                    b.type = "OMM";
+                    b.peer = argStr("peer", "12D3KooWBurstWriter");
+                    b.tags.push_back(Tag{"space-data-network-02", "celestrak-gp", "", "OMM-celestrak-gp-burst", "", "", ""});
+                    b.at = 1790700000;
+                    for (int i = 0; i < 4096; i++) {
+                        In in;
+                        in.frame = buildFrame(real, {Field::str("OBJECT_NAME", "BURST " + std::to_string(i)), Field::str("OBJECT_ID", "2026-001A"),
+                                                     Field::u64("NORAD_CAT_ID", uint64_t(1 + i)),
+                                                     Field::str("EPOCH", isoTime(unixOf(2026, 10, 1) + round * 86400 + i)),
+                                                     Field::f64("MEAN_MOTION", 15.5), Field::f64("ECCENTRICITY", 0.0001),
+                                                     Field::f64("INCLINATION", 51.6)});
+                        in.ts = 1790700000;
+                        b.recs.push_back(std::move(in));
+                    }
+                    wr = put(b);
+                });
+            }
+#endif
+            for (size_t i = 0; i < shapes.size(); i++)
+                th.emplace_back([&, i] { res[i] = call(shapes[i].op, shapes[i].t.b, co); });
+            for (auto& t : th) t.join();
+            if (!argStr("bfbs", "").empty() && wr.status != P4_OK) {
+                errors++;
+                std::printf("  round %ld: write -> %d %s\n", round, wr.status, wr.err.c_str());
+            }
+            for (size_t i = 0; i < shapes.size(); i++)
+                if (res[i].status != P4_OK) {
+                    errors++;
+                    std::printf("  round %ld: %s -> %d %s\n", round, shapes[i].name.c_str(), res[i].status, res[i].err.c_str());
+                }
+            closeEngine(600000);
+        }
+        report("burst.rounds", double(rounds), "rounds");
+        report("burst.errors", double(errors), "errors");
+        CHECK_EQ(errors, 0, "every concurrent first read after open");
+        return;
+    }
     for (Shape& sh : shapes) {
         if (!only.empty() && sh.name.find(only) == std::string::npos) continue;
         std::vector<double> ms;

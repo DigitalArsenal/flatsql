@@ -143,12 +143,19 @@ int32_t catalogAppend(const std::string& path, const std::string& name) {
 
 std::mutex gGlobalMu;
 bool gGlobalDone = false;
+// SQLite's own error log, kept per thread: a read that fails names the
+// SQLite error behind its status.
+void sqlLog(void*, int code, const char* msg) {
+    if ((code & 0xff) == SQLITE_NOTICE || (code & 0xff) == SQLITE_WARNING) return;
+    std::snprintf(tSqlLog, sizeof tSqlLog, "%s (%d)", msg ? msg : "", code);
+}
 int32_t globalInit() {
     std::lock_guard<std::mutex> g(gGlobalMu);
     if (gGlobalDone) return P4_OK;
     // p4sql installs its per-lane allocators before SQLite initializes (§3.9).
     int32_t rc = p4sql_global_init();
     if (rc != P4_OK) return rc;
+    sqlite3_config(SQLITE_CONFIG_LOG, sqlLog, nullptr);  // refused (ignored) once SQLite is initialized
     if (sqlite3_initialize() != SQLITE_OK) return P4_E_INTERNAL;
     if (flatsql::registerFlatSqlIoVfs(false) != SQLITE_OK) return P4_E_INTERNAL;
     gGlobalDone = true;
