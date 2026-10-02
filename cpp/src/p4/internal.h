@@ -10,7 +10,7 @@
 //   STORE, MIGRATED                      markers (§2.2)
 //   T/TYPES                              registered type names (append-only records with a crc)
 //   T/<TYPE>.spec                        the registered spec TLV, plus a crc tag
-//   T/<TYPE>.idx                         type index: derived, rebuildable (c, ident, part, file, lanes, srcs, lanecnt, meta)
+//   T/<TYPE>.idx                         type index: derived, rebuildable (c, ident, part, src, lanes, lanecnt, meta)
 //   T/<TYPE>.jnl                         intent journal (synchronous=FULL)
 //   T/<TYPE>.fts                         FTS5 (maintenance thread)
 //   P/<TYPE>/<pid>.db                    the partition's one file, for its life
@@ -103,6 +103,10 @@ int64_t nowSec();
 void dayText(int64_t sec, char out[11]);  // "YYYY-MM-DD"
 
 // ---- statistics (§3.10; entries only ever appended) ----------------------------------
+// kStUnlinked, kStQuotaFiles and kStTwoPhase are always 0 in the owner layout
+// (a partition keeps its one file; there are no merges): the frozen ABI keeps
+// their slots until a re-freeze removes them, as it keeps SUPERSEDE's
+// files_deleted and QUOTA_GC's files_dropped columns (always 0).
 enum Stat : int {
     kStPuts, kStPutRecords, kStNew, kStCopies, kStRetags, kStDups, kStIdentDups, kStRejects,
     kStCatSuperseded, kStSupersedeTags, kStSupersedeRecords, kStDeletes, kStGroupCommits,
@@ -188,7 +192,6 @@ int32_t statusOfSqlite(int rc);  // SQLite result -> P4 status (BUSY and I/O err
 // ---- engine objects ------------------------------------------------------------------------
 struct Type;
 struct Part;
-struct File;
 
 struct SrcDef {
     uint32_t id = 0;
@@ -208,10 +211,17 @@ struct LaneCount {
     std::string url0;  // an instance's url when its rl.u is NULL
 };
 
-// The partition's one file. Its counters mirror the file's meta and lane
-// rows (the durable copy), under Type::mu.
-struct File {
-    Part* part = nullptr;
+struct WriteTask;
+
+// A partition (producer x type) and its one file, P/<TYPE>/<pid>.db, for its
+// life (C-32). The counters mirror the file's meta and lane rows (the
+// durable copy), under Type::mu.
+struct Part {
+    Type* type = nullptr;
+    uint32_t pid = 0;
+    std::string producer;  // the producer token (C-13)
+    std::string peer;      // the first writer's peer (REC.peer when r.p is NULL, C-2)
+    uint32_t owner = 0;    // writer thread index
     std::string path;
     int64_t n = 0, bytes = 0, ncopy = 0, minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN,
             maxts = 0, nnull = 0, mints = INT64_MAX, mine = INT64_MAX, maxe = INT64_MIN;
@@ -220,23 +230,12 @@ struct File {
     bool quarantined = false;  // corrupt: P4_E_CORRUPT for ops that need it
     bool indexed = true;       // secondary indexes present (false between a migration's append and REBUILD 1)
     bool touched = false;      // changed since the last flush
+    bool journaled = false;    // its J_PART row is durable
     // writer connection (Engine::wconnMu)
     Conn* w = nullptr;
     int wPins = 0;
-    std::list<File*>::iterator lru;
+    std::list<Part*>::iterator lru;
     bool inLru = false;
-};
-
-struct WriteTask;
-
-struct Part {
-    Type* type = nullptr;
-    uint32_t pid = 0;
-    std::string producer;  // the producer token (C-13)
-    std::string peer;      // the first writer's peer (REC.peer when r.p is NULL, C-2)
-    uint32_t owner = 0;    // writer thread index
-    std::unique_ptr<File> file;  // P/<TYPE>/<pid>.db
-    bool journaled = false;  // its J_PART row is durable
     // backlog (WriterState::mu of the owner)
     std::deque<WriteTask*> backlog;
     uint64_t backlogRecords = 0;
@@ -534,7 +533,7 @@ struct P4Engine {
     std::atomic<uint32_t> nextOwner{0};
     // writer connections (wconnMu): LRU over files with an open writer connection
     std::mutex wconnMu;
-    std::list<flatsql::p4::File*> wlru;
+    std::list<flatsql::p4::Part*> wlru;
     uint32_t nWConn = 0;
     // reader connections
     flatsql::p4::ReaderPool rpool;
@@ -602,11 +601,11 @@ SrcDef* srcFor(Type* t, const std::string& provider, const std::string& source, 
 uint64_t laneHash(const std::string* f6);
 
 // ---- journal.cpp ------------------------------------------------------------------------------
+// J_FILE marks a partition file the group changed: a retag-only group or a
+// tag-only supersede chunk changes its lane counters with no J_C/J_DEL row.
 enum JOp : int { J_PART = 1, J_LANE = 2, J_SRC = 3, J_FILE = 4, J_C = 5, J_IDENT = 6, J_DEL = 7 };
 int32_t journalOpen(Type* t, std::string* err);
-// VACUUMs an emptied journal holding more than keepPages free pages (jmu held).
-void journalReclaim(Type* t, int64_t keepPages);
-int32_t journalReserve(Type* t, int64_t through);  // jmu held by caller? no: takes jmu
+int32_t journalReserve(Type* t, int64_t through);  // takes jmu
 int32_t journalReplay(Type* t, std::string* err);  // at open, before any read (M8)
 
 // ---- type_index.cpp -----------------------------------------------------------------------------
@@ -627,17 +626,15 @@ int32_t typeIndexFlush(Type* t, bool force);  // maintenance thread
 
 // ---- partition.cpp -------------------------------------------------------------------------------
 // The writer connection of a file (created on first use), pinned for the caller.
-Conn* writerPin(P4Engine* e, File* f, int32_t* rc, std::string* err);
-void writerUnpin(P4Engine* e, File* f);
-int32_t fileSchema(Type* t, Conn* c, File* f, bool indexes);
+Conn* writerPin(P4Engine* e, Part* f, int32_t* rc, std::string* err);
+void writerUnpin(P4Engine* e, Part* f);
+int32_t fileSchema(Type* t, Conn* c, Part* f, bool indexes);
 int32_t fileCreateIndexes(Type* t, Conn* c);
 void putGroup(P4Engine* e, uint32_t writer, Part* p, std::vector<WriteTask*>& tasks);
 void supersedePart(P4Engine* e, Part* p, WriteTask* task);
 // DELETE and quota: the given seqs of this partition's file.
 void deletePart(P4Engine* e, Part* p, WriteTask* task);
 void finishShared(P4Engine* e, Shared* s);
-// Tests compare the EPOCH per-object answers with the scan's.
-extern std::atomic<bool> gEpochScanOnly;
 
 // ---- reader.cpp -----------------------------------------------------------------------------------
 int32_t runRead(P4Lane* L, uint32_t op);  // ops 10-17 on a lane

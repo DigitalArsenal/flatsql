@@ -755,7 +755,7 @@ int32_t engineStop(Engine* e, double deadlineMs) {
     std::vector<Conn*> conns;
     {
         std::lock_guard<std::mutex> g(e->wconnMu);
-        for (File* f : e->wlru) {
+        for (Part* f : e->wlru) {
             conns.push_back(f->w);
             f->w = nullptr;
             f->inLru = false;

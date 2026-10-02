@@ -73,7 +73,7 @@ void jinflightDone(Type* t, int64_t first) {
 // transaction, after journaling the rows' delete intents.
 int32_t removeFromFile(Engine* e, Part* p, const std::vector<Inst>& insts, std::vector<Gone>& gone) {
     Type* t = p->type;
-    File* f = p->file.get();
+    Part* f = p;
     int32_t status = P4_OK;
     Conn* c = writerPin(e, f, &status, nullptr);
     if (!c) return status;
@@ -283,7 +283,7 @@ void sharedFail(Shared* s, int32_t status, const std::string& err) {
 void supersedePart(Engine* e, Part* p, WriteTask* task) {
     Shared* s = task->shared;
     Type* t = p->type;
-    File* f = p->file.get();
+    Part* f = p;
     std::vector<uint32_t> drop;
     uint32_t sid = 0;
     bool has = false;
@@ -386,7 +386,7 @@ void deletePart(Engine* e, Part* p, WriteTask* task) {
     bool created;
     {
         std::lock_guard<std::mutex> g(p->type->mu);
-        created = p->file->created;
+        created = p->created;
     }
     std::vector<int64_t> seqs = task->dels;
     std::sort(seqs.begin(), seqs.end());

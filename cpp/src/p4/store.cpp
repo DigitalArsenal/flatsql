@@ -266,9 +266,7 @@ Part* partFor(Type* t, const std::string& producer, const std::string& peer, boo
     p->pid = uint32_t(t->parts.size() + 1);
     p->producer = producer;
     p->peer = peer;
-    p->file = std::make_unique<File>();
-    p->file->part = p.get();
-    p->file->path = t->filePath(p->pid);
+    p->path = t->filePath(p->pid);
     Engine* e = t->e;
     p->owner = e->writers.empty() ? 0 : e->nextOwner.fetch_add(1) % uint32_t(e->writers.size());
     Part* raw = p.get();
@@ -469,14 +467,16 @@ int32_t engineActivate(Engine* e) {
         int32_t rc = typeIndexFlush(t, true);
         if (rc != P4_OK) return rc;
         {
+            // The migration's journal, emptied by the flush, at rest: its free
+            // pages go (no writer runs on a store being activated).
             std::lock_guard<std::mutex> g(t->jmu);
-            journalReclaim(t, 0);
+            t->jdb->exec("VACUUM");
         }
         std::vector<std::string> paths;
         {
             std::lock_guard<std::mutex> g(t->mu);
             for (auto& p : t->parts)
-                if (p->file->created) paths.push_back(p->file->path);
+                if (p->created) paths.push_back(p->path);
         }
         paths.push_back(t->pIdx);
         paths.push_back(t->pJnl);
@@ -514,8 +514,8 @@ int32_t engineStats(Engine* e, uint8_t* out, int32_t cap) {
             parts += t->parts.size();
             pending += t->pend.bytes() + t->flushing.bytes();
             for (auto& p : t->parts) {
-                if (p->file->created) files++;
-                if (p->file->quarantined) quarantined++;
+                if (p->created) files++;
+                if (p->quarantined) quarantined++;
             }
         }
     }

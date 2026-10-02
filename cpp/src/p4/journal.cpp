@@ -68,22 +68,6 @@ int32_t journalOpen(Type* t, std::string* err) {
     return P4_OK;
 }
 
-// Hands an emptied journal's free pages back: VACUUM when no entry is left
-// (cheap then, and it keeps sqlite_sequence, so ids never restart). A journal
-// with live entries keeps its high-water size; ingest reuses the pages.
-void journalReclaim(Type* t, int64_t keepPages) {
-    // jmu held by the caller.
-    sqlite3_stmt* s = t->jdb->sql("SELECT (SELECT count(*) FROM (SELECT 1 FROM j LIMIT 1)), (SELECT freelist_count FROM pragma_freelist_count)");
-    int64_t live = 1, freePages = 0;
-    if (s && sqlite3_step(s) == SQLITE_ROW) {
-        live = sqlite3_column_int64(s, 0);
-        freePages = sqlite3_column_int64(s, 1);
-    }
-    if (s) sqlite3_reset(s);
-    if (live || freePages <= keepPages) return;
-    t->jdb->exec("VACUUM");
-}
-
 int32_t journalReserve(Type* t, int64_t through) {
     std::lock_guard<std::mutex> g(t->jmu);
     sqlite3_stmt* s = t->jdb->get(S_JM_SET);
@@ -140,7 +124,7 @@ int32_t journalReplay(Type* t, std::string* err) {
     // A file is created once its schema committed: a crash between the
     // empty file (ioTouch) and the schema leaves a file without tables, which
     // the writer completes (CREATE ... IF NOT EXISTS) instead of trusting.
-    std::unordered_set<File*> checked;
+    std::unordered_set<Part*> checked;
     for (const JE& x : rows) {
         if (x.op == J_PART) {
             const auto f = splitUnit(x.s, 2);
@@ -198,7 +182,7 @@ int32_t journalReplay(Type* t, std::string* err) {
         } else if (x.op == J_FILE) {
             Part* p = t->partById(x.pid);
             if (!p) continue;
-            File* f = p->file.get();
+            Part* f = &*p;
             if (!checked.count(f)) {
                 checked.insert(f);
                 f->created = fileHasSchema(f->path);
@@ -209,8 +193,8 @@ int32_t journalReplay(Type* t, std::string* err) {
     // 2. Entries, checked against the files. One maintenance connection per
     //    file, opened here: opening it recovers the file's WAL before any read
     //    is served (M8).
-    std::unordered_map<File*, Conn*> conns;
-    auto connOf = [&](File* f) -> Conn* {
+    std::unordered_map<Part*, Conn*> conns;
+    auto connOf = [&](Part* f) -> Conn* {
         auto it = conns.find(f);
         if (it != conns.end()) return it->second;
         Conn* c = nullptr;
@@ -218,16 +202,16 @@ int32_t journalReplay(Type* t, std::string* err) {
         conns[f] = c;
         return c;
     };
-    auto fileOf = [&](uint32_t pid) -> File* {
+    auto fileOf = [&](uint32_t pid) -> Part* {
         Part* p = t->partById(pid);
-        return p ? p->file.get() : nullptr;
+        return p ? p : nullptr;
     };
     Conn* idx = t->idx;
     std::unordered_set<int64_t> liveSeqs;
     std::shared_ptr<const Spec> sp = t->spec_;
     for (const JE& x : rows) {
         if (x.op != J_C && x.op != J_DEL) continue;
-        File* f = fileOf(x.pid);
+        Part* f = fileOf(x.pid);
         Conn* c = f ? connOf(f) : nullptr;
         bool present = false;
         int64_t len = 0;
@@ -297,7 +281,7 @@ int32_t journalReplay(Type* t, std::string* err) {
     }
     // 3. Recount every touched file from its own rows and lane rows.
     for (auto& p : t->parts) {
-        File* f = p->file.get();
+        Part* f = &*p;
         if (!f->touched) continue;
         Conn* c = connOf(f);
         if (!c) continue;

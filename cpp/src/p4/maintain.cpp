@@ -106,11 +106,11 @@ std::vector<Type*> typesWithFiles(Engine* e) {
     return types;
 }
 
-std::vector<File*> createdFiles(Type* t) {
-    std::vector<File*> files;
+std::vector<Part*> createdFiles(Type* t) {
+    std::vector<Part*> files;
     std::lock_guard<std::mutex> g(t->mu);
     for (auto& p : t->parts)
-        if (p->file->created) files.push_back(p->file.get());
+        if (p->created) files.push_back(p.get());
     return files;
 }
 
@@ -122,7 +122,7 @@ std::vector<File*> createdFiles(Type* t) {
 int64_t storeBytes(Engine* e, bool inUse) {
     int64_t total = 0;
     for (Type* t : typesWithFiles(e)) {
-        for (File* f : createdFiles(t)) {
+        for (Part* f : createdFiles(t)) {
             total += sizeOf(f->path + "-journal");
             if (!inUse) {
                 total += sizeOf(f->path) + sizeOf(f->path + "-wal");
@@ -152,7 +152,7 @@ int64_t storeBytes(Engine* e, bool inUse) {
 int32_t oldestOf(Engine* e, Type* t, int64_t* seq, int64_t* ts) {
     *seq = 0;
     *ts = INT64_MAX;
-    for (File* f : createdFiles(t)) {
+    for (Part* f : createdFiles(t)) {
         int rc = 0;
         Conn* c = e->rpool.acquire(f->path, OpenKind::Reader, &rc, nullptr);
         if (!c) return statusOfSqlite(rc);
@@ -178,11 +178,11 @@ int32_t quotaPass(Engine* e, Type* t, size_t want, int64_t* records, int64_t* by
     {
         std::lock_guard<std::mutex> g(t->mu);
         for (auto& p : t->parts)
-            if (p->file->created && p->file->n > 0) parts.push_back(p.get());
+            if (p->created && p->n > 0) parts.push_back(p.get());
     }
     for (Part* p : parts) {
         int rc = 0;
-        Conn* c = e->rpool.acquire(p->file->path, OpenKind::Reader, &rc, nullptr);
+        Conn* c = e->rpool.acquire(p->path, OpenKind::Reader, &rc, nullptr);
         if (!c) return statusOfSqlite(rc);
         sqlite3_stmt* q = c->sql("SELECT seq FROM r INDEXED BY r_s ORDER BY seq LIMIT ?1");
         if (!q) q = c->sql("SELECT seq FROM r ORDER BY seq LIMIT ?1");
@@ -315,7 +315,7 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
     int32_t rc = typeIndexFlush(t, true);
     if (rc != P4_OK) return rc;
     std::lock_guard<std::mutex> fg(t->flushMu);
-    std::vector<File*> files = createdFiles(t);
+    std::vector<Part*> files = createdFiles(t);
     Conn* x = t->idx;
     // An error ends the pass with that error (M9): a statement that stops
     // early must not read as missing rows, and a fix must not rewrite the
@@ -328,7 +328,7 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
         if (fix) x->exec("ROLLBACK");
         return statusOfSqlite(src == SQLITE_OK || src == SQLITE_ROW || src == SQLITE_DONE ? SQLITE_ERROR : src);
     };
-    for (File* f : files) {
+    for (Part* f : files) {
         Conn* c = nullptr;
         where = f->path;
         const int orc = openConn(f->path, OpenKind::Maint, 4096, 0, &c, nullptr);
@@ -338,7 +338,7 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
     if (fix && x->exec("BEGIN IMMEDIATE") != SQLITE_OK) return fail(SQLITE_BUSY);
     // 1. Each file's counters and lanes from its own rows.
     for (size_t fi = 0; fi < files.size(); fi++) {
-        File* f = files[fi];
+        Part* f = files[fi];
         Conn* c = conns[fi];
         where = f->path;
         sqlite3_stmt* s = c->sql("SELECT seq, length(d), w, e FROM r");
@@ -428,7 +428,7 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
         if (!probe || !put) return fail(SQLITE_ERROR);
         for (size_t fi = 0; fi < files.size(); fi++) {
             where = files[fi]->path;
-            const uint32_t pid = files[fi]->part->pid;
+            const uint32_t pid = files[fi]->pid;
             sqlite3_stmt* s = conns[fi]->sql("SELECT seq, cid FROM r");
             if (!s) return fail(SQLITE_ERROR);
             int src;
@@ -464,7 +464,7 @@ int32_t indexAgainstFiles(Engine* e, Type* t, bool fix, Verify* v) {
             if (src != SQLITE_DONE) return fail(src);
         }
         std::unordered_map<uint32_t, Conn*> connOf;
-        for (size_t fi = 0; fi < files.size(); fi++) connOf[files[fi]->part->pid] = conns[fi];
+        for (size_t fi = 0; fi < files.size(); fi++) connOf[files[fi]->pid] = conns[fi];
         sqlite3_stmt* page = x->sql("SELECT cid, pid, seq FROM c WHERE (cid, pid) > (?1, ?2) ORDER BY cid, pid LIMIT 65536");
         sqlite3_stmt* del = x->get(S_C_DEL);
         if (!page || !del) return fail(SQLITE_ERROR);
@@ -562,7 +562,7 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
         Verify v;
         if (what & 1) {
             // Partition secondary indexes after a migration's bulk append.
-            for (File* f : createdFiles(t)) {
+            for (Part* f : createdFiles(t)) {
                 Conn* c = nullptr;
                 if (openConn(f->path, OpenKind::Maint, 65536, 0, &c, nullptr) != SQLITE_OK) return P4_E_IO;
                 const int32_t rc = fileCreateIndexes(t, c);
@@ -598,7 +598,7 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
             v.mismatches = vv.mismatches;
             // C-27: every live file of the type, its index and its journal.
             std::vector<std::string> paths;
-            for (File* f : createdFiles(t)) paths.push_back(f->path);
+            for (Part* f : createdFiles(t)) paths.push_back(f->path);
             if (t->hasFiles.load()) {
                 paths.push_back(t->pIdx);
                 paths.push_back(t->pJnl);
@@ -645,7 +645,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
     {
         std::lock_guard<std::mutex> tg(t->mu);
         for (auto& p : t->parts)
-            if (p->file->created && p->file->maxseq > t->ftsThrough) paths.push_back(p->file->path);
+            if (p->created && p->maxseq > t->ftsThrough) paths.push_back(p->path);
     }
     const std::string fid(reinterpret_cast<const char*>(sp->tc.fid()), 4);
     // The cut: seqs interleave across files, so a bounded pass indexes every

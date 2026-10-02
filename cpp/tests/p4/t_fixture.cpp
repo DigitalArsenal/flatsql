@@ -1019,3 +1019,162 @@ P4_SLOW_TEST(open_bench) {
     removeTree(root.substr(0, root.size() - 6));
 }
 #endif
+
+// The read gate's material shapes (GATES-r1), as the SDN backend sends them
+// to the engine, on a fixture store: one cold call and three warm ones each.
+//   flatsql_p4_test --test=reads_bench --store=<dir with fsql4> [--only=<substring>]
+P4_SLOW_TEST(reads_bench) {
+    const std::string store = argStr("store", "");
+    if (store.empty()) {
+        std::printf("  skipped: --store\n");
+        return;
+    }
+    EngineOpts o;
+    o.createMode = 0;
+    REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
+    auto text = [](uint8_t field, uint8_t op, const std::string& v) {
+        std::vector<uint8_t> p = {field, op, 1, 0, 3};
+        uint8_t n[4];
+        fp::st32(n, uint32_t(v.size()));
+        p.insert(p.end(), n, n + 4);
+        p.insert(p.end(), v.begin(), v.end());
+        return p;
+    };
+    struct Shape {
+        std::string name;
+        uint32_t op;
+        TlvW t;
+    };
+    std::vector<Shape> shapes;
+    auto add = [&](const std::string& name, uint32_t op, TlvW t) { shapes.push_back(Shape{name, op, std::move(t)}); };
+    const std::string day14 = "2026-09-14", day20 = "2026-09-20";
+    {
+        TlvW t;
+        t.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052");
+        add("R10 HEAD OMM source+batch", P4_OPC_HEAD, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "IQC").text(12, "IQEngine");
+        add("R10 HEAD IQC source", P4_OPC_HEAD, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM");
+        auto p = text(P4_F_EPOCH_DAY, P4_OP_EQ, day14);
+        t.raw(17, p.data(), p.size());
+        add("R10 HEAD OMM EPOCH_DAY", P4_OPC_HEAD, t);
+    }
+    for (int prof : {2, 3, 4}) {
+        TlvW t;
+        t.text(1, "OMM").text(12, "celestrak-gp").u8(30, uint8_t(prof)).i64(31, 1789371001).u64(3, 50000);
+        add(std::string("R18 EPOCH OMM@celestrak-gp ") + (prof == 2 ? "nearest" : prof == 3 ? "as_of" : "forward"), P4_OPC_EPOCH, t);
+    }
+    {
+        TlvW t;
+        t.u8(45, 4);
+        add("R20 SUMMARY 4 (DiskUsage)", P4_OPC_SUMMARY, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").text(12, "celestrak-gp").u64(3, 50).u64(4, 50);
+        add("R11 INDEX_PAGE OMM src page 2", P4_OPC_INDEX_PAGE, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "IQC").text(12, "IQEngine").u64(3, 50).u64(4, 100);
+        add("R11 INDEX_PAGE IQC src page 3", P4_OPC_INDEX_PAGE, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "MPE").text(12, "celestrak-gp").u64(3, 50).u64(4, 200);
+        add("R11 INDEX_PAGE MPE src page 5", P4_OPC_INDEX_PAGE, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "CAT").u64(3, 50);
+        auto p = text(P4_F_COL0, P4_OP_LIKE, "%2554%");
+        t.raw(17, p.data(), p.size());
+        add("R11 INDEX_PAGE CAT norad LIKE", P4_OPC_INDEX_PAGE, t);
+        add("R11 HEAD CAT norad LIKE", P4_OPC_HEAD, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").u8(2, 1).u64(3, 1000);
+        auto p = text(P4_F_EPOCH_DAY, P4_OP_EQ, day14);
+        t.raw(17, p.data(), p.size());
+        add("R12 WINDOW OMM day", P4_OPC_WINDOW, t);
+    }
+    for (const char* ty : {"CAT", "OMM"}) {
+        TlvW t;
+        t.text(1, ty).u8(2, 1).u64(3, 100).u64(4, 20000);
+        add(std::string("R12 WINDOW ") + ty + " off=20000", P4_OPC_WINDOW, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").u8(30, 1).u64(3, 200);
+        auto p = text(P4_F_EPOCH_DAY, P4_OP_EQ, day20);
+        t.raw(17, p.data(), p.size());
+        add("R16 EPOCH OMM window day", P4_OPC_EPOCH, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").u8(30, 5);
+        add("R16 EPOCH OMM coverage", P4_OPC_EPOCH, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(5, P4_ORDER_CID).u8(2, 1).u64(3, 1000);
+        add("R13 WINDOW OMM src+batch cid", P4_OPC_WINDOW, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "IQC").u8(5, P4_ORDER_CID).u8(2, 1).u64(3, 1000).u64(4, 100000);
+        add("R13 WINDOW IQC cid off=100000", P4_OPC_WINDOW, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "CAT").u8(5, P4_ORDER_CID).u8(2, 1).u64(3, 200).u64(4, 60000);
+        add("R13 WINDOW CAT cid off=60000", P4_OPC_WINDOW, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").text(11, "space-data-network-02").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(2, 1).u64(3, 1000);
+        add("R09 SCAN OMM batch b052", P4_OPC_SCAN, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "CAT").text(12, "celestrak-satcat-csv").u8(2, 1).u64(3, 100).u64(4, 1000);
+        add("R14 WINDOW CAT source off=1000", P4_OPC_WINDOW, t);
+    }
+    {
+        TlvW t;
+        t.text(1, "OMM").u8(2, 1).u64(3, 500);
+        auto p = text(P4_F_EPOCH_DAY, P4_OP_EQ, day14);
+        t.raw(17, p.data(), p.size());
+        add("R08 SCAN OMM day", P4_OPC_SCAN, t);
+    }
+    const std::string only = argStr("only", "");
+    CallOpts co{0, 0, 0, 0, 0, 0, false, 600000};
+    for (Shape& sh : shapes) {
+        if (!only.empty() && sh.name.find(only) == std::string::npos) continue;
+        std::vector<double> ms;
+        size_t rows = 0;
+        int32_t st = 0;
+        uint64_t ex = 0;
+        for (int i = 0; i < 4; i++) {
+            const uint64_t s = flatsql::ps::monoNs();
+            Result r = call(sh.op, sh.t.b, co);
+            ms.push_back(double(flatsql::ps::monoNs() - s) / 1e6);
+            rows = r.rows.size();
+            st = r.status;
+            ex = r.rowsExamined;
+            if (sh.op == P4_OPC_HEAD && r.rows.size() == 1 && i == 0) rows = size_t(r.i(0, "n"));
+        }
+        std::vector<double> warm(ms.begin() + 1, ms.end());
+        std::sort(warm.begin(), warm.end());
+        std::printf("  %-36s cold %9.3f ms  warm p50 %9.3f  max %9.3f  rows %zu  examined %llu  status %d (load %.1f)\n",
+                    sh.name.c_str(), ms[0], warm[1], warm[2], rows, (unsigned long long)ex, st, loadAvg());
+    }
+    closeEngine(600000);
+}

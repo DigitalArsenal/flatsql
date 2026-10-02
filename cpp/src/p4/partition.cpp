@@ -55,7 +55,7 @@ int32_t fileCreateIndexes(Type* t, Conn* c) {
     return rc == SQLITE_OK ? P4_OK : statusOfSqlite(rc);
 }
 
-int32_t fileSchema(Type* t, Conn* c, File* f, bool indexes) {
+int32_t fileSchema(Type* t, Conn* c, Part* f, bool indexes) {
     std::shared_ptr<const Spec> sp = t->spec();
     std::string ddl = std::string("BEGIN IMMEDIATE;") + kFileSchema;
     int rc = c->exec(ddl.c_str());
@@ -71,8 +71,8 @@ int32_t fileSchema(Type* t, Conn* c, File* f, bool indexes) {
         sqlite3_reset(s);
         return r == SQLITE_DONE;
     };
-    bool ok = meta("format", "4") && meta("type", t->name) && meta("producer", f->part->producer) &&
-              meta("peer", f->part->peer) && meta("pid", std::to_string(f->part->pid));
+    bool ok = meta("format", "4") && meta("type", t->name) && meta("producer", f->producer) &&
+              meta("peer", f->peer) && meta("pid", std::to_string(f->pid));
     if (ok && !indexes) {
         sqlite3_stmt* s = c->sql("INSERT OR IGNORE INTO meta(k, v) VALUES('ix', 0)");
         ok = s && sqlite3_step(s) == SQLITE_DONE;
@@ -92,7 +92,7 @@ int32_t fileSchema(Type* t, Conn* c, File* f, bool indexes) {
 }
 
 // ---- writer connections (≤ writer conns open; the LRU never closes a pinned one) ----------------
-Conn* writerPin(Engine* e, File* f, int32_t* rc, std::string* err) {
+Conn* writerPin(Engine* e, Part* f, int32_t* rc, std::string* err) {
     {
         std::lock_guard<std::mutex> g(e->wconnMu);
         if (f->w) {
@@ -104,7 +104,7 @@ Conn* writerPin(Engine* e, File* f, int32_t* rc, std::string* err) {
             return f->w;
         }
     }
-    Type* t = f->part->type;
+    Type* t = f->type;
     std::shared_ptr<const Spec> sp = t->spec();
     if (!f->created) {
         // The directory chain and the empty file, made durable, before SQLite opens it.
@@ -142,7 +142,7 @@ Conn* writerPin(Engine* e, File* f, int32_t* rc, std::string* err) {
         std::lock_guard<std::mutex> g(e->wconnMu);
         while (e->nWConn >= e->cfg.writerConns && !e->wlru.empty()) {
             auto it = e->wlru.end();
-            File* v = nullptr;
+            Part* v = nullptr;
             while (it != e->wlru.begin()) {
                 --it;
                 if ((*it)->wPins == 0) {
@@ -178,7 +178,7 @@ Conn* writerPin(Engine* e, File* f, int32_t* rc, std::string* err) {
     return c;
 }
 
-void writerUnpin(Engine* e, File* f) {
+void writerUnpin(Engine* e, Part* f) {
     std::lock_guard<std::mutex> g(e->wconnMu);
     if (f->wPins > 0) f->wPins--;
 }
@@ -538,11 +538,11 @@ void Group::prepare(Rec& r, const Call& c) {
 }
 
 int32_t Group::readHolder(const Holder& h, Rec& r) {
-    File* hf = nullptr;
+    Part* hf = nullptr;
     {
         std::lock_guard<std::mutex> g(t_->mu);
         Part* hp = t_->partById(h.pid);
-        if (hp && hp->file->created) hf = hp->file.get();
+        if (hp && hp->created) hf = hp;
     }
     if (!hf) return 0;
     int rc = 0;
@@ -769,7 +769,7 @@ int32_t Group::assign() {
         {
             std::lock_guard<std::mutex> g(t_->mu);
             for (auto& p : t_->parts)
-                if (p->file->created) paths.push_back(p->file->path);
+                if (p->created) paths.push_back(p->path);
         }
         for (const std::string& path : paths) {
             int rc = 0;
@@ -921,7 +921,7 @@ struct FileOut {
 };
 
 int32_t Group::writeFile(std::vector<size_t>& idxs) {
-    File* f = p_->file.get();
+    Part* f = p_;
     std::vector<Del>& dels = dels_;
     int32_t status = P4_OK;
     std::string err;
@@ -1364,7 +1364,7 @@ void Group::run(std::vector<WriteTask*>& tasks) {
         respond();
         return;
     }
-    File* f = p_->file.get();
+    Part* f = p_;
     {
         std::lock_guard<std::mutex> g(t_->mu);
         for (Rec& r : recs_) {
