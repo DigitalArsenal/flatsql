@@ -159,6 +159,7 @@ int32_t ioAppend(const std::string& path, const uint8_t* p, size_t n);    // app
 int32_t ioTouch(const std::string& path);                                  // create (and parents)
 int32_t ioUnlink(const std::string& path);                                 // absent is fine
 int64_t ioSize(const std::string& path);                                   // -1 absent
+void ioPrefault(const std::string& path);  // reads the file once, start to end (the host's page cache)
 
 // ---- SQLite connections --------------------------------------------------------------------
 enum StmtId : int {
@@ -688,7 +689,7 @@ struct Derived {
     bool wh = false;
     std::map<int64_t, int64_t> dh;  // hour -> rows added (removed < 0)
     int load(Conn* c, bool objects);  // in the write transaction; objects: the file has r_ke
-    bool fresh(Conn* c, const KVal& k);  // before a row's insert: k has no row yet
+    bool fresh(Conn* c, const KVal& k, bool hasE, int64_t e);  // k has no row (before an insert, after a delete)
     void added(bool freshK, bool hasE, int64_t e);
     int removed(Conn* c, const KVal& k, bool hasE, int64_t e);  // after the row's delete
     int save(Conn* c);

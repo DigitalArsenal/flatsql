@@ -129,17 +129,28 @@ int Derived::load(Conn* c, bool objects) {
     return r == SQLITE_DONE ? SQLITE_OK : r;
 }
 
-bool Derived::fresh(Conn* c, const KVal& k) {
+// No row of object k: probed next to (k, e), the entry the row's insert or
+// delete touches (the same r_ke leaf, so no extra page is read).
+bool Derived::fresh(Conn* c, const KVal& k, bool hasE, int64_t e) {
     if (nobj < 0 || k.type == 0) return false;
-    sqlite3_stmt* q = c->sql("SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 LIMIT 1");
-    if (!q) {
-        nobj = -2;  // cannot keep it: dropped at save
-        return false;
+    auto probe = [&](const char* sql) -> int {
+        sqlite3_stmt* q = c->sql(sql);
+        if (!q) return SQLITE_ERROR;
+        k.bind(q, 1);
+        if (hasE) sqlite3_bind_int64(q, 2, e);
+        const int r = sqlite3_step(q);
+        sqlite3_reset(q);
+        return r;
+    };
+    int r;
+    if (hasE) {
+        r = probe("SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 AND e<=?2 ORDER BY e DESC LIMIT 1");
+        if (r == SQLITE_DONE) r = probe("SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 AND e>?2 ORDER BY e LIMIT 1");
+        if (r == SQLITE_DONE) r = probe("SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 AND e IS NULL LIMIT 1");
+    } else {
+        r = probe("SELECT 1 FROM r INDEXED BY r_ke WHERE k=?1 LIMIT 1");
     }
-    k.bind(q, 1);
-    const int r = sqlite3_step(q);
-    sqlite3_reset(q);
-    if (r != SQLITE_ROW && r != SQLITE_DONE) nobj = -2;
+    if (r != SQLITE_ROW && r != SQLITE_DONE) nobj = -2;  // cannot keep it: dropped at save
     return r == SQLITE_DONE;
 }
 
@@ -150,7 +161,7 @@ void Derived::added(bool freshK, bool hasE, int64_t e) {
 
 int Derived::removed(Conn* c, const KVal& k, bool hasE, int64_t e) {
     if (wh && hasE) dh[hourOf(e)]--;
-    if (nobj >= 0 && k.type != 0 && fresh(c, k)) nobj--;
+    if (nobj >= 0 && k.type != 0 && fresh(c, k, hasE, e)) nobj--;
     return SQLITE_OK;
 }
 
@@ -1170,7 +1181,7 @@ int32_t Group::writeFile(std::vector<size_t>& idxs) {
             kv.type = r.kType;
             kv.i = r.kInt;
             kv.s = r.kText;
-            const bool freshK = dv.fresh(c, kv);
+            const bool freshK = dv.fresh(c, kv, r.hasE, r.e);
             sqlite3_stmt* s = c->get(S_INS);
             sqlite3_bind_int64(s, 1, r.seq);
             sqlite3_bind_blob(s, 2, r.key, 32, SQLITE_STATIC);

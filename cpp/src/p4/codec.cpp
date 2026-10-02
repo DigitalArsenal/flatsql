@@ -408,6 +408,19 @@ int32_t ioUnlink(const std::string& path) {
     return rc >= 0 || rc == FLATSQL_IO_ERR_NOENT ? P4_OK : P4_E_IO;
 }
 
+void ioPrefault(const std::string& path) {
+    const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_READ);
+    if (h < 0) return;
+    std::vector<uint8_t> buf(1u << 20);
+    const double sz = flatsql_io_size(h);
+    for (double at = 0; at < sz;) {
+        const int32_t n = flatsql_io_read(h, buf.data(), int32_t(buf.size()), at);
+        if (n <= 0) break;
+        at += n;
+    }
+    flatsql_io_close(h);
+}
+
 int64_t ioSize(const std::string& path) {
     const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_READ);
     if (h < 0) return -1;

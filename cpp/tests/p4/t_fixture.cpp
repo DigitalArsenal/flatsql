@@ -847,6 +847,7 @@ P4_SLOW_TEST(g3_bench) {
     }
     EngineOpts o;
     o.createMode = 0;
+    if (argInt("writer-cache-kib", 0)) o.extra = TlvW().u32(22, uint32_t(argInt("writer-cache-kib", 0))).b;
     REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
     CallOpts slow{0, 0, 0, 0, 0, 0, false, 3600000};
 #if !defined(__wasm__)

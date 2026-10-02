@@ -977,6 +977,14 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
 void slowLoop(Engine* e) {
     uint64_t lastTick = 0;
     int quotaTicks = 0;
+    // A fresh process: each type index read once, start to end, so the first
+    // writes' dedupe probes and the first reads' CID probes find its pages in
+    // the host's cache instead of reading them one at a time (a cold type
+    // index cost the first ingest calls 2-6x a warm call).
+    for (Type* t : typesWithFiles(e)) {
+        if (e->stopping.load()) break;
+        ioPrefault(t->pIdx);
+    }
     for (;;) {
         uint32_t slot = 0;
         bool have = false;
