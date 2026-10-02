@@ -107,6 +107,14 @@ P4_SLOW_TEST(g2_fixture) {
         std::printf("  skipped: --fixture and --bfbs\n");
         return;
     }
+    {
+        // The engine configures SQLite (the SQL surface's allocator) before
+        // anything initializes it: the format-1 oracle below opens SQLite too.
+        const std::string warm = scratchDir("g2init") + "/fsql4";
+        REQUIRE(openEngine(warm) == P4_OK, "engine init");
+        closeEngine();
+        removeTree(warm.substr(0, warm.size() - 6));
+    }
     const std::string uri = "file:" + fixture + "?mode=ro&immutable=1";
     sqlite3* fx = nullptr;
     REQUIRE(sqlite3_open_v2(uri.c_str(), &fx, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr) == SQLITE_OK, "fixture");
