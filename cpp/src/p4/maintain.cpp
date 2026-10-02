@@ -30,7 +30,10 @@ Conn* maintConn(Engine* e, MaintState& m, const std::string& path) {
         m.lru.pop_back();
         delete m.conns[victim];  // the file's last connection deletes its WAL
         m.conns.erase(victim);
-        if (!ioExists(victim + "-wal")) walNote(e, victim, 0);
+        if (!ioExists(victim + "-wal")) {
+            walNote(e, victim, 0);
+            walExtNote(e, victim, 0);
+        }
     }
     Conn* c = nullptr;
     if (openConn(path, OpenKind::Maint, 1024, 0, &c, nullptr) != SQLITE_OK) return nullptr;
@@ -63,9 +66,10 @@ void checkpoint(Engine* e, MaintState& m, const std::string& path) {
     // Still busy (or a small WAL): no restart now, so the writer lock is never
     // held across a large copy; the next kick tries again.
     if (!settled || log < int(e->cfg.passivePages / 4)) return;
-    if (sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_RESTART, &log, &ck) == SQLITE_OK) {
+    if (sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &log, &ck) == SQLITE_OK) {
         e->bump(kStRestart);
-        walNote(e, path, log >= ck ? log - ck : 0);
+        walNote(e, path, 0);
+        walExtNote(e, path, 0);
     }
 }
 
@@ -86,6 +90,18 @@ void walNote(Engine* e, const std::string& path, int64_t frames) {
     e->stat[kStWalBytes].store(uint64_t(std::max<int64_t>(0, e->walSum)) * 4096, std::memory_order_relaxed);
 }
 
+void walExtNote(Engine* e, const std::string& path, int64_t frames) {
+    std::lock_guard<std::mutex> g(e->walMu);
+    auto it = e->walExt.find(path);
+    const int64_t old = it == e->walExt.end() ? 0 : it->second;
+    if (frames <= 0) {
+        if (it != e->walExt.end()) e->walExt.erase(it);
+    } else {
+        e->walExt[path] = frames;
+    }
+    e->walExtSum += std::max<int64_t>(0, frames) - old;
+}
+
 int64_t walBytesOf(Engine* e, const std::string& path) {
     std::lock_guard<std::mutex> g(e->walMu);
     auto it = e->walPages.find(path);
@@ -103,13 +119,46 @@ int walHook(void* arg, sqlite3* db, const char* zDb, int nPages) {
     const char* path = sqlite3_db_filename(db, zDb);
     if (!path) return SQLITE_OK;
     walNote(e, path, nPages);
-    // A WAL past the PASSIVE pages, or any WAL of 4 MiB or more while the
+    // The WAL file's bound. Under steady commits a PASSIVE pass never finds
+    // the WAL fully copied at the moment the writer starts its next
+    // transaction, so the WAL never starts over by itself and the file grows
+    // without end. The file's one writer (this connection, which just
+    // committed, so no frame is added meanwhile) restarts it once it passes
+    // a quarter of walTotal, or 32 MiB while the instance's WALs are over
+    // three quarters of it: TRUNCATE copies what the PASSIVE passes left,
+    // waits out the readers still inside the WAL (a reader starting after
+    // the copy reads the file only) and truncates the WAL to 0.
+    int64_t ext;
+    {
+        std::lock_guard<std::mutex> g(e->walMu);
+        auto it = e->walExt.find(path);
+        const int64_t old = it == e->walExt.end() ? 0 : it->second;
+        e->walExt[path] = nPages;
+        e->walExtSum += int64_t(nPages) - old;
+        ext = e->walExtSum;
+    }
+    const uint64_t frames = uint64_t(nPages) * 4096;
+    if (frames >= e->cfg.walTotal / 4 || (uint64_t(ext) * 4096 > e->cfg.walTotal / 4 * 3 && frames >= (32ull << 20))) {
+        sqlite3_busy_timeout(db, 2000);
+        int log = 0, ck = 0;
+        const int r = sqlite3_wal_checkpoint_v2(db, zDb, SQLITE_CHECKPOINT_TRUNCATE, &log, &ck);
+        sqlite3_busy_timeout(db, 30000);
+        if (r == SQLITE_OK) {
+            e->bump(kStTruncate);
+            walNote(e, path, 0);
+            walExtNote(e, path, 0);
+            return SQLITE_OK;
+        }
+    }
+    // A WAL past the PASSIVE pages (at most 32 MiB, so the passes keep up and
+    // the restart above copies little), or any WAL of 4 MiB or more while the
     // instance's WALs are over their total, is checkpointed.
     bool kick = false;
     {
         std::lock_guard<std::mutex> g(e->walMu);
         const bool over = uint64_t(e->walSum) * 4096 > e->cfg.walTotal && nPages >= 1024;
-        if ((uint32_t(nPages) >= e->cfg.passivePages || over) && e->ckptQueued.insert(path).second) kick = true;
+        const uint32_t passive = std::min<uint32_t>(e->cfg.passivePages, 8192);
+        if ((uint32_t(nPages) >= passive || over) && e->ckptQueued.insert(path).second) kick = true;
     }
     if (kick) {
         {
@@ -840,8 +889,12 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
                     int log = 0, ck = 0;
                     const int r = sqlite3_wal_checkpoint_v2(mt.conn->db, nullptr, SQLITE_CHECKPOINT_PASSIVE, &log, &ck);
                     delete mt.conn;
-                    if (!ioExists(path + "-wal")) walNote(e, path, 0);
-                    else if (r == SQLITE_OK) walNote(e, path, log >= ck ? log - ck : 0);
+                    if (!ioExists(path + "-wal")) {
+                        walNote(e, path, 0);
+                        walExtNote(e, path, 0);
+                    } else if (r == SQLITE_OK) {
+                        walNote(e, path, log >= ck ? log - ck : 0);
+                    }
                     break;
                 }
                 case MaintTask::kCheckpoint:

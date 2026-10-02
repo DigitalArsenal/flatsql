@@ -1404,6 +1404,187 @@ P4_SLOW_TEST(reads_bench) {
     }
     const std::string only = argStr("only", "");
     CallOpts co{0, 0, 0, 0, 0, 0, false, 600000};
+#if !defined(__wasm__)
+    if (const long secs = argInt("m01", 0)) {
+        // M01 (proof harness m01.go), native: R01 / R05 / R11 / R16 (count +
+        // nearest limit=200, as the /epoch handler) at 20 calls a second each,
+        // idle for --idle-s, then a supersede of every OMM record keeping b053
+        // and OMM batch (32,015 records, a new batch each cycle) + supersede
+        // keeping it, until --m01 seconds. Samples the -wal files every 100 ms.
+        TestType real = realType(argStr("bfbs", ""), "OMM");
+        REQUIRE(!real.bfbs.empty(), "--bfbs");
+        real.schema = reflection::GetSchema(real.bfbs.data());
+        TlvW s2;
+        s2.u8(45, 2).text(1, "OMM");
+        Result parts = call(P4_OPC_SUMMARY, s2.b);
+        REQUIRE(parts.status == P4_OK && !parts.rows.empty(), parts.err);
+        size_t big = 0;
+        for (size_t i = 1; i < parts.rows.size(); i++)
+            if (parts.i(i, "records") > parts.i(big, "records")) big = i;
+        const std::string peer = parts.s(big, "peer");
+        std::vector<std::vector<uint8_t>> hits;
+        for (const char* ty : {"OMM", "MPE"}) {
+            TlvW sc;
+            sc.text(1, ty).u8(2, 1).u64(3, 50);
+            Result r = call(P4_OPC_SCAN, sc.b, co);
+            for (size_t i = 0; i < r.rows.size(); i++) {
+                const std::string c = r.s(i, "cid");
+                uint8_t d[32], c36[36] = {0x01, 0x55, 0x12, 0x20};
+                fp::cidDigestFromText(c.data(), c.size(), d);
+                std::memcpy(c36 + 4, d, 32);
+                hits.emplace_back(c36, c36 + 36);
+            }
+        }
+        std::atomic<bool> stop{false}, busy{false};
+        std::atomic<int> errs{0};
+        struct Lat {
+            std::mutex mu;
+            std::vector<double> idle, during;
+        };
+        const char* names[4] = {"R01 get OMM+MPE", "R05 datasync OMM limit=100", "R11 index OMM page=1",
+                                "R16 OMM count+nearest limit=200"};
+        Lat lat[4];
+        std::vector<std::thread> rd;
+        for (int k = 0; k < 4; k++)
+            rd.emplace_back([&, k] {
+                for (int i = 0; !stop.load(); i++) {
+                    const bool b0 = busy.load();
+                    const uint64_t s = flatsql::ps::monoNs();
+                    int32_t st = P4_OK;
+                    std::string err;
+                    if (k == 0) {
+                        Result r = get(i % 2 ? "MPE" : "OMM", {hits[size_t(i) % hits.size()]});
+                        st = r.status;
+                        err = r.err;
+                    } else if (k == 1) {
+                        TlvW t;
+                        t.text(1, "OMM").u8(2, 1).u64(3, 100);
+                        Result r = call(P4_OPC_SCAN, t.b, co);
+                        st = r.status;
+                        err = r.err;
+                    } else if (k == 2) {
+                        TlvW t;
+                        t.text(1, "OMM").u64(3, 50);
+                        Result r = call(P4_OPC_INDEX_PAGE, t.b, co);
+                        st = r.status;
+                        err = r.err;
+                    } else {
+                        TlvW c, q;
+                        c.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u8(33, 1);
+                        q.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u64(3, 200);
+                        Result r1 = call(P4_OPC_EPOCH, c.b, co);
+                        Result r2 = call(P4_OPC_EPOCH, q.b, co);
+                        st = r1.status != P4_OK ? r1.status : r2.status;
+                        err = r1.err + r2.err;
+                    }
+                    const double ms = double(flatsql::ps::monoNs() - s) / 1e6;
+                    if (st != P4_OK) {
+                        errs++;
+                        std::printf("  READ ERROR %s: %d %s\n", names[k], st, err.c_str());
+                    }
+                    {
+                        std::lock_guard<std::mutex> g(lat[k].mu);
+                        (b0 && busy.load() ? lat[k].during : lat[k].idle).push_back(ms);
+                    }
+                    const double rest = 50.0 - ms;
+                    if (rest > 0) std::this_thread::sleep_for(std::chrono::microseconds(int64_t(rest * 1000)));
+                }
+            });
+        std::atomic<int64_t> walMax{0};
+        std::atomic<int64_t> walAt{0};
+        const uint64_t t0 = flatsql::ps::monoNs();
+        std::thread sampler([&] {
+            while (!stop.load()) {
+                int64_t files = 0;
+                std::error_code ec;
+                for (auto it = std::filesystem::recursive_directory_iterator(store + "/fsql4", ec);
+                     !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                    const std::string pth = it->path().string();
+                    if (pth.size() > 4 && pth.compare(pth.size() - 4, 4, "-wal") == 0) files += int64_t(it->file_size(ec));
+                }
+                if (files > walMax.load()) {
+                    walMax = files;
+                    walAt = int64_t((flatsql::ps::monoNs() - t0) / 1000000000ull);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::seconds(argInt("idle-s", 5)));
+        busy = true;
+        const uint64_t ws = flatsql::ps::monoNs();
+        CallOpts slow{0, 0, 0, 0, 0, 0, false, 3600000};
+        auto supersede = [&](const std::string& keep) {
+            TlvW s;
+            s.text(1, "OMM").text(11, "space-data-network-02").text(12, "celestrak-gp").text(60, keep).u8(61, 1);
+            return call(P4_OPC_SUPERSEDE, s.b, slow);
+        };
+        double w06 = 0;
+        if (!argInt("no-w06", 0)) {
+            const uint64_t s = flatsql::ps::monoNs();
+            Result r = supersede("OMM-celestrak-gp-b053");
+            w06 = double(flatsql::ps::monoNs() - s) / 1e6;
+            CHECK_EQ(r.status, P4_OK, r.err);
+            std::printf("  supersede keep b053: %.0f ms, wal max so far %.0f MiB (load %.1f)\n", w06,
+                        double(walMax.load()) / 1048576.0, loadAvg());
+        }
+        std::vector<double> putMs, supMs;
+        int cycles = 0;
+        while (double(flatsql::ps::monoNs() - ws) / 1e9 < double(secs)) {
+            const std::string batch = "OMM-celestrak-gp-m01-" + std::to_string(cycles);
+            const uint64_t s = flatsql::ps::monoNs();
+            for (int at = 0; at < 32015; at += 4096) {
+                Batch b;
+                b.type = "OMM";
+                b.peer = peer;
+                b.tags.push_back(Tag{"space-data-network-02", "celestrak-gp", "", batch, "", "", ""});
+                b.at = 1790800000 + cycles;
+                for (int i = at; i < 32015 && i < at + 4096; i++) {
+                    In in;
+                    in.frame = buildFrame(real, {Field::str("OBJECT_NAME", "M01 " + std::to_string(i)), Field::str("OBJECT_ID", "2026-001A"),
+                                                 Field::u64("NORAD_CAT_ID", uint64_t(1 + i)),
+                                                 Field::str("EPOCH", isoTime(unixOf(2026, 10, 1) + int64_t(cycles) * 600 + i % 600)),
+                                                 Field::f64("MEAN_MOTION", 15.5 + double(cycles) * 1e-6), Field::f64("ECCENTRICITY", 0.0001),
+                                                 Field::f64("INCLINATION", 51.6)});
+                    in.ts = 1790800000 + cycles;
+                    b.recs.push_back(std::move(in));
+                }
+                Result r = put(b);
+                if (r.status != P4_OK) std::printf("  put: %d %s\n", r.status, r.err.c_str());
+            }
+            putMs.push_back(double(flatsql::ps::monoNs() - s) / 1e6);
+            const uint64_t s2 = flatsql::ps::monoNs();
+            Result r = supersede(batch);
+            if (r.status != P4_OK) std::printf("  supersede: %d %s\n", r.status, r.err.c_str());
+            supMs.push_back(double(flatsql::ps::monoNs() - s2) / 1e6);
+            cycles++;
+            if (cycles % 10 == 0)
+                std::printf("  t=%.0fs cycles=%d wal max %.0f MiB (at %llds) load %.1f\n", double(flatsql::ps::monoNs() - ws) / 1e9,
+                            cycles, double(walMax.load()) / 1048576.0, (long long)walAt.load(), loadAvg());
+        }
+        busy = false;
+        stop = true;
+        for (auto& t : rd) t.join();
+        sampler.join();
+        auto pct = [](std::vector<double> v, double q) {
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            return v[size_t(double(v.size() - 1) * q)];
+        };
+        std::printf("  m01: %d cycles in %.0f s; put p50 %.0f ms, supersede p50 %.0f ms (keep b053 %.0f ms); wal max %.1f MiB at %llds; read errors %d (load %.1f)\n",
+                    cycles, double(flatsql::ps::monoNs() - ws) / 1e9, pct(putMs, 0.5), pct(supMs, 0.5), w06,
+                    double(walMax.load()) / 1048576.0, (long long)walAt.load(), errs.load(), loadAvg());
+        for (int k = 0; k < 4; k++) {
+            int over = 0;
+            for (double x : lat[k].during) over += x > 50.0;
+            std::printf("  %-34s idle p50 %7.2f p99 %7.2f max %7.2f | writes p50 %7.2f p99 %7.2f max %7.2f, over 50 ms %d of %zu\n",
+                        names[k], pct(lat[k].idle, 0.5), pct(lat[k].idle, 0.99), pct(lat[k].idle, 1.0), pct(lat[k].during, 0.5),
+                        pct(lat[k].during, 0.99), pct(lat[k].during, 1.0), over, lat[k].during.size());
+        }
+        report("m01.wal_max", double(walMax.load()) / 1048576.0, "MiB");
+        closeEngine(600000);
+        return;
+    }
+#endif
     if (argInt("check-limit", 0)) {
         // EPOCH with a limit (and an offset) answers the no-limit answer's
         // first rows: OMM, MPE and CAT, every point profile.

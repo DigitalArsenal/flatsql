@@ -145,13 +145,20 @@ Two background threads do this work, never on a caller's path.
   SUMMARY 4, once a second.
 - **Checkpoints never wait for a writer.** PASSIVE passes copy a WAL into its
   file while the writer keeps committing; once a pass leaves little behind, a
-  RESTART with no busy handler takes the writer lock only if it is free that
-  instant, copies the last frames, and the writer's next transaction starts
-  the WAL over. A WAL is checkpointed when it passes the PASSIVE pages
-  (config tag 30), and while the instance's WALs are over `walTotal`, every
-  committing WAL of 4 MiB or more and the largest idle ones (down to half the
-  total). The WAL stat is each path's frames not yet checkpointed, kept with
-  every commit, checkpoint and close.
+  TRUNCATE with no busy handler takes the writer lock only if it is free that
+  instant, copies the last frames and empties the WAL. A WAL is checkpointed
+  when it passes the PASSIVE pages (config tag 30, at most 32 MiB), and while
+  the instance's WALs are over `walTotal`, every committing WAL of 4 MiB or
+  more and the largest idle ones (down to half the total). The WAL stat is
+  each path's frames not yet checkpointed, kept with every commit, checkpoint
+  and close.
+- **The WAL file's bound.** Under steady commits no PASSIVE pass ends exactly
+  when the writer starts its next transaction, so a WAL never starts over by
+  itself. The file's one writer, right after a commit that leaves its WAL at
+  a quarter of `walTotal` or more (or at 32 MiB while the instance's WALs
+  pass three quarters of it), runs a TRUNCATE checkpoint itself: no frame is
+  added meanwhile, the PASSIVE passes have copied most of it, and it waits
+  (2 s at most) only for readers still inside the WAL.
 - **The long-work thread:** REBUILD and QUOTA_GC calls, the configured quota
   once a second, and full text. Nothing it does delays a checkpoint or a
   flush.

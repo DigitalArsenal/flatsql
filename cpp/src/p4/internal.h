@@ -550,6 +550,9 @@ struct P4Engine {
     std::mutex walMu;
     std::unordered_map<std::string, int64_t> walPages;
     int64_t walSum = 0;
+    // and each WAL's frames since it last started over (its file's extent)
+    std::unordered_map<std::string, int64_t> walExt;
+    int64_t walExtSum = 0;
     std::unordered_set<std::string> ckptQueued;
     // maintenance
     std::mutex maintMu;
@@ -688,6 +691,7 @@ int walHook(void* arg, sqlite3* db, const char* zDb, int nPages);
 // is the WAL stat, refreshed on every change (commits and checkpoints).
 int64_t walBytesOf(P4Engine* e, const std::string& path);
 void walNote(P4Engine* e, const std::string& path, int64_t frames);  // 0 forgets the path
+void walExtNote(P4Engine* e, const std::string& path, int64_t frames);  // a WAL's extent (0: started over / gone)
 void typeFileBytes(Type* t);                  // refreshes idxBytes and ftsBytes (maintenance thread)
 
 // ---- mailbox.cpp --------------------------------------------------------------------------------------

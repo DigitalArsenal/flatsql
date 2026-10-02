@@ -511,6 +511,7 @@ int32_t engineActivate(Engine* e) {
             delete c;
             if (r != SQLITE_OK) return statusOfSqlite(r);
             walNote(e, path, 0);
+            walExtNote(e, path, 0);
             e->bump(kStTruncate);
         }
     }
