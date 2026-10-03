@@ -98,7 +98,10 @@ Also, committed with the rows in the same transaction:
 - `meta`: the file's counters (rows, records, bytes, records without an
   epoch, the records' bytes, copies, the copies' bytes, and bounds).
 
-Writers open with `synchronous=FULL`, WAL, and no autocheckpoint.
+Writers open with `synchronous=FULL`, WAL, and no autocheckpoint. A new
+file's tables, its meta rows and its indexes commit in one transaction (a
+migration's file is made without indexes, `meta` ix = 0, until REBUILD 1), so
+a file either has no schema or a complete one.
 
 **Type index** (`.idx`, `synchronous=FULL`; C-38 (2)): no per-record entry.
 
@@ -199,6 +202,9 @@ The cost is the journal tail's (one write), not the store's. A write whose
 type-index commit fails runs the same replay at once; if that fails too,
 the type refuses writes (`P4_E_IO`) until a reopen. A feed file the index
 says has records and that is missing is quarantined (`P4_E_CORRUPT`, named).
+A feed file a crash cut between its creation and its schema's commit exists
+but holds nothing: the first writer open (the replay's included) finds no
+`r` table and makes the schema then, instead of reading it as a broken file.
 Nothing unlinks or replaces a feed file. A write cut between two feed files
 leaves the files it committed: a retry of an unacknowledged call finds its
 records there (DUP) and adds them to the rest.
@@ -255,8 +261,10 @@ feed id). A page of candidates is resolved by reading each record's rows
 (one rid range of its file, one read transaction per file). A record answers
 once per feed file (C-10 within the file, C-38 (5) across files). Its copy
 is the lowest token's matching row (C-12); its tag the earliest instance of
-its feed that matches the lane filter (§3.6), with provider and source from
-the file and the rest from its ids: never blank when the record has a tag.
+its feed that matches the lane filter (§3.6), or in a newest-first page (SCAN
+5/6) the newest, the delivery the page orders it by (C-41 N9), with provider
+and source from the file and the rest from its ids: never blank when the
+record has a tag.
 
 - **A18 (C-31):** `<TYPE>@<source>` is the newest N records of that type from
   that source (the source's feed files' `r_s`, newest first, merged); `<TYPE>`
@@ -266,13 +274,17 @@ the file and the rest from its ids: never blank when the record has a tag.
   equality or IN on the object rule's first column (each file's `r_ke`).
 - **Keyed walks** (w, delivery time, ts) meet a record once per value its rows
   carry; it answers at the value of the row it answers with (its copy's w or
-  ts; its newest matching instance's delivery time), so once.
+  ts; the delivery time of the instance it projects, its newest matching
+  one), so once.
 - **SCAN orders 5-7** (C-39 E2, E3; mailbox only) are format 1's two-part
   pages: the tagged records (the feed files) in the order with the offset,
   then, without a lane filter, the untagged (local) records from the start,
   as many as the limit leaves. 5 NEWEST: delivery time desc, CID asc; local
   ts desc, CID asc (the raw default page). 6 RECENT: delivery time desc, seq
-  desc; local seq desc (QueryRecentRecords). 7 W_ASC: w asc, CID asc (a raw
+  desc; local seq desc (QueryRecentRecords). In 5 and 6 a tagged record
+  projects the instance it is ordered by: its newest matching instance's
+  batch, url, content key, producer peer and key, and delivery time (C-41 N9;
+  ties at that time by the smallest identity). 7 W_ASC: w asc, CID asc (a raw
   page with a sync filter or a search).
 - **EPOCH nearest / as_of / forward:** one seek per object in each file's
   `r_ke`, read from the target in rank order until an epoch group has a
