@@ -68,7 +68,7 @@ delivery of a record to the feed:
 | `b` | the batch: `batch(id, batch, ppeer, pkey)`, format 1's summary key inside the feed (0 on local rows) |
 | `c`, `u` | the content key and the url: `ckey(id, ckey)`, `url(id, url)` (0 = "") |
 | `at` | when this feed delivered it (format 1's tag `created_at`) |
-| `cid`, `e`, `k`, `ts` | the CID, epoch, object key and source timestamp |
+| `cid`, `e`, `k`, `ts` | the CID, epoch, object key and source timestamp (the copy's: a record's copies share the record's, except a COPY made by StoreRoutedByProducer, which keeps its own, C-39 E6) |
 | `d`, `x`, `f` | the record bytes verbatim (sealed bytes when sealed), the signature, a sealed record's extracted COL values |
 | `w` | `coalesce(e, ts)` (virtual) |
 
@@ -87,6 +87,7 @@ per file:
 | `r_ke(k, e)` | object and epoch: EPOCH nearest / as_of / forward per object, object predicates, CAT supersede |
 | `r_w(w DESC)` | epoch windows; a w group is put in CID order from its rows |
 | `r_b(b)` | batch supersede and batch-filtered reads |
+| `r_a(at DESC)` (feed files) / `r_t(ts DESC)` (local) | newest-first pages (C-39 E2): delivery time, and the untagged copies' time; neither holds a CID (a group is put in order from its rows) |
 
 Also, committed with the rows in the same transaction:
 - `inst(b, c, n, bytes, ...)`: each instance's records (each once), their
@@ -130,7 +131,8 @@ a file, with its seq, for another file of the same write).
   2. ingest mode: each record goes to every feed its call's tags name,
      found in that feed file by its CID (`r_c`). In the file it is a new
      record (NEW: a fresh seq), a new copy (COPY: the holder's bytes and ts
-     with this write's signature and peer), a new instance (RETAG), a repeat
+     with this write's signature and peer; with PUT tag 55, StoreRoutedByProducer,
+     this write's own ts, C-39 E6), a new instance (RETAG), a repeat
      (DUP: the url follows the latest write, C-3), or an ingest-identity
      repeat (IDENT_DUP, C-26: the feed's `ident` names the held record,
      which takes the repeat's tag). A tagged record that is new to its feed
@@ -143,11 +145,13 @@ a file, with its seq, for another file of the same write).
      the feeds already holding its seq (a copy sent without instances joins
      the record's instances there); with none, to local. Local rows of the
      seq move into the feeds once the record has an instance. A seq held by
-     another CID is `P4_REJ_SEQ`. A copy keeps its own bytes (C-35);
+     another CID is `P4_REJ_SEQ`. A copy keeps its own bytes (C-35) and the ts
+     it is sent (format 1's own, e.g. a StoreRoutedByProducer copy);
   4. CAT supersede-on-ingest (ingest mode only, C-20): the scope feed's
      records of the same object identity are retired from that feed;
-  5. seqs for records new to a feed, in content-time order (durable seq
-     blocks);
+  5. seqs for records new to a feed, in input order (format 1's rowids,
+     C-39 E1: the calls in queue order, each call's records in order, each
+     record's feeds in tag order; durable seq blocks);
   6. the journal (`synchronous=FULL`: the touched feed files, the moves,
      new ids, the seq reservation);
   7. each feed file in one transaction (rows, its counters, instances,
@@ -160,6 +164,16 @@ a file, with its seq, for another file of the same write).
   record left with no row in the file leaves the feed.
 - **DELETE**: every row of the CIDs in every feed file (each file's `r_c`).
   `deleted` counts each CID's distinct copies over the files.
+- **Lane times** (an instance's `first` and `updated`, SUMMARY 3): a write
+  that delivers the instance by a tag stamps `updated` with the clock (a
+  migration: format 1's times, C-36). A copy joining instances the record
+  already has (an untagged write) leaves them alone (C-39 E4). The instances a
+  DELETE or a CAT supersede-on-ingest leaves are restamped with the clock, as
+  format 1's `decrementSourceSummary` (C-39 E5).
+- **Bounds after deletes:** a delete recounts a file's seq and w bounds from the
+  ends of `r_s` / `r_w`; a delete at the file's epoch edge also its min/max
+  epoch (the first row with an epoch from each end of `r_w`), so the type's
+  epoch range follows deletes. The ts bounds stay bounds.
 - **QUOTA_GC**: the type's oldest record row sets by arrival (the feed files
   merged by seq), every row of each.
 
@@ -250,6 +264,16 @@ the file and the rest from its ids: never blank when the record has a tag.
   applies above the cut.
 - **Candidates instead of a walk:** an exact CID (each file's `r_c`), an
   equality or IN on the object rule's first column (each file's `r_ke`).
+- **Keyed walks** (w, delivery time, ts) meet a record once per value its rows
+  carry; it answers at the value of the row it answers with (its copy's w or
+  ts; its newest matching instance's delivery time), so once.
+- **SCAN orders 5-7** (C-39 E2, E3; mailbox only) are format 1's two-part
+  pages: the tagged records (the feed files) in the order with the offset,
+  then, without a lane filter, the untagged (local) records from the start,
+  as many as the limit leaves. 5 NEWEST: delivery time desc, CID asc; local
+  ts desc, CID asc (the raw default page). 6 RECENT: delivery time desc, seq
+  desc; local seq desc (QueryRecentRecords). 7 W_ASC: w asc, CID asc (a raw
+  page with a sync filter or a search).
 - **EPOCH nearest / as_of / forward:** one seek per object in each file's
   `r_ke`, read from the target in rank order until an epoch group has a
   record that passes the filters; ties at the best epoch go to the lowest
@@ -269,7 +293,11 @@ the file and the rest from its ids: never blank when the record has a tag.
 and bytes, and cancel. RB1 streams always end with RB1E.
 
 **SQL surface.** `src/p4sql` answers ops 30 and 31 through `p4_reader.h`, and
-the engine writes their RB1E (C-28).
+the engine writes their RB1E (C-28). `<TYPE>@<source>` resolves, as format 1
+(C-39 S1), when the source (case-insensitive) is a feed source of any type or
+`local`: `<TYPE>@local` is the type's local file (its records no feed holds;
+`P4ScanSpec.part = 2`), another type's source the type has no feed file for is
+empty; a source no type has is "no such table".
 
 ## 7. Memory
 
