@@ -209,8 +209,9 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
 
 // ---- DELETE ------------------------------------------------------------------------------------------
 // Every feed file holding a CID gives up its rows of it (each file's CID
-// index). `deleted` counts the CID's distinct copies (producer tokens) over
-// the files, format 1's count of producer rows.
+// index), and the instances it leaves are restamped with the clock (format
+// 1's decrementSourceSummary, C-39 E5). `deleted` counts the CID's distinct
+// copies (producer tokens) over the files, format 1's count of producer rows.
 void deleteOp(Engine* e, Type* t, WriteTask* task) {
     SlotOut out(e, task->slot);
     out.enc.header({"deleted"});
@@ -254,6 +255,7 @@ void deleteOp(Engine* e, Type* t, WriteTask* task) {
                 }
                 if (!r->existed) continue;
                 for (auto& kv : copiesLive(r)) toks.insert(kv.first);
+                r->restamp = true;
                 w.dropAll(r);
             }
             deleted += int64_t(toks.size());
@@ -346,11 +348,11 @@ int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc) {
     if (!q) return P4_E_INTERNAL;
     struct RowC {
         uint32_t tok, b, cc;
-        int64_t len;
+        int64_t len, ts;
         std::string key;
     };
     bool have = false;
-    int64_t seq = 0, ts = 0, ev = 0, w = 0;
+    int64_t seq = 0, ev = 0;
     bool hasE = false;
     std::vector<RowC> rows;
     int32_t st = P4_OK;
@@ -388,10 +390,13 @@ int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc) {
         if (sp->hasEpochRule && !hasE) k.nnull++;
         k.minseq = std::min(k.minseq, seq);
         k.maxseq = std::max(k.maxseq, seq);
-        k.minw = std::min(k.minw, w);
-        k.maxw = std::max(k.maxw, w);
-        k.mints = std::min(k.mints, ts);
-        k.maxts = std::max(k.maxts, ts);
+        for (const RowC& r : rows) {  // a copy may keep its own ts (C-39 E6)
+            const int64_t w = hasE ? ev : r.ts;
+            k.minw = std::min(k.minw, w);
+            k.maxw = std::max(k.maxw, w);
+            k.mints = std::min(k.mints, r.ts);
+            k.maxts = std::max(k.maxts, r.ts);
+        }
         if (hasE) {
             k.mine = std::min(k.mine, ev);
             k.maxe = std::max(k.maxe, ev);
@@ -421,11 +426,10 @@ int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc) {
             seq = s;
             hasE = sqlite3_column_type(q, 7) != SQLITE_NULL;
             ev = sqlite3_column_int64(q, 7);
-            ts = sqlite3_column_int64(q, 9);
-            w = hasE ? ev : ts;
             have = true;
         }
         RowC x;
+        x.ts = sqlite3_column_int64(q, 9);
         const uint32_t n = uint32_t(sqlite3_column_int64(q, 2));
         x.b = uint32_t(sqlite3_column_int64(q, 3));
         x.cc = uint32_t(sqlite3_column_int64(q, 4));
@@ -565,7 +569,7 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
                 in->err = er;
                 return;
             }
-            st = fileCreateIndexes(t, c);
+            st = fileCreateIndexes(t, c, f->local);
             writerUnpin(e, f);
             if (st != P4_OK) {
                 in->status = st;

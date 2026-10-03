@@ -177,6 +177,7 @@ struct RelSpec {
     RelKind kind = kRelType;
     std::string type;     // canonical type name
     std::string source;   // canonical source (kRelAlias)
+    bool local = false;   // kRelAlias "<TYPE>@local": the type's local file (its records no feed holds, C-39 S1)
 };
 
 struct LaneState {

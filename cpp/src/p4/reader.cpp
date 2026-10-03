@@ -203,13 +203,17 @@ struct Row {
 };
 
 // A candidate record: its seq in one feed file (FRef index), and what the
-// walk knows of it.
+// walk knows of it. A keyed walk (w, delivery time, ts) meets a record once
+// per order value its rows carry; the candidate is answered only at the
+// value of the row it answers with (checkOv), so the record answers once.
 struct Cand {
     int64_t seq = 0;
     int fi = 0;
     uint8_t key[32] = {};
     bool haveKey = false;
     int64_t w = 0;
+    int64_t ov = 0;
+    bool checkOv = false;
 };
 
 struct Spec2 {
@@ -230,6 +234,7 @@ struct Spec2 {
     std::vector<Pred> preds;
     std::string search;
     int order = 0;  // 0: the op's default
+    int part = 0;   // 0 every file; 1 the feed files (tagged records); 2 the local file (C-39 two-part pages)
     bool hydrate = false;
     uint64_t limit = 0, offset = 0, bound = 0;
     // internal
@@ -293,9 +298,10 @@ int tagCmp(const Row& a, const RowV& b, const FRef& fb) {
     return 0;
 }
 
-// An entry of a feed file's walk: one of its rows, in the walk's order.
+// An entry of a feed file's walk: one of its rows, in the walk's order (ov:
+// a keyed walk's order value, the row's w, at or ts).
 struct Ent {
-    int64_t seq = 0, w = 0, rid = 0;
+    int64_t seq = 0, w = 0, rid = 0, ov = 0;
     uint8_t key[32];
     bool haveKey = false;
 };
@@ -307,13 +313,16 @@ struct Stream {
     int fi = 0;
     bool done = false, started = false;
     std::deque<Ent> buf;
-    int64_t rKey = 0;             // SEQ: the last seq (r_s) or rid (rows); W: the last whole w group
+    int64_t rKey = 0;             // SEQ: the last seq (r_s) or rid (rows); keyed: the last whole key group
     std::string rCid;             // CID: the last entry's cid
     int64_t rRid = 0;             // CID: the last entry's rid
     int64_t lastSeq = INT64_MIN;  // the last record the walk took (a record's rows are adjacent)
 };
 
-enum WalkOrder { kSeqAsc, kSeqDesc, kWDesc, kWAsc, kCid };
+// Keyed walks: kWDesc / kWAsc (r_w), kAtDesc (r_a: delivery time desc, CID
+// asc), kAtDescSeq (r_a: delivery time desc, seq desc), kTsDesc (r_t, the
+// local file: ts desc, CID asc).
+enum WalkOrder { kSeqAsc, kSeqDesc, kWDesc, kWAsc, kCid, kAtDesc, kAtDescSeq, kTsDesc };
 
 class Scan {
 public:
@@ -346,6 +355,8 @@ private:
     int32_t fetch(Stream& s);
     int32_t fill(Stream& s);  // fetches until the stream has an entry or is done
     bool before(const Ent& a, int fa, const Ent& b, int fb) const;
+    bool keyed() const { return wo_ == kWDesc || wo_ == kWAsc || wo_ == kAtDesc || wo_ == kAtDescSeq || wo_ == kTsDesc; }
+    int64_t orderValue(const Row& r) const;  // the answered row's value in a keyed walk
     int32_t resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Row>>* out);
     bool evaluate(int64_t seq, std::vector<RowV>& rows, Row* out);
     int32_t loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::map<std::pair<int64_t, int>, std::vector<RowV>>* out);
@@ -430,6 +441,7 @@ int32_t Scan::pickFiles() {
     for (auto& fp : t_->feeds) {
         Feed* f = fp.get();
         if (!f->created || f->k.recs <= 0) continue;
+        if ((s_.part == 1 && f->local) || (s_.part == 2 && !f->local)) continue;
         if (s_.lane) {
             if (f->local) continue;  // a lane filter matches tagged records only
             if (s_.lfSet[0] && f->provider != s_.lf[0]) continue;
@@ -469,9 +481,9 @@ int32_t Scan::pickFiles() {
 }
 
 // A18 (C-31): the bound is the newest N records of lane.source when it is
-// set (its feed files), else of the type (every feed file); the cut is the
-// N-th newest seq of those files merged, and every other filter applies
-// above it.
+// set (its feed files) or of the local file ("<TYPE>@local"), else of the
+// type (every feed file); the cut is the N-th newest seq of those files
+// merged, and every other filter applies above it.
 int32_t Scan::boundCut() {
     if (!s_.bound || files_.empty()) return P4_OK;
     struct H {
@@ -481,7 +493,7 @@ int32_t Scan::boundCut() {
         std::deque<int64_t> buf;
     };
     std::vector<H> hs;
-    if (s_.lfSet[1]) {
+    if (s_.lfSet[1] || s_.part == 2) {
         for (const FRef& f : files_) hs.push_back(H{f.path, f.indexed, false, hi_ + 1, {}});
     } else {
         std::lock_guard<std::mutex> g(t_->mu);
@@ -556,10 +568,12 @@ int32_t Scan::candidatesFromPreds(bool* used) {
     for (const FRef& fr : files_)
         if (!fr.indexed) return P4_OK;  // a file before REBUILD 1: the walk
     struct E {
-        int64_t seq, w;
+        int64_t seq, w, ov;
         uint8_t key[32];
         int fi;
     };
+    // The order value a keyed walk sorts by: w, delivery time or ts.
+    const char* ovCol = wo_ == kAtDesc || wo_ == kAtDescSeq ? "at" : wo_ == kTsDesc ? "ts" : "w";
     std::vector<E> ents;
     const size_t kMax = 200000;
     auto bindCell = [](sqlite3_stmt* q, int i, const ps::rb1::Cell& c) {
@@ -571,8 +585,9 @@ int32_t Scan::candidatesFromPreds(bool* used) {
         int rc = 0;
         Conn* c = e_->rpool.acquire(fr.path, OpenKind::Reader, &rc, nullptr);
         if (!c) return statusOfSqlite(rc);
-        const std::string sql = s_.hasCid ? "SELECT seq, w, cid FROM r INDEXED BY r_c WHERE cid=?1 AND seq>?2 AND seq<=?3"
-                                          : "SELECT seq, w, cid FROM r INDEXED BY r_ke WHERE k=?1 AND seq>?2 AND seq<=?3";
+        const std::string sql = std::string("SELECT seq, w, cid, ") + ovCol +
+                                (s_.hasCid ? " FROM r INDEXED BY r_c WHERE cid=?1 AND seq>?2 AND seq<=?3"
+                                           : " FROM r INDEXED BY r_ke WHERE k=?1 AND seq>?2 AND seq<=?3");
         sqlite3_stmt* q = c->sql(sql);
         if (!q) {
             e_->rpool.release(c);
@@ -593,6 +608,7 @@ int32_t Scan::candidatesFromPreds(bool* used) {
                 en.seq = sqlite3_column_int64(q, 0);
                 en.fi = int(fi);
                 en.w = sqlite3_column_int64(q, 1);
+                en.ov = sqlite3_column_int64(q, 3);
                 std::memcpy(en.key, sqlite3_column_blob(q, 2), 32);
                 ents.push_back(en);
                 if (ents.size() > kMax) break;
@@ -605,40 +621,33 @@ int32_t Scan::candidatesFromPreds(bool* used) {
         if (st != P4_OK) return st;
     }
     if (ents.size() > kMax) return P4_OK;  // the walk
-    // One candidate per (file, seq), in the scan's order.
-    std::map<std::pair<int, int64_t>, Cand> bySeq;
+    // One candidate per (file, seq), in the scan's order; in a keyed order
+    // one per (file, seq, order value), each answered only at its own value.
+    std::map<std::tuple<int, int64_t, int64_t>, Cand> bySeq;
+    const bool kd = keyed();
     for (const E& en : ents) {
         if (en.w < s_.wLo || en.w > s_.wHi) continue;
-        Cand& c = bySeq[{en.fi, en.seq}];
+        Cand& c = bySeq[std::make_tuple(en.fi, en.seq, kd ? en.ov : int64_t(0))];
         c.seq = en.seq;
         c.fi = en.fi;
         c.w = en.w;
+        c.ov = en.ov;
+        c.checkOv = kd;
         std::memcpy(c.key, en.key, 32);
         c.haveKey = true;
     }
     for (auto& kv : bySeq) cands_.push_back(std::move(kv.second));
-    std::stable_sort(cands_.begin(), cands_.end(), [&](const Cand& a, const Cand& b) {
-        switch (wo_) {
-            case kSeqDesc:
-                if (a.seq != b.seq) return a.seq > b.seq;
-                return a.fi > b.fi;
-            case kWDesc:
-            case kWAsc: {
-                if (a.w != b.w) return wo_ == kWAsc ? a.w < b.w : a.w > b.w;
-                const int k = std::memcmp(a.key, b.key, 32);
-                if (k) return k < 0;
-                return a.fi < b.fi;
-            }
-            case kCid: {
-                const int k = std::memcmp(a.key, b.key, 32);
-                if (k) return k < 0;
-                return a.fi < b.fi;
-            }
-            default:
-                if (a.seq != b.seq) return a.seq < b.seq;
-                return a.fi < b.fi;
-        }
-    });
+    auto asEnt = [](const Cand& c) {
+        Ent e;
+        e.seq = c.seq;
+        e.w = c.w;
+        e.ov = c.ov;
+        std::memcpy(e.key, c.key, 32);
+        e.haveKey = true;
+        return e;
+    };
+    std::stable_sort(cands_.begin(), cands_.end(),
+                     [&](const Cand& a, const Cand& b) { return before(asEnt(a), a.fi, asEnt(b), b.fi); });
     candMode_ = true;
     *used = true;
     return P4_OK;
@@ -656,10 +665,15 @@ int32_t Scan::open() {
         fts_ = true;
     }
     if (s_.order == 0) s_.order = P4_ORDER_SEQ_ASC;
-    const bool desc = s_.order == P4_ORDER_SEQ_DESC || (s_.bound && s_.order != P4_ORDER_SEQ_ASC && s_.order != P4_ORDER_W_DESC &&
-                                                        s_.order != P4_ORDER_CID);
-    wo_ = desc ? kSeqDesc
-               : s_.order == P4_ORDER_W_DESC ? (s_.wAsc ? kWAsc : kWDesc) : s_.order == P4_ORDER_CID ? kCid : kSeqAsc;
+    switch (s_.order) {
+        case P4_ORDER_SEQ_DESC: wo_ = kSeqDesc; break;
+        case P4_ORDER_W_DESC: wo_ = s_.wAsc ? kWAsc : kWDesc; break;
+        case P4_ORDER_CID: wo_ = kCid; break;
+        case P4_ORDER_NEWEST: wo_ = s_.part == 2 ? kTsDesc : kAtDesc; break;   // local rows: their ts (format 1's untagged order)
+        case P4_ORDER_RECENT: wo_ = s_.part == 2 ? kSeqDesc : kAtDescSeq; break;
+        case P4_ORDER_W_ASC: wo_ = kWAsc; break;
+        default: wo_ = kSeqAsc; break;
+    }
     if (!t_->hasFiles.load(std::memory_order_acquire)) {
         done_ = true;
         return P4_OK;
@@ -696,12 +710,18 @@ bool Scan::before(const Ent& a, int fa, const Ent& b, int fb) const {
             if (a.seq != b.seq) return a.seq > b.seq;
             return fa > fb;
         case kWDesc:
-        case kWAsc: {
-            if (a.w != b.w) return wo_ == kWAsc ? a.w < b.w : a.w > b.w;
+        case kWAsc:
+        case kAtDesc:
+        case kTsDesc: {
+            if (a.ov != b.ov) return wo_ == kWAsc ? a.ov < b.ov : a.ov > b.ov;
             const int k = std::memcmp(a.key, b.key, 32);
             if (k) return k < 0;
             return fa < fb;
         }
+        case kAtDescSeq:
+            if (a.ov != b.ov) return a.ov > b.ov;
+            if (a.seq != b.seq) return a.seq > b.seq;
+            return fa < fb;
         default: {
             const int k = std::memcmp(a.key, b.key, 32);
             if (k) return k < 0;
@@ -724,7 +744,8 @@ int32_t Scan::fetch(Stream& s) {
     const bool wBound = s_.wLo != INT64_MIN || s_.wHi != INT64_MAX;
     std::vector<Ent> got;
     int32_t rc = P4_OK;
-    auto read = [&](sqlite3_stmt* q, int kind) -> int32_t {  // kind 0: seq; 1: rid, w; 2: rid, w, cid
+    // kind 0: seq; 1: rid, w; 2: rid, order value (w, at or ts), cid
+    auto read = [&](sqlite3_stmt* q, int kind) -> int32_t {
         int r;
         while ((r = sqlite3_step(q)) == SQLITE_ROW) {
             Ent en;
@@ -734,7 +755,7 @@ int32_t Scan::fetch(Stream& s) {
             } else {
                 en.rid = sqlite3_column_int64(q, 0);
                 en.seq = en.rid >> 16;
-                en.w = sqlite3_column_int64(q, 1);
+                en.w = en.ov = sqlite3_column_int64(q, 1);
                 en.haveKey = kind == 2 && sqlite3_column_bytes(q, 2) == 32;
                 if (en.haveKey) std::memcpy(en.key, sqlite3_column_blob(q, 2), 32);
                 else std::memset(en.key, 0, 32);
@@ -772,20 +793,33 @@ int32_t Scan::fetch(Stream& s) {
                 s.started = true;
             }
         }
-    } else if (wo_ == kWDesc || wo_ == kWAsc) {
-        const bool asc = wo_ == kWAsc;
+    } else if (keyed()) {
+        // A keyed walk, whole key groups: w (r_w, within the predicates' w
+        // range), delivery time (r_a, a feed file) or the copies' ts (r_t,
+        // the local file). None of them holds a CID: each group is put in
+        // its tie order from the rows.
+        const bool asc = wo_ == kWAsc, isW = wo_ == kWDesc || wo_ == kWAsc;
+        const std::string col = isW ? "w" : wo_ == kTsDesc ? "ts" : "at";
+        const std::string idx = isW ? "r_w" : wo_ == kTsDesc ? "r_t" : "r_a";
+        const int64_t lo = isW ? s_.wLo : INT64_MIN, hi = isW ? s_.wHi : INT64_MAX;
         if (!fr.indexed) rc = P4_E_UNSUPPORTED;
+        // A file made before its r_a / r_t (an older store): the same answer
+        // through a sort.
+        auto prep = [&](const std::string& tail) {
+            sqlite3_stmt* q = c->sql("SELECT rid, " + col + ", cid FROM r INDEXED BY " + idx + " WHERE " + tail);
+            if (!q && !isW) q = c->sql("SELECT rid, " + col + ", cid FROM r WHERE " + tail);
+            return q;
+        };
         if (rc == P4_OK) {
-            if (!s.started) s.rKey = asc ? s_.wLo : s_.wHi;
-            const std::string sql = std::string("SELECT rid, w, cid FROM r INDEXED BY r_w WHERE ") +
-                                    (asc ? (s.started ? "w>?1 AND w<=?2" : "w>=?1 AND w<=?2")
-                                         : (s.started ? "w<?1 AND w>=?2" : "w<=?1 AND w>=?2")) +
-                                    " AND rid>=?3 AND rid<=?4 ORDER BY w " + (asc ? "ASC" : "DESC") + " LIMIT ?5";
-            sqlite3_stmt* q = c->sql(sql);
+            if (!s.started) s.rKey = asc ? lo : hi;
+            const std::string tail = col + (asc ? (s.started ? ">?1 AND " : ">=?1 AND ") : (s.started ? "<?1 AND " : "<=?1 AND ")) +
+                                     col + (asc ? "<=?2" : ">=?2") + " AND rid>=?3 AND rid<=?4 ORDER BY " + col +
+                                     (asc ? " ASC" : " DESC") + " LIMIT ?5";
+            sqlite3_stmt* q = prep(tail);
             if (!q) rc = P4_E_INTERNAL;
             else {
                 sqlite3_bind_int64(q, 1, s.rKey);
-                sqlite3_bind_int64(q, 2, asc ? s_.wHi : s_.wLo);
+                sqlite3_bind_int64(q, 2, asc ? hi : lo);
                 sqlite3_bind_int64(q, 3, ridLo);
                 sqlite3_bind_int64(q, 4, ridHi);
                 sqlite3_bind_int64(q, 5, int64_t(chunk_));
@@ -793,31 +827,34 @@ int32_t Scan::fetch(Stream& s) {
             }
             const bool full = got.size() >= chunk_;
             if (rc == P4_OK && full) {
-                // The last w group whole.
-                const int64_t lastW = got.back().w;
-                while (!got.empty() && got.back().w == lastW) got.pop_back();
-                sqlite3_stmt* g = c->sql("SELECT rid, w, cid FROM r INDEXED BY r_w WHERE w=?1 AND rid>=?2 AND rid<=?3");
+                // The last key group whole.
+                const int64_t last = got.back().ov;
+                while (!got.empty() && got.back().ov == last) got.pop_back();
+                sqlite3_stmt* g = prep(col + "=?1 AND rid>=?2 AND rid<=?3");
                 if (!g) rc = P4_E_INTERNAL;
                 else {
-                    sqlite3_bind_int64(g, 1, lastW);
+                    sqlite3_bind_int64(g, 1, last);
                     sqlite3_bind_int64(g, 2, ridLo);
                     sqlite3_bind_int64(g, 3, ridHi);
                     rc = read(g, 2);
                 }
             }
             if (rc == P4_OK) {
-                // Each w group in CID order (then rid: a record's rows stay adjacent).
+                // Each group in CID order (RECENT: seq desc), then rid: a
+                // record's rows stay adjacent.
+                const bool bySeq = wo_ == kAtDescSeq;
                 size_t a = 0;
                 while (a < got.size()) {
                     size_t b = a;
-                    while (b < got.size() && got[b].w == got[a].w) b++;
-                    std::sort(got.begin() + long(a), got.begin() + long(b), [](const Ent& x, const Ent& y) {
+                    while (b < got.size() && got[b].ov == got[a].ov) b++;
+                    std::sort(got.begin() + long(a), got.begin() + long(b), [bySeq](const Ent& x, const Ent& y) {
+                        if (bySeq) return x.seq != y.seq ? x.seq > y.seq : x.rid < y.rid;
                         const int k = std::memcmp(x.key, y.key, 32);
                         return k ? k < 0 : x.rid < y.rid;
                     });
                     a = b;
                 }
-                if (!got.empty()) s.rKey = got.back().w;
+                if (!got.empty()) s.rKey = got.back().ov;
                 if (!full) s.done = true;
                 s.started = true;
             }
@@ -913,6 +950,8 @@ int32_t Scan::page(std::vector<Cand>* out) {
         c.seq = en.seq;
         c.fi = s.fi;
         c.w = en.w;
+        c.ov = en.ov;
+        c.checkOv = keyed();
         c.haveKey = en.haveKey;
         if (en.haveKey) std::memcpy(c.key, en.key, 32);
         out->push_back(c);
@@ -1178,6 +1217,19 @@ bool Scan::evaluate(int64_t seq, std::vector<RowV>& rows, Row* out) {
     return true;
 }
 
+// A record's place in a keyed walk: the w of the copy it answers with, its
+// newest matching instance's delivery time (format 1's newest tag row), or
+// that copy's ts (local).
+int64_t Scan::orderValue(const Row& r) const {
+    if (wo_ == kTsDesc) return r.ts;
+    if (wo_ == kAtDesc || wo_ == kAtDescSeq) {
+        int64_t v = INT64_MIN;
+        for (int64_t a : r.ats) v = std::max(v, a);
+        return v;
+    }
+    return r.w;
+}
+
 int32_t Scan::resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Row>>* out) {
     std::map<int, std::vector<int64_t>> want;
     for (const Cand& c : page) want[c.fi].push_back(c.seq);
@@ -1213,6 +1265,7 @@ int32_t Scan::resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Ro
         if (it == rows.end()) continue;
         Row r;
         if (evaluate(c.seq, it->second, &r)) {
+            if (c.checkOv && c.ov != orderValue(r)) continue;  // answered at its own row's value
             r.fid = files_[size_t(c.fi)].fid;
             out->push_back({c.seq, std::move(r)});
         }
@@ -1833,7 +1886,9 @@ int32_t opScanLike(P4Lane* L, const std::vector<Tlv>& v, uint32_t op) {
     if (rc == P4_OK) {
         if (op == P4_OPC_SCAN) {
             if (s.order == 0) s.order = P4_ORDER_SEQ_ASC;
-            if (s.order != P4_ORDER_SEQ_ASC && s.order != P4_ORDER_SEQ_DESC) rc = P4_E_ARG;
+            if (s.order != P4_ORDER_SEQ_ASC && s.order != P4_ORDER_SEQ_DESC && s.order != P4_ORDER_NEWEST &&
+                s.order != P4_ORDER_RECENT && s.order != P4_ORDER_W_ASC)
+                rc = P4_E_ARG;
         } else {
             if (s.order == 0) s.order = P4_ORDER_W_DESC;
             if (s.order != P4_ORDER_W_DESC && s.order != P4_ORDER_CID) rc = P4_E_ARG;
@@ -1843,17 +1898,42 @@ int32_t opScanLike(P4Lane* L, const std::vector<Tlv>& v, uint32_t op) {
         o.finish(rc, rc == P4_E_NOTYPE ? "type not registered" : "bad request");
         return rc;
     }
-    Scan sc(L, t, s);
-    rc = sc.open();
-    Row* r;
-    while (rc == P4_OK) {
-        const int32_t n = sc.next(&r);
-        if (n <= 0) {
-            rc = n;
-            break;
+    // Format 1's two-part pages (C-39 E2, E3): the tagged records (the feed
+    // files) in the order, the offset over them; then, without a lane
+    // filter, the untagged records (the local file) from the start, as many
+    // as the limit leaves (format 1 runs its untagged query without the
+    // offset).
+    const bool twoPart = op == P4_OPC_SCAN && (s.order == P4_ORDER_NEWEST || s.order == P4_ORDER_RECENT || s.order == P4_ORDER_W_ASC);
+    uint64_t emitted = 0;
+    auto run = [&](const Spec2& spec) -> int32_t {
+        Scan sc(L, t, spec);
+        int32_t st = sc.open();
+        Row* r;
+        while (st == P4_OK) {
+            const int32_t n = sc.next(&r);
+            if (n <= 0) {
+                st = n;
+                break;
+            }
+            writeRec(o, *r, nullptr, false);
+            emitted++;
+            st = o.rowDone();
         }
-        writeRec(o, *r, nullptr, false);
-        rc = o.rowDone();
+        return st;
+    };
+    if (!twoPart) {
+        rc = run(s);
+    } else {
+        Spec2 tagged = s;
+        tagged.part = 1;
+        rc = run(tagged);
+        if (rc == P4_OK && !s.lane && (!s.limit || emitted < s.limit)) {
+            Spec2 untagged = s;
+            untagged.part = 2;
+            untagged.offset = 0;
+            untagged.limit = s.limit ? s.limit - emitted : 0;
+            rc = run(untagged);
+        }
     }
     L->e->bump(kStReads);
     o.finish(rc, rc == P4_OK ? "" : "read failed");
@@ -2733,6 +2813,8 @@ int32_t p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out) {
     if (s.order < P4_ORDER_SEQ_ASC || s.order > P4_ORDER_CID) return P4_E_ARG;
     s.hydrate = spec->hydrate != 0;
     s.needTags = spec->noTags == 0;
+    if (spec->part != 0 && spec->part != 2) return P4_E_ARG;
+    s.part = spec->part;
     s.limit = spec->limit;
     s.offset = spec->offset;
     s.bound = spec->bound;

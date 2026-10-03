@@ -662,7 +662,7 @@ int indexPutNextSeq(Conn* idx, int64_t nextSeq);
 // The writer connection of a feed file (made with its schema on first use), pinned for the caller.
 Conn* writerPin(P4Engine* e, Feed* f, int32_t* rc, std::string* err);
 void writerUnpin(P4Engine* e, Feed* f);
-int32_t fileCreateIndexes(Type* t, Conn* c);
+int32_t fileCreateIndexes(Type* t, Conn* c, bool local);
 int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes);
 int writeMeta(Conn* c, const Counters& k, int64_t now);  // in the caller's write transaction; SQLite rc
 int readMeta(Conn* c, Counters* k, bool* indexed);       // SQLite rc
@@ -693,7 +693,7 @@ struct RowR {
     std::string batch, ppeer, pkey, ckey;
     std::string url;
     int64_t at = 0;
-    int64_t ts = 0, len = 0;
+    int64_t ts = 0, len = 0;   // ts: this copy's (a record's copies share the record's, except a COPY that keeps its own, C-39 E6)
     std::string sig, fcols;
     bool sealed = false;
     bool hasD = false;
@@ -703,6 +703,10 @@ struct RowR {
     bool del = false;      // to delete
     bool urlSet = false;   // the url changed (an existing row)
     bool loaded = false;   // read from its file (an existing row)
+    // A new row of an instance this write's tag delivered: the instance's
+    // summary times follow it. A copy joining instances the record already
+    // has (an untagged write, a filled row) leaves them alone (C-39 E4).
+    bool stamp = false;
     uint32_t nId = 0, bId = 0, cId = 0, uId = 0;  // its file's ids (an existing row)
     bool live() const { return !del; }
     bool sameInst(const RowR& o) const {
@@ -714,7 +718,9 @@ struct RecState {
     uint32_t fid = 0;
     uint8_t key[32] = {};
     int64_t seq = 0;
+    bool keyed = false;    // key holds the record's CID (a seq probed absent has none until a caller names it, C-39 B1)
     bool existed = false;  // rows in the file before this write
+    bool restamp = false;  // its rows leave as a DELETE or a CAT supersede: the instances it leaves are restamped (C-39 E5)
     bool hasE = false;
     int64_t e = 0, ts = 0, w = 0;
     KVal k;

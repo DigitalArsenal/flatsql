@@ -8,7 +8,12 @@ typedef struct P4Engine P4Engine;
 typedef struct P4Lane P4Lane;
 typedef struct P4Cursor P4Cursor;
 
-enum { P4_ORDER_SEQ_ASC = 1, P4_ORDER_SEQ_DESC = 2, P4_ORDER_W_DESC = 3, P4_ORDER_CID = 4 };
+enum { P4_ORDER_SEQ_ASC = 1, P4_ORDER_SEQ_DESC = 2, P4_ORDER_W_DESC = 3, P4_ORDER_CID = 4,
+       /* SCAN over the mailbox only (C-39; p4_cursor_open refuses them): format 1's two-part pages, the
+        * tagged records (feed files) in the order with the offset, then, without a lane filter, the
+        * untagged (local) records from the start. NEWEST: delivery time desc, CID asc; local ts desc,
+        * CID asc. RECENT: delivery time desc, seq desc; local seq desc. W_ASC: w asc, CID asc. */
+       P4_ORDER_NEWEST = 5, P4_ORDER_RECENT = 6, P4_ORDER_W_ASC = 7 };
 enum { P4_F_EPOCH = 1, P4_F_TS = 2, P4_F_W = 3, P4_F_EPOCH_DAY = 4,
        P4_F_COL0 = 10, P4_F_COL1 = 11, P4_F_COL2 = 12, P4_F_COL3 = 13 };
 enum { P4_OP_EQ = 1, P4_OP_NE, P4_OP_LT, P4_OP_LE, P4_OP_GT, P4_OP_GE, P4_OP_BETWEEN, P4_OP_LIKE,
@@ -32,7 +37,7 @@ typedef struct P4ScanSpec {
     uint8_t order;               /* P4_ORDER_* */
     uint8_t hydrate;
     uint8_t noTags;              /* 1: the caller reads no row's tag (P4Row.tag may be NULL) */
-    uint8_t rsv;
+    uint8_t part;                /* 0 every file; 2 the type's local file only ("<TYPE>@local", C-39 S1) */
     uint64_t limit, offset;      /* 0 = none */
     uint64_t bound;              /* A18 newest-N seqs OF THE TYPE, applied before every other filter incl. lane (v2, C-17); 0 = none */
 } P4ScanSpec;

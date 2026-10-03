@@ -9,7 +9,8 @@
 //     d the record bytes verbatim (sealed bytes when sealed), x the
 //     signature, f a sealed record's extracted COL values.
 //   indexes: r_s(seq) arrival, r_c(cid) the file's one CID index, r_ke(k, e)
-//     object + epoch, r_w(w DESC) epoch, r_b(b) batch
+//     object + epoch, r_w(w DESC) epoch, r_b(b) batch; r_a(at DESC) delivery
+//     time (a feed file) or r_t(ts DESC) the copies' time (local)
 //   inst(b, c, ...) each instance's counters; tokc(producer, ...) each
 //   token's copies; ident(h, seq) ingest identities (IQC); meta: the file's
 //   counters
@@ -20,9 +21,10 @@
 // delivered to each feed file its tags name (local without a tag), found
 // there by its CID (ingest: a record new to a feed gets its own seq, C-38
 // (3)) or by format 1's rowid (migrate: the same seq in every feed holding
-// it); seqs assigned for new records in content-time order; then the
-// journal, the feed files and the type index commit (record.cpp), and every
-// call is acked after its records are durable and visible (C-4).
+// it); seqs assigned for new records in input order (format 1's rowids,
+// C-39 E1); then the journal, the feed files and the type index commit
+// (record.cpp), and every call is acked after its records are durable and
+// visible (C-4).
 #include <algorithm>
 
 #include "internal.h"
@@ -54,8 +56,10 @@ const char* kFileSchema =
 // (r_ke: one seek per object for EPOCH nearest / as_of / forward, object
 // predicates, CAT supersede), epoch windows (r_w on w = coalesce(e, ts); ties
 // are put in CID order from the rows), and the batch (r_b: batch supersede
-// and batch-filtered reads).
-int32_t fileCreateIndexes(Type* t, Conn* c) {
+// and batch-filtered reads). Newest-first pages (C-39 E2) walk a feed file by
+// delivery time (r_a on at) and the local file by the copies' time (r_t on
+// ts); neither holds a CID (ties are put in order from the rows).
+int32_t fileCreateIndexes(Type* t, Conn* c, bool local) {
     std::shared_ptr<const Spec> sp = t->spec();
     std::string ddl =
         "BEGIN IMMEDIATE;"
@@ -63,6 +67,7 @@ int32_t fileCreateIndexes(Type* t, Conn* c) {
         "CREATE INDEX IF NOT EXISTS r_c ON r(cid);"
         "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC);"
         "CREATE INDEX IF NOT EXISTS r_b ON r(b);";
+    ddl += local ? "CREATE INDEX IF NOT EXISTS r_t ON r(ts DESC);" : "CREATE INDEX IF NOT EXISTS r_a ON r(at DESC);";
     if (sp->hasObject) ddl += "CREATE INDEX IF NOT EXISTS r_ke ON r(k, e);";
     ddl += "INSERT OR REPLACE INTO meta(k, v) VALUES('ix', 1);";
     int rc = c->exec(ddl.c_str());
@@ -103,7 +108,7 @@ int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes) {
         c->exec("ROLLBACK");
         return statusOfSqlite(rc);
     }
-    if (indexes) return fileCreateIndexes(t, c);
+    if (indexes) return fileCreateIndexes(t, c, f->local);
     return P4_OK;
 }
 
@@ -537,6 +542,7 @@ struct Call {
     uint32_t tok = 0;
     std::vector<TagIn> tags;
     int64_t at = 0;
+    bool ownTs = false;  // tag 55: a COPY stores this write's ts (format 1's StoreRoutedByProducer, C-39 E6)
     std::vector<size_t> recs;  // group indexes
     int32_t status = P4_OK;
     std::string err;
@@ -617,6 +623,9 @@ bool Group::parseCall(Call& c) {
     tlvText(v, 50, &c.peer);
     c.at = 0;
     if (!tlvI64(v, 54, &c.at, &bad)) c.at = nowSec();
+    uint8_t ownTs = 0;
+    tlvU8(v, 55, &ownTs, &bad);
+    c.ownTs = ownTs != 0;
     if (bad) {
         c.status = P4_E_ARG;
         c.err = "a typed tag has the wrong length";
@@ -796,6 +805,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
     const auto key = std::make_pair(scope, r.supIdentity);
     auto it = supOf_.find(key);
     if (it != supOf_.end() && it->second != rs) {
+        it->second->restamp = true;
         w.dropAll(it->second);
         e_->bump(kStCatSuperseded);
     }
@@ -848,6 +858,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
         RecState* other = w.bySeq(scope, s, &lrc);
         if (!other) return lrc;
         if (other == rs) continue;
+        other->restamp = true;  // C-39 E5: format 1's supersede restamps the lanes it leaves
         w.dropAll(other);
         e_->bump(kStCatSuperseded);
     }
@@ -891,6 +902,7 @@ RowR Group::copyOf(const Call& c, const Rec& r) const {
     copy.hasD = true;
     copy.d.assign(reinterpret_cast<const char*>(r.d), r.dLen);
     copy.len = r.dLen;
+    copy.ts = r.ts;
     copy.sealed = r.sealed != nullptr;
     copy.fcols = r.fCols;
     return copy;
@@ -1057,6 +1069,9 @@ int32_t Group::ingest(WriteCtx& w, Call& c, Rec& r) {
             rs->seq = localRs->seq;
             rs->ts = localRs->ts;
         }
+        // The copy's ts is the record's (format 1's mirror of the held
+        // record), or this write's own for a COPY that keeps it (C-39 E6).
+        copy.ts = holder && c.ownTs ? r.ts : rs->ts;
         if (absorb) {
             const RowR* own = nullptr;  // the call producer's local copy
             const RowR* lh = nullptr;   // the record's first copy
@@ -1179,6 +1194,8 @@ int32_t Group::absorbLocal(WriteCtx& w, RecState* local, RecState* into) {
         m.rid = 0;
         m.inst = false;
         m.urlSet = false;
+        m.stamp = false;
+        m.ts = into->ts;
         m.nId = m.bId = m.cId = m.uId = 0;
         if (!x.hasD) {
             m.srcFid = x.loaded ? local->fid : x.srcFid;
@@ -1264,7 +1281,7 @@ int32_t Group::migrate(WriteCtx& w, Call& c, Rec& r) {
         const bool isNew = !rs->existed && !freshSet_.count(rs);
         if (isNew) setRecord(rs, r);
         WriteCtx::Out out;
-        w.deliver(rs, copy, tg.insts, &out);
+        w.deliver(rs, copy, tg.insts, &out);  // a copy keeps the ts it is sent (format 1's own; C-39 E6 across the migration)
         copyNew = copyNew || (!isNew && out.copyNew);
         if (isNew) {
             fresh_.push_back(rs);
@@ -1298,8 +1315,10 @@ int32_t Group::migrate(WriteCtx& w, Call& c, Rec& r) {
             RecState* rs = w.bySeq(tg.fid, seq, &rc, r.key);
             if (!rs) return rc;
             for (const RowR& m : moving) {
+                RowR mm = m;  // a local copy keeps its own ts
+                mm.stamp = false;
                 WriteCtx::Out out;
-                w.deliver(rs, m, {}, &out);
+                w.deliver(rs, mm, {}, &out);
             }
         }
         w.dropAll(localHolder);
@@ -1402,17 +1421,13 @@ void Group::run(std::vector<WriteTask*>& tasks) {
         respond();
         return;
     }
-    // Seqs: records new to a feed in content-time order (ingest), format 1's
-    // (migrate, already set).
+    // Seqs: records new to a feed in input order, as format 1's rowids
+    // (ingest, C-39 E1: the calls in queue order, each call's records in
+    // order, each record's feeds in tag order); format 1's own (migrate,
+    // already set).
     std::vector<RecState*> assign;
     for (RecState* rs : fresh_)
         if (!w.migrate && !rs->seq) assign.push_back(rs);
-    std::sort(assign.begin(), assign.end(), [](const RecState* a, const RecState* b) {
-        if (a->w != b->w) return a->w < b->w;
-        const int c = std::memcmp(a->key, b->key, 32);
-        if (c) return c < 0;
-        return a->fid < b->fid;
-    });
     std::pair<int64_t, int64_t> inflight(INT64_MAX, 0);
     {
         std::lock_guard<std::mutex> g(t_->mu);

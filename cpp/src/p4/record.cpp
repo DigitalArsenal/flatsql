@@ -39,7 +39,10 @@ RecState* WriteCtx::make(uint32_t fid, int64_t seq, const uint8_t* key) {
     RecState* r = &store_.back();
     r->fid = fid;
     r->seq = seq;
-    if (key) std::memcpy(r->key, key, 32);
+    if (key) {
+        std::memcpy(r->key, key, 32);
+        r->keyed = true;
+    }
     order_.push_back(r);
     return r;
 }
@@ -97,6 +100,7 @@ int32_t WriteCtx::loadRows(RecState* r) {
         const uint8_t* cid = static_cast<const uint8_t*>(sqlite3_column_blob(q, 6));
         if (!haveKey) {
             std::memcpy(r->key, cid, 32);
+            r->keyed = true;
             haveKey = true;
             r->hasE = sqlite3_column_type(q, 7) != SQLITE_NULL;
             r->e = sqlite3_column_int64(q, 7);
@@ -199,13 +203,23 @@ RecState* WriteCtx::byKey(uint32_t fid, const uint8_t key[32], int32_t* rc) {
 
 RecState* WriteCtx::bySeq(uint32_t fid, int64_t seq, int32_t* rc, const uint8_t* keyIfNew) {
     *rc = P4_OK;
-    if (RecState* r = known(fid, seq)) return r;
-    RecState* r = make(fid, seq, nullptr);
-    *rc = loadRows(r);
-    if (*rc != P4_OK) return nullptr;
-    bySeq_[{fid, seq}] = r;
-    if (!r->existed && keyIfNew) std::memcpy(r->key, keyIfNew, 32);
-    if (r->existed || keyIfNew) byKey_[{fid, std::string(reinterpret_cast<const char*>(r->key), 32)}] = r;
+    RecState* r = known(fid, seq);
+    if (!r) {
+        r = make(fid, seq, nullptr);
+        *rc = loadRows(r);
+        if (*rc != P4_OK) return nullptr;
+        bySeq_[{fid, seq}] = r;
+        if (r->existed) byKey_[{fid, std::string(reinterpret_cast<const char*>(r->key), 32)}] = r;
+    }
+    // A seq the file does not hold is a new record of the file once a caller
+    // names its CID. A probe that asked without one (is the seq here?) keeps
+    // the state keyless; the caller that names the CID keys it, whenever it
+    // asks (C-39 B1: a cached keyless state wrote a zero CID).
+    if (!r->keyed && keyIfNew) {
+        std::memcpy(r->key, keyIfNew, 32);
+        r->keyed = true;
+        byKey_.emplace(std::make_pair(fid, std::string(reinterpret_cast<const char*>(r->key), 32)), r);
+    }
     return r;
 }
 
@@ -295,7 +309,7 @@ void WriteCtx::fill(RecState* r) {
             n.ckey = in.ckey;
             n.url = in.url;
             n.at = instAt(ii);
-            n.ts = r->ts;
+            n.ts = c.ts;
             n.len = c.len;
             n.sig = c.sig;
             n.fcols = c.fcols;
@@ -329,11 +343,11 @@ void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& i
                 rep = x;
                 break;
             }
-    auto newRow = [&](const Inst* in) {
+    auto newRow = [&](const Inst* in, bool stamp) {
         RowR n;
         n.tok = rep.tok;
         n.peer = rep.peer;
-        n.ts = r->ts;
+        n.ts = rep.ts;
         n.len = rep.len;
         n.sig = rep.sig;
         n.fcols = rep.fcols;
@@ -356,6 +370,7 @@ void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& i
             n.ckey = in->ckey;
             n.url = in->url;
             n.at = in->at;
+            n.stamp = stamp;
         }
         r->touched = true;
         r->rows.push_back(std::move(n));
@@ -376,7 +391,7 @@ void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& i
         if (!held) out->instNew = true;
         bool row = false;
         for (const RowR& x : r->rows) row = row || (x.live() && x.tok == rep.tok && sameInst(x, in));
-        if (!row) newRow(&in);
+        if (!row) newRow(&in, true);
     }
     // A new copy without new instances: a row with each instance the record
     // has in this file, or one local row.
@@ -392,8 +407,8 @@ void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& i
                 }
             if (!seen) have.push_back(Inst{x.batch, x.ppeer, x.pkey, x.ckey, x.url, x.at});
         }
-        if (have.empty()) newRow(nullptr);
-        for (const Inst& in : have) newRow(&in);
+        if (have.empty()) newRow(nullptr, false);
+        for (const Inst& in : have) newRow(&in, false);
     }
     fill(r);
 }
@@ -640,6 +655,16 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
     bool identWrites = false;
     for (const IdentNew& id : idents) identWrites = identWrites || (id.rec && id.rec->fid == f->fid && id.rec->seq);
     if (!change && !identWrites) return P4_OK;
+    // A new row is stored under its record's CID: a record still without one
+    // is a bug, refused before anything is written (C-39 B1).
+    for (RecState* r : recs) {
+        bool adds = false;
+        for (const RowR& x : r->rows) adds = adds || (!x.loaded && !x.del);
+        if (adds && !r->keyed) {
+            err = "a new row of seq " + std::to_string(r->seq) + " has no CID: " + f->path;
+            return P4_E_INTERNAL;
+        }
+    }
     // The bytes new rows copy from other rows, before the transaction.
     for (RecState* r : recs)
         for (RowR& x : r->rows)
@@ -699,6 +724,7 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
     std::set<InstId> changedInst;
     std::vector<int64_t> gone;  // records that leave the file
     bool deleted = false;
+    bool epochEdge = false;     // a record at the file's epoch bound left it
     int rc = c->exec("BEGIN IMMEDIATE");
     auto bad = [&](int r) {
         if (rc == SQLITE_OK && r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) rc = r;
@@ -798,7 +824,7 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
                     a.lenA = std::min(a.lenA, x.len);
                     a.maxat = std::max(a.maxat, x.at);
                     a.minat = std::min(a.minat, x.at);
-                    if (!x.loaded || x.urlSet) {
+                    if ((!x.loaded && x.stamp) || x.urlSet) {
                         a.changed = true;
                         a.url = x.url;
                     }
@@ -807,6 +833,21 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
             }
         }
         const std::map<uint32_t, int64_t> cpB = copiesOf(r, false), cpA = copiesOf(r, true);
+        // The live rows' ts and w (a copy may keep its own ts, C-39 E6), and
+        // each copy's.
+        int64_t tsLo = INT64_MAX, tsHi = INT64_MIN, wLo = INT64_MAX, wHi = INT64_MIN;
+        std::map<uint32_t, std::pair<int64_t, int64_t>> tokTs;
+        for (const RowR& x : r->rows) {
+            if (x.del) continue;
+            const int64_t xw = r->hasE ? r->e : x.ts;
+            tsLo = std::min(tsLo, x.ts);
+            tsHi = std::max(tsHi, x.ts);
+            wLo = std::min(wLo, xw);
+            wHi = std::max(wHi, xw);
+            auto it = tokTs.find(x.tok);
+            if (it == tokTs.end()) tokTs[x.tok] = {x.ts, x.ts};
+            else it->second = {std::min(it->second.first, x.ts), std::max(it->second.second, x.ts)};
+        }
         auto minLen = [](const std::map<uint32_t, int64_t>& m) {
             int64_t v = INT64_MAX;
             for (auto& kv : m) v = std::min(v, kv.second);
@@ -825,14 +866,17 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
         k.copies += int64_t(cpA.size()) - int64_t(cpB.size());
         k.cbytes += sumLen(cpA) - sumLen(cpB);
         if (sp->hasEpochRule && !r->hasE) k.nnull += has - had;
-        if (had && !has) gone.push_back(r->seq);
+        if (had && !has) {
+            gone.push_back(r->seq);
+            if (r->hasE && (r->e <= k.mine || r->e >= k.maxe)) epochEdge = true;
+        }
         if (has) {
             k.minseq = std::min(k.minseq, r->seq);
             k.maxseq = std::max(k.maxseq, r->seq);
-            k.minw = std::min(k.minw, r->w);
-            k.maxw = std::max(k.maxw, r->w);
-            k.mints = std::min(k.mints, r->ts);
-            k.maxts = std::max(k.maxts, r->ts);
+            k.minw = std::min(k.minw, wLo);
+            k.maxw = std::max(k.maxw, wHi);
+            k.mints = std::min(k.mints, tsLo);
+            k.maxts = std::max(k.maxts, tsHi);
             if (r->hasE) {
                 k.mine = std::min(k.mine, r->e);
                 k.maxe = std::max(k.maxe, r->e);
@@ -849,14 +893,18 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
             d.n += int64_t(inA) - int64_t(inB);
             d.bytes += (inA ? ia->second : 0) - (inB ? ib->second : 0);
             if (inA) {
-                d.mints = std::min(d.mints, r->ts);
-                d.maxts = std::max(d.maxts, r->ts);
+                const auto& tt = tokTs[tok];
+                d.mints = std::min(d.mints, tt.first);
+                d.maxts = std::max(d.maxts, tt.second);
                 d.maxseq = std::max(d.maxseq, r->seq);
             }
         }
         for (auto& kv : agg) {
             InstAgg& a = kv.second;
-            if (a.a == a.b && !a.changed && a.lenA == a.lenB) continue;
+            // A DELETE or CAT supersede restamps the instances its record
+            // leaves (format 1's decrementSourceSummary, C-39 E5).
+            const bool restamp = r->restamp && a.b && !a.a;
+            if (a.a == a.b && !a.changed && a.lenA == a.lenB && !restamp) continue;
             changedInst.insert(kv.first);
             InstCount& ic = inst[kv.first];
             if (ic.n == 0 && a.any) {
@@ -877,12 +925,13 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
                     if (!ic.first) ic.first = a.minat;
                 }
                 ic.maxat = std::max(ic.maxat, a.maxat);
-                ic.maxts = std::max(ic.maxts, r->ts);
-                ic.minw = std::min(ic.minw, r->w);
-                ic.maxw = std::max(ic.maxw, r->w);
+                ic.maxts = std::max(ic.maxts, tsHi);
+                ic.minw = std::min(ic.minw, wLo);
+                ic.maxw = std::max(ic.maxw, wHi);
                 ic.minseq = std::min(ic.minseq, r->seq);
                 ic.maxseq = std::max(ic.maxseq, r->seq);
             }
+            if (restamp) ic.updated = now;
         }
     }
     for (const InstId& id : changedInst) {
@@ -957,6 +1006,21 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
             s = c->sql(indexed ? "SELECT max(w) FROM r INDEXED BY r_w" : "SELECT max(w) FROM r");
             if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) k.maxw = sqlite3_column_int64(s, 0);
             if (s) sqlite3_reset(s);
+            // The epoch range follows a delete at its edge (the type's
+            // epoch range, SchemaDateRanges): among rows with an epoch w is
+            // the epoch, so each end of r_w to its first such row.
+            if (epochEdge) {
+                k.mine = INT64_MAX;
+                k.maxe = INT64_MIN;
+                s = c->sql(indexed ? "SELECT e FROM r INDEXED BY r_w WHERE e IS NOT NULL ORDER BY w ASC LIMIT 1"
+                                   : "SELECT min(e) FROM r");
+                if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) k.mine = sqlite3_column_int64(s, 0);
+                if (s) sqlite3_reset(s);
+                s = c->sql(indexed ? "SELECT e FROM r INDEXED BY r_w WHERE e IS NOT NULL ORDER BY w DESC LIMIT 1"
+                                   : "SELECT max(e) FROM r");
+                if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) k.maxe = sqlite3_column_int64(s, 0);
+                if (s) sqlite3_reset(s);
+            }
         }
     }
     if (rc == SQLITE_OK) rc = writeMeta(c, k, now);

@@ -595,7 +595,10 @@ int32_t RelScan::open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, con
     spec_.hydrate = a.hydrate ? 1 : 0;
     spec_.noTags = a.tags ? 0 : 1;
     spec_.bound = t.bound;
-    if (alias_) {
+    if (alias_ && rel.local) {
+        spec_.part = 2;  // the type's local file
+        source_ = prefix_ + rel.source;
+    } else if (alias_) {
         strs_.push_back(rel.source);
         spec_.lane.source = strs_.back().c_str();
         source_ = prefix_ + rel.source;
@@ -644,6 +647,36 @@ int registerModule(LaneState* ls) { return sqlite3_create_module_v2(ls->db, "fla
 
 bool isRelation(const LaneState* ls, const char* name) { return name && ls->relations.count(lower(name)) != 0; }
 
+// Whether any registered type has a feed of the source (lower-case `want`),
+// or it is local; *spelled is its spelling. 1 yes, 0 no, < 0 status.
+int32_t knownSource(LaneState* ls, const std::string& want, std::string* spelled) {
+    if (want == "local") {
+        *spelled = "local";
+        return 1;
+    }
+    const P4TypeInfo* infos = nullptr;
+    uint32_t n = 0;
+    std::vector<std::string> names;
+    {
+        EngineCall ec;
+        const int32_t rc = p4_types(ls->lane, &infos, &n);
+        if (rc < 0) return rc;
+        for (uint32_t i = 0; i < n; i++)
+            if (infos[i].name) names.emplace_back(infos[i].name);
+    }
+    for (const std::string& t : names) {
+        std::vector<std::string> srcs;
+        const int32_t rc = sourcesOf(ls, t, &srcs);
+        if (rc < 0) return rc;
+        for (const std::string& s : srcs)
+            if (lower(s) == want) {
+                *spelled = s;
+                return 1;
+            }
+    }
+    return 0;
+}
+
 int32_t resolveRelation(LaneState* ls, const std::string& name, RelSpec* out, std::string* err) {
     const size_t at = name.find('@');
     const std::string typePart = at == std::string::npos ? name : name.substr(0, at);
@@ -669,7 +702,21 @@ int32_t resolveRelation(LaneState* ls, const std::string& name, RelSpec* out, st
                 spec.kind = kRelAlias;
                 spec.source = s;
             }
-        if (spec.kind != kRelAlias) return 0;   // format 1: no per-source table for a source it never saw
+        // A source the node knows (another type's feed, or local) resolves
+        // as format 1 (C-39 S1): "<TYPE>@local" is the type's local file
+        // (its records no feed holds); another type's source the type has no
+        // feed file for answers empty; a source no type has stays "no such
+        // table".
+        if (spec.kind != kRelAlias) {
+            const int32_t known = knownSource(ls, want, &spec.source);
+            if (known < 0) {
+                if (err) *err = "sources unavailable";
+                return known;
+            }
+            if (!known) return 0;
+            spec.kind = kRelAlias;
+            spec.local = want == "local";
+        }
     }
     *out = spec;
     return 1;
