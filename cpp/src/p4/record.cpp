@@ -441,11 +441,11 @@ int32_t WriteCtx::journalWrite() {
         }
         for (uint32_t fid : fids) {
             Feed* f = t->feedById(fid);
-            if (f && !f->registered) feeds.push_back({fid, f->provider + '\x1f' + f->source + '\x1f' + f->name});
+            if (f && !f->registered) feeds.push_back({fid, unitJoin({&f->provider, &f->source, &f->name})});
         }
         for (uint32_t id : tokIds) {
             TokDef* d = t->tokById(id);
-            if (d && !d->registered) toks.push_back({id, d->token + '\x1f' + d->peer});
+            if (d && !d->registered) toks.push_back({id, unitJoin({&d->token, &d->peer})});
         }
         if (t->nextSeq - 1 > t->seqReserved) reserve = t->nextSeq - 1 + int64_t(e->cfg.seqBlock);
     }

@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <initializer_list>
 #include <list>
 #include <map>
 #include <memory>
@@ -238,6 +239,12 @@ struct Dict {
     std::unordered_map<std::string, uint32_t> nodeId, batchId;
     bool loaded = false;
 };
+// Strings joined by 0x1F, each escaped (0x1E and 0x1F behind a 0x1E), so a
+// joined key names exactly one tuple whatever bytes its strings hold
+// (GATES-feed-r2 N-A); a string with neither byte joins unchanged.
+std::string unitJoin(std::initializer_list<const std::string*> parts);
+// The strings of a unitJoin, `want` of them (missing ones empty).
+std::vector<std::string> unitSplit(const std::string& s, size_t want);
 std::string nodeKey(const std::string& producer, const std::string& peer);
 std::string batchKey(const std::string& batch, const std::string& ppeer, const std::string& pkey);
 

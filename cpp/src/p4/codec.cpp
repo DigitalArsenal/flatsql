@@ -470,9 +470,39 @@ void KVal::from(sqlite3_stmt* q, int col) {
     else s.clear();
 }
 
-std::string nodeKey(const std::string& producer, const std::string& peer) { return producer + '\x1f' + peer; }
+std::string unitJoin(std::initializer_list<const std::string*> parts) {
+    std::string out;
+    bool first = true;
+    for (const std::string* p : parts) {
+        if (!first) out.push_back('\x1f');
+        first = false;
+        for (char c : *p) {
+            if (c == '\x1e' || c == '\x1f') out.push_back('\x1e');
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> unitSplit(const std::string& s, size_t want) {
+    std::vector<std::string> out(1);
+    for (size_t i = 0; i < s.size(); i++) {
+        const char c = s[i];
+        if (c == '\x1e' && i + 1 < s.size()) {
+            out.back().push_back(s[++i]);
+        } else if (c == '\x1f' && out.size() < want) {
+            out.emplace_back();
+        } else {
+            out.back().push_back(c);
+        }
+    }
+    while (out.size() < want) out.emplace_back();
+    return out;
+}
+
+std::string nodeKey(const std::string& producer, const std::string& peer) { return unitJoin({&producer, &peer}); }
 std::string batchKey(const std::string& batch, const std::string& ppeer, const std::string& pkey) {
-    return batch + '\x1f' + ppeer + '\x1f' + pkey;
+    return unitJoin({&batch, &ppeer, &pkey});
 }
 
 Conn::~Conn() {

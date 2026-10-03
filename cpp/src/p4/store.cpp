@@ -324,7 +324,7 @@ Feed* feedRestore(Type* t, uint32_t fid, const std::string& provider, const std:
         f->name = name;
         f->local = provider.empty() && source.empty();
         f->path = pathJoin(t->pDir, name + ".db");
-        t->feedByKey[provider + '\x1f' + source] = fid;
+        t->feedByKey[unitJoin({&provider, &source})] = fid;
     }
     f->registered = true;
     return f;
@@ -332,7 +332,7 @@ Feed* feedRestore(Type* t, uint32_t fid, const std::string& provider, const std:
 
 Feed* feedFor(Type* t, const std::string& provider, const std::string& source, bool create, bool* made) {
     if (made) *made = false;
-    auto it = t->feedByKey.find(provider + '\x1f' + source);
+    auto it = t->feedByKey.find(unitJoin({&provider, &source}));
     if (it != t->feedByKey.end()) return t->feeds[it->second - 1].get();
     if (!create) return nullptr;
     auto f = std::make_unique<Feed>();
@@ -345,7 +345,7 @@ Feed* feedFor(Type* t, const std::string& provider, const std::string& source, b
     f->path = pathJoin(t->pDir, f->name + ".db");
     Feed* raw = f.get();
     t->feeds.push_back(std::move(f));
-    t->feedByKey.emplace(provider + '\x1f' + source, raw->fid);
+    t->feedByKey.emplace(unitJoin({&provider, &source}), raw->fid);
     if (made) *made = true;
     return raw;
 }

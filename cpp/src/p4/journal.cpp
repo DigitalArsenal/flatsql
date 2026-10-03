@@ -29,20 +29,6 @@ const char* kJournalSchema =
     " k BLOB, s TEXT, v INTEGER);"
     "CREATE TABLE IF NOT EXISTS jm(k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;";
 
-std::vector<std::string> splitUnit(const std::string& s, size_t want) {
-    std::vector<std::string> out;
-    size_t at = 0;
-    while (out.size() + 1 < want) {
-        const size_t x = s.find('\x1f', at);
-        if (x == std::string::npos) break;
-        out.push_back(s.substr(at, x - at));
-        at = x + 1;
-    }
-    out.push_back(s.substr(at));
-    while (out.size() < want) out.emplace_back();
-    return out;
-}
-
 const char* colText(sqlite3_stmt* s, int i) {
     const unsigned char* t = sqlite3_column_text(s, i);
     return t ? reinterpret_cast<const char*>(t) : "";
@@ -112,12 +98,12 @@ int32_t journalReplay(Type* t, std::string* err) {
         std::lock_guard<std::mutex> g(t->mu);
         for (const JE& x : rows) {
             if (x.op == J_FEED) {
-                const auto f = splitUnit(x.s, 3);
+                const auto f = unitSplit(x.s, 3);
                 Feed* fd = feedRestore(t, x.fid, f[0], f[1], f[2]);
                 fd->created = ioExists(fd->path);
                 files.insert(x.fid);
             } else if (x.op == J_TOK) {
-                const auto f = splitUnit(x.s, 2);
+                const auto f = unitSplit(x.s, 2);
                 const uint32_t id = uint32_t(x.v);
                 while (t->toks.size() + 1 < id) {
                     TokDef ph;
