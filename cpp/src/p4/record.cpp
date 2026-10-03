@@ -469,6 +469,36 @@ int32_t WriteCtx::journalWrite() {
     for (auto& f : feeds) add(J_FEED, f.first, &f.second, 0);
     for (auto& d : toks) add(J_TOK, 0, &d.second, d.first);
     for (uint32_t fid : fids) add(J_TOUCH, fid, nullptr, 0);
+    // Moves: a record whose rows leave one file while its seq gains rows in
+    // another file of this write (a local record taken into a feed).
+    for (RecState* r : order_) {
+        if (rc != SQLITE_OK) break;
+        if (!r->touched || !r->existed || !r->seq) continue;
+        bool live = false;
+        for (const RowR& x : r->rows) live = live || x.live();
+        if (live) continue;
+        bool gains = false;
+        for (RecState* o : order_) {
+            if (o == r || o->seq != r->seq || o->fid == r->fid) continue;
+            for (const RowR& x : o->rows) gains = gains || (x.live() && !x.loaded);
+        }
+        if (!gains) continue;
+        sqlite3_stmt* q = j->get(S_J_INS);
+        if (!q) {
+            rc = SQLITE_ERROR;
+            break;
+        }
+        sqlite3_bind_int(q, 1, J_MOVE);
+        sqlite3_bind_int64(q, 2, r->fid);
+        sqlite3_bind_int64(q, 3, r->seq);
+        sqlite3_bind_null(q, 4);
+        sqlite3_bind_null(q, 5);
+        sqlite3_bind_int64(q, 6, 0);
+        const int x = sqlite3_step(q);
+        sqlite3_reset(q);
+        if (x != SQLITE_DONE) rc = x;
+        rows++;
+    }
     if (rc == SQLITE_OK && reserve) {
         sqlite3_stmt* q = j->get(S_JM_SET);
         if (!q) rc = SQLITE_ERROR;
@@ -951,8 +981,19 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
         if (dict.node.size() >= f->dict.node.size() && dict.batch.size() >= f->dict.batch.size()) f->dict = std::move(dict);
     }
     if (!gone.empty() && sp->fullText) {
+        // A seq that moved to another file in this write (a record's local
+        // rows taken into a feed) keeps its full-text row.
+        std::vector<int64_t> drop;
+        for (int64_t seq : gone) {
+            bool elsewhere = false;
+            for (RecState* o : order_) {
+                if (o->seq != seq || o->fid == f->fid) continue;
+                for (const RowR& x : o->rows) elsewhere = elsewhere || x.live();
+            }
+            if (!elsewhere) drop.push_back(seq);
+        }
         std::lock_guard<std::mutex> g(t->ftsGoneMu);
-        t->ftsGone.insert(t->ftsGone.end(), gone.begin(), gone.end());
+        t->ftsGone.insert(t->ftsGone.end(), drop.begin(), drop.end());
     }
     std::lock_guard<std::mutex> g(t->mu);
     if (dbBytes >= 0) {
@@ -1017,8 +1058,10 @@ int32_t WriteCtx::commit() {
             any = true;
         }
     if (!any) return P4_OK;
-    const int32_t jrc = journalWrite();
-    if (jrc != P4_OK) return jrc;
+    if (!replaying) {
+        const int32_t jrc = journalWrite();
+        if (jrc != P4_OK) return jrc;
+    }
     // Feed files, then local files.
     std::set<uint32_t> fids;
     for (RecState* r : order_)
@@ -1058,6 +1101,7 @@ int32_t WriteCtx::commit() {
         }
     }
     const int32_t irc = indexCommit();
+    if (irc != P4_OK && replaying) return irc;
     if (irc != P4_OK) {
         // The index lags the files: the journal (not cut) brings it in line.
         const std::string why = err;

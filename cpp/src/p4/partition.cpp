@@ -594,6 +594,9 @@ private:
     std::vector<RecState*> fresh_;  // records new to their feed file, in delivery order
     std::unordered_set<RecState*> freshSet_;
     std::unordered_map<int64_t, std::string> seqKey_;  // migrate: a seq's CID key in this group
+    std::unordered_map<std::string, std::vector<RecState*>> byCid_;  // CID key -> its records this group delivered
+    int32_t holders(WriteCtx& w, const Rec& r, bool feedsToo, std::vector<RecState*>* feeds, RecState** local);
+    int32_t absorbLocal(WriteCtx& w, RecState* local, RecState* into);
 };
 
 bool Group::parseCall(Call& c) {
@@ -968,14 +971,30 @@ int32_t Group::ingest(WriteCtx& w, Call& c, Rec& r) {
         }
         t->insts.push_back(WriteCtx::Inst{tag.f6[2], tag.f6[4], tag.f6[5], tag.f6[3], tag.url, c.at});
     }
-    if (targets.empty()) targets.push_back(Target{localFid_, {}});
+    // The record's other rows: the feeds holding its CID and its local rows.
+    // A record has no source only while no feed holds it (C-37 (1)): an
+    // untagged write of a held CID is a copy of the record in each feed
+    // holding it (format 1's copy of a tagged record), and a tagged write
+    // takes the record's local rows into its feed.
+    std::vector<RecState*> held_;
+    RecState* localRs = nullptr;
+    int32_t rc = holders(w, r, c.tags.empty(), &held_, &localRs);
+    if (rc != P4_OK) return rc;
+    if (targets.empty()) {
+        for (RecState* h : held_) targets.push_back(Target{h->fid, {}});
+        if (targets.empty()) targets.push_back(Target{localFid_, {}});
+        else if (localRs) {
+            rc = absorbLocal(w, localRs, held_[0]);  // local rows beside a feed's (never left by a write)
+            if (rc != P4_OK) return rc;
+            localRs = nullptr;
+        }
+    }
     const uint32_t scope = c.tags.empty() ? 0 : c.tags[0].fid;
     // An ingest identity (IQC) of the first tag's feed: a repeat of a held
     // capture tags the held record (C-26), in that feed.
     RecState* held = nullptr;
     std::string ikey;
     const bool ingestIdent = sp_->identity && r.ident && !c.tags.empty();
-    int32_t rc = P4_OK;
     if (ingestIdent) {
         ikey.assign(reinterpret_cast<const char*>(r.ident), 32);
         auto it = identOf_.find({scope, ikey});
@@ -1025,13 +1044,57 @@ int32_t Group::ingest(WriteCtx& w, Call& c, Rec& r) {
         } else {
             copy = copyOf(c, r);
         }
+        // A record new to a feed that has local rows takes them, with its
+        // seq: the same record, now with a source (format 1: the untagged
+        // record gains the tag).
+        const bool absorb = isNew && localRs && rs->fid != localRs->fid && liveRows(localRs);
+        bool copyKnown = false;  // the call's producer already had a copy (local)
+        // A local record of this write has no seq yet: the feed's record
+        // takes a new one.
+        const bool keepSeq = absorb && localRs->existed;
         if (isNew) setRecord(rs, r);
+        if (keepSeq) {
+            rs->seq = localRs->seq;
+            rs->ts = localRs->ts;
+        }
+        if (absorb) {
+            const RowR* own = nullptr;  // the call producer's local copy
+            const RowR* lh = nullptr;   // the record's first copy
+            for (const RowR& x : localRs->rows) {
+                if (!x.live()) continue;
+                if (x.tok == c.tok && !own) own = &x;
+                if (!lh || x.tok < lh->tok) lh = &x;
+            }
+            const RowR* src = own ? own : lh;
+            copyKnown = own != nullptr;
+            if (src) {
+                if (own) {
+                    copy.peer = own->peer;
+                    copy.sig = own->sig;
+                }
+                copy.len = src->len;
+                copy.sealed = src->sealed;
+                copy.fcols = src->fcols;
+                copy.hasD = src->hasD;
+                copy.d = src->hasD ? src->d : std::string();
+                copy.srcFid = src->hasD ? 0 : (src->loaded ? localRs->fid : src->srcFid);
+                copy.srcRid = src->hasD ? 0 : (src->loaded ? src->rid : src->srcRid);
+            }
+        }
         WriteCtx::Out out;
         w.deliver(rs, copy, tg.insts, &out);
-        if (isNew) {
+        if (absorb) {
+            rc = absorbLocal(w, localRs, rs);
+            if (rc != P4_OK) return rc;
+            if (copyKnown) out.copyNew = false;
+        }
+        byCid_[std::string(reinterpret_cast<const char*>(r.key), 32)].push_back(rs);
+        if (isNew && !keepSeq) {
             fresh_.push_back(rs);
             freshSet_.insert(rs);
-            anyNew = true;
+            anyNew = anyNew || !absorb;
+        } else if (isNew) {
+            freshSet_.insert(rs);
         }
         anyCopy = anyCopy || out.copyNew;
         anyInst = anyInst || out.instNew;
@@ -1054,6 +1117,80 @@ int32_t Group::ingest(WriteCtx& w, Call& c, Rec& r) {
     else if (anyCopy) r.action = P4_ACT_COPY;
     else if (anyInst) r.action = P4_ACT_RETAG;
     else r.action = P4_ACT_DUP;
+    return P4_OK;
+}
+
+// The records of r's CID in local and, with feedsToo (an untagged write), in
+// every feed file holding it (each file's CID index; this group's
+// deliveries too).
+int32_t Group::holders(WriteCtx& w, const Rec& r, bool feedsToo, std::vector<RecState*>* feeds, RecState** local) {
+    feeds->clear();
+    *local = nullptr;
+    struct F {
+        uint32_t fid;
+        bool local;
+    };
+    std::vector<F> files;
+    {
+        std::lock_guard<std::mutex> g(t_->mu);
+        for (auto& f : t_->feeds)
+            if (f->created && f->k.recs > 0 && !f->quarantined && (feedsToo || f->local)) files.push_back(F{f->fid, f->local});
+    }
+    const std::string key(reinterpret_cast<const char*>(r.key), 32);
+    std::set<RecState*> seen;
+    auto take = [&](RecState* rs, bool isLocal) {
+        if (!rs || !seen.insert(rs).second) return;
+        if (!(rs->existed || freshSet_.count(rs)) || !liveRows(rs)) return;
+        if (isLocal) *local = rs;
+        else feeds->push_back(rs);
+    };
+    int32_t rc = P4_OK;
+    for (const F& f : files) {
+        RecState* rs = w.byKey(f.fid, r.key, &rc);
+        if (!rs) return rc;
+        take(rs, f.local);
+    }
+    auto it = byCid_.find(key);
+    if (it != byCid_.end())
+        for (RecState* rs : it->second) {
+            bool isLocal;
+            {
+                std::lock_guard<std::mutex> g(t_->mu);
+                Feed* f = t_->feedById(rs->fid);
+                isLocal = f && f->local;
+            }
+            if (isLocal || feedsToo) take(rs, isLocal);
+        }
+    std::sort(feeds->begin(), feeds->end(), [](const RecState* a, const RecState* b) { return a->fid < b->fid; });
+    return P4_OK;
+}
+
+// A record's local rows move into a feed file: each local copy joins the
+// record's instances there; the local rows go.
+int32_t Group::absorbLocal(WriteCtx& w, RecState* local, RecState* into) {
+    std::vector<RowR> moving;
+    for (const RowR& x : local->rows) {
+        if (!x.live()) continue;
+        bool seen = false;
+        for (const RowR& m : moving) seen = seen || m.tok == x.tok;
+        if (seen) continue;
+        RowR m = x;
+        m.loaded = false;
+        m.rid = 0;
+        m.inst = false;
+        m.urlSet = false;
+        m.nId = m.bId = m.cId = m.uId = 0;
+        if (!x.hasD) {
+            m.srcFid = x.loaded ? local->fid : x.srcFid;
+            m.srcRid = x.loaded ? x.rid : x.srcRid;
+        }
+        moving.push_back(std::move(m));
+    }
+    for (const RowR& m : moving) {
+        WriteCtx::Out out;
+        w.deliver(into, m, {}, &out);
+    }
+    w.dropAll(local);
     return P4_OK;
 }
 

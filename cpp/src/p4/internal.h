@@ -171,7 +171,6 @@ int32_t ioAppend(const std::string& path, const uint8_t* p, size_t n);    // app
 int32_t ioTouch(const std::string& path);                                  // create (and parents)
 int32_t ioUnlink(const std::string& path);                                 // absent is fine
 int64_t ioSize(const std::string& path);                                   // -1 absent
-void ioPrefault(const std::string& path);  // reads the file once, start to end (the host's page cache)
 
 // ---- SQLite connections --------------------------------------------------------------------
 enum StmtId : int {
@@ -631,12 +630,15 @@ uint32_t tokFor(Type* t, const std::string& token, const std::string& peer, bool
 std::string pathJoin(const std::string& a, const std::string& b);
 
 // ---- journal.cpp ------------------------------------------------------------------------------
-// J_FEED and J_TOK register ids; J_TOUCH names a feed file a write changes.
-// A write journals them (synchronous=FULL) with the seq reservation before
-// its first file commit; open replays the tail: the ids are registered and
-// every touched feed file's counters (committed with its rows) are mirrored
-// into the type index.
-enum JOp : int { J_FEED = 1, J_TOK = 2, J_TOUCH = 3 };
+// J_FEED and J_TOK register ids; J_TOUCH names a feed file a write changes;
+// J_MOVE a record whose rows leave a file (local) for another file in the
+// same write. A write journals them (synchronous=FULL) with the seq
+// reservation before its first file commit; open replays the tail: the ids
+// are registered, a move cut between its two files is finished (the source
+// file's rows of the seq go once another file holds it), and every touched
+// feed file's counters (committed with its rows) are mirrored into the type
+// index.
+enum JOp : int { J_FEED = 1, J_TOK = 2, J_TOUCH = 3, J_MOVE = 4 };
 int32_t journalOpen(Type* t, std::string* err);
 int32_t journalReplay(Type* t, std::string* err);  // at open, before any read (M8); also after a failed index commit
 
@@ -757,6 +759,7 @@ public:
     // Journal, the feed files (feeds before local), then the type index.
     int32_t commit();
     bool migrate = false;  // migrate mode: instance times are the caller's (C-36), new files without indexes
+    bool replaying = false;  // journal replay's own repair: no journal rows, no replay on a failed index commit
     int64_t now = 0;
     std::vector<IdentNew> idents;
     std::set<uint32_t> committedFids, failedFids;

@@ -4,7 +4,9 @@
 // supersede, quota) until it is killed at a random point; the parent reopens
 // the store and checks it: integrity_check on every file, one seq per CID in
 // each feed file (C-38: a record of two feeds is a row set in each, with its
-// own seq), every CID found by GET, the record count (once per feed),
+// own seq), no CID both in local and in a feed file (an untagged write of a
+// held record is a copy in its feeds; a tagged write takes a local record
+// into its feed), every CID found by GET, the record count (once per feed),
 // REBUILD 8 (each file's counters and the type index's mirrors against the
 // rows) and seqs above the old ones.
 // The loop's two halves (t_kill_run, t_kill_check) are also tests of their
@@ -186,6 +188,7 @@ bool killCheck(const std::string& root, std::string* why) {
     std::unordered_set<std::string> distinct;   // CIDs over every feed file
     std::map<std::string, int64_t> diskSeq;      // (file, CID) -> its one seq in that file
     std::map<std::pair<std::string, int64_t>, std::string> seqCid;  // (file, seq) -> its one CID
+    std::unordered_set<std::string> localCids, feedCids;  // a record is local only while no feed holds it
     int64_t rows = 0, maxSeq = 0, missing = 0, diskSplit = 0;
     size_t files = 0;
     std::vector<std::vector<uint8_t>> sample;
@@ -209,6 +212,8 @@ bool killCheck(const std::string& root, std::string* why) {
             if (ds.first->second != seq) diskSplit++;
             const auto sc = seqCid.emplace(std::make_pair(f, seq), key);
             if (sc.first->second != key) diskSplit++;
+            const bool isLocal = f.size() >= 9 && f.compare(f.size() - 9, 9, "/local.db") == 0;
+            (isLocal ? localCids : feedCids).insert(key);
             if (distinct.insert(key).second) {
                 uint8_t d[32], c[36] = {0x01, 0x55, 0x12, 0x20};
                 fp::cidDigestFromKey(reinterpret_cast<const uint8_t*>(key.data()), d);
@@ -219,6 +224,8 @@ bool killCheck(const std::string& root, std::string* why) {
         sqlite3_finalize(q);
         sqlite3_close(db);
     }
+    int64_t localAndFeed = 0;
+    for (const std::string& k : localCids) localAndFeed += feedCids.count(k);
     // every CID on disk is found by GET (its first feed file's row set: one seq)
     int64_t split = 0;
     for (size_t i = 0; i < sample.size(); i += 512) {
@@ -251,12 +258,14 @@ bool killCheck(const std::string& root, std::string* why) {
     if (nodesLeft) std::fprintf(stderr, "  check: %lld VFS nodes left open after close\n", (long long)nodesLeft);
     char buf[256];
     std::snprintf(buf, sizeof buf,
-                  "files %zu rows %lld cids %zu records %zu count %lld missing %lld split %lld disk-split %lld mismatches %lld above %d nodes %lld",
-                  files, (long long)rows, distinct.size(), diskSeq.size(), (long long)count, (long long)missing, (long long)split,
-                  (long long)diskSplit,
+                  "files %zu rows %lld cids %zu records %zu local %zu local+feed %lld count %lld missing %lld split %lld disk-split %lld"
+                  " mismatches %lld above %d nodes %lld",
+                  files, (long long)rows, distinct.size(), diskSeq.size(), localCids.size(), (long long)localAndFeed, (long long)count,
+                  (long long)missing, (long long)split, (long long)diskSplit,
                   (long long)mism, int(above), (long long)nodesLeft);
     *why = buf;
-    return missing == 0 && split == 0 && diskSplit == 0 && count == int64_t(diskSeq.size()) && mism == 0 && above && nodesLeft == 0;
+    return missing == 0 && split == 0 && diskSplit == 0 && localAndFeed == 0 && count == int64_t(diskSeq.size()) && mism == 0 &&
+           above && nodesLeft == 0;
 }
 }  // namespace
 
