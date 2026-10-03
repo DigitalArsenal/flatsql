@@ -7,10 +7,17 @@
 //   "<TYPE>@<source>"  lane.source = the source: the newest N records of the
 //                      type from that source (the reader walks the source's
 //                      own index newest-first and stops at N);
+//   "<TYPE>@local"     the type's local file (its untagged records) plus any
+//                      feed whose source is "local": format 1's "local"
+//                      partition (C-43 B2);
 //   <TYPE>             no lane filter: the type's newest N records, one row
 //                      each, _source from the record's earliest live tag, or
 //                      "<TYPE>@local" with none (format 1 keeps one resident
 //                      row per record, in its first source's partition).
+//
+// SQLite's catalog folds case, so a relation serves every spelling of its
+// name; what it reads follows the running statement's spelling, resolved once
+// per statement (C-43 B3).
 //
 // Pushed down (always re-checked by SQLite, so a pushdown only has to be a
 // superset of the rows SQLite keeps): _seq/_rowid ranges, _epoch and _ts
@@ -108,12 +115,13 @@ const TypeEntry* typeByName(LaneState* ls, const std::string& name) {
     return it == ls->types.end() ? nullptr : &it->second;
 }
 
-int32_t sourcesOf(LaneState* ls, const std::string& type, std::vector<std::string>* out) {
+int32_t sourcesOf(LaneState* ls, const std::string& type, std::vector<std::string>* out, bool everyFeed) {
     out->clear();
     const char* const* srcs = nullptr;
     uint32_t n = 0;
     EngineCall ec;
-    const int32_t rc = p4_sources(ls->lane, type.c_str(), &srcs, &n);
+    const int32_t rc = everyFeed ? p4_feed_sources(ls->lane, type.c_str(), &srcs, &n)
+                                 : p4_sources(ls->lane, type.c_str(), &srcs, &n);
     if (rc < 0) return rc;
     for (uint32_t i = 0; i < n; i++)
         if (srcs[i]) out->emplace_back(srcs[i]);
@@ -137,9 +145,9 @@ const char* const kMetaDecl[kMetaCount] = {
 
 struct RelVtab : sqlite3_vtab {
     LaneState* ls = nullptr;
+    std::string key;      // the lane's relation (lower-case name)
     RelKind kind = kRelType;
     const TypeEntry* t = nullptr;
-    std::string source;   // alias
     int ns = 0;           // schema columns
     int meta(Meta m) const { return ns + int(m); }
 };
@@ -157,16 +165,16 @@ int relConnect(sqlite3* db, void* aux, int argc, const char* const* argv, sqlite
     LaneState* ls = static_cast<LaneState*>(aux);
     const std::string name = argc > 2 && argv[2] ? argv[2] : "";
     auto it = ls->relations.find(lower(name));
-    const TypeEntry* t = it == ls->relations.end() ? nullptr : typeByName(ls, it->second.type);
+    const TypeEntry* t = it == ls->relations.end() ? nullptr : typeByName(ls, it->second.spec.type);
     if (!t) {
         *err = sqlite3_mprintf("flatsql_p4: %s is not a record relation", name.c_str());
         return SQLITE_ERROR;
     }
     std::unique_ptr<RelVtab> vt(new RelVtab());
     vt->ls = ls;
-    vt->kind = it->second.kind;
+    vt->key = it->first;
+    vt->kind = it->second.spec.kind;
     vt->t = t;
-    vt->source = it->second.source;
     vt->ns = int(t->cols.size());
     std::string ddl = "CREATE TABLE x(";
     for (const Column& c : t->cols) {
@@ -340,10 +348,36 @@ bool spaceAt(const unsigned char* s, int n) {
     return n > 0 && (sp(s[0]) || sp(s[n - 1]));
 }
 
+// What the relation reads for the running statement: its spelling's
+// resolution, made once per statement (sources come and go between
+// statements; C-43 B3). 1, 0 (the spelling names no relation now), or a status.
+int32_t currentSpec(RelVtab* vt, const RelSpec** out, std::string* err) {
+    auto it = vt->ls->relations.find(vt->key);
+    if (it == vt->ls->relations.end()) return 0;
+    Relation& r = it->second;
+    if (r.spec.kind == kRelAlias && r.resolvedAt != vt->ls->gen) {
+        RelSpec spec;
+        const int32_t found = resolveRelation(vt->ls, r.spelling, &spec, err);
+        if (found <= 0) return found;
+        r.spec = spec;
+        r.resolvedAt = vt->ls->gen;
+    }
+    *out = &r.spec;
+    return 1;
+}
+
 int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc, sqlite3_value** argv) {
     RelCursor* c = static_cast<RelCursor*>(cur);
     RelVtab* vt = c->vt;
     c->scan.close();
+    const RelSpec* rel = nullptr;
+    std::string err;
+    const int32_t found = currentSpec(vt, &rel, &err);
+    if (found < 0) return fail(c, found, err.empty() ? "sources unavailable" : err);
+    if (found == 0) {
+        auto it = vt->ls->relations.find(vt->key);
+        return fail(c, P4_E_SQL, "no such table: " + (it == vt->ls->relations.end() ? vt->key : it->second.spelling));
+    }
     ScanArgs args;
     args.desc = (idxNum & kPlanDesc) != 0;
     args.hydrate = (idxNum & kPlanHydrate) != 0;
@@ -416,7 +450,7 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
             case 'R':   // _source = s: an alias holds one value; <TYPE> holds "<TYPE>@..." only
                 if (sqlite3_value_type(v) == SQLITE_TEXT) {
                     const std::string s(reinterpret_cast<const char*>(sqlite3_value_text(v)), size_t(sqlite3_value_bytes(v)));
-                    if (vt->kind == kRelAlias ? s != prefix + vt->source : s.compare(0, prefix.size(), prefix) != 0)
+                    if (rel->kind == kRelAlias ? s != prefix + rel->source : s.compare(0, prefix.size(), prefix) != 0)
                         seq.empty = true;
                 }
                 break;
@@ -441,11 +475,7 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
 
     args.seqAfter = seq.after;
     args.seqThrough = seq.through == INT64_MAX ? 0 : seq.through;
-    RelSpec rel;
-    rel.kind = vt->kind;
-    rel.type = vt->t->name;
-    rel.source = vt->source;
-    const int32_t rc = c->scan.open(vt->ls, *vt->t, rel, args);
+    const int32_t rc = c->scan.open(vt->ls, *vt->t, *rel, args);
     if (rc < 0) return fail(c, rc, "reader cursor failed");
     return SQLITE_OK;
 }
@@ -595,12 +625,11 @@ int32_t RelScan::open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, con
     spec_.hydrate = a.hydrate ? 1 : 0;
     spec_.noTags = a.tags ? 0 : 1;
     spec_.bound = t.bound;
-    if (alias_ && rel.local) {
-        spec_.part = 2;  // the type's local file
-        source_ = prefix_ + rel.source;
-    } else if (alias_) {
+    if (alias_) {
+        if (rel.empty) return P4_OK;   // a source the type holds no feed of (C-39 S1): no rows
         strs_.push_back(rel.source);
         spec_.lane.source = strs_.back().c_str();
+        spec_.part = rel.part;   // 3 for "<TYPE>@local": the local file too (C-43 B2)
         source_ = prefix_ + rel.source;
     }
     int32_t rc;
@@ -647,13 +676,10 @@ int registerModule(LaneState* ls) { return sqlite3_create_module_v2(ls->db, "fla
 
 bool isRelation(const LaneState* ls, const char* name) { return name && ls->relations.count(lower(name)) != 0; }
 
-// Whether any registered type has a feed of the source (lower-case `want`),
-// or it is local; *spelled is its spelling. 1 yes, 0 no, < 0 status.
-int32_t knownSource(LaneState* ls, const std::string& want, std::string* spelled) {
-    if (want == "local") {
-        *spelled = "local";
-        return 1;
-    }
+// Whether any registered type has a feed of the source `asked` (records or
+// none, as format 1 keeps every source's table): spelled exactly, or equal but
+// for case. 1 yes, 0 no, < 0 status.
+int32_t knownSource(LaneState* ls, const std::string& asked, bool exact) {
     const P4TypeInfo* infos = nullptr;
     uint32_t n = 0;
     std::vector<std::string> names;
@@ -664,19 +690,30 @@ int32_t knownSource(LaneState* ls, const std::string& want, std::string* spelled
         for (uint32_t i = 0; i < n; i++)
             if (infos[i].name) names.emplace_back(infos[i].name);
     }
+    const std::string want = lower(asked);
     for (const std::string& t : names) {
         std::vector<std::string> srcs;
-        const int32_t rc = sourcesOf(ls, t, &srcs);
+        const int32_t rc = sourcesOf(ls, t, &srcs, true);
         if (rc < 0) return rc;
         for (const std::string& s : srcs)
-            if (lower(s) == want) {
-                *spelled = s;
-                return 1;
-            }
+            if (exact ? s == asked : lower(s) == want) return 1;
     }
     return 0;
 }
 
+// "<TYPE>@<source>" as spelled (C-43 B3; format 1 names its tables by the
+// source, and serves untagged records as the source "local"):
+//   1. "local" is format 1's "local" partition: the type's local file plus
+//      any feed whose source is "local" (C-43 B2);
+//   2. a feed source of the type spelled exactly so;
+//   3. a case variant of "local" with no such feed: as 1;
+//   4. the type's one feed source equal but for case;
+//   5. otherwise C-39 S1: empty when a type has a feed of the source (spelled
+//      exactly when the type has case twins of it, else equal but for case),
+//      else no relation. A name never reads another feed.
+// The feeds are every feed the type has, with records or none (a feed
+// emptied by deletes, supersede or quota still names its relation, empty, as
+// format 1's table does).
 int32_t resolveRelation(LaneState* ls, const std::string& name, RelSpec* out, std::string* err) {
     const size_t at = name.find('@');
     const std::string typePart = at == std::string::npos ? name : name.substr(0, at);
@@ -689,35 +726,51 @@ int32_t resolveRelation(LaneState* ls, const std::string& name, RelSpec* out, st
     }
     RelSpec spec;
     spec.type = t->name;
-    if (at != std::string::npos) {
-        std::vector<std::string> srcs;
-        const int32_t rc = sourcesOf(ls, t->name, &srcs);
-        if (rc < 0) {
-            if (err) *err = "sources unavailable";
-            return rc;
-        }
-        const std::string want = lower(name.substr(at + 1));
-        for (const std::string& s : srcs)
-            if (lower(s) == want) {
-                spec.kind = kRelAlias;
-                spec.source = s;
-            }
-        // A source the node knows (another type's feed, or local) resolves
-        // as format 1 (C-39 S1): "<TYPE>@local" is the type's local file
-        // (its records no feed holds); another type's source the type has no
-        // feed file for answers empty; a source no type has stays "no such
-        // table".
-        if (spec.kind != kRelAlias) {
-            const int32_t known = knownSource(ls, want, &spec.source);
-            if (known < 0) {
-                if (err) *err = "sources unavailable";
-                return known;
-            }
-            if (!known) return 0;
-            spec.kind = kRelAlias;
-            spec.local = want == "local";
-        }
+    if (at == std::string::npos) {
+        *out = spec;
+        return 1;
     }
+    spec.kind = kRelAlias;
+    const std::string asked = name.substr(at + 1);
+    const std::string want = lower(asked);
+    auto local = [&]() {
+        spec.source = "local";
+        spec.part = 3;
+        *out = spec;
+        return 1;
+    };
+    if (asked == "local") return local();
+    std::vector<std::string> srcs;
+    const int32_t rc = sourcesOf(ls, t->name, &srcs, true);
+    if (rc < 0) {
+        if (err) *err = "sources unavailable";
+        return rc;
+    }
+    bool exact = false;
+    std::vector<std::string> twins;
+    for (const std::string& s : srcs) {
+        if (s == asked) exact = true;
+        if (lower(s) == want) twins.push_back(s);
+    }
+    if (exact) {
+        spec.source = asked;
+        *out = spec;
+        return 1;
+    }
+    if (want == "local") return local();
+    if (twins.size() == 1) {
+        spec.source = twins[0];
+        *out = spec;
+        return 1;
+    }
+    const int32_t known = knownSource(ls, asked, !twins.empty());
+    if (known < 0) {
+        if (err) *err = "sources unavailable";
+        return known;
+    }
+    if (!known) return 0;
+    spec.source = asked;
+    spec.empty = true;
     *out = spec;
     return 1;
 }
@@ -725,10 +778,12 @@ int32_t resolveRelation(LaneState* ls, const std::string& name, RelSpec* out, st
 int32_t ensureRelation(LaneState* ls, const std::string& name, std::string* err) {
     const std::string key = lower(name);
     if (ls->relations.count(key)) return 0;
-    RelSpec spec;
-    const int32_t found = resolveRelation(ls, name, &spec, err);
+    Relation r;
+    const int32_t found = resolveRelation(ls, name, &r.spec, err);
     if (found <= 0) return found;
-    ls->relations.emplace(key, spec);
+    r.spelling = name;
+    r.resolvedAt = ls->gen;
+    ls->relations.emplace(key, std::move(r));
     const std::string ddl = "CREATE VIRTUAL TABLE " + quoteIdent(name) + " USING flatsql_p4";
     char* msg = nullptr;
     const int rc = sqlite3_exec(ls->db, ddl.c_str(), nullptr, nullptr, &msg);
@@ -739,6 +794,91 @@ int32_t ensureRelation(LaneState* ls, const std::string& name, std::string* err)
         return rc == SQLITE_NOMEM ? P4_E_NOMEM : P4_E_SQL;
     }
     return 1;
+}
+
+// ---- spellings (C-43 B3) ---------------------------------------------------
+namespace {
+
+// The quoted names statement `sql` spells with an '@' ("...", `...`, [...]),
+// and apart from them its '...' strings with an '@' (SQLite reads a string as
+// a name where no string can stand, as in FROM 'OMM@x'), outside comments.
+void spelledNames(const char* sql, size_t n, std::vector<std::string>* names, std::vector<std::string>* strs) {
+    const char* p = sql;
+    const char* e = sql + n;
+    while (p < e) {
+        const char ch = *p;
+        if (ch == '-' && p + 1 < e && p[1] == '-') {
+            while (p < e && *p != '\n') p++;
+            continue;
+        }
+        if (ch == '/' && p + 1 < e && p[1] == '*') {
+            p += 2;
+            while (p + 1 < e && !(p[0] == '*' && p[1] == '/')) p++;
+            p = p + 1 < e ? p + 2 : e;
+            continue;
+        }
+        if (ch == '"' || ch == '`' || ch == '\'' || ch == '[') {
+            const char close = ch == '[' ? ']' : ch;
+            std::string tok;
+            for (p++; p < e; p++) {
+                if (*p != close) {
+                    tok.push_back(*p);
+                    continue;
+                }
+                if (ch != '[' && p + 1 < e && p[1] == close) {   // a doubled quote is one quote
+                    tok.push_back(close);
+                    p++;
+                    continue;
+                }
+                p++;
+                break;
+            }
+            if (tok.find('@') != std::string::npos) (ch == '\'' ? strs : names)->push_back(tok);
+            continue;
+        }
+        p++;
+    }
+}
+
+}  // namespace
+
+int32_t bindSpellings(LaneState* ls, const char* sql, size_t n, std::string* msg) {
+    std::vector<std::string> names, strs;
+    spelledNames(sql, n, &names, &strs);
+    // key -> its distinct spellings, first seen first; strings only for keys
+    // no quoted name spells (a string beside a name is a value).
+    std::map<std::string, std::vector<std::string>> byKey;
+    for (const std::string& s : names) {
+        std::vector<std::string>& v = byKey[lower(s)];
+        if (std::find(v.begin(), v.end(), s) == v.end()) v.push_back(s);
+    }
+    for (const std::string& s : strs) {
+        const std::string k = lower(s);
+        if (!byKey.count(k)) byKey[k].push_back(s);
+    }
+    for (auto& kv : byKey) {
+        const std::vector<std::string>& v = kv.second;
+        // Two spellings of one name: SQLite serves both with one relation,
+        // so they must read the same thing.
+        if (v.size() > 1) {
+            RelSpec first;
+            const int32_t f0 = resolveRelation(ls, v[0], &first, msg);
+            if (f0 < 0) return f0;
+            for (size_t i = 1; i < v.size(); i++) {
+                RelSpec other;
+                const int32_t fi = resolveRelation(ls, v[i], &other, msg);
+                if (fi < 0) return fi;
+                if (fi != f0 || (f0 == 1 && !first.same(other))) {
+                    *msg = "relation names \"" + v[0] + "\" and \"" + v[i] +
+                           "\" differ only by case and read different sources; one statement can name only one of them";
+                    return P4_E_SQL;
+                }
+            }
+        }
+        auto it = ls->relations.find(kv.first);
+        if (it != ls->relations.end()) it->second.spelling = v[0];
+    }
+    return P4_OK;
 }
 
 }  // namespace p4sql

@@ -39,7 +39,8 @@ typedef struct P4ScanSpec {
     uint8_t order;               /* P4_ORDER_* */
     uint8_t hydrate;
     uint8_t noTags;              /* 1: the caller reads no row's tag (P4Row.tag may be NULL) */
-    uint8_t part;                /* 0 every file; 2 the type's local file only ("<TYPE>@local", C-39 S1) */
+    uint8_t part;                /* 0 every file; 2 the type's local file only; 3 the local file plus the feed files the
+                                    lane filter selects ("<TYPE>@local": format 1's "local" partition, C-43 B2) */
     uint64_t limit, offset;      /* 0 = none */
     uint64_t bound;              /* A18 newest-N seqs OF THE TYPE, applied before every other filter incl. lane (v2, C-17); 0 = none */
 } P4ScanSpec;
@@ -72,6 +73,8 @@ void*     p4_lane_sql_state(P4Lane* lane);
 void      p4_lane_set_sql_state(P4Lane* lane, void* state);
 int32_t   p4_types(P4Lane* lane, const P4TypeInfo** out, uint32_t* n);   /* registered types; valid until the lane's next call */
 int32_t   p4_sources(P4Lane* lane, const char* type, const char* const** out, uint32_t* n); /* sources with >= 1 live tag */
+int32_t   p4_feed_sources(P4Lane* lane, const char* type, const char* const** out, uint32_t* n); /* the sources of every feed
+                                                               the type has, records or none (relation names, C-43 B3) */
 int64_t   p4_visible_through(P4Engine* e, const char* type);
 int64_t   p4_type_rows(P4Lane* lane, const char* type);   /* the type's records (copies once, as a scan returns
                                                                them); -1 for an unknown type */

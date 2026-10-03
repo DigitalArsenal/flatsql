@@ -236,7 +236,9 @@ struct Spec2 {
     std::vector<Pred> preds;
     std::string search;
     int order = 0;  // 0: the op's default
-    int part = 0;   // 0 every file; 1 the feed files (tagged records); 2 the local file (C-39 two-part pages)
+    int part = 0;   // 0 every file; 1 the feed files (tagged records); 2 the local file (C-39 two-part pages,
+                    // "<TYPE>@local"); 3 the local file plus the feed files the lane filter selects (C-43 B2:
+                    // format 1's "local" partition, its untagged records and any feed whose source is "local")
     bool hydrate = false;
     uint64_t limit = 0, offset = 0, bound = 0;
     // internal
@@ -447,8 +449,10 @@ int32_t Scan::pickFiles() {
         Feed* f = fp.get();
         if (!f->created || f->k.recs <= 0) continue;
         if ((s_.part == 1 && f->local) || (s_.part == 2 && !f->local)) continue;
-        if (s_.lane) {
-            if (f->local) continue;  // a lane filter matches tagged records only
+        // A lane filter matches tagged records only; part 3 keeps the local
+        // file beside the feed files the filter selects.
+        if (s_.lane && f->local && s_.part != 3) continue;
+        if (s_.lane && !f->local) {
             if (s_.lfSet[0] && f->provider != s_.lf[0]) continue;
             if (s_.lfSet[1] && f->source != s_.lf[1]) continue;
             if (s_.lfSet[2] || s_.lfSet[3] || s_.lfSet[4] || s_.lfSet[5]) {
@@ -486,9 +490,10 @@ int32_t Scan::pickFiles() {
 }
 
 // A18 (C-31): the bound is the newest N records of lane.source when it is
-// set (its feed files) or of the local file ("<TYPE>@local"), else of the
-// type (every feed file); the cut is the N-th newest seq of those files
-// merged, and every other filter applies above it.
+// set (its feed files), or of the local file ("<TYPE>@local", with part 3 also
+// the feed files of the source "local"), else of the type (every feed file);
+// the cut is the N-th newest seq of those files merged, and every other
+// filter applies above it.
 int32_t Scan::boundCut() {
     if (!s_.bound || files_.empty()) return P4_OK;
     struct H {
@@ -498,7 +503,7 @@ int32_t Scan::boundCut() {
         std::deque<int64_t> buf;
     };
     std::vector<H> hs;
-    if (s_.lfSet[1] || s_.part == 2) {
+    if (s_.lfSet[1] || s_.part >= 2) {
         for (const FRef& f : files_) hs.push_back(H{f.path, f.indexed, false, hi_ + 1, {}});
     } else {
         std::lock_guard<std::mutex> g(t_->mu);
@@ -1182,7 +1187,8 @@ bool Scan::evaluate(int64_t seq, std::vector<RowV>& rows, Row* out) {
             r.url = x.url;
         }
     }
-    if (s_.lane && !r.hasTag) return false;
+    // A lane filter keeps tagged records; part 3 also the local file's.
+    if (s_.lane && !r.hasTag && !(s_.part == 3 && files_[size_t(pick->fi)].local)) return false;
     if (s_.preds.empty()) return true;
     bool needCols = false;
     for (auto& p : s_.preds) needCols = needCols || p.field >= P4_F_COL0;
@@ -1679,6 +1685,14 @@ int32_t decodeSpec(const std::vector<Tlv>& v, Spec2* s) {
         }
     }
     tlvText(v, 18, &s->search);
+    // Tag 20 (C-43 B2): which files a read covers. 0 every file; 2 the type's
+    // local file ("<TYPE>@local"); 3 the local file plus the feed files the
+    // lane filter selects (format 1's "local" partition with lane source
+    // "local").
+    if (tlvU8(v, 20, &u8, &bad)) {
+        if (u8 != 0 && u8 != 2 && u8 != 3) return P4_E_ARG;
+        s->part = u8;
+    }
     if (bad) return P4_E_ARG;
     const int32_t rc = decodePreds(v, &s->preds);
     if (rc != P4_OK) return rc;
@@ -1890,6 +1904,9 @@ int32_t opScanLike(P4Lane* L, const std::vector<Tlv>& v, uint32_t op) {
             if (s.order == 0) s.order = P4_ORDER_SEQ_ASC;
             if (s.order != P4_ORDER_SEQ_ASC && s.order != P4_ORDER_SEQ_DESC && s.order != P4_ORDER_NEWEST &&
                 s.order != P4_ORDER_RECENT && s.order != P4_ORDER_W_ASC)
+                rc = P4_E_ARG;
+            // The two-part orders choose their files themselves (tag 20 is not theirs).
+            if (s.part != 0 && (s.order == P4_ORDER_NEWEST || s.order == P4_ORDER_RECENT || s.order == P4_ORDER_W_ASC))
                 rc = P4_E_ARG;
         } else {
             if (s.order == 0) s.order = P4_ORDER_W_DESC;
@@ -2124,8 +2141,8 @@ int32_t opHead(P4Lane* L, const std::vector<Tlv>& v) {
     bool more = false;
     const int64_t through = t->vis.load(std::memory_order_acquire);
     // No filter: the type's counters.
-    const bool plain = !s.lane && s.preds.empty() && !s.hasCid && !s.hasPeer && !s.hasProducer && s.search.empty() &&
-                       s.seqAfter == 0 && s.seqThrough == 0 && !cap && s.offset == 0 && s.limit == 0;
+    const bool plain = !s.lane && s.part == 0 && s.preds.empty() && !s.hasCid && !s.hasPeer && !s.hasProducer &&
+                       s.search.empty() && s.seqAfter == 0 && s.seqThrough == 0 && !cap && s.offset == 0 && s.limit == 0;
     if (plain) {
         {
             std::lock_guard<std::mutex> g(t->mu);
@@ -2762,6 +2779,28 @@ struct P4Cursor {
     std::string producer, peer, provider, source, url, batch, ckey, ppeer, pkey;
 };
 
+// The sources of the type's feeds (live: with records), sorted and distinct,
+// in the lane's buffers (valid until the lane's next call).
+static int32_t laneSources(P4Lane* lane, const char* type, bool live, const char* const** out, uint32_t* n) {
+    if (!lane || !type || !out || !n) return P4_E_ARG;
+    Type* t = lane->e->findType(type);
+    if (!t) return P4_E_NOTYPE;
+    std::set<std::string> names;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        for (auto& f : t->feeds) {
+            if (f->local || f->provider.rfind("\x1f#", 0) == 0) continue;   // the local file; an id placeholder
+            if (live ? f->created && f->k.recs > 0 : f->created || f->registered) names.insert(f->source);
+        }
+    }
+    lane->srcStore.assign(names.begin(), names.end());
+    lane->srcPtrs.clear();
+    for (auto& s : lane->srcStore) lane->srcPtrs.push_back(s.c_str());
+    *out = lane->srcPtrs.data();
+    *n = uint32_t(lane->srcPtrs.size());
+    return P4_OK;
+}
+
 extern "C" {
 
 int32_t p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out) {
@@ -2815,7 +2854,7 @@ int32_t p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out) {
     if (s.order < P4_ORDER_SEQ_ASC || s.order > P4_ORDER_CID) return P4_E_ARG;
     s.hydrate = spec->hydrate != 0;
     s.needTags = spec->noTags == 0;
-    if (spec->part != 0 && spec->part != 2) return P4_E_ARG;
+    if (spec->part != 0 && spec->part != 2 && spec->part != 3) return P4_E_ARG;
     s.part = spec->part;
     s.limit = spec->limit;
     s.offset = spec->offset;
@@ -2933,22 +2972,13 @@ int32_t p4_types(P4Lane* lane, const P4TypeInfo** out, uint32_t* n) {
     return P4_OK;
 }
 
+
 int32_t p4_sources(P4Lane* lane, const char* type, const char* const** out, uint32_t* n) {
-    if (!lane || !type || !out || !n) return P4_E_ARG;
-    Type* t = lane->e->findType(type);
-    if (!t) return P4_E_NOTYPE;
-    std::set<std::string> names;
-    {
-        std::lock_guard<std::mutex> g(t->mu);
-        for (auto& f : t->feeds)
-            if (f->created && !f->local && f->k.recs > 0) names.insert(f->source);
-    }
-    lane->srcStore.assign(names.begin(), names.end());
-    lane->srcPtrs.clear();
-    for (auto& s : lane->srcStore) lane->srcPtrs.push_back(s.c_str());
-    *out = lane->srcPtrs.data();
-    *n = uint32_t(lane->srcPtrs.size());
-    return P4_OK;
+    return laneSources(lane, type, true, out, n);
+}
+
+int32_t p4_feed_sources(P4Lane* lane, const char* type, const char* const** out, uint32_t* n) {
+    return laneSources(lane, type, false, out, n);
 }
 
 int64_t p4_type_rows(P4Lane* lane, const char* type) {

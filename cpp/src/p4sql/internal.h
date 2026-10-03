@@ -172,12 +172,26 @@ struct Stmt {
 
 enum RelKind : uint8_t { kRelType = 1, kRelAlias = 2 };
 
-// A relation created on the lane's connection.
+// What a relation name reads (C-39 S1, C-43 B2 and B3).
 struct RelSpec {
     RelKind kind = kRelType;
     std::string type;     // canonical type name
-    std::string source;   // canonical source (kRelAlias)
-    bool local = false;   // kRelAlias "<TYPE>@local": the type's local file (its records no feed holds, C-39 S1)
+    std::string source;   // kRelAlias: the source its lane filter names
+    uint8_t part = 0;     // kRelAlias: 0 the source's feed files; 3 "<TYPE>@local", the type's local file plus any
+                          // feed whose source is "local" (format 1's "local" partition, P4ScanSpec.part 3)
+    bool empty = false;   // kRelAlias: a source the type holds no feed of (C-39 S1): no rows
+    bool same(const RelSpec& o) const {
+        return kind == o.kind && type == o.type && source == o.source && part == o.part && empty == o.empty;
+    }
+};
+
+// A relation created on the lane's connection. SQLite's catalog folds case,
+// so one relation serves every spelling of its name; the spelling the running
+// statement uses decides what it reads, resolved once per statement (C-43 B3).
+struct Relation {
+    RelSpec spec;
+    std::string spelling;      // the name as the running statement spells it
+    uint64_t resolvedAt = 0;   // the statement (LaneState::gen) spec was resolved for
 };
 
 struct LaneState {
@@ -185,7 +199,8 @@ struct LaneState {
     LaneArena* arena = nullptr;   // sandboxed statements' heap, made at the first one
     sqlite3* db = nullptr;
     std::map<std::string, TypeEntry> types;      // key: lower-case name
-    std::map<std::string, RelSpec> relations;    // key: lower-case relation name
+    std::map<std::string, Relation> relations;   // key: lower-case relation name
+    uint64_t gen = 0;                            // the running statement's number
     Stmt* cur = nullptr;
 };
 
@@ -251,9 +266,14 @@ private:
     P4ScanSpec spec_{};
 };
 
-// The relation `name` names (case-insensitive): 1 found, 0 not a relation,
-// < 0 status. Creates nothing.
+// What the relation `name` reads, as spelled (C-43 B3: the exact source
+// spelling, else the type's one source equal but for case, else C-39 S1):
+// 1 found, 0 not a relation, < 0 status. Creates nothing.
 int32_t resolveRelation(LaneState* ls, const std::string& name, RelSpec* out, std::string* err);
+// Points the lane's relations at the spellings statement `sql` uses (C-43 B3).
+// P4_OK, or P4_E_SQL with *msg when two spellings of one relation name read
+// different things (SQLite's catalog cannot hold both), or a status.
+int32_t bindSpellings(LaneState* ls, const char* sql, size_t n, std::string* msg);
 int registerModule(LaneState* ls);
 // Refreshes the registered types from the engine (p4_types).
 int32_t loadTypes(LaneState* ls, std::string* err);
@@ -262,8 +282,9 @@ const TypeEntry* typeByName(LaneState* ls, const std::string& name);   // case-i
 // relation, < 0 status.
 int32_t ensureRelation(LaneState* ls, const std::string& name, std::string* err);
 bool isRelation(const LaneState* ls, const char* name);
-// The sources of a type with >= 1 live tag, sorted (byte order).
-int32_t sourcesOf(LaneState* ls, const std::string& type, std::vector<std::string>* out);
+// The sources of a type, sorted (byte order): with >= 1 live tag, or with
+// everyFeed every feed it has (records or none).
+int32_t sourcesOf(LaneState* ls, const std::string& type, std::vector<std::string>* out, bool everyFeed);
 
 std::string lower(const std::string& s);
 

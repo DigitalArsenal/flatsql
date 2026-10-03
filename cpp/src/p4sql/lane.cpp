@@ -550,7 +550,7 @@ int32_t surfaceRows(LaneState* ls, Out& out, std::string* msg) {
     std::vector<Cell> cells(6);
     for (const TypeEntry* t : types) {
         std::vector<std::string> srcs;
-        rc = sourcesOf(ls, t->name, &srcs);
+        rc = sourcesOf(ls, t->name, &srcs, false);
         if (rc < 0) {
             *msg = "sources unavailable";
             return rc;
@@ -636,6 +636,8 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
             status = P4_E_ARG;
             msg = "malformed parameters";
         }
+        ls->gen++;   // the relations resolve again for this statement (C-43 B3)
+        if (status == P4_OK && req->sql) status = bindSpellings(ls, req->sql, req->sqlLen, &msg);
         if (status == P4_OK) status = prepare(ls, st, req->sql ? req->sql : "", req->sql ? req->sqlLen : 0, &s, &msg);
         if (status == P4_OK) status = bindParams(ls->db, s, params, &msg);
         std::vector<std::string> names;
