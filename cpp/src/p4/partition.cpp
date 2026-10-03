@@ -59,10 +59,11 @@ const char* kFileSchema =
 // and batch-filtered reads). Newest-first pages (C-39 E2) walk a feed file by
 // delivery time (r_a on at) and the local file by the copies' time (r_t on
 // ts); neither holds a CID (ties are put in order from the rows).
-int32_t fileCreateIndexes(Type* t, Conn* c, bool local) {
+namespace {
+// The indexes' DDL and the meta row that records them (no transaction).
+std::string indexDdl(Type* t, bool local) {
     std::shared_ptr<const Spec> sp = t->spec();
     std::string ddl =
-        "BEGIN IMMEDIATE;"
         "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
         "CREATE INDEX IF NOT EXISTS r_c ON r(cid);"
         "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC);"
@@ -70,12 +71,36 @@ int32_t fileCreateIndexes(Type* t, Conn* c, bool local) {
     ddl += local ? "CREATE INDEX IF NOT EXISTS r_t ON r(ts DESC);" : "CREATE INDEX IF NOT EXISTS r_a ON r(at DESC);";
     if (sp->hasObject) ddl += "CREATE INDEX IF NOT EXISTS r_ke ON r(k, e);";
     ddl += "INSERT OR REPLACE INTO meta(k, v) VALUES('ix', 1);";
+    return ddl;
+}
+
+// Whether a feed file holds its schema (committed in one transaction with
+// its meta rows and, unless a migration appends first, its indexes).
+int32_t fileHasSchema(Conn* c, bool* has) {
+    *has = false;
+    sqlite3_stmt* s = c->sql("SELECT 1 FROM sqlite_master WHERE type='table' AND name='r'");
+    if (!s) return P4_E_IO;
+    const int r = sqlite3_step(s);
+    sqlite3_reset(s);
+    if (r != SQLITE_ROW && r != SQLITE_DONE) return statusOfSqlite(r);
+    *has = r == SQLITE_ROW;
+    return P4_OK;
+}
+}  // namespace
+
+int32_t fileCreateIndexes(Type* t, Conn* c, bool local) {
+    const std::string ddl = "BEGIN IMMEDIATE;" + indexDdl(t, local);
     int rc = c->exec(ddl.c_str());
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) c->exec("ROLLBACK");
     return rc == SQLITE_OK ? P4_OK : statusOfSqlite(rc);
 }
 
+// A feed file's tables, meta rows and (indexes) its indexes, in ONE
+// transaction: a file is either without a schema or complete, so a crash
+// between its creation and this commit leaves nothing a reader or the
+// journal's replay can half-read (writerPin completes such a file). Without
+// indexes (a migration's bulk append) meta records ix=0 until REBUILD 1.
 int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes) {
     std::string ddl = std::string("BEGIN IMMEDIATE;") + kFileSchema;
     int rc = c->exec(ddl.c_str());
@@ -94,11 +119,7 @@ int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes) {
     };
     bool ok = meta("format", "4") && meta("layout", "feed") && meta("type", t->name) && meta("provider", f->provider) &&
               meta("source", f->source) && meta("fid", std::to_string(f->fid));
-    if (ok && !indexes) {
-        sqlite3_stmt* s = c->sql("INSERT OR IGNORE INTO meta(k, v) VALUES('ix', 0)");
-        ok = s && sqlite3_step(s) == SQLITE_DONE;
-        if (s) sqlite3_reset(s);
-    }
+    if (ok) ok = c->exec(indexes ? indexDdl(t, f->local).c_str() : "INSERT OR IGNORE INTO meta(k, v) VALUES('ix', 0)") == SQLITE_OK;
     if (!ok) {
         c->exec("ROLLBACK");
         return P4_E_IO;
@@ -108,7 +129,6 @@ int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes) {
         c->exec("ROLLBACK");
         return statusOfSqlite(rc);
     }
-    if (indexes) return fileCreateIndexes(t, c, f->local);
     return P4_OK;
 }
 
@@ -420,14 +440,19 @@ Conn* writerPin(Engine* e, Feed* f, int32_t* rc, std::string* err) {
         return nullptr;
     }
     sqlite3_wal_hook(c->db, walHook, e);
+    // A new file gets its schema; so does a file a crash cut between its
+    // creation and its schema's commit (it exists, so the open and the
+    // journal's replay count it created, but it holds nothing yet).
+    bool has = false;
+    int32_t s = created ? fileHasSchema(c, &has) : P4_OK;
+    if (s == P4_OK && !has) s = fileSchema(t, c, f, indexed);
+    if (s != P4_OK) {
+        delete c;
+        *rc = s;
+        if (err) *err = "schema " + f->path;
+        return nullptr;
+    }
     if (!created) {
-        const int32_t s = fileSchema(t, c, f, indexed);
-        if (s != P4_OK) {
-            delete c;
-            *rc = s;
-            if (err) *err = "schema " + f->path;
-            return nullptr;
-        }
         std::lock_guard<std::mutex> g(t->mu);
         f->created = true;
     }
