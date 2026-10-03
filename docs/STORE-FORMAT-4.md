@@ -3,14 +3,16 @@
 Store format 4 keeps each standard's records in one SQLite file per source
 feed. A feed is a record's (provider, source) tag pair, for example
 `OMM/space-data-network-02@celestrak-gp.db`; a record with no source lives in
-`<TYPE>/local.db`. SQLite 3.53.4 is unmodified: only the VFS, WAL and
-configuration are FlatSQL's. The engine is `cpp/src/p4`; it ships as
+`<TYPE>/local.db`. Each feed file is the feed's own table: it holds the
+feed's records with their own CID index, and nothing ties a record in one
+feed file to a record in another. SQLite 3.53.4 is unmodified: only the VFS,
+WAL and configuration are FlatSQL's. The engine is `cpp/src/p4`; it ships as
 `wasm/flatsql-p4-threads.wasm` (wasm32-wasip1-threads).
 
 - **Design:** the stack's `docs/architecture/flatsql-sqlite-partitions.md`,
   with its owner revisions of 2026-10-01 and 2026-10-02.
-- **Interfaces:** the build-out contract (`CONTRACT.md`, version 15; C-37 is
-  this layout):
+- **Interfaces:** the build-out contract (`CONTRACT.md`, version 16; C-37 is
+  this layout, C-38 its CID index and type index):
   - the ABI in `cpp/include/flatsql/p4/flatsql_p4.h`;
   - the reader API for the SQL surface in `cpp/include/flatsql/p4/p4_reader.h`.
   Both are unchanged by the feed layout: a PUT's tag names its feed file, and
@@ -27,7 +29,7 @@ This file records what was built, how to run it, and what was measured.
   MIGRATED              40 B, magic FSQM, format 4
   T/TYPES               the registered types (crc'd records)
   T/<TYPE>.spec         the registered spec TLV (C-5); a reopen serves before re-registration
-  T/<TYPE>.idx          the type index (derived from the feed files)
+  T/<TYPE>.idx          the type index: the feed and token registries, each feed file's counters, next seq
   T/<TYPE>.jnl          the intent journal
   T/<TYPE>.fts          full text (FTS5, contentless-delete; background)
   P/<TYPE>/<feed>.db    one file per source feed of the type; local.db for records with no source
@@ -38,8 +40,16 @@ This file records what was built, how to run it, and what was measured.
   string. The file name is the provider and source, URL-escaped outside
   `[A-Za-z0-9._-]` and joined by `@`; a name that would collide with another
   feed's on a case-insensitive file system, or is long, carries the feed id.
-- **The same record from two feeds is a row in each feed's file**, under one
-  seq (dedupe is per type: one seq per CID).
+- **No cross-feed identity (C-38).** A record is identified inside its feed
+  file by its CID (the file's one CID index) and its seq. A record that
+  arrives through a second source feed is a new row set in that feed's file
+  with its own seq (ingest). A migrated record keeps format 1's rowid as its
+  seq in every feed file holding it. Type-wide reads merge the feed files,
+  so a record held by N feeds answers once per feed (C-38 (5)).
+- **A record is local only while no feed holds it.** An untagged write of a
+  CID that feeds hold is a copy of the record in each of them (format 1's
+  copy of a tagged record), not a local record; a tagged write of a local
+  record takes it into its feed with its seq.
 - **Lazy type files:** a type's `.idx`, `.jnl` and `.fts` are made by its
   first write. A registered type without data has only its `.spec`.
 
@@ -53,7 +63,7 @@ delivery of a record to the feed:
 | Column | Meaning |
 |---|---|
 | `rid` | `seq << 16 \| j`: a record's rows are one rowid range, in arrival order |
-| `seq` | the type-wide arrival number (the datasync cursor); every row of a record has it |
+| `seq` | the record's arrival number in the type's seq space (the datasync cursor); every row of the record has it |
 | `n` | the publishing node: `node(id, producer, peer)`, the copy's producer token and peer |
 | `b` | the batch: `batch(id, batch, ppeer, pkey)`, format 1's summary key inside the feed (0 on local rows) |
 | `c`, `u` | the content key and the url: `ckey(id, ckey)`, `url(id, url)` (0 = "") |
@@ -64,107 +74,120 @@ delivery of a record to the feed:
 
 A record's rows are its copies x its instances: every copy (producer token)
 of the record appears with every one of its instances (batch, content key,
-producer peer and key) in each feed it has. A batch supersede of one feed
-file therefore never loses a copy the record keeps through another feed, and
-a record with no instance has one row per copy in `local.db`.
+producer peer and key) of the feed. A local record has one row per copy.
+
+The CID is stored once per row (it cannot be derived from `d`: a migrated
+copy keeps its own bytes, C-35, and SDN supplies the CID) and indexed once
+per file:
 
 | Index | Purpose |
 |---|---|
-| `r_s(seq)` | arrival: the newest-N cut of `<TYPE>@<source>` (C-31) and the one-feed datasync walk, without the rows' pages |
-| `r_c(cid)` | CID order inside a feed |
+| `r_s(seq)` | arrival: the merge by seq, the newest-N cut of `<TYPE>@<source>` (C-31), datasync, oldest-first quota, without the rows' pages |
+| `r_c(cid)` | **the file's one CID index**: re-fetch dedupe in the feed, and SDN's by-CID lookups (GET, TAGS, DELETE, SCAN by CID), which probe each feed file of the type |
 | `r_ke(k, e)` | object and epoch: EPOCH nearest / as_of / forward per object, object predicates, CAT supersede |
-| `r_w(w DESC, cid)` | epoch windows, ties in CID order |
+| `r_w(w DESC)` | epoch windows; a w group is put in CID order from its rows |
 | `r_b(b)` | batch supersede and batch-filtered reads |
 
-Also `inst(b, c, n, bytes, ...)`: each instance's records (each once), their
-bytes (each record's smallest copy) and format 1's summary times (`first`,
-`updated`, `maxat`, url), and `meta`: the file's counters (rows, records,
-bytes, records without an epoch, and bounds). Both commit with the rows.
+Also, committed with the rows in the same transaction:
+- `inst(b, c, n, bytes, ...)`: each instance's records (each once), their
+  bytes (each record's smallest copy) and format 1's summary times
+  (`first`, `updated`, `maxat`, url);
+- `tokc(producer, n, bytes, ...)`: each producer token's copies in the file;
+- `ident(h, seq)`: the feed's IQC ingest identities (C-21, C-26);
+- `meta`: the file's counters (rows, records, bytes, records without an
+  epoch, the records' bytes, copies, the copies' bytes, and bounds).
 
 Writers open with `synchronous=FULL`, WAL, and no autocheckpoint.
 
-**Type index** (`.idx`, `synchronous=FULL`), the per-standard index of
-C-37 (5):
+**Type index** (`.idx`, `synchronous=FULL`; C-38 (2)): no per-record entry.
 
 | Table | Purpose |
 |---|---|
 | `feed(fid, provider, source, name, counters)` | feed id <-> (provider, source) and file; each file's counters, mirrored |
 | `inst(fid, b, c, ...)` | each file's live instances and counters, mirrored (SUMMARY 3 without opening files) |
-| `tok(id, token, peer, counters)` | the type's producer tokens and their copies' counters (SUMMARY 2) |
-| `x(seq, fid, cid, len, w, k, e, cp)` | one entry per (record, feed file holding it); `cp` = the copies in that file |
-| `x_c(cid, seq, fid, e)` | CID -> (seq, feed): lookup, dedupe, CID-ordered windows |
-| `x_w(w DESC, cid, seq, fid, e)` | type windows, index pages, epoch windows |
-| `x_k(k, e, cid, seq, fid)` | EPOCH per object (types with an object rule) |
-| `ident(src, h, seq, cid)` | IQC ingest identities |
-| `meta` | records, bytes, copies, copy bytes, bounds, next seq, full text through |
+| `tok(id, token, peer)` | the type's producer tokens in order (the lowest id is the first copy, C-12) |
+| `ftok(fid, tok, counters)` | each file's copies per token, mirrored (SUMMARY 2) |
+| `meta` | next seq |
 
-A type-wide read walks `x` and reads only the feed files that hold the
-page's records; it never opens every feed file of the type.
+The type's totals (records, copies, bytes, bounds) are sums over the feed
+files' counters; HEAD with no filter, SUMMARY 1 and 2 never open a feed file.
 
 **Intent journal** (`.jnl`): `j(id AUTOINCREMENT, op, fid, seq, k, s, v)` and
 `jm(seq_reserved)`. Ops: `J_FEED` and `J_TOK` (new feed and token ids),
-`J_TOUCH` (a (feed file, record) a write changes), `J_IDENT` (an ingest
-identity).
+`J_TOUCH` (a feed file a write changes), `J_MOVE` (a record whose rows leave
+a file, with its seq, for another file of the same write).
 
 ## 3. Writes
 
 - **One writer per file.** Every feed file of a type is written by the
   type's one writer thread (types are spread over the writer threads); a
-  file has one writer connection. A record's rows across its feed files
-  (a copy into every feed of the record, an untagged record that gains a
-  tag) commit in order on that thread.
+  file has one writer connection.
 - **Calls** arrive in mailbox slots, in two pools (C-6): 8 MiB write
   requests and 64 KiB read requests. A type's backlog has a record credit;
   a full backlog answers `P4_E_BUSY`.
 - **A PUT group** (the queued PUT calls of a type, up to `groupRecords`):
   1. parse, check and extract;
-  2. load each record from the type index (`x_c`) and its feed files (its
-     rows: one rid range per file);
-  3. plan its delivery: a new record (NEW), a new copy (COPY: the holder's
-     bytes and ts with this write's signature and peer; in migrate mode its
-     own bytes, C-35), a new instance (RETAG), a repeat (DUP: the url follows
-     the latest write, C-3), an ingest-identity repeat (IDENT_DUP, C-26);
-     every copy is then put with every instance;
+  2. ingest mode: each record goes to every feed its call's tags name,
+     found in that feed file by its CID (`r_c`). In the file it is a new
+     record (NEW: a fresh seq), a new copy (COPY: the holder's bytes and ts
+     with this write's signature and peer), a new instance (RETAG), a repeat
+     (DUP: the url follows the latest write, C-3), or an ingest-identity
+     repeat (IDENT_DUP, C-26: the feed's `ident` names the held record,
+     which takes the repeat's tag). A tagged record that is new to its feed
+     and has local rows takes them, with their seq (a move: the local copies
+     join the feed's instances and the local rows go). An untagged record
+     is a copy in every feed file holding its CID (each file's `r_c`
+     probed), or, held by none, goes to local;
+  3. migrate mode: format 1's rowid is the record's seq in every feed file
+     holding it. The record goes to the feeds of its tag instances and to
+     the feeds already holding its seq (a copy sent without instances joins
+     the record's instances there); with none, to local. Local rows of the
+     seq move into the feeds once the record has an instance. A seq held by
+     another CID is `P4_REJ_SEQ`. A copy keeps its own bytes (C-35);
   4. CAT supersede-on-ingest (ingest mode only, C-20): the scope feed's
      records of the same object identity are retired from that feed;
-  5. seqs for new records in content-time order (durable seq blocks);
-  6. the journal (`synchronous=FULL`);
-  7. each feed file in one transaction (rows, its counters, its instances),
-     feed files before local;
-  8. the type index in one transaction (the records' entries, the type's
-     and tokens' counters, the feeds' mirrors);
+  5. seqs for records new to a feed, in content-time order (durable seq
+     blocks);
+  6. the journal (`synchronous=FULL`: the touched feed files, the moves,
+     new ids, the seq reservation);
+  7. each feed file in one transaction (rows, its counters, instances,
+     tokens and identities), feed files before local;
+  8. the type index in one transaction (the touched files' mirrors, new
+     tokens, next seq);
   9. publish (visible-through) and ack: the ack follows the commits (C-4).
 - **SUPERSEDE** (`provider`, `source`, keep): one feed file; its rows whose
   batch is not the kept one go, a chunk of 32,768 rows per transaction; a
-  record left with no row anywhere is gone.
-- **DELETE**: every row of the CIDs in every feed file.
-- **QUOTA_GC**: the type's oldest records by arrival (the type index's seq
-  order), every row of each.
-- **Migrate mode** (PUT mode 1, create mode 2): seqs and tag instances are
-  the caller's (format 1's rowids and `created_at`; each format-1 tag
-  instance becomes rows in its feed's file); a copy keeps its own bytes;
-  identities are registered (C-21); a new feed file is made without its
-  secondary indexes, which REBUILD 1 adds; full text waits for activation.
+  record left with no row in the file leaves the feed.
+- **DELETE**: every row of the CIDs in every feed file (each file's `r_c`).
+  `deleted` counts each CID's distinct copies over the files.
+- **QUOTA_GC**: the type's oldest record row sets by arrival (the feed files
+  merged by seq), every row of each.
 
 ## 4. Crash safety
 
-Every open replays the journal before it serves (M8):
+Each feed file's transaction carries its rows with its own counters,
+instances, token counts and identities: the file is consistent on its own.
+The one write that spans two files with one record is a move (a local
+record taken into a feed), committed feed first. Every open replays the
+journal before it serves (M8):
 
 1. the feed and token ids it names are registered;
-2. every touched feed file's counters are reloaded from its `meta` and
-   `inst` (they commit with its rows);
-3. every touched record is read from its feed files and brought in line
-   (every copy with every instance; local rows only without one): a write
-   cut between two feed files leaves rows that only add, completed here;
-4. its type-index entries, the type's and tokens' counters and the feeds'
-   mirrors are set from its rows, in one index transaction;
+2. a move cut between its two files is finished: the source file's rows of
+   the seq go once another file holds the seq (a destination that did not
+   commit leaves the record where it was);
+3. every touched feed file's counters, instances and token counts are read
+   from the file;
+4. they are mirrored into the type index with the token registry and the
+   next seq, in one index transaction;
 5. the journal's rows go.
 
 The cost is the journal tail's (one write), not the store's. A write whose
 type-index commit fails runs the same replay at once; if that fails too,
 the type refuses writes (`P4_E_IO`) until a reopen. A feed file the index
 says has records and that is missing is quarantined (`P4_E_CORRUPT`, named).
-Nothing unlinks or replaces a feed file.
+Nothing unlinks or replaces a feed file. A write cut between two feed files
+leaves the files it committed: a retry of an unacknowledged call finds its
+records there (DUP) and adds them to the rest.
 
 Every connection to a format-4 file is opened with `share=1` through
 FlatSQL's VFS (`openConn`): it attaches to the path's node, so the engine's
@@ -172,13 +195,8 @@ connections see each other's locks and one WAL index. A connection opened
 beside a running engine without `share=1` gets a private node (every lock
 granted, a WAL index of its own); at close it takes itself for the file's
 last connection and, when the WAL is empty, deletes it under the engine's
-connections, after which their WAL handles and the WAL index no longer
-describe one file. The wasm kill loop found this in its own check (read-only
-connections for `integrity_check`, opened the default way: on wasm the
-default VFS is FlatSQL's), as a feed file whose page 1 was another page
-after 28-153 rounds; the check now opens them with `share=1`. The engine and
-the SQL surface open no other connection (the SQL surface's own database is
-`:memory:` with ATTACH refused).
+connections. The engine and the SQL surface open no other connection (the
+SQL surface's own database is `:memory:` with ATTACH refused).
 
 ## 5. Maintenance
 
@@ -194,53 +212,52 @@ the SQL surface open no other connection (the SQL surface's own database is
   quota once a second, and full text; their per-type work runs on the
   type's writer thread.
 - **Quota** measures every file by its pages in use (pages less free pages:
-  feed files, the type index, the journal and full text alike), so the
-  index entries a pass deletes count as freed, and deletes the oldest
-  records by arrival until the store fits.
-- **Full text** follows the records: catching up adds the records past
-  `through` (one row per record, from one of its feed files), and the rows
-  of records gone since the last pass (supersede, delete, quota, CAT
-  supersede-on-ingest: no row left in any feed file) are deleted first.
-  The gone list is in memory: a crash leaves those rows (a search drops
+  feed files, the type index, the journal and full text alike) and deletes
+  the oldest record row sets by arrival until the store fits.
+- **Full text** follows the records: catching up adds the seqs past
+  `through` (the feed files merged by seq; a seq once, from the first file
+  holding it), and the rows of seqs that left a feed file since the last
+  pass (supersede, delete, quota, CAT supersede-on-ingest) are deleted
+  first; a migrated seq (below the seq floor) only once no feed file holds
+  it, and a seq that moved to another file keeps its row. The gone list is in memory: a crash leaves those rows (a search drops
   them, as it drops any hit without a live record), and REBUILD 4 removes
   them.
 - **REBUILD:** 1 adds the feed files' secondary indexes (after a migration's
-  bulk append); 2 recounts every feed file's counters and instances from
-  its rows, sets every type-index entry from the files (dangling entries go)
-  and the type's counters from the entries; 4 rebuilds full text; 8 makes
-  the same comparisons and changes nothing, and runs `PRAGMA
-  integrity_check` on every feed file, the type index and the journal
-  (C-27). A record whose rows are not its copies x its instances is a
-  mismatch.
+  bulk append); 2 recounts every feed file's counters, instances and tokens
+  from its rows and mirrors them into the type index; 4 rebuilds full text;
+  8 makes the same comparisons (file, engine and type-index mirror) and
+  changes nothing, and runs `PRAGMA integrity_check` on every feed file, the
+  type index and the journal (C-27). A record whose rows are not its copies
+  x its instances, or that holds two CIDs, is a mismatch.
 
 ## 6. Reads
 
 A scan first picks its feed files: the lane filter's (provider and source
 name a feed file; a batch, content key or producer peer narrows to the feeds
-holding such an instance), else every feed of the type. Then:
-
-- **One feed file** (a `<TYPE>@<source>` read, or a type with one feed): that
-  file's own indexes (`r_s` arrival, `r_w` epoch, `r_c` CID, `r_ke` object).
-- **Several:** the type index (`x` seq, `x_w` epoch, `x_c` CID, `x_k`
-  object), which names the feed files holding each record; only those are
-  read.
-
-A page of candidates is resolved by reading each record's rows (one rid
-range per feed file, one read transaction per file). A record answers once
-(C-10). Its copy is the lowest token's matching row (C-12); its tag the
-earliest instance that matches the lane filter (§3.6), with provider and
-source from the row's feed file and the rest from its ids: never blank when
-the record has a tag.
+holding such an instance), else every feed of the type. Each file is walked
+in the scan's order through its own indexes (`r_s` arrival, `r_w` epoch,
+`r_c` CID), a chunk at a time, and the walks are merged (C-38 (4); ties by
+feed id). A page of candidates is resolved by reading each record's rows
+(one rid range of its file, one read transaction per file). A record answers
+once per feed file (C-10 within the file, C-38 (5) across files). Its copy
+is the lowest token's matching row (C-12); its tag the earliest instance of
+its feed that matches the lane filter (§3.6), with provider and source from
+the file and the rest from its ids: never blank when the record has a tag.
 
 - **A18 (C-31):** `<TYPE>@<source>` is the newest N records of that type from
   that source (the source's feed files' `r_s`, newest first, merged); `<TYPE>`
-  the type's newest N (`x`). Every other filter applies above the cut.
-- **Candidates instead of a walk:** an exact CID (`x_c` / `r_c`), an
-  equality or IN on the object rule's first column (`x_k` / `r_ke`).
-- **EPOCH nearest / as_of / forward:** one seek per object in `x_k` (or
-  `r_ke`), read from the target in rank order until an epoch group has a
+  the type's newest N (every feed file's `r_s`, merged). Every other filter
+  applies above the cut.
+- **Candidates instead of a walk:** an exact CID (each file's `r_c`), an
+  equality or IN on the object rule's first column (each file's `r_ke`).
+- **EPOCH nearest / as_of / forward:** one seek per object in each file's
+  `r_ke`, read from the target in rank order until an epoch group has a
   record that passes the filters; ties at the best epoch go to the lowest
-  CID (format 1's ranking). A record without an object is its own entity.
+  CID (format 1's ranking), then the lowest feed id. One answer per entity.
+  A record without an object is its own entity.
+- **By CID:** GET answers from the first feed file holding the CID (its
+  copies, the lowest token first); TAGS lists the tag instances of every
+  feed file holding it, each with that file's seq.
 - **Counters:** HEAD with no filter, SUMMARY 1 (records, copies, bytes),
   SUMMARY 2 (one row per producer token: its copies and bytes), SUMMARY 3
   (one row per feed file and instance: provider, source, batch, content key,
@@ -283,31 +300,34 @@ files.
 ```
 FLATBUFFERS_DIR=<flatbuffers> cmake -S cpp -B cpp/build && cmake --build cpp/build --target flatsql_p4_test flatsql_p4_fault_test -j 6
 cpp/build/flatsql_p4_test                                     # the SQL surface's engine tests
-cpp/build/flatsql_p4_test --test=t_kill --rounds=30           # kill -9 loop
+cpp/build/flatsql_p4_test --test=t_kill --slow=1 --rounds=30  # kill -9 loop
 cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=30
 ```
 
 - **`t_kill`** (`t_kill.cpp`): a forked engine ingests from three producers
   into three feeds (`prov@src`, `prov@src2` and `local`; repeats of earlier
-  records land in another feed, so records sit in two or three feed files;
-  the same new records from three producers at once, each to its own feed;
-  a batch supersede every 13th call; a 4 MiB quota every 11th), is killed
-  with SIGKILL at a random point, and the store is checked: every file
-  passes `integrity_check`; a CID has one seq in every feed file; every row
-  on disk is found by CID with that seq; the count equals the distinct CIDs
-  on disk; REBUILD 8 finds no mismatch; new seqs are above every seq on
-  disk; no file is left open. The wasm test command runs the same loop
-  under the Node wasi-threads host (`scripts/p4-wasm-suite.mjs
-  --kill-rounds N`).
+  records land in another feed, so records sit in two or three feed files,
+  a row set in each; the same new records from three producers at once,
+  each to its own feed; a batch supersede every 13th call; a 4 MiB quota
+  every 11th), is killed with SIGKILL at a random point, and the store is
+  checked: every file passes `integrity_check`; a CID has one seq in each
+  feed file and a seq one CID; no CID is both in local and in a feed file;
+  every CID on disk is found by GET; the count
+  equals the (feed file, CID) pairs on disk; REBUILD 8 finds no mismatch;
+  new seqs are above every seq on disk; no file is left open. The wasm test
+  command runs the same loop under the Node wasi-threads host
+  (`scripts/p4-wasm-suite.mjs --kill-rounds N`).
 - **`t_power_loss`:** the engine over FaultFs, frozen at a random I/O call,
   five crash modes, the same three feeds; every acknowledged record is
   there and every acknowledged tag instance still lists its source,
-  REBUILD 8 is clean, the count equals a full scan's distinct CIDs.
+  REBUILD 8 is clean, the count equals the records of a full scan, each
+  with its own seq.
 - The proof is end to end (C-33): the SDN harness on the real engine
   (`sdn-server/internal/storage/format4proof`): `store-migrate --to 4`, every
   benchset read and the coverage classes against format 1 field by field,
-  W01-W10, kill -9 and LazyFS power loss, and the growth step.
+  W01-W10, kill -9 and LazyFS power loss, and the growth steps.
 
 ## 10. Measured
 
-See the build-out report (`ENGINE-REPORT.md`, section "Feed tables").
+See the build-out report (`ENGINE-REPORT.md`, sections "Feed tables" and
+"C-38").
