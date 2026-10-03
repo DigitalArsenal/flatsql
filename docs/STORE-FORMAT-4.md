@@ -122,7 +122,12 @@ files' counters; HEAD with no filter, SUMMARY 1 and 2 never open a feed file.
 **Intent journal** (`.jnl`): `j(id AUTOINCREMENT, op, fid, seq, k, s, v)` and
 `jm(seq_reserved)`. Ops: `J_FEED` and `J_TOK` (new feed and token ids),
 `J_TOUCH` (a feed file a write changes), `J_MOVE` (a record whose rows leave
-a file, with its seq, for another file of the same write).
+a file, with its seq, for another file of the same write). `J_FEED` holds
+(provider, source, file name) and `J_TOK` (token, peer) as strings joined by
+0x1F with each 0x1E and 0x1F escaped behind a 0x1E; the engine's in-memory
+keys (feed, publishing node, batch) are joined the same way, so two feeds
+whose names differ only in where a 0x1F sits stay two feeds (GATES-feed-r2
+N-A). A name without either byte is stored unchanged.
 
 ## 3. Writes
 
@@ -263,7 +268,12 @@ SQL surface's own database is `:memory:` with ATTACH refused).
 
 A scan first picks its feed files: the lane filter's (provider and source
 name a feed file; a batch, content key or producer peer narrows to the feeds
-holding such an instance), else every feed of the type. Each file is walked
+holding such an instance), else every feed of the type. Request tag 20 (ops
+12-16; C-43 B2) narrows the files: 2 the type's local file only (a lane
+filter then answers empty), 3 the local file plus the feed files the lane
+filter selects: with lane source `local`, format 1's "local" partition (its
+untagged records and any feed whose source is `local`). SCAN orders 5-7
+refuse it (they pick their files themselves). Each file is walked
 in the scan's order through its own indexes (`r_s` arrival, `r_w` epoch,
 `r_c` CID), a chunk at a time, and the walks are merged (C-38 (4); ties by
 feed id). A page of candidates is resolved by reading each record's rows
@@ -314,11 +324,25 @@ record has a tag.
 and bytes, and cancel. RB1 streams always end with RB1E.
 
 **SQL surface.** `src/p4sql` answers ops 30 and 31 through `p4_reader.h`, and
-the engine writes their RB1E (C-28). `<TYPE>@<source>` resolves, as format 1
-(C-39 S1), when the source (case-insensitive) is a feed source of any type or
-`local`: `<TYPE>@local` is the type's local file (its records no feed holds;
-`P4ScanSpec.part = 2`), another type's source the type has no feed file for is
-empty; a source no type has is "no such table".
+the engine writes their RB1E (C-28). `<TYPE>@<source>` resolves as spelled
+(C-39 S1, C-43 B2 and B3):
+1. `local` is format 1's "local" partition: the type's local file plus any
+   feed whose source is `local` (`P4ScanSpec.part = 3`, lane source `local`;
+   format 1 files a record tagged with source `local` in the partition of its
+   untagged records);
+2. else a feed source of the type spelled exactly so;
+3. else a case variant of `local`: as 1;
+4. else the type's one feed source equal but for case;
+5. else (no such source, or case twins and neither spelled exactly) empty
+   when a type has a feed of that source (spelled exactly when the type has
+   case twins of it, equal but for case otherwise), else "no such table".
+
+A name never reads another feed. SQLite's catalog folds case, so one virtual
+table serves every spelling of a name: what it reads follows the running
+statement's spelling (the quoted names in its text), resolved once per
+statement, so a relation made earlier also sees feeds added since. A statement
+that names two spellings of one relation which read different sources is
+refused with an SQL error.
 
 ## 7. Memory
 
