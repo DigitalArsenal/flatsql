@@ -38,8 +38,12 @@ namespace {
 // connection gets a private node (every lock granted, its own WAL index),
 // believes it is the file's last connection at close and may delete the WAL
 // under the engine's connections.
+// The URI names exactly `path` (feed file names carry %HH escapes; SQLite
+// decodes %HH in a URI path and ends it at '?' or '#').
 int openSide(const std::string& path, sqlite3** db) {
-    const std::string uri = "file:" + path + "?share=1";
+    std::string uri = "file://";
+    for (char c : path) uri += c == '%' ? std::string("%25") : c == '?' ? std::string("%3F") : c == '#' ? std::string("%23") : std::string(1, c);
+    uri += "?share=1";
     return sqlite3_open_v2(uri.c_str(), db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, flatsql::kFlatSqlVfsName);
 }
 
@@ -64,6 +68,30 @@ std::vector<std::string> partitionFiles(const std::string& root, const std::stri
     for (auto& d : std::filesystem::recursive_directory_iterator(root + "/P/" + type, ec)) {
         const std::string p = d.path().string();
         if (p.size() > 3 && p.compare(p.size() - 3, 3, ".db") == 0) out.push_back(p);
+    }
+    return out;
+}
+
+// The second source feed's source needs escaping in a file name: a space,
+// '/', "/../", '%' before hex digits, '?', '#' and non-ASCII (C-37 (1): the
+// file name is a safe encoding of the feed). Its file is exactly
+// kOddFeedFile, flat in P/<TYPE>.
+const char* const kOddSource = "s rc/../2 %41?#\xC3\xA9";
+const char* const kOddFeedFile = "prov@s%20rc%2F..%2F2%20%2541%3F%23%C3%A9.db";
+
+// What is in P/<type> other than the feed files the workload writes
+// (prov@src, the odd feed, local) and their -wal/-shm/-journal: a
+// directory, or another file. Empty when the layout is right.
+std::string strayEntries(const std::string& root, const std::string& type) {
+    std::string out;
+    std::error_code ec;
+    for (auto& d : std::filesystem::directory_iterator(root + "/P/" + type, ec)) {
+        std::string n = d.path().filename().string();
+        for (const char* sfx : {"-wal", "-shm", "-journal"}) {
+            const size_t k = std::strlen(sfx);
+            if (n.size() > k && n.compare(n.size() - k, k, sfx) == 0) n.resize(n.size() - k);
+        }
+        if (d.is_directory() || (n != "prov@src.db" && n != "local.db" && n != kOddFeedFile)) out += " " + d.path().filename().string();
     }
     return out;
 }
@@ -94,14 +122,14 @@ std::vector<uint8_t> killFrame(uint64_t id) {
                                    Field::raw("BODY", std::vector<uint8_t>(160, uint8_t(id)))});
 }
 
-// The feeds a call writes to (C-37, C-38): 0 prov@src, 1 prov@src2, 2 the
-// local file (no tag).
+// The feeds a call writes to (C-37, C-38): 0 prov@src, 1 prov@<kOddSource>,
+// 2 the local file (no tag).
 Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from, int n, int feed = 0) {
     Batch b;
     b.type = "PNM";
     b.peer = peer;
     if (feed == 0) b.tags.push_back(Tag{"prov", "src", "", batch, "", "", ""});
-    if (feed == 1) b.tags.push_back(Tag{"prov", "src2", "", batch, "", "", ""});
+    if (feed == 1) b.tags.push_back(Tag{"prov", kOddSource, "", batch, "", "", ""});
     b.at = 1790000000;
     for (int i = 0; i < n; i++) {
         In in;
@@ -226,6 +254,9 @@ bool killCheck(const std::string& root, std::string* why) {
     }
     int64_t localAndFeed = 0;
     for (const std::string& k : localCids) localAndFeed += feedCids.count(k);
+    // P/PNM holds the three feed files (and sidecars) only, flat: the odd
+    // source's file is its escaped name, not a decoded path.
+    const std::string stray = strayEntries(root, "PNM");
     // every CID on disk is found by GET (its first feed file's row set: one seq)
     int64_t split = 0;
     for (size_t i = 0; i < sample.size(); i += 512) {
@@ -264,7 +295,8 @@ bool killCheck(const std::string& root, std::string* why) {
                   (long long)missing, (long long)split, (long long)diskSplit,
                   (long long)mism, int(above), (long long)nodesLeft);
     *why = buf;
-    return missing == 0 && split == 0 && diskSplit == 0 && localAndFeed == 0 && count == int64_t(diskSeq.size()) && mism == 0 &&
+    if (!stray.empty()) *why += "; stray entries in P/PNM:" + stray;
+    return stray.empty() && missing == 0 && split == 0 && diskSplit == 0 && localAndFeed == 0 && count == int64_t(diskSeq.size()) && mism == 0 &&
            above && nodesLeft == 0;
 }
 }  // namespace

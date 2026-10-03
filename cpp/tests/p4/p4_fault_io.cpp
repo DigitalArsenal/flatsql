@@ -5,8 +5,8 @@
 // crash applies one of five modes to the unsynced writes (all vanish, a
 // random subset survives in order, the last write is torn, a random subset
 // survives reordered, or everything survives: kill -9). The engine runs a
-// workload (three producers over three feeds: prov@src, prov@src2 and the
-// local file; a fifth of the calls repeat earlier records, so records sit in
+// workload (three producers over three feeds: prov@src, prov@<kOddSource>
+// and the local file; a fifth of the calls repeat earlier records, so records sit in
 // more than one feed file) until the device freezes at a random mutating
 // call, is stopped (its I/O failing, as a dying machine's), the crash is
 // applied, and the store is reopened and checked through the engine:
@@ -18,7 +18,9 @@
 //     file, C-27);
 //   - the count equals the records a full scan returns (C-38: a record of
 //     two feeds once per feed; each answer its own seq), and no VFS node is
-//     left open after the close.
+//     left open after the close;
+//   - P/PNM holds the three feed files and their sidecars only, flat: the
+//     odd source's file is its escaped name (C-37 (1)).
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -76,6 +78,27 @@ std::vector<uint8_t> faultFrame(uint64_t id) {
     std::snprintf(name, sizeof name, "2026-%02d-15T00:00:00", 7 + int((id / 200) % 2));
     return buildFrame(faultType(), {Field::str("FILE_ID", "file-" + std::to_string(id)), Field::str("NAME", name),
                                     Field::raw("BODY", std::vector<uint8_t>(96, uint8_t(id)))});
+}
+
+// The second source feed's source needs escaping in a file name (space, '/',
+// "/../", '%' before hex digits, '?', '#', non-ASCII); its file is exactly
+// kOddFeedFile.
+const char* const kOddSource = "s rc/../2 %41?#\xC3\xA9";
+const char* const kOddFeedFile = "prov@s%20rc%2F..%2F2%20%2541%3F%23%C3%A9.db";
+
+// A path under P/PNM that is not one of the three feed files or a sidecar
+// of one ("" when there is none).
+std::string strayPath(FaultFs& fs, const std::string& root) {
+    const std::string dir = root + "/P/PNM/";
+    for (const std::string& p : fs.list(dir)) {
+        std::string n = p.substr(dir.size());
+        for (const char* sfx : {"-wal", "-shm", "-journal"}) {
+            const size_t k = std::strlen(sfx);
+            if (n.size() > k && n.compare(n.size() - k, k, sfx) == 0) n.resize(n.size() - k);
+        }
+        if (n != "prov@src.db" && n != "local.db" && n != kOddFeedFile) return p;
+    }
+    return "";
 }
 
 std::string cidKeyOf(const std::vector<uint8_t>& frame) {
@@ -219,9 +242,9 @@ P4_SLOW_TEST(t_power_loss) {
                     Batch b;
                     b.type = "PNM";
                     b.peer = "12D3KooWFault" + std::to_string(pi);
-                    // three feeds (C-37, C-38): prov@src, prov@src2 and the local file
+                    // three feeds (C-37, C-38): prov@src, prov@<kOddSource> and the local file
                     const int feed = (c + pi) % 3;
-                    const std::string src = feed == 0 ? "src" : "src2";
+                    const std::string src = feed == 0 ? "src" : kOddSource;
                     if (feed < 2) b.tags.push_back(Tag{"prov", src, "", "b" + std::to_string(c % 5), "", "", ""});
                     b.at = 1790000000;
                     uint64_t base;
@@ -272,6 +295,8 @@ P4_SLOW_TEST(t_power_loss) {
         const int mode = int(round % FaultFs::kModeCount);
         fs.crash(FaultFs::CrashMode(mode), rng());
         Check ck = checkStore(root, want, wantInst);
+        const std::string stray = strayPath(fs, root);
+        if (!stray.empty()) ck.fail("not a feed file of the workload: " + stray);
         if (ck.ok) pass++;
         else {
             fail++;

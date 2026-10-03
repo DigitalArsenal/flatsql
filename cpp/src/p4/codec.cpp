@@ -547,11 +547,31 @@ int32_t statusOfSqlite(int rc) {
     }
 }
 
+namespace {
+// `path` as a file: URI that names exactly `path`. SQLite decodes %HH in a
+// URI's path and ends the path at '?' or '#'; a feed file's name carries %HH
+// escapes (feedFileName) and the root may hold any of the three, so they are
+// escaped here. Without this SQLite opened the decoded name ("a b.db", or a
+// directory for "%2F") while the engine's own I/O created and measured the
+// escaped one. An absolute path gets an empty authority ("file://" + path),
+// so a path that starts with "//" is not read as an authority.
+std::string fileUri(const std::string& path) {
+    std::string u = path.empty() || path[0] != '/' ? "file:" : "file://";
+    for (char c : path) {
+        if (c == '%') u += "%25";
+        else if (c == '?') u += "%3F";
+        else if (c == '#') u += "%23";
+        else u.push_back(c);
+    }
+    return u;
+}
+}  // namespace
+
 int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t pageSize, Conn** out,
              std::string* err) {
     *out = nullptr;
     const bool reader = kind == OpenKind::Reader;
-    std::string uri = "file:" + path + "?share=1";
+    std::string uri = fileUri(path) + "?share=1";
     if (reader) uri += "&ra=1";
     if (kind == OpenKind::Writer || kind == OpenKind::Journal || kind == OpenKind::Index) uri += "&dsync=1";
     sqlite3* db = nullptr;
