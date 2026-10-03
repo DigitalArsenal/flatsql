@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <queue>
 #include <unordered_map>
 
 #include "flatsql/record_search.h"
@@ -261,46 +263,126 @@ int64_t storeBytes(Engine* e, bool inUse) {
     return total;
 }
 
-// The oldest records of a type by arrival: up to `want` seqs (the type
-// index's seq order), and the first one's ts.
-int32_t oldestOf(Engine* e, Type* t, size_t want, std::vector<int64_t>* seqs, int64_t* ts) {
-    seqs->clear();
-    *ts = INT64_MAX;
-    Conn* c = nullptr;
-    if (openConn(t->pIdx, OpenKind::IndexReader, 1024, 0, &c, nullptr) != SQLITE_OK) return P4_E_IO;
-    const int64_t vis = t->vis.load(std::memory_order_acquire);
-    sqlite3_stmt* q = c->sql("SELECT DISTINCT seq FROM x WHERE seq<=?1 ORDER BY seq LIMIT ?2");
-    int r = SQLITE_ERROR;
-    if (q) {
-        sqlite3_bind_int64(q, 1, vis);
-        sqlite3_bind_int64(q, 2, int64_t(want));
-        while ((r = sqlite3_step(q)) == SQLITE_ROW) seqs->push_back(sqlite3_column_int64(q, 0));
-        sqlite3_reset(q);
-    }
-    uint32_t fid = 0;
-    if (r == SQLITE_DONE && !seqs->empty()) {
-        sqlite3_stmt* f = c->sql("SELECT fid FROM x WHERE seq=?1 LIMIT 1");
-        if (f) {
-            sqlite3_bind_int64(f, 1, (*seqs)[0]);
-            if (sqlite3_step(f) == SQLITE_ROW) fid = uint32_t(sqlite3_column_int64(f, 0));
-            sqlite3_reset(f);
+// The type's feed files merged by arrival (C-38 (4)): (seq, feed) pairs in
+// seq order, ties by feed id, read a chunk at a time from each file's r_s
+// (its rows before REBUILD 1). A record's rows in a file count once.
+class SeqMerge {
+public:
+    SeqMerge(Engine* e, Type* t, int64_t after, int64_t through, size_t chunk) : e_(e), through_(through), chunk_(chunk) {
+        std::lock_guard<std::mutex> g(t->mu);
+        for (auto& f : t->feeds) {
+            if (!f->created || f->k.recs <= 0 || f->quarantined) continue;
+            S s;
+            s.fid = f->fid;
+            s.path = f->path;
+            s.indexed = f->indexed;
+            s.last = after;
+            ss_.push_back(std::move(s));
         }
     }
-    delete c;
-    if (r != SQLITE_DONE) return statusOfSqlite(r);
-    if (fid) {
+    // 1: an entry; 0: the end; < 0: a status.
+    int32_t next(int64_t* seq, uint32_t* fid) {
+        if (!started_) {
+            started_ = true;
+            for (size_t i = 0; i < ss_.size(); i++) {
+                const int32_t rc = fill(ss_[i]);
+                if (rc != P4_OK) return rc;
+                if (!ss_[i].buf.empty()) heap_.push(Head{ss_[i].buf.front(), ss_[i].fid, i});
+            }
+        }
+        if (heap_.empty()) return 0;
+        const Head h = heap_.top();
+        heap_.pop();
+        S& s = ss_[h.i];
+        s.buf.pop_front();
+        if (s.buf.empty() && !s.done) {
+            const int32_t rc = fill(s);
+            if (rc != P4_OK) return rc;
+        }
+        if (!s.buf.empty()) heap_.push(Head{s.buf.front(), s.fid, h.i});
+        *seq = h.seq;
+        *fid = h.fid;
+        return 1;
+    }
+
+private:
+    struct S {
+        uint32_t fid = 0;
+        std::string path;
+        bool indexed = true, done = false;
+        int64_t last = 0;
+        std::deque<int64_t> buf;
+    };
+    struct Head {
+        int64_t seq;
+        uint32_t fid;
+        size_t i;
+        bool operator<(const Head& o) const { return seq != o.seq ? seq > o.seq : fid > o.fid; }  // a min-heap
+    };
+    int32_t fill(S& s) {
+        if (s.done) return P4_OK;
+        int orc = 0;
+        Conn* c = e_->rpool.acquire(s.path, OpenKind::Reader, &orc, nullptr);
+        if (!c) return statusOfSqlite(orc);
+        sqlite3_stmt* q = c->sql(s.indexed ? "SELECT seq FROM r INDEXED BY r_s WHERE seq>?1 AND seq<=?2 ORDER BY seq LIMIT ?3"
+                                           : "SELECT seq FROM r WHERE rid>=((?1+1)<<16) AND rid<=((?2<<16)|65535) ORDER BY rid LIMIT ?3");
+        int32_t st = q ? P4_OK : P4_E_INTERNAL;
+        size_t got = 0;
+        if (q) {
+            sqlite3_bind_int64(q, 1, s.last);
+            sqlite3_bind_int64(q, 2, through_);
+            sqlite3_bind_int64(q, 3, int64_t(chunk_));
+            int r;
+            while ((r = sqlite3_step(q)) == SQLITE_ROW) {
+                got++;
+                const int64_t v = sqlite3_column_int64(q, 0);
+                if (v != s.last) s.buf.push_back(v);
+                s.last = v;
+            }
+            sqlite3_reset(q);
+            if (r != SQLITE_DONE) st = statusOfSqlite(r);
+        }
+        e_->rpool.release(c);
+        if (st == P4_OK && got < chunk_) s.done = true;
+        if (st == P4_OK && s.buf.empty() && !s.done) return fill(s);  // a chunk of one record's rows
+        return st;
+    }
+    Engine* e_;
+    int64_t through_;
+    size_t chunk_;
+    std::vector<S> ss_;
+    std::priority_queue<Head> heap_;
+    bool started_ = false;
+};
+
+// The oldest record row sets of a type by arrival: up to `want` (feed, seq)
+// pairs, and the first one's ts.
+int32_t oldestOf(Engine* e, Type* t, size_t want, std::vector<std::pair<uint32_t, int64_t>>* seqs, int64_t* ts) {
+    seqs->clear();
+    *ts = INT64_MAX;
+    const int64_t vis = t->vis.load(std::memory_order_acquire);
+    SeqMerge m(e, t, 0, vis, std::min<size_t>(want, 4096));
+    while (seqs->size() < want) {
+        int64_t seq = 0;
+        uint32_t fid = 0;
+        const int32_t rc = m.next(&seq, &fid);
+        if (rc < 0) return rc;
+        if (rc == 0) break;
+        seqs->push_back({fid, seq});
+    }
+    if (!seqs->empty()) {
         Feed* f;
         {
             std::lock_guard<std::mutex> g(t->mu);
-            f = t->feedById(fid);
+            f = t->feedById((*seqs)[0].first);
         }
         int orc = 0;
         Conn* rc = f ? e->rpool.acquire(f->path, OpenKind::Reader, &orc, nullptr) : nullptr;
         if (rc) {
             sqlite3_stmt* q2 = rc->sql("SELECT ts FROM r WHERE rid>=?1 AND rid<=?2 LIMIT 1");
             if (q2) {
-                sqlite3_bind_int64(q2, 1, (*seqs)[0] << 16);
-                sqlite3_bind_int64(q2, 2, ((*seqs)[0] << 16) | 0xffff);
+                sqlite3_bind_int64(q2, 1, (*seqs)[0].second << 16);
+                sqlite3_bind_int64(q2, 2, ((*seqs)[0].second << 16) | 0xffff);
                 if (sqlite3_step(q2) == SQLITE_ROW) *ts = sqlite3_column_int64(q2, 0);
                 sqlite3_reset(q2);
             }
@@ -335,7 +417,7 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFr
         int64_t held = 0;
         for (Type* t : typesWithFiles(e)) {
             std::lock_guard<std::mutex> g(t->mu);
-            held += t->uniq;
+            held += t->totals().recs;
         }
         const double perRecord = held > 0 ? double(used) / double(held) : double(used);
         const double excess = double(used) - double(maxBytes);
@@ -343,9 +425,9 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFr
         // The type whose oldest record arrived first gives up its oldest.
         Type* victim = nullptr;
         int64_t oldestTs = INT64_MAX;
-        std::vector<int64_t> victimSeqs;
+        std::vector<std::pair<uint32_t, int64_t>> victimSeqs;
         for (Type* t : typesWithFiles(e)) {
-            std::vector<int64_t> seqs;
+            std::vector<std::pair<uint32_t, int64_t>> seqs;
             int64_t ts = 0;
             const int32_t rc = oldestOf(e, t, want, &seqs, &ts);
             if (rc != P4_OK) return rc;
@@ -430,27 +512,50 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         sqlite3_wal_hook(c->db, walHook, e);
         t->fts = c;
     }
-    // Records gone since the last pass (no row in any feed file): their
-    // full-text rows go, for those the full text holds (a record past
-    // ftsThrough was never added, and catching up skips it: no index entry).
+    // Seqs whose row set left a feed file since the last pass: their
+    // full-text rows go, for those the full text holds (a seq past
+    // ftsThrough was never added, and catching up skips it: no rows). A
+    // migrated seq (below the store's seq floor) can be held by several feed
+    // files: its row goes once none holds it.
     std::vector<int64_t> gone;
     {
         std::lock_guard<std::mutex> gg(t->ftsGoneMu);
         gone.swap(t->ftsGone);
     }
     if (!gone.empty()) {
-        sqlite3_stmt* del = t->fts->sql("DELETE FROM fts WHERE rowid=?1");
-        bool ok = del && t->fts->exec("BEGIN IMMEDIATE") == SQLITE_OK;
-        for (size_t i = 0; ok && i < gone.size(); i++) {
-            if (gone[i] > t->ftsThrough) continue;
-            sqlite3_bind_int64(del, 1, gone[i]);
-            const int r = sqlite3_step(del);
-            sqlite3_reset(del);
+        std::vector<Feed*> files = createdFeeds(t);
+        std::vector<int64_t> del;
+        bool ok = true;
+        for (int64_t seq : gone) {
+            if (seq > t->ftsThrough) continue;
+            bool held = false;
+            if (seq < int64_t(e->cfg.gseqFloor) && files.size() > 1)
+                for (Feed* f : files) {
+                    int orc = 0;
+                    Conn* c = e->rpool.acquire(f->path, OpenKind::Reader, &orc, nullptr);
+                    if (!c) {
+                        ok = false;
+                        break;
+                    }
+                    const int32_t st = fileHoldsSeq(c, seq, &held);
+                    e->rpool.release(c);
+                    if (st != P4_OK) ok = false;
+                    if (held || !ok) break;
+                }
+            if (!ok) break;
+            if (!held) del.push_back(seq);
+        }
+        sqlite3_stmt* q = ok ? t->fts->sql("DELETE FROM fts WHERE rowid=?1") : nullptr;
+        ok = q && t->fts->exec("BEGIN IMMEDIATE") == SQLITE_OK;
+        for (size_t i = 0; ok && i < del.size(); i++) {
+            sqlite3_bind_int64(q, 1, del[i]);
+            const int r = sqlite3_step(q);
+            sqlite3_reset(q);
             ok = r == SQLITE_DONE;
         }
         if (ok) ok = t->fts->exec("COMMIT") == SQLITE_OK;
         if (!ok) {
-            if (del) t->fts->exec("ROLLBACK");
+            if (q) t->fts->exec("ROLLBACK");
             std::lock_guard<std::mutex> gg(t->ftsGoneMu);  // the next pass retries
             t->ftsGone.insert(t->ftsGone.end(), gone.begin(), gone.end());
         }
@@ -463,30 +568,32 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
     t->ftsState = 1;
     if (e->ftsHold.load()) return P4_OK;
     const std::string fid(reinterpret_cast<const char*>(sp->tc.fid()), 4);
-    // Pages of the type index's seq order, each record read once from one of
-    // its feed files (the first), a file at a time.
-    Conn* x = nullptr;
-    if (openConn(t->pIdx, OpenKind::IndexReader, 1024, 0, &x, nullptr) != SQLITE_OK) return P4_E_IO;
+    // Pages of the feed files merged by seq, each seq read once from the
+    // first feed file holding it, a file at a time.
     int64_t through = t->ftsThrough;
     const int64_t limit = all ? INT64_MAX : 20000;
     int64_t done = 0;
     int32_t status = P4_OK;
-    while (status == P4_OK && done < limit) {
+    SeqMerge merge(e, t, through, vis, 1024);
+    bool end = false;
+    while (status == P4_OK && done < limit && !end) {
         std::vector<std::pair<int64_t, uint32_t>> page;  // (seq, fid)
-        sqlite3_stmt* q = x->sql("SELECT seq, min(fid) FROM x WHERE seq>?1 AND seq<=?2 GROUP BY seq ORDER BY seq LIMIT 4096");
-        if (!q) {
-            status = P4_E_INTERNAL;
-            break;
+        while (page.size() < 4096) {
+            int64_t seq = 0;
+            uint32_t ffid = 0;
+            const int32_t rc = merge.next(&seq, &ffid);
+            if (rc < 0) {
+                status = rc;
+                break;
+            }
+            if (rc == 0) {
+                end = true;
+                break;
+            }
+            if (!page.empty() && page.back().first == seq) continue;  // a migrated seq held by several feeds
+            page.push_back({seq, ffid});
         }
-        sqlite3_bind_int64(q, 1, through);
-        sqlite3_bind_int64(q, 2, vis);
-        int r;
-        while ((r = sqlite3_step(q)) == SQLITE_ROW) page.push_back({sqlite3_column_int64(q, 0), uint32_t(sqlite3_column_int64(q, 1))});
-        sqlite3_reset(q);
-        if (r != SQLITE_DONE) {
-            status = statusOfSqlite(r);
-            break;
-        }
+        if (status != P4_OK) break;
         if (page.empty()) {
             through = vis;
             break;
@@ -535,7 +642,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             t->fts->exec("ROLLBACK");
             break;
         }
-        through = page.back().first;
+        through = end ? vis : page.back().first;
         sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
         sqlite3_bind_int64(m, 1, through);
         sqlite3_step(m);
@@ -543,12 +650,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         t->fts->exec("COMMIT");
         t->ftsThrough = through;
         done += int64_t(page.size());
-        if (page.size() < 4096) {
-            through = vis;
-            break;
-        }
     }
-    delete x;
     if (status == P4_OK && through >= vis) {
         sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
         sqlite3_bind_int64(m, 1, vis);

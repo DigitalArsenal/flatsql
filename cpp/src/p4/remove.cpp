@@ -1,15 +1,16 @@
 // Store format 4: removals and repair on a type's writer (CONTRACT C-37
-// (7), (9); design §4 W-f/W-g/W-i; §3.5 REBUILD).
+// (7), (9), C-38; design §4 W-f/W-g/W-i; §3.5 REBUILD).
 //   SUPERSEDE  one feed file: its rows whose batch is not the kept one, a
 //              chunk of 32,768 rows per transaction; a record left with no
-//              row anywhere is gone (the record keeps its other feeds' rows,
-//              which hold every one of its copies).
-//   DELETE     every row of the CIDs, in every feed file.
-//   QUOTA      the type's oldest records by arrival (the type index's seq order).
+//              row in the file leaves the feed.
+//   DELETE     every row of the CIDs, in every feed file (each file's CID index).
+//   QUOTA      the type's oldest record row sets by arrival (the feed files
+//              merged by seq).
 //   REBUILD    1 the feed files' secondary indexes (after a migration's bulk
-//              append); 2 the counters and the type index recounted from the
-//              rows; 8 the same comparison changing nothing, plus
-//              PRAGMA integrity_check on every file (C-27).
+//              append); 2 the feed files' counters recounted from their rows
+//              and mirrored into the type index; 8 the same comparison
+//              changing nothing, plus PRAGMA integrity_check on every file
+//              (C-27).
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -97,7 +98,7 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
     }
     if (!drop.empty() && status == P4_OK && !apply) {
         // Count only: the dropped instances' records, and the records that
-        // would be left with no row.
+        // would be left with no row in the file.
         {
             std::lock_guard<std::mutex> g(t->mu);
             for (auto& kv : f->inst)
@@ -122,14 +123,13 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
             if (r != SQLITE_DONE) status = statusOfSqlite(r);
         }
         for (size_t i = 0; i < seqs.size() && status == P4_OK; i++) {
-            RecState* r = w.bySeq(seqs[i], &st);
+            RecState* r = w.bySeq(f->fid, seqs[i], &st);
             if (!r) {
                 status = st;
                 break;
             }
             bool keeps = false;
-            for (const RowR& x : r->rows)
-                keeps = keeps || (x.live() && (x.fid != f->fid || std::find(drop.begin(), drop.end(), x.bId) == drop.end()));
+            for (const RowR& x : r->rows) keeps = keeps || (x.live() && std::find(drop.begin(), drop.end(), x.bId) == drop.end());
             if (!keeps) records++;
         }
     }
@@ -166,7 +166,7 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
         WriteCtx w(e, t);
         int64_t chunkTags = 0, chunkRecs = 0;
         for (int64_t s : seqs) {
-            RecState* rs = w.bySeq(s, &st);
+            RecState* rs = w.bySeq(f->fid, s, &st);
             if (!rs) {
                 status = st;
                 err = w.err;
@@ -174,18 +174,18 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
             }
             std::vector<const RowR*> gone;
             for (RowR& x : rs->rows)
-                if (x.live() && x.fid == f->fid && std::find(drop.begin(), drop.end(), x.bId) != drop.end()) {
+                if (x.live() && std::find(drop.begin(), drop.end(), x.bId) != drop.end()) {
                     bool seen = false;
                     for (const RowR* y : gone) seen = seen || (y->bId == x.bId && y->cId == x.cId);
                     if (!seen) chunkTags++;
                     gone.push_back(&x);
                     x.del = true;
-                    rs->touched.insert(x.fid);
+                    rs->touched = true;
                 }
             if (!anyLive(rs)) chunkRecs++;
         }
         if (status != P4_OK) break;
-        status = w.commit(true);
+        status = w.commit();
         if (status != P4_OK) {
             err = "supersede commit failed: " + w.err;
             break;
@@ -208,6 +208,9 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
 }
 
 // ---- DELETE ------------------------------------------------------------------------------------------
+// Every feed file holding a CID gives up its rows of it (each file's CID
+// index). `deleted` counts the CID's distinct copies (producer tokens) over
+// the files, format 1's count of producer rows.
 void deleteOp(Engine* e, Type* t, WriteTask* task) {
     SlotOut out(e, task->slot);
     out.enc.header({"deleted"});
@@ -223,6 +226,18 @@ void deleteOp(Engine* e, Type* t, WriteTask* task) {
     int32_t status = P4_OK;
     std::string err;
     if (t->hasFiles.load(std::memory_order_acquire)) {
+        std::vector<uint32_t> fids;
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            for (auto& f : t->feeds) {
+                if (!f->created || f->k.recs <= 0) continue;
+                if (f->quarantined) {
+                    status = P4_E_CORRUPT;
+                    err = "feed file quarantined: " + f->path;
+                }
+                fids.push_back(f->fid);
+            }
+        }
         WriteCtx w(e, t);
         const uint32_t n = ld32(cids->v);
         for (uint32_t i = 0; i < n && status == P4_OK; i++) {
@@ -230,17 +245,21 @@ void deleteOp(Engine* e, Type* t, WriteTask* task) {
             if (!cidBinValid(c36)) continue;
             uint8_t key[32];
             cidKeyFromDigest(c36 + 4, key);
-            RecState* r = w.byKey(key, &status);
-            if (!r) {
-                err = w.err;
-                break;
+            std::set<uint32_t> toks;
+            for (uint32_t fid : fids) {
+                RecState* r = w.byKey(fid, key, &status);
+                if (!r) {
+                    err = w.err;
+                    break;
+                }
+                if (!r->existed) continue;
+                for (auto& kv : copiesLive(r)) toks.insert(kv.first);
+                w.dropAll(r);
             }
-            if (!r->existed) continue;
-            deleted += int64_t(copiesLive(r).size());
-            w.dropAll(r);
+            deleted += int64_t(toks.size());
         }
         if (status == P4_OK) {
-            status = w.commit(true);
+            status = w.commit();
             if (status != P4_OK) err = "delete commit failed: " + w.err;
         }
         if (status == P4_OK) e->bump(kStDeletes, uint64_t(deleted));
@@ -261,7 +280,7 @@ void quotaWork(Engine* e, Type* t, Internal* in) {
         int64_t recs = 0, bytes = 0;
         for (size_t i = at; i < in->seqs.size() && i < at + 32768; i++) {
             int32_t st = P4_OK;
-            RecState* r = w.bySeq(in->seqs[i], &st);
+            RecState* r = w.bySeq(in->seqs[i].first, in->seqs[i].second, &st);
             if (!r) {
                 in->status = st;
                 in->err = w.err;
@@ -273,7 +292,7 @@ void quotaWork(Engine* e, Type* t, Internal* in) {
             w.dropAll(r);
         }
         if (in->status != P4_OK) break;
-        const int32_t rc = w.commit(true);
+        const int32_t rc = w.commit();
         if (rc != P4_OK) {
             in->status = rc;
             in->err = "quota commit failed: " + w.err;
@@ -310,42 +329,43 @@ bool fileIntact(const std::string& path) {
     return ok;
 }
 
-// One feed file's rows, recounted: its counters, its instances, and each
-// record's entry (seq, len, w, k, e, copies), in seq order. Also whether
-// each record's rows are its copies x its instances.
+// One feed file's rows, recounted: its counters, its instances and its
+// tokens' copies, record by record in rid order. Also whether each record's
+// rows are its copies x its instances (local records: one row per copy) and
+// one CID.
 struct FileCount {
     Counters k;
     std::map<InstId, InstCount> inst;
-    int64_t u2bad = 0;
+    std::map<uint32_t, TokCount> tokc;
+    int64_t records = 0, u2bad = 0;
 };
-int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc, const std::function<int32_t(const XEnt&)>& entry) {
+int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc) {
     std::shared_ptr<const Spec> sp = t->spec();
     if (!dictEnsure(f, c)) return P4_E_IO;
     sqlite3_stmt* q = c->sql("SELECT rid, seq, n, b, c, at, cid, e, k, ts, length(d) FROM r ORDER BY rid");
     if (!q) return P4_E_INTERNAL;
     struct RowC {
-        uint32_t tok, n, b, cc;
-        int64_t len, at;
+        uint32_t tok, b, cc;
+        int64_t len;
+        std::string key;
     };
-    XEnt cur;
     bool have = false;
+    int64_t seq = 0, ts = 0, ev = 0, w = 0;
+    bool hasE = false;
     std::vector<RowC> rows;
-    int64_t ts = 0;
     int32_t st = P4_OK;
-    auto flush = [&]() -> int32_t {
-        if (!have) return P4_OK;
+    auto flush = [&]() {
+        if (!have) return;
         Counters& k = fc->k;
         int64_t bytes = 0;
         std::map<uint32_t, int64_t> cp;
         std::map<InstId, int64_t> instLen;
-        std::map<InstId, std::pair<int64_t, int64_t>> instAt;
-        std::set<uint32_t> nodes;
-        bool localRows = false;
+        bool localRows = false, oneCid = true;
         for (const RowC& r : rows) {
             bytes += r.len;
+            oneCid = oneCid && r.key == rows[0].key;
             auto it = cp.find(r.tok);
             if (it == cp.end() || r.len < it->second) cp[r.tok] = r.len;
-            nodes.insert(r.tok);
             if (!r.b) {
                 localRows = true;
                 continue;
@@ -353,83 +373,78 @@ int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc, const std::function<
             const InstId id(r.b, r.cc);
             auto il = instLen.find(id);
             if (il == instLen.end() || r.len < il->second) instLen[id] = r.len;
-            auto& a = instAt[id];
-            if (il == instLen.end()) a = {r.at, r.at};
-            a.first = std::min(a.first, r.at);
-            a.second = std::max(a.second, r.at);
+        }
+        int64_t minLen = INT64_MAX, sumLen = 0;
+        for (auto& kv : cp) {
+            minLen = std::min(minLen, kv.second);
+            sumLen += kv.second;
         }
         k.rows += int64_t(rows.size());
         k.bytes += bytes;
         k.recs++;
-        if (sp->hasEpochRule && !cur.hasE) k.nnull++;
-        k.minseq = std::min(k.minseq, cur.seq);
-        k.maxseq = std::max(k.maxseq, cur.seq);
-        k.minw = std::min(k.minw, cur.w);
-        k.maxw = std::max(k.maxw, cur.w);
+        k.rbytes += minLen;
+        k.copies += int64_t(cp.size());
+        k.cbytes += sumLen;
+        if (sp->hasEpochRule && !hasE) k.nnull++;
+        k.minseq = std::min(k.minseq, seq);
+        k.maxseq = std::max(k.maxseq, seq);
+        k.minw = std::min(k.minw, w);
+        k.maxw = std::max(k.maxw, w);
         k.mints = std::min(k.mints, ts);
         k.maxts = std::max(k.maxts, ts);
-        if (cur.hasE) {
-            k.mine = std::min(k.mine, cur.e);
-            k.maxe = std::max(k.maxe, cur.e);
+        if (hasE) {
+            k.mine = std::min(k.mine, ev);
+            k.maxe = std::max(k.maxe, ev);
         }
         for (auto& kv : instLen) {
             InstCount& ic = fc->inst[kv.first];
             ic.n++;
             ic.bytes += kv.second;
         }
-        // every copy with every instance; local rows only without one
-        const size_t want = instLen.empty() ? cp.size() : cp.size() * instLen.size();
-        if (rows.size() != want || (localRows && !instLen.empty())) fc->u2bad++;
-        cur.len = INT64_MAX;
-        cur.cp.clear();
         for (auto& kv : cp) {
-            cur.cp.push_back(CopyLen{kv.first, kv.second});
-            cur.len = std::min(cur.len, kv.second);
+            TokCount& tc = fc->tokc[kv.first];
+            tc.n++;
+            tc.bytes += kv.second;
         }
-        cur.fid = f->fid;
-        const int32_t r = entry(cur);
+        // every copy with every instance; local rows only without one; one CID
+        const size_t want = instLen.empty() ? cp.size() : cp.size() * instLen.size();
+        if (rows.size() != want || (localRows && !instLen.empty()) || (f->local != instLen.empty()) || !oneCid) fc->u2bad++;
+        fc->records++;
         rows.clear();
         have = false;
-        return r;
     };
     int r;
     while ((r = sqlite3_step(q)) == SQLITE_ROW) {
-        const int64_t seq = sqlite3_column_int64(q, 1);
-        if (have && seq != cur.seq) {
-            st = flush();
-            if (st != P4_OK) break;
-        }
+        const int64_t s = sqlite3_column_int64(q, 1);
+        if (have && s != seq) flush();
         if (!have) {
-            cur = XEnt();
-            cur.seq = seq;
-            if (sqlite3_column_bytes(q, 6) == 32) std::memcpy(cur.key, sqlite3_column_blob(q, 6), 32);
-            cur.hasE = sqlite3_column_type(q, 7) != SQLITE_NULL;
-            cur.e = sqlite3_column_int64(q, 7);
-            cur.k.from(q, 8);
+            seq = s;
+            hasE = sqlite3_column_type(q, 7) != SQLITE_NULL;
+            ev = sqlite3_column_int64(q, 7);
             ts = sqlite3_column_int64(q, 9);
-            cur.w = cur.hasE ? cur.e : ts;
+            w = hasE ? ev : ts;
             have = true;
         }
         RowC x;
-        x.n = uint32_t(sqlite3_column_int64(q, 2));
+        const uint32_t n = uint32_t(sqlite3_column_int64(q, 2));
         x.b = uint32_t(sqlite3_column_int64(q, 3));
         x.cc = uint32_t(sqlite3_column_int64(q, 4));
-        x.at = sqlite3_column_int64(q, 5);
         x.len = sqlite3_column_int64(q, 10);
+        if (sqlite3_column_bytes(q, 6) == 32) x.key.assign(static_cast<const char*>(sqlite3_column_blob(q, 6)), 32);
         NodeDef nd;
-        if (!dictNode(f, c, x.n, &nd)) {
+        if (!dictNode(f, c, n, &nd)) {
             st = P4_E_CORRUPT;
             break;
         }
         {
             std::lock_guard<std::mutex> g(t->mu);
-            x.tok = tokFor(t, nd.producer, nd.peer, false);
+            x.tok = tokFor(t, nd.producer, nd.peer, true);
         }
-        rows.push_back(x);
+        rows.push_back(std::move(x));
     }
     sqlite3_reset(q);
     if (st == P4_OK && r != SQLITE_DONE && r != SQLITE_ROW) st = statusOfSqlite(r);
-    if (st == P4_OK) st = flush();
+    if (st == P4_OK) flush();
     if (st != P4_OK) return st;
     // The instances' strings from the dictionary.
     for (auto& kv : fc->inst) {
@@ -449,58 +464,9 @@ int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc, const std::function<
     return P4_OK;
 }
 
-bool sameEnt(const XEnt& a, const XEnt& b) {
-    if (a.seq != b.seq || a.fid != b.fid || std::memcmp(a.key, b.key, 32) != 0 || a.len != b.len || a.w != b.w ||
-        !(a.k == b.k) || a.hasE != b.hasE || (a.hasE && a.e != b.e) || a.cp.size() != b.cp.size())
-        return false;
-    for (size_t i = 0; i < a.cp.size(); i++)
-        if (a.cp[i].tok != b.cp[i].tok || a.cp[i].len != b.cp[i].len) return false;
-    return true;
-}
-
-// The type's counters from its index entries (a walk in seq order).
-int32_t countIndex(Conn* x, TypeCounts* tc, int64_t* entries, int64_t* u2bad) {
-    sqlite3_stmt* q = x->sql("SELECT seq, fid, cid, len, w, k, e, cp FROM x ORDER BY seq, fid");
-    if (!q) return P4_E_INTERNAL;
-    std::vector<XEnt> cur;
-    int32_t st = P4_OK;
-    auto flush = [&]() {
-        if (cur.empty()) return;
-        XChange c;
-        c.after = cur;
-        xCount(c, tc);
-        // every entry of a record names the same copies
-        for (size_t i = 1; i < cur.size(); i++) {
-            bool same = cur[i].cp.size() == cur[0].cp.size();
-            for (size_t j = 0; same && j < cur[i].cp.size(); j++) same = cur[i].cp[j].tok == cur[0].cp[j].tok;
-            if (!same) (*u2bad)++;
-        }
-        cur.clear();
-    };
-    int r;
-    while ((r = sqlite3_step(q)) == SQLITE_ROW) {
-        XEnt e;
-        e.seq = sqlite3_column_int64(q, 0);
-        e.fid = uint32_t(sqlite3_column_int64(q, 1));
-        if (sqlite3_column_bytes(q, 2) == 32) std::memcpy(e.key, sqlite3_column_blob(q, 2), 32);
-        e.len = sqlite3_column_int64(q, 3);
-        e.w = sqlite3_column_int64(q, 4);
-        e.k.from(q, 5);
-        e.hasE = sqlite3_column_type(q, 6) != SQLITE_NULL;
-        e.e = sqlite3_column_int64(q, 6);
-        cpDecode(sqlite3_column_blob(q, 7), size_t(sqlite3_column_bytes(q, 7)), &e.cp);
-        if (!cur.empty() && cur[0].seq != e.seq) flush();
-        cur.push_back(std::move(e));
-        (*entries)++;
-    }
-    sqlite3_reset(q);
-    if (r != SQLITE_DONE) st = statusOfSqlite(r);
-    flush();
-    return st;
-}
-
 bool sameCounts(const Counters& a, const Counters& b) {
-    return a.rows == b.rows && a.recs == b.recs && a.bytes == b.bytes && a.nnull == b.nnull;
+    return a.rows == b.rows && a.recs == b.recs && a.bytes == b.bytes && a.nnull == b.nnull && a.rbytes == b.rbytes &&
+           a.copies == b.copies && a.cbytes == b.cbytes;
 }
 bool sameInst(const std::map<InstId, InstCount>& a, const std::map<InstId, InstCount>& b) {
     if (a.size() != b.size()) return false;
@@ -512,6 +478,64 @@ bool sameInst(const std::map<InstId, InstCount>& a, const std::map<InstId, InstC
             return false;
     }
     return true;
+}
+bool sameTokc(const std::map<uint32_t, TokCount>& a, const std::map<uint32_t, TokCount>& b) {
+    if (a.size() != b.size()) return false;
+    for (auto& kv : a) {
+        auto it = b.find(kv.first);
+        if (it == b.end() || it->second.n != kv.second.n || it->second.bytes != kv.second.bytes) return false;
+    }
+    return true;
+}
+
+// A feed's mirror as the type index holds it.
+int32_t readMirror(Conn* x, uint32_t fid, Counters* k, std::map<InstId, InstCount>* inst, std::map<uint32_t, TokCount>* tokc,
+                   bool* present) {
+    *present = false;
+    sqlite3_stmt* s = x->sql("SELECT rows, recs, bytes, nnull, rbytes, copies, cbytes FROM feed WHERE fid=?1");
+    if (!s) return P4_E_INTERNAL;
+    sqlite3_bind_int64(s, 1, fid);
+    int r = sqlite3_step(s);
+    if (r == SQLITE_ROW) {
+        *present = true;
+        k->rows = sqlite3_column_int64(s, 0);
+        k->recs = sqlite3_column_int64(s, 1);
+        k->bytes = sqlite3_column_int64(s, 2);
+        k->nnull = sqlite3_column_int64(s, 3);
+        k->rbytes = sqlite3_column_int64(s, 4);
+        k->copies = sqlite3_column_int64(s, 5);
+        k->cbytes = sqlite3_column_int64(s, 6);
+    }
+    sqlite3_reset(s);
+    if (r != SQLITE_ROW && r != SQLITE_DONE) return statusOfSqlite(r);
+    s = x->sql("SELECT b, c, batch, ppeer, pkey, ckey, n, bytes FROM inst WHERE fid=?1 AND n>0");
+    if (!s) return P4_E_INTERNAL;
+    sqlite3_bind_int64(s, 1, fid);
+    while ((r = sqlite3_step(s)) == SQLITE_ROW) {
+        InstCount& ic = (*inst)[InstId(uint32_t(sqlite3_column_int64(s, 0)), uint32_t(sqlite3_column_int64(s, 1)))];
+        auto txt = [&](int i) {
+            const unsigned char* p = sqlite3_column_text(s, i);
+            return p ? std::string(reinterpret_cast<const char*>(p)) : std::string();
+        };
+        ic.batch = txt(2);
+        ic.ppeer = txt(3);
+        ic.pkey = txt(4);
+        ic.ckey = txt(5);
+        ic.n = sqlite3_column_int64(s, 6);
+        ic.bytes = sqlite3_column_int64(s, 7);
+    }
+    sqlite3_reset(s);
+    if (r != SQLITE_DONE) return statusOfSqlite(r);
+    s = x->sql("SELECT tok, n, bytes FROM ftok WHERE fid=?1 AND n>0");
+    if (!s) return P4_E_INTERNAL;
+    sqlite3_bind_int64(s, 1, fid);
+    while ((r = sqlite3_step(s)) == SQLITE_ROW) {
+        TokCount& tc = (*tokc)[uint32_t(sqlite3_column_int64(s, 0))];
+        tc.n = sqlite3_column_int64(s, 1);
+        tc.bytes = sqlite3_column_int64(s, 2);
+    }
+    sqlite3_reset(s);
+    return r == SQLITE_DONE ? P4_OK : statusOfSqlite(r);
 }
 }  // namespace
 
@@ -569,89 +593,80 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
     if (in->what & (2 | 8)) {
         const bool fix = (in->what & 2) != 0;
         Conn* x = t->idx;
-        int64_t entries = 0, mismatches = 0, present = 0;
-        // 1. Each feed file: its counters and instances from its rows; each
-        //    record's entry against the index.
-        if (fix && x->exec("BEGIN IMMEDIATE") != SQLITE_OK) {
-            in->status = P4_E_IO;
-            in->err = "type index busy";
-            return;
-        }
-        int32_t st = P4_OK;
-        auto fail = [&](int32_t s, const std::string& what) {
-            if (fix) x->exec("ROLLBACK");
-            in->status = s;
-            in->err = what;
-        };
+        int64_t entries = 0, mismatches = 0;
+        std::vector<FeedSnap> repaired;
         for (Feed* f : feeds) {
+            // 1. The file's counters, instances and tokens from its rows,
+            //    against its meta, the engine's and the type index's.
             Conn* c = nullptr;
             if (openConn(f->path, OpenKind::Maint, 4096, 0, &c, nullptr) != SQLITE_OK) {
-                fail(P4_E_IO, "open " + f->path);
+                in->status = P4_E_IO;
+                in->err = "open " + f->path;
                 return;
             }
             c->exec("BEGIN");
             FileCount fc;
-            std::vector<XEnt> xs;
-            st = countFile(t, f, c, &fc, [&](const XEnt& en) -> int32_t {
-                entries++;
-                const int32_t rc = xOfSeq(x, en.seq, &xs);
-                if (rc != P4_OK) return rc;
-                const XEnt* have = nullptr;
-                for (const XEnt& y : xs)
-                    if (y.fid == en.fid) have = &y;
-                if (have) present++;
-                if (have && sameEnt(*have, en)) {
-                } else {
-                    mismatches++;
-                    why("entry", f->path, en.seq, have ? 1 : 0);
-                    if (fix) {
-                        XChange ch;
-                        if (have) ch.before.push_back(*have);
-                        ch.after.push_back(en);
-                        const int r = xWrite(x, ch);
-                        if (r != SQLITE_OK) return statusOfSqlite(r);
-                    }
-                }
-                return P4_OK;
-            });
+            int32_t st = countFile(t, f, c, &fc);
             Counters stored;
             bool indexed = true;
             std::map<InstId, InstCount> storedInst;
-            if (st == P4_OK && (readMeta(c, &stored, &indexed) != SQLITE_OK || readInst(f, c, &storedInst) != SQLITE_OK))
+            std::map<uint32_t, TokCount> storedTokc;
+            if (st == P4_OK && (readMeta(c, &stored, &indexed) != SQLITE_OK || readInst(f, c, &storedInst) != SQLITE_OK ||
+                                readTokc(t, c, &storedTokc) != SQLITE_OK))
                 st = P4_E_IO;
             c->exec("COMMIT");
             delete c;
             if (st != P4_OK) {
-                fail(st, "count " + f->path);
+                in->status = st;
+                in->err = "count " + f->path;
                 return;
             }
-            Counters mem;
-            std::map<InstId, InstCount> memInst;
+            entries += fc.records;
+            Counters mem, mir;
+            std::map<InstId, InstCount> memInst, mirInst;
+            std::map<uint32_t, TokCount> memTokc, mirTokc;
             {
                 std::lock_guard<std::mutex> g(t->mu);
                 mem = f->k;
                 memInst = f->inst;
+                memTokc = f->tokc;
             }
-            if (!sameCounts(fc.k, stored) || !sameCounts(fc.k, mem)) {
+            bool present = false;
+            st = readMirror(x, f->fid, &mir, &mirInst, &mirTokc, &present);
+            if (st != P4_OK) {
+                in->status = st;
+                in->err = "type index mirror of " + f->path;
+                return;
+            }
+            const bool fileBad = !sameCounts(fc.k, stored) || !sameInst(fc.inst, storedInst) || !sameTokc(fc.tokc, storedTokc);
+            const bool memBad = !sameCounts(fc.k, mem) || !sameInst(fc.inst, memInst) || !sameTokc(fc.tokc, memTokc);
+            const bool mirBad = !present || !sameCounts(fc.k, mir) || !sameInst(fc.inst, mirInst) || !sameTokc(fc.tokc, mirTokc);
+            if (fileBad) {
                 mismatches++;
                 why("file counters rows", f->path, stored.rows, fc.k.rows);
                 why("file counters recs", f->path, stored.recs, fc.k.recs);
             }
-            if (!sameInst(fc.inst, storedInst) || !sameInst(fc.inst, memInst)) {
+            if (memBad) {
                 mismatches++;
-                why("instance counters", f->path, int64_t(storedInst.size()), int64_t(fc.inst.size()));
+                why("engine counters recs", f->path, mem.recs, fc.k.recs);
+            }
+            if (mirBad) {
+                mismatches++;
+                why("type index mirror recs", f->path, mir.recs, fc.k.recs);
             }
             if (fc.u2bad) {
                 mismatches += fc.u2bad;
                 why("rows not copies x instances", f->path, fc.u2bad, 0);
             }
-            if (fix && (!sameCounts(fc.k, stored) || !sameInst(fc.inst, storedInst))) {
-                // The file's counters rewritten from its rows (its writer).
+            if (fix && (fileBad || memBad || mirBad)) {
+                // The file's counters rewritten from its rows (its writer),
+                // keeping the times and bounds the rows cannot give back.
                 int32_t ps = P4_OK;
                 std::string er;
                 Conn* w = writerPin(e, f, &ps, &er);
                 if (!w) {
-                    fail(ps, er);
+                    in->status = ps;
+                    in->err = er;
                     return;
                 }
                 int r = w->exec("BEGIN IMMEDIATE");
@@ -690,134 +705,48 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
                     sqlite3_reset(q);
                     if (r == SQLITE_DONE) r = SQLITE_OK;
                 }
+                for (auto& kv : fc.tokc) {
+                    auto old = storedTokc.find(kv.first);
+                    if (old != storedTokc.end()) {
+                        kv.second.mints = old->second.mints;
+                        kv.second.maxts = old->second.maxts;
+                        kv.second.maxseq = old->second.maxseq;
+                    }
+                }
+                if (r == SQLITE_OK) r = w->exec("DELETE FROM tokc");
+                if (r == SQLITE_OK) r = writeTokc(t, w, {}, fc.tokc);
                 fc.k.maxseq = std::max(fc.k.maxseq, stored.maxseq);
                 if (r == SQLITE_OK) r = writeMeta(w, fc.k, nowSec());
                 if (r == SQLITE_OK) r = w->exec("COMMIT");
                 if (r != SQLITE_OK) w->exec("ROLLBACK");
                 writerUnpin(e, f);
                 if (r != SQLITE_OK) {
-                    fail(statusOfSqlite(r), "repair " + f->path);
+                    in->status = statusOfSqlite(r);
+                    in->err = "repair " + f->path;
                     return;
                 }
                 std::lock_guard<std::mutex> g(t->mu);
                 f->k = fc.k;
                 f->inst = fc.inst;
+                f->tokc = fc.tokc;
+                repaired.push_back(feedSnapOf(f));
             }
             if (!fileIntact(f->path)) {
                 mismatches++;
                 if (in->firstBad.empty()) in->firstBad = f->path;
             }
         }
-        // 2. Entries the files do not hold (dangling), and the type's
-        //    counters from the entries.
-        int64_t total = 0, u2bad = 0;
-        TypeCounts tc;
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            tc.toks = t->toks;
-            for (TokDef& d : tc.toks) {
-                d.n = d.bytes = d.maxts = d.maxseq = 0;
-                d.mints = INT64_MAX;
-            }
-        }
-        {
-            // Entries no file holds: the index's count against the files'
-            // (one walk); when they differ, each entry probed in its file.
-            sqlite3_stmt* q = x->sql("SELECT count(*) FROM x");
-            int64_t n = 0;
-            if (q && sqlite3_step(q) == SQLITE_ROW) n = sqlite3_column_int64(q, 0);
-            if (q) sqlite3_reset(q);
-            const int64_t held = fix ? entries : present;
-            if (n != held) {
-                std::vector<std::pair<int64_t, uint32_t>> dangling;
-                sqlite3_stmt* w = x->sql("SELECT seq, fid FROM x ORDER BY fid, seq");
-                std::map<uint32_t, Conn*> conns;
-                int r;
-                while (w && (r = sqlite3_step(w)) == SQLITE_ROW) {
-                    const int64_t seq = sqlite3_column_int64(w, 0);
-                    const uint32_t fid = uint32_t(sqlite3_column_int64(w, 1));
-                    Feed* f;
-                    {
-                        std::lock_guard<std::mutex> g(t->mu);
-                        f = t->feedById(fid);
-                    }
-                    bool ok = false;
-                    if (f && f->created) {
-                        Conn*& c = conns[fid];
-                        if (!c && openConn(f->path, OpenKind::Maint, 1024, 0, &c, nullptr) != SQLITE_OK) c = nullptr;
-                        sqlite3_stmt* p = c ? c->get(S_R_MAXRID) : nullptr;
-                        if (p) {
-                            sqlite3_bind_int64(p, 1, seq << 16);
-                            sqlite3_bind_int64(p, 2, (seq << 16) | 0xffff);
-                            ok = sqlite3_step(p) == SQLITE_ROW && sqlite3_column_type(p, 0) != SQLITE_NULL;
-                            sqlite3_reset(p);
-                        }
-                    }
-                    if (!ok) dangling.push_back({seq, fid});
-                }
-                if (w) sqlite3_reset(w);
-                for (auto& kv : conns) delete kv.second;
-                mismatches += int64_t(dangling.size());
-                why("dangling entries", t->name, n, held);
-                for (auto& d : dangling) {
-                    if (!fix) break;
-                    sqlite3_stmt* del = x->get(S_X_DEL);
-                    sqlite3_bind_int64(del, 1, d.first);
-                    sqlite3_bind_int64(del, 2, d.second);
-                    const int dr = sqlite3_step(del);
-                    sqlite3_reset(del);
-                    if (dr != SQLITE_DONE) {
-                        fail(statusOfSqlite(dr), "type index");
-                        return;
-                    }
-                }
-            }
-        }
-        st = countIndex(x, &tc, &total, &u2bad);
-        if (st != P4_OK) {
-            fail(st, "type index walk");
-            return;
-        }
-        mismatches += u2bad;
-        TypeCounts mem;
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            mem = typeCountsOf(t);
-        }
-        if (tc.uniq != mem.uniq || tc.uniqBytes != mem.uniqBytes || tc.copies != mem.copies || tc.copyBytes != mem.copyBytes) {
-            mismatches++;
-            why("type counters uniq", t->name, mem.uniq, tc.uniq);
-            why("type counters copies", t->name, mem.copies, tc.copies);
-        }
-        for (size_t i = 0; i < tc.toks.size() && i < mem.toks.size(); i++)
-            if (tc.toks[i].n != mem.toks[i].n || tc.toks[i].bytes != mem.toks[i].bytes) {
-                mismatches++;
-                why("token counters", tc.toks[i].token, mem.toks[i].n, tc.toks[i].n);
-            }
-        if (fix) {
-            // Bounds kept from before (they only widen); counts from the entries.
-            tc.mine = std::min(tc.mine, mem.mine);
-            tc.maxe = std::max(tc.maxe, mem.maxe);
-            tc.mints = std::min(tc.mints, mem.mints);
-            tc.maxts = std::max(tc.maxts, mem.maxts);
-            tc.maxseq = std::max(tc.maxseq, mem.maxseq);
-            tc.nextSeq = mem.nextSeq;
-            for (size_t i = 0; i < tc.toks.size(); i++) tc.dirtyToks.insert(uint32_t(i + 1));
-            std::vector<FeedSnap> snaps;
-            {
-                std::lock_guard<std::mutex> g(t->mu);
-                for (Feed* f : feeds) snaps.push_back(feedSnapOf(f));
-            }
-            int r = indexPutCounts(x, tc);
-            for (const FeedSnap& s : snaps)
+        if (fix && !repaired.empty()) {
+            int r = x->exec("BEGIN IMMEDIATE");
+            for (const FeedSnap& s : repaired)
                 if (r == SQLITE_OK) r = indexPutFeed(x, s);
             if (r == SQLITE_OK) r = x->exec("COMMIT");
             if (r != SQLITE_OK) {
-                fail(statusOfSqlite(r), "type index commit");
+                x->exec("ROLLBACK");
+                in->status = statusOfSqlite(r);
+                in->err = "type index commit";
                 return;
             }
-            std::lock_guard<std::mutex> g(t->mu);
-            typeCountsTo(t, tc);
         }
         // C-27: the type index and the journal too.
         for (const std::string* p : {&t->pIdx, &t->pJnl})

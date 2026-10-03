@@ -1,20 +1,20 @@
-// Store format 4: a record's rows across its feed files (CONTRACT C-37), and
-// how a write changes and commits them.
+// Store format 4: a record's rows in one feed file (CONTRACT C-37, C-38),
+// and how a write changes and commits them.
 //
-// A record's rows are its copies x its instances: every copy (producer token)
-// appears with every instance (feed, batch, content key, producer peer and
-// key) in that instance's feed file; a record with no instance has one row
-// per copy in the type's local file. A write loads the records it touches
-// (the type index names their feed files; their rows are a rid range of each
-// file, rid = seq << 16 | n), changes their rows, then commits:
-//   1. the journal (synchronous=FULL): the feed files and records it touches
-//      (J_TOUCH), new feed / token ids and ingest identities;
-//   2. each feed file in one transaction (rows, the file's counters and its
-//      instances' counters), feeds before local, so a cut leaves rows that
-//      only add;
-//   3. the type index in one transaction: each record's entries set from its
-//      rows, the type's counters, the feeds' mirrors.
-// Open replays the journal tail through the same steps (journal.cpp).
+// A record of a feed file is found by its CID (the file's one CID index) or
+// its seq; its rows are one rid range of that file (rid = seq << 16 | n):
+// every copy (producer token) appears with every instance (batch, content
+// key, producer peer and key) of the feed; a local record (no source) has one
+// row per copy. A write loads the records it touches, changes their rows,
+// then commits:
+//   1. the journal (synchronous=FULL): the feed files it touches (J_TOUCH),
+//      new feed / token ids, the seq reservation;
+//   2. each feed file in one transaction (rows, the file's counters, its
+//      instances' and tokens' counters, its ingest identities), feeds before
+//      local;
+//   3. the type index in one transaction: the touched files' mirrors, new
+//      tokens, the next seq.
+// Open replays the journal tail (journal.cpp).
 #include <algorithm>
 
 #include "internal.h"
@@ -29,22 +29,31 @@ WriteCtx::WriteCtx(Engine* e_, Type* t_) : e(e_), t(t_) {
 
 WriteCtx::~WriteCtx() {}
 
-RecState* WriteCtx::known(int64_t seq) {
-    auto it = bySeq_.find(seq);
+RecState* WriteCtx::known(uint32_t fid, int64_t seq) {
+    auto it = bySeq_.find({fid, seq});
     return it == bySeq_.end() ? nullptr : it->second;
 }
 
-int32_t WriteCtx::loadRows(RecState* r, uint32_t fid) {
-    r->loadedFids.insert(fid);
+RecState* WriteCtx::make(uint32_t fid, int64_t seq, const uint8_t* key) {
+    store_.emplace_back();
+    RecState* r = &store_.back();
+    r->fid = fid;
+    r->seq = seq;
+    if (key) std::memcpy(r->key, key, 32);
+    order_.push_back(r);
+    return r;
+}
+
+int32_t WriteCtx::loadRows(RecState* r) {
     Feed* f;
     bool created, quarantined;
     {
         std::lock_guard<std::mutex> g(t->mu);
-        f = t->feedById(fid);
+        f = t->feedById(r->fid);
         created = f && f->created;
         quarantined = f && f->quarantined;
     }
-    if (!f || !created) return P4_OK;
+    if (!f || !created || !r->seq) return P4_OK;
     if (quarantined) {
         err = "feed file quarantined: " + f->path;
         return P4_E_CORRUPT;
@@ -70,15 +79,10 @@ int32_t WriteCtx::loadRows(RecState* r, uint32_t fid) {
     sqlite3_bind_int64(q, 1, base);
     sqlite3_bind_int64(q, 2, base | 0xffff);
     int rc;
-    bool haveKey = r->existed || !r->rows.empty();
-    struct Pending {
-        RowR row;
-        NodeDef node;
-    };
+    bool haveKey = false;
     std::vector<RowR> got;
     while ((rc = sqlite3_step(q)) == SQLITE_ROW) {
         RowR x;
-        x.fid = fid;
         x.loaded = true;
         x.rid = sqlite3_column_int64(q, 0);
         x.nId = uint32_t(sqlite3_column_int64(q, 1));
@@ -94,29 +98,21 @@ int32_t WriteCtx::loadRows(RecState* r, uint32_t fid) {
         if (!haveKey) {
             std::memcpy(r->key, cid, 32);
             haveKey = true;
+            r->hasE = sqlite3_column_type(q, 7) != SQLITE_NULL;
+            r->e = sqlite3_column_int64(q, 7);
+            r->k.from(q, 8);
+            r->ts = sqlite3_column_int64(q, 9);
+            r->w = r->hasE ? r->e : r->ts;
         } else if (std::memcmp(r->key, cid, 32) != 0) {
-            rc = SQLITE_CORRUPT;  // one seq is one CID (§3.8.2)
+            rc = SQLITE_CORRUPT;  // one seq is one CID in a file
             break;
         }
-        const bool hasE = sqlite3_column_type(q, 7) != SQLITE_NULL;
-        const int64_t ev = sqlite3_column_int64(q, 7);
-        KVal kv;
-        kv.from(q, 8);
         x.ts = sqlite3_column_int64(q, 9);
         x.sealed = sqlite3_column_type(q, 10) != SQLITE_NULL;
         if (x.sealed) x.fcols.assign(static_cast<const char*>(sqlite3_column_blob(q, 10)), size_t(sqlite3_column_bytes(q, 10)));
         if (sqlite3_column_type(q, 11) != SQLITE_NULL)
             x.sig.assign(static_cast<const char*>(sqlite3_column_blob(q, 11)), size_t(sqlite3_column_bytes(q, 11)));
         x.len = sqlite3_column_int64(q, 12);
-        if (r->rows.empty() && got.empty() && !r->existed) {
-            r->hasE = hasE;
-            r->e = ev;
-            r->k = kv;
-            r->ts = x.ts;
-            r->w = hasE ? ev : x.ts;
-        } else if (r->rows.empty() && got.empty()) {
-            r->ts = x.ts;
-        }
         NodeDef nd;
         if (!dictNode(f, c, x.nId, &nd)) {
             rc = SQLITE_CORRUPT;
@@ -152,108 +148,69 @@ int32_t WriteCtx::loadRows(RecState* r, uint32_t fid) {
         if ((rc & 0xff) == SQLITE_CORRUPT) return P4_E_CORRUPT;
         return statusOfSqlite(rc);
     }
-    if (!got.empty()) r->fids.insert(fid);
-    for (RowR& x : got) r->rows.push_back(std::move(x));
+    r->existed = !got.empty();
+    r->rows = std::move(got);
     return P4_OK;
 }
 
-RecState* WriteCtx::byKey(const uint8_t key[32], int32_t* rc) {
+RecState* WriteCtx::byKey(uint32_t fid, const uint8_t key[32], int32_t* rc) {
     *rc = P4_OK;
-    const std::string k(reinterpret_cast<const char*>(key), 32);
+    const auto k = std::make_pair(fid, std::string(reinterpret_cast<const char*>(key), 32));
     auto it = byKey_.find(k);
     if (it != byKey_.end()) return it->second;
-    std::vector<XEnt> xs;
-    if (t->idx) {
-        *rc = xOfCid(t->idx, key, &xs);
-        if (*rc != P4_OK) return nullptr;
+    Feed* f;
+    bool created, indexed;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        f = t->feedById(fid);
+        created = f && f->created;
+        indexed = f && f->indexed;
     }
-    if (!xs.empty()) {
-        // One seq per CID: the entries of its (lowest) seq.
-        int64_t s0 = xs[0].seq;
-        for (const XEnt& x : xs) s0 = std::min(s0, x.seq);
-        std::vector<XEnt> keep;
-        for (XEnt& x : xs)
-            if (x.seq == s0) keep.push_back(std::move(x));
-        xs.swap(keep);
-        auto bs = bySeq_.find(s0);
-        if (bs != bySeq_.end()) {
-            byKey_[k] = bs->second;
-            return bs->second;
+    int64_t seq = 0;
+    if (created) {
+        std::string er;
+        Conn* c = writerPin(e, f, rc, &er);
+        if (!c) {
+            err = "writer open: " + er;
+            return nullptr;
+        }
+        *rc = seqOfCid(c, indexed, key, &seq);
+        writerUnpin(e, f);
+        if (*rc != P4_OK) {
+            err = "CID lookup in " + f->path;
+            return nullptr;
         }
     }
-    store_.emplace_back();
-    RecState* r = &store_.back();
-    std::memcpy(r->key, key, 32);
-    if (!xs.empty()) {
-        r->seq = xs[0].seq;
-        r->existed = true;
-        r->hasE = xs[0].hasE;
-        r->e = xs[0].e;
-        r->k = xs[0].k;
-        r->w = xs[0].w;
-        for (const XEnt& x : xs) r->fids.insert(x.fid);
-        r->before = std::move(xs);
-        const std::set<uint32_t> fids = r->fids;
-        for (uint32_t fid : fids) {
-            *rc = loadRows(r, fid);
+    if (seq) {
+        RecState* r = known(fid, seq);
+        if (!r) {
+            r = make(fid, seq, key);
+            *rc = loadRows(r);
             if (*rc != P4_OK) return nullptr;
+            bySeq_[{fid, seq}] = r;
         }
-        bySeq_[r->seq] = r;
-    }
-    byKey_[k] = r;
-    order_.push_back(r);
-    return r;
-}
-
-RecState* WriteCtx::bySeq(int64_t seq, int32_t* rc, const std::set<uint32_t>* more) {
-    *rc = P4_OK;
-    auto it = bySeq_.find(seq);
-    if (it != bySeq_.end()) {
-        RecState* r = it->second;
-        if (more)
-            for (uint32_t fid : *more)
-                if (!r->loadedFids.count(fid)) {
-                    *rc = loadRows(r, fid);
-                    if (*rc != P4_OK) return nullptr;
-                }
+        byKey_[k] = r;
         return r;
     }
-    std::vector<XEnt> xs;
-    if (t->idx) {
-        *rc = xOfSeq(t->idx, seq, &xs);
-        if (*rc != P4_OK) return nullptr;
-    }
-    store_.emplace_back();
-    RecState* r = &store_.back();
-    r->seq = seq;
-    std::set<uint32_t> fids;
-    for (const XEnt& x : xs) fids.insert(x.fid);
-    if (more) fids.insert(more->begin(), more->end());
-    if (!xs.empty()) {
-        std::memcpy(r->key, xs[0].key, 32);
-        r->existed = true;
-        r->hasE = xs[0].hasE;
-        r->e = xs[0].e;
-        r->k = xs[0].k;
-        r->w = xs[0].w;
-        for (const XEnt& x : xs) r->fids.insert(x.fid);
-        r->before = std::move(xs);
-    }
-    for (uint32_t fid : fids) {
-        *rc = loadRows(r, fid);
-        if (*rc != P4_OK) return nullptr;
-    }
-    if (!r->existed && !r->rows.empty()) r->existed = true;
-    bySeq_[seq] = r;
-    if (r->existed) byKey_[std::string(reinterpret_cast<const char*>(r->key), 32)] = r;
-    order_.push_back(r);
+    RecState* r = make(fid, 0, key);
+    byKey_[k] = r;
     return r;
 }
 
-int32_t WriteCtx::loadD(RowR& x) {
+RecState* WriteCtx::bySeq(uint32_t fid, int64_t seq, int32_t* rc, const uint8_t* keyIfNew) {
+    *rc = P4_OK;
+    if (RecState* r = known(fid, seq)) return r;
+    RecState* r = make(fid, seq, nullptr);
+    *rc = loadRows(r);
+    if (*rc != P4_OK) return nullptr;
+    bySeq_[{fid, seq}] = r;
+    if (!r->existed && keyIfNew) std::memcpy(r->key, keyIfNew, 32);
+    if (r->existed || keyIfNew) byKey_[{fid, std::string(reinterpret_cast<const char*>(r->key), 32)}] = r;
+    return r;
+}
+
+int32_t WriteCtx::loadD(uint32_t fid, RowR& x) {
     if (x.hasD) return P4_OK;
-    const uint32_t fid = x.loaded ? x.fid : x.srcFid;
-    const int64_t rid = x.loaded ? x.rid : x.srcRid;
     Feed* f;
     {
         std::lock_guard<std::mutex> g(t->mu);
@@ -270,7 +227,7 @@ int32_t WriteCtx::loadD(RowR& x) {
     sqlite3_stmt* q = c->get(S_R_D);
     int r = SQLITE_ERROR;
     if (q) {
-        sqlite3_bind_int64(q, 1, rid);
+        sqlite3_bind_int64(q, 1, x.rid);
         r = sqlite3_step(q);
         if (r == SQLITE_ROW) {
             x.d.assign(static_cast<const char*>(sqlite3_column_blob(q, 0)), size_t(sqlite3_column_bytes(q, 0)));
@@ -280,18 +237,23 @@ int32_t WriteCtx::loadD(RowR& x) {
     }
     writerUnpin(e, f);
     if (r == SQLITE_ROW) return P4_OK;
-    err = "bytes of row " + std::to_string(rid) + " in " + f->path;
+    err = "bytes of row " + std::to_string(x.rid) + " in " + f->path;
     return r == SQLITE_DONE ? P4_E_CORRUPT : statusOfSqlite(r);
 }
 
 // ---- changes ------------------------------------------------------------------------------------
 namespace {
 bool sameInst(const RowR& a, const WriteCtx::Inst& i) {
-    return a.inst && a.fid == i.fid && a.batch == i.batch && a.ppeer == i.ppeer && a.pkey == i.pkey && a.ckey == i.ckey;
+    return a.inst && a.batch == i.batch && a.ppeer == i.ppeer && a.pkey == i.pkey && a.ckey == i.ckey;
+}
+void sweep(RecState* r) {
+    // New rows that are gone again (a superseded record of this write) are dropped.
+    r->rows.erase(std::remove_if(r->rows.begin(), r->rows.end(), [](const RowR& x) { return !x.loaded && x.del; }),
+                  r->rows.end());
 }
 }  // namespace
 
-// Every copy with every instance; local rows only without one.
+// Every copy with every instance of the feed (a local record: one row per copy).
 void WriteCtx::fill(RecState* r) {
     std::vector<size_t> copies;  // a representative live row per copy (token)
     std::vector<size_t> insts;   // a representative live row per instance
@@ -306,8 +268,9 @@ void WriteCtx::fill(RecState* r) {
         for (size_t c : insts) seen = seen || r->rows[c].sameInst(x);
         if (!seen) insts.push_back(i);
     }
-    // An instance's at is the earliest of its rows; its url is the one its
-    // rows carry (kept equal by deliver).
+    if (insts.empty()) return;  // local rows: one per copy, as delivered
+    // An instance's at is the earliest of its rows; its url the one its rows
+    // carry (kept equal by deliver).
     auto instAt = [&](size_t ir) {
         int64_t at = r->rows[ir].at;
         for (const RowR& x : r->rows)
@@ -315,85 +278,43 @@ void WriteCtx::fill(RecState* r) {
         return at;
     };
     std::vector<RowR> add;
-    if (!insts.empty()) {
-        for (size_t ci : copies)
-            for (size_t ii : insts) {
-                bool have = false;
-                for (const RowR& x : r->rows) have = have || (x.live() && x.tok == r->rows[ci].tok && x.sameInst(r->rows[ii]));
-                if (have) continue;
-                const RowR& c = r->rows[ci];
-                const RowR& in = r->rows[ii];
-                RowR n;
-                n.fid = in.fid;
-                n.tok = c.tok;
-                n.peer = c.peer;
-                n.inst = true;
-                n.batch = in.batch;
-                n.ppeer = in.ppeer;
-                n.pkey = in.pkey;
-                n.ckey = in.ckey;
-                n.url = in.url;
-                n.at = instAt(ii);
-                n.ts = r->ts;
-                n.len = c.len;
-                n.sig = c.sig;
-                n.fcols = c.fcols;
-                n.sealed = c.sealed;
-                if (c.hasD) {
-                    n.hasD = true;
-                    n.d = c.d;
-                } else {
-                    n.srcFid = c.loaded ? c.fid : c.srcFid;
-                    n.srcRid = c.loaded ? c.rid : c.srcRid;
-                }
-                add.push_back(std::move(n));
-            }
-        for (RowR& x : r->rows)
-            if (x.live() && !x.inst) {
-                x.del = true;
-                r->touched.insert(x.fid);
-            }
-    } else {
-        uint32_t local;
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            local = feedFor(t, "", "", true)->fid;
-        }
-        for (size_t ci : copies) {
+    for (size_t ci : copies)
+        for (size_t ii : insts) {
             bool have = false;
-            for (const RowR& x : r->rows) have = have || (x.live() && x.tok == r->rows[ci].tok && !x.inst && x.fid == local);
+            for (const RowR& x : r->rows) have = have || (x.live() && x.tok == r->rows[ci].tok && x.sameInst(r->rows[ii]));
             if (have) continue;
             const RowR& c = r->rows[ci];
-            RowR n = c;
-            n.fid = local;
-            n.inst = false;
-            n.batch.clear();
-            n.ppeer.clear();
-            n.pkey.clear();
-            n.ckey.clear();
-            n.url.clear();
+            const RowR& in = r->rows[ii];
+            RowR n;
+            n.tok = c.tok;
+            n.peer = c.peer;
+            n.inst = true;
+            n.batch = in.batch;
+            n.ppeer = in.ppeer;
+            n.pkey = in.pkey;
+            n.ckey = in.ckey;
+            n.url = in.url;
+            n.at = instAt(ii);
             n.ts = r->ts;
-            n.rid = 0;
-            n.loaded = false;
-            n.del = false;
-            n.urlSet = false;
-            n.nId = n.bId = n.cId = n.uId = 0;
-            if (!c.hasD) {
-                n.srcFid = c.loaded ? c.fid : c.srcFid;
-                n.srcRid = c.loaded ? c.rid : c.srcRid;
+            n.len = c.len;
+            n.sig = c.sig;
+            n.fcols = c.fcols;
+            n.sealed = c.sealed;
+            if (c.hasD) {
+                n.hasD = true;
+                n.d = c.d;
+            } else if (c.loaded) {
+                n.srcFid = r->fid;
+                n.srcRid = c.rid;
+            } else {
+                n.srcFid = c.srcFid;
+                n.srcRid = c.srcRid;
             }
             add.push_back(std::move(n));
         }
-    }
-    for (RowR& n : add) {
-        r->fids.insert(n.fid);
-        r->touched.insert(n.fid);
-        r->rows.push_back(std::move(n));
-    }
-    // New rows that are gone again (a seed replaced, a superseded record of
-    // this write) are dropped.
-    r->rows.erase(std::remove_if(r->rows.begin(), r->rows.end(), [](const RowR& x) { return !x.loaded && x.del; }),
-                  r->rows.end());
+    for (RowR& n : add) r->rows.push_back(std::move(n));
+    if (!add.empty()) r->touched = true;
+    sweep(r);
 }
 
 void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& insts, Out* out) {
@@ -408,9 +329,8 @@ void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& i
                 rep = x;
                 break;
             }
-    auto newRow = [&](uint32_t fid, const Inst* in) {
+    auto newRow = [&](const Inst* in) {
         RowR n;
-        n.fid = fid;
         n.tok = rep.tok;
         n.peer = rep.peer;
         n.ts = r->ts;
@@ -421,9 +341,12 @@ void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& i
         if (rep.hasD) {
             n.hasD = true;
             n.d = rep.d;
+        } else if (rep.loaded) {
+            n.srcFid = r->fid;
+            n.srcRid = rep.rid;
         } else {
-            n.srcFid = rep.loaded ? rep.fid : rep.srcFid;
-            n.srcRid = rep.loaded ? rep.rid : rep.srcRid;
+            n.srcFid = rep.srcFid;
+            n.srcRid = rep.srcRid;
         }
         if (in) {
             n.inst = true;
@@ -434,8 +357,7 @@ void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& i
             n.url = in->url;
             n.at = in->at;
         }
-        r->fids.insert(fid);
-        r->touched.insert(fid);
+        r->touched = true;
         r->rows.push_back(std::move(n));
     };
     for (const Inst& in : insts) {
@@ -447,77 +369,42 @@ void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& i
             if (x.url != in.url) {
                 x.url = in.url;
                 if (x.loaded) x.urlSet = true;
-                r->touched.insert(x.fid);
+                r->touched = true;
                 out->urlChanged = true;
             }
         }
         if (!held) out->instNew = true;
         bool row = false;
         for (const RowR& x : r->rows) row = row || (x.live() && x.tok == rep.tok && sameInst(x, in));
-        if (!row) newRow(in.fid, &in);
+        if (!row) newRow(&in);
     }
-    if (insts.empty() && !copyAt) {
-        // A copy without instances: a seed row (local); fill puts it with
-        // every instance the record has, or keeps it local.
-        uint32_t local;
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            local = feedFor(t, "", "", true)->fid;
+    // A new copy without new instances: a row with each instance the record
+    // has in this file, or one local row.
+    if (!copyAt && insts.empty()) {
+        std::vector<Inst> have;
+        for (const RowR& x : r->rows) {
+            if (!x.live() || !x.inst) continue;
+            bool seen = false;
+            for (Inst& h : have)
+                if (sameInst(x, h)) {
+                    seen = true;
+                    h.at = std::min(h.at, x.at);
+                }
+            if (!seen) have.push_back(Inst{x.batch, x.ppeer, x.pkey, x.ckey, x.url, x.at});
         }
-        newRow(local, nullptr);
+        if (have.empty()) newRow(nullptr);
+        for (const Inst& in : have) newRow(&in);
     }
     fill(r);
-}
-
-void WriteCtx::normalize(RecState* r) { fill(r); }
-
-void WriteCtx::dropFid(RecState* r, uint32_t fid) {
-    for (RowR& x : r->rows)
-        if (x.live() && x.fid == fid) {
-            x.del = true;
-            r->touched.insert(fid);
-        }
-    r->rows.erase(std::remove_if(r->rows.begin(), r->rows.end(), [](const RowR& x) { return !x.loaded && x.del; }),
-                  r->rows.end());
 }
 
 void WriteCtx::dropAll(RecState* r) {
     for (RowR& x : r->rows)
         if (x.live()) {
             x.del = true;
-            r->touched.insert(x.fid);
+            r->touched = true;
         }
-    r->rows.erase(std::remove_if(r->rows.begin(), r->rows.end(), [](const RowR& x) { return !x.loaded && x.del; }),
-                  r->rows.end());
-}
-
-void WriteCtx::touchAll(RecState* r) {
-    for (uint32_t fid : r->fids) r->touched.insert(fid);
-    for (uint32_t fid : r->loadedFids) r->touched.insert(fid);
-    for (const XEnt& x : r->before) r->touched.insert(x.fid);
-}
-
-bool entryOf(const RecState& r, uint32_t fid, XEnt* out) {
-    std::map<uint32_t, int64_t> cp;
-    int64_t len = INT64_MAX;
-    for (const RowR& x : r.rows) {
-        if (!x.live() || x.fid != fid) continue;
-        auto it = cp.find(x.tok);
-        if (it == cp.end() || x.len < it->second) cp[x.tok] = x.len;
-        len = std::min(len, x.len);
-    }
-    if (cp.empty()) return false;
-    *out = XEnt();
-    out->seq = r.seq;
-    out->fid = fid;
-    std::memcpy(out->key, r.key, 32);
-    out->len = len;
-    out->w = r.w;
-    out->k = r.k;
-    out->hasE = r.hasE;
-    out->e = r.e;
-    for (auto& kv : cp) out->cp.push_back(CopyLen{kv.first, kv.second});
-    return true;
+    sweep(r);
 }
 
 // ---- commit ---------------------------------------------------------------------------------------
@@ -527,12 +414,14 @@ int32_t WriteCtx::journalWrite() {
     // Ids this write uses that no durable record names yet.
     std::vector<std::pair<uint32_t, std::string>> feeds;
     std::vector<std::pair<uint32_t, std::string>> toks;
+    std::set<uint32_t> fids;
     int64_t reserve = 0;
     {
         std::lock_guard<std::mutex> g(t->mu);
-        std::set<uint32_t> fids, tokIds;
+        std::set<uint32_t> tokIds;
         for (RecState* r : order_) {
-            for (uint32_t fid : r->touched) fids.insert(fid);
+            if (!r->touched) continue;
+            fids.insert(r->fid);
             for (const RowR& x : r->rows) tokIds.insert(x.tok);
         }
         for (uint32_t fid : fids) {
@@ -547,7 +436,7 @@ int32_t WriteCtx::journalWrite() {
     }
     int rc = j->exec("BEGIN IMMEDIATE");
     int64_t rows = 0;
-    auto add = [&](int op, int64_t fid, int64_t seq, const void* k, size_t kn, const std::string* s, int64_t v) {
+    auto add = [&](int op, int64_t fid, const std::string* s, int64_t v) {
         if (rc != SQLITE_OK) return;
         sqlite3_stmt* q = j->get(S_J_INS);
         if (!q) {
@@ -556,9 +445,8 @@ int32_t WriteCtx::journalWrite() {
         }
         sqlite3_bind_int(q, 1, op);
         sqlite3_bind_int64(q, 2, fid);
-        sqlite3_bind_int64(q, 3, seq);
-        if (k) sqlite3_bind_blob(q, 4, k, int(kn), SQLITE_STATIC);
-        else sqlite3_bind_null(q, 4);
+        sqlite3_bind_int64(q, 3, 0);
+        sqlite3_bind_null(q, 4);
         if (s) sqlite3_bind_text(q, 5, s->data(), int(s->size()), SQLITE_STATIC);
         else sqlite3_bind_null(q, 5);
         sqlite3_bind_int64(q, 6, v);
@@ -578,18 +466,9 @@ int32_t WriteCtx::journalWrite() {
             if (r != SQLITE_DONE) rc = r;
         }
     }
-    for (auto& f : feeds) add(J_FEED, f.first, 0, nullptr, 0, &f.second, 0);
-    for (auto& d : toks) add(J_TOK, 0, 0, nullptr, 0, &d.second, d.first);
-    for (RecState* r : order_)
-        if (r->seq)
-            for (uint32_t fid : r->touched) add(J_TOUCH, fid, r->seq, r->key, 32, nullptr, 0);
-    for (const IdentNew& id : idents) {
-        if (!id.rec || !id.rec->seq) continue;
-        uint8_t k[64];
-        std::memcpy(k, id.h, 32);
-        std::memcpy(k + 32, id.rec->key, 32);
-        add(J_IDENT, 0, id.rec->seq, k, 64, nullptr, int64_t(id.src));
-    }
+    for (auto& f : feeds) add(J_FEED, f.first, &f.second, 0);
+    for (auto& d : toks) add(J_TOK, 0, &d.second, d.first);
+    for (uint32_t fid : fids) add(J_TOUCH, fid, nullptr, 0);
     if (rc == SQLITE_OK && reserve) {
         sqlite3_stmt* q = j->get(S_JM_SET);
         if (!q) rc = SQLITE_ERROR;
@@ -709,33 +588,46 @@ uint32_t internText(Conn* c, StmtId get, StmtId ins, const std::string& s, int* 
     }
     return uint32_t(sqlite3_last_insert_rowid(c->db));
 }
+
+// A record's copies over its rows (loaded = before, live = after): token ->
+// its smallest length.
+std::map<uint32_t, int64_t> copiesOf(const RecState* r, bool after) {
+    std::map<uint32_t, int64_t> m;
+    for (const RowR& x : r->rows) {
+        if (after ? x.del : !x.loaded) continue;
+        auto it = m.find(x.tok);
+        if (it == m.end() || x.len < it->second) m[x.tok] = x.len;
+    }
+    return m;
+}
 }  // namespace
 
 int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
     bool change = false;
     for (RecState* r : recs)
         for (const RowR& x : r->rows)
-            if (x.fid == f->fid && ((!x.loaded && !x.del) || (x.loaded && x.del) || (x.loaded && !x.del && x.urlSet))) change = true;
-    if (!change) return P4_OK;
+            if ((!x.loaded && !x.del) || (x.loaded && x.del) || (x.loaded && !x.del && x.urlSet)) change = true;
+    bool identWrites = false;
+    for (const IdentNew& id : idents) identWrites = identWrites || (id.rec && id.rec->fid == f->fid && id.rec->seq);
+    if (!change && !identWrites) return P4_OK;
     // The bytes new rows copy from other rows, before the transaction.
     for (RecState* r : recs)
         for (RowR& x : r->rows)
-            if (x.fid == f->fid && !x.loaded && !x.del && !x.hasD) {
-                // Its source: a loaded row of the same record.
+            if (!x.loaded && !x.del && !x.hasD) {
                 RowR* src = nullptr;
-                for (RowR& y : r->rows)
-                    if (y.loaded && y.fid == x.srcFid && y.rid == x.srcRid) src = &y;
+                if (x.srcFid == r->fid)
+                    for (RowR& y : r->rows)
+                        if (y.loaded && y.rid == x.srcRid) src = &y;
                 if (src) {
-                    const int32_t st = loadD(*src);
+                    const int32_t st = loadD(r->fid, *src);
                     if (st != P4_OK) return st;
                     x.d = src->d;
                     x.hasD = true;
                 } else {
                     RowR tmp;
                     tmp.loaded = true;
-                    tmp.fid = x.srcFid;
                     tmp.rid = x.srcRid;
-                    const int32_t st = loadD(tmp);
+                    const int32_t st = loadD(x.srcFid, tmp);
                     if (st != P4_OK) return st;
                     x.d.swap(tmp.d);
                     x.hasD = true;
@@ -764,14 +656,18 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
     }
     Counters k;
     std::map<InstId, InstCount> inst;
+    std::map<uint32_t, TokCount> tokc;
     bool indexed;
     {
         std::lock_guard<std::mutex> g(t->mu);
         k = f->k;
         inst = f->inst;
+        tokc = f->tokc;
         indexed = f->indexed;
     }
+    const std::map<uint32_t, TokCount> tokcBefore = tokc;
     std::set<InstId> changedInst;
+    std::vector<int64_t> gone;  // records that leave the file
     bool deleted = false;
     int rc = c->exec("BEGIN IMMEDIATE");
     auto bad = [&](int r) {
@@ -785,7 +681,6 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
         int64_t next = -1;
         for (RowR& x : r->rows) {
             if (rc != SQLITE_OK) break;
-            if (x.fid != f->fid) continue;
             if (x.loaded && x.del) {
                 sqlite3_stmt* q = c->get(S_R_DEL);
                 sqlite3_bind_int64(q, 1, x.rid);
@@ -849,12 +744,11 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
             }
         }
         if (rc != SQLITE_OK) break;
-        // The file's and its instances' counters: this record's rows before
-        // (as loaded) and after (live).
+        // The file's, its instances' and its tokens' counters: this record's
+        // rows before (as loaded) and after (live).
         int64_t nB = 0, nA = 0, bytesB = 0, bytesA = 0;
         std::map<InstId, InstAgg> agg;
         for (const RowR& x : r->rows) {
-            if (x.fid != f->fid) continue;
             if (x.loaded) {
                 nB++;
                 bytesB += x.len;
@@ -882,11 +776,26 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
                 }
             }
         }
+        const std::map<uint32_t, int64_t> cpB = copiesOf(r, false), cpA = copiesOf(r, true);
+        auto minLen = [](const std::map<uint32_t, int64_t>& m) {
+            int64_t v = INT64_MAX;
+            for (auto& kv : m) v = std::min(v, kv.second);
+            return m.empty() ? int64_t(0) : v;
+        };
+        auto sumLen = [](const std::map<uint32_t, int64_t>& m) {
+            int64_t v = 0;
+            for (auto& kv : m) v += kv.second;
+            return v;
+        };
         k.rows += nA - nB;
         k.bytes += bytesA - bytesB;
         const int64_t had = nB > 0, has = nA > 0;
         k.recs += has - had;
+        k.rbytes += minLen(cpA) - minLen(cpB);
+        k.copies += int64_t(cpA.size()) - int64_t(cpB.size());
+        k.cbytes += sumLen(cpA) - sumLen(cpB);
         if (sp->hasEpochRule && !r->hasE) k.nnull += has - had;
+        if (had && !has) gone.push_back(r->seq);
         if (has) {
             k.minseq = std::min(k.minseq, r->seq);
             k.maxseq = std::max(k.maxseq, r->seq);
@@ -897,6 +806,22 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
             if (r->hasE) {
                 k.mine = std::min(k.mine, r->e);
                 k.maxe = std::max(k.maxe, r->e);
+            }
+        }
+        std::set<uint32_t> toks;
+        for (auto& kv : cpA) toks.insert(kv.first);
+        for (auto& kv : cpB) toks.insert(kv.first);
+        for (uint32_t tok : toks) {
+            auto ia = cpA.find(tok), ib = cpB.find(tok);
+            const bool inA = ia != cpA.end(), inB = ib != cpB.end();
+            if (inA == inB && (!inA || ia->second == ib->second)) continue;
+            TokCount& d = tokc[tok];
+            d.n += int64_t(inA) - int64_t(inB);
+            d.bytes += (inA ? ia->second : 0) - (inB ? ib->second : 0);
+            if (inA) {
+                d.mints = std::min(d.mints, r->ts);
+                d.maxts = std::max(d.maxts, r->ts);
+                d.maxseq = std::max(d.maxseq, r->seq);
             }
         }
         for (auto& kv : agg) {
@@ -960,6 +885,28 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
         bad(sqlite3_step(q));
         sqlite3_reset(q);
     }
+    for (auto it = tokc.begin(); it != tokc.end();) {
+        if (it->second.n <= 0) it = tokc.erase(it);
+        else ++it;
+    }
+    if (rc == SQLITE_OK) rc = writeTokc(t, c, tokcBefore, tokc);
+    // Ingest identities of this file's records that hold rows after the write.
+    for (const IdentNew& id : idents) {
+        if (rc != SQLITE_OK) break;
+        if (!id.rec || id.rec->fid != f->fid || !id.rec->seq) continue;
+        bool live = false;
+        for (const RowR& rr : id.rec->rows) live = live || rr.live();
+        if (!live) continue;
+        sqlite3_stmt* q = c->get(S_IDENT_INS);
+        if (!q) {
+            rc = SQLITE_ERROR;
+            break;
+        }
+        sqlite3_bind_blob(q, 1, id.h, 32, SQLITE_STATIC);
+        sqlite3_bind_int64(q, 2, id.rec->seq);
+        bad(sqlite3_step(q));
+        sqlite3_reset(q);
+    }
     if (rc == SQLITE_OK && deleted) {
         // The bounds again (the ends of the seq and w indexes: O(log n)); a
         // file without the indexes (a migration before REBUILD 1) walks.
@@ -1003,6 +950,10 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
         std::lock_guard<std::mutex> g(f->dictMu);
         if (dict.node.size() >= f->dict.node.size() && dict.batch.size() >= f->dict.batch.size()) f->dict = std::move(dict);
     }
+    if (!gone.empty() && sp->fullText) {
+        std::lock_guard<std::mutex> g(t->ftsGoneMu);
+        t->ftsGone.insert(t->ftsGone.end(), gone.begin(), gone.end());
+    }
     std::lock_guard<std::mutex> g(t->mu);
     if (dbBytes >= 0) {
         f->dbBytes = dbBytes;
@@ -1010,6 +961,7 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
     }
     f->k = k;
     f->inst = std::move(inst);
+    f->tokc = std::move(tokc);
     f->created = true;
     return P4_OK;
 }
@@ -1017,81 +969,29 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs) {
 int32_t WriteCtx::indexCommit() {
     Conn* x = t->idx;
     if (!x) return P4_E_INTERNAL;
-    TypeCounts tc;
     std::vector<FeedSnap> snaps;
+    std::vector<std::pair<uint32_t, TokDef>> toks;
+    int64_t nextSeq;
     {
         std::lock_guard<std::mutex> g(t->mu);
-        tc = typeCountsOf(t);
-        tc.nextSeq = t->nextSeq;
+        nextSeq = t->nextSeq;
         std::set<uint32_t> fids(committedFids.begin(), committedFids.end());
         for (auto& f : t->feeds)
             if (f->registered && !f->created && f->provider.rfind("\x1f#", 0) != 0) fids.insert(f->fid);
         for (uint32_t fid : fids)
             if (Feed* f = t->feedById(fid)) snaps.push_back(feedSnapOf(f));
+        std::set<uint32_t> ids;
+        for (RecState* r : order_)
+            for (const RowR& rr : r->rows) ids.insert(rr.tok);
+        for (uint32_t id : ids)
+            if (TokDef* d = t->tokById(id)) toks.push_back({id, *d});
     }
     int rc = x->exec("BEGIN IMMEDIATE");
-    int64_t entries = 0;
-    std::vector<int64_t> gone;  // records left with no row anywhere
-    for (RecState* r : order_) {
-        if (rc != SQLITE_OK) break;
-        if (r->touched.empty() || !r->seq) continue;
-        XChange xc;
-        xc.before = r->before;
-        xc.ts = r->ts;
-        std::set<uint32_t> all;
-        for (const XEnt& b : r->before) all.insert(b.fid);
-        for (uint32_t fid : r->fids) all.insert(fid);
-        for (uint32_t fid : r->touched) all.insert(fid);
-        for (uint32_t fid : all) {
-            if (r->touched.count(fid) && committedFids.count(fid)) {
-                XEnt en;
-                if (entryOf(*r, fid, &en)) xc.after.push_back(std::move(en));
-            } else {
-                for (const XEnt& b : r->before)
-                    if (b.fid == fid) xc.after.push_back(b);
-            }
-        }
-        xCount(xc, &tc);
-        rc = xWrite(x, xc);
-        entries += int64_t(xc.after.size());
-        if (!xc.before.empty() && xc.after.empty()) gone.push_back(r->seq);
-    }
-    for (const IdentNew& id : idents) {
-        if (rc != SQLITE_OK) break;
-        if (!id.rec || !id.rec->seq) continue;
-        bool live = false;
-        for (const RowR& rr : id.rec->rows) live = live || (rr.live() && committedFids.count(rr.fid));
-        if (!live) continue;
-        sqlite3_stmt* q = x->get(S_IDENT_INS);
-        if (!q) {
-            rc = SQLITE_ERROR;
-            break;
-        }
-        sqlite3_bind_int64(q, 1, int64_t(id.src));
-        sqlite3_bind_blob(q, 2, id.h, 32, SQLITE_STATIC);
-        sqlite3_bind_int64(q, 3, id.rec->seq);
-        sqlite3_bind_blob(q, 4, id.rec->key, 32, SQLITE_STATIC);
-        const int r = sqlite3_step(q);
-        sqlite3_reset(q);
-        if (r != SQLITE_DONE) rc = r;
-    }
-    for (const FeedSnap& s : snaps) {
-        if (rc != SQLITE_OK) break;
-        rc = indexPutFeed(x, s);
-    }
-    {
-        // Tokens this write registered, with their counters.
-        std::lock_guard<std::mutex> g(t->mu);
-        for (size_t i = 0; i < t->toks.size() && i < tc.toks.size(); i++) {
-            tc.toks[i].token = t->toks[i].token;
-            tc.toks[i].peer = t->toks[i].peer;
-        }
-        for (size_t i = tc.toks.size(); i < t->toks.size(); i++) tc.toks.push_back(t->toks[i]);
-        for (RecState* r : order_)
-            for (const RowR& rr : r->rows)
-                if (rr.tok && rr.tok <= tc.toks.size()) tc.dirtyToks.insert(rr.tok);
-    }
-    if (rc == SQLITE_OK) rc = indexPutCounts(x, tc);
+    for (auto& d : toks)
+        if (rc == SQLITE_OK) rc = indexPutTok(x, d.first, d.second);
+    for (const FeedSnap& s : snaps)
+        if (rc == SQLITE_OK) rc = indexPutFeed(x, s);
+    if (rc == SQLITE_OK) rc = indexPutNextSeq(x, nextSeq);
     if (rc == SQLITE_OK) rc = x->exec("COMMIT");
     if (rc != SQLITE_OK) {
         err = std::string("type index: ") + sqlite3_errmsg(x->db) + " (" + std::to_string(rc) + ")";
@@ -1099,32 +999,30 @@ int32_t WriteCtx::indexCommit() {
         return statusOfSqlite(rc);
     }
     e->bump(kStIndexFlushes);
-    e->bump(kStIndexFlushEntries, uint64_t(entries));
-    if (!gone.empty() && sp->fullText) {
-        std::lock_guard<std::mutex> g(t->ftsGoneMu);
-        t->ftsGone.insert(t->ftsGone.end(), gone.begin(), gone.end());
-    }
+    e->bump(kStIndexFlushEntries, uint64_t(snaps.size()));
     std::lock_guard<std::mutex> g(t->mu);
-    typeCountsTo(t, tc);
     if (jlast > 0) t->jcut = jlast;
     return P4_OK;
 }
 
-int32_t WriteCtx::commit(bool journal) {
+int32_t WriteCtx::commit() {
     bool any = false;
     for (RecState* r : order_) {
-        if (!r->seq) r->touched.clear();  // a new record this write refused: never stored
-        any = any || !r->touched.empty();
+        if (!r->seq) r->touched = false;  // a new record this write refused: never stored
+        any = any || r->touched;
     }
+    for (const IdentNew& id : idents)
+        if (id.rec && id.rec->seq) {
+            id.rec->touched = true;
+            any = true;
+        }
     if (!any) return P4_OK;
-    if (journal) {
-        const int32_t rc = journalWrite();
-        if (rc != P4_OK) return rc;
-    }
-    // Feed files, then local files (a cut between them leaves rows that only add).
+    const int32_t jrc = journalWrite();
+    if (jrc != P4_OK) return jrc;
+    // Feed files, then local files.
     std::set<uint32_t> fids;
     for (RecState* r : order_)
-        for (uint32_t fid : r->touched) fids.insert(fid);
+        if (r->touched) fids.insert(r->fid);
     std::vector<uint32_t> order;
     std::vector<uint32_t> locals;
     {
@@ -1150,7 +1048,7 @@ int32_t WriteCtx::commit(bool journal) {
         }
         std::vector<RecState*> recs;
         for (RecState* r : order_)
-            if (r->touched.count(fid) && r->seq) recs.push_back(r);
+            if (r->touched && r->fid == fid && r->seq) recs.push_back(r);
         const int32_t rc = commitFile(f, recs);
         if (rc == P4_OK) {
             committedFids.insert(fid);
@@ -1164,7 +1062,7 @@ int32_t WriteCtx::commit(bool journal) {
         // The index lags the files: the journal (not cut) brings it in line.
         const std::string why = err;
         std::string rerr;
-        const int32_t rr = journal ? journalReplay(t, &rerr) : irc;
+        const int32_t rr = journalReplay(t, &rerr);
         if (rr != P4_OK) {
             std::lock_guard<std::mutex> g(t->mu);
             t->broken = true;

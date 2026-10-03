@@ -454,13 +454,12 @@ const char* stmtSql(StmtId id) {
             return "INSERT OR REPLACE INTO inst(b,c,n,bytes,minw,maxw,minseq,maxseq,first,updated,maxat,maxts,url)"
                    " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
         case S_INST_DEL: return "DELETE FROM inst WHERE b=?1 AND c=?2";
-        // type index
-        case S_X_CID: return "SELECT seq, fid, len, w, k, e, cp FROM x INDEXED BY x_c WHERE cid=?1";
-        case S_X_SEQ: return "SELECT fid, cid, len, w, k, e, cp FROM x WHERE seq=?1";
-        case S_X_PUT: return "INSERT OR REPLACE INTO x(seq,fid,cid,len,w,k,e,cp) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)";
-        case S_X_DEL: return "DELETE FROM x WHERE seq=?1 AND fid=?2";
-        case S_IDENT_GET: return "SELECT seq, cid FROM ident WHERE src=?1 AND h=?2";
-        case S_IDENT_INS: return "INSERT OR REPLACE INTO ident(src,h,seq,cid) VALUES(?1,?2,?3,?4)";
+        case S_R_CID: return "SELECT seq FROM r INDEXED BY r_c WHERE cid=?1 LIMIT 1";
+        case S_R_CIDSCAN: return "SELECT seq FROM r WHERE cid=?1 LIMIT 1";
+        case S_IDENT_GET: return "SELECT seq FROM ident WHERE h=?1";
+        case S_IDENT_INS: return "INSERT OR REPLACE INTO ident(h,seq) VALUES(?1,?2)";
+        case S_TOKC_PUT: return "INSERT OR REPLACE INTO tokc(producer,n,bytes,mints,maxts,maxseq) VALUES(?1,?2,?3,?4,?5,?6)";
+        case S_TOKC_DEL: return "DELETE FROM tokc WHERE producer=?1";
         // journal
         case S_J_INS: return "INSERT INTO j(op,fid,seq,k,s,v) VALUES(?1,?2,?3,?4,?5,?6)";
         case S_J_DEL: return "DELETE FROM j WHERE id<=?1";
@@ -482,26 +481,6 @@ void KVal::from(sqlite3_stmt* q, int col) {
     i = type == 1 ? sqlite3_column_int64(q, col) : 0;
     if (type == 3) s.assign(reinterpret_cast<const char*>(sqlite3_column_text(q, col)), size_t(sqlite3_column_bytes(q, col)));
     else s.clear();
-}
-
-// cp: [u32 tok][u64 len] per copy, token ids ascending.
-std::string cpEncode(const std::vector<CopyLen>& cp) {
-    std::string out(cp.size() * 12, '\0');
-    uint8_t* p = reinterpret_cast<uint8_t*>(&out[0]);
-    for (const CopyLen& c : cp) {
-        st32(p, c.tok);
-        st64(p + 4, uint64_t(c.len));
-        p += 12;
-    }
-    return out;
-}
-
-bool cpDecode(const void* p, size_t n, std::vector<CopyLen>* out) {
-    out->clear();
-    if (n % 12) return false;
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    for (size_t i = 0; i < n; i += 12) out->push_back(CopyLen{ld32(b + i), int64_t(ld64(b + i + 4))});
-    return true;
 }
 
 std::string nodeKey(const std::string& producer, const std::string& peer) { return producer + '\x1f' + peer; }

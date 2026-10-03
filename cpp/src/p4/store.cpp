@@ -201,8 +201,8 @@ bool markersActivated(const Markers& m) {
 }
 
 // The type index and journal: opened (made when absent), the journal's tail
-// replayed (every touched record brought in line across its feed files, the
-// index set from them) before any read (M8), the seq floor applied.
+// replayed (the touched feed files' counters mirrored into the index) before
+// any read (M8), the seq floor applied.
 int32_t typeFilesOpen(Type* t, std::string* err) {
     int32_t rc = typeIndexOpen(t, err);
     if (rc != P4_OK) return rc;
@@ -238,8 +238,8 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
     t->pJnl = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".jnl");
     t->pFts = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".fts");
     t->pSpec = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".spec");
-    // Every feed file of a type is written by one writer thread: a record's
-    // rows across its feeds commit in order on it.
+    // Every feed file of a type is written by one writer thread (one writer
+    // per file).
     t->owner = e->cfg.writers ? e->nextOwner.fetch_add(1) % e->cfg.writers : 0;
     {
         std::lock_guard<std::mutex> g(t->mu);
@@ -462,7 +462,7 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
             *err = "the epoch rule of a type with data cannot change (C-5)";
             return P4_E_FORMAT;
         }
-        // Rows keep the object key (r.k, r_ke, x_k) and sealed records their
+        // Rows keep the object key (r.k, r_ke) and sealed records their
         // COL values from the rules they were written under.
         if (hasData && cur->keyRules != spec->keyRules) {
             *err = "the object and col rules of a type with data cannot change (C-5)";

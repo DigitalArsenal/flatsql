@@ -2,9 +2,11 @@
 // engine ingests (three producers, three feeds: two source feeds and the
 // local file, the same records in more than one feed, copies, batch
 // supersede, quota) until it is killed at a random point; the parent reopens
-// the store and checks it: integrity_check on every file, one seq per CID
-// across the feed files, every row found by CID, the record count, REBUILD 8
-// (the type index against the files) and seqs above the old ones.
+// the store and checks it: integrity_check on every file, one seq per CID in
+// each feed file (C-38: a record of two feeds is a row set in each, with its
+// own seq), every CID found by GET, the record count (once per feed),
+// REBUILD 8 (each file's counters and the type index's mirrors against the
+// rows) and seqs above the old ones.
 // The loop's two halves (t_kill_run, t_kill_check) are also tests of their
 // own, so the wasm build's host drives the same loop (scripts/p4-wasm-suite.mjs).
 #include <unistd.h>
@@ -90,8 +92,8 @@ std::vector<uint8_t> killFrame(uint64_t id) {
                                    Field::raw("BODY", std::vector<uint8_t>(160, uint8_t(id)))});
 }
 
-// The feeds a call writes to (C-37): 0 prov@src, 1 prov@src2, 2 the local
-// file (no tag).
+// The feeds a call writes to (C-37, C-38): 0 prov@src, 1 prov@src2, 2 the
+// local file (no tag).
 Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from, int n, int feed = 0) {
     Batch b;
     b.type = "PNM";
@@ -110,12 +112,11 @@ Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from
 
 // One step of the workload the kill lands in: 3 producers, call c to feed
 // c % 3; every 5th call repeats earlier records under another producer and
-// often another feed (copies; the same record in two feed files); every 4th
-// call (from the second) sends the same new records from all three
-// producers at once, each to its own feed (concurrent copies across feed
-// files: one seq per CID, §3.8.2; 50-record calls); every 13th call
-// supersedes a batch of prov@src and every 11th deletes the oldest arrivals
-// down to a 4 MiB quota.
+// often another feed (copies; the same record in two feed files, a row set
+// in each); every 4th call (from the second) sends the same new records from
+// all three producers at once, each to its own feed (50-record calls);
+// every 13th call supersedes a batch of prov@src and every 11th deletes the
+// oldest arrivals down to a 4 MiB quota.
 void killWorkStep(int c, uint64_t* id) {
     Batch b = killBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), *id, 500, c % 3);
     if (c % 5 == 4)
@@ -182,8 +183,9 @@ bool killCheck(const std::string& root, std::string* why) {
         closeEngine();
         return false;
     }
-    std::unordered_set<std::string> distinct;
-    std::map<std::string, int64_t> diskSeq;  // one seq per CID in every feed file
+    std::unordered_set<std::string> distinct;   // CIDs over every feed file
+    std::map<std::string, int64_t> diskSeq;      // (file, CID) -> its one seq in that file
+    std::map<std::pair<std::string, int64_t>, std::string> seqCid;  // (file, seq) -> its one CID
     int64_t rows = 0, maxSeq = 0, missing = 0, diskSplit = 0;
     size_t files = 0;
     std::vector<std::vector<uint8_t>> sample;
@@ -200,10 +202,13 @@ bool killCheck(const std::string& root, std::string* why) {
         sqlite3_prepare_v2(db, "SELECT seq, cid FROM r", -1, &q, nullptr);
         while (sqlite3_step(q) == SQLITE_ROW) {
             rows++;
-            maxSeq = std::max<int64_t>(maxSeq, sqlite3_column_int64(q, 0));
+            const int64_t seq = sqlite3_column_int64(q, 0);
+            maxSeq = std::max<int64_t>(maxSeq, seq);
             const std::string key(static_cast<const char*>(sqlite3_column_blob(q, 1)), 32);
-            const auto ds = diskSeq.emplace(key, sqlite3_column_int64(q, 0));
-            if (ds.first->second != sqlite3_column_int64(q, 0)) diskSplit++;
+            const auto ds = diskSeq.emplace(f + "|" + key, seq);
+            if (ds.first->second != seq) diskSplit++;
+            const auto sc = seqCid.emplace(std::make_pair(f, seq), key);
+            if (sc.first->second != key) diskSplit++;
             if (distinct.insert(key).second) {
                 uint8_t d[32], c[36] = {0x01, 0x55, 0x12, 0x20};
                 fp::cidDigestFromKey(reinterpret_cast<const uint8_t*>(key.data()), d);
@@ -214,7 +219,7 @@ bool killCheck(const std::string& root, std::string* why) {
         sqlite3_finalize(q);
         sqlite3_close(db);
     }
-    // every row on disk is found by CID, and every copy of a CID has its one seq
+    // every CID on disk is found by GET (its first feed file's row set: one seq)
     int64_t split = 0;
     for (size_t i = 0; i < sample.size(); i += 512) {
         std::vector<std::vector<uint8_t>> part(sample.begin() + long(i), sample.begin() + long(std::min(sample.size(), i + 512)));
@@ -246,11 +251,12 @@ bool killCheck(const std::string& root, std::string* why) {
     if (nodesLeft) std::fprintf(stderr, "  check: %lld VFS nodes left open after close\n", (long long)nodesLeft);
     char buf[256];
     std::snprintf(buf, sizeof buf,
-                  "files %zu rows %lld distinct %zu count %lld missing %lld split %lld disk-split %lld mismatches %lld above %d nodes %lld",
-                  files, (long long)rows, distinct.size(), (long long)count, (long long)missing, (long long)split, (long long)diskSplit,
+                  "files %zu rows %lld cids %zu records %zu count %lld missing %lld split %lld disk-split %lld mismatches %lld above %d nodes %lld",
+                  files, (long long)rows, distinct.size(), diskSeq.size(), (long long)count, (long long)missing, (long long)split,
+                  (long long)diskSplit,
                   (long long)mism, int(above), (long long)nodesLeft);
     *why = buf;
-    return missing == 0 && split == 0 && diskSplit == 0 && count == int64_t(distinct.size()) && mism == 0 && above && nodesLeft == 0;
+    return missing == 0 && split == 0 && diskSplit == 0 && count == int64_t(diskSeq.size()) && mism == 0 && above && nodesLeft == 0;
 }
 }  // namespace
 

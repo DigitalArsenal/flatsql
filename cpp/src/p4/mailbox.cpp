@@ -189,7 +189,6 @@ void P4Engine::wake(uint32_t thread) {
 void P4Engine::kickMaintenance() { wake(maintThread); }
 
 P4Lane::~P4Lane() {
-    for (auto& kv : idx) delete kv.second;
 }
 
 namespace flatsql {

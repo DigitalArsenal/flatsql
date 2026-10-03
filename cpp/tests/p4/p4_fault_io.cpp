@@ -13,10 +13,12 @@
 //   - every record whose PUT was acknowledged is there, and every
 //     acknowledged tag instance still lists its source (C-4: the ack follows
 //     the commit, so a power loss cannot take it);
-//   - REBUILD 8 finds no mismatch (the type index against the files, and
-//     PRAGMA integrity_check on every file, C-27);
-//   - the count equals the distinct CIDs a full scan returns, and no VFS
-//     node is left open after the close.
+//   - REBUILD 8 finds no mismatch (each feed file's counters and the type
+//     index's mirrors against the rows, and PRAGMA integrity_check on every
+//     file, C-27);
+//   - the count equals the records a full scan returns (C-38: a record of
+//     two feeds once per feed; each answer its own seq), and no VFS node is
+//     left open after the close.
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -138,8 +140,10 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked,
             if (!have.count(cidText(reinterpret_cast<const uint8_t*>(inst[k].first.data())) + "|" + inst[k].second)) instLost++;
     }
     if (instLost) ck.fail("acknowledged tag instances lost: " + std::to_string(instLost));
-    // count = distinct CIDs of a full scan
+    // count = the records of a full scan (once per feed), each its own seq
     std::set<std::string> distinct;
+    std::set<int64_t> seqs;
+    int64_t scanned = 0;
     int64_t after = 0;
     for (;;) {
         TlvW sc;
@@ -151,6 +155,8 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked,
         }
         for (size_t i = 0; i < r.rows.size(); i++) {
             distinct.insert(r.s(i, "cid"));
+            seqs.insert(r.i(i, "seq"));
+            scanned++;
             after = std::max(after, r.i(i, "seq"));
         }
         if (r.rows.size() < 5000) break;
@@ -158,9 +164,9 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked,
     TlvW s1;
     s1.u8(45, 1).text(1, "PNM");
     Result s = call(P4_OPC_SUMMARY, s1.b);
-    const int64_t count = s.rows.size() == 1 ? s.i(0, "records") : (distinct.empty() ? 0 : -1);
-    if (count != int64_t(distinct.size()))
-        ck.fail("count " + std::to_string(count) + " vs distinct " + std::to_string(distinct.size()));
+    const int64_t count = s.rows.size() == 1 ? s.i(0, "records") : (scanned == 0 ? 0 : -1);
+    if (count != scanned) ck.fail("count " + std::to_string(count) + " vs scanned " + std::to_string(scanned));
+    if (int64_t(seqs.size()) != scanned) ck.fail("scanned " + std::to_string(scanned) + " records, " + std::to_string(seqs.size()) + " seqs");
     TlvW rb;
     rb.u32(63, 8);
     Result v = call(P4_OPC_REBUILD, rb.b);
@@ -213,7 +219,7 @@ P4_SLOW_TEST(t_power_loss) {
                     Batch b;
                     b.type = "PNM";
                     b.peer = "12D3KooWFault" + std::to_string(pi);
-                    // three feeds (C-37): prov@src, prov@src2 and the local file
+                    // three feeds (C-37, C-38): prov@src, prov@src2 and the local file
                     const int feed = (c + pi) % 3;
                     const std::string src = feed == 0 ? "src" : "src2";
                     if (feed < 2) b.tags.push_back(Tag{"prov", src, "", "b" + std::to_string(c % 5), "", "", ""});

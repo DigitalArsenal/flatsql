@@ -1,29 +1,29 @@
 // FlatSQL store format 4 ("p4"): engine internals.
 //
-// One SQLite file per SOURCE FEED x standard (CONTRACT C-37, owner layout of
-// 2026-10-02): P/<TYPE>/<feed>.db, where a feed is a record's (provider,
-// source) tag pair; a record with no source lives in P/<TYPE>/local.db.
-// SQLite 3.53.4 unmodified, every file through FlatSQL's own VFS
-// (flatsql_io). The interfaces are CONTRACT.md §1-§4; docs/STORE-FORMAT-4.md
-// is the as-built description.
+// One SQLite file per SOURCE FEED x standard (CONTRACT C-37, C-38, owner
+// layout of 2026-10-02): P/<TYPE>/<feed>.db, where a feed is a record's
+// (provider, source) tag pair; a record with no source lives in
+// P/<TYPE>/local.db. SQLite 3.53.4 unmodified, every file through FlatSQL's
+// own VFS (flatsql_io). The interfaces are CONTRACT.md §1-§4;
+// docs/STORE-FORMAT-4.md is the as-built description.
 //
-// A row of a feed file is one delivery of a record: one copy of it (the
-// publishing node: the producer token and peer that stored it, with the tag's
-// producer peer and key) in one batch of that feed. A row keeps the record
-// bytes verbatim, its signature, epoch, object key, ts, the delivery's `at`,
-// and small per-file ids for the node, the batch, the content key and the
-// url. No provider or source string is in a row: the file is the feed.
-// The same record from two feeds is a row in each feed's file under one seq.
-// Within a feed file the rows of a record are its copies x its instances
-// (every copy of a record appears with every one of its instances in the
-// feed), so a batch supersede of one feed file never loses a copy the record
-// keeps elsewhere.
+// A feed file is its own table: a record is identified within it by its CID
+// (the file's one CID index) and its seq; there is no cross-feed identity
+// (C-38). A record that arrives through a second feed is a new row set in
+// that feed's file with its own seq (ingest); a migrated record keeps format
+// 1's rowid as its seq in every feed holding it. Within a feed file the rows
+// of a record are its copies x its instances (every copy, the publishing
+// node, with every instance, a batch and content key of the feed); local
+// rows carry no instance. A row keeps the record bytes verbatim, its
+// signature, epoch, object key, ts, the delivery's `at`, and small per-file
+// ids for the node, the batch, the content key and the url. No provider or
+// source string is in a row: the file is the feed.
 //
 // Layout under the root (<data>/fsql4):
 //   STORE, MIGRATED                      markers (§2.2)
 //   T/TYPES                              registered type names (append-only records with a crc)
 //   T/<TYPE>.spec                        the registered spec TLV, plus a crc tag
-//   T/<TYPE>.idx                         type index: feeds, tokens, x (one entry per record x feed), ident, counters
+//   T/<TYPE>.idx                         type index: the feed and token registries, each feed's counters, next seq
 //   T/<TYPE>.jnl                         intent journal (synchronous=FULL)
 //   T/<TYPE>.fts                         FTS5 (background)
 //   P/<TYPE>/<feed>.db                   one file per source feed of the type
@@ -178,9 +178,7 @@ enum StmtId : int {
     // feed file
     S_R_SEQ, S_R_SEQD, S_R_D, S_R_INS, S_R_DEL, S_R_URL, S_R_MAXRID, S_META_SET,
     S_NODE_INS, S_BATCH_INS, S_CKEY_GET, S_CKEY_INS, S_URL_GET, S_URL_TEXT, S_URL_INS, S_CKEY_TEXT,
-    S_INST_PUT, S_INST_DEL,
-    // type index
-    S_X_CID, S_X_SEQ, S_X_PUT, S_X_DEL, S_IDENT_GET, S_IDENT_INS,
+    S_INST_PUT, S_INST_DEL, S_R_CID, S_R_CIDSCAN, S_IDENT_GET, S_IDENT_INS, S_TOKC_PUT, S_TOKC_DEL,
     // journal
     S_J_INS, S_J_DEL, S_JM_SET,
     S_COUNT
@@ -256,12 +254,19 @@ struct InstCount {
 using InstId = std::pair<uint32_t, uint32_t>;  // (batch id, ckey id; 0 = "")
 
 // A feed file's counters, committed in its meta with its rows. Exact: rows,
-// recs (records), bytes (over rows), nnull (records without an epoch).
-// Bounds: the rest.
+// recs (records), bytes (over rows), nnull (records without an epoch), rbytes
+// (each record's smallest copy), copies (record x copy) and cbytes (each
+// copy's bytes). Bounds: the rest.
 struct Counters {
-    int64_t rows = 0, recs = 0, bytes = 0, nnull = 0;
+    int64_t rows = 0, recs = 0, bytes = 0, nnull = 0, rbytes = 0, copies = 0, cbytes = 0;
     int64_t minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN;
     int64_t mints = INT64_MAX, maxts = 0, mine = INT64_MAX, maxe = INT64_MIN;
+};
+
+// A producer token's copies in one feed file (exact: n, bytes; bounds: the
+// rest), committed in the file's tokc table with its rows.
+struct TokCount {
+    int64_t n = 0, bytes = 0, mints = INT64_MAX, maxts = 0, maxseq = 0;
 };
 
 struct Feed {
@@ -272,7 +277,8 @@ struct Feed {
     bool local = false;
     // Type::mu
     Counters k;
-    std::map<InstId, InstCount> inst;  // live instances (n > 0)
+    std::map<InstId, InstCount> inst;   // live instances (n > 0)
+    std::map<uint32_t, TokCount> tokc;  // type token id -> its copies in this file (n > 0)
     bool created = false;      // exists on disk with its schema (readers skip it until then)
     bool quarantined = false;  // corrupt: P4_E_CORRUPT for ops that need it
     bool indexed = true;       // secondary indexes present (false between a migration's append and REBUILD 1)
@@ -288,10 +294,10 @@ struct Feed {
     bool inLru = false;
 };
 
-// A producer token of the type (a copy's identity), with its copies' counters.
+// A producer token of the type (a copy's identity). Type-wide ids, in
+// registration order: the lowest id is the first copy (C-12).
 struct TokDef {
     std::string token, peer;
-    int64_t n = 0, bytes = 0, mints = INT64_MAX, maxts = 0, maxseq = 0;
     bool registered = false;  // in the journal or the type index
 };
 
@@ -307,7 +313,7 @@ struct Spec {
     uint8_t epochProfile = 0;
     bool fullText = false;
     bool hasEpochRule = false;
-    bool hasObject = false;     // an object rule: r.k, indexed r_ke(k, e) and x_k
+    bool hasObject = false;     // an object rule: r.k, indexed r_ke(k, e)
     bool hasSupersede = false;  // supersede-on-ingest (CAT)
     bool ek = false;            // epoch + object: EPOCH points by one seek per object
     std::string epochRule;      // the epoch line (C-5)
@@ -317,6 +323,14 @@ struct Spec {
 int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::string* err);
 
 struct WriteTask;
+
+// The type's totals over its feed files (C-38 (5): a record held by N feeds
+// counts once per feed).
+struct TypeTotals {
+    int64_t recs = 0, rbytes = 0, copies = 0, cbytes = 0;
+    int64_t mine = INT64_MAX, maxe = INT64_MIN, mints = INT64_MAX, maxts = 0, maxseq = 0;
+    std::vector<TokCount> toks;  // index token id-1, summed over the feeds
+};
 
 struct Type {
     Engine* e = nullptr;
@@ -338,8 +352,6 @@ struct Type {
     std::unordered_map<std::string, uint32_t> feedByKey;  // provider \x1f source -> fid
     std::vector<TokDef> toks;                              // index id-1
     std::unordered_map<std::string, uint32_t> tokByToken;
-    int64_t uniq = 0, uniqBytes = 0, copies = 0, copyBytes = 0;
-    int64_t mine = INT64_MAX, maxe = INT64_MIN, mints = INT64_MAX, maxts = 0, maxseq = 0;  // bounds
     int64_t nextSeq = 1;
     int64_t seqReserved = 0;
     std::atomic<int64_t> vis{0};  // visible-through (B2)
@@ -359,8 +371,9 @@ struct Type {
     struct Conn* fts = nullptr;
     int64_t ftsThrough = 0;
     uint8_t ftsState = 0;  // 0 off, 1 building, 2 ready
-    // Records gone (no row in any feed file) since the full text last caught
-    // up: their full-text rows are deleted by the long-work thread.
+    // Seqs whose row set left a feed file since the full text last caught up:
+    // their full-text rows are deleted by the long-work thread (a migrated
+    // seq only once no feed file holds it).
     std::mutex ftsGoneMu;
     std::vector<int64_t> ftsGone;
 
@@ -371,26 +384,9 @@ struct Type {
 
     Feed* feedById(uint32_t fid) { return fid >= 1 && fid <= feeds.size() ? feeds[fid - 1].get() : nullptr; }
     TokDef* tokById(uint32_t id) { return id >= 1 && id <= toks.size() ? &toks[id - 1] : nullptr; }
-    void visRecompute();  // mu held
+    void visRecompute();   // mu held
+    TypeTotals totals();   // mu held
 };
-
-// ---- the type index's entry: one per (record, feed file) -------------------------------------
-struct CopyLen {
-    uint32_t tok;
-    int64_t len;
-};
-struct XEnt {
-    int64_t seq = 0;
-    uint32_t fid = 0;
-    uint8_t key[32] = {};
-    int64_t len = 0, w = 0;
-    KVal k;
-    bool hasE = false;
-    int64_t e = 0;
-    std::vector<CopyLen> cp;  // the copies whose rows are in this feed (token id ascending)
-};
-std::string cpEncode(const std::vector<CopyLen>& cp);
-bool cpDecode(const void* p, size_t n, std::vector<CopyLen>* out);
 
 // ---- mailbox (§3.4) ---------------------------------------------------------------------------
 struct alignas(64) SlotHeader {
@@ -450,7 +446,7 @@ struct Internal {
     int32_t status = P4_OK;
     std::string err;
     int64_t a = 0, b = 0;  // QUOTA: records, bytes; REBUILD: entries, mismatches
-    std::vector<int64_t> seqs;  // QUOTA: the seqs to delete
+    std::vector<std::pair<uint32_t, int64_t>> seqs;  // QUOTA: the (feed, seq) row sets to delete
     uint32_t what = 0;          // REBUILD
     std::string firstBad;       // REBUILD 8: the first damaged file
 };
@@ -612,7 +608,6 @@ struct P4Lane {
     std::vector<P4TypeInfo> typeInfos;
     std::vector<std::string> srcStore;
     std::vector<const char*> srcPtrs;
-    std::unordered_map<flatsql::p4::Type*, flatsql::p4::Conn*> idx;  // type-index readers
     std::vector<uint8_t> out;  // pending output bytes (RB1)
     ~P4Lane();
 };
@@ -636,56 +631,30 @@ uint32_t tokFor(Type* t, const std::string& token, const std::string& peer, bool
 std::string pathJoin(const std::string& a, const std::string& b);
 
 // ---- journal.cpp ------------------------------------------------------------------------------
-// J_FEED and J_TOK register ids; J_TOUCH names a (record, feed file) a write
-// changes; J_IDENT an ingest identity. A write journals them (synchronous=FULL)
-// before its first file commit; open replays the tail: every touched record
-// is brought in line across its files and the type index is set from them.
-enum JOp : int { J_FEED = 1, J_TOK = 2, J_TOUCH = 3, J_IDENT = 4 };
+// J_FEED and J_TOK register ids; J_TOUCH names a feed file a write changes.
+// A write journals them (synchronous=FULL) with the seq reservation before
+// its first file commit; open replays the tail: the ids are registered and
+// every touched feed file's counters (committed with its rows) are mirrored
+// into the type index.
+enum JOp : int { J_FEED = 1, J_TOK = 2, J_TOUCH = 3 };
 int32_t journalOpen(Type* t, std::string* err);
 int32_t journalReplay(Type* t, std::string* err);  // at open, before any read (M8); also after a failed index commit
 
 // ---- type_index.cpp -----------------------------------------------------------------------------
-int32_t typeIndexOpen(Type* t, std::string* err);  // load the registry and counters
-// The entries of a CID / of a seq.
-int32_t xOfCid(Conn* c, const uint8_t key[32], std::vector<XEnt>* out);
-int32_t xOfSeq(Conn* c, int64_t seq, std::vector<XEnt>* out);
-// A type-index reader connection for the lane; nullptr with *rc = P4_OK when
-// the type has no index yet (no data).
-Conn* indexReader(P4Lane* L, Type* t, int32_t* rc);
-// The holder of an ingest identity (seq 0 when none).
-int32_t identGet(Conn* c, uint64_t src, const uint8_t h[32], int64_t* seq, uint8_t cid[32]);
-uint64_t identSrcOf(const std::string& provider, const std::string& source);
-
-// One record's type-level change: its entries before and after (every feed
-// file holding it). xCount moves the counters in a TypeCounts copy (the
-// writer's, stored into the Type under its mu after the index commit);
-// xWrite writes the index rows (in the caller's index transaction).
-struct XChange {
-    std::vector<XEnt> before, after;
-    int64_t ts = 0;  // the record's ts (bounds of an added record)
-};
-struct TypeCounts {
-    int64_t uniq = 0, uniqBytes = 0, copies = 0, copyBytes = 0;
-    int64_t mine = INT64_MAX, maxe = INT64_MIN, mints = INT64_MAX, maxts = 0, maxseq = 0, nextSeq = 1;
-    std::vector<TokDef> toks;  // index id-1
-    std::set<uint32_t> dirtyToks;  // tokens whose counters (or registration) this write changes
-};
-TypeCounts typeCountsOf(Type* t);             // Type::mu held
-void typeCountsTo(Type* t, const TypeCounts& c);  // Type::mu held
-void xCount(const XChange& x, TypeCounts* tc);
-int xWrite(Conn* idx, const XChange& x);  // SQLite rc
-// A feed's mirror in the type index (its counters and live instances).
+int32_t typeIndexOpen(Type* t, std::string* err);  // load the registries and the feeds' counters
+// A feed's mirror in the type index (its counters, live instances and tokens).
 struct FeedSnap {
     uint32_t fid = 0;
     std::string provider, source, name;
     Counters k;
     bool indexed = true;
     std::map<InstId, InstCount> inst;
+    std::map<uint32_t, TokCount> tokc;
 };
 FeedSnap feedSnapOf(Feed* f);  // Type::mu held
-int indexPutFeed(Conn* idx, const FeedSnap& f);       // SQLite rc
-int indexPutCounts(Conn* idx, const TypeCounts& c);  // the meta counters and the dirty tokens
-int indexPutTok(Conn* idx, uint32_t id, const TokDef& d);
+int indexPutFeed(Conn* idx, const FeedSnap& f);           // SQLite rc
+int indexPutTok(Conn* idx, uint32_t id, const TokDef& d);  // the registry row
+int indexPutNextSeq(Conn* idx, int64_t nextSeq);
 
 // ---- partition.cpp (feed files) -------------------------------------------------------------------
 // The writer connection of a feed file (made with its schema on first use), pinned for the caller.
@@ -696,6 +665,8 @@ int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes);
 int writeMeta(Conn* c, const Counters& k, int64_t now);  // in the caller's write transaction; SQLite rc
 int readMeta(Conn* c, Counters* k, bool* indexed);       // SQLite rc
 int readInst(Feed* f, Conn* c, std::map<InstId, InstCount>* out);  // SQLite rc; strings from the file's dictionary
+int readTokc(Type* t, Conn* c, std::map<uint32_t, TokCount>* out);  // SQLite rc; tokens registered as needed
+int writeTokc(Type* t, Conn* c, const std::map<uint32_t, TokCount>& before, const std::map<uint32_t, TokCount>& after);
 // The dictionary of a feed file, loaded through c (any connection of the
 // file) when needed. Returns false on a read error.
 bool dictEnsure(Feed* f, Conn* c);
@@ -703,13 +674,16 @@ bool dictNode(Feed* f, Conn* c, uint32_t id, NodeDef* out);
 bool dictBatch(Feed* f, Conn* c, uint32_t id, BatchDef* out);
 std::string dictCkey(Conn* c, uint32_t id);  // "" for 0
 std::string dictUrl(Conn* c, uint32_t id);   // "" for 0
+// The seq of a CID in a feed file (0: none; through r_c, or a walk before REBUILD 1).
+int32_t seqOfCid(Conn* c, bool indexed, const uint8_t key[32], int64_t* seq);
+// Whether a feed file holds rows of seq (its rid range).
+int32_t fileHoldsSeq(Conn* c, int64_t seq, bool* held);
 void putGroup(P4Engine* e, uint32_t writer, Type* t, std::vector<WriteTask*>& tasks);
 // The supersede identity of a stored record (unsealed bytes only).
 std::string identityOf(const ps::TypeConfig& tc, const uint8_t* d, size_t n);
 
-// ---- record.cpp: a record's rows across its feed files, changed and committed ------------------
+// ---- record.cpp: a record's rows in one feed file, changed and committed --------------------------
 struct RowR {
-    uint32_t fid = 0;
     int64_t rid = 0;  // 0: a new row (its rid is assigned at the commit)
     uint32_t tok = 0;          // the copy (type token id)
     std::string peer;          // the copy's peer
@@ -730,29 +704,27 @@ struct RowR {
     uint32_t nId = 0, bId = 0, cId = 0, uId = 0;  // its file's ids (an existing row)
     bool live() const { return !del; }
     bool sameInst(const RowR& o) const {
-        return fid == o.fid && inst == o.inst && batch == o.batch && ppeer == o.ppeer && pkey == o.pkey && ckey == o.ckey;
+        return inst == o.inst && batch == o.batch && ppeer == o.ppeer && pkey == o.pkey && ckey == o.ckey;
     }
 };
+// A record in one feed file: its rows there (one rid range).
 struct RecState {
+    uint32_t fid = 0;
     uint8_t key[32] = {};
     int64_t seq = 0;
-    bool existed = false;  // in the type before this write
+    bool existed = false;  // rows in the file before this write
     bool hasE = false;
     int64_t e = 0, ts = 0, w = 0;
     KVal k;
-    std::vector<XEnt> before;  // its index entries before
-    std::vector<RowR> rows;    // its rows: loaded, then changed
-    std::set<uint32_t> fids;   // feed files it has rows in (before), or gets rows in
-    std::set<uint32_t> touched;  // feed files whose rows (or index entry) this write changes
-    std::set<uint32_t> loadedFids;
+    std::vector<RowR> rows;  // loaded, then changed
+    bool touched = false;    // this write changes its rows
 };
-// An ingest identity a write registers (IQC): (src, h) -> the record.
+// An ingest identity a write registers (IQC) in a feed file: h -> the record.
 struct IdentNew {
-    uint64_t src;
     uint8_t h[32];
     RecState* rec;
 };
-// One type's write context (the type's writer thread, or open's replay).
+// One type's write context (the type's writer thread).
 class WriteCtx {
 public:
     WriteCtx(Engine* e, Type* t);
@@ -761,17 +733,18 @@ public:
     Type* t;
     std::shared_ptr<const Spec> sp;
     std::string err;
-    // A record by CID key / by seq: loaded from the type index and its files
-    // (nullptr with *rc on an error). A key with no entry is a new record.
-    RecState* byKey(const uint8_t key[32], int32_t* rc);
-    RecState* bySeq(int64_t seq, int32_t* rc, const std::set<uint32_t>* moreFids = nullptr);
-    RecState* known(int64_t seq);  // already loaded by this write
-    int32_t loadD(RowR& r);  // the stored bytes of an existing row
-    // A delivery: copy `copy.tok` (its data in `copy`, used when the copy is
-    // new) with the given instances. Every copy of the record then appears
-    // with every instance in each feed (local rows when it has none).
+    // A record of a feed file by CID key / by seq, loaded with its rows
+    // (nullptr with *rc on an error). A key or seq with no rows is a new
+    // record of that file.
+    RecState* byKey(uint32_t fid, const uint8_t key[32], int32_t* rc);
+    RecState* bySeq(uint32_t fid, int64_t seq, int32_t* rc, const uint8_t* keyIfNew = nullptr);
+    RecState* known(uint32_t fid, int64_t seq);  // already loaded by this write
+    int32_t loadD(uint32_t fid, RowR& r);         // the stored bytes of an existing row
+    // A delivery to the record's file: copy `copy.tok` (its data in `copy`,
+    // used when the copy is new) with the given instances of the file's feed.
+    // Every copy of the record then appears with every instance (local rows
+    // carry none).
     struct Inst {
-        uint32_t fid;
         std::string batch, ppeer, pkey, ckey, url;
         int64_t at;
     };
@@ -779,31 +752,27 @@ public:
         bool copyNew = false, instNew = false, urlChanged = false;
     };
     void deliver(RecState* r, const RowR& copy, const std::vector<Inst>& insts, Out* out);
-    void normalize(RecState* r);  // every copy with every instance; local rows only without one
-    void dropFid(RecState* r, uint32_t fid);  // every row of the record in that feed
     void dropAll(RecState* r);
-    void touchAll(RecState* r);  // its entries are rewritten from its rows (replay, repair)
     const std::vector<RecState*>& records() const { return order_; }
-    // Journal (unless at replay: the journal's own rows), files, index.
-    int32_t commit(bool journal);
+    // Journal, the feed files (feeds before local), then the type index.
+    int32_t commit();
     bool migrate = false;  // migrate mode: instance times are the caller's (C-36), new files without indexes
     int64_t now = 0;
     std::vector<IdentNew> idents;
     std::set<uint32_t> committedFids, failedFids;
     int64_t jlast = 0;  // the journal id this write ended at
 private:
-    int32_t loadRows(RecState* r, uint32_t fid);
+    RecState* make(uint32_t fid, int64_t seq, const uint8_t* key);
+    int32_t loadRows(RecState* r);
     int32_t journalWrite();
     int32_t commitFile(Feed* f, const std::vector<RecState*>& recs);
     int32_t indexCommit();
     void fill(RecState* r);
     std::deque<RecState> store_;
     std::vector<RecState*> order_;
-    std::unordered_map<std::string, RecState*> byKey_;
-    std::unordered_map<int64_t, RecState*> bySeq_;
+    std::map<std::pair<uint32_t, std::string>, RecState*> byKey_;
+    std::map<std::pair<uint32_t, int64_t>, RecState*> bySeq_;
 };
-// The x entry of a record in one feed file from its live rows (false: none).
-bool entryOf(const RecState& r, uint32_t fid, XEnt* out);
 
 // ---- remove.cpp ----------------------------------------------------------------------------------
 void supersedeOp(P4Engine* e, Type* t, WriteTask* task);
