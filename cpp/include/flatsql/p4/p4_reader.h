@@ -12,7 +12,9 @@ enum { P4_ORDER_SEQ_ASC = 1, P4_ORDER_SEQ_DESC = 2, P4_ORDER_W_DESC = 3, P4_ORDE
        /* SCAN over the mailbox only (C-39; p4_cursor_open refuses them): format 1's two-part pages, the
         * tagged records (feed files) in the order with the offset, then, without a lane filter, the
         * untagged (local) records from the start. NEWEST: delivery time desc, CID asc; local ts desc,
-        * CID asc. RECENT: delivery time desc, seq desc; local seq desc. W_ASC: w asc, CID asc. */
+        * CID asc. RECENT: delivery time desc, seq desc; local seq desc. In NEWEST and RECENT a tagged
+        * record's tag is the instance it is ordered by, its newest matching one (C-41 N9).
+        * W_ASC: w asc, CID asc. */
        P4_ORDER_NEWEST = 5, P4_ORDER_RECENT = 6, P4_ORDER_W_ASC = 7 };
 enum { P4_F_EPOCH = 1, P4_F_TS = 2, P4_F_W = 3, P4_F_EPOCH_DAY = 4,
        P4_F_COL0 = 10, P4_F_COL1 = 11, P4_F_COL2 = 12, P4_F_COL3 = 13 };

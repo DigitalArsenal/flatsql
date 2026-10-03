@@ -17,9 +17,11 @@
 // candidates is resolved by reading each record's rows (one rid range of its
 // file, one read transaction per file); a record answers with the first
 // matching row's copy (the lowest token) and the earliest matching instance
-// of its feed. provider and source come from the row's feed file, batch and
-// the rest from the row's ids: never blank when the record has a tag. A CID
-// is looked up in each feed file's CID index.
+// of its feed, or, in a newest-first page (SCAN 5/6), the newest one: the
+// delivery the page orders it by (C-41 N9). provider and source come from
+// the row's feed file, batch and the rest from the row's ids: never blank
+// when the record has a tag. A CID is looked up in each feed file's CID
+// index.
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -286,9 +288,11 @@ bool predOn(const Spec2::Pred& p, bool present, int64_t i, const std::string* s,
     }
 }
 
-int tagCmp(const Row& a, const RowV& b, const FRef& fb) {
-    // earliest at, then the smallest identity
-    if (a.at != b.at) return a.at < b.at ? -1 : 1;
+// The order of a record's matching instances, the first answers: the
+// earliest at (§3.6), or the newest (a newest-first page, C-41 N9), then the
+// smallest identity.
+int tagCmp(const Row& a, const RowV& b, const FRef& fb, bool newest) {
+    if (a.at != b.at) return (a.at < b.at) != newest ? -1 : 1;
     const std::string* x[6] = {&a.provider, &a.source, &a.batch, &a.ckey, &a.ppeer, &a.pkey};
     const std::string* y[6] = {&fb.provider, &fb.source, &b.batch, &b.ckey, &b.ppeer, &b.pkey};
     for (int i = 0; i < 6; i++) {
@@ -356,6 +360,7 @@ private:
     int32_t fill(Stream& s);  // fetches until the stream has an entry or is done
     bool before(const Ent& a, int fa, const Ent& b, int fb) const;
     bool keyed() const { return wo_ == kWDesc || wo_ == kWAsc || wo_ == kAtDesc || wo_ == kAtDescSeq || wo_ == kTsDesc; }
+    bool byAt() const { return wo_ == kAtDesc || wo_ == kAtDescSeq; }  // a walk by delivery time (SCAN 5/6)
     int64_t orderValue(const Row& r) const;  // the answered row's value in a keyed walk
     int32_t resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Row>>* out);
     bool evaluate(int64_t seq, std::vector<RowV>& rows, Row* out);
@@ -1118,7 +1123,8 @@ int32_t Scan::cols(const Row& r, ps::Extracted* x, uint8_t* scratch, size_t n) {
 
 // A record's rows (the scan's files) -> its answer, or false when it does
 // not match. The copy is the lowest token's matching row (the first copy,
-// C-12); the tag the earliest matching instance (§3.6).
+// C-12); the tag the earliest matching instance (§3.6), or in a walk by
+// delivery time the newest, the delivery the record is ordered by (C-41 N9).
 bool Scan::evaluate(int64_t seq, std::vector<RowV>& rows, Row* out) {
     if (rows.empty()) return false;
     if (s_.hasCid && std::memcmp(rows[0].key, s_.cidKey, 32) != 0) return false;
@@ -1164,7 +1170,7 @@ bool Scan::evaluate(int64_t seq, std::vector<RowV>& rows, Row* out) {
         if (s_.lane && !laneMatch(x)) continue;
         const FRef& f = files_[size_t(x.fi)];
         r.ats.push_back(x.at);
-        if (!r.hasTag || tagCmp(r, x, f) > 0) {
+        if (!r.hasTag || tagCmp(r, x, f, byAt()) > 0) {
             r.hasTag = true;
             r.at = x.at;
             r.provider = f.provider;
@@ -1217,16 +1223,12 @@ bool Scan::evaluate(int64_t seq, std::vector<RowV>& rows, Row* out) {
     return true;
 }
 
-// A record's place in a keyed walk: the w of the copy it answers with, its
-// newest matching instance's delivery time (format 1's newest tag row), or
-// that copy's ts (local).
+// A record's place in a keyed walk: the w of the copy it answers with, the
+// delivery time of the instance it answers with (its newest matching one,
+// format 1's newest tag row), or that copy's ts (local).
 int64_t Scan::orderValue(const Row& r) const {
     if (wo_ == kTsDesc) return r.ts;
-    if (wo_ == kAtDesc || wo_ == kAtDescSeq) {
-        int64_t v = INT64_MIN;
-        for (int64_t a : r.ats) v = std::max(v, a);
-        return v;
-    }
+    if (byAt()) return r.hasTag ? r.at : INT64_MIN;
     return r.w;
 }
 
