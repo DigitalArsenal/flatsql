@@ -40,6 +40,9 @@ This file records what was built, how to run it, and what was measured.
   string. The file name is the provider and source, URL-escaped outside
   `[A-Za-z0-9._-]` and joined by `@`; a name that would collide with another
   feed's on a case-insensitive file system, or is long, carries the feed id.
+  So a name never holds `/`, and the file is always flat in `P/<TYPE>`
+  whatever the provider or source holds (a space, `/`, `/../`, `%`, `?`, `#`,
+  non-ASCII bytes).
 - **No cross-feed identity (C-38).** A record is identified inside its feed
   file by its CID (the file's one CID index) and its seq. A record that
   arrives through a second source feed is a new row set in that feed's file
@@ -211,7 +214,13 @@ records there (DUP) and adds them to the rest.
 
 Every connection to a format-4 file is opened with `share=1` through
 FlatSQL's VFS (`openConn`): it attaches to the path's node, so the engine's
-connections see each other's locks and one WAL index. A connection opened
+connections see each other's locks and one WAL index. The open is a `file:`
+URI whose path is the file's path with `%`, `?` and `#` escaped (`%25`,
+`%3F`, `%23`), and an empty authority for an absolute path: SQLite decodes
+`%HH` in a URI path and ends it at `?` or `#`, so without the escapes a feed
+file's escaped name (`a%20b`, `x%2F..%2Fy`) opened the decoded path (a
+different file, a directory, or a path outside `P/<TYPE>`) while the
+engine's own I/O created, sized and measured the escaped one. A connection opened
 beside a running engine without `share=1` gets a private node (every lock
 granted, a WAL index of its own); at close it takes itself for the file's
 last connection and, when the WAL is empty, deletes it under the engine's
