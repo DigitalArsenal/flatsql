@@ -38,16 +38,27 @@
 //   P/<TYPE>/<feed>.fsdata, <feed>.db    one stream and one index per source feed of the type
 //
 // A write appends its new frames to each feed's stream, makes them durable
-// (sync) and only then commits the index rows that point at them with the
-// stream's mark (its indexed end) in one SQLite transaction: the index never
-// claims bytes the stream cannot back. Open cuts each stream to its mark.
+// (sync) and only then commits the rows that point at them with the stream's
+// mark (its indexed end) in one SQLite transaction: the index never claims
+// bytes the stream cannot back. Open cuts each stream to its mark.
+//
+// The ack writes no random index page (BRIEF4 ruling (B), owner: "stream
+// them directly while indices and btrees ... were created in a separate
+// thread"). A committed row is staged: in table r with m=0, outside the
+// feed's random-keyed indexes (r_c CID, r_ke object + epoch, r_w epoch: partial
+// indexes WHERE m=1), listed by r_m; the ordered indexes (r_s seq, r_b batch,
+// r_a / r_t delivery time) take it at once (their pages are appends). The
+// writer's indexer thread later merges a feed's staged rows into those
+// indexes in one large transaction (m=1). Until then the reads that use them
+// take the staged rows from the feed's in-memory view (Staged), which each
+// commit and each merge replace and a read pins before its SQL runs.
 //
 // Threads: writers (every feed of a type is written by the type's one writer
-// thread; a file has one writer connection), interactive / bulk / sandbox
-// lanes, one maintenance thread and one long-work thread. Lock order,
-// outermost first: Engine::typesMu, Type::mu, Feed::dictMu, Feed::smu,
-// Engine::wconnMu. No lock is held across a feed file's I/O except by its
-// one writer.
+// thread; a file has one writer connection), each with its indexer thread
+// (commits, acks and merges), interactive / bulk / sandbox lanes, one
+// maintenance thread and one long-work thread. Lock order, outermost first:
+// Engine::typesMu, Type::mu, Feed::dictMu, Feed::smu, Engine::wconnMu. No lock
+// is held across a feed file's I/O except by its one writer.
 #ifndef FLATSQL_P4_INTERNAL_H
 #define FLATSQL_P4_INTERNAL_H
 
@@ -164,7 +175,9 @@ struct Config {
     uint32_t writerConns = 64, writerCacheKiB = 4096, readerConns = 256, readerCacheKiB = 512;
     uint64_t pendingBytes = 64ull << 20, softHeap = 512ull << 20, hardHeap = 640ull << 20;
     uint32_t raStreams = 2, raBytes = 1u << 20, passivePages = 65536;
-    uint64_t restartBytes = 256ull << 20, walTotal = 1ull << 30, journalSizeLimit = 64ull << 20;
+    uint64_t restartBytes = 256ull << 20, walTotal = 4ull << 30, journalSizeLimit = 64ull << 20;
+    // flushEntries (tag 42, "index flush entries"): a feed's staged rows are
+    // merged into its indexes once it holds this many (Staged).
     uint32_t groupRecords = 4096, groupMs = 50, flushEntries = 131072, seqBlock = 1u << 20;
     uint32_t backlogCredit = 16384;
     uint64_t sandboxHeap = 64ull << 20, sandboxRows = 1000000, sandboxBytes = 256ull << 20;
@@ -199,7 +212,7 @@ enum StmtId : int {
     S_R_SEQ, S_R_FRAME, S_R_INS, S_R_DEL, S_R_URL, S_R_OFF, S_R_MAXRID, S_META_SET, S_META_GEN,
     S_NODE_INS, S_BATCH_INS, S_CKEY_GET, S_CKEY_INS, S_URL_GET, S_URL_TEXT, S_URL_INS, S_CKEY_TEXT,
     S_INST_PUT, S_INST_DEL, S_R_CID, S_R_CIDSCAN, S_IDENT_GET, S_IDENT_INS, S_TOKC_PUT, S_TOKC_DEL,
-    S_MOVED_INS,
+    S_MOVED_INS, S_R_STAGE, S_IDST_INS,
     S_COUNT
 };
 struct Conn {
@@ -218,6 +231,11 @@ const char* stmtSql(StmtId id);
 // and query_only and never create (a missing file is an error, never empty);
 // writers and the type index add dsync=1.
 enum class OpenKind { Writer, Reader, IndexReader, Index, Maint };
+// A feed index writer's spill threshold (PRAGMA cache_spill, KiB): a
+// transaction's dirty pages stay in memory up to this before SQLite spills
+// any to the WAL (a spilled page touched again is written again). A merge
+// raises it to its own budget for its transaction.
+constexpr uint32_t kWriterSpillKiB = 32768;
 int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t pageSize, Conn** out,
              std::string* err);
 int32_t statusOfSqlite(int rc);  // SQLite result -> P4 status (BUSY and I/O errors are errors, never misses)
@@ -225,6 +243,10 @@ extern thread_local char tSqlLog[200];  // this thread's last SQLite error log l
 // A connection's database bytes (pages x page size) and free bytes, from its
 // header (no file I/O on a connection that just committed).
 int64_t dbBytesOf(Conn* c, int64_t* freeBytes);
+// A SQLite file's page size, recorded when a writing connection opens it
+// (4096 until then): WAL frames are accounted in bytes.
+void notePageSize(const std::string& path, uint32_t pageSize);
+uint32_t pageSizeOf(const std::string& path);
 
 // ---- keys --------------------------------------------------------------------------------------
 // An object key value (r.k / x.k): none, an integer or text.
@@ -236,6 +258,57 @@ struct KVal {
     void from(sqlite3_stmt* q, int col);
     bool operator==(const KVal& o) const { return type == o.type && i == o.i && s == o.s; }
     std::string text() const { return type == 1 ? std::to_string(i) : type == 3 ? s : std::string(); }
+};
+// SQLite's order of k values: none < integers < text (BINARY).
+int kCmp(const KVal& a, const KVal& b);
+
+// ---- staged rows (staged.cpp) ---------------------------------------------------------------------
+// A feed's committed rows that are not in its random-keyed indexes yet (r
+// rows with m=0): what the reads that use those indexes need of each row.
+struct StRow {
+    int64_t rid = 0, w = 0, e = 0, at = 0, ts = 0;
+    bool hasE = false;
+    KVal k;
+    uint8_t cid[32] = {};
+    int64_t seq() const { return rid >> 16; }
+};
+// Rows in a few runs, each sorted four ways; the rows stay where they were
+// made (chunks shared by successive views).
+struct StRun {
+    std::vector<std::shared_ptr<const std::vector<StRow>>> chunks;
+    std::vector<const StRow*> byRid, byCid, byKe, byW;  // rid; (cid, rid); (k, e, rid); (w, rid)
+};
+using IdentKey = std::array<uint8_t, 32>;
+// A feed's staged rows and staged ingest identities (idst), as one commit or
+// merge left them. Immutable: the indexer publishes a new one (Feed::staged,
+// Type::mu); a read pins the one it starts with, before its SQL runs, so a
+// row merged after the pin is in both (and collapses: same key, same seq),
+// one merged before it in the index only.
+class Staged {
+public:
+    std::vector<std::shared_ptr<const StRun>> runs;
+    std::vector<std::pair<IdentKey, int64_t>> idents;  // by hash, the latest seq of each
+    size_t rows = 0;
+    // base (may be null) less the rows `drop` names (and its identities when
+    // dropIdents), plus `add` and `ids`; null when nothing is left.
+    static std::shared_ptr<const Staged> make(const Staged* base, std::vector<StRow> add, const std::vector<int64_t>& drop,
+                                              const std::vector<std::pair<IdentKey, int64_t>>& ids, bool dropIdents);
+    void all(std::vector<const StRow*>* out) const;                           // rid order
+    void ofCid(const uint8_t key[32], std::vector<const StRow*>* out) const;  // rid order
+    void ofK(const KVal& k, std::vector<const StRow*>* out) const;           // (e, rid) order
+    int64_t identSeq(const uint8_t h[32]) const;                              // 0: none
+    // In w order (desc: descending), w from `from` (fromIncl: inclusive) to
+    // `to` (inclusive), rid in [ridLo, ridHi]; past `limit` rows only the
+    // last w group is completed. *more: rows are left in the range.
+    void wRange(bool desc, int64_t from, bool fromIncl, int64_t to, int64_t ridLo, int64_t ridHi, size_t limit,
+                std::vector<const StRow*>* out, bool* more) const;
+    // In (cid, rid) order after (aCid, aRid) (aCid empty: from the start), up
+    // to (bCid, bRid) inclusive (bCid null: to the end), rid in [ridLo, ridHi],
+    // at most limit rows. *more: rows are left in the range.
+    void cidRange(const std::string& aCid, int64_t aRid, const uint8_t* bCid, int64_t bRid, int64_t ridLo, int64_t ridHi,
+                  size_t limit, std::vector<const StRow*>* out, bool* more) const;
+    // The rows grouped by object key, keys in order (none first).
+    void byObject(std::vector<std::pair<KVal, std::vector<const StRow*>>>* out) const;
 };
 
 // ---- engine objects ------------------------------------------------------------------------
@@ -344,6 +417,12 @@ struct Feed {
     // Moves (a local record taken into this feed): the file's `moved` table
     // may hold rows, and they are all finished (their local rows are gone).
     bool movedRows = false, movedDone = true;
+    // The staged rows and identities (Type::mu; replaced by commits and
+    // merges on the type's indexer, never changed in place), and when rows
+    // were last staged (monoNs).
+    std::shared_ptr<const Staged> staged;
+    uint64_t stagedAt = 0;
+    uint64_t mergeAfter = 0;  // a failed merge is tried again after this (monoNs)
     // writer connection (Engine::wconnMu)
     struct Conn* w = nullptr;
     int wPins = 0;
@@ -529,6 +608,10 @@ struct WriterState {
     bool istop = false;
     int32_t poison = P4_OK;
     std::thread indexer;
+    // Merges (the indexer's, between rounds) never run while the writer
+    // reads and writes the feed files itself (hold, set by drain): the
+    // writer waits out a running merge (merging) first.
+    bool hold = false, merging = false;
     // The writer's: its units not yet collected, oldest first.
     std::deque<std::unique_ptr<PutUnit>> pending;
     bool failing = false;          // a collected unit failed: recover before planning
@@ -629,6 +712,8 @@ struct P4Engine {
     std::unordered_map<std::string, int64_t> walExt;
     int64_t walExtSum = 0;
     std::unordered_set<std::string> ckptQueued;
+    // Staged rows over every feed (merges start with the largest feed past 4x flushEntries).
+    std::atomic<int64_t> stagedRows{0};
     // maintenance
     std::mutex maintMu;
     std::deque<flatsql::p4::MaintTask> maintQ;
@@ -757,8 +842,9 @@ bool dictNode(Feed* f, Conn* c, uint32_t id, NodeDef* out);
 bool dictBatch(Feed* f, Conn* c, uint32_t id, BatchDef* out);
 std::string dictCkey(Conn* c, uint32_t id);  // "" for 0
 std::string dictUrl(Conn* c, uint32_t id);   // "" for 0
-// The seq of a CID in a feed file (0: none; through r_c, or a walk before REBUILD 1).
-int32_t seqOfCid(Conn* c, bool indexed, const uint8_t key[32], int64_t* seq);
+// The seq of a CID in a feed file (0: none): its staged rows (st, pinned before
+// c's read), then r_c (or a walk before REBUILD 1).
+int32_t seqOfCid(Conn* c, bool indexed, const Staged* st, const uint8_t key[32], int64_t* seq);
 // Whether a feed file holds rows of seq (its rid range).
 int32_t fileHoldsSeq(Conn* c, int64_t seq, bool* held);
 // A feed at open (before any read, M8): its counters, instances and tokens
@@ -831,6 +917,13 @@ struct FileTxn {
     std::set<InstId> changedInst;
     std::vector<int64_t> ftsDrop;  // full-text rows to delete after the commit
     int64_t newEnd = 0;            // the stream's mark after the round's frames
+    // Staged rows: the feed's view at the transaction's start, the rows it
+    // stages (by rid) and the staged rows it deletes, the identities it
+    // stages; then the view it publishes.
+    std::shared_ptr<const Staged> stBase, stNew;
+    std::map<int64_t, StRow> stAdd;
+    std::vector<int64_t> stDrop;
+    std::vector<std::pair<IdentKey, int64_t>> idAdd;
     bool indexed = true, clearMoved = false, deleted = false, epochEdge = false, moves = false, open = false;
     int rc = 0;
 };
@@ -973,6 +1066,24 @@ bool compactDue(const Feed* f);
 // A missing or damaged index made again from the feed's stream (at open,
 // after every other feed of the type is open: fresh seqs). *indexed: records.
 int32_t rebuildFeed(P4Engine* e, Type* t, Feed* f, int64_t* indexed, std::string* err);
+
+// ---- staged.cpp: the merge -------------------------------------------------------------------------
+// One merge transaction of a feed: its staged rows (CID order, at most
+// 2 x flushEntries) set m=1, which puts them in r_c, r_ke and r_w, and its
+// staged identities into ident; then the view without them. On the type's
+// indexer (or its writer, the indexer held). A failure changes nothing.
+int32_t mergeFeed(P4Engine* e, Type* t, Feed* f, std::string* err);
+// Every staged row of the type merged (REBUILD 1; the writer, indexer held).
+int32_t mergeAll(P4Engine* e, Type* t, std::string* err);
+// The indexer's merge step between rounds: the most due feed of the
+// writer's types, if any (writer not holding the files).
+void mergeStep(P4Engine* e, uint32_t writer);
+// A feed's view rebuilt from its file at open (r_m and idst).
+int32_t stagedLoad(P4Engine* e, Feed* f, Conn* c, std::string* err);
+// REBUILD 8: whether a feed's view holds exactly its file's staged rows and identities (0: yes).
+int64_t stagedMismatches(Feed* f, Conn* c);
+// Publishes a feed's new view (Type::mu held).
+void stagedPublish(P4Engine* e, Feed* f, std::shared_ptr<const Staged> v, bool added);
 
 // ---- reader.cpp -----------------------------------------------------------------------------------
 int32_t runRead(P4Lane* L, uint32_t op);  // ops 10-17 on a lane

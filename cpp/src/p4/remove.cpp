@@ -9,9 +9,11 @@
 //   These remove index rows; the stream keeps the frames until a compaction
 //   writes the live ones into the next generation (COMPACT).
 //   REBUILD    1 the feed files' secondary indexes (after a migration's bulk
-//              append); 2 the feed files' counters recounted from their rows;
+//              append), and every staged row merged into its indexes;
+//              2 the feed files' counters recounted from their rows;
 //              8 the same comparison changing nothing, every row's frame
-//              checked in its stream, plus PRAGMA integrity_check on every
+//              checked in its stream, each feed's view of staged rows
+//              against its file's, plus PRAGMA integrity_check on every
 //              index file and the type index (C-27).
 //   An index that is missing or damaged at open is rebuilt from its stream
 //   (rebuildFeed).
@@ -550,6 +552,14 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             std::lock_guard<std::mutex> g(t->mu);
             f->indexed = true;
         }
+        // Every index complete: the staged rows merged.
+        std::string er;
+        const int32_t st = mergeAll(e, t, &er);
+        if (st != P4_OK) {
+            in->status = st;
+            in->err = er;
+            return;
+        }
         e->bump(kStRebuilds);
     }
     if (in->what & (2 | 8)) {
@@ -584,6 +594,12 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             c->exec("BEGIN");
             FileCount fc;
             st = countFile(t, f, c, stream.get(), mark, &fc);
+            bool indexedNow;
+            {
+                std::lock_guard<std::mutex> g(t->mu);
+                indexedNow = f->indexed;
+            }
+            const int64_t stagedBad = st == P4_OK && indexedNow ? stagedMismatches(f, c) : 0;
             FileMeta stored;
             std::map<InstId, InstCount> storedInst;
             std::map<uint32_t, TokCount> storedTokc;
@@ -632,6 +648,10 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             if (fc.framesBad) {
                 mismatches += fc.framesBad;
                 why("rows naming no frame of the stream", f->path, fc.framesBad, 0);
+            }
+            if (stagedBad) {
+                mismatches += stagedBad;
+                why("staged rows of the view vs the file", f->path, stagedBad, 0);
             }
             if (fix && (fileBad || memBad)) {
                 // The file's counters rewritten from its rows (its writer),

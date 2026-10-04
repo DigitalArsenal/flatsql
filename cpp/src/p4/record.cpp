@@ -18,7 +18,10 @@
 //      counters, its instances' and tokens' counters, its ingest identities,
 //      the moves it takes in, and the stream's new mark).
 // There is no ingest journal: a feed file's transaction is the whole truth
-// about that feed. The one write that spans two files with one record is a
+// about that feed. Its new rows are staged (m=0: not in r_c, r_ke, r_w until
+// the indexer merges them, staged.cpp) and its ingest identities go to idst,
+// so the transaction writes appended pages only; the feed's view of staged
+// rows is published after the commit, before the ack. The one write that spans two files with one record is a
 // move (a local record taken into a feed): the feed's transaction records the
 // seq in its `moved` table, and open finishes a move a crash cut (the local
 // rows of the seq go once the feed holds it).
@@ -204,11 +207,13 @@ RecState* WriteCtx::byKey(uint32_t fid, const uint8_t key[32], int32_t* rc) {
     }
     Feed* f;
     bool created, indexed;
+    std::shared_ptr<const Staged> st;
     {
         std::lock_guard<std::mutex> g(t->mu);
         f = t->feedById(fid);
         created = f && f->created;
         indexed = f && f->indexed;
+        if (f) st = f->staged;  // pinned before the read below
     }
     int64_t seq = 0;
     if (created) {
@@ -218,7 +223,7 @@ RecState* WriteCtx::byKey(uint32_t fid, const uint8_t key[32], int32_t* rc) {
             err = "read open: " + er;
             return nullptr;
         }
-        *rc = seqOfCid(c, indexed, key, &seq);
+        *rc = seqOfCid(c, indexed, st.get(), key, &seq);
         planRelease(e, c);
         if (*rc != P4_OK) {
             err = "CID lookup in " + f->path;
@@ -795,6 +800,7 @@ int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
         x.indexed = f->indexed;
         x.clearMoved = f->movedRows && f->movedDone;
         x.newEnd = f->mark;
+        x.stBase = f->staged;
     }
     x.tokcBefore = x.tokc;
     x.rc = x.c->exec("BEGIN IMMEDIATE");
@@ -869,6 +875,8 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
                 bad(sqlite3_step(q));
                 sqlite3_reset(q);
                 x.deleted = true;
+                // A staged row leaves the view (one this round staged, or the base's).
+                if (!x.stAdd.erase(y.rid)) x.stDrop.push_back(y.rid);
             } else if (y.loaded && y.urlSet) {
                 y.uId = internText(c, S_URL_GET, S_URL_INS, y.url, &rc);
                 sqlite3_stmt* q = c->get(S_R_URL);
@@ -897,7 +905,9 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
                     rc = SQLITE_INTERNAL;  // frames() gives every new row its frame
                     break;
                 }
-                sqlite3_stmt* q = c->get(S_R_INS);
+                // A row of an indexed file is staged (m=0); a migration's
+                // append (no secondary indexes until REBUILD 1) is not.
+                sqlite3_stmt* q = c->get(x.indexed ? S_R_STAGE : S_R_INS);
                 sqlite3_bind_int64(q, 1, y.rid);
                 sqlite3_bind_int64(q, 2, r->seq);
                 sqlite3_bind_int64(q, 3, y.nId);
@@ -918,6 +928,17 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
                 sqlite3_bind_int64(q, 15, y.len);
                 bad(sqlite3_step(q));
                 sqlite3_reset(q);
+                if (x.indexed) {
+                    StRow& sr = x.stAdd[y.rid];
+                    sr.rid = y.rid;
+                    sr.hasE = r->hasE;
+                    sr.e = r->e;
+                    sr.ts = y.ts;
+                    sr.at = y.at;
+                    sr.w = r->hasE ? r->e : y.ts;
+                    sr.k = r->k;
+                    std::memcpy(sr.cid, r->key, 32);
+                }
             }
         }
         if (rc != SQLITE_OK) break;
@@ -1073,7 +1094,8 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
         bool live = false;
         for (const RowR& rr : id.rec->rows) live = live || rr.live();
         if (!live) continue;
-        sqlite3_stmt* q = c->get(S_IDENT_INS);
+        // Staged (idst, appended; the merge moves it into ident) in an indexed file.
+        sqlite3_stmt* q = c->get(x.indexed ? S_IDST_INS : S_IDENT_INS);
         if (!q) {
             rc = SQLITE_ERROR;
             break;
@@ -1082,6 +1104,11 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
         sqlite3_bind_int64(q, 2, id.rec->seq);
         bad(sqlite3_step(q));
         sqlite3_reset(q);
+        if (x.indexed) {
+            IdentKey h;
+            std::memcpy(h.data(), id.h, 32);
+            x.idAdd.push_back({h, id.rec->seq});
+        }
     }
     // The full-text rows of records that left the file go after the commit;
     // a seq that moved to another file in this write (a record's local rows
@@ -1166,6 +1193,16 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
         else ++it;
     }
     if (rc == SQLITE_OK) rc = writeTokc(t, c, x.tokcBefore, x.tokc);
+    // The feed's staged rows after this transaction.
+    const bool stChanged = !x.stAdd.empty() || !x.stDrop.empty() || !x.idAdd.empty();
+    if (stChanged) {
+        std::vector<StRow> add;
+        add.reserve(x.stAdd.size());
+        for (auto& kv : x.stAdd) add.push_back(std::move(kv.second));
+        x.stNew = Staged::make(x.stBase.get(), std::move(add), x.stDrop, x.idAdd, false);
+    } else {
+        x.stNew = x.stBase;
+    }
     if (rc == SQLITE_OK && x.deleted) {
         // The bounds again (the ends of the seq and w indexes: O(log n)); a
         // file without the indexes (a migration before REBUILD 1) walks.
@@ -1180,26 +1217,40 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
                 k.maxseq = std::max(k.maxseq, sqlite3_column_int64(s, 1));
             }
             if (s) sqlite3_reset(s);
-            s = c->sql(x.indexed ? "SELECT min(w) FROM r INDEXED BY r_w" : "SELECT min(w) FROM r");
+            // r_w holds the merged rows, the view the staged ones.
+            k.minw = INT64_MAX;
+            k.maxw = INT64_MIN;
+            s = c->sql(x.indexed ? "SELECT min(w) FROM r INDEXED BY r_w WHERE m=1" : "SELECT min(w) FROM r");
             if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) k.minw = sqlite3_column_int64(s, 0);
             if (s) sqlite3_reset(s);
-            s = c->sql(x.indexed ? "SELECT max(w) FROM r INDEXED BY r_w" : "SELECT max(w) FROM r");
+            s = c->sql(x.indexed ? "SELECT max(w) FROM r INDEXED BY r_w WHERE m=1" : "SELECT max(w) FROM r");
             if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) k.maxw = sqlite3_column_int64(s, 0);
             if (s) sqlite3_reset(s);
+            std::vector<const StRow*> staged;
+            if (x.indexed && x.stNew) x.stNew->all(&staged);
+            for (const StRow* y : staged) {
+                k.minw = std::min(k.minw, y->w);
+                k.maxw = std::max(k.maxw, y->w);
+            }
             // The epoch range follows a delete at its edge (the type's
             // epoch range, SchemaDateRanges): among rows with an epoch w is
             // the epoch, so each end of r_w to its first such row.
             if (x.epochEdge) {
                 k.mine = INT64_MAX;
                 k.maxe = INT64_MIN;
-                s = c->sql(x.indexed ? "SELECT e FROM r INDEXED BY r_w WHERE e IS NOT NULL ORDER BY w ASC LIMIT 1"
+                s = c->sql(x.indexed ? "SELECT e FROM r INDEXED BY r_w WHERE m=1 AND e IS NOT NULL ORDER BY w ASC LIMIT 1"
                                      : "SELECT min(e) FROM r");
                 if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) k.mine = sqlite3_column_int64(s, 0);
                 if (s) sqlite3_reset(s);
-                s = c->sql(x.indexed ? "SELECT e FROM r INDEXED BY r_w WHERE e IS NOT NULL ORDER BY w DESC LIMIT 1"
+                s = c->sql(x.indexed ? "SELECT e FROM r INDEXED BY r_w WHERE m=1 AND e IS NOT NULL ORDER BY w DESC LIMIT 1"
                                      : "SELECT max(e) FROM r");
                 if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) k.maxe = sqlite3_column_int64(s, 0);
                 if (s) sqlite3_reset(s);
+                for (const StRow* y : staged)
+                    if (y->hasE) {
+                        k.mine = std::min(k.mine, y->e);
+                        k.maxe = std::max(k.maxe, y->e);
+                    }
             }
         }
     }
@@ -1237,6 +1288,7 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
     }
     f->mark = x.newEnd;
     f->streamBytes = x.newEnd;
+    if (stChanged) stagedPublish(e, f, x.stNew, !x.stAdd.empty() || !x.idAdd.empty());
     f->k = k;
     f->inst = std::move(x.inst);
     f->tokc = std::move(x.tokc);

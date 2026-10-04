@@ -3,19 +3,22 @@
 //
 // A feed is its record stream P/<TYPE>/<feed>.fsdata (stream.cpp) and its
 // index file P/<TYPE>/<feed>.db, the feed's table:
-//   r(rid PK, seq, n, b, c, u, at, cid, e, k, ts, f, x, off, len, w = coalesce(e, ts))
+//   r(rid PK, seq, n, b, c, u, at, cid, e, k, ts, f, x, off, len, m, w = coalesce(e, ts))
 //     rid = seq << 16 | j: a record's rows are one rowid range (arrival order);
 //     n the publishing node (node: producer token, peer), b the batch (batch:
 //     batch, producer peer, producer key; 0 on local rows), c the content key
 //     and u the url (small ids, 0 = ""), at when this feed delivered it;
 //     off, len the record's frame in the stream ([u32 len][bytes] at off: the
 //     bytes verbatim, sealed bytes when sealed), x the signature, f a sealed
-//     record's extracted COL values. No record bytes are in SQLite.
-//   indexes: r_s(seq) arrival, r_c(cid) the file's one CID index, r_ke(k, e)
-//     object + epoch, r_w(w DESC) epoch, r_b(b) batch; r_a(at DESC) delivery
-//     time (a feed file) or r_t(ts DESC) the copies' time (local)
+//     record's extracted COL values, m 0 while the row is staged (staged.cpp).
+//     No record bytes are in SQLite.
+//   indexes: r_s(seq) arrival, r_b(b) batch, r_a(at DESC) delivery time (a
+//     feed file) or r_t(ts DESC) the copies' time (local): every row; r_c(cid)
+//     the file's one CID index, r_ke(k, e) object + epoch, r_w(w DESC) epoch:
+//     merged rows (WHERE m=1); r_m(rid) the staged rows (WHERE m=0)
 //   inst(b, c, ...) each instance's counters; tokc(producer, ...) each
-//   token's copies; ident(h, seq) ingest identities (IQC); moved(seq) the
+//   token's copies; ident(h, seq) ingest identities (IQC), idst(h, seq) the
+//   staged ones (appended, merged into ident); moved(seq) the
 //   local records this feed took in (a move's intent, finished at open);
 //   meta: the file's counters, the stream's committed mark and generation
 // The file is the feed: its provider and source are in its meta, never in a row.
@@ -49,10 +52,12 @@ const char* kFileSchema =
     "CREATE TABLE IF NOT EXISTS tokc(producer TEXT PRIMARY KEY, n INTEGER NOT NULL, bytes INTEGER NOT NULL, mints, maxts,"
     " maxseq) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS ident(h BLOB PRIMARY KEY, seq INTEGER NOT NULL) WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS idst(h BLOB NOT NULL, seq INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS moved(seq INTEGER PRIMARY KEY);"
     "CREATE TABLE IF NOT EXISTS r(rid INTEGER PRIMARY KEY, seq INTEGER NOT NULL, n INTEGER NOT NULL, b INTEGER NOT NULL,"
     " c INTEGER NOT NULL, u INTEGER NOT NULL, at INTEGER NOT NULL, cid BLOB NOT NULL, e INTEGER, k, ts INTEGER NOT NULL,"
-    " f BLOB, x BLOB, off INTEGER NOT NULL, len INTEGER NOT NULL, w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL);";
+    " f BLOB, x BLOB, off INTEGER NOT NULL, len INTEGER NOT NULL, m INTEGER NOT NULL DEFAULT 1,"
+    " w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL);";
 }  // namespace
 
 // The file's indexes (C-37 (4), C-38 (1)): arrival seq (r_s: the seqs alone,
@@ -64,17 +69,21 @@ const char* kFileSchema =
 // and batch-filtered reads). Newest-first pages (C-39 E2) walk a feed file by
 // delivery time (r_a on at) and the local file by the copies' time (r_t on
 // ts); neither holds a CID (ties are put in order from the rows).
+// r_c, r_ke and r_w take random keys: they hold merged rows only (WHERE m=1),
+// so an ack writes none of their pages; the indexer merges staged rows into
+// them in large batches, and r_m lists the staged rows (staged.cpp).
 namespace {
 // The indexes' DDL and the meta row that records them (no transaction).
 std::string indexDdl(Type* t, bool local) {
     std::shared_ptr<const Spec> sp = t->spec();
     std::string ddl =
         "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
-        "CREATE INDEX IF NOT EXISTS r_c ON r(cid);"
-        "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC);"
-        "CREATE INDEX IF NOT EXISTS r_b ON r(b);";
+        "CREATE INDEX IF NOT EXISTS r_c ON r(cid) WHERE m=1;"
+        "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC) WHERE m=1;"
+        "CREATE INDEX IF NOT EXISTS r_b ON r(b);"
+        "CREATE INDEX IF NOT EXISTS r_m ON r(rid) WHERE m=0;";
     ddl += local ? "CREATE INDEX IF NOT EXISTS r_t ON r(ts DESC);" : "CREATE INDEX IF NOT EXISTS r_a ON r(at DESC);";
-    if (sp->hasObject) ddl += "CREATE INDEX IF NOT EXISTS r_ke ON r(k, e);";
+    if (sp->hasObject) ddl += "CREATE INDEX IF NOT EXISTS r_ke ON r(k, e) WHERE m=1;";
     ddl += "INSERT OR REPLACE INTO meta(k, v) VALUES('ix', 1);";
     return ddl;
 }
@@ -313,8 +322,16 @@ int writeTokc(Type* t, Conn* c, const std::map<uint32_t, TokCount>& before, cons
     return SQLITE_OK;
 }
 
-int32_t seqOfCid(Conn* c, bool indexed, const uint8_t key[32], int64_t* seq) {
+int32_t seqOfCid(Conn* c, bool indexed, const Staged* st, const uint8_t key[32], int64_t* seq) {
     *seq = 0;
+    if (st && st->rows) {
+        std::vector<const StRow*> v;
+        st->ofCid(key, &v);
+        if (!v.empty()) {
+            *seq = v[0]->seq();
+            return P4_OK;
+        }
+    }
     sqlite3_stmt* q = c->get(indexed ? S_R_CID : S_R_CIDSCAN);
     if (!q) return P4_E_INTERNAL;
     sqlite3_bind_blob(q, 1, key, 32, SQLITE_STATIC);
@@ -586,12 +603,17 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
         if (q) sqlite3_reset(q);
         if (r == SQLITE_DONE) r = SQLITE_OK;
     }
+    // The staged rows and identities: the view the reads take them from
+    // until the indexer merges them.
+    int32_t sst = P4_OK;
+    if (r == SQLITE_OK && m.indexed) sst = stagedLoad(e, f, c, err);
     writerUnpin(e, f);
     if (r != SQLITE_OK) {
         if (damaged(r)) return P4_E_CORRUPT;
         if (err) *err = "read " + f->path + ": " + std::to_string(r);
         return statusOfSqlite(r);
     }
+    if (sst != P4_OK) return sst == P4_E_CORRUPT ? P4_E_CORRUPT : sst;
     // The stream: cut back to the committed mark (bytes past it were never
     // acknowledged). A stream shorter than its mark lost acknowledged frames:
     // the feed is quarantined (P4_E_CORRUPT, named), never silently cut.
@@ -985,10 +1007,12 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
     supOf_[key] = rs;
     Feed* f;
     bool usable;
+    std::shared_ptr<const Staged> staged;
     {
         std::lock_guard<std::mutex> g(t_->mu);
         f = t_->feedById(scope);
         usable = f && f->created && f->indexed && !f->quarantined;
+        if (f) staged = f->staged;  // pinned before the read below
     }
     if (rs->k.type == 0) return P4_OK;
     // The records of the previous unit (still being applied) with the object
@@ -1017,7 +1041,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
     Conn* c = planAcquire(e_, f, &st, &er);
     if (!c) return st;
     std::vector<int64_t> seqs;
-    sqlite3_stmt* q = c->sql("SELECT rid, seq FROM r INDEXED BY r_ke WHERE k=?1 AND seq<>?2");
+    sqlite3_stmt* q = c->sql("SELECT rid, seq FROM r INDEXED BY r_ke WHERE k=?1 AND m=1 AND seq<>?2");
     int rc = SQLITE_ERROR;
     std::vector<std::pair<int64_t, int64_t>> cand;
     if (q) {
@@ -1025,6 +1049,17 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
         sqlite3_bind_int64(q, 2, rs->seq);
         while ((rc = sqlite3_step(q)) == SQLITE_ROW) cand.push_back({sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 1)});
         sqlite3_reset(q);
+    }
+    if (staged && staged->rows) {
+        // The object's staged rows too (a row merged since the pin is in both: once).
+        std::vector<const StRow*> v;
+        staged->ofK(rs->k, &v);
+        for (const StRow* x : v)
+            if (x->seq() != rs->seq) cand.push_back({x->rid, x->seq()});
+        std::sort(cand.begin(), cand.end(), [](const std::pair<int64_t, int64_t>& a, const std::pair<int64_t, int64_t>& b) {
+            return a.second != b.second ? a.second < b.second : a.first < b.first;
+        });
+        cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
     }
     int32_t frc = P4_OK;
     if (rc == SQLITE_DONE) {
@@ -1080,12 +1115,16 @@ int32_t Group::identSeq(uint32_t fid, const uint8_t h[32], int64_t* seq) {
     }
     Feed* f;
     bool created;
+    std::shared_ptr<const Staged> staged;
     {
         std::lock_guard<std::mutex> g(t_->mu);
         f = t_->feedById(fid);
         created = f && f->created;
+        if (f) staged = f->staged;  // pinned before the read below
     }
     if (!created) return P4_OK;
+    // A staged identity is the latest (the merge replaces ident's row with it).
+    if (staged && (*seq = staged->identSeq(h)) != 0) return P4_OK;
     int32_t st = P4_OK;
     std::string er;
     Conn* c = planAcquire(e_, f, &st, &er);

@@ -425,6 +425,9 @@ const char* stmtSql(StmtId id) {
         case S_R_FRAME: return "SELECT off, len FROM r WHERE rid=?1";
         case S_R_INS:
             return "INSERT INTO r(rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,off,len) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)";
+        // a staged row (m=0): outside r_c, r_ke and r_w until the indexer merges it
+        case S_R_STAGE:
+            return "INSERT INTO r(rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,off,len,m) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,0)";
         case S_R_DEL: return "DELETE FROM r WHERE rid=?1";
         case S_R_URL: return "UPDATE r SET u=?2 WHERE rid=?1";
         case S_R_OFF: return "UPDATE r SET off=?2 WHERE rid=?1";
@@ -443,10 +446,11 @@ const char* stmtSql(StmtId id) {
             return "INSERT OR REPLACE INTO inst(b,c,n,bytes,minw,maxw,minseq,maxseq,first,updated,maxat,maxts,url)"
                    " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
         case S_INST_DEL: return "DELETE FROM inst WHERE b=?1 AND c=?2";
-        case S_R_CID: return "SELECT seq FROM r INDEXED BY r_c WHERE cid=?1 LIMIT 1";
+        case S_R_CID: return "SELECT seq FROM r INDEXED BY r_c WHERE cid=?1 AND m=1 LIMIT 1";
         case S_R_CIDSCAN: return "SELECT seq FROM r WHERE cid=?1 LIMIT 1";
         case S_IDENT_GET: return "SELECT seq FROM ident WHERE h=?1";
         case S_IDENT_INS: return "INSERT OR REPLACE INTO ident(h,seq) VALUES(?1,?2)";
+        case S_IDST_INS: return "INSERT INTO idst(h,seq) VALUES(?1,?2)";
         case S_TOKC_PUT: return "INSERT OR REPLACE INTO tokc(producer,n,bytes,mints,maxts,maxseq) VALUES(?1,?2,?3,?4,?5,?6)";
         case S_TOKC_DEL: return "DELETE FROM tokc WHERE producer=?1";
         case S_MOVED_INS: return "INSERT OR IGNORE INTO moved(seq) VALUES(?1)";
@@ -639,10 +643,22 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
                   sync, cacheKiB ? cacheKiB : 512, (long long)(64ll << 20));
     rc = sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
     if (rc == SQLITE_OK && reader) rc = sqlite3_exec(db, "PRAGMA query_only=1", nullptr, nullptr, nullptr);
+    if (rc == SQLITE_OK && kind == OpenKind::Writer) {
+        std::snprintf(sql, sizeof sql, "PRAGMA cache_spill=-%u", kWriterSpillKiB);
+        rc = sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+    }
     if (rc != SQLITE_OK) {
         if (err) *err = sqlite3_errmsg(db);
         sqlite3_close_v2(db);
         return rc;
+    }
+    if (!reader) {
+        sqlite3_stmt* q = nullptr;
+        if (sqlite3_prepare_v2(db, "PRAGMA page_size", -1, &q, nullptr) == SQLITE_OK && sqlite3_step(q) == SQLITE_ROW) {
+            const char* fn = sqlite3_db_filename(db, "main");
+            notePageSize(fn ? fn : path, uint32_t(sqlite3_column_int(q, 0)));
+        }
+        sqlite3_finalize(q);
     }
     Conn* c = new (std::nothrow) Conn();
     if (!c) {
@@ -653,6 +669,26 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
     c->path = path;
     *out = c;
     return SQLITE_OK;
+}
+
+namespace {
+std::mutex gPageSizeMu;
+std::unordered_map<std::string, uint32_t>& pageSizes() {
+    static auto* m = new std::unordered_map<std::string, uint32_t>();  // never destroyed: used until exit
+    return *m;
+}
+}  // namespace
+
+void notePageSize(const std::string& path, uint32_t pageSize) {
+    if (pageSize < 512 || pageSize > 65536) return;
+    std::lock_guard<std::mutex> g(gPageSizeMu);
+    pageSizes()[path] = pageSize;
+}
+
+uint32_t pageSizeOf(const std::string& path) {
+    std::lock_guard<std::mutex> g(gPageSizeMu);
+    auto it = pageSizes().find(path);
+    return it == pageSizes().end() ? 4096 : it->second;
 }
 
 }  // namespace p4

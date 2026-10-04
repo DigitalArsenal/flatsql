@@ -67,7 +67,7 @@ void checkpoint(Engine* e, MaintState& m, const std::string& path) {
     }
     // Still busy (or a small WAL): no restart now, so the writer lock is never
     // held across a large copy; the next kick tries again.
-    if (!settled || log < int(e->cfg.passivePages / 4)) return;
+    if (!settled || int64_t(log) * pageSizeOf(path) < int64_t(e->cfg.passivePages) * 4096 / 4) return;
     if (sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &log, &ck) == SQLITE_OK) {
         e->bump(kStRestart);
         walNote(e, path, 0);
@@ -77,37 +77,41 @@ void checkpoint(Engine* e, MaintState& m, const std::string& path) {
 
 }  // namespace
 
+// WAL frames are accounted in bytes (frames x the file's page size: IQC's
+// feed indexes have 16 KiB pages).
 void walNote(Engine* e, const std::string& path, int64_t frames) {
+    const int64_t bytes = frames * pageSizeOf(path);
     std::lock_guard<std::mutex> g(e->walMu);
     auto it = e->walPages.find(path);
     const int64_t old = it == e->walPages.end() ? 0 : it->second;
-    if (frames <= 0) {
+    if (bytes <= 0) {
         if (it != e->walPages.end()) e->walPages.erase(it);
     } else if (it != e->walPages.end()) {
-        it->second = frames;
+        it->second = bytes;
     } else {
-        e->walPages.emplace(path, frames);
+        e->walPages.emplace(path, bytes);
     }
-    e->walSum += std::max<int64_t>(0, frames) - old;
-    e->stat[kStWalBytes].store(uint64_t(std::max<int64_t>(0, e->walSum)) * 4096, std::memory_order_relaxed);
+    e->walSum += std::max<int64_t>(0, bytes) - old;
+    e->stat[kStWalBytes].store(uint64_t(std::max<int64_t>(0, e->walSum)), std::memory_order_relaxed);
 }
 
 void walExtNote(Engine* e, const std::string& path, int64_t frames) {
+    const int64_t bytes = frames * pageSizeOf(path);
     std::lock_guard<std::mutex> g(e->walMu);
     auto it = e->walExt.find(path);
     const int64_t old = it == e->walExt.end() ? 0 : it->second;
-    if (frames <= 0) {
+    if (bytes <= 0) {
         if (it != e->walExt.end()) e->walExt.erase(it);
     } else {
-        e->walExt[path] = frames;
+        e->walExt[path] = bytes;
     }
-    e->walExtSum += std::max<int64_t>(0, frames) - old;
+    e->walExtSum += std::max<int64_t>(0, bytes) - old;
 }
 
 int64_t walBytesOf(Engine* e, const std::string& path) {
     std::lock_guard<std::mutex> g(e->walMu);
     auto it = e->walPages.find(path);
-    return it == e->walPages.end() ? 0 : it->second * 4096;
+    return it == e->walPages.end() ? 0 : it->second;
 }
 
 void typeFileBytes(Type* t) {
@@ -121,6 +125,7 @@ int walHook(void* arg, sqlite3* db, const char* zDb, int nPages) {
     const char* path = sqlite3_db_filename(db, zDb);
     if (!path) return SQLITE_OK;
     walNote(e, path, nPages);
+    const int64_t bytes = int64_t(nPages) * pageSizeOf(path);
     // The WAL file's bound. Under steady commits a PASSIVE pass never finds
     // the WAL fully copied at the moment the writer starts its next
     // transaction, so the WAL never starts over by itself and the file grows
@@ -135,12 +140,11 @@ int walHook(void* arg, sqlite3* db, const char* zDb, int nPages) {
         std::lock_guard<std::mutex> g(e->walMu);
         auto it = e->walExt.find(path);
         const int64_t old = it == e->walExt.end() ? 0 : it->second;
-        e->walExt[path] = nPages;
-        e->walExtSum += int64_t(nPages) - old;
+        e->walExt[path] = bytes;
+        e->walExtSum += bytes - old;
         ext = e->walExtSum;
     }
-    const uint64_t frames = uint64_t(nPages) * 4096;
-    if (frames >= e->cfg.walTotal / 4 || (uint64_t(ext) * 4096 > e->cfg.walTotal / 4 * 3 && frames >= (32ull << 20))) {
+    if (uint64_t(bytes) >= e->cfg.walTotal / 4 || (uint64_t(ext) > e->cfg.walTotal / 4 * 3 && bytes >= (32ll << 20))) {
         sqlite3_busy_timeout(db, 2000);
         int log = 0, ck = 0;
         const int r = sqlite3_wal_checkpoint_v2(db, zDb, SQLITE_CHECKPOINT_TRUNCATE, &log, &ck);
@@ -152,15 +156,17 @@ int walHook(void* arg, sqlite3* db, const char* zDb, int nPages) {
             return SQLITE_OK;
         }
     }
-    // A WAL past the PASSIVE pages (at most 32 MiB, so the passes keep up and
-    // the restart above copies little), or any WAL of 4 MiB or more while the
-    // instance's WALs are over their total, is checkpointed.
+    // A WAL past the PASSIVE pages (at most 128 MiB: a checkpoint writes each
+    // page once however many frames the WAL holds for it, so a longer window
+    // writes fewer pages; WRITE-AMP measured a third of the store's bytes at
+    // 32 MiB), or any WAL of 4 MiB or more while the instance's WALs are over
+    // their total, is checkpointed.
     bool kick = false;
     {
         std::lock_guard<std::mutex> g(e->walMu);
-        const bool over = uint64_t(e->walSum) * 4096 > e->cfg.walTotal && nPages >= 1024;
-        const uint32_t passive = std::min<uint32_t>(e->cfg.passivePages, 8192);
-        if ((uint32_t(nPages) >= passive || over) && e->ckptQueued.insert(path).second) kick = true;
+        const bool over = uint64_t(e->walSum) > e->cfg.walTotal && bytes >= (4ll << 20);
+        const uint32_t passive = std::min<uint32_t>(e->cfg.passivePages, 32768);
+        if ((bytes >= int64_t(passive) * 4096 || over) && e->ckptQueued.insert(path).second) kick = true;
     }
     if (kick) {
         {
@@ -812,14 +818,14 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
             std::vector<std::string> idle;
             {
                 std::lock_guard<std::mutex> g(e->walMu);
-                if (uint64_t(e->walSum) * 4096 > e->cfg.walTotal) {
+                if (uint64_t(e->walSum) > e->cfg.walTotal) {
                     std::vector<std::pair<int64_t, std::string>> big;
                     for (auto& kv : e->walPages)
                         if (!e->ckptQueued.count(kv.first)) big.push_back({kv.second, kv.first});
                     std::sort(big.begin(), big.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
                     int64_t sum = e->walSum;
                     for (auto& b2 : big) {
-                        if (uint64_t(sum) * 4096 <= e->cfg.walTotal / 2) break;
+                        if (uint64_t(sum) <= e->cfg.walTotal / 2) break;
                         sum -= b2.first;
                         e->ckptQueued.insert(b2.second);
                         idle.push_back(b2.second);

@@ -487,9 +487,11 @@ bool takeGroup(Engine* e, uint32_t wi, Type** tp, std::vector<WriteTask*>* out) 
 // ---- the PUT pipeline -------------------------------------------------------------------------------
 // The writer plans groups and appends their frames; its indexer commits them
 // in rounds: each round takes every queued unit and gives each feed file it
-// touches ONE transaction (stream synced first), then acks the round's calls.
-// Units are committed and answered in plan order. A group is planned on the
-// state the type's pending units leave its records in (their seeds).
+// touches ONE transaction (stream synced first; the rows staged), then acks
+// the round's calls. Units are committed and answered in plan order. A group
+// is planned on the state the type's pending units leave its records in
+// (their seeds). Between rounds the indexer merges the feeds' staged rows
+// into their indexes (staged.cpp), one feed's transaction at a time.
 
 constexpr size_t kMaxPending = 16;  // planned but not yet committed, per writer
 
@@ -528,10 +530,18 @@ void recover(WriterState& ws) {
     ws.failing = false;
 }
 
-// Every pending unit committed (the writer's own index work runs next).
+// Every pending unit committed and no merge running: the writer's own index
+// work runs next (release() lets the indexer merge again).
 void drain(WriterState& ws) {
     while (!ws.pending.empty() && !ws.failing) collect(ws, true);
     if (ws.failing) recover(ws);
+    std::unique_lock<std::mutex> g(ws.imu);
+    ws.hold = true;
+    ws.dcv.wait(g, [&] { return !ws.merging; });
+}
+void release(WriterState& ws) {
+    std::lock_guard<std::mutex> g(ws.imu);
+    ws.hold = false;
 }
 
 void runPut(Engine* e, uint32_t wi, Type* t, std::vector<WriteTask*>& tasks) {
@@ -558,12 +568,17 @@ void indexerLoop(Engine* e, uint32_t wi) {
         std::vector<PutUnit*> round;
         int32_t poison;
         {
+            // Units, or (staged rows waiting) a look at the merges every 250 ms.
             std::unique_lock<std::mutex> g(ws.imu);
-            ws.icv.wait(g, [&] { return !ws.iq.empty() || ws.istop; });
-            if (ws.iq.empty()) break;
+            ws.icv.wait_for(g, std::chrono::milliseconds(250), [&] { return !ws.iq.empty() || ws.istop; });
+            if (ws.iq.empty() && ws.istop) break;
             round.assign(ws.iq.begin(), ws.iq.end());
             ws.iq.clear();
             poison = ws.poison;
+        }
+        if (round.empty()) {
+            mergeStep(e, wi);
+            continue;
         }
         int32_t rc = poison;
         std::string why = "an earlier write on this writer failed before this one could commit: nothing stored";
@@ -583,6 +598,7 @@ void indexerLoop(Engine* e, uint32_t wi) {
             for (PutUnit* u : round) u->done.store(true, std::memory_order_release);
         }
         ws.dcv.notify_all();
+        if (rc == P4_OK) mergeStep(e, wi);
     }
 }
 
@@ -624,6 +640,7 @@ void writerLoop(Engine* e, uint32_t wi) {
                 } else {
                     deleteOp(e, t, tasks[0]);
                 }
+                release(ws);
             }
             for (WriteTask* wt : tasks) delete wt;
         }
