@@ -108,7 +108,7 @@
     "test:ps-wasm": "node scripts/ps-wasm-suite.mjs --crash-trials 1000",
     "dev": "tsc --watch",
     "serve": "vite docs --port 8081",
-    "check:nav": "node scripts/check-sdn-stack-nav.mjs flatsql docs/index.html",
+    "check:nav": "node scripts/check-sdn-stack-nav.mjs flatsql docs/index.html docs/assets/sdn-chrome/sdn-chrome.css",
     "check:dist": "node scripts/check-dist-tracked.mjs",
     "bench": "node bench/flatsql-perf.mjs",
     "bench:perf": "node bench/flatsql-perf.mjs",

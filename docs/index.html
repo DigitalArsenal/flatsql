@@ -1,11 +1,13 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-sdn-light="invert">
 <head>
     <meta charset="UTF-8">
+    <link rel="stylesheet" href="assets/sdn-chrome/sdn-chrome.css">
+    <script src="assets/sdn-chrome/sdn-chrome.js"></script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="Edgesource FlatSQL - SQL queries over raw FlatBuffer storage. Zero-copy queries, file identifier routing, real-time indexing.">
     <title>Edgesource FlatSQL</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><ellipse cx='50' cy='25' rx='35' ry='12' fill='%23fff'/><path d='M15 25v50c0 6.6 15.7 12 35 12s35-5.4 35-12V25' fill='none' stroke='%23fff' stroke-width='6'/><ellipse cx='50' cy='75' rx='35' ry='12' fill='none' stroke='%23fff' stroke-width='6'/><path d='M55 35L40 55h15L42 80l25-30H52l8-15z' fill='%23000'/></svg>">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' fill='none'><defs><linearGradient id='t' gradientUnits='userSpaceOnUse' x1='16' y1='29' x2='16' y2='3'><stop offset='0' stop-color='%23f5a524' stop-opacity='0'/><stop offset='.55' stop-color='%23f5a524' stop-opacity='.55'/><stop offset='1' stop-color='%23f5a524'/></linearGradient></defs><circle cx='16' cy='16' r='13' stroke='%23f5f5f7' stroke-width='1.6' opacity='.3'/><path d='M16 29A13 13 0 0 1 16 3' stroke='url(%23t)' stroke-width='2.2' stroke-linecap='round'/><path d='M16 10.2L10.4 20.1H21.6Z' stroke='%23f5f5f7' stroke-width='1.6' stroke-linejoin='round'/><circle cx='16' cy='10.2' r='2.6' fill='%23f5f5f7'/><circle cx='10.4' cy='20.1' r='2.6' fill='%23f5f5f7'/><circle cx='21.6' cy='20.1' r='2.6' fill='%23f5f5f7'/><circle cx='16' cy='3' r='2.5' fill='%23f5a524'/></svg>">
     <!-- SDN_CONSUMER_ASSETS_START -->
 <link rel="stylesheet" href="https://static.spacedatanetwork.org/assets/hd-wallet-ui/2.0.28/sdn-wallet-public-client.c3f68d1cfd88478f10d836a5e829d1dfc6a10157972cf0f7d4d319d0636f2cc4.css" integrity="sha384-fICuhN4I9xqOK1F5vGGzl26opuO+xQIvTZXMSV76lWTBiQ6AfzztMGLLDw8yRT8i" crossorigin="anonymous">
 <script defer src="https://static.spacedatanetwork.org/assets/hd-wallet-ui/2.0.28/sdn-wallet-public-client.f611e7e151a3b5c38384272f8894a4c6634f0a29bf925b0e02e0e27f8db0bfff.js" integrity="sha384-R+QqsKoWJIS7iWrtPmgJ49DVnb1hSGjZokupbLInJd1PLp8RwQhtF/hnaerc33ci" crossorigin="anonymous" data-sdn-wallet-public-client="v1"></script>
@@ -68,57 +70,7 @@
         }
 
         /* Navigation */
-        nav {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            height: var(--sdn-stack-header-height, 52px);
-            z-index: 9999;
-            background: var(--nav-bg);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-        }
-
-        .nav-content {
-            max-width: 1024px;
-            margin: 0 auto;
-            height: 100%;
-            padding: 0 24px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .logo {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-weight: 600;
-            font-size: var(--sdn-stack-header-brand-size, 15px);
-            color: var(--text-primary);
-            text-decoration: none;
-        }
-
-        .logo-icon {
-            width: 20px;
-            height: 20px;
-        }
-
-        .nav-links {
-            display: flex;
-            gap: 32px;
-        }
-
-        .nav-links a {
-            color: var(--text-secondary);
-            text-decoration: none;
-            font-size: var(--sdn-stack-header-link-size, 14px);
-            font-weight: 600;
-            transition: opacity 0.2s;
-        }
-
-        .nav-links a:hover { opacity: 0.6; }
+        
 
         .btn {
             display: inline-flex;
@@ -1491,145 +1443,10 @@
         .code-block .function { color: var(--text-primary); }
 
         /* SDN Stack Section */
-        .stack-section {
-            padding: 120px 24px;
-            max-width: 1024px;
-            margin: 0 auto;
-            position: relative;
-        }
-
-        .stack-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 16px;
-        }
-
-        .stack-card {
-            min-height: 168px;
-            padding: 24px;
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 16px;
-            background: rgba(22, 22, 23, 0.72);
-            text-decoration: none;
-            transition: transform 0.2s, background-color 0.2s, border-color 0.2s;
-        }
-
-        .stack-card:hover,
-        .stack-card.active {
-            transform: translateY(-2px);
-            border-color: rgba(255, 255, 255, 0.28);
-            background: rgba(42, 42, 45, 0.84);
-        }
-
-        .stack-card h3 {
-            margin-bottom: 10px;
-            color: var(--text-primary);
-            font-size: 18px;
-        }
-
-        .stack-card p {
-            color: var(--text-secondary);
-            font-size: 14px;
-            line-height: 1.55;
-        }
+        
 
         /* Footer */
-        footer {
-            padding: 80px 24px 40px;
-            text-align: center;
-            position: relative;
-            border-top: 1px solid rgba(255, 255, 255, 0.05);
-        }
-
-        .footer-content {
-            max-width: 600px;
-            margin: 0 auto;
-        }
-
-        .footer-brand {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-            margin-bottom: 16px;
-            font-size: 18px;
-            font-weight: 600;
-            color: var(--text-primary);
-        }
-
-        .footer-logo {
-            width: 28px;
-            height: 28px;
-            color: var(--text-primary);
-        }
-
-        .footer-tagline {
-            color: var(--text-muted);
-            font-size: 14px;
-            margin-bottom: 24px;
-        }
-
-        .footer-tagline a {
-            color: var(--text-secondary);
-            text-decoration: none;
-        }
-
-        .footer-tagline a:hover {
-            color: var(--text-primary);
-        }
-
-        .footer-badges {
-            display: flex;
-            gap: 12px;
-            justify-content: center;
-            margin-bottom: 24px;
-            flex-wrap: wrap;
-        }
-
-        .footer-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 6px 14px;
-            background: rgba(245, 165, 36, 0.08);
-            border: 1px solid rgba(245, 165, 36, 0.2);
-            border-radius: 20px;
-            font-size: 12px;
-            color: #f5a524;
-            text-decoration: none;
-        }
-
-        .footer-badge svg {
-            width: 14px;
-            height: 14px;
-        }
-
-        .footer-contact {
-            display: flex;
-            gap: 16px;
-            justify-content: center;
-            margin-bottom: 32px;
-            flex-wrap: wrap;
-        }
-
-        .footer-contact a {
-            color: var(--text-secondary);
-            text-decoration: none;
-            font-size: 14px;
-        }
-
-        .footer-contact a:hover {
-            color: var(--text-primary);
-        }
-
-        .footer-divider {
-            color: var(--text-muted);
-        }
-
-        .footer-copyright {
-            color: var(--text-muted);
-            font-size: 12px;
-        }
+        
 
         /* Responsive */
         @media (max-width: 734px) {
@@ -1642,14 +1459,11 @@
             .overview { padding: 60px 24px; }
             .demo { padding: 60px 24px; }
             .code-section { padding: 60px 24px; }
-            .stack-section { padding: 60px 24px; }
-            .nav-links { display: none; }
         }
 
         /* Space Data Network style guide (spacedatanetwork.org/style-guide.html):
            dark first, one amber accent, system fonts, pill buttons. */
         :root { --accent: #f5a524; --accent-soft: rgba(245,165,36,.14); --border: rgba(255,255,255,.12); --border-strong: rgba(255,255,255,.22); --radius: 20px; --radius-sm: 12px; }
-        nav { -webkit-user-select: none; user-select: none; border-bottom: 1px solid var(--border); }
         .eyebrow, .hero p.eyebrow { font-size: 12px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin: 0 auto 14px; line-height: 1.4; }
         .hero { justify-content: flex-start; padding: calc(var(--sdn-stack-header-height, 52px) + 7vh) 24px 72px; }
         .hero-content { max-width: 1120px; width: 100%; }
@@ -1672,36 +1486,27 @@
 <body>
     <sdn-stack-nav active="flatsql"></sdn-stack-nav>
     <!-- Fixed full-page video background -->
-    <video class="page-video-bg" id="pageVideoBg" autoplay loop muted playsinline></video>
-    <div class="page-video-overlay"></div>
+    <video class="page-video-bg" id="pageVideoBg" autoplay loop muted playsinline data-sdn-dark-only></video>
+    <div class="page-video-overlay" data-sdn-dark-only></div>
 
-    <nav>
-        <div class="nav-content">
-            <a href="#" class="logo">
-                <svg class="logo-icon" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <ellipse cx="50" cy="25" rx="35" ry="12" fill="#fff"/>
-                    <path d="M15 25v50c0 6.6 15.7 12 35 12s35-5.4 35-12V25" stroke="#fff" stroke-width="6" fill="none"/>
-                    <ellipse cx="50" cy="75" rx="35" ry="12" stroke="#fff" stroke-width="6" fill="none"/>
-                    <path d="M55 35L40 55h15L42 80l25-30H52l8-15z" fill="#000"/>
-                </svg>
-                <span>FlatSQL</span>
-            </a>
-            <div class="nav-links">
+    <header class="sdn-header">
+        <div class="sdn-header-inner">
+            <a class="sdn-header-brand" href="./"><span>FlatSQL</span></a>
+            <nav class="sdn-header-links" aria-label="Site">
                 <a href="#features">Features</a>
                 <a href="#overview">Overview</a>
                 <a href="#demo">Demo</a>
                 <a href="#code">Code</a>
                 <a href="#stack">Stack</a>
                 <a href="https://github.com/DigitalArsenal/flatbuffers" target="_blank">Docs</a>
+                <a href="https://github.com/DigitalArsenal/flatsql" target="_blank" rel="noopener">GitHub</a>
+            </nav>
+            <div class="sdn-header-actions">
+                <button data-sdn-theme-toggle aria-label="Switch between light and dark theme"></button>
+                <button data-sdn-menu-toggle aria-label="Menu"></button>
             </div>
-            <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" class="btn" target="_blank">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
-                </svg>
-                GitHub
-            </a>
         </div>
-    </nav>
+    </header>
 
     <section class="hero">
         <div class="hero-content">
@@ -2193,65 +1998,20 @@
         </div>
     </section>
 
-    <section id="stack" class="stack-section">
-        <div class="section-title">
-            <p class="eyebrow">SDN Stack</p>
-            <h2>Move across the stack</h2>
-            <p>FlatSQL is the query surface for FlatBuffer data inside the broader SDN toolchain.</p>
-        </div>
-        <div class="stack-grid">
-            <a href="https://spacedatastandards.org/" class="stack-card">
-                <h3>Standards</h3>
-                <p>Canonical space data schemas and generated bindings.</p>
-            </a>
-            <a href="https://digitalarsenal.github.io/flatbuffers/" class="stack-card">
-                <h3>FlatBuffers</h3>
-                <p>Binary encoding, schema tooling, and runtimes.</p>
-            </a>
-            <a href="https://digitalarsenal.github.io/flatsql/" class="stack-card active">
-                <h3>FlatSQL</h3>
-                <p>SQL-style queries over FlatBuffer-backed datasets.</p>
-            </a>
-            <a href="https://spacedatanetwork.org/" class="stack-card">
-                <h3>SDN</h3>
-                <p>Publication, discovery, delivery, and marketplace infrastructure.</p>
-            </a>
-            <a href="https://digitalarsenal.github.io/space-data-module-sdk/" class="stack-card">
-                <h3>Module SDK</h3>
-                <p>WASM module packaging and compatibility tooling.</p>
-            </a>
-        </div>
-    </section>
+    <section id="stack" data-sdn-stack="flatsql"></section>
 
-    <footer>
-        <div class="footer-content">
-            <div class="footer-brand">
-                <svg class="footer-logo" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <ellipse cx="50" cy="25" rx="35" ry="12" fill="currentColor"/>
-                    <path d="M15 25v50c0 6.6 15.7 12 35 12s35-5.4 35-12V25" stroke="currentColor" stroke-width="6" fill="none"/>
-                    <ellipse cx="50" cy="75" rx="35" ry="12" stroke="currentColor" stroke-width="6" fill="none"/>
-                </svg>
-                <span>FlatSQL</span>
-            </div>
-            <p class="footer-tagline">Built with <a href="https://github.com/digitalarsenal/flatbuffers">FlatBuffers</a> and <a href="https://sqlite.org/">SQLite</a></p>
-            <div class="footer-badges">
-                <a href="https://github.com/DigitalArsenal/flatsql/blob/main/LICENSE" class="footer-badge">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-                    </svg>
-                    PolyForm Noncommercial 1.0.0
-                </a>
-                <span class="footer-badge">Free for Noncommercial Use</span>
-            </div>
-            <div class="footer-contact">
-                <a href="mailto:tj@edgesource.com">tj@edgesource.com</a>
-                <span class="footer-divider">·</span>
-                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" target="_blank">GitHub</a>
-                <span class="footer-divider">·</span>
-                <a href="https://edgesource.com" target="_blank">Edgesource Corporation</a>
-            </div>
+    <footer class="sdn-footer">
+        <div class="sdn-footer-inner">
+            <a class="sdn-footer-brand" href="https://spacedatanetwork.org/">Space Data Network</a>
+            <nav class="sdn-footer-links" aria-label="Footer">
+                <a href="#features">Features</a>
+                <a href="#demo">Demo</a>
+                <a href="#code">Code</a>
+                <a href="https://github.com/DigitalArsenal/flatsql/blob/main/LICENSE">License</a>
+                <a href="https://github.com/DigitalArsenal/flatsql">GitHub</a>
+            </nav>
+            <p class="sdn-footer-legal">PolyForm Noncommercial 1.0.0, free for noncommercial use &middot; &copy; Edgesource Corporation &middot; <a href="mailto:tj@edgesource.com">tj@edgesource.com</a></p>
         </div>
-        <p class="footer-copyright">© Edgesource Corporation</p>
     </footer>
 
     <script>
