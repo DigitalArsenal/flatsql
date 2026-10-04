@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+Store format 4 follow-ups (CONTRACT C-46). Every answer is 3.7.0's except where C-46 (1)-(3)
+make it format 1's and (6) makes a crash a refusal.
+- EPOCH counts and limited pages push the limit down again (a58f818/226872c's design on the
+  stream engine): a count probes each entity until one feed has a pick within the max delta; a
+  page whose offset + limit fits 4,096 probes only its first entities and stops a text-keyed
+  object walk there; a pick deleted before its answer sends the page to the full pass. R16
+  (nearest count + limit 200), native warm: 600 feeds 8.2 s -> 0.29 s merged, 8.0 s -> 0.36 s
+  staged; 16 feeds 3.5 s -> 0.24 s. The equivalence driver, the 365-variant R16 matrices and
+  the new count/page shapes answer as 3.7.0 byte for byte.
+- The default soft heap is 576 MiB (was 512): idle readers give way past three quarters of it,
+  and a 600-feed type's warm readers hold 404-414 MiB, so type-wide reads no longer reopen up to
+  600 connections each. The hard heap stays 640 MiB.
+- An index file an earlier format-4 build wrote (74b2f0d, the WIP staged layouts, the feed-table
+  and partition eras) is refused with `P4_E_FORMAT` before anything reads or writes it, and a
+  failed open cleans up without crashing (3.7.0 dereferenced freed feeds after an init error).
+- Full text reads each frame with its size prefix, as format 1 does: records whose 8-byte fields
+  align to a prefix the producer cut off are indexed (3.7.0 skipped them silently). A type with
+  no records reports `ready` and a search answers no rows (was `building` / unsupported).
+- typecfg: a double epoch (`f64floor`) outside the int64 range is clamped to it, as Go's
+  conversion on arm64 (format 1); 9.2e18..2^63 is no longer dropped; the millisecond value is
+  defined. Format 2 (`flatsql-ps-threads.wasm`) shares the extractor.
+- Tests: `cpp/tests/p4/t_c46.cpp` and the fixture `cpp/tests/p4/fixtures/store-74b2f0d`.
+
 ## 3.7.0
 
 - Store format 4 (docs/STORE-FORMAT-4.md), the stream engine: each standard's records are kept

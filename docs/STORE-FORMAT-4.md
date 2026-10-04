@@ -185,7 +185,10 @@ intent journal.
 - **A PUT group** (the queued PUT calls of a type, up to `groupRecords`) is
   planned on the writer and committed on its indexer:
   1. *writer:* parse, check (frame size, file identifier, BFBS, CID) and
-     extract the keys (CID, epoch, object, COL rules) from the frame bytes;
+     extract the keys (CID, epoch, object, COL rules) from the frame bytes; a
+     double epoch (`f64floor`) is floored and clamped to the int64 range,
+     infinities included, as Go's conversion on arm64 gives format 1
+     (C-46 (1)); 0 and NaN are no epoch;
   2. *writer:* ingest mode: each record goes to every feed its call's tags
      name, found in that feed by its CID (`r_c`). In the feed it is a new
      record (NEW: a fresh seq), a new copy (COPY: the holder's bytes and ts
@@ -299,6 +302,14 @@ index transaction carries its rows with its own counters, instances, token
 counts, identities and moves: a feed is consistent on its own. Every open,
 before it serves (M8), visits every feed the type index names:
 
+0. an index file an earlier format-4 build wrote is refused, as it is, with
+   `P4_E_FORMAT` (C-46 (6)): a type index holds the tables `feed` and `tok`
+   only (the partition and feed-table eras had others), and a feed index has
+   this layout's `r.m`, `r.kk`, `r.cp`, `okey` and `idst` (74b2f0d and the
+   earlier staged builds lack some). Nothing is read or written first; an
+   open that fails releases every connection, stream and view it made
+   before the engine is deleted (3.7.0 crashed there);
+
 1. its index's counters, instances and tokens are read (the type's totals
    and the next seq follow from them: seqs never go back, a file keeps its
    max seq after deletes);
@@ -394,7 +405,13 @@ the readers.
   deleted first; a migrated seq (below the seq floor) only once no feed holds
   it, and a seq that moved to another file keeps its row. The gone list is in
   memory: a crash leaves those rows (a search drops them, as it drops any hit
-  without a live record), and REBUILD 4 removes them.
+  without a live record), and REBUILD 4 removes them. The text comes from the
+  whole frame, size prefix included, as format 1 hands it (C-46 (3)): a
+  record whose 8-byte fields align to a prefix its producer cut off (a
+  size-prefixed build plus `[4:]`) verifies from the prefix's origin, any
+  other from its own start. A type with no records has nothing to index: its
+  state is `ready` and a search answers no rows (C-46 (2)). `ready` is the
+  last pass's state (a pass runs every 100 ms).
 - **REBUILD:** 1 adds the indexes' secondary indexes (after a migration's
   bulk append) and merges every staged row; 2 recounts every index's
   counters, instances and tokens from its rows; 4 rebuilds full text; 8 makes
@@ -470,7 +487,18 @@ record has a tag.
   in rank order until an epoch group has a record that passes the filters;
   ties at the best epoch go to the lowest CID (format 1's ranking), then the
   lowest feed id. One answer per entity. A record without an object is its
-  own entity.
+  own entity. The distance to the instant is exact over the whole int64
+  range. A count and a limited page push the limit down (C-46 (5), the design
+  of a58f818/226872c): every profile ranks by the distance first, so an
+  entity's best record is within the max delta iff one feed's pick is; a
+  count counts an entity at its first such pick and probes it no more; a page
+  whose offset + limit fits one answer chunk (4,096) keeps its first offset +
+  limit entities with such a pick (entity text order), probes no entity past
+  the last of them (a text-keyed object walk stops there), and answers them
+  in one chunk. When a pick is gone before its answer (a delete in between),
+  the page is computed again by the full pass and filled from the next
+  entities. No limit, a larger page and files before REBUILD 1 take the full
+  pass.
 - **By CID:** GET answers from the first feed file holding the CID (its
   copies, the lowest token first); TAGS lists the tag instances of every
   feed file holding it, each with that file's seq.
@@ -519,8 +547,13 @@ files.
 - Reader connections are one pool (tag 23) inside a shared cache budget
   (tags 23 x 24): idle connections close, least recently used first, while
   the pool is over its count or its caches pass the budget, and while the
-  heap is past three quarters of the soft limit. A `SQLITE_NOMEM` open
-  closes the idle readers and tries once more.
+  heap is past three quarters of the soft limit (tag 26, 576 MiB by default:
+  432 MiB). SQLite enforces no soft limit itself (no memory statistics); the
+  line is the pool's. A 600-feed type's readers, all warm, hold 404-414 MiB
+  (store600, 2,048 connections), so a type-wide read keeps every connection;
+  at 512 MiB (a 384 MiB line) each read reopened up to 600. The hard heap
+  keeps 208 MiB above the line for the writers (a merge holds up to 160 MiB).
+  A `SQLITE_NOMEM` open closes the idle readers and tries once more.
 - Writer connections are an LRU (tag 21); the LRU never closes a pinned one.
 - Nothing is held back beyond the pipeline: at most 16 planned units per
   writer wait for their round; a unit's seed is its type's pending units'
@@ -557,7 +590,7 @@ files.
 
 ```
 FLATBUFFERS_DIR=<flatbuffers> cmake -S cpp -B cpp/build && cmake --build cpp/build --target flatsql_p4_test flatsql_p4_fault_test -j 6
-cpp/build/flatsql_p4_test                                     # the SQL surface's engine tests
+cpp/build/flatsql_p4_test                                     # the default suite: SQL surface, C-46 cases
 cpp/build/flatsql_p4_test --test=t_kill --slow=1 --rounds=30  # kill -9 loop
 cpp/build/flatsql_p4_test --test=t_kill_merge --slow=1 --rounds=30  # kill -9 inside merges
 cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=30
@@ -596,6 +629,17 @@ cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=30
   (`P4_MERGE_DEBUG`, native test builds) and each acknowledged call; the
   parent kills it 0-4 ms after the k-th merge start, then runs `t_kill`'s
   checks and finds every acknowledged record with its feed's batch.
+- **C-46 (`t_c46.cpp`, default suite):** `t_earlier_layout_refused` opens
+  `tests/p4/fixtures/store-74b2f0d` (a store the 74b2f0d build wrote) in
+  create modes 0 and 1: `P4_E_FORMAT`, every file unchanged, then a fresh
+  store serves in the same process. `t_fts_prefix_aligned` finds records
+  built size-prefixed and stored without their prefix, and start-aligned
+  ones. `t_fts_empty_type`: `ready`, no rows. `t_epoch_clamped`: epochs of
+  +-1e19, +-inf, +-2^63 and 9.21e18 indexed clamped (exact where int64 holds
+  them), NaN none; nearest, as_of, forward, a count, a max delta, SUMMARY 1,
+  staged and merged. `t_epoch_page_under_deletes`: pushed-down pages while
+  deletes take their picks (the full-pass fallback runs), then the page
+  equals the first rows of the answer with no limit.
 - The proof is end to end (C-33): the SDN harness on the real engine
   (`sdn-server/internal/storage/format4proof`): `store-migrate --to 4`, every
   benchset read and the coverage classes against format 1 field by field,
