@@ -175,7 +175,11 @@ struct Config {
     uint32_t cores = 4;
     uint64_t engineBytes = 1ull << 30;
     uint32_t writerConns = 64, writerCacheKiB = 4096, readerConns = 256, readerCacheKiB = 512;
-    uint64_t pendingBytes = 64ull << 20, softHeap = 512ull << 20, hardHeap = 640ull << 20;
+    // softHeap: idle readers give way past three quarters of it (432 MiB): a
+    // 600-feed type's readers, all warm, hold 404-414 MiB (C-46, BRIEF5 item
+    // 2), and the hard heap keeps 208 MiB for the writers (a merge's budget
+    // is 160 MiB). SQLite enforces no soft limit itself (C-30).
+    uint64_t pendingBytes = 64ull << 20, softHeap = 576ull << 20, hardHeap = 640ull << 20;
     uint32_t raStreams = 2, raBytes = 1u << 20, passivePages = 65536;
     uint64_t restartBytes = 256ull << 20, walTotal = 4ull << 30, journalSizeLimit = 64ull << 20;
     // flushEntries (tag 42, "index flush entries"): a feed's staged rows are
