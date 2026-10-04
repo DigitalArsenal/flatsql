@@ -866,12 +866,12 @@ public:
     void dropAll(RecState* r);
     const std::vector<RecState*>& records() const { return order_; }
     // The writer: what this write commits (its new rows' rids and frames, the
-    // frames appended to each feed's stream, the moves), and the state it
-    // leaves its records in (the next unit's seed).
+    // new feeds and tokens registered, the frames appended to each feed's
+    // stream, the moves), and the state it leaves its records in (the next
+    // unit's seed).
     int32_t prepare();
-    // The indexer: the registries (new feeds and tokens), then each feed file
-    // (feeds before local): its stream synced, then its rows committed with
-    // the stream's new mark in one transaction.
+    // The indexer: each feed file (feeds before local): its stream synced,
+    // then its rows committed with the stream's new mark in one transaction.
     int32_t apply();
     // prepare + apply on the caller's thread (the writer's synchronous work,
     // its indexer idle); a failure cuts the streams back to their marks.
@@ -889,12 +889,14 @@ public:
     bool migrate = false;  // migrate mode: instance times are the caller's (C-36), new files without indexes
     int64_t now = 0;
     std::vector<IdentNew> idents;
-    // The commit round's steps (applyRound): new feeds and tokens into the
-    // type index; the feed files this write touches (feeds before local) and
-    // whether it changes one; its rows applied to a feed's round transaction.
+    // New feeds and tokens into the type index (prepare, the writer). The
+    // commit round's steps (applyRound): the feed files this write touches
+    // (feeds before local) and whether it changes one; its rows applied to a
+    // feed's round transaction.
     int32_t registryWrite();
     const std::vector<uint32_t>& files() const { return fileOrder_; }
     bool fileChanges(uint32_t fid) const;
+    int32_t fileCreate(Feed* f);  // the writer: a new feed's index file, before its first frame
     int32_t fileBegin(FileTxn& x, Feed* f);
     int32_t fileApply(FileTxn& x);
     bool pending() const { return any_; }  // prepared with something to commit
@@ -929,7 +931,8 @@ private:
 int32_t applyRound(P4Engine* e, const std::vector<WriteCtx*>& units, std::string* err);
 int32_t fileCommit(P4Engine* e, Type* t, FileTxn& x, std::string* err);
 // Planning reads go through the reader pool (committed rows): the writer
-// connection belongs to the indexer.
+// connection belongs to the indexer (the writer pins it only to create a new
+// feed's index file, before any unit of that feed is queued).
 Conn* planAcquire(P4Engine* e, Feed* f, int32_t* rc, std::string* err);
 void planRelease(P4Engine* e, Conn* c);
 

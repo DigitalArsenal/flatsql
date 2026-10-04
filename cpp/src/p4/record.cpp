@@ -10,9 +10,11 @@
 // the rows of a record whose bytes are the same share one frame. A write
 // loads the records it touches, changes their rows, then commits:
 //   1. the type index (synchronous=FULL), only when the write uses a feed or
-//      a producer token the registry does not hold yet;
+//      a producer token the registry does not hold yet (the writer, before
+//      any file of a new feed exists);
 //   2. each feed, feeds before local: its new frames appended to its stream
-//      and synced, then its index file in one transaction (rows, the file's
+//      (a new feed's index file made before its first frame) and synced,
+//      then its index file in one transaction (rows, the file's
 //      counters, its instances' and tokens' counters, its ingest identities,
 //      the moves it takes in, and the stream's new mark).
 // There is no ingest journal: a feed file's transaction is the whole truth
@@ -480,8 +482,9 @@ void WriteCtx::dropAll(RecState* r) {
 }
 
 // ---- commit ---------------------------------------------------------------------------------------
-// New feeds and producer tokens go into the type index before the first feed
-// file commit that uses them (a reopen finds every feed file a commit made).
+// New feeds and producer tokens go into the type index while the writer
+// plans, before any file of a new feed exists: every feed file on disk then
+// belongs to a registered feed, which a reopen opens and recovers.
 int32_t WriteCtx::registryWrite() {
     std::vector<Feed*> feeds;
     std::vector<std::pair<uint32_t, TokDef>> toks;
@@ -743,12 +746,30 @@ bool WriteCtx::fileChanges(uint32_t fid) const {
     return false;
 }
 
-int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
-    x.f = f;
+// A feed's first frame: its index file comes first (the feed is registered
+// already). writerPin creates it durably, directory entry included, and
+// commits its schema with mark 0. A stream is then never without its index
+// unless the index was lost, and open cuts the frames past the index's mark
+// (never acknowledged) instead of indexing them as records with blank
+// provenance (GATES-stream-r1 B1).
+int32_t WriteCtx::fileCreate(Feed* f) {
     {
         std::lock_guard<std::mutex> g(t->mu);
-        if (!f->created && migrate) f->indexed = false;  // a migration: REBUILD 1 adds the secondary indexes
+        if (f->created) return P4_OK;
+        if (migrate) f->indexed = false;  // a migration: REBUILD 1 adds the secondary indexes
     }
+    int32_t st = P4_OK;
+    std::string er;
+    if (!writerPin(e, f, &st, &er)) {
+        err = "create " + f->path + ": " + er;
+        return st;
+    }
+    writerUnpin(e, f);
+    return P4_OK;
+}
+
+int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
+    x.f = f;
     int32_t status = P4_OK;
     std::string er;
     x.c = writerPin(e, f, &status, &er);
@@ -1228,19 +1249,12 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
     return P4_OK;
 }
 
-// A commit round: the writes' registries, then every feed file any of them
-// touches in ONE transaction each (the writes' rows in plan order), source
-// feeds before local files, each stream synced before its transaction
-// commits. A failure fails the round; the files committed before it stay
-// (as a write cut between two files).
+// A commit round: every feed file the writes touch in ONE transaction each
+// (the writes' rows in plan order), source feeds before local files, each
+// stream synced before its transaction commits (the writes registered their
+// new feeds and tokens while planned). A failure fails the round; the files
+// committed before it stay (as a write cut between two files).
 int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* err) {
-    for (WriteCtx* w : units) {
-        const int32_t rc = w->registryWrite();
-        if (rc != P4_OK) {
-            *err = w->err;
-            return rc;
-        }
-    }
     std::map<Feed*, FileTxn> txns;
     std::vector<Feed*> feeds, locals;
     int32_t first = P4_OK;
@@ -1362,10 +1376,12 @@ int32_t WriteCtx::prepare() {
         for (RowR& x : r->rows)
             if (!x.loaded && !x.del) x.rid = next++;
     }
-    // Frames: appended to each feed's stream at its end (the writer's offset,
-    // past the frames of a unit still being applied); the apply syncs them.
+    // New feeds and tokens registered, then frames appended to each feed's
+    // stream at its end (the writer's offset, past the frames of a unit still
+    // being applied); the apply syncs them.
     newEnd_.clear();
     oldEnd_.clear();
+    if (const int32_t rc = registryWrite()) return rc;
     for (uint32_t fid : fileOrder_) {
         Feed* f;
         {
@@ -1378,6 +1394,7 @@ int32_t WriteCtx::prepare() {
         const int64_t oldEnd = f->end;
         std::string fr;
         int32_t st = frames(f, recs, &fr, oldEnd);
+        if (st == P4_OK && !fr.empty()) st = fileCreate(f);
         if (st == P4_OK && !fr.empty()) {
             std::shared_ptr<Stream> stream = streamCur(f, &st);
             if (stream) st = streamWrite(stream.get(), oldEnd, reinterpret_cast<const uint8_t*>(fr.data()), fr.size());

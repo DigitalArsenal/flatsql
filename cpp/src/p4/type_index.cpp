@@ -8,8 +8,9 @@
 //                                             stream generation (a missing index's rebuild reads it)
 //   tok(id, token, peer)                      the type's producer tokens (copies), in order
 //
-// A write registers a new feed or token here (synchronous=FULL) before the
-// first feed file commit that uses it.
+// A write registers a new feed or token here (synchronous=FULL) while its
+// type's writer plans it, before any file of a new feed exists. Only that
+// writer (and the open) uses this connection.
 #include <algorithm>
 
 #include "internal.h"

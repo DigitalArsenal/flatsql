@@ -13,7 +13,11 @@
 // walked from byte 0 to its end with no FlatSQL code: back-to-back
 // [u32 LE size][FlatBuffer] frames, each a PNM table with its file
 // identifier, ending exactly at the end of the file, and every index row
-// names one of its frames (off, len).
+// names one of its frames (off, len). Every 3rd call also writes to a feed
+// of its own, new to the store, so kills land between a new feed's first
+// frames and its first commit: no row of a source feed may come back without
+// its batch (an unacknowledged record is absent or present with its tag,
+// never a record with blank provenance; GATES-stream-r1 B1).
 // The loop's two halves (t_kill_run, t_kill_check) are also tests of their
 // own, so the wasm build's host drives the same loop (scripts/p4-wasm-suite.mjs).
 #include <unistd.h>
@@ -131,15 +135,17 @@ std::string feedOfFile(std::string n) {
 }
 
 // What is in P/<type> other than the feeds the workload writes (prov@src,
-// the odd feed, local): their index files with -wal/-shm/-journal and their
-// streams. A directory, or another file. Empty when the layout is right.
+// the odd feed, local, the new feeds prov@fresh-<id>): their index files with
+// -wal/-shm/-journal and their streams. A directory, or another file. Empty
+// when the layout is right.
 std::string strayEntries(const std::string& root, const std::string& type) {
     std::string out;
     std::error_code ec;
     const std::string odd = std::string(kOddFeedFile).substr(0, std::strlen(kOddFeedFile) - 3);
     for (auto& d : std::filesystem::directory_iterator(root + "/P/" + type, ec)) {
         const std::string n = feedOfFile(d.path().filename().string());
-        if (d.is_directory() || (n != "prov@src" && n != "local" && n != odd)) out += " " + d.path().filename().string();
+        const bool fresh = n.rfind("prov@fresh-", 0) == 0 && n.size() > 11 && n.find_first_not_of("0123456789", 11) == std::string::npos;
+        if (d.is_directory() || (n != "prov@src" && n != "local" && n != odd && !fresh)) out += " " + d.path().filename().string();
     }
     return out;
 }
@@ -171,13 +177,14 @@ std::vector<uint8_t> killFrame(uint64_t id) {
 }
 
 // The feeds a call writes to (C-37, C-38): 0 prov@src, 1 prov@<kOddSource>,
-// 2 the local file (no tag).
+// 2 the local file (no tag), 3 a feed of its own, prov@fresh-<from>.
 Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from, int n, int feed = 0) {
     Batch b;
     b.type = "PNM";
     b.peer = peer;
     if (feed == 0) b.tags.push_back(Tag{"prov", "src", "", batch, "", "", ""});
     if (feed == 1) b.tags.push_back(Tag{"prov", kOddSource, "", batch, "", "", ""});
+    if (feed == 3) b.tags.push_back(Tag{"prov", "fresh-" + std::to_string(from), "", batch, "", "", ""});
     b.at = 1790000000;
     for (int i = 0; i < n; i++) {
         In in;
@@ -194,8 +201,17 @@ Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from
 // in each); every 4th call (from the second) sends the same new records from
 // all three producers at once, each to its own feed (50-record calls);
 // every 13th call supersedes a batch of prov@src and every 11th deletes the
-// oldest arrivals down to a 4 MiB quota.
+// oldest arrivals down to a 4 MiB quota; every 3rd first sends 64 new records
+// to a feed new to the store.
 void killWorkStep(int c, uint64_t* id) {
+    if (c % 3 == 2) {
+        Result r = put(killBatch("producer1", "f" + std::to_string(*id), *id, 64, 3));
+        if (r.status != P4_OK) {
+            std::fprintf(stderr, "  put failed: %d %s\n", r.status, r.err.c_str());
+            std::_Exit(1);
+        }
+        *id += 64;
+    }
     Batch b = killBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), *id, 500, c % 3);
     if (c % 5 == 4)
         for (int i = 0; i < 500; i++) b.recs[size_t(i)].frame = killFrame(*id - 1000 + uint64_t(i));
@@ -265,7 +281,7 @@ bool killCheck(const std::string& root, std::string* why) {
     std::map<std::string, int64_t> diskSeq;      // (file, CID) -> its one seq in that file
     std::map<std::pair<std::string, int64_t>, std::string> seqCid;  // (file, seq) -> its one CID
     std::unordered_set<std::string> localCids, feedCids;  // a record is local only while no feed holds it
-    int64_t rows = 0, maxSeq = 0, missing = 0, diskSplit = 0, frames = 0, unframed = 0;
+    int64_t rows = 0, maxSeq = 0, missing = 0, diskSplit = 0, frames = 0, unframed = 0, unbatched = 0;
     size_t files = 0;
     std::vector<std::vector<uint8_t>> sample;
     for (auto& f : partitionFiles(root, "PNM")) {
@@ -304,6 +320,15 @@ bool killCheck(const std::string& root, std::string* why) {
             if (it == fr.end() || it->second != sqlite3_column_int64(q, 1)) unframed++;
         }
         sqlite3_finalize(q);
+        // Every row of a source feed carries its batch: the workload tags
+        // every call to a feed with a non-empty batch.
+        const bool isLocal = f.size() >= 9 && f.compare(f.size() - 9, 9, "/local.db") == 0;
+        if (!isLocal) {
+            sqlite3_prepare_v2(db, "SELECT count(*) FROM r LEFT JOIN batch ON batch.id = r.b WHERE coalesce(batch.batch, '') = ''", -1, &q,
+                               nullptr);
+            if (sqlite3_step(q) == SQLITE_ROW) unbatched += sqlite3_column_int64(q, 0);
+            sqlite3_finalize(q);
+        }
         sqlite3_prepare_v2(db, "SELECT seq, cid FROM r", -1, &q, nullptr);
         while (sqlite3_step(q) == SQLITE_ROW) {
             rows++;
@@ -314,7 +339,6 @@ bool killCheck(const std::string& root, std::string* why) {
             if (ds.first->second != seq) diskSplit++;
             const auto sc = seqCid.emplace(std::make_pair(f, seq), key);
             if (sc.first->second != key) diskSplit++;
-            const bool isLocal = f.size() >= 9 && f.compare(f.size() - 9, 9, "/local.db") == 0;
             (isLocal ? localCids : feedCids).insert(key);
             if (distinct.insert(key).second) {
                 uint8_t d[32], c[36] = {0x01, 0x55, 0x12, 0x20};
@@ -366,17 +390,18 @@ bool killCheck(const std::string& root, std::string* why) {
     // inherit its locks and WAL index).
     const int64_t nodesLeft = flatsql::flatSqlIoVfsStats().nodes;
     if (nodesLeft) std::fprintf(stderr, "  check: %lld VFS nodes left open after close\n", (long long)nodesLeft);
-    char buf[256];
+    char buf[384];
     std::snprintf(buf, sizeof buf,
-                  "files %zu rows %lld frames %lld unframed %lld cids %zu records %zu local %zu local+feed %lld count %lld missing %lld"
-                  " bad-bytes %lld split %lld disk-split %lld mismatches %lld above %d nodes %lld",
-                  files, (long long)rows, (long long)frames, (long long)unframed, distinct.size(), diskSeq.size(), localCids.size(),
+                  "files %zu rows %lld frames %lld unframed %lld unbatched %lld cids %zu records %zu local %zu local+feed %lld count %lld"
+                  " missing %lld bad-bytes %lld split %lld disk-split %lld mismatches %lld above %d nodes %lld",
+                  files, (long long)rows, (long long)frames, (long long)unframed, (long long)unbatched, distinct.size(), diskSeq.size(),
+                  localCids.size(),
                   (long long)localAndFeed, (long long)count, (long long)missing, (long long)badBytes, (long long)split, (long long)diskSplit,
                   (long long)mism, int(above), (long long)nodesLeft);
     *why = buf;
     if (!stray.empty()) *why += "; stray entries in P/PNM:" + stray;
     return stray.empty() && missing == 0 && split == 0 && diskSplit == 0 && localAndFeed == 0 && count == int64_t(diskSeq.size()) && mism == 0 &&
-           above && nodesLeft == 0 && unframed == 0 && badBytes == 0;
+           above && nodesLeft == 0 && unframed == 0 && unbatched == 0 && badBytes == 0;
 }
 }  // namespace
 

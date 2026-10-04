@@ -546,10 +546,12 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
     Engine* e = t->e;
     moved->clear();
     if (!ioExists(f->path)) {
-        // No index: a feed never written, or an index that is gone. A stream
-        // without its index (the registered generation, or the next one a
-        // compaction committed after the registry last named it) is indexed
-        // again from its frames (rebuildFeed, after every feed is open).
+        // No index: a feed never written, or an index that is gone. A feed's
+        // index file is made before its first frame (WriteCtx::fileCreate),
+        // so a stream without one lost its index: that stream (the registered
+        // generation, or the next one a compaction committed after the
+        // registry last named it) is indexed again from its frames
+        // (rebuildFeed, after every feed is open).
         std::lock_guard<std::mutex> g(t->mu);
         f->created = false;
         for (uint32_t gen : {f->regGen + 1, f->regGen})
