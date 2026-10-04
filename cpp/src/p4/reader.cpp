@@ -172,6 +172,10 @@ void ReaderPool::closeAll() {
 
 namespace {
 
+// |e - at|, exact over the whole int64 range (an epoch clamped to it, C-46 (1),
+// and any instant): the EPOCH point profiles rank by it first.
+uint64_t epochDistance(int64_t e, int64_t at) { return e > at ? uint64_t(e) - uint64_t(at) : uint64_t(at) - uint64_t(e); }
+
 // The stream generation of a feed file's read transaction, which the caller
 // has begun and not yet read in: its first read (the file's meta) fixes the
 // snapshot. A generation a compaction has since replaced and no longer keeps
@@ -377,7 +381,24 @@ public:
         uint8_t key[32];
         uint32_t fid = 0;
     };
-    int32_t epochPoints(int profile, int64_t at, std::map<std::string, Pick>* best, bool* handled);
+    // What a count or a limited page needs of the points (C-46 (5), the
+    // push-down of a58f818 and 226872c). Every profile ranks by the distance
+    // first, so an entity's best pick is within maxDelta iff one feed file's
+    // pick is. A count counts an entity at its first such pick and probes it
+    // no more. A page of the first n entities (text order) with a pick within
+    // maxDelta keeps those n confirmed; no entity past the n-th confirmed one
+    // is probed (it can never return: the n-th only moves down), and a
+    // text-keyed object walk stops there (okey order is text order). pruned:
+    // an entity was skipped or dropped, so `best` holds the page's entities only.
+    struct EpochWant {
+        bool countOnly = false;
+        size_t n = 0;
+        int64_t maxDelta = 0;
+        std::unordered_set<std::string> counted;
+        std::set<std::string> conf;
+        bool pruned = false;
+    };
+    int32_t epochPoints(int profile, int64_t at, std::map<std::string, Pick>* best, bool* handled, EpochWant* want);
     // The given records, each answered as the scan answers (filters, tags).
     int32_t answer(std::vector<Cand>& cands, std::vector<std::pair<int64_t, Row>>* out);
     // The given (feed id, seq) records (those in the scan's files).
@@ -1479,7 +1500,7 @@ int32_t Scan::next(Row** out) {
 // epoch group has a record that passes the filters; ties at the best epoch go
 // to the lowest CID (format 1's ranking), then the lowest feed id. Records
 // without an object are their own entities (their CID).
-int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* best, bool* handled) {
+int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* best, bool* handled, EpochWant* want) {
     *handled = false;
     if (!sp_->ek || !s_.search.empty() || profile < 2 || profile > 4) return P4_OK;
     for (const FRef& fr : files_)
@@ -1502,7 +1523,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
         if (profile == 4) {
             if (ae != be) return ae < be;
         } else if (profile == 2) {
-            const int64_t da = ae > at ? ae - at : at - ae, db = be > at ? be - at : at - be;
+            const uint64_t da = epochDistance(ae, at), db = epochDistance(be, at);
             if (da != db) return da < db;
             if ((ae <= at) != (be <= at)) return ae <= at;
             if (ae != be) return ae > be;
@@ -1516,6 +1537,32 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
     auto offer = [&](const std::string& ent, const Pick& p) {
         auto it = best->find(ent);
         if (it == best->end() || better(p.e, p.key, it->second.e, it->second.key)) (*best)[ent] = p;
+    };
+    // EpochWant: whether an entity takes no probe, and a feed file's pick for one.
+    auto skip = [&](const std::string& ent) -> bool {
+        if (!want) return false;
+        if (want->countOnly) return want->counted.count(ent) != 0;
+        if (want->n && want->conf.size() >= want->n && ent > *want->conf.rbegin()) {
+            want->pruned = true;
+            return true;
+        }
+        return false;
+    };
+    auto take = [&](const std::string& ent, const Pick& p) {
+        const bool within = !want || want->maxDelta <= 0 || epochDistance(p.e, at) <= uint64_t(want->maxDelta);
+        if (want && want->countOnly) {
+            if (within) want->counted.insert(ent);
+            return;
+        }
+        offer(ent, p);
+        if (!want || !want->n || !within) return;
+        want->conf.insert(ent);
+        if (want->conf.size() > want->n) {
+            auto last = std::prev(want->conf.end());
+            best->erase(*last);
+            want->conf.erase(last);
+            want->pruned = true;
+        }
     };
     int32_t rc = P4_OK;
     for (size_t fi = 0; fi < files_.size() && rc == P4_OK; fi++) {
@@ -1650,7 +1697,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
             }
             return have ? 1 : 0;
         };
-        auto object = [&](const KVal& k, int64_t kk, const std::vector<const StRow*>* sk) -> int32_t {
+        auto object = [&](const std::string& ent, int64_t kk, const std::vector<const StRow*>* sk) -> int32_t {
             Pick b, a;
             int got = 0;
             if (profile != 4) {
@@ -1665,8 +1712,14 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
             }
             if (!got) return P4_OK;
             const Pick& p = got == 1 ? b : got == 2 ? a : (better(b.e, b.key, a.e, a.key) ? b : a);
-            offer(k.text(), p);
+            take(ent, p);
             return check();
+        };
+        // An object's entity: its key's text.
+        auto entOf = [](const KVal& k, std::string* tmp) -> const std::string& {
+            if (k.type == 3) return k.s;
+            *tmp = k.text();
+            return *tmp;
         };
         // The staged rows by object (keys in order; rows without an object first).
         std::vector<std::pair<KVal, std::vector<const StRow*>>> stObj;
@@ -1688,7 +1741,9 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                 if (kr == SQLITE_ROW) kk = sqlite3_column_int64(keyId, 0);
                 sqlite3_reset(keyId);
                 if (kr != SQLITE_ROW && kr != SQLITE_DONE) rc = statusOfSqlite(kr);
-                if (rc == P4_OK && (kk || !sk.empty())) rc = object(kv, kk, st ? &sk : nullptr);
+                std::string tmp;
+                const std::string& ent = entOf(kv, &tmp);
+                if (rc == P4_OK && (kk || !sk.empty()) && !skip(ent)) rc = object(ent, kk, st ? &sk : nullptr);
                 if (rc != P4_OK) break;
             }
         } else {
@@ -1709,10 +1764,20 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                 if (r != SQLITE_ROW && r != SQLITE_DONE) rc = statusOfSqlite(r);
             };
             nextSql();
+            uint64_t skipped = 0;
             while (rc == P4_OK && (haveSql || oi < stObj.size())) {
                 const int cmp = !haveSql ? 1 : oi >= stObj.size() ? -1 : kCmp(sqlK, stObj[oi].first);
-                const KVal k = cmp <= 0 ? sqlK : stObj[oi].first;
-                rc = object(k, cmp <= 0 ? sqlId : 0, cmp >= 0 ? &stObj[oi].second : nullptr);
+                const KVal& k = cmp <= 0 ? sqlK : stObj[oi].first;
+                std::string tmp;
+                const std::string& ent = entOf(k, &tmp);
+                if (!skip(ent)) {
+                    rc = object(ent, cmp <= 0 ? sqlId : 0, cmp >= 0 ? &stObj[oi].second : nullptr);
+                } else {
+                    // Keys come in SQLite's order (integers, then text in text
+                    // order): past a page's skipped text key every key is skipped.
+                    if (!want->countOnly && k.type == 3) break;
+                    if ((++skipped & 4095) == 0) rc = check();
+                }
                 if (cmp >= 0) oi++;
                 if (rc == P4_OK && cmp <= 0) nextSql();
             }
@@ -1751,12 +1816,14 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                     }
                 for (const Pick& p : ps) {
                     if (rc != P4_OK) break;
+                    char cid[60];
+                    cidTextFromKey(p.key, cid);
+                    const std::string ent(cid, kCidText);
+                    if (skip(ent)) continue;
                     const int32_t ok = passes(p.seq);
                     if (ok < 0) rc = ok;
                     if (ok <= 0) continue;
-                    char cid[60];
-                    cidTextFromKey(p.key, cid);
-                    offer(std::string(cid, kCidText), p);
+                    take(ent, p);
                 }
             }
         }
@@ -2649,7 +2716,7 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
         if (profile == 4) {
             if (ae != be) return ae < be;
         } else if (profile == 2) {
-            const int64_t da = ae > at ? ae - at : at - ae, db = be > at ? be - at : at - be;
+            const uint64_t da = epochDistance(ae, at), db = epochDistance(be, at);
             if (da != db) return da < db;
             if ((ae <= at) != (be <= at)) return ae <= at;
             if (ae != be) return ae > be;
@@ -2667,52 +2734,74 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
     if (profile == 3) w.wHi = std::min(w.wHi, at);
     if (profile == 4) w.wLo = std::max(w.wLo, at);
     std::map<std::string, Scan::Pick> best;
-    Scan sc(L, t, w);
-    rc = sc.open();
+    // The entities' best records over the type's feed files, in one snapshot
+    // (need: only what a count or a limited page asks); files before REBUILD 1
+    // are walked (*handled false).
+    auto points = [&](Scan::EpochWant* need, bool* handled) -> int32_t {
+        best.clear();
+        Scan sc(L, t, w);
+        int32_t st = sc.open();
+        *handled = false;
+        if (st == P4_OK) st = sc.epochPoints(profile, at, &best, handled, need);
+        Row* r;
+        while (st == P4_OK && !*handled) {
+            const int32_t k = sc.next(&r);
+            if (k <= 0) {
+                st = k;
+                break;
+            }
+            if (profile == 3 && r->e > at) continue;
+            if (profile == 4 && r->e < at) continue;
+            std::string ent = r->k.text();
+            if (ent.empty()) {
+                char cid[60];
+                cidTextFromKey(r->key, cid);
+                ent.assign(cid, kCidText);
+            }
+            auto it = best.find(ent);
+            if (it == best.end() || better(r->e, r->key, it->second.e, it->second.key)) {
+                Scan::Pick p;
+                p.e = r->e;
+                p.seq = r->seq;
+                p.fid = r->fid;
+                std::memcpy(p.key, r->key, 32);
+                best[ent] = p;
+            }
+        }
+        return st;
+    };
+    // The records are answered a chunk of picks at a time. A count takes each
+    // entity once; a page of limit records after offset that fits one chunk
+    // takes its first offset + limit entities only (C-46 (5)).
+    constexpr uint64_t kChunk = 4096;
+    Scan::EpochWant need;
+    need.countOnly = countOnly != 0;
+    need.maxDelta = maxDelta;
+    if (!countOnly && s.limit && s.offset < kChunk && s.limit <= kChunk - s.offset) need.n = size_t(s.offset + s.limit);
     bool handled = false;
-    if (rc == P4_OK) rc = sc.epochPoints(profile, at, &best, &handled);
-    Row* r;
-    while (rc == P4_OK && !handled) {
-        const int32_t k = sc.next(&r);
-        if (k <= 0) {
-            rc = k;
-            break;
-        }
-        if (profile == 3 && r->e > at) continue;
-        if (profile == 4 && r->e < at) continue;
-        std::string ent = r->k.text();
-        if (ent.empty()) {
-            char cid[60];
-            cidTextFromKey(r->key, cid);
-            ent.assign(cid, kCidText);
-        }
-        auto it = best.find(ent);
-        if (it == best.end() || better(r->e, r->key, it->second.e, it->second.key)) {
-            Scan::Pick p;
-            p.e = r->e;
-            p.seq = r->seq;
-            p.fid = r->fid;
-            std::memcpy(p.key, r->key, 32);
-            best[ent] = p;
-        }
-    }
+    rc = points(need.countOnly || need.n ? &need : nullptr, &handled);
+    const bool pruned = handled && need.n && need.pruned;
     if (rc == P4_OK) {
         std::vector<std::pair<std::string, Scan::Pick>> picks;
-        for (auto& kv : best) {
-            if (maxDelta > 0) {
-                const int64_t d = kv.second.e > at ? kv.second.e - at : at - kv.second.e;
-                if (d > maxDelta) continue;
+        // The picks within maxDelta, in entity order (cut: a pruned page's
+        // n-th entity, past which `best` holds nothing complete).
+        auto pickList = [&](const std::string* cut) {
+            picks.clear();
+            for (auto& kv : best) {
+                if (cut && kv.first > *cut) break;
+                if (maxDelta > 0 && epochDistance(kv.second.e, at) > uint64_t(maxDelta)) continue;
+                picks.push_back(kv);
             }
-            picks.push_back(kv);
-        }
+        };
+        pickList(pruned ? &*need.conf.rbegin() : nullptr);
         if (countOnly) {
             o.enc.beginRow();
-            o.enc.i64(int64_t(picks.size()));
+            o.enc.i64(handled ? int64_t(need.counted.size()) : int64_t(picks.size()));
             o.enc.endRow();
             rc = o.rowDone();
         } else {
-            // The records with their matched tags, a chunk of picks at a time,
-            // written in the picks' order (entity text ascending).
+            // The records with their matched tags, written in the picks' order
+            // (entity text ascending).
             Spec2 out = s;
             out.order = P4_ORDER_SEQ_ASC;
             out.limit = 0;
@@ -2720,28 +2809,47 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
             out.needTags = true;
             if (profile == 3) out.wHi = std::min(out.wHi, at);
             if (profile == 4) out.wLo = std::max(out.wLo, at);
-            Scan os(L, t, out);
-            rc = os.open();
             uint64_t emitted = 0;
-            size_t pos = size_t(std::min<uint64_t>(s.offset, picks.size()));
-            while (rc == P4_OK && pos < picks.size() && !(s.limit && emitted >= s.limit)) {
-                size_t want = 4096;
-                if (s.limit) want = size_t(std::min<uint64_t>(want, s.limit - emitted));
-                const size_t end = std::min(picks.size(), pos + want);
-                std::vector<std::pair<uint32_t, int64_t>> chunk;
-                for (size_t i = pos; i < end; i++) chunk.push_back({picks[i].second.fid, picks[i].second.seq});
-                std::vector<std::pair<int64_t, Row>> got;
-                rc = os.answerPicks(chunk, &got);
-                std::map<std::pair<uint32_t, int64_t>, Row*> bySeq;
-                for (auto& g : got) bySeq[{g.second.fid, g.first}] = &g.second;
-                for (size_t i = pos; rc == P4_OK && i < end; i++) {
-                    auto it = bySeq.find({picks[i].second.fid, picks[i].second.seq});
-                    if (it == bySeq.end()) continue;  // gone since the pick, or filtered out
-                    writeRec(o, *it->second, &picks[i].first, false);
-                    rc = o.rowDone();
-                    emitted++;
+            // false: a pick of a pruned page (whole: its one chunk) is gone
+            // since it was picked (a delete in between); nothing is written.
+            auto emit = [&](Scan& os, bool whole) -> bool {
+                size_t pos = size_t(std::min<uint64_t>(s.offset, picks.size()));
+                while (rc == P4_OK && pos < picks.size() && !(s.limit && emitted >= s.limit)) {
+                    const size_t end = std::min(picks.size(), pos + size_t(s.limit ? std::min(kChunk, s.limit - emitted) : kChunk));
+                    std::vector<std::pair<uint32_t, int64_t>> chunk;
+                    for (size_t i = pos; i < end; i++) chunk.push_back({picks[i].second.fid, picks[i].second.seq});
+                    std::vector<std::pair<int64_t, Row>> got;
+                    rc = os.answerPicks(chunk, &got);
+                    std::map<std::pair<uint32_t, int64_t>, Row*> bySeq;
+                    for (auto& g : got) bySeq[{g.second.fid, g.first}] = &g.second;
+                    if (rc == P4_OK && whole)
+                        for (const auto& c : chunk)
+                            if (!bySeq.count(c)) return false;
+                    for (size_t i = pos; rc == P4_OK && i < end; i++) {
+                        auto it = bySeq.find({picks[i].second.fid, picks[i].second.seq});
+                        if (it == bySeq.end()) continue;  // gone since the pick, or filtered out
+                        writeRec(o, *it->second, &picks[i].first, false);
+                        rc = o.rowDone();
+                        emitted++;
+                    }
+                    pos = end;
                 }
-                pos = end;
+                return true;
+            };
+            bool done;
+            {
+                Scan os(L, t, out);
+                rc = os.open();
+                done = rc != P4_OK || emit(os, pruned);
+            }
+            if (!done) {
+                // The page as an unpruned one: every entity picked again (a new
+                // snapshot), the page filled from the next entities.
+                rc = points(nullptr, &handled);
+                pickList(nullptr);
+                Scan os(L, t, out);
+                if (rc == P4_OK) rc = os.open();
+                if (rc == P4_OK) emit(os, false);
             }
         }
     }
