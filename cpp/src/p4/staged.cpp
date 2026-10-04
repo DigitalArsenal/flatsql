@@ -369,6 +369,7 @@ int32_t stagedLoad(Engine* e, Feed* f, Conn* c, std::string* err) {
     const int32_t st = readStaged(c, &rows, &ids);
     if (st == P4_E_FORMAT && err) *err = f->path + ": a feed index without staged rows (format 4 from an older engine)";
     if (st != P4_OK) return st;
+    rows.shrink_to_fit();  // the view's memory is its rows
     Type* t = f->type;
     std::lock_guard<std::mutex> g(t->mu);
     stagedPublish(e, f, Staged::make(nullptr, std::move(rows), {}, ids, true), true);
@@ -403,8 +404,14 @@ int64_t stagedMismatches(Feed* f, Conn* c) {
 // ---- the merge ------------------------------------------------------------------------------------------
 namespace {
 // A feed with staged rows and no new ones for this long is merged (due),
-// whatever it holds.
-constexpr uint64_t kMergeIdleNs = 2000000000ull;
+// whatever it holds. Reads take staged rows at no measurable cost (500k
+// staged rows over 300 feeds: every read shape within noise of all merged),
+// so a quiet feed waits: a delivery that follows within the window shares
+// the merge, and a merge's cost is about every page of the feed's three
+// random-keyed indexes whatever it carries (W01 into the fixture's big feeds,
+// two deliveries ~7 s apart: 5,283 B/record with a 2 s window, 3,256 with
+// 10 s or 30 s). The views' cap bounds the memory whatever the window.
+constexpr uint64_t kMergeIdleNs = 30000000000ull;
 
 // Native test builds: P4_MERGE_DEBUG=1 logs each merge's start and end on
 // stderr (the kill-during-merge test times its kills by them).
