@@ -208,6 +208,9 @@ jobs:
         ls cpp/src/p4sql/*.cpp >/dev/null 2>&1 || { echo "::error::cpp/src/p4sql is absent: the p4 engine ships with the SQL surface"; exit 1; }
         ls cpp/tests/p4sql/*.cpp >/dev/null 2>&1 || { echo "::error::cpp/tests/p4sql has no engine-backed SQL tests"; exit 1; }
 
+    - name: Install dependencies (the Node host imports space-data-module-sdk)
+      run: npm ci --ignore-scripts
+
     - name: Build the wasi-threads artifacts and test commands
       run: bash scripts/build-wasm.sh --ps-tests
 
