@@ -28,6 +28,11 @@
 
 using namespace p4t;
 namespace fp = flatsql::p4;
+namespace flatsql {
+namespace p4 {
+const std::string& lastError();
+}
+}  // namespace flatsql
 
 #if !defined(__wasm__)
 #include <filesystem>
@@ -305,7 +310,7 @@ P4_SLOW_TEST(g2_fixture) {
     const uint64_t ti = flatsql::ps::monoNs();
     CHECK_EQ(call(P4_OPC_REBUILD, r1.b).status, P4_OK, "REBUILD 1");
     report("g2.rebuild1.seconds", double(flatsql::ps::monoNs() - ti) / 1e9, "s");
-    CHECK_EQ(flatsql_p4_activate(), P4_OK, "activate");
+    CHECK_EQ(flatsql_p4_activate(), P4_OK, "activate: " + fp::lastError());
     closeEngine(600000);
     }
     // Full text builds after activation (§11 step 5).

@@ -91,7 +91,8 @@ FLATSQL_P4_EXPORT("flatsql_p4_set_quota") int32_t flatsql_p4_set_quota(double by
 
 FLATSQL_P4_EXPORT("flatsql_p4_activate") int32_t flatsql_p4_activate(void) {
     if (!gEngine) return P4_E_STOPPED;
-    return flatsql::p4::engineActivate(gEngine);
+    gLastError.clear();
+    return flatsql::p4::engineActivate(gEngine, &gLastError);
 }
 
 FLATSQL_P4_EXPORT("flatsql_p4_stats") int32_t flatsql_p4_stats(uint8_t* out, int32_t cap) {

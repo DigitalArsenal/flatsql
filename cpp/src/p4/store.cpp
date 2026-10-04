@@ -545,10 +545,16 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
 }
 
 // ---- activation (§2.3 step 1) -------------------------------------------------------------
-int32_t engineActivate(Engine* e) {
-    if (e->cfg.createMode != 2) return P4_E_FORMAT;
+int32_t engineActivate(Engine* e, std::string* err) {
+    if (e->cfg.createMode != 2) {
+        *err = "activate: not a migration target (create mode 2)";
+        return P4_E_FORMAT;
+    }
     Markers m;
-    if (readMarkers(e, &m) != P4_OK) return P4_E_IO;
+    if (readMarkers(e, &m) != P4_OK) {
+        *err = "activate: markers unreadable";
+        return P4_E_IO;
+    }
     if (markersActivated(m)) return P4_OK;  // idempotent
     std::vector<Type*> types;
     {
@@ -568,9 +574,22 @@ int32_t engineActivate(Engine* e) {
         paths.push_back(t->pIdx);
         for (const std::string& path : paths) {
             Conn* c = nullptr;
-            if (openConn(path, OpenKind::Maint, 1024, 0, &c, nullptr) != SQLITE_OK) return P4_E_IO;
-            int log = 0, ck = 0;
-            const int r = sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &log, &ck);
+            std::string oerr;
+            const int orc = openConn(path, OpenKind::Maint, 1024, 0, &c, &oerr);
+            if (orc != SQLITE_OK) {
+                *err = "activate: open " + path + ": " + oerr + " (" + std::to_string(orc) + ")";
+                return P4_E_IO;
+            }
+            // The maintenance thread may be checkpointing the same file (a
+            // second checkpointer gets SQLITE_BUSY at once, without the busy
+            // handler): retry until it is done.
+            int log = 0, ck = 0, r = SQLITE_BUSY;
+            for (int tries = 0; tries < 600; tries++) {
+                r = sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &log, &ck);
+                if ((r & 0xff) != SQLITE_BUSY && (r & 0xff) != SQLITE_LOCKED) break;
+                ps::sleepNs(50ull * 1000 * 1000);
+            }
+            if (r != SQLITE_OK) *err = "activate: checkpoint " + path + ": " + sqlite3_errmsg(c->db) + " (" + std::to_string(r) + ")";
             delete c;
             if (r != SQLITE_OK) return statusOfSqlite(r);
             walNote(e, path, 0);
@@ -586,6 +605,7 @@ int32_t engineActivate(Engine* e) {
     const bool rewriteMigrated = !(m.migratedValid && m.storePresent && !m.storeValid);
     const int32_t rc = writeMarkers(e, uuid, e->cfg.gseqFloor, 1, rewriteMigrated);
     if (rc == P4_OK) e->ftsHold.store(false);  // full text builds from seq 0 (§11 step 5)
+    else *err = "activate: markers write failed";
     return rc;
 }
 
