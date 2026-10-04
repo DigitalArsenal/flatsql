@@ -44,7 +44,23 @@ void planRelease(Engine* e, Conn* c) { e->rpool.release(c); }
 
 RecState* WriteCtx::known(uint32_t fid, int64_t seq) {
     auto it = bySeq_.find({fid, seq});
-    return it == bySeq_.end() ? nullptr : it->second;
+    if (it != bySeq_.end()) return it->second;
+    // A record a pending unit of the type touched: its state after that unit.
+    for (const WriteCtx* p : seeds_) {
+        auto s = p->postSeq_.find({fid, seq});
+        if (s != p->postSeq_.end()) return materialize(p->post_[s->second]);
+    }
+    return nullptr;
+}
+
+// A pending unit's record, copied into this write (once).
+RecState* WriteCtx::materialize(const RecState& s) {
+    store_.push_back(s);
+    RecState* r = &store_.back();
+    order_.push_back(r);
+    bySeq_[{r->fid, r->seq}] = r;
+    if (r->keyed) byKey_[{r->fid, std::string(reinterpret_cast<const char*>(r->key), 32)}] = r;
+    return r;
 }
 
 RecState* WriteCtx::make(uint32_t fid, int64_t seq, const uint8_t* key) {
@@ -176,6 +192,14 @@ RecState* WriteCtx::byKey(uint32_t fid, const uint8_t key[32], int32_t* rc) {
     const auto k = std::make_pair(fid, std::string(reinterpret_cast<const char*>(key), 32));
     auto it = byKey_.find(k);
     if (it != byKey_.end()) return it->second;
+    for (const WriteCtx* p : seeds_) {
+        auto sk = p->postKey_.find(k);
+        if (sk != p->postKey_.end()) {
+            // The latest state of that record's seq (a newer unit may hold it).
+            const RecState& s0 = p->post_[sk->second];
+            return known(s0.fid, s0.seq);
+        }
+    }
     Feed* f;
     bool created, indexed;
     {
@@ -1392,7 +1416,11 @@ int32_t WriteCtx::prepare() {
 // looked up by the unit that needs them), and the ingest identities it adds.
 void WriteCtx::snapshot() {
     post_.clear();
-    postIdents_.clear();
+    postSeq_.clear();
+    postKey_.clear();
+    postK_.clear();
+    postIdent_.clear();
+    postFids_.clear();
     std::map<const RecState*, size_t> at;
     for (RecState* r : order_) {
         if (!r->touched || !r->seq) continue;
@@ -1426,46 +1454,53 @@ void WriteCtx::snapshot() {
     for (const IdentNew& id : idents) {
         auto it = id.rec ? at.find(id.rec) : at.end();
         if (it == at.end()) continue;
-        postIdents_.push_back({std::string(reinterpret_cast<const char*>(id.h), 32), it->second});
+        postIdent_[{post_[it->second].fid, std::string(reinterpret_cast<const char*>(id.h), 32)}] = it->second;
     }
+    // The lookups a later unit's planning makes into this state.
+    for (size_t i = 0; i < post_.size(); i++) {
+        const RecState& r = post_[i];
+        postSeq_[{r.fid, r.seq}] = i;
+        if (r.keyed) postKey_[{r.fid, std::string(reinterpret_cast<const char*>(r.key), 32)}] = i;
+        if (r.k.type) postK_[{r.fid, std::to_string(r.k.type) + ":" + r.k.text()}].push_back(i);
+        postFids_.insert(r.fid);
+    }
+    seeds_.clear();  // planned: nothing of the pending units is used after this
 }
 
 void WriteCtx::seed(const std::vector<const WriteCtx*>& prevs) {
-    // Oldest first: a record a later unit touched is in its later state.
-    for (const WriteCtx* prev : prevs) {
-        for (const RecState& s : prev->post_) {
-            store_.push_back(s);
-            RecState* r = &store_.back();
-            order_.push_back(r);
-            bySeq_[{r->fid, r->seq}] = r;
-            if (r->keyed) byKey_[{r->fid, std::string(reinterpret_cast<const char*>(r->key), 32)}] = r;
-            seededFids_.insert(r->fid);
-        }
-        for (const auto& id : prev->postIdents_) {
-            const RecState& s = prev->post_[id.second];
-            seedIdent_[{s.fid, id.first}] = bySeq_[{s.fid, s.seq}];
-        }
-    }
-    // The object-key lists over each record's latest state only.
-    std::set<const RecState*> seen;
-    for (auto& kv : bySeq_) {
-        RecState* r = kv.second;
-        if (!seededFids_.count(r->fid) || !r->k.type || !seen.insert(r).second) continue;
-        seedK_[{r->fid, std::to_string(r->k.type) + ":" + r->k.text()}].push_back(r);
-    }
+    // Newest first: a record a later unit touched is in its later state.
+    // Nothing is copied until this write asks for a record.
+    seeds_.assign(prevs.rbegin(), prevs.rend());
 }
 
-bool WriteCtx::seededFeed(uint32_t fid) const { return seededFids_.count(fid) != 0; }
+bool WriteCtx::seededFeed(uint32_t fid) const {
+    for (const WriteCtx* p : seeds_)
+        if (p->postFids_.count(fid)) return true;
+    return false;
+}
 
-void WriteCtx::seededWithK(uint32_t fid, const KVal& k, std::vector<RecState*>* out) const {
+void WriteCtx::seededWithK(uint32_t fid, const KVal& k, std::vector<RecState*>* out) {
     out->clear();
-    auto it = seedK_.find({fid, std::to_string(k.type) + ":" + k.text()});
-    if (it != seedK_.end()) *out = it->second;
+    const auto key = std::make_pair(fid, std::to_string(k.type) + ":" + k.text());
+    std::set<int64_t> seen;
+    for (const WriteCtx* p : seeds_) {
+        auto it = p->postK_.find(key);
+        if (it == p->postK_.end()) continue;
+        for (size_t at : it->second) {
+            const int64_t seq = p->post_[at].seq;
+            if (!seen.insert(seq).second) continue;
+            if (RecState* r = known(fid, seq)) out->push_back(r);
+        }
+    }
 }
 
-RecState* WriteCtx::seededIdent(uint32_t fid, const uint8_t h[32]) const {
-    auto it = seedIdent_.find({fid, std::string(reinterpret_cast<const char*>(h), 32)});
-    return it == seedIdent_.end() ? nullptr : it->second;
+RecState* WriteCtx::seededIdent(uint32_t fid, const uint8_t h[32]) {
+    const auto key = std::make_pair(fid, std::string(reinterpret_cast<const char*>(h), 32));
+    for (const WriteCtx* p : seeds_) {
+        auto it = p->postIdent_.find(key);
+        if (it != p->postIdent_.end()) return known(fid, p->post_[it->second].seq);
+    }
+    return nullptr;
 }
 
 // After a failed apply: every feed this write appended to goes back to its

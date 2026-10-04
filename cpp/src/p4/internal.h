@@ -884,8 +884,8 @@ public:
     // only committed rows).
     void seed(const std::vector<const WriteCtx*>& prevs);
     bool seededFeed(uint32_t fid) const;
-    void seededWithK(uint32_t fid, const KVal& k, std::vector<RecState*>* out) const;  // seeded records of an object key
-    RecState* seededIdent(uint32_t fid, const uint8_t h[32]) const;                     // a seeded ingest identity
+    void seededWithK(uint32_t fid, const KVal& k, std::vector<RecState*>* out);  // seeded records of an object key
+    RecState* seededIdent(uint32_t fid, const uint8_t h[32]);                     // a seeded ingest identity
     bool migrate = false;  // migrate mode: instance times are the caller's (C-36), new files without indexes
     int64_t now = 0;
     std::vector<IdentNew> idents;
@@ -913,12 +913,16 @@ private:
     std::vector<uint32_t> fileOrder_, locals_;
     std::map<uint32_t, std::vector<int64_t>> movesIn_;
     std::map<uint32_t, int64_t> newEnd_, oldEnd_;  // each feed's stream end after / before this write's frames
-    // the state after this write (snapshot) and the seed taken from the previous unit
+    // the state after this write (snapshot), with the lookups a later unit
+    // makes into it; and this write's seeds (pending units, newest first,
+    // used while planning only)
     std::vector<RecState> post_;
-    std::vector<std::pair<std::string, size_t>> postIdents_;
-    std::set<uint32_t> seededFids_;
-    std::map<std::pair<uint32_t, std::string>, std::vector<RecState*>> seedK_;
-    std::map<std::pair<uint32_t, std::string>, RecState*> seedIdent_;
+    std::map<std::pair<uint32_t, int64_t>, size_t> postSeq_;
+    std::map<std::pair<uint32_t, std::string>, size_t> postKey_, postIdent_;
+    std::map<std::pair<uint32_t, std::string>, std::vector<size_t>> postK_;
+    std::set<uint32_t> postFids_;
+    std::vector<const WriteCtx*> seeds_;
+    RecState* materialize(const RecState& s);
 };
 // A commit round over several prepared writes (the indexer's), or one
 // (WriteCtx::apply). A failure fails the round; files committed before it stay.
