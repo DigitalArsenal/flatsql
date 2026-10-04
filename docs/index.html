@@ -6,9 +6,6 @@
     <meta name="description" content="Edgesource FlatSQL - SQL queries over raw FlatBuffer storage. Zero-copy queries, file identifier routing, real-time indexing.">
     <title>Edgesource FlatSQL</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><ellipse cx='50' cy='25' rx='35' ry='12' fill='%23fff'/><path d='M15 25v50c0 6.6 15.7 12 35 12s35-5.4 35-12V25' fill='none' stroke='%23fff' stroke-width='6'/><ellipse cx='50' cy='75' rx='35' ry='12' fill='none' stroke='%23fff' stroke-width='6'/><path d='M55 35L40 55h15L42 80l25-30H52l8-15z' fill='%23000'/></svg>">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <!-- SDN_CONSUMER_ASSETS_START -->
 <link rel="stylesheet" href="https://static.spacedatanetwork.org/assets/hd-wallet-ui/2.0.28/sdn-wallet-public-client.c3f68d1cfd88478f10d836a5e829d1dfc6a10157972cf0f7d4d319d0636f2cc4.css" integrity="sha384-fICuhN4I9xqOK1F5vGGzl26opuO+xQIvTZXMSV76lWTBiQ6AfzztMGLLDw8yRT8i" crossorigin="anonymous">
 <script defer src="https://static.spacedatanetwork.org/assets/hd-wallet-ui/2.0.28/sdn-wallet-public-client.f611e7e151a3b5c38384272f8894a4c6634f0a29bf925b0e02e0e27f8db0bfff.js" integrity="sha384-R+QqsKoWJIS7iWrtPmgJ49DVnb1hSGjZokupbLInJd1PLp8RwQhtF/hnaerc33ci" crossorigin="anonymous" data-sdn-wallet-public-client="v1"></script>
@@ -26,8 +23,8 @@
             --ui-bg: rgba(42, 42, 45, 0.72);
             --ui-hover: rgba(66, 66, 69, 0.72);
             --nav-bg: rgba(22, 22, 23, 1.0);
-            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-            --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
+            --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+            --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
             --sdn-stack-footer-height: 40px;
             --sdn-stack-header-height: 52px;
             --sdn-stack-header-brand-size: 15px;
@@ -176,7 +173,7 @@
         }
 
         .hero-license a:hover {
-            color: #4ade80;
+            color: #f5a524;
         }
 
         .hero-builton {
@@ -192,7 +189,7 @@
         }
 
         .hero-builton a:hover {
-            color: #4ade80;
+            color: #f5a524;
         }
 
         .hero-contact {
@@ -569,9 +566,9 @@
         }
 
         .source-btn.active {
-            background: rgba(74, 222, 128, 0.15);
-            border-color: rgba(74, 222, 128, 0.3);
-            color: #4ade80;
+            background: rgba(245, 165, 36, 0.15);
+            border-color: rgba(245, 165, 36, 0.3);
+            color: #f5a524;
         }
 
         .source-dropdown {
@@ -594,7 +591,7 @@
 
         .source-dropdown:focus {
             outline: none;
-            border-color: rgba(96, 165, 250, 0.5);
+            border-color: rgba(89, 217, 255, 0.5);
         }
 
         .source-dropdown:disabled {
@@ -624,10 +621,10 @@
         .query-example-btn {
             padding: 10px 18px;
             min-height: 44px;
-            background: rgba(96, 165, 250, 0.1);
-            border: 1px solid rgba(96, 165, 250, 0.25);
+            background: rgba(89, 217, 255, 0.1);
+            border: 1px solid rgba(89, 217, 255, 0.25);
             border-radius: 22px;
-            color: #60a5fa;
+            color: #59d9ff;
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
@@ -639,8 +636,8 @@
         }
 
         .query-example-btn:hover {
-            background: rgba(96, 165, 250, 0.2);
-            border-color: rgba(96, 165, 250, 0.5);
+            background: rgba(89, 217, 255, 0.2);
+            border-color: rgba(89, 217, 255, 0.5);
             color: #93c5fd;
         }
 
@@ -842,7 +839,7 @@
         }
 
         .schema-note a {
-            color: #60a5fa;
+            color: #59d9ff;
             text-decoration: none;
         }
 
@@ -862,16 +859,16 @@
         }
 
         .schema-code .json-key {
-            color: #4ade80;
+            color: #f5a524;
         }
 
         .schema-code .json-string {
-            color: #fbbf24;
+            color: #f5a524;
         }
 
         .schema-code .json-bool,
         .schema-code .json-number {
-            color: #60a5fa;
+            color: #59d9ff;
         }
 
         /* Overview Section */
@@ -884,7 +881,7 @@
 
         /* Why FlatSQL Block */
         .why-block {
-            background: linear-gradient(135deg, rgba(74, 222, 128, 0.08) 0%, rgba(96, 165, 250, 0.08) 50%, rgba(251, 191, 36, 0.08) 100%);
+            background: linear-gradient(135deg, rgba(245, 165, 36, 0.08) 0%, rgba(89, 217, 255, 0.08) 50%, rgba(245, 165, 36, 0.08) 100%);
             border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: 24px;
             padding: 48px;
@@ -900,7 +897,7 @@
             left: 0;
             right: 0;
             height: 3px;
-            background: linear-gradient(90deg, #4ade80, #60a5fa, #fbbf24);
+            background: linear-gradient(90deg, #f5a524, #59d9ff, #f5a524);
         }
 
         .why-block-header {
@@ -955,12 +952,12 @@
         }
 
         .data-source:hover .data-source-icon {
-            background: rgba(74, 222, 128, 0.15);
-            border-color: rgba(74, 222, 128, 0.3);
+            background: rgba(245, 165, 36, 0.15);
+            border-color: rgba(245, 165, 36, 0.3);
         }
 
         .data-source:hover .data-source-icon svg {
-            color: #4ade80;
+            color: #f5a524;
         }
 
         .data-source-label {
@@ -997,11 +994,11 @@
         }
 
         .comparison-box.traditional {
-            border-color: rgba(239, 68, 68, 0.3);
+            border-color: rgba(255, 59, 48, 0.3);
         }
 
         .comparison-box.flatsql {
-            border-color: rgba(74, 222, 128, 0.3);
+            border-color: rgba(245, 165, 36, 0.3);
         }
 
         .comparison-box h4 {
@@ -1014,11 +1011,11 @@
         }
 
         .comparison-box.traditional h4 {
-            color: #ef4444;
+            color: #ff3b30;
         }
 
         .comparison-box.flatsql h4 {
-            color: #4ade80;
+            color: #f5a524;
         }
 
         .comparison-steps {
@@ -1048,13 +1045,13 @@
         }
 
         .comparison-box.traditional .comparison-step-num {
-            background: rgba(239, 68, 68, 0.2);
-            color: #ef4444;
+            background: rgba(255, 59, 48, 0.2);
+            color: #ff3b30;
         }
 
         .comparison-box.flatsql .comparison-step-num {
-            background: rgba(74, 222, 128, 0.2);
-            color: #4ade80;
+            background: rgba(245, 165, 36, 0.2);
+            color: #f5a524;
         }
 
         .comparison-vs {
@@ -1109,7 +1106,7 @@
         .use-case-icon {
             width: 32px;
             height: 32px;
-            background: rgba(96, 165, 250, 0.15);
+            background: rgba(89, 217, 255, 0.15);
             border-radius: 8px;
             display: flex;
             align-items: center;
@@ -1119,7 +1116,7 @@
         .use-case-icon svg {
             width: 18px;
             height: 18px;
-            color: #60a5fa;
+            color: #59d9ff;
         }
 
         .use-case-label {
@@ -1177,27 +1174,27 @@
         }
 
         .overview-card-icon.green {
-            background: rgba(74, 222, 128, 0.15);
+            background: rgba(245, 165, 36, 0.15);
         }
 
         .overview-card-icon.green svg {
-            color: #4ade80;
+            color: #f5a524;
         }
 
         .overview-card-icon.blue {
-            background: rgba(96, 165, 250, 0.15);
+            background: rgba(89, 217, 255, 0.15);
         }
 
         .overview-card-icon.blue svg {
-            color: #60a5fa;
+            color: #59d9ff;
         }
 
         .overview-card-icon.amber {
-            background: rgba(251, 191, 36, 0.15);
+            background: rgba(245, 165, 36, 0.15);
         }
 
         .overview-card-icon.amber svg {
-            color: #fbbf24;
+            color: #f5a524;
         }
 
         .overview-card h3 {
@@ -1292,12 +1289,12 @@
         }
 
         .arch-icon.highlight {
-            background: rgba(74, 222, 128, 0.15);
-            border-color: rgba(74, 222, 128, 0.3);
+            background: rgba(245, 165, 36, 0.15);
+            border-color: rgba(245, 165, 36, 0.3);
         }
 
         .arch-icon.highlight svg {
-            color: #4ade80;
+            color: #f5a524;
         }
 
         .arch-stage-title {
@@ -1399,11 +1396,11 @@
         }
 
         .benchmark-fill.flatsql {
-            background: linear-gradient(90deg, #4ade80, #22c55e);
+            background: linear-gradient(90deg, #f5a524, #f5a524);
         }
 
         .benchmark-fill.sqlite {
-            background: linear-gradient(90deg, #60a5fa, #3b82f6);
+            background: linear-gradient(90deg, #59d9ff, #59d9ff);
         }
 
         .benchmark-legend {
@@ -1428,11 +1425,11 @@
         }
 
         .benchmark-legend-dot.flatsql {
-            background: #22c55e;
+            background: #f5a524;
         }
 
         .benchmark-legend-dot.sqlite {
-            background: #3b82f6;
+            background: #59d9ff;
         }
 
         /* Code Section */
@@ -1594,11 +1591,11 @@
             align-items: center;
             gap: 6px;
             padding: 6px 14px;
-            background: rgba(74, 222, 128, 0.08);
-            border: 1px solid rgba(74, 222, 128, 0.2);
+            background: rgba(245, 165, 36, 0.08);
+            border: 1px solid rgba(245, 165, 36, 0.2);
             border-radius: 20px;
             font-size: 12px;
-            color: #4ade80;
+            color: #f5a524;
             text-decoration: none;
         }
 
@@ -1648,7 +1645,29 @@
             .stack-section { padding: 60px 24px; }
             .nav-links { display: none; }
         }
+
+        /* Space Data Network style guide (spacedatanetwork.org/style-guide.html):
+           dark first, one amber accent, system fonts, pill buttons. */
+        :root { --accent: #f5a524; --accent-soft: rgba(245,165,36,.14); --border: rgba(255,255,255,.12); --border-strong: rgba(255,255,255,.22); --radius: 20px; --radius-sm: 12px; }
+        nav { -webkit-user-select: none; user-select: none; border-bottom: 1px solid var(--border); }
+        .eyebrow, .hero p.eyebrow { font-size: 12px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); margin: 0 auto 14px; line-height: 1.4; }
+        .hero { justify-content: flex-start; padding: calc(var(--sdn-stack-header-height, 52px) + 7vh) 24px 72px; }
+        .hero-content { max-width: 1120px; width: 100%; }
+        .hero h1 { font-size: clamp(40px, 7vw, 76px); font-weight: 700; letter-spacing: -.03em; line-height: 1.04; margin-bottom: 14px; }
+        .hero h1 + p { font-size: clamp(17px, 2vw, 21px); font-weight: 400; color: rgba(245,245,247,.78); margin-bottom: 26px; }
+        .hero .hero-reel { width: min(100%, 960px, max(560px, calc((100svh - 500px) * 16 / 9))); max-width: 100%; margin: 0 auto 22px; }
+        .hero p.hero-license, .hero p.hero-builton { font-size: 15px; font-weight: 400; margin-bottom: 6px; max-width: 760px; }
+        .hero p.hero-contact { font-size: 13px; font-weight: 400; margin: 0 auto; }
+        .hero-buttons { margin: 18px 0 18px; }
+        .btn { border-radius: 999px; border: 1px solid var(--border-strong); background: rgba(28,28,30,.72); color: #f5f5f7; transition: background .2s, color .2s, border-color .2s; }
+        .btn.btn-primary { background: #f5f5f7; color: #000; border-color: #f5f5f7; }
+        .hero-buttons:hover .btn.btn-primary:not(:hover) { background: rgba(28,28,30,.72); color: #f5f5f7; border-color: var(--border-strong); }
+        .btn:hover { background: #f5f5f7; color: #000; border-color: #f5f5f7; opacity: 1; }
+        .section-title h2 { font-size: clamp(28px, 4vw, 40px); font-weight: 700; letter-spacing: -.02em; }
+        .section-title p { font-size: clamp(17px, 2vw, 21px); font-weight: 400; color: rgba(245,245,247,.78); }
+        a:hover { color: var(--accent); }
     </style>
+    <link rel="stylesheet" href="media/reel/reel.css">
 </head>
 <body>
     <sdn-stack-nav active="flatsql"></sdn-stack-nav>
@@ -1686,42 +1705,25 @@
 
     <section class="hero">
         <div class="hero-content">
-            <h1>Edgesource<br>FlatSQL</h1>
-            <p>SQL queries over raw FlatBuffer storage. Zero conversion, real-time indexing, pure streaming.</p>
-
-            <!-- License line -->
-            <p class="hero-license"><a href="https://github.com/DigitalArsenal/flatsql/blob/main/LICENSE" target="_blank">PolyForm Noncommercial 1.0.0</a> licensed — free for noncommercial use; commercial use requires a license.</p>
+            <p class="eyebrow">Edgesource</p>
+            <h1>FlatSQL</h1>
+            <p>SQL queries over raw FlatBuffer storage.</p>
+            <figure class="reel-frame hero-reel">
+                <div class="reel-stage">
+                    <video muted playsinline preload="auto" data-poster="media/flatsql-reel-poster.webp" aria-label="FlatSQL in 34 seconds, with music">
+                        <source src="media/flatsql-reel.webm" type='video/webm; codecs="av01.0.08M.08"'>
+                        <source src="media/flatsql-reel.mp4" type="video/mp4">
+                    </video>
+                </div>
+            </figure>
+            <p class="hero-license"><a href="https://github.com/DigitalArsenal/flatsql/blob/main/LICENSE" target="_blank">PolyForm Noncommercial 1.0.0</a> licensed: free for noncommercial use; commercial use requires a license.</p>
             <p class="hero-builton">Built on <a href="https://digitalarsenal.github.io/flatbuffers/" target="_blank">FlatBuffers</a></p>
-
-            <!-- Shields.io badges -->
-            <div class="hero-badges">
-                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite/actions" target="_blank">
-                    <img src="https://img.shields.io/github/actions/workflow/status/DigitalArsenal/flatbuffers-sqlite/ci.yml?logo=github&label=CI" alt="CI">
-                </a>
-                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite/stargazers" target="_blank">
-                    <img src="https://img.shields.io/github/stars/DigitalArsenal/flatbuffers-sqlite?logo=github" alt="Stars">
-                </a>
-                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite/network/members" target="_blank">
-                    <img src="https://img.shields.io/github/forks/DigitalArsenal/flatbuffers-sqlite?logo=github" alt="Forks">
-                </a>
-            </div>
-
-            <!-- Contact -->
-            <p class="hero-contact"><a href="mailto:tj@edgesource.com">tj@edgesource.com</a></p>
-
             <div class="hero-buttons">
-                <a href="#demo" class="btn btn-large">Try Live Demo</a>
-                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" class="btn btn-large" target="_blank">View Source</a>
+                <a href="#demo" class="btn btn-large btn-primary">Try the live demo</a>
+                <a href="https://github.com/DigitalArsenal/flatbuffers-sqlite" class="btn btn-large" target="_blank">View source</a>
             </div>
+            <p class="hero-contact"><a href="mailto:tj@edgesource.com">tj@edgesource.com</a></p>
         </div>
-
-        <!-- Scroll Indicator -->
-        <a href="#features" class="scroll-indicator">
-            <span>Scroll</span>
-            <svg class="scroll-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 5v14M19 12l-7 7-7-7"/>
-            </svg>
-        </a>
     </section>
 
     <section class="features" id="features">
@@ -2074,7 +2076,7 @@
                         <li><strong>Append-Only</strong> — No updates; use delete + re-insert</li>
                         <li><strong>In-Memory</strong> — Disk persistence via export/import</li>
                     </ul>
-                    <p style="margin-top: 16px; font-size: 12px;"><a href="https://github.com/DigitalArsenal/flatsql#performance-trade-offs" style="color: #60a5fa;">See full trade-offs analysis →</a></p>
+                    <p style="margin-top: 16px; font-size: 12px;"><a href="https://github.com/DigitalArsenal/flatsql#performance-trade-offs" style="color: #59d9ff;">See full trade-offs analysis →</a></p>
                 </div>
             </div>
         </div>
@@ -2852,5 +2854,7 @@ flatsql --schema app.fbs --load data.bin \\
             console.error(error);
         });
     </script>
+    <script src="media/reel/reel.js" defer></script>
+    <script src="assets/ai-credits/ai-credits.js" defer></script>
 </body>
 </html>
