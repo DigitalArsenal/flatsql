@@ -459,57 +459,65 @@ int32_t mergeAll(Engine* e, Type* t, std::string* err) {
 
 // A feed is due when it holds flushEntries staged rows, when it has had no
 // new rows for 2 s (a quiet feed ends fully indexed), or, while every feed's
-// staged rows together pass 4 x flushEntries, when it holds the most.
+// staged rows together pass 4 x flushEntries, when it holds the most. The
+// due feeds are merged one transaction after the other, until calls are
+// waiting for their ack.
 void mergeStep(Engine* e, uint32_t writer) {
     WriterState& ws = *e->writers[writer];
-    {
-        std::lock_guard<std::mutex> g(ws.imu);
-        if (ws.hold || ws.istop) return;
-        ws.merging = true;
-    }
-    const uint64_t now = monoNs();
-    const int64_t flush = int64_t(std::max<uint32_t>(e->cfg.flushEntries, 1));
-    const bool over = e->stagedRows.load(std::memory_order_relaxed) >= 4 * flush;
-    Feed* pick = nullptr;
-    int64_t pickRows = 0;
-    bool pickDue = false;
-    {
-        std::lock_guard<std::mutex> g(e->typesMu);
-        for (auto& tp : e->types) {
-            Type* t = tp.get();
-            if (t->owner != writer || !t->hasFiles.load(std::memory_order_acquire)) continue;
-            std::lock_guard<std::mutex> g2(t->mu);
-            for (auto& fp : t->feeds) {
-                Feed* f = fp.get();
-                if (!f->staged || !f->created || f->quarantined || now < f->mergeAfter) continue;
-                const int64_t n = int64_t(f->staged->rows) + int64_t(f->staged->idents.size());
-                const bool due = n >= flush || now - f->stagedAt >= 2000000000ull;
-                if ((due && !pickDue) || ((due == pickDue) && n > pickRows)) {
-                    pick = f;
-                    pickRows = n;
-                    pickDue = due;
+    for (bool first = true;; first = false) {
+        {
+            std::lock_guard<std::mutex> g(ws.imu);
+            if (ws.hold || ws.istop || (!first && !ws.iq.empty())) return;
+            ws.merging = true;
+        }
+        const uint64_t now = monoNs();
+        const int64_t flush = int64_t(std::max<uint32_t>(e->cfg.flushEntries, 1));
+        const bool over = e->stagedRows.load(std::memory_order_relaxed) >= 4 * flush;
+        Feed* pick = nullptr;
+        int64_t pickRows = 0;
+        bool pickDue = false;
+        {
+            std::lock_guard<std::mutex> g(e->typesMu);
+            for (auto& tp : e->types) {
+                Type* t = tp.get();
+                if (t->owner != writer || !t->hasFiles.load(std::memory_order_acquire)) continue;
+                std::lock_guard<std::mutex> g2(t->mu);
+                for (auto& fp : t->feeds) {
+                    Feed* f = fp.get();
+                    if (!f->staged || !f->created || f->quarantined || now < f->mergeAfter) continue;
+                    const int64_t n = int64_t(f->staged->rows) + int64_t(f->staged->idents.size());
+                    const bool due = n >= flush || now - f->stagedAt >= 2000000000ull;
+                    if ((due && !pickDue) || ((due == pickDue) && n > pickRows)) {
+                        pick = f;
+                        pickRows = n;
+                        pickDue = due;
+                    }
                 }
             }
         }
-    }
-    if (pick && (pickDue || over)) {
-        std::string err;
-        const int32_t mrc = mergeFeed(e, pick->type, pick, &err);
+        const bool run = pick && (pickDue || over);
+        if (run) {
+            std::string err;
+            const int32_t mrc = mergeFeed(e, pick->type, pick, &err);
 #if !defined(__wasm__)
-        static const bool dbg = std::getenv("P4_MERGE_DEBUG") != nullptr;
-        if (dbg) std::fprintf(stderr, "merge %s rows %lld due %d over %d: %d %s\n", pick->path.c_str(), (long long)pickRows, int(pickDue), int(over), mrc, err.c_str());
+            static const bool dbg = std::getenv("P4_MERGE_DEBUG") != nullptr;
+            if (dbg)
+                std::fprintf(stderr, "merge %s rows %lld due %d over %d: %d %s %.0f ms\n", pick->path.c_str(), (long long)pickRows,
+                             int(pickDue), int(over), mrc, err.c_str(), double(monoNs() - now) / 1e6);
 #endif
-        if (mrc != P4_OK) {
-            // Nothing changed: the rows stay staged and are merged later.
-            std::lock_guard<std::mutex> g(pick->type->mu);
-            pick->mergeAfter = monoNs() + 2000000000ull;
+            if (mrc != P4_OK) {
+                // Nothing changed: the rows stay staged and are merged later.
+                std::lock_guard<std::mutex> g(pick->type->mu);
+                pick->mergeAfter = monoNs() + 2000000000ull;
+            }
         }
+        {
+            std::lock_guard<std::mutex> g(ws.imu);
+            ws.merging = false;
+        }
+        ws.dcv.notify_all();
+        if (!run) return;
     }
-    {
-        std::lock_guard<std::mutex> g(ws.imu);
-        ws.merging = false;
-    }
-    ws.dcv.notify_all();
 }
 
 }  // namespace p4
