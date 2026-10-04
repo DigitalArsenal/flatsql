@@ -19,6 +19,8 @@
 // A row merged before the pin is in the index only; a staged one in the view
 // only. Reads never wait on a merge.
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 #include "internal.h"
 
@@ -492,7 +494,12 @@ void mergeStep(Engine* e, uint32_t writer) {
     }
     if (pick && (pickDue || over)) {
         std::string err;
-        if (mergeFeed(e, pick->type, pick, &err) != P4_OK) {
+        const int32_t mrc = mergeFeed(e, pick->type, pick, &err);
+#if !defined(__wasm__)
+        static const bool dbg = std::getenv("P4_MERGE_DEBUG") != nullptr;
+        if (dbg) std::fprintf(stderr, "merge %s rows %lld due %d over %d: %d %s\n", pick->path.c_str(), (long long)pickRows, int(pickDue), int(over), mrc, err.c_str());
+#endif
+        if (mrc != P4_OK) {
             // Nothing changed: the rows stay staged and are merged later.
             std::lock_guard<std::mutex> g(pick->type->mu);
             pick->mergeAfter = monoNs() + 2000000000ull;
