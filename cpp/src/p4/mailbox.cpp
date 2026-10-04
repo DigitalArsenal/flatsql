@@ -627,7 +627,7 @@ void writerLoop(Engine* e, uint32_t wi) {
                 runPut(e, wi, t, tasks);
             } else {
                 // Everything else reads and writes the index files itself:
-                // the indexer is idle first.
+                // the indexer is idle first (no round, no merge).
                 drain(ws);
                 if (tasks[0]->internal) {
                     Internal* in = tasks[0]->internal;

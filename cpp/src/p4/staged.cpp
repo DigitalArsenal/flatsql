@@ -477,18 +477,20 @@ int32_t mergeAll(Engine* e, Type* t, std::string* err) {
 // new rows for 2 s (a quiet feed ends fully indexed), or, while every feed's
 // staged rows together pass 4 x flushEntries, when it holds the most. The
 // due feeds are merged one transaction after the other, until calls are
-// waiting for their ack.
+// waiting for their ack; past 8 x flushEntries staged rows the merges go on
+// first (the acks wait: the views' memory stays bounded).
 void mergeStep(Engine* e, uint32_t writer) {
     WriterState& ws = *e->writers[writer];
     for (bool first = true;; first = false) {
+        const int64_t flush = int64_t(std::max<uint32_t>(e->cfg.flushEntries, 1));
+        const int64_t staged = e->stagedRows.load(std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> g(ws.imu);
-            if (ws.hold || ws.istop || (!first && !ws.iq.empty())) return;
+            if (ws.hold || ws.istop || (!first && !ws.iq.empty() && staged < 8 * flush)) return;
             ws.merging = true;
         }
         const uint64_t now = monoNs();
-        const int64_t flush = int64_t(std::max<uint32_t>(e->cfg.flushEntries, 1));
-        const bool over = e->stagedRows.load(std::memory_order_relaxed) >= 4 * flush;
+        const bool over = staged >= 4 * flush;
         Feed* pick = nullptr;
         int64_t pickRows = 0;
         bool pickDue = false;
