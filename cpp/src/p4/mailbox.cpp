@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include <chrono>
+
 #include "internal.h"
 #include "sql_bridge.h"
 
@@ -482,9 +484,75 @@ bool takeGroup(Engine* e, uint32_t wi, Type** tp, std::vector<WriteTask*>* out) 
     return false;
 }
 
+// ---- the PUT pipeline -------------------------------------------------------------------------------
+// The writer plans a group and appends its frames while its indexer applies
+// the previous unit (syncs the streams, commits the index rows, acks). The
+// writer hands a unit over only once the previous one is done, so units are
+// applied and answered in plan order.
+
+// The writer's pending unit, once done. A failed one cuts its streams back to
+// their marks, and fails `next` when next was planned on its state (returns
+// true: next is answered).
+bool collect(Engine* e, WriterState& ws, PutUnit* next) {
+    (void)e;
+    PutUnit* p = ws.pending.get();
+    if (!p) return false;
+    {
+        std::unique_lock<std::mutex> g(ws.imu);
+        ws.dcv.wait(g, [&] { return p->done.load(std::memory_order_acquire); });
+    }
+    bool aborted = false;
+    if (p->status != P4_OK) {
+        p->resetStreams();
+        if (next && next->seeded) {
+            next->abort(p->status, "an earlier write of this type failed before this one could commit: nothing stored");
+            aborted = true;
+        }
+    }
+    ws.pending.reset();
+    return aborted;
+}
+
+void runPut(Engine* e, uint32_t wi, Type* t, std::vector<WriteTask*>& tasks) {
+    WriterState& ws = *e->writers[wi];
+    std::unique_ptr<PutUnit> u = putPlan(e, t, tasks, ws.pending.get());
+    if (collect(e, ws, u.get())) return;
+    PutUnit* raw = u.get();
+    ws.pending = std::move(u);
+    {
+        std::lock_guard<std::mutex> g(ws.imu);
+        ws.iq.push_back(raw);
+    }
+    ws.icv.notify_one();
+}
+
+void indexerLoop(Engine* e, uint32_t wi) {
+    tThread = e->firstOfClass[1] + wi;
+    WriterState& ws = *e->writers[wi];
+    for (;;) {
+        PutUnit* u = nullptr;
+        {
+            std::unique_lock<std::mutex> g(ws.imu);
+            ws.icv.wait(g, [&] { return !ws.iq.empty() || ws.istop; });
+            if (ws.iq.empty()) break;
+            u = ws.iq.front();
+            ws.iq.pop_front();
+        }
+        const int32_t rc = u->apply();
+        u->status = rc;
+        u->finish(rc);
+        {
+            std::lock_guard<std::mutex> g(ws.imu);
+            u->done.store(true, std::memory_order_release);
+        }
+        ws.dcv.notify_all();
+    }
+}
+
 void writerLoop(Engine* e, uint32_t wi) {
     tThread = e->firstOfClass[1] + wi;
     Bell& b = e->bells[tThread];
+    WriterState& ws = *e->writers[wi];
     for (;;) {
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
         bool did = false;
@@ -502,18 +570,23 @@ void writerLoop(Engine* e, uint32_t wi) {
             const int op = tasks[0]->op;
             for (WriteTask* wt : tasks)
                 if (!wt->internal) e->slot(wt->slot)->thread = tThread;
-            if (tasks[0]->internal) {
-                Internal* in = tasks[0]->internal;
-                if (op == P4_OPC_QUOTA_GC) quotaWork(e, t, in);
-                else if (op == kOpCompact) compactWork(e, t, in);
-                else rebuildWork(e, t, in);
-                in->done.store(true, std::memory_order_release);
-            } else if (op == P4_OPC_PUT) {
-                putGroup(e, wi, t, tasks);
-            } else if (op == P4_OPC_SUPERSEDE) {
-                supersedeOp(e, t, tasks[0]);
+            if (op == P4_OPC_PUT && !tasks[0]->internal) {
+                runPut(e, wi, t, tasks);
             } else {
-                deleteOp(e, t, tasks[0]);
+                // Everything else reads and writes the index files itself:
+                // the indexer is idle first.
+                collect(e, ws, nullptr);
+                if (tasks[0]->internal) {
+                    Internal* in = tasks[0]->internal;
+                    if (op == P4_OPC_QUOTA_GC) quotaWork(e, t, in);
+                    else if (op == kOpCompact) compactWork(e, t, in);
+                    else rebuildWork(e, t, in);
+                    in->done.store(true, std::memory_order_release);
+                } else if (op == P4_OPC_SUPERSEDE) {
+                    supersedeOp(e, t, tasks[0]);
+                } else {
+                    deleteOp(e, t, tasks[0]);
+                }
             }
             for (WriteTask* wt : tasks) delete wt;
         }
@@ -523,12 +596,29 @@ void writerLoop(Engine* e, uint32_t wi) {
             std::lock_guard<std::mutex> g(e->writers[wi]->mu);
             idle = e->writers[wi]->ready.empty();
         }
+        if (idle && ws.pending) {
+            // Nothing to plan: the pending unit, once its indexer is done
+            // (a short wait, then new calls are routed again).
+            if (ws.pending->done.load(std::memory_order_acquire)) {
+                collect(e, ws, nullptr);
+            } else {
+                std::unique_lock<std::mutex> g(ws.imu);
+                ws.dcv.wait_for(g, std::chrono::milliseconds(1));
+            }
+            continue;
+        }
         if (idle && e->queues[0].empty() && e->stopping.load()) break;
         b.state.store(0, std::memory_order_seq_cst);
         if (idle && e->queues[0].empty() && b.doorbell.load(std::memory_order_acquire) == seq)
             ps::waitU32(&b.doorbell, seq, 50ull * 1000 * 1000);
         b.state.store(1, std::memory_order_seq_cst);
     }
+    {
+        std::lock_guard<std::mutex> g(ws.imu);
+        ws.istop = true;
+    }
+    ws.icv.notify_all();
+    if (ws.indexer.joinable()) ws.indexer.join();
     b.state.store(2);
 }
 
@@ -651,6 +741,11 @@ void laneLoop(Engine* e, uint32_t ti, uint32_t cls) {
 
 int32_t startThreads(Engine* e) {
     if (e->started) return P4_E_ARG;
+    // Each writer's indexer first (a writer hands it units from its start).
+    for (uint32_t w = 0; w < e->writers.size(); w++) {
+        e->writers[w]->istop = false;
+        e->writers[w]->indexer = std::thread(indexerLoop, e, w);
+    }
     for (uint32_t i = 0; i < e->nThreads; i++) {
         const uint32_t cls = e->threadClass[i];
         if (cls == P4_CLASS_WRITE) e->threads.emplace_back(writerLoop, e, i - e->firstOfClass[1]);

@@ -34,6 +34,14 @@ WriteCtx::WriteCtx(Engine* e_, Type* t_) : e(e_), t(t_) {
 
 WriteCtx::~WriteCtx() {}
 
+Conn* planAcquire(Engine* e, Feed* f, int32_t* rc, std::string* err) {
+    int orc = 0;
+    Conn* c = e->rpool.acquire(f->path, OpenKind::Reader, &orc, err);
+    if (!c) *rc = statusOfSqlite(orc);
+    return c;
+}
+void planRelease(Engine* e, Conn* c) { e->rpool.release(c); }
+
 RecState* WriteCtx::known(uint32_t fid, int64_t seq) {
     auto it = bySeq_.find({fid, seq});
     return it == bySeq_.end() ? nullptr : it->second;
@@ -68,19 +76,19 @@ int32_t WriteCtx::loadRows(RecState* r) {
     }
     int32_t st = P4_OK;
     std::string er;
-    Conn* c = writerPin(e, f, &st, &er);
+    Conn* c = planAcquire(e, f, &st, &er);
     if (!c) {
-        err = "writer open: " + er;
+        err = "read open: " + er;
         return st;
     }
     if (!dictEnsure(f, c)) {
-        writerUnpin(e, f);
+        planRelease(e, c);
         err = "dictionary of " + f->path;
         return P4_E_IO;
     }
     sqlite3_stmt* q = c->get(S_R_SEQ);
     if (!q) {
-        writerUnpin(e, f);
+        planRelease(e, c);
         return P4_E_INTERNAL;
     }
     const int64_t base = r->seq << 16;
@@ -152,7 +160,7 @@ int32_t WriteCtx::loadRows(RecState* r) {
         if (x.cId) x.ckey = dictCkey(c, x.cId);
         if (x.uId) x.url = dictUrl(c, x.uId);
     }
-    writerUnpin(e, f);
+    planRelease(e, c);
     if (rc != SQLITE_DONE) {
         err = "rows of seq " + std::to_string(r->seq) + " in " + f->path + ": " + std::to_string(rc);
         if ((rc & 0xff) == SQLITE_CORRUPT) return P4_E_CORRUPT;
@@ -179,13 +187,13 @@ RecState* WriteCtx::byKey(uint32_t fid, const uint8_t key[32], int32_t* rc) {
     int64_t seq = 0;
     if (created) {
         std::string er;
-        Conn* c = writerPin(e, f, rc, &er);
+        Conn* c = planAcquire(e, f, rc, &er);
         if (!c) {
-            err = "writer open: " + er;
+            err = "read open: " + er;
             return nullptr;
         }
         *rc = seqOfCid(c, indexed, key, &seq);
-        writerUnpin(e, f);
+        planRelease(e, c);
         if (*rc != P4_OK) {
             err = "CID lookup in " + f->path;
             return nullptr;
@@ -242,9 +250,9 @@ int32_t WriteCtx::loadD(uint32_t fid, RowR& x) {
     if (off < 0) {
         // The row's frame from the index (a row this write did not load).
         std::string er;
-        Conn* c = writerPin(e, f, &st, &er);
+        Conn* c = planAcquire(e, f, &st, &er);
         if (!c) {
-            err = "writer open: " + er;
+            err = "read open: " + er;
             return st;
         }
         sqlite3_stmt* q = c->get(S_R_FRAME);
@@ -258,7 +266,7 @@ int32_t WriteCtx::loadD(uint32_t fid, RowR& x) {
             }
             sqlite3_reset(q);
         }
-        writerUnpin(e, f);
+        planRelease(e, c);
         if (r != SQLITE_ROW) {
             err = "frame of row " + std::to_string(x.rid) + " in " + f->path;
             return r == SQLITE_DONE ? P4_E_CORRUPT : statusOfSqlite(r);
@@ -512,11 +520,11 @@ int32_t WriteCtx::frames(Feed* f, const std::vector<RecState*>& recs, std::strin
             std::string read;  // the bytes read from the stream (row -1)
             bool have;
         };
-        std::vector<Fr> known;
+        std::vector<Fr> framed;
         auto knownAdd = [&](const RowR& y, int row) {
-            for (const Fr& k : known)
+            for (const Fr& k : framed)
                 if (k.off == y.off) return;
-            known.push_back(Fr{y.off, y.len, y.sealed, row, std::string(), row >= 0});
+            framed.push_back(Fr{y.off, y.len, y.sealed, row, std::string(), row >= 0});
         };
         for (const RowR& y : r->rows)
             if (y.loaded && y.off >= 0) knownAdd(y, -1);
@@ -535,10 +543,20 @@ int32_t WriteCtx::frames(Feed* f, const std::vector<RecState*>& recs, std::strin
                 continue;
             }
             if (!x.hasD) {
-                // Another file's bytes (a local record's taken into a feed).
+                // Another file's bytes (a local record's taken into a feed):
+                // its frame where this write knows the row (a row of a unit
+                // still being applied is not in the index yet), else from
+                // that file's index.
                 RowR src;
                 src.loaded = true;
                 src.rid = x.srcRid;
+                if (RecState* sr = known(x.srcFid, x.srcRid >> 16))
+                    for (const RowR& y : sr->rows)
+                        if (y.loaded && y.rid == x.srcRid) {
+                            src.off = y.off;
+                            src.len = y.len;
+                            break;
+                        }
                 const int32_t st = loadD(x.srcFid, src);
                 if (st != P4_OK) return st;
                 x.d.swap(src.d);
@@ -546,7 +564,7 @@ int32_t WriteCtx::frames(Feed* f, const std::vector<RecState*>& recs, std::strin
             }
             x.len = int64_t(x.d.size());
             bool reuse = false;
-            for (Fr& k : known) {
+            for (Fr& k : framed) {
                 if (k.len != x.len) continue;
                 bool same;
                 if (verified && !k.sealed && !x.sealed) {
@@ -577,7 +595,7 @@ int32_t WriteCtx::frames(Feed* f, const std::vector<RecState*>& recs, std::strin
             st32(p, uint32_t(x.len));
             out->append(reinterpret_cast<const char*>(p), 4);
             out->append(x.d);
-            known.push_back(Fr{x.off, x.len, x.sealed, int(i), std::string(), true});
+            framed.push_back(Fr{x.off, x.len, x.sealed, int(i), std::string(), true});
         }
     }
     return P4_OK;
@@ -709,37 +727,37 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs, const 
         std::lock_guard<std::mutex> g(t->mu);
         if (!f->created && migrate) f->indexed = false;  // a migration: REBUILD 1 adds the secondary indexes
     }
-    // 1. The new frames, appended to the stream and synced before the index
-    //    transaction that commits the rows pointing at them and the new mark.
-    const int64_t oldEnd = f->end;
-    std::string fr;
-    int32_t status = frames(f, recs, &fr, oldEnd);
-    if (status != P4_OK) return status;
+    // 1. The stream: the frames prepare() appended are synced first. The index
+    //    transaction below commits the rows that point at them with the new
+    //    mark, so the index never claims bytes the stream cannot back.
+    int32_t status = P4_OK;
+    auto ne = newEnd_.find(f->fid);
+    int64_t oldMark;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        oldMark = f->mark;
+    }
+    const int64_t newEnd = ne == newEnd_.end() ? oldMark : ne->second;
     std::shared_ptr<Stream> stream;
-    if (!fr.empty()) {
+    if (newEnd > oldMark) {
         stream = streamCur(f, &status);
-        if (stream) status = streamWrite(stream.get(), oldEnd, reinterpret_cast<const uint8_t*>(fr.data()), fr.size());
-        if (status == P4_OK) status = streamSync(stream.get());
+        if (stream) status = streamSync(stream.get());
         if (status != P4_OK) {
-            err = "stream append " + streamPath(f, f->gen);
-            if (stream) streamTruncate(stream.get(), oldEnd, false);
+            err = "stream sync " + streamPath(f, f->gen);
             return status;
         }
         e->bump(kStJournalSyncs);
     }
-    const int64_t newEnd = oldEnd + int64_t(fr.size());
     // 2. The index transaction.
     std::string er;
     Conn* c = writerPin(e, f, &status, &er);
     if (!c) {
         err = "writer open: " + er;
-        if (stream) streamTruncate(stream.get(), oldEnd, false);
         return status;
     }
     if (!dictEnsure(f, c)) {
         writerUnpin(e, f);
         err = "dictionary of " + f->path;
-        if (stream) streamTruncate(stream.get(), oldEnd, false);
         return P4_E_IO;
     }
     Dict dict;
@@ -781,12 +799,21 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs, const 
         bad(sqlite3_step(q));
         sqlite3_reset(q);
     }
+    // Rows a previous unit of this writer added (this write's seed) carry no
+    // file ids yet: their instance's ids are looked up (the previous unit
+    // committed them).
+    for (RecState* r : recs)
+        for (RowR& x : r->rows) {
+            if (rc != SQLITE_OK) break;
+            if (!x.loaded || !x.inst || x.bId) continue;
+            x.bId = internBatch(dict, c, x, &rc);
+            x.cId = internText(c, S_CKEY_GET, S_CKEY_INS, x.ckey, &rc);
+        }
     std::vector<RecState*> sorted = recs;
     std::sort(sorted.begin(), sorted.end(), [](RecState* a, RecState* b) { return a->seq < b->seq; });
     for (RecState* r : sorted) {
         if (rc != SQLITE_OK) break;
         const int64_t base = r->seq << 16;
-        int64_t next = -1;
         for (RowR& x : r->rows) {
             if (rc != SQLITE_OK) break;
             if (x.loaded && x.del) {
@@ -803,16 +830,8 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs, const 
                 bad(sqlite3_step(q));
                 sqlite3_reset(q);
             } else if (!x.loaded && !x.del) {
-                if (next < 0) {
-                    sqlite3_stmt* q = c->get(S_R_MAXRID);
-                    sqlite3_bind_int64(q, 1, base);
-                    sqlite3_bind_int64(q, 2, base | 0xffff);
-                    const int sr = sqlite3_step(q);
-                    next = sr == SQLITE_ROW && sqlite3_column_type(q, 0) != SQLITE_NULL ? sqlite3_column_int64(q, 0) + 1 : base;
-                    sqlite3_reset(q);
-                    if (sr != SQLITE_ROW) bad(sr);
-                }
-                if (next > (base | 0xffff)) {
+                // prepare() gave the row its rid (after the record's live rows)
+                if (x.rid < base || x.rid > (base | 0xffff)) {
                     rc = SQLITE_FULL;  // 65,536 rows of one record in one feed
                     break;
                 }
@@ -828,7 +847,7 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs, const 
                 x.uId = x.inst ? internText(c, S_URL_GET, S_URL_INS, x.url, &rc) : 0;
                 if (rc != SQLITE_OK) break;
                 sqlite3_stmt* q = c->get(S_R_INS);
-                const int64_t rid = next++;
+                const int64_t rid = x.rid;
                 sqlite3_bind_int64(q, 1, rid);
                 sqlite3_bind_int64(q, 2, r->seq);
                 sqlite3_bind_int64(q, 3, x.nId);
@@ -1097,8 +1116,8 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs, const 
         err = std::string(sqlite3_errmsg(c->db)) + " (" + std::to_string(rc) + ") " + f->path;
         c->exec("ROLLBACK");
         writerUnpin(e, f);
-        // The frames past the committed mark were never acknowledged: cut.
-        if (stream) streamTruncate(stream.get(), oldEnd, false);
+        // The frames past the committed mark were never acknowledged: the
+        // caller cuts them (resetStreams).
         if ((rc & 0xff) == SQLITE_CORRUPT || (rc & 0xff) == SQLITE_NOTADB) {
             std::lock_guard<std::mutex> g(t->mu);
             f->quarantined = true;
@@ -1106,7 +1125,6 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs, const 
         // The in-memory rows keep their ids; the context is discarded.
         return statusOfSqlite(rc);
     }
-    f->end = newEnd;
     int64_t freeBytes = 0;
     const int64_t dbBytes = dbBytesOf(c, &freeBytes);
     writerUnpin(e, f);
@@ -1135,6 +1153,7 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs, const 
         f->dbBytes = dbBytes;
         f->freeBytes = freeBytes;
     }
+    f->mark = newEnd;
     f->streamBytes = newEnd;
     f->k = k;
     f->inst = std::move(inst);
@@ -1148,38 +1167,46 @@ int32_t WriteCtx::commitFile(Feed* f, const std::vector<RecState*>& recs, const 
     return P4_OK;
 }
 
-int32_t WriteCtx::commit() {
-    bool any = false;
+// ---- prepare (the writer) ------------------------------------------------------------------------------
+// What this write commits, decided on the writer: the records it touches,
+// each new row's rid (after the record's live rows) and frame, the frames
+// appended to each feed's stream (not yet synced), the moves; then the state
+// its records are in after it (the next unit's seed).
+int32_t WriteCtx::prepare() {
+    any_ = false;
     for (RecState* r : order_) {
         if (!r->seq) r->touched = false;  // a new record this write refused: never stored
-        any = any || r->touched;
+        any_ = any_ || r->touched;
     }
     for (const IdentNew& id : idents)
         if (id.rec && id.rec->seq) {
             id.rec->touched = true;
-            any = true;
+            any_ = true;
         }
-    if (!any) return P4_OK;
-    const int32_t grc = registryWrite();
-    if (grc != P4_OK) return grc;
+    if (!any_) {
+        snapshot();
+        return P4_OK;
+    }
     // Feed files, then local files.
     std::set<uint32_t> fids;
     for (RecState* r : order_)
         if (r->touched) fids.insert(r->fid);
-    std::vector<uint32_t> order;
     std::vector<uint32_t> locals;
+    fileOrder_.clear();
     {
         std::lock_guard<std::mutex> g(t->mu);
         for (uint32_t fid : fids) {
             Feed* f = t->feedById(fid);
-            if (f && f->local) locals.push_back(fid);
-            else order.push_back(fid);
+            if (!f) continue;
+            if (f->local) locals.push_back(fid);
+            else fileOrder_.push_back(fid);
         }
     }
-    order.insert(order.end(), locals.begin(), locals.end());
+    locals_ = locals;
+    fileOrder_.insert(fileOrder_.end(), locals.begin(), locals.end());
     // Moves: a local record whose rows leave local while its seq gains rows
     // in a feed file of this write; the feed's transaction records the seq.
-    std::map<uint32_t, std::vector<int64_t>> movesIn;
+    movesIn_.clear();
     for (RecState* r : order_) {
         if (!r->touched || !r->existed || !r->seq) continue;
         if (std::find(locals.begin(), locals.end(), r->fid) == locals.end()) continue;
@@ -1190,11 +1217,168 @@ int32_t WriteCtx::commit() {
             if (o == r || o->seq != r->seq || o->fid == r->fid) continue;
             bool gains = false;
             for (const RowR& x : o->rows) gains = gains || (x.live() && !x.loaded);
-            if (gains) movesIn[o->fid].push_back(r->seq);
+            if (gains) movesIn_[o->fid].push_back(r->seq);
         }
     }
+    // Rids: a record's new rows after its live rows (deleted rows go first in
+    // the same transaction).
+    for (RecState* r : order_) {
+        if (!r->touched || !r->seq) continue;
+        const int64_t base = r->seq << 16;
+        int64_t next = base;
+        for (const RowR& x : r->rows)
+            if (x.loaded && !x.del) next = std::max(next, x.rid + 1);
+        for (RowR& x : r->rows)
+            if (!x.loaded && !x.del) x.rid = next++;
+    }
+    // Frames: appended to each feed's stream at its end (the writer's offset,
+    // past the frames of a unit still being applied); the apply syncs them.
+    newEnd_.clear();
+    oldEnd_.clear();
+    for (uint32_t fid : fileOrder_) {
+        Feed* f;
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            f = t->feedById(fid);
+        }
+        std::vector<RecState*> recs;
+        for (RecState* r : order_)
+            if (r->touched && r->fid == fid && r->seq) recs.push_back(r);
+        const int64_t oldEnd = f->end;
+        std::string fr;
+        int32_t st = frames(f, recs, &fr, oldEnd);
+        if (st == P4_OK && !fr.empty()) {
+            std::shared_ptr<Stream> stream = streamCur(f, &st);
+            if (stream) st = streamWrite(stream.get(), oldEnd, reinterpret_cast<const uint8_t*>(fr.data()), fr.size());
+            if (st != P4_OK) {
+                err = "stream append " + streamPath(f, f->gen);
+                if (stream) streamTruncate(stream.get(), oldEnd, false);
+            }
+        }
+        if (st != P4_OK) {
+            // This write's frames so far go (a pending unit's stay below them).
+            for (auto& kv : oldEnd_) {
+                Feed* g2;
+                {
+                    std::lock_guard<std::mutex> g(t->mu);
+                    g2 = t->feedById(kv.first);
+                }
+                int32_t s2 = P4_OK;
+                std::shared_ptr<Stream> stream = g2 ? streamCur(g2, &s2) : nullptr;
+                if (stream) streamTruncate(stream.get(), kv.second, false);
+                if (g2) g2->end = kv.second;
+            }
+            newEnd_.clear();
+            return st;
+        }
+        oldEnd_[fid] = oldEnd;
+        f->end = oldEnd + int64_t(fr.size());
+        newEnd_[fid] = f->end;
+    }
+    snapshot();
+    return P4_OK;
+}
+
+// The state this write leaves its records in, for the next unit of the type
+// while this one is applied: every touched record with its live rows (new
+// rows as rows of the file with their rid and frame; their file ids are
+// looked up by the unit that needs them), and the ingest identities it adds.
+void WriteCtx::snapshot() {
+    post_.clear();
+    postIdents_.clear();
+    std::map<const RecState*, size_t> at;
+    for (RecState* r : order_) {
+        if (!r->touched || !r->seq) continue;
+        RecState s;
+        s.fid = r->fid;
+        std::memcpy(s.key, r->key, 32);
+        s.seq = r->seq;
+        s.keyed = r->keyed;
+        s.hasE = r->hasE;
+        s.e = r->e;
+        s.ts = r->ts;
+        s.w = r->w;
+        s.k = r->k;
+        for (const RowR& x : r->rows) {
+            if (x.del) continue;
+            RowR y = x;
+            if (!x.loaded) y.nId = y.bId = y.cId = y.uId = 0;
+            y.loaded = true;
+            y.hasD = false;
+            y.d.clear();
+            y.srcFid = 0;
+            y.srcRid = 0;
+            y.urlSet = false;
+            y.stamp = false;
+            s.rows.push_back(std::move(y));
+        }
+        s.existed = !s.rows.empty();
+        at[r] = post_.size();
+        post_.push_back(std::move(s));
+    }
+    for (const IdentNew& id : idents) {
+        auto it = id.rec ? at.find(id.rec) : at.end();
+        if (it == at.end()) continue;
+        postIdents_.push_back({std::string(reinterpret_cast<const char*>(id.h), 32), it->second});
+    }
+}
+
+void WriteCtx::seed(const WriteCtx& prev) {
+    for (const RecState& s : prev.post_) {
+        store_.push_back(s);
+        RecState* r = &store_.back();
+        order_.push_back(r);
+        bySeq_[{r->fid, r->seq}] = r;
+        if (r->keyed) byKey_[{r->fid, std::string(reinterpret_cast<const char*>(r->key), 32)}] = r;
+        seededFids_.insert(r->fid);
+        if (r->k.type) seedK_[{r->fid, std::to_string(r->k.type) + ":" + r->k.text()}].push_back(r);
+    }
+    for (const auto& id : prev.postIdents_) {
+        const RecState& s = prev.post_[id.second];
+        auto it = bySeq_.find({s.fid, s.seq});
+        if (it != bySeq_.end()) seedIdent_[{s.fid, id.first}] = it->second;
+    }
+}
+
+bool WriteCtx::seededFeed(uint32_t fid) const { return seededFids_.count(fid) != 0; }
+
+void WriteCtx::seededWithK(uint32_t fid, const KVal& k, std::vector<RecState*>* out) const {
+    out->clear();
+    auto it = seedK_.find({fid, std::to_string(k.type) + ":" + k.text()});
+    if (it != seedK_.end()) *out = it->second;
+}
+
+RecState* WriteCtx::seededIdent(uint32_t fid, const uint8_t h[32]) const {
+    auto it = seedIdent_.find({fid, std::string(reinterpret_cast<const char*>(h), 32)});
+    return it == seedIdent_.end() ? nullptr : it->second;
+}
+
+// After a failed apply: every feed this write appended to goes back to its
+// committed mark (the frames past it were never acknowledged).
+void WriteCtx::resetStreams() {
+    for (auto& kv : newEnd_) {
+        Feed* f;
+        int64_t mark;
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            f = t->feedById(kv.first);
+            mark = f ? f->mark : 0;
+        }
+        if (!f) continue;
+        int32_t st = P4_OK;
+        std::shared_ptr<Stream> stream = streamCur(f, &st);
+        if (stream && streamSize(stream.get()) > mark) streamTruncate(stream.get(), mark, false);
+        f->end = mark;
+    }
+}
+
+// ---- apply (the indexer, or the writer for its own synchronous work) -------------------------------------
+int32_t WriteCtx::apply() {
+    if (!any_) return P4_OK;
+    const int32_t grc = registryWrite();
+    if (grc != P4_OK) return grc;
     int32_t first = P4_OK;
-    for (uint32_t fid : order) {
+    for (uint32_t fid : fileOrder_) {
         Feed* f;
         {
             std::lock_guard<std::mutex> g(t->mu);
@@ -1209,8 +1393,8 @@ int32_t WriteCtx::commit() {
         for (RecState* r : order_)
             if (r->touched && r->fid == fid && r->seq) recs.push_back(r);
         static const std::vector<int64_t> kNone;
-        auto mv = movesIn.find(fid);
-        const int32_t rc = commitFile(f, recs, mv == movesIn.end() ? kNone : mv->second);
+        auto mv = movesIn_.find(fid);
+        const int32_t rc = commitFile(f, recs, mv == movesIn_.end() ? kNone : mv->second);
         if (rc == P4_OK) {
             committedFids.insert(fid);
         } else {
@@ -1221,14 +1405,23 @@ int32_t WriteCtx::commit() {
     // Every local file committed: the moves into the feeds are finished (the
     // feeds' next commits drop their `moved` rows; open finishes the others).
     bool localsOk = true;
-    for (uint32_t fid : locals) localsOk = localsOk && committedFids.count(fid);
-    if (localsOk && !movesIn.empty()) {
+    for (uint32_t fid : locals_) localsOk = localsOk && committedFids.count(fid);
+    if (localsOk && !movesIn_.empty()) {
         std::lock_guard<std::mutex> g(t->mu);
-        for (auto& kv : movesIn)
+        for (auto& kv : movesIn_)
             if (committedFids.count(kv.first))
                 if (Feed* f = t->feedById(kv.first)) f->movedDone = true;
     }
     return first;
+}
+
+// The synchronous write (DELETE, SUPERSEDE, QUOTA, REBUILD, open's repairs):
+// the writer prepares and applies it itself, its indexer idle.
+int32_t WriteCtx::commit() {
+    int32_t rc = prepare();
+    if (rc == P4_OK) rc = apply();
+    if (rc != P4_OK) resetStreams();
+    return rc;
 }
 
 }  // namespace p4

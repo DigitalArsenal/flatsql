@@ -335,10 +335,12 @@ struct Feed {
     std::shared_ptr<Stream> retired;
     int64_t retiredBytes = 0;  // its size (DiskUsage counts it until it goes)
     uint64_t retireAt = 0;
-    // The writer's (and the open's): the append offset, which is the committed
-    // mark between writes, and the current generation.
+    // The writer's (and the open's): the append offset (past the frames of a
+    // unit its indexer has not committed yet), and the current generation.
     int64_t end = 0;
     uint32_t gen = 0;
+    // The committed mark (Type::mu; the indexer sets it with each commit).
+    int64_t mark = 0;
     // Moves (a local record taken into this feed): the file's `moved` table
     // may hold rows, and they are all finished (their local rows are gone).
     bool movedRows = false, movedDone = true;
@@ -378,6 +380,8 @@ struct Spec {
 int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::string* err);
 
 struct WriteTask;
+class WriteCtx;
+class PutUnit;
 
 // The type's totals over its feed files (C-38 (5): a record held by N feeds
 // counts once per feed).
@@ -516,6 +520,14 @@ struct WriteTask {
 struct WriterState {
     std::mutex mu;
     std::deque<Type*> ready;  // types with a backlog
+    // The writer's indexer thread and its queue (imu): units in plan order.
+    std::mutex imu;
+    std::condition_variable icv, dcv;  // work for the indexer; a unit done
+    std::deque<PutUnit*> iq;
+    bool istop = false;
+    std::thread indexer;
+    // The writer's: the unit its indexer applies (or will), at most one.
+    std::unique_ptr<PutUnit> pending;
 };
 
 // Reader connections: one pool for every thread, inside the engine's one
@@ -749,7 +761,6 @@ int32_t fileHoldsSeq(Conn* c, int64_t seq, bool* held);
 // index rebuilt from the stream, a crashed compaction's leftovers unlinked.
 // *moved: the seqs its `moved` table names (moves into it from local).
 int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err);
-void putGroup(P4Engine* e, uint32_t writer, Type* t, std::vector<WriteTask*>& tasks);
 // The supersede identity of a stored record (unsealed bytes only).
 std::string identityOf(const ps::TypeConfig& tc, const uint8_t* d, size_t n);
 
@@ -832,10 +843,27 @@ public:
     void deliver(RecState* r, const RowR& copy, const std::vector<Inst>& insts, Out* out);
     void dropAll(RecState* r);
     const std::vector<RecState*>& records() const { return order_; }
-    // The registries (new feeds and tokens), then the feed files (feeds
-    // before local): each appends its new frames to its stream, syncs it,
-    // and commits its rows with the stream's mark.
+    // The writer: what this write commits (its new rows' rids and frames, the
+    // frames appended to each feed's stream, the moves), and the state it
+    // leaves its records in (the next unit's seed).
+    int32_t prepare();
+    // The indexer: the registries (new feeds and tokens), then each feed file
+    // (feeds before local): its stream synced, then its rows committed with
+    // the stream's new mark in one transaction.
+    int32_t apply();
+    // prepare + apply on the caller's thread (the writer's synchronous work,
+    // its indexer idle); a failure cuts the streams back to their marks.
     int32_t commit();
+    // After a failed apply: the feeds this write appended to go back to their
+    // committed marks.
+    void resetStreams();
+    // The type's previous unit, still being applied: its records' state after
+    // it is this write's starting point (planning reads see only committed
+    // rows).
+    void seed(const WriteCtx& prev);
+    bool seededFeed(uint32_t fid) const;
+    void seededWithK(uint32_t fid, const KVal& k, std::vector<RecState*>* out) const;  // seeded records of an object key
+    RecState* seededIdent(uint32_t fid, const uint8_t h[32]) const;                     // a seeded ingest identity
     bool migrate = false;  // migrate mode: instance times are the caller's (C-36), new files without indexes
     int64_t now = 0;
     std::vector<IdentNew> idents;
@@ -847,11 +875,50 @@ private:
     int32_t frames(Feed* f, const std::vector<RecState*>& recs, std::string* out, int64_t end);
     int32_t commitFile(Feed* f, const std::vector<RecState*>& recs, const std::vector<int64_t>& movesIn);
     void fill(RecState* r);
+    void snapshot();
     std::deque<RecState> store_;
     std::vector<RecState*> order_;
     std::map<std::pair<uint32_t, std::string>, RecState*> byKey_;
     std::map<std::pair<uint32_t, int64_t>, RecState*> bySeq_;
+    // prepare()'s plan for apply()
+    bool any_ = false;
+    std::vector<uint32_t> fileOrder_, locals_;
+    std::map<uint32_t, std::vector<int64_t>> movesIn_;
+    std::map<uint32_t, int64_t> newEnd_, oldEnd_;  // each feed's stream end after / before this write's frames
+    // the state after this write (snapshot) and the seed taken from the previous unit
+    std::vector<RecState> post_;
+    std::vector<std::pair<std::string, size_t>> postIdents_;
+    std::set<uint32_t> seededFids_;
+    std::map<std::pair<uint32_t, std::string>, std::vector<RecState*>> seedK_;
+    std::map<std::pair<uint32_t, std::string>, RecState*> seedIdent_;
 };
+// Planning reads go through the reader pool (committed rows): the writer
+// connection belongs to the indexer.
+Conn* planAcquire(P4Engine* e, Feed* f, int32_t* rc, std::string* err);
+void planRelease(P4Engine* e, Conn* c);
+
+// ---- the PUT pipeline (partition.cpp plans, mailbox.cpp runs it) --------------------------------------
+// A PUT group: planned on the type's writer thread (checks, delivery, seqs,
+// rids and frames, the frames appended to the feeds' streams), then applied
+// and answered on the writer's indexer thread (each stream synced, then the
+// index rows committed with its mark, then the calls acked) while the writer
+// plans the next group. Units are applied and answered in the order they were
+// planned; the next group of the same type starts from the state the unit
+// still being applied leaves its records in (its seed).
+class PutUnit {
+public:
+    virtual ~PutUnit() = default;
+    virtual int32_t apply() = 0;                                 // the indexer
+    virtual void finish(int32_t rc) = 0;                         // the indexer: in-flight seqs released, calls answered
+    virtual void abort(int32_t rc, const std::string& why) = 0;  // the writer: the unit it was planned on failed
+    virtual void resetStreams() = 0;                             // the writer: after a failed apply
+    virtual const WriteCtx* ctx() const = 0;
+    Type* type = nullptr;
+    bool seeded = false;  // planned on the previous unit's state
+    std::atomic<bool> done{false};
+    int32_t status = P4_OK;
+};
+std::unique_ptr<PutUnit> putPlan(P4Engine* e, Type* t, std::vector<WriteTask*>& tasks, const PutUnit* prev);
 
 // ---- remove.cpp ----------------------------------------------------------------------------------
 void supersedeOp(P4Engine* e, Type* t, WriteTask* task);

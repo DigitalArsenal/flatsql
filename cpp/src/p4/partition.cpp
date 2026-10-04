@@ -626,6 +626,7 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
     f->inst = std::move(inst);
     f->tokc = std::move(tokc);
     f->end = m.mark;
+    f->mark = m.mark;
     f->streamBytes = m.mark;
     f->movedRows = !moved->empty();
     f->movedDone = moved->empty();
@@ -727,10 +728,22 @@ std::string encodeCols(const ps::Extracted& x, uint32_t nCols) {
     return out;
 }
 
-class Group {
+bool liveRows(const RecState* r);
+
+// A PUT group as a pipeline unit: plan() on the type's writer, apply() and
+// finish() on the writer's indexer (or abort() on the writer when the unit it
+// was planned on failed).
+class Group final : public PutUnit {
 public:
-    Group(Engine* e, Type* t) : e_(e), t_(t) {}
-    void run(std::vector<WriteTask*>& tasks);
+    Group(Engine* e, Type* t) : e_(e), t_(t) { type = t; }
+    void plan(std::vector<WriteTask*>& tasks, const PutUnit* prev);
+    int32_t apply() override;
+    void finish(int32_t rc) override;
+    void abort(int32_t rc, const std::string& why) override;
+    void resetStreams() override {
+        if (w_) w_->resetStreams();
+    }
+    const WriteCtx* ctx() const override { return w_.get(); }
 
 private:
     bool parseCall(Call& c);
@@ -758,6 +771,11 @@ private:
     std::unordered_map<std::string, std::vector<RecState*>> byCid_;  // CID key -> its records this group delivered
     int32_t holders(WriteCtx& w, const Rec& r, bool feedsToo, std::vector<RecState*>* feeds, RecState** local);
     int32_t absorbLocal(WriteCtx& w, RecState* local, RecState* into);
+    void release();  // the group's in-flight seqs (visible-through moves on)
+
+    std::unique_ptr<WriteCtx> w_;
+    bool applying_ = false;  // prepared: apply() commits it
+    std::pair<int64_t, int64_t> inflight_{INT64_MAX, 0};
 };
 
 bool Group::parseCall(Call& c) {
@@ -972,10 +990,31 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
         f = t_->feedById(scope);
         usable = f && f->created && f->indexed && !f->quarantined;
     }
-    if (!usable || rs->k.type == 0) return P4_OK;
+    if (rs->k.type == 0) return P4_OK;
+    // The records of the previous unit (still being applied) with the object
+    // key: their state is the seed's.
+    {
+        std::vector<RecState*> seeded;
+        w.seededWithK(scope, rs->k, &seeded);
+        for (RecState* other : seeded) {
+            if (other == rs || !liveRows(other)) continue;
+            const RowR* any = nullptr;
+            for (const RowR& x : other->rows)
+                if (x.live() && !x.sealed) any = &x;
+            if (!any) continue;
+            RowR tmp = *any;
+            const int32_t lrc = w.loadD(scope, tmp);
+            if (lrc != P4_OK) return lrc;
+            if (identityOf(sp_->tc, reinterpret_cast<const uint8_t*>(tmp.d.data()), tmp.d.size()) != r.supIdentity) continue;
+            other->restamp = true;
+            w.dropAll(other);
+            e_->bump(kStCatSuperseded);
+        }
+    }
+    if (!usable) return P4_OK;
     int32_t st = P4_OK;
     std::string er;
-    Conn* c = writerPin(e_, f, &st, &er);
+    Conn* c = planAcquire(e_, f, &st, &er);
     if (!c) return st;
     std::vector<int64_t> seqs;
     sqlite3_stmt* q = c->sql("SELECT rid, seq FROM r INDEXED BY r_ke WHERE k=?1 AND seq<>?2");
@@ -1017,14 +1056,14 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
                 seqs.push_back(x.second);
         }
     }
-    writerUnpin(e_, f);
+    planRelease(e_, c);
     if (rc != SQLITE_DONE) return statusOfSqlite(rc);
     if (frc != P4_OK) return frc;
     for (int64_t s : seqs) {
         int32_t lrc = P4_OK;
         RecState* other = w.bySeq(scope, s, &lrc);
         if (!other) return lrc;
-        if (other == rs) continue;
+        if (other == rs || !liveRows(other)) continue;  // a record the seed already holds gone
         other->restamp = true;  // C-39 E5: format 1's supersede restamps the lanes it leaves
         w.dropAll(other);
         e_->bump(kStCatSuperseded);
@@ -1035,6 +1074,10 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
 // The holder of an ingest identity in a feed file (seq 0 when none).
 int32_t Group::identSeq(uint32_t fid, const uint8_t h[32], int64_t* seq) {
     *seq = 0;
+    if (RecState* held = w_->seededIdent(fid, h)) {
+        *seq = held->seq;  // the previous unit registered it
+        return P4_OK;
+    }
     Feed* f;
     bool created;
     {
@@ -1045,7 +1088,7 @@ int32_t Group::identSeq(uint32_t fid, const uint8_t h[32], int64_t* seq) {
     if (!created) return P4_OK;
     int32_t st = P4_OK;
     std::string er;
-    Conn* c = writerPin(e_, f, &st, &er);
+    Conn* c = planAcquire(e_, f, &st, &er);
     if (!c) return st;
     sqlite3_stmt* q = c->get(S_IDENT_GET);
     int r = SQLITE_ERROR;
@@ -1055,7 +1098,7 @@ int32_t Group::identSeq(uint32_t fid, const uint8_t h[32], int64_t* seq) {
         if (r == SQLITE_ROW) *seq = sqlite3_column_int64(q, 0);
         sqlite3_reset(q);
     }
-    writerUnpin(e_, f);
+    planRelease(e_, c);
     return r == SQLITE_ROW || r == SQLITE_DONE ? P4_OK : statusOfSqlite(r);
 }
 
@@ -1316,7 +1359,8 @@ int32_t Group::holders(WriteCtx& w, const Rec& r, bool feedsToo, std::vector<Rec
     {
         std::lock_guard<std::mutex> g(t_->mu);
         for (auto& f : t_->feeds)
-            if (f->created && f->k.recs > 0 && !f->quarantined && (feedsToo || f->local)) files.push_back(F{f->fid, f->local});
+            if (((f->created && f->k.recs > 0) || w.seededFeed(f->fid)) && !f->quarantined && (feedsToo || f->local))
+                files.push_back(F{f->fid, f->local});
     }
     const std::string key(reinterpret_cast<const char*>(r.key), 32);
     std::set<RecState*> seen;
@@ -1508,7 +1552,7 @@ int32_t Group::migrate(WriteCtx& w, Call& c, Rec& r) {
     return P4_OK;
 }
 
-void Group::run(std::vector<WriteTask*>& tasks) {
+void Group::plan(std::vector<WriteTask*>& tasks, const PutUnit* prev) {
     sp_ = t_->spec();
     for (WriteTask* wt : tasks) {
         Call c;
@@ -1526,49 +1570,51 @@ void Group::run(std::vector<WriteTask*>& tasks) {
     }
     bool any = false;
     for (Call& c : calls_) any = any || (c.status == P4_OK && !c.recs.empty());
-    if (!any) {
-        respond();
-        return;
-    }
+    if (!any) return;  // answered in order by finish()
     // The type's T/ files exist from its first write.
     {
         std::string err;
         const int32_t frc = typeFilesEnsure(t_, &err);
         if (frc != P4_OK) {
             fail(frc, "type files: " + err);
-            respond();
             return;
         }
     }
     {
         std::lock_guard<std::mutex> g(t_->mu);
-        {
-            // The feeds of every call's tags, local when a call may need it
-            // (an untagged ingest, any migration), and each call's token (copy).
-            for (Call& c : calls_) {
-                if (c.status != P4_OK) continue;
-                c.tok = tokFor(t_, c.token, c.peer, true);
-                for (TagIn& tag : c.tags) {
-                    if (!tag.valid) continue;
-                    Feed* f = feedFor(t_, tag.f6[0], tag.f6[1], true);
-                    tag.fid = f->fid;
-                    if (f->quarantined) {
-                        c.status = P4_E_CORRUPT;
-                        c.err = "feed file quarantined: " + f->path;
-                    }
+        // The feeds of every call's tags, local when a call may need it
+        // (an untagged ingest, any migration), and each call's token (copy).
+        for (Call& c : calls_) {
+            if (c.status != P4_OK) continue;
+            c.tok = tokFor(t_, c.token, c.peer, true);
+            for (TagIn& tag : c.tags) {
+                if (!tag.valid) continue;
+                Feed* f = feedFor(t_, tag.f6[0], tag.f6[1], true);
+                tag.fid = f->fid;
+                if (f->quarantined) {
+                    c.status = P4_E_CORRUPT;
+                    c.err = "feed file quarantined: " + f->path;
                 }
-                if (c.status == P4_OK && (c.tags.empty() || c.mode == 1)) {
-                    Feed* local = feedFor(t_, "", "", true);
-                    localFid_ = local->fid;
-                    if (local->quarantined) {
-                        c.status = P4_E_CORRUPT;
-                        c.err = "feed file quarantined: " + local->path;
-                    }
+            }
+            if (c.status == P4_OK && (c.tags.empty() || c.mode == 1)) {
+                Feed* local = feedFor(t_, "", "", true);
+                localFid_ = local->fid;
+                if (local->quarantined) {
+                    c.status = P4_E_CORRUPT;
+                    c.err = "feed file quarantined: " + local->path;
                 }
             }
         }
     }
-    WriteCtx w(e_, t_);
+    w_ = std::make_unique<WriteCtx>(e_, t_);
+    WriteCtx& w = *w_;
+    // The type's previous unit, still being applied: its records' state after
+    // it is where this group starts (the index files show only what it has
+    // committed).
+    if (prev && prev->type == t_ && prev->ctx()) {
+        w.seed(*prev->ctx());
+        seeded = true;
+    }
     w.migrate = false;
     for (Call& c : calls_)
         if (c.status == P4_OK) w.migrate = c.mode == 1;  // a group never mixes modes
@@ -1584,51 +1630,72 @@ void Group::run(std::vector<WriteTask*>& tasks) {
     }
     if (rc != P4_OK) {
         fail(rc, "write planning failed: " + w.err);
-        respond();
         return;
     }
     // Seqs: records new to a feed in input order, as format 1's rowids
     // (ingest, C-39 E1: the calls in queue order, each call's records in
     // order, each record's feeds in tag order); format 1's own (migrate,
-    // already set).
+    // already set). They stay in flight (above visible-through) until the
+    // indexer commits them.
     std::vector<RecState*> assign;
     for (RecState* rs : fresh_)
         if (!w.migrate && !rs->seq) assign.push_back(rs);
-    std::pair<int64_t, int64_t> inflight(INT64_MAX, 0);
     {
         std::lock_guard<std::mutex> g(t_->mu);
         for (RecState* rs : assign) rs->seq = t_->nextSeq++;
         for (RecState* rs : fresh_) {
             if (rs->seq >= t_->nextSeq) t_->nextSeq = rs->seq + 1;
-            inflight.first = std::min(inflight.first, rs->seq);
-            inflight.second = std::max(inflight.second, rs->seq);
+            inflight_.first = std::min(inflight_.first, rs->seq);
+            inflight_.second = std::max(inflight_.second, rs->seq);
         }
-        if (inflight.second) {
-            t_->inflight.push_back(inflight);
+        if (inflight_.second) {
+            t_->inflight.push_back(inflight_);
             if (t_->inflight.size() > e_->stat[kStMaxInflight].load()) e_->stat[kStMaxInflight].store(t_->inflight.size());
             t_->visRecompute();
         }
     }
-    rc = w.commit();
-    {
-        std::lock_guard<std::mutex> g(t_->mu);
-        for (size_t i = 0; i < t_->inflight.size(); i++)
-            if (t_->inflight[i] == inflight) {
-                t_->inflight.erase(t_->inflight.begin() + long(i));
-                break;
-            }
-        t_->visRecompute();
+    rc = w.prepare();
+    if (rc != P4_OK) {
+        fail(rc, "commit failed: " + w.err);
+        return;
     }
-    if (rc != P4_OK) fail(rc, "commit failed: " + w.err);
+    applying_ = true;
+}
+
+int32_t Group::apply() { return applying_ ? w_->apply() : P4_OK; }
+
+void Group::release() {
+    if (!inflight_.second) return;
+    std::lock_guard<std::mutex> g(t_->mu);
+    for (size_t i = 0; i < t_->inflight.size(); i++)
+        if (t_->inflight[i] == inflight_) {
+            t_->inflight.erase(t_->inflight.begin() + long(i));
+            break;
+        }
+    inflight_ = {INT64_MAX, 0};
+    t_->visRecompute();
+}
+
+void Group::finish(int32_t rc) {
+    release();
+    if (rc != P4_OK) fail(rc, "commit failed: " + (w_ ? w_->err : std::string()));
+    respond();
+}
+
+void Group::abort(int32_t rc, const std::string& why) {
+    if (w_) w_->resetStreams();
+    applying_ = false;
+    release();
+    fail(rc, why);
     respond();
 }
 
 }  // namespace
 
-void putGroup(Engine* e, uint32_t writer, Type* t, std::vector<WriteTask*>& tasks) {
-    (void)writer;
-    Group g(e, t);
-    g.run(tasks);
+std::unique_ptr<PutUnit> putPlan(Engine* e, Type* t, std::vector<WriteTask*>& tasks, const PutUnit* prev) {
+    auto g = std::make_unique<Group>(e, t);
+    g->plan(tasks, prev);
+    return g;
 }
 
 }  // namespace p4

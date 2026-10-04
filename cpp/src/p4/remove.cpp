@@ -562,7 +562,12 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             //    generation are the committed ones.
             int32_t st = P4_OK;
             std::shared_ptr<Stream> stream;
-            if (f->end > 0) {
+            int64_t mark;
+            {
+                std::lock_guard<std::mutex> g(t->mu);
+                mark = f->mark;
+            }
+            if (mark > 0) {
                 stream = streamCur(f, &st);
                 if (!stream) {
                     in->status = st;
@@ -578,7 +583,7 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             }
             c->exec("BEGIN");
             FileCount fc;
-            st = countFile(t, f, c, stream.get(), f->end, &fc);
+            st = countFile(t, f, c, stream.get(), mark, &fc);
             FileMeta stored;
             std::map<InstId, InstCount> storedInst;
             std::map<uint32_t, TokCount> storedTokc;
@@ -604,8 +609,8 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             }
             const bool fileBad = !sameCounts(fc.k, stored.k) || !sameInst(fc.inst, storedInst) || !sameTokc(fc.tokc, storedTokc);
             const bool memBad = !sameCounts(fc.k, mem) || !sameInst(fc.inst, memInst) || !sameTokc(fc.tokc, memTokc);
-            const bool markBad = stored.mark != f->end || stored.gen != f->gen ||
-                                 (stream && streamSize(stream.get()) != f->end);
+            const bool markBad = stored.mark != mark || stored.gen != f->gen || f->end != mark ||
+                                 (stream && streamSize(stream.get()) != mark);
             if (fileBad) {
                 mismatches++;
                 why("file counters rows", f->path, stored.k.rows, fc.k.rows);
@@ -686,7 +691,7 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
                 if (r == SQLITE_OK) r = w->exec("DELETE FROM tokc");
                 if (r == SQLITE_OK) r = writeTokc(t, w, {}, fc.tokc);
                 fc.k.maxseq = std::max(fc.k.maxseq, stored.k.maxseq);
-                if (r == SQLITE_OK) r = writeMeta(w, fc.k, nowSec(), f->end, f->gen);
+                if (r == SQLITE_OK) r = writeMeta(w, fc.k, nowSec(), mark, f->gen);
                 if (r == SQLITE_OK) r = w->exec("COMMIT");
                 if (r != SQLITE_OK) w->exec("ROLLBACK");
                 writerUnpin(e, f);
@@ -720,8 +725,8 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
 // A stream is compacted once more than half of it is dead (frames no live row
 // names) and the dead part is at least 1 MiB.
 bool compactDue(const Feed* f) {
-    const int64_t dead = f->end - f->k.fbytes;
-    return f->created && !f->quarantined && f->end > 0 && dead >= (int64_t(1) << 20) && dead * 2 > f->end;
+    const int64_t dead = f->mark - f->k.fbytes;
+    return f->created && !f->quarantined && f->mark > 0 && dead >= (int64_t(1) << 20) && dead * 2 > f->mark;
 }
 
 void compactWork(Engine* e, Type* t, Internal* in) {
@@ -733,7 +738,7 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         due = f && compactDue(f);
     }
     if (!due) return;
-    in->a = f->end;
+    in->a = f->end;  // the writer's own work, its indexer idle: the end is the mark
     int32_t st = P4_OK;
     std::string er;
     Conn* c = writerPin(e, f, &st, &er);
@@ -856,6 +861,7 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     f->end = at;
     {
         std::lock_guard<std::mutex> g(t->mu);
+        f->mark = at;
         f->streamBytes = at;
     }
     // The registry follows (a missing index's rebuild reads it; open also
@@ -928,6 +934,10 @@ int32_t rebuildFeed(Engine* e, Type* t, Feed* f, int64_t* indexed, std::string* 
         if (st != P4_OK) return st;
     }
     f->end = at;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        f->mark = 0;  // the new index commits the whole stream
+    }
     uint32_t tok;
     {
         std::lock_guard<std::mutex> g(t->mu);
