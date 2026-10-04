@@ -34,6 +34,16 @@ int32_t typeIndexOpen(Type* t, std::string* err) {
     Conn* c = nullptr;
     int rc = openConn(t->pIdx, OpenKind::Index, 512, 4096, &c, err);
     if (rc != SQLITE_OK) return statusOfSqlite(rc);
+    // A type index holds the two registries and nothing else; one with other
+    // tables is an earlier format-4 build's (C-46 (6)): refused as it is.
+    sqlite3_stmt* old = c->sql("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT IN ('feed','tok')");
+    const int orc = old ? sqlite3_step(old) : SQLITE_ERROR;
+    if (old) sqlite3_reset(old);
+    if (orc != SQLITE_DONE) {
+        if (err) *err = t->pIdx + (orc == SQLITE_ROW ? ": a type index an earlier format-4 build wrote" : ": unreadable");
+        delete c;
+        return orc == SQLITE_ROW ? P4_E_FORMAT : statusOfSqlite(orc);
+    }
     rc = c->exec(kIndexSchema);
     if (rc != SQLITE_OK) {
         if (err) *err = sqlite3_errmsg(c->db);

@@ -599,6 +599,16 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
         if (err) *err = "open " + f->path + ": " + er;
         return st;
     }
+    // The current layout (C-45: staged rows, the keys' okey ids, the CID
+    // prefix); an index an earlier format-4 build wrote lacks some of it and
+    // is refused as it is (C-46 (6)).
+    if (!c->sql("SELECT r.m, r.kk, r.cp, okey.k, idst.h FROM r, okey, idst LIMIT 0")) {
+        const int pr = sqlite3_errcode(c->db);
+        writerUnpin(e, f);
+        if (damaged(pr)) return P4_E_CORRUPT;
+        if (err) *err = f->path + (pr == SQLITE_ERROR ? ": a feed index an earlier format-4 build wrote" : ": unreadable");
+        return pr == SQLITE_ERROR ? P4_E_FORMAT : statusOfSqlite(pr);
+    }
     FileMeta m;
     std::map<InstId, InstCount> inst;
     std::map<uint32_t, TokCount> tokc;

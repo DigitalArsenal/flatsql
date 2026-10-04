@@ -53,7 +53,7 @@ P4_TEST(t_earlier_layout_refused) {
         EngineOpts o;
         o.createMode = mode;
         CHECK_EQ(openEngine(dir + "/fsql4", o), P4_E_FORMAT, "create mode " + std::to_string(mode));
-        CHECK(flatsql::p4::lastError().find("older engine") != std::string::npos, flatsql::p4::lastError());
+        CHECK(flatsql::p4::lastError().find("an earlier format-4 build wrote") != std::string::npos, flatsql::p4::lastError());
     }
     // Refused as it was: every file of the store has its bytes.
     const std::map<std::string, std::string> after = filesUnder(dir + "/fsql4");
