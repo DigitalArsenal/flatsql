@@ -443,6 +443,8 @@ int32_t mergeFeed(Engine* e, Type* t, Feed* f, std::string* err) {
     const int64_t dbBytes = rc == SQLITE_OK ? dbBytesOf(c, &freeBytes) : -1;
     writerUnpin(e, f);
     if (rc != SQLITE_OK) return statusOfSqlite(rc);
+    e->bump(kStIndexFlushes);
+    e->bump(kStIndexFlushEntries, merged.size());
     std::lock_guard<std::mutex> g(t->mu);
     if (dbBytes >= 0) {
         f->dbBytes = dbBytes;

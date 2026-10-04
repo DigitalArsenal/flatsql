@@ -524,8 +524,6 @@ int32_t WriteCtx::registryWrite() {
         x->exec("ROLLBACK");
         return statusOfSqlite(rc);
     }
-    e->bump(kStIndexFlushes);
-    e->bump(kStIndexFlushEntries, uint64_t(feeds.size() + toks.size()));
     std::lock_guard<std::mutex> g(t->mu);
     for (Feed* f : feeds) {
         f->registered = true;

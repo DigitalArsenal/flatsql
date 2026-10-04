@@ -241,7 +241,8 @@ intent journal.
   `flushEntries`, when it holds the most. The due feeds are merged one after
   the other until calls wait for their ack; past 8 x `flushEntries` staged
   rows the merges go first. A failed merge changes nothing (tried again 2 s
-  later). REBUILD 1 merges everything.
+  later). REBUILD 1 merges everything. Stats 14 and 15 ("index flushes",
+  "index flush entries") count the merges and the rows merged.
 - **The view** (`Staged`, per feed): what the reads that use `r_c`, `r_ke`
   or `r_w` need of each staged row (rid, CID, epoch, object key, w, delivery
   time, ts), in a few sorted runs, and the staged identities. It is

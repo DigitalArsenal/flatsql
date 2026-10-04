@@ -144,14 +144,15 @@ void dayText(int64_t sec, char out[11]);  // "YYYY-MM-DD"
 
 // ---- statistics (§3.10; entries only ever appended) ----------------------------------
 // kStQuotaFiles and kStTwoPhase are always 0 in this layout (a feed keeps its
-// files; there are no merges): the frozen ABI keeps their slots, as it keeps
-// SUPERSEDE's files_deleted and QUOTA_GC's files_dropped columns (always 0).
-// kStPartitions counts feeds. With the streams the frozen names read:
-// kStJournalSyncs = stream syncs (the stream is the record journal: a write
-// syncs it before its index commit), kStIndexFlushes / kStIndexFlushEntries
-// = type-index registry commits and their rows, kStUnlinked = stream
-// generations a compaction retired and unlinked, kStRebuilds also counts
-// compactions and indexes rebuilt from a stream.
+// files; reads never merge in two phases): the frozen ABI keeps their slots,
+// as it keeps SUPERSEDE's files_deleted and QUOTA_GC's files_dropped columns
+// (always 0). kStPartitions counts feeds. With the streams the frozen names
+// read: kStJournalSyncs = stream syncs (the stream is the record journal: a
+// write syncs it before its index commit), kStIndexFlushes /
+// kStIndexFlushEntries = the indexer's merges of staged rows into the feeds'
+// indexes and the rows merged, kStUnlinked = stream generations a compaction
+// retired and unlinked, kStRebuilds also counts compactions and indexes
+// rebuilt from a stream.
 enum Stat : int {
     kStPuts, kStPutRecords, kStNew, kStCopies, kStRetags, kStDups, kStIdentDups, kStRejects,
     kStCatSuperseded, kStSupersedeTags, kStSupersedeRecords, kStDeletes, kStGroupCommits,
