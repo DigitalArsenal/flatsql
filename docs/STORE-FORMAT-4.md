@@ -603,11 +603,39 @@ cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=30
 
 ## 10. Measured
 
-See the build-out reports: `ENGINE-STREAM-REPORT.md` (the streams: readability
-of every stream of the migrated host-02-sized fixture with stock Python
-`flatbuffers` and the SDS generated readers, and the stock C++ Verifier;
-bytes per record; the crash loops), and `ENGINE-REPORT.md` (the feed tables,
-C-38).
+The build-out reports hold the runs: `ENGINE-MERGE-REPORT.md` (the staged
+acks and the merges: equivalence with the engine before them, the crash
+loops, bytes per record, reads), `ENGINE-STREAM-REPORT.md` (the streams) and
+`ENGINE-REPORT.md` (the feed tables, C-38). On the shared 28-core build box
+(load 7-11), native:
+
+- **Bytes written per record** (every write through `flatsql_io`: stream,
+  WAL, index and type files, through close, the merges still owed included),
+  against the engine whose acks wrote the random-keyed indexes:
+
+  | | acks write every index | staged acks + merges |
+  |---|---|---|
+  | write bench, 5M records (8 producers, 4,096-record calls, ~300 feeds) | 4,615 | 1,200 (stream 480, WAL 477, index 243) |
+  | write bench, 20M records | 8,248 | 1,840 (480, 856, 503) |
+  | W01 into the host-02-sized fixture's big feeds, a delivery merged alone (two passes) | 26,633, 16,280 | 5,663, 4,901 |
+  | W01, two deliveries ~7 s apart sharing one merge (both passes) | 21,456 | 3,256 |
+
+- **Ingest** 74.1k records/s at 5M (62.5k before), 70.8k at 20M (43.0k);
+  acknowledgement p50 / p99 289 / 943 ms at 5M (542 / 777), 300 / 1,106 ms
+  at 20M (762 / 1,414).
+- **Reads** back to back on the same stores (GET by CID, EPOCH nearest /
+  as_of / forward over every object, a 1-day EPOCH window, newest 100 of a
+  source): equal or faster, but for the 1-day window, +3.5% (+0.06 ms) at
+  both sizes, within the box's noise. With 500k rows staged over 300 feeds
+  every shape is within noise of the same store all merged.
+- **Equivalence:** a driver covering five types (CAT supersede, IQC
+  identities, OMM local-to-feed moves, copies, 35-character keys), every PUT
+  response, SUPERSEDE, DELETE and every read shape before and after REBUILD
+  1, answers byte for byte as the engine before staged acks, with no merge
+  during the run, ~80 merges during it, and merges plus two REBUILD 1s.
+- **Crash:** `t_kill` 100/100, `t_power_loss` 100/100, `t_kill_merge` 50/50
+  (every kill inside a merge transaction); the fixture's migration matches
+  format 1 (sampled, 0 differences).
 
 Readability script (no FlatSQL code): `fsdata-reader-check.py` walks every
 `P/<TYPE>/*.fsdata` of a store root, parses every frame with its SDS root
