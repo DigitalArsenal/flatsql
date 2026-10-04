@@ -280,10 +280,12 @@ struct StRow {
     int64_t seq() const { return rid >> 16; }
 };
 // Rows in a few runs, each sorted four ways; the rows stay where they were
-// made (chunks shared by successive views).
+// made (chunks shared by successive views) until a run loses rows (a merge,
+// a delete), which copies the rest into a chunk of their own.
 struct StRun {
     std::vector<std::shared_ptr<const std::vector<StRow>>> chunks;
     std::vector<const StRow*> byRid, byCid, byKe, byW;  // rid; (cid, rid); (k, e, rid); (w, rid)
+    size_t bytes = 0;  // memory: the chunks' rows, their keys' text, the four orders
 };
 using IdentKey = std::array<uint8_t, 32>;
 // A feed's staged rows and staged ingest identities (idst), as one commit or
@@ -296,6 +298,7 @@ public:
     std::vector<std::shared_ptr<const StRun>> runs;
     std::vector<std::pair<IdentKey, int64_t>> idents;  // by hash, the latest seq of each
     size_t rows = 0;
+    size_t bytes = 0;  // memory: the runs and the identities
     // base (may be null) less the rows `drop` names (and its identities when
     // dropIdents), plus `add` and `ids`; null when nothing is left.
     static std::shared_ptr<const Staged> make(const Staged* base, std::vector<StRow> add, const std::vector<int64_t>& drop,
@@ -719,8 +722,9 @@ struct P4Engine {
     std::unordered_map<std::string, int64_t> walExt;
     int64_t walExtSum = 0;
     std::unordered_set<std::string> ckptQueued;
-    // Staged rows over every feed (merges start with the largest feed past 4x flushEntries).
-    std::atomic<int64_t> stagedRows{0};
+    // The current views over every feed: staged rows and their memory (the
+    // merges' global triggers, mergeStep).
+    std::atomic<int64_t> stagedRows{0}, stagedBytes{0};
     // maintenance
     std::mutex maintMu;
     std::deque<flatsql::p4::MaintTask> maintQ;

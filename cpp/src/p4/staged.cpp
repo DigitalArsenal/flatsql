@@ -57,9 +57,21 @@ bool wLess(const StRow* a, const StRow* b) { return a->w != b->w ? a->w < b->w :
 
 size_t runSize(const StRun& r) { return r.byRid.size(); }
 
+// A chunk's memory and its four orders': the rows, and a key's text past the
+// string's inline buffer.
+size_t chunkBytes(const std::vector<StRow>& v) {
+    static const size_t kInline = std::string().capacity();
+    size_t n = v.capacity() * (sizeof(StRow) + 4 * sizeof(const StRow*));
+    for (const StRow& x : v)
+        if (x.k.s.capacity() > kInline) n += x.k.s.capacity() + 1;
+    return n;
+}
+
 std::shared_ptr<StRun> runOf(std::shared_ptr<const std::vector<StRow>> chunk) {
     auto r = std::make_shared<StRun>();
+    r->byRid.reserve(chunk->size());
     for (const StRow& x : *chunk) r->byRid.push_back(&x);
+    r->bytes = chunkBytes(*chunk);
     r->chunks.push_back(std::move(chunk));
     r->byCid = r->byKe = r->byW = r->byRid;
     std::sort(r->byRid.begin(), r->byRid.end(), ridLess);
@@ -82,10 +94,14 @@ std::shared_ptr<StRun> runMerge(const StRun& a, const StRun& b) {
     m(a.byCid, b.byCid, &r->byCid, cidLess);
     m(a.byKe, b.byKe, &r->byKe, keLess);
     m(a.byW, b.byW, &r->byW, wLess);
+    r->bytes = a.bytes + b.bytes;
     return r;
 }
 
-// A run without the rows of `gone` (sorted rids); the same run when it holds none.
+// A run without the rows of `gone` (sorted rids); the same run when it holds
+// none. The rows kept are copied into a chunk of their own, so a view never
+// keeps merged rows alive (the old chunks go with the views that hold them);
+// each order is kept, its pointers moved to the copies.
 std::shared_ptr<const StRun> runWithout(const std::shared_ptr<const StRun>& r, const std::vector<int64_t>& gone) {
     bool any = false;
     for (int64_t rid : gone) {
@@ -99,15 +115,26 @@ std::shared_ptr<const StRun> runWithout(const std::shared_ptr<const StRun>& r, c
     }
     if (!any) return r;
     auto keep = [&](const StRow* x) { return !std::binary_search(gone.begin(), gone.end(), x->rid); };
+    auto rows = std::make_shared<std::vector<StRow>>();
+    rows->reserve(r->byRid.size());
+    for (const StRow* x : r->byRid)
+        if (keep(x)) rows->push_back(*x);
+    if (rows->empty()) return nullptr;
+    rows->shrink_to_fit();
+    // The copies are in rid order: a row's copy is found by its rid.
+    auto copyOf = [&](const StRow* x) {
+        return &*std::lower_bound(rows->begin(), rows->end(), x->rid, [](const StRow& a, int64_t rid) { return a.rid < rid; });
+    };
     auto n = std::make_shared<StRun>();
-    n->chunks = r->chunks;
-    for (auto* v : {&r->byRid, &r->byCid, &r->byKe, &r->byW}) {
-        std::vector<const StRow*>& out = v == &r->byRid ? n->byRid : v == &r->byCid ? n->byCid : v == &r->byKe ? n->byKe : n->byW;
-        out.reserve(v->size());
+    for (const StRow& x : *rows) n->byRid.push_back(&x);
+    for (auto* v : {&r->byCid, &r->byKe, &r->byW}) {
+        std::vector<const StRow*>& out = v == &r->byCid ? n->byCid : v == &r->byKe ? n->byKe : n->byW;
+        out.reserve(rows->size());
         for (const StRow* x : *v)
-            if (keep(x)) out.push_back(x);
+            if (keep(x)) out.push_back(copyOf(x));
     }
-    if (n->byRid.empty()) return nullptr;
+    n->bytes = chunkBytes(*rows);
+    n->chunks.push_back(std::move(rows));
     return n;
 }
 
@@ -144,7 +171,11 @@ std::shared_ptr<const Staged> Staged::make(const Staged* base, std::vector<StRow
         for (auto& kv : ids) m[kv.first] = kv.second;  // later wins (INSERT OR REPLACE in order)
         v->idents.assign(m.begin(), m.end());
     }
-    for (auto& r : v->runs) v->rows += runSize(*r);
+    for (auto& r : v->runs) {
+        v->rows += runSize(*r);
+        v->bytes += r->bytes;
+    }
+    v->bytes += v->idents.capacity() * sizeof(v->idents[0]);
     if (v->rows == 0 && v->idents.empty()) return nullptr;
     return v;
 }
@@ -289,10 +320,12 @@ void Staged::byObject(std::vector<std::pair<KVal, std::vector<const StRow*>>>* o
 
 // ---- the view's lifecycle --------------------------------------------------------------------------
 void stagedPublish(Engine* e, Feed* f, std::shared_ptr<const Staged> v, bool added) {
-    const int64_t before = f->staged ? int64_t(f->staged->rows) : 0, after = v ? int64_t(v->rows) : 0;
+    const int64_t rows0 = f->staged ? int64_t(f->staged->rows) : 0, rows1 = v ? int64_t(v->rows) : 0;
+    const int64_t bytes0 = f->staged ? int64_t(f->staged->bytes) : 0, bytes1 = v ? int64_t(v->bytes) : 0;
     f->staged = std::move(v);
     if (added) f->stagedAt = monoNs();
-    if (after != before) e->stagedRows.fetch_add(after - before, std::memory_order_relaxed);
+    if (rows1 != rows0) e->stagedRows.fetch_add(rows1 - rows0, std::memory_order_relaxed);
+    if (bytes1 != bytes0) e->stagedBytes.fetch_add(bytes1 - bytes0, std::memory_order_relaxed);
 }
 
 namespace {
@@ -369,6 +402,10 @@ int64_t stagedMismatches(Feed* f, Conn* c) {
 
 // ---- the merge ------------------------------------------------------------------------------------------
 namespace {
+// A feed with staged rows and no new ones for this long is merged (due),
+// whatever it holds.
+constexpr uint64_t kMergeIdleNs = 2000000000ull;
+
 // Native test builds: P4_MERGE_DEBUG=1 logs each merge's start and end on
 // stderr (the kill-during-merge test times its kills by them).
 void mergeLog(const char* what, const Feed* f, size_t rows, int rc) {
@@ -475,24 +512,30 @@ int32_t mergeAll(Engine* e, Type* t, std::string* err) {
     return P4_OK;
 }
 
-// A feed is due when it holds flushEntries staged rows, when it has had no
-// new rows for 2 s (a quiet feed ends fully indexed), or, while every feed's
-// staged rows together pass 4 x flushEntries, when it holds the most. The
-// due feeds are merged one transaction after the other, until calls are
-// waiting for their ack; past 8 x flushEntries staged rows the merges go on
-// first (the acks wait: the views' memory stays bounded).
+// A feed is due when it holds flushEntries staged rows, or when it has had
+// no new rows for kMergeIdleNs (a quiet feed ends fully indexed). The due
+// feeds are merged one transaction after the other, until calls are waiting
+// for their ack. The views over every feed are capped (the engine's memory
+// budget, STORE-FORMAT-4 §7): past half the cap the feed holding the most is
+// merged even when not due; past the cap the merges go on before any more
+// acks (the acks wait). The cap is 8 x flushEntries staged rows or a quarter
+// of the hard heap of view memory (160 MiB by default), whichever comes first.
 void mergeStep(Engine* e, uint32_t writer) {
     WriterState& ws = *e->writers[writer];
+    const int64_t capRows = 8 * int64_t(std::max<uint32_t>(e->cfg.flushEntries, 1));
+    const int64_t capBytes = int64_t(e->cfg.hardHeap / 4);
     for (bool first = true;; first = false) {
         const int64_t flush = int64_t(std::max<uint32_t>(e->cfg.flushEntries, 1));
-        const int64_t staged = e->stagedRows.load(std::memory_order_relaxed);
+        const int64_t rows = e->stagedRows.load(std::memory_order_relaxed);
+        const int64_t bytes = e->stagedBytes.load(std::memory_order_relaxed);
+        const bool full = rows >= capRows || bytes >= capBytes;
         {
             std::lock_guard<std::mutex> g(ws.imu);
-            if (ws.hold || ws.istop || (!first && !ws.iq.empty() && staged < 8 * flush)) return;
+            if (ws.hold || ws.istop || (!first && !ws.iq.empty() && !full)) return;
             ws.merging = true;
         }
         const uint64_t now = monoNs();
-        const bool over = staged >= 4 * flush;
+        const bool over = rows >= capRows / 2 || bytes >= capBytes / 2;
         Feed* pick = nullptr;
         int64_t pickRows = 0;
         bool pickDue = false;
@@ -506,7 +549,7 @@ void mergeStep(Engine* e, uint32_t writer) {
                     Feed* f = fp.get();
                     if (!f->staged || !f->created || f->quarantined || now < f->mergeAfter) continue;
                     const int64_t n = int64_t(f->staged->rows) + int64_t(f->staged->idents.size());
-                    const bool due = n >= flush || now - f->stagedAt >= 2000000000ull;
+                    const bool due = n >= flush || now - f->stagedAt >= kMergeIdleNs;
                     if ((due && !pickDue) || ((due == pickDue) && n > pickRows)) {
                         pick = f;
                         pickRows = n;

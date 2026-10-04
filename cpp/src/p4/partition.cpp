@@ -663,7 +663,10 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
     f->streamBytes = m.mark;
     f->movedRows = !moved->empty();
     f->movedDone = moved->empty();
-    if (quarantine) f->quarantined = true;
+    if (quarantine) {
+        f->quarantined = true;
+        stagedPublish(e, f, nullptr, false);  // never read or merged: its view goes
+    }
     if (m.k.maxseq >= t->nextSeq) t->nextSeq = m.k.maxseq + 1;
     return P4_OK;
 }

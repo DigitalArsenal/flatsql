@@ -25,9 +25,12 @@
 //
 // The random-keyed indexes (r_c, r_ke, r_w) hold merged rows only: a walk or
 // probe through them also takes the feed's staged rows from its view, which
-// the scan pins (pickFiles) before any of its SQL runs (staged.cpp). A row
-// merged after the pin comes from both with the same key and seq and is taken
-// once (a record's entries are adjacent in every order and collapse).
+// each step (a walk's chunk, the predicates' probes, an EPOCH pass over a
+// file) pins before its SQL transaction starts and lets go when it ends, so
+// a view outlives no step and no wait on the host (staged.cpp). A row merged
+// after the pin comes from both with the same key and seq and is taken once
+// (a record's entries are adjacent in every order and collapse); one merged
+// before it is in the step's SQL snapshot, which starts after the pin.
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -197,7 +200,6 @@ struct FRef {
     std::string path, provider, source;
     bool local = false, indexed = true;
     Counters k;
-    std::shared_ptr<const Staged> st;  // the feed's staged rows, pinned at the scan's start
 };
 
 // A row of a feed file, as a scan reads it.
@@ -383,6 +385,8 @@ public:
 
 private:
     int32_t pickFiles();
+    // A file's view of staged rows, pinned by a step before its SQL runs.
+    std::shared_ptr<const Staged> staged(const FRef& fr) const;
     int32_t boundCut();
     int32_t candidatesFromPreds(bool* used);
     int32_t page(std::vector<Cand>* out);  // the next page of candidates in order; empty at the end
@@ -511,11 +515,15 @@ int32_t Scan::pickFiles() {
         r.local = f->local;
         r.indexed = f->indexed;
         r.k = f->k;
-        r.st = f->staged;
         files_.push_back(std::move(r));
     }
     for (size_t i = 0; i < files_.size(); i++) fiOf_[files_[i].fid] = int(i);
     return P4_OK;
+}
+
+std::shared_ptr<const Staged> Scan::staged(const FRef& fr) const {
+    std::lock_guard<std::mutex> g(t_->mu);
+    return fr.f->staged;
 }
 
 // A18 (C-31): the bound is the newest N records of lane.source when it is
@@ -621,6 +629,7 @@ int32_t Scan::candidatesFromPreds(bool* used) {
     };
     for (size_t fi = 0; fi < files_.size() && ents.size() <= kMax; fi++) {
         const FRef& fr = files_[fi];
+        const std::shared_ptr<const Staged> view = staged(fr);
         int rc = 0;
         Conn* c = e_->rpool.acquire(fr.path, OpenKind::Reader, &rc, nullptr);
         if (!c) return statusOfSqlite(rc);
@@ -659,18 +668,18 @@ int32_t Scan::candidatesFromPreds(bool* used) {
         e_->rpool.release(c);
         if (st != P4_OK) return st;
         // The file's staged rows of the CID or the object keys.
-        if (fr.st && fr.st->rows) {
+        if (view && view->rows) {
             std::vector<const StRow*> v;
             for (size_t vi = 0; vi < nv && ents.size() <= kMax; vi++) {
                 if (s_.hasCid) {
-                    fr.st->ofCid(s_.cidKey, &v);
+                    view->ofCid(s_.cidKey, &v);
                 } else {
                     KVal kv;
                     const ps::rb1::Cell& cell = kp->vals[vi];
                     kv.type = cell.type == ps::rb1::kInt ? 1 : 3;
                     kv.i = cell.type == ps::rb1::kInt ? cell.i : 0;
                     if (kv.type == 3) kv.s = cell.s;
-                    fr.st->ofK(kv, &v);
+                    view->ofK(kv, &v);
                 }
                 for (const StRow* x : v) {
                     if (x->seq() <= lo_ || x->seq() > hi_) continue;
@@ -799,6 +808,7 @@ bool Scan::before(const Ent& a, int fa, const Ent& b, int fb) const {
 int32_t Scan::fetch(Stream& s) {
     if (s.done) return P4_OK;
     const FRef& fr = files_[size_t(s.fi)];
+    const std::shared_ptr<const Staged> view = staged(fr);
     int orc = 0;
     Conn* c = e_->rpool.acquire(fr.path, OpenKind::Reader, &orc, nullptr);
     if (!c) {
@@ -907,7 +917,7 @@ int32_t Scan::fetch(Stream& s) {
                     rc = read(g, 2);
                 }
             }
-            if (rc == P4_OK && isW && fr.st && fr.st->rows) {
+            if (rc == P4_OK && isW && view && view->rows) {
                 // The staged rows of the interval this chunk covers: to its
                 // last group when the chunk is full, else to the range's end
                 // (whole groups past a chunk; the rest on the next fetch,
@@ -915,7 +925,7 @@ int32_t Scan::fetch(Stream& s) {
                 std::vector<const StRow*> v;
                 bool more = false;
                 const int64_t to = full ? got.back().ov : (asc ? hi : lo);
-                fr.st->wRange(!asc, s.rKey, !s.started, to, ridLo, ridHi, full ? SIZE_MAX : chunk_, &v, &more);
+                view->wRange(!asc, s.rKey, !s.started, to, ridLo, ridHi, full ? SIZE_MAX : chunk_, &v, &more);
                 if (more) {
                     const int64_t cut = v.back()->w;
                     while (!got.empty() && (asc ? got.back().ov > cut : got.back().ov < cut)) got.pop_back();
@@ -979,11 +989,11 @@ int32_t Scan::fetch(Stream& s) {
             else sqlite3_bind_zeroblob(q, 6, 0);
             rc = read(q, 2);
             bool full = got.size() >= chunk_;
-            if (rc == P4_OK && fr.st && fr.st->rows) {
+            if (rc == P4_OK && view && view->rows) {
                 std::vector<const StRow*> v;
                 bool more = false;
                 const Ent* last = full ? &got.back() : nullptr;
-                fr.st->cidRange(s.rCid, s.rRid, last ? last->key : nullptr, last ? last->rid : 0, ridLo, ridHi, full ? SIZE_MAX : chunk_, &v,
+                view->cidRange(s.rCid, s.rRid, last ? last->key : nullptr, last ? last->rid : 0, ridLo, ridHi, full ? SIZE_MAX : chunk_, &v,
                                 &more);
                 auto before = [](const uint8_t* ak, int64_t ar, const uint8_t* bk, int64_t br) {
                     const int k = std::memcmp(ak, bk, 32);
@@ -1511,7 +1521,8 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
     for (size_t fi = 0; fi < files_.size() && rc == P4_OK; fi++) {
         const uint32_t fid = files_[fi].fid;
         // r_ke holds the merged rows; the file's staged rows come from its view.
-        const Staged* st = files_[fi].st && files_[fi].st->rows ? files_[fi].st.get() : nullptr;
+        const std::shared_ptr<const Staged> pin = staged(files_[fi]);
+        const Staged* st = pin && pin->rows ? pin.get() : nullptr;
         int orc = 0;
         Conn* c = e_->rpool.acquire(files_[fi].path, OpenKind::Reader, &orc, nullptr);
         if (!c) return statusOfSqlite(orc);

@@ -1270,6 +1270,7 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
         if ((rc & 0xff) == SQLITE_CORRUPT || (rc & 0xff) == SQLITE_NOTADB) {
             std::lock_guard<std::mutex> g(t->mu);
             f->quarantined = true;
+            stagedPublish(e, f, nullptr, false);  // never read or merged: its view goes
         }
         return statusOfSqlite(rc);
     }
