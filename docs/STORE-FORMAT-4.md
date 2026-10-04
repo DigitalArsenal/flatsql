@@ -16,6 +16,14 @@ type's `local` feed. Each feed is two files:
   are FlatSQL's): the feed's index rows and per-row metadata. A row points at
   its record's frame by `(off, len)`; no record bytes are in SQLite.
 
+The records are streamed and the indexes built beside them (owner,
+2026-10-03: "stream them directly while indices and btrees (SQLite database
+metadata) were created in a separate thread in the data being streamed in";
+BRIEF4 ruling (B)): an acknowledged write has its frames synced in the stream
+and its rows committed *staged*, which writes appended pages only; the
+writer's indexer thread later merges a feed's staged rows into its
+random-keyed indexes in one large transaction (§3).
+
 Each feed is its own table: it holds the feed's records with their own CID
 index, and nothing ties a record in one feed to a record in another. The
 engine is `cpp/src/p4`; it ships as `wasm/flatsql-p4-threads.wasm`
@@ -85,8 +93,8 @@ stay until a compaction.
 
 **Index** (`<feed>.db`):
 
-`r(rid, seq, n, b, c, u, at, cid, e, k, ts, f, x, off, len, w)`, one row per
-delivery of a record to the feed:
+`r(rid, seq, n, b, c, u, at, cid, e, k, ts, f, x, off, len, kk, m, w, cp)`,
+one row per delivery of a record to the feed:
 
 | Column | Meaning |
 |---|---|
@@ -99,7 +107,10 @@ delivery of a record to the feed:
 | `cid`, `e`, `k`, `ts` | the CID, epoch, object key and source timestamp (the copy's: a record's copies share the record's, except a COPY made by StoreRoutedByProducer, which keeps its own, C-39 E6) |
 | `off`, `len` | the record's frame in the stream: `[u32 len][bytes]` at `off` |
 | `x`, `f` | the signature, a sealed record's extracted COL values |
+| `kk` | the object key's id in `okey(id, k)` (each key of the feed once): the object index holds a small integer, not the key |
+| `m` | 0 while the row is staged, 1 once merged (§3) |
 | `w` | `coalesce(e, ts)` (virtual) |
+| `cp` | `substr(cid, 1, 8)` (virtual): the CID index's key |
 
 A record's rows are its copies x its instances: every copy (producer token)
 of the record appears with every one of its instances (batch, content key,
@@ -108,21 +119,35 @@ producer peer and key) of the feed. A local record has one row per copy.
 The CID is stored once per row (SDN supplies it; a sealed record's bytes are
 not what it names) and indexed once per file:
 
-| Index | Purpose |
-|---|---|
-| `r_s(seq)` | arrival: the merge by seq, the newest-N cut of `<TYPE>@<source>` (C-31), datasync, oldest-first quota, without the rows' pages |
-| `r_c(cid)` | **the index's one CID index**: re-fetch dedupe in the feed, and SDN's by-CID lookups (GET, TAGS, DELETE, SCAN by CID), which probe each feed of the type |
-| `r_ke(k, e)` | object and epoch: EPOCH nearest / as_of / forward per object, object predicates, CAT supersede |
-| `r_w(w DESC)` | epoch windows; a w group is put in CID order from its rows |
-| `r_b(b)` | batch supersede and batch-filtered reads |
-| `r_a(at DESC)` (feeds) / `r_t(ts DESC)` (local) | newest-first pages (C-39 E2): delivery time, and the untagged copies' time; neither holds a CID (a group is put in order from its rows) |
+| Index | Rows | Purpose |
+|---|---|---|
+| `r_s(seq)` | all | arrival: the merge by seq, the newest-N cut of `<TYPE>@<source>` (C-31), datasync, oldest-first quota, without the rows' pages |
+| `r_c(cp)` | merged (`WHERE m=1`) | **the index's one CID index**, on the CID key's first 8 bytes (a lookup matches `cp` and then the whole CID in the row; `cp` order is CID order, a walk orders a `cp` group by the CID): re-fetch dedupe in the feed, and SDN's by-CID lookups (GET, TAGS, DELETE, SCAN by CID), which probe each feed of the type |
+| `r_ke(kk, e)` | merged | object and epoch: EPOCH nearest / as_of / forward per object, object predicates, CAT supersede |
+| `r_w(w DESC)` | merged | epoch windows; a w group is put in CID order from its rows |
+| `r_b(b)` | all | batch supersede and batch-filtered reads |
+| `r_a(at DESC)` (feeds) / `r_t(ts DESC)` (local) | all | newest-first pages (C-39 E2): delivery time, and the untagged copies' time; neither holds a CID (a group is put in order from its rows) |
+| `r_m(rid)` | staged (`WHERE m=0`) | the staged rows (open rebuilds the feed's view from it) |
+
+`r_c`, `r_ke` and `r_w` take random keys (CIDs, objects, epochs): a commit
+that inserted into them dirtied pages all over each (about two random pages
+per record at 4,096-record commits, each written to the WAL and again by
+the checkpoint: ~16 KB per record into a big feed). They are partial
+indexes on the merged rows, so an ack writes none of their pages; `r_s`,
+`r_b`, `r_a`/`r_t` and `r_m` take keys that arrive in order (appended pages).
+Feed index files have 4 KiB pages whatever the spec's tag 8 says (a page
+smaller than the VFS's 4 KiB sector drags its sector-mates into every write;
+a larger one writes more per dirty page).
 
 Also, committed with the rows in the same transaction:
 - `inst(b, c, n, bytes, ...)`: each instance's records (each once), their
   bytes (each record's smallest copy) and format 1's summary times
   (`first`, `updated`, `maxat`, url);
 - `tokc(producer, n, bytes, ...)`: each producer token's copies in the file;
-- `ident(h, seq)`: the feed's IQC ingest identities (C-21, C-26);
+- `ident(h, seq)`: the feed's IQC ingest identities (C-21, C-26), and
+  `idst(h, seq)` the staged ones (appended; the merge moves them into
+  `ident`; a staged identity is the latest);
+- `okey(id, k)`: each object key of the feed once (its `kk`);
 - `moved(seq)`: the local records this feed took in (a move's intent, §4);
 - `meta`: the file's counters (rows, records, bytes, records without an
   epoch, the records' bytes, copies, the copies' bytes, the stream's live
@@ -196,9 +221,32 @@ intent journal.
   8. *indexer:* each feed file the round touches, feeds before local, in ONE
      transaction for the whole round: the units' rows in plan order, its
      counters, instances, tokens, identities and moves; **its stream synced
-     first**, then the transaction commits with the stream's new `mark`;
+     first**, then the transaction commits with the stream's new `mark`. The
+     new rows are **staged** (`m=0`: in `r_s`, `r_b`, `r_a`/`r_t` and `r_m`,
+     not in `r_c`, `r_ke`, `r_w`) and new identities go to `idst`, so the
+     transaction writes appended pages only (a migration's append into an
+     index without its secondary indexes is not staged). After the commit
+     the feed's **view** of its staged rows is replaced (below);
   9. *indexer:* publish (visible-through) and ack every call of the round, in
      plan order: the ack follows the commits (C-4).
+- **The merge** (the indexer, between rounds): one feed per transaction, its
+  staged rows (at most twice `flushEntries`, CID order: `r_c`'s pages filled
+  one after the other) set `m=1`, which puts them in `r_c`, `r_ke` and
+  `r_w`, and `idst` moved into `ident`; then the feed's view without them.
+  The transaction keeps its dirty pages in memory up to a quarter of the hard
+  heap (at most 256 MiB), so each page is written once. A feed is due when it
+  holds `flushEntries` staged rows (config tag 42, "index flush entries",
+  131,072 by default), when it has had no new rows for 2 s (a quiet feed
+  ends fully indexed), or, while all staged rows together pass 4 x
+  `flushEntries`, when it holds the most. The due feeds are merged one after
+  the other until calls wait for their ack; past 8 x `flushEntries` staged
+  rows the merges go first. A failed merge changes nothing (tried again 2 s
+  later). REBUILD 1 merges everything.
+- **The view** (`Staged`, per feed): what the reads that use `r_c`, `r_ke`
+  or `r_w` need of each staged row (rid, CID, epoch, object key, w, delivery
+  time, ts), in a few sorted runs, and the staged identities. It is
+  immutable: each commit and each merge publishes a new one, a read pins the
+  one it starts with.
 
   A group is planned on the state its type's pending units leave its records
   in (their seeds); planning reads go through the reader pool and see
@@ -213,8 +261,9 @@ intent journal.
 - **DELETE**: every row of the CIDs in every feed (each index's `r_c`).
   `deleted` counts each CID's distinct copies over the feeds.
 - SUPERSEDE, DELETE, QUOTA_GC, REBUILD and compactions wait for the indexer
-  to be idle, then run on the writer thread. They remove index rows; frames
-  stay in the stream until a compaction.
+  to be idle (no round, no merge; it starts none until they are done), then
+  run on the writer thread. They remove index rows (a staged row leaves the
+  view with its commit); frames stay in the stream until a compaction.
 - **Lane times** (an instance's `first` and `updated`, SUMMARY 3): a write
   that delivers the instance by a tag stamps `updated` with the clock (a
   migration: format 1's times, C-36). A copy joining instances the record
@@ -222,9 +271,10 @@ intent journal.
   DELETE or a CAT supersede-on-ingest leaves are restamped with the clock, as
   format 1's `decrementSourceSummary` (C-39 E5).
 - **Bounds after deletes:** a delete recounts a file's seq and w bounds from the
-  ends of `r_s` / `r_w`; a delete at the file's epoch edge also its min/max
-  epoch (the first row with an epoch from each end of `r_w`), so the type's
-  epoch range follows deletes. The ts bounds stay bounds.
+  ends of `r_s` / `r_w` and the staged rows; a delete at the file's epoch
+  edge also its min/max epoch (the first row with an epoch from each end of
+  `r_w`, and the staged rows), so the type's epoch range follows deletes. The
+  ts bounds stay bounds.
 - **QUOTA_GC**: the type's oldest record row sets by arrival (the feeds
   merged by seq), every row of each.
 
@@ -263,7 +313,11 @@ before it serves (M8), visits every feed the type index names:
 5. a move cut between its feed and local is finished: the feed's `moved`
    table names the seq (committed with the feed's rows), and the local rows of
    that seq go once the feed holds it. A feed's next commit drops `moved`
-   rows whose local side is done.
+   rows whose local side is done;
+6. its view of staged rows is rebuilt from `r_m` and `idst`. A merge is one
+   transaction that only sets `m` (and moves `idst` into `ident`): cut by a
+   crash, its rows are still staged; committed, they are merged. Either way
+   every acknowledged row is there once, with its metadata (`t_kill_merge`).
 
 The one write that spans two files with one record is that move, committed
 feed first. A write cut between two feeds leaves the feeds it committed: a
@@ -294,11 +348,14 @@ the readers.
 - **The maintenance thread:** checkpoints for the indexes, the type index and
   full text; closing evicted writer connections; the T/ files' sizes for
   SUMMARY 4.
-- **Checkpoints never wait for a writer.** PASSIVE passes copy a WAL while
-  the writer keeps committing; a TRUNCATE takes the writer lock only if it
-  is free that instant. An index's one writer truncates its own WAL after a
-  commit that leaves it at a quarter of `walTotal` (or 32 MiB while the
-  instance's WALs pass three quarters of it). Activation retries a TRUNCATE
+- **Checkpoints never wait for a writer.** PASSIVE passes copy a WAL once
+  it passes 128 MiB (a checkpoint writes each page once however many frames
+  the WAL holds for it); a TRUNCATE takes the writer lock only if it is free
+  that instant. An index's one writer truncates its own WAL after a commit
+  that leaves it at a quarter of `walTotal` (4 GiB by default; or 32 MiB
+  while the instance's WALs pass three quarters of it). WAL sizes are
+  accounted in bytes. Writer connections spill a transaction's dirty pages
+  only past 32 MiB (a merge: past its budget). Activation retries a TRUNCATE
   checkpoint the maintenance thread is running.
 - **The long-work thread:** REBUILD and QUOTA_GC calls, the configured
   quota once a second, full text, and compactions; their per-type work runs
@@ -328,13 +385,15 @@ the readers.
   memory: a crash leaves those rows (a search drops them, as it drops any hit
   without a live record), and REBUILD 4 removes them.
 - **REBUILD:** 1 adds the indexes' secondary indexes (after a migration's
-  bulk append); 2 recounts every index's counters, instances and tokens from
-  its rows; 4 rebuilds full text; 8 makes the same comparisons (file and
-  engine) and changes nothing, checks every row's frame in its stream (below
-  the mark, its size prefix equal to the row's `len`) and the stream's end
-  against the mark, and runs `PRAGMA integrity_check` on every index and the
-  type index (C-27). A record whose rows are not its copies x its instances,
-  or that holds two CIDs, is a mismatch.
+  bulk append) and merges every staged row; 2 recounts every index's
+  counters, instances and tokens from its rows; 4 rebuilds full text; 8 makes
+  the same comparisons (file and engine) and changes nothing, checks every
+  row's frame in its stream (below the mark, its size prefix equal to the
+  row's `len`) and the stream's end against the mark, compares each feed's
+  view with its file's staged rows and identities, and runs `PRAGMA
+  integrity_check` on every index and the type index (C-27). A record whose
+  rows are not its copies x its instances, or that holds two CIDs, is a
+  mismatch.
 
 ## 6. Reads
 
@@ -357,6 +416,17 @@ its feed that matches the lane filter (§3.6), or in a newest-first page (SCAN
 and source from the file and the rest from its ids: never blank when the
 record has a tag.
 
+- **Staged rows:** `r_c`, `r_ke` and `r_w` hold merged rows only. A scan
+  pins each file's view before any of its SQL runs, and every walk or probe
+  through those indexes also takes the view's rows in the same order and
+  range (a CID or object probe, a CID or w walk chunk, an object's epochs).
+  A row merged after the pin comes from both with the same key and seq and
+  collapses (a record's entries are adjacent in every order); one merged
+  before it is in the index only; a staged one in the view only. Walks
+  through `r_s`, `r_a`, `r_t` and the rows themselves (one rid range of
+  table `r`) see staged rows directly. Reads never wait on a merge (WAL
+  snapshots, an immutable view). The planner's lookups (dedupe by CID, CAT
+  supersede by object, identities) take the view the same way.
 - **A18 (C-31):** `<TYPE>@<source>` is the newest N records of that type from
   that source (the source's feed files' `r_s`, newest first, merged); `<TYPE>`
   the type's newest N (every feed file's `r_s`, merged). Every other filter
@@ -377,11 +447,13 @@ record has a tag.
   batch, url, content key, producer peer and key, and delivery time (C-41 N9;
   ties at that time by the smallest identity). 7 W_ASC: w asc, CID asc (a raw
   page with a sync filter or a search).
-- **EPOCH nearest / as_of / forward:** one seek per object in each file's
-  `r_ke`, read from the target in rank order until an epoch group has a
-  record that passes the filters; ties at the best epoch go to the lowest
-  CID (format 1's ranking), then the lowest feed id. One answer per entity.
-  A record without an object is its own entity.
+- **EPOCH nearest / as_of / forward:** the file's objects are its `okey`
+  keys in key order (merged with the staged rows' keys); one seek per object
+  in `r_ke` (its `kk`) beside the object's staged rows, read from the target
+  in rank order until an epoch group has a record that passes the filters;
+  ties at the best epoch go to the lowest CID (format 1's ranking), then the
+  lowest feed id. One answer per entity. A record without an object is its
+  own entity.
 - **By CID:** GET answers from the first feed file holding the CID (its
   copies, the lowest token first); TAGS lists the tag instances of every
   feed file holding it, each with that file's seq.
@@ -436,6 +508,10 @@ files.
 - Nothing is held back beyond the pipeline: at most 16 planned units per
   writer wait for their round; a unit's seed is its type's pending units'
   touched records only.
+- The views of staged rows: about 130 bytes per staged row (its keys and
+  four sorted pointers); the merges keep all of them below about 8 x
+  `flushEntries` rows (1M by default) plus a round. A merge transaction
+  holds up to a quarter of the hard heap (at most 256 MiB) of dirty pages.
 - Streams: one open handle per feed (and a replaced generation while kept).
 
 ## 8. The artifact
@@ -453,6 +529,7 @@ files.
 FLATBUFFERS_DIR=<flatbuffers> cmake -S cpp -B cpp/build && cmake --build cpp/build --target flatsql_p4_test flatsql_p4_fault_test -j 6
 cpp/build/flatsql_p4_test                                     # the SQL surface's engine tests
 cpp/build/flatsql_p4_test --test=t_kill --slow=1 --rounds=30  # kill -9 loop
+cpp/build/flatsql_p4_test --test=t_kill_merge --slow=1 --rounds=30  # kill -9 inside merges
 cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=30
 ```
 
@@ -478,7 +555,13 @@ cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=30
   five crash modes, the same three feeds; every acknowledged record is
   there and every acknowledged tag instance still lists its source,
   REBUILD 8 is clean, the count equals the records of a full scan, each
-  with its own seq.
+  with its own seq. Its index flush threshold (2,000) and `t_kill`'s (5,000)
+  make the merges frequent, so both loops crash inside merges too.
+- **`t_kill_merge`:** the kill -9 loop timed into merges: a child ingests
+  with a 2,000-row flush threshold and logs each merge's start and end
+  (`P4_MERGE_DEBUG`, native test builds) and each acknowledged call; the
+  parent kills it 0-4 ms after the k-th merge start, then runs `t_kill`'s
+  checks and finds every acknowledged record with its feed's batch.
 - The proof is end to end (C-33): the SDN harness on the real engine
   (`sdn-server/internal/storage/format4proof`): `store-migrate --to 4`, every
   benchset read and the coverage classes against format 1 field by field,
