@@ -7,7 +7,8 @@
 //
 //   epoch   <alt>|<alt>...     first alternative that yields a value wins
 //           alt: str:<path>      parseEpochString (Go storage parity)
-//                f64floor:<path> floor(double seconds), 0 = absent
+//                f64floor:<path> floor(double seconds), 0 and NaN = absent,
+//                                clamped to the int64 range (Go on arm64)
 //                i64s:<path> | i64ms:<path>
 //   col <n> <alt>|<alt>...     COL(n) posting
 //           alt: u64pos:<path>  unsigned > 0 | str:<path> trimmed, non-empty

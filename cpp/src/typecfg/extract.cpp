@@ -630,6 +630,15 @@ template <typename T>
 T fieldOr(const flatbuffers::Table* t, uint16_t vo, T def) {
     return t->GetField<T>(vo, def);
 }
+
+// Go's int64(math.Floor(v)) on arm64: saturated to the int64 range (C-46 (1);
+// in C++ the plain conversion of an out-of-range double is undefined).
+int64_t floorToI64(double v) {
+    const double f = std::floor(v);
+    if (f >= 9223372036854775808.0) return INT64_MAX;
+    if (f < -9223372036854775808.0) return INT64_MIN;
+    return int64_t(f);
+}
 }  // namespace
 
 bool TypeConfig::readI64(const uint8_t* root, const Path& p, int64_t* v) const {
@@ -755,12 +764,10 @@ void TypeConfig::extract(const uint8_t* frame, size_t len, Extracted* out, uint8
             break;
         } else if (a.kind == kAltEpochF64Floor) {
             double v;
-            if (!readF64(root, a.a, &v) || v == 0 || !std::isfinite(v)) continue;
-            const double fl = std::floor(v);
-            if (fl < -9.2e18 || fl > 9.2e18) continue;
+            if (!readF64(root, a.a, &v) || v == 0 || std::isnan(v)) continue;
             out->hasEpoch = true;
-            out->epochSec = int64_t(fl);
-            out->epochMs = int64_t(std::floor(v * 1000.0));
+            out->epochSec = floorToI64(v);
+            out->epochMs = floorToI64(v * 1000.0);
             break;
         } else {
             int64_t v;
