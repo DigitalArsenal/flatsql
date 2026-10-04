@@ -2,6 +2,7 @@
 // gives (or a refusal), driven through the mailbox as a host drives it.
 #include <flatbuffers/reflection.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -216,6 +217,83 @@ P4_TEST(t_epoch_clamped) {
         rb.text(1, "MPE").u32(63, 1);
         if (!pass) REQUIRE(call(P4_OPC_REBUILD, rb.b).status == P4_OK, "REBUILD 1");
     }
+    closeEngine();
+    removeTree(root);
+}
+
+// C-46 (5): EPOCH pages with the limit pushed down while deletes take the
+// records they pick: a pick gone before its answer sends the page to the full
+// pass. Every page answers (no error, no stall), in entity order within its
+// limit; once the deletes end, the page is the first rows of the answer with
+// no limit, and the count is its size.
+P4_TEST(t_epoch_page_under_deletes) {
+    const std::string root = scratchDir("t_epoch_page_deletes");
+    REQUIRE(openEngine(root) == P4_OK, "open");
+    REQUIRE(registerType(mpeType()) == P4_OK, "register");
+    const int64_t at = 1789000000;
+    Batch b;
+    b.type = "MPE";
+    b.peer = "12D3KooWExample";
+    b.tags.push_back(Tag{"space-data-network-02", "celestrak-gp", "", "b1", "", "", ""});
+    // 40 entities x 5 records; record j of an entity is j+1 minutes from at
+    std::vector<std::vector<std::vector<uint8_t>>> cids(40);
+    for (int k = 0; k < 40; k++)
+        for (int j = 0; j < 5; j++) {
+            In r;
+            char ent[16];
+            std::snprintf(ent, sizeof ent, "ENT-%02d", k);
+            r.frame = mpeFrame(ent, double(at + 60 * (j + 1) * (k % 2 ? 1 : -1)), 1.0 + j);
+            r.ts = 1790000000 + k * 5 + j;
+            uint8_t c[36];
+            cidOf(r.frame, c);
+            cids[size_t(k)].push_back(std::vector<uint8_t>(c, c + 36));
+            b.recs.push_back(std::move(r));
+        }
+    REQUIRE(put(b).status == P4_OK, "put");
+    auto page = [&](uint64_t limit) {
+        TlvW w;
+        w.text(1, "MPE").u8(30, 2).i64(31, at).u64(3, limit).u8(2, 1);
+        return call(P4_OPC_EPOCH, w.b);
+    };
+    // The deleter takes, one call each, the nearest record of the page's
+    // entities (ENT-00..ENT-03), their first four records in rank order.
+    std::atomic<bool> done{false};
+    int deleteErrors = 0;
+    std::thread deleter([&]() {
+        for (int j = 0; j < 4; j++)
+            for (int k = 0; k < 4; k++) {
+                TlvW d;
+                d.text(1, "MPE");
+                std::vector<uint8_t> cl = {1, 0, 0, 0};  // one CID
+                cl.insert(cl.end(), cids[size_t(k)][size_t(j)].begin(), cids[size_t(k)][size_t(j)].end());
+                d.raw(40, cl.data(), cl.size());
+                if (call(P4_OPC_DELETE, d.b).status != P4_OK) deleteErrors++;
+            }
+        done = true;
+    });
+    int pages = 0, bad = 0;
+    while (!done.load() || pages < 20) {
+        const Result r = page(3);
+        bool ok = r.status == P4_OK && r.rows.size() == 3;
+        for (size_t i = 1; ok && i < r.rows.size(); i++) ok = r.s(i - 1, "key") < r.s(i, "key");
+        if (!ok) bad++;
+        pages++;
+    }
+    deleter.join();
+    CHECK_EQ(deleteErrors, 0, "deletes");
+    CHECK_EQ(bad, 0, std::to_string(pages) + " pages under deletes");
+    const Result full = page(250000), three = page(3);
+    REQUIRE(full.status == P4_OK && full.rows.size() == 40 && three.status == P4_OK && three.rows.size() == 3, full.err + three.err);
+    for (size_t i = 0; i < 3; i++)
+        CHECK(three.s(i, "key") == full.s(i, "key") && three.i(i, "epoch") == full.i(i, "epoch") && three.s(i, "cid") == full.s(i, "cid"),
+              "row " + std::to_string(i));
+    // ENT-00's last record is 5 minutes before at, ENT-01's 5 minutes after
+    CHECK(three.s(0, "key") == "ENT-00" && three.i(0, "epoch") == at - 300, "ENT-00 keeps its last record");
+    CHECK(three.s(1, "key") == "ENT-01" && three.i(1, "epoch") == at + 300, "ENT-01 keeps its last record");
+    TlvW c;
+    c.text(1, "MPE").u8(30, 2).i64(31, at).u8(33, 1);
+    const Result n = call(P4_OPC_EPOCH, c.b);
+    CHECK(n.status == P4_OK && n.rows.size() == 1 && n.rows[0][0].i == 40, "count");
     closeEngine();
     removeTree(root);
 }
