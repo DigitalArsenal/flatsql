@@ -112,7 +112,7 @@ int64_t walBytesOf(Engine* e, const std::string& path) {
 
 void typeFileBytes(Type* t) {
     if (!t->hasFiles.load(std::memory_order_acquire)) return;
-    t->idxBytes.store(std::max<int64_t>(0, ioSize(t->pIdx)) + std::max<int64_t>(0, ioSize(t->pJnl)), std::memory_order_relaxed);
+    t->idxBytes.store(std::max<int64_t>(0, ioSize(t->pIdx)), std::memory_order_relaxed);
     t->ftsBytes.store(std::max<int64_t>(0, ioSize(t->pFts)), std::memory_order_relaxed);
 }
 
@@ -232,16 +232,26 @@ int64_t typeFileInUse(const std::string& path) {
 }
 
 // Bytes the store occupies. On disk: every file with its WAL and rollback
-// journal (an upper bound, no page counts). In use: every file's pages less
-// its free pages (the WAL files are not added), feed files and type files
-// alike (the type index frees its entries' pages as records go, so a quota
-// pass measures what it freed there too), plus any rollback journal.
+// journal (an upper bound, no page counts), and every stream (its committed
+// end, plus a generation a compaction replaced until it goes). In use: every
+// index file's pages less its free pages (the WAL files are not added), the
+// type files alike, plus each stream's live frames (deleted records' frames
+// stay on disk until a compaction gives them back, but are not in use), plus
+// any rollback journal.
 int64_t storeBytes(Engine* e, bool inUse) {
     int64_t total = 0;
     for (Type* t : typesWithFiles(e)) {
         for (Feed* f : createdFeeds(t)) {
             total += sizeOf(f->path + "-journal");
+            {
+                std::lock_guard<std::mutex> g(t->mu);
+                total += inUse ? f->k.fbytes : f->streamBytes;
+            }
             if (!inUse) {
+                {
+                    std::lock_guard<std::mutex> g(f->smu);
+                    total += f->retiredBytes;
+                }
                 total += sizeOf(f->path) + sizeOf(f->path + "-wal");
                 continue;
             }
@@ -255,7 +265,7 @@ int64_t storeBytes(Engine* e, bool inUse) {
             total += n >= 0 ? n : sizeOf(f->path) + sizeOf(f->path + "-wal");
             e->rpool.release(c);
         }
-        for (const std::string* p : {&t->pIdx, &t->pJnl, &t->pFts}) {
+        for (const std::string* p : {&t->pIdx, &t->pFts}) {
             total += sizeOf(*p + "-journal");
             total += inUse ? typeFileInUse(*p) : sizeOf(*p) + sizeOf(*p + "-wal");
         }
@@ -614,17 +624,29 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
                 status = statusOfSqlite(rc);
                 break;
             }
-            sqlite3_stmt* s = c->sql("SELECT d, f FROM r WHERE rid>=?1 AND rid<=?2 LIMIT 1");
-            c->exec("BEGIN");
+            sqlite3_stmt* s = c->sql("SELECT off, len, f FROM r WHERE rid>=?1 AND rid<=?2 LIMIT 1");
+            // The bytes come from the stream generation this read transaction
+            // sees (a compaction may have replaced it since: then a new one).
+            std::shared_ptr<Stream> stream;
+            for (int tries = 0; tries < 4 && !stream && status == P4_OK; tries++) {
+                if (tries) c->exec("COMMIT");
+                c->exec("BEGIN");
+                uint32_t gen = 0;
+                int32_t st = snapGen(c, &gen);
+                if (st == P4_OK) stream = streamAt(f, gen, &st);
+                if (st != P4_OK) status = st;
+            }
+            if (!stream && status == P4_OK) status = P4_E_BUSY;
+            std::string bytes;
             for (int64_t seq : kv.second) {
-                if (!s) break;
+                if (!s || status != P4_OK) break;
                 sqlite3_bind_int64(s, 1, seq << 16);
                 sqlite3_bind_int64(s, 2, (seq << 16) | 0xffff);
-                if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 1) == SQLITE_NULL) {
+                if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 2) == SQLITE_NULL &&
+                    streamRead(stream.get(), sqlite3_column_int64(s, 0), sqlite3_column_int64(s, 1), &bytes) == P4_OK) {
                     std::string text, err;
-                    const auto* d = static_cast<const uint8_t*>(sqlite3_column_blob(s, 0));
-                    if (reflectedRecordSearchText(sp->tc.bfbs().data(), sp->tc.bfbs().size(), fid, d,
-                                                  size_t(sqlite3_column_bytes(s, 0)), text, &err)) {
+                    if (reflectedRecordSearchText(sp->tc.bfbs().data(), sp->tc.bfbs().size(), fid,
+                                                  reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), text, &err)) {
                         sqlite3_stmt* ins = t->fts->sql("INSERT OR REPLACE INTO fts(rowid, t) VALUES(?1,?2)");
                         sqlite3_bind_int64(ins, 1, seq);
                         sqlite3_bind_text(ins, 2, text.data(), int(text.size()), SQLITE_TRANSIENT);
@@ -637,6 +659,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             }
             c->exec("COMMIT");
             e->rpool.release(c);
+            if (status != P4_OK) break;
         }
         if (status != P4_OK) {
             t->fts->exec("ROLLBACK");
@@ -874,6 +897,35 @@ void slowLoop(Engine* e) {
         if (now - lastTick < 100ull * 1000 * 1000) continue;
         lastTick = now;
         for (Type* t : typesWithFiles(e)) ftsCatchUp(e, t, false);
+        // Streams: a generation a compaction replaced goes once its grace is
+        // over (unlinked when the last reader holding it lets go), and a
+        // stream more than half dead is compacted on its type's writer.
+        for (Type* t : typesWithFiles(e)) {
+            std::vector<uint32_t> due;
+            std::vector<Feed*> fs;
+            {
+                std::lock_guard<std::mutex> g(t->mu);
+                for (auto& f : t->feeds) {
+                    fs.push_back(f.get());
+                    if (compactDue(f.get())) due.push_back(f->fid);
+                }
+            }
+            for (Feed* f : fs) {
+                std::shared_ptr<Stream> gone;
+                std::lock_guard<std::mutex> g(f->smu);
+                if (f->retired && now >= f->retireAt) {
+                    gone.swap(f->retired);
+                    f->retiredBytes = 0;
+                    e->bump(kStUnlinked);
+                }
+            }
+            for (uint32_t fid : due) {
+                if (e->stopping.load()) break;
+                Internal in;
+                in.what = fid;
+                runOnWriter(e, t, kOpCompact, &in);
+            }
+        }
         const uint64_t q = e->quota.load();
         if (q && ++quotaTicks >= 10) {
             quotaTicks = 0;

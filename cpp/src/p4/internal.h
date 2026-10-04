@@ -1,11 +1,19 @@
 // FlatSQL store format 4 ("p4"): engine internals.
 //
-// One SQLite file per SOURCE FEED x standard (CONTRACT C-37, C-38, owner
-// layout of 2026-10-02): P/<TYPE>/<feed>.db, where a feed is a record's
-// (provider, source) tag pair; a record with no source lives in
-// P/<TYPE>/local.db. SQLite 3.53.4 unmodified, every file through FlatSQL's
-// own VFS (flatsql_io). The interfaces are CONTRACT.md §1-§4;
-// docs/STORE-FORMAT-4.md is the as-built description.
+// One source feed x standard is one feed (CONTRACT C-37, C-38, owner layout of
+// 2026-10-02; BRIEF4, owner 2026-10-03: "use flatbuffers as the backing tech
+// and stream them directly while indices and btrees (SQLite database
+// metadata) were created"). A feed is two files:
+//   P/<TYPE>/<feed>.fsdata  the feed's records as received, a pure FlatBuffer
+//                           stream: [u32 LE size][FlatBuffer] ... and nothing
+//                           else (no header, tag, CRC, padding or trailer), so
+//                           a stock FlatBuffers reader walks it;
+//   P/<TYPE>/<feed>.db      SQLite 3.53.4 unmodified, through FlatSQL's own VFS
+//                           (flatsql_io): the index rows and per-row metadata,
+//                           never record bytes.
+// A feed is a record's (provider, source) tag pair; a record with no source
+// lives in the local feed (P/<TYPE>/local.*). The interfaces are CONTRACT.md
+// §1-§4; docs/STORE-FORMAT-4.md is the as-built description.
 //
 // A feed file is its own table: a record is identified within it by its CID
 // (the file's one CID index) and its seq; there is no cross-feed identity
@@ -14,7 +22,9 @@
 // 1's rowid as its seq in every feed holding it. Within a feed file the rows
 // of a record are its copies x its instances (every copy, the publishing
 // node, with every instance, a batch and content key of the feed); local
-// rows carry no instance. A row keeps the record bytes verbatim, its
+// rows carry no instance. A row points at its record's bytes in the feed's
+// stream (off, len: the frame at off is [u32 len][bytes]; the rows of a
+// record share a frame when their bytes are the same) and keeps its
 // signature, epoch, object key, ts, the delivery's `at`, and small per-file
 // ids for the node, the batch, the content key and the url. No provider or
 // source string is in a row: the file is the feed.
@@ -23,16 +33,21 @@
 //   STORE, MIGRATED                      markers (§2.2)
 //   T/TYPES                              registered type names (append-only records with a crc)
 //   T/<TYPE>.spec                        the registered spec TLV, plus a crc tag
-//   T/<TYPE>.idx                         type index: the feed and token registries, each feed's counters, next seq
-//   T/<TYPE>.jnl                         intent journal (synchronous=FULL)
+//   T/<TYPE>.idx                         type index: the feed and token registries
 //   T/<TYPE>.fts                         FTS5 (background)
-//   P/<TYPE>/<feed>.db                   one file per source feed of the type
+//   P/<TYPE>/<feed>.fsdata, <feed>.db    one stream and one index per source feed of the type
 //
-// Threads: writers (every feed file of a type is written by the type's one
-// writer thread; a file has one writer connection), interactive / bulk /
-// sandbox lanes, one maintenance thread and one long-work thread. Lock order,
-// outermost first: Engine::typesMu, Type::mu, Feed::dictMu, Engine::wconnMu.
-// No lock is held across a feed file's I/O except by its one writer.
+// A write appends its new frames to each feed's stream, makes them durable
+// (sync) and only then commits the index rows that point at them with the
+// stream's mark (its indexed end) in one SQLite transaction: the index never
+// claims bytes the stream cannot back. Open cuts each stream to its mark.
+//
+// Threads: writers (every feed of a type is written by the type's one writer
+// thread; a file has one writer connection), interactive / bulk / sandbox
+// lanes, one maintenance thread and one long-work thread. Lock order,
+// outermost first: Engine::typesMu, Type::mu, Feed::dictMu, Feed::smu,
+// Engine::wconnMu. No lock is held across a feed file's I/O except by its
+// one writer.
 #ifndef FLATSQL_P4_INTERNAL_H
 #define FLATSQL_P4_INTERNAL_H
 
@@ -117,10 +132,15 @@ int64_t nowSec();
 void dayText(int64_t sec, char out[11]);  // "YYYY-MM-DD"
 
 // ---- statistics (§3.10; entries only ever appended) ----------------------------------
-// kStUnlinked, kStQuotaFiles and kStTwoPhase are always 0 in this layout (a
-// feed keeps its one file; there are no merges): the frozen ABI keeps their
-// slots, as it keeps SUPERSEDE's files_deleted and QUOTA_GC's files_dropped
-// columns (always 0). kStPartitions counts feed files.
+// kStQuotaFiles and kStTwoPhase are always 0 in this layout (a feed keeps its
+// files; there are no merges): the frozen ABI keeps their slots, as it keeps
+// SUPERSEDE's files_deleted and QUOTA_GC's files_dropped columns (always 0).
+// kStPartitions counts feeds. With the streams the frozen names read:
+// kStJournalSyncs = stream syncs (the stream is the record journal: a write
+// syncs it before its index commit), kStIndexFlushes / kStIndexFlushEntries
+// = type-index registry commits and their rows, kStUnlinked = stream
+// generations a compaction retired and unlinked, kStRebuilds also counts
+// compactions and indexes rebuilt from a stream.
 enum Stat : int {
     kStPuts, kStPutRecords, kStNew, kStCopies, kStRetags, kStDups, kStIdentDups, kStRejects,
     kStCatSuperseded, kStSupersedeTags, kStSupersedeRecords, kStDeletes, kStGroupCommits,
@@ -176,11 +196,10 @@ int64_t ioSize(const std::string& path);                                   // -1
 // ---- SQLite connections --------------------------------------------------------------------
 enum StmtId : int {
     // feed file
-    S_R_SEQ, S_R_SEQD, S_R_D, S_R_INS, S_R_DEL, S_R_URL, S_R_MAXRID, S_META_SET,
+    S_R_SEQ, S_R_FRAME, S_R_INS, S_R_DEL, S_R_URL, S_R_OFF, S_R_MAXRID, S_META_SET, S_META_GEN,
     S_NODE_INS, S_BATCH_INS, S_CKEY_GET, S_CKEY_INS, S_URL_GET, S_URL_TEXT, S_URL_INS, S_CKEY_TEXT,
     S_INST_PUT, S_INST_DEL, S_R_CID, S_R_CIDSCAN, S_IDENT_GET, S_IDENT_INS, S_TOKC_PUT, S_TOKC_DEL,
-    // journal
-    S_J_INS, S_J_DEL, S_JM_SET,
+    S_MOVED_INS,
     S_COUNT
 };
 struct Conn {
@@ -197,8 +216,8 @@ struct Conn {
 const char* stmtSql(StmtId id);
 // Every connection is opened through flatsql_io with share=1. Readers add ra=1
 // and query_only and never create (a missing file is an error, never empty);
-// writers, the journal and the type index add dsync=1.
-enum class OpenKind { Writer, Reader, IndexReader, Index, Journal, Maint };
+// writers and the type index add dsync=1.
+enum class OpenKind { Writer, Reader, IndexReader, Index, Maint };
 int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t pageSize, Conn** out,
              std::string* err);
 int32_t statusOfSqlite(int rc);  // SQLite result -> P4 status (BUSY and I/O errors are errors, never misses)
@@ -261,10 +280,11 @@ using InstId = std::pair<uint32_t, uint32_t>;  // (batch id, ckey id; 0 = "")
 
 // A feed file's counters, committed in its meta with its rows. Exact: rows,
 // recs (records), bytes (over rows), nnull (records without an epoch), rbytes
-// (each record's smallest copy), copies (record x copy) and cbytes (each
-// copy's bytes). Bounds: the rest.
+// (each record's smallest copy), copies (record x copy), cbytes (each copy's
+// bytes) and fbytes (the stream's live frames, size prefixes included: the
+// stream's end less fbytes is what a compaction gives back). Bounds: the rest.
 struct Counters {
-    int64_t rows = 0, recs = 0, bytes = 0, nnull = 0, rbytes = 0, copies = 0, cbytes = 0;
+    int64_t rows = 0, recs = 0, bytes = 0, nnull = 0, rbytes = 0, copies = 0, cbytes = 0, fbytes = 0;
     int64_t minseq = INT64_MAX, maxseq = 0, minw = INT64_MAX, maxw = INT64_MIN;
     int64_t mints = INT64_MAX, maxts = 0, mine = INT64_MAX, maxe = INT64_MIN;
 };
@@ -275,11 +295,24 @@ struct TokCount {
     int64_t n = 0, bytes = 0, mints = INT64_MAX, maxts = 0, maxseq = 0;
 };
 
+// One generation of a feed's record stream: P/<TYPE>/<name>.fsdata
+// (generation 0) or <name>.<gen>.fsdata. A pure FlatBuffer stream:
+// [u32 LE size][record bytes] ..., nothing else. One flatsql_io handle,
+// offset-addressed, shared by the feed's writer and its readers. A generation
+// a compaction replaced is unlinked when its last holder lets it go.
+struct Stream {
+    std::string path;
+    uint32_t gen = 0;
+    int32_t h = -1;
+    std::atomic<bool> drop{false};
+    ~Stream();
+};
+
 struct Feed {
     Type* type = nullptr;
     uint32_t fid = 0;
     std::string provider, source;  // both "" for local
-    std::string name, path;
+    std::string name, path;        // path: the index (.db)
     bool local = false;
     // Type::mu
     Counters k;
@@ -288,11 +321,27 @@ struct Feed {
     bool created = false;      // exists on disk with its schema (readers skip it until then)
     bool quarantined = false;  // corrupt: P4_E_CORRUPT for ops that need it
     bool indexed = true;       // secondary indexes present (false between a migration's append and REBUILD 1)
-    bool registered = false;   // in the journal or the type index (a write journals it before its first use)
+    bool registered = false;   // in the type index (a write registers it before its first commit)
     int64_t dbBytes = -1, freeBytes = 0;  // pages and free pages after its writer's last commit (-1: not read)
+    int64_t streamBytes = 0;   // the stream's committed end (its mark)
+    uint32_t regGen = 0;       // the stream generation the type index records (a missing index's rebuild reads it)
     // dictMu
     std::mutex dictMu;
     Dict dict;
+    // the record stream (smu): the current generation, and the generation a
+    // compaction replaced, kept for readers on an older snapshot until retireAt
+    std::mutex smu;
+    std::shared_ptr<Stream> stream;
+    std::shared_ptr<Stream> retired;
+    int64_t retiredBytes = 0;  // its size (DiskUsage counts it until it goes)
+    uint64_t retireAt = 0;
+    // The writer's (and the open's): the append offset, which is the committed
+    // mark between writes, and the current generation.
+    int64_t end = 0;
+    uint32_t gen = 0;
+    // Moves (a local record taken into this feed): the file's `moved` table
+    // may hold rows, and they are all finished (their local rows are gone).
+    bool movedRows = false, movedDone = true;
     // writer connection (Engine::wconnMu)
     struct Conn* w = nullptr;
     int wPins = 0;
@@ -304,7 +353,7 @@ struct Feed {
 // registration order: the lowest id is the first copy (C-12).
 struct TokDef {
     std::string token, peer;
-    bool registered = false;  // in the journal or the type index
+    bool registered = false;  // in the type index
 };
 
 // A registered spec and what the engine derives from it. Immutable once
@@ -341,9 +390,9 @@ struct TypeTotals {
 struct Type {
     Engine* e = nullptr;
     std::string name;
-    std::string pIdx, pJnl, pFts, pSpec, pDir;
-    // The type index and journal exist (the type has had a write, or they
-    // were on disk at open). Set once, under openMu; readers check it first.
+    std::string pIdx, pFts, pSpec, pDir;
+    // The type index exists (the type has had a write, or it was on disk at
+    // open). Set once, under openMu; readers check it first.
     std::atomic<bool> hasFiles{false};
     std::mutex openMu;
     std::shared_ptr<const Spec> spec_;  // mu
@@ -358,19 +407,16 @@ struct Type {
     std::unordered_map<std::string, uint32_t> feedByKey;  // provider \x1f source -> fid
     std::vector<TokDef> toks;                              // index id-1
     std::unordered_map<std::string, uint32_t> tokByToken;
+    // The next seq: above every seq any feed file's meta holds (seqs never go
+    // back: a file keeps its max seq after deletes), read at open.
     int64_t nextSeq = 1;
-    int64_t seqReserved = 0;
     std::atomic<int64_t> vis{0};  // visible-through (B2)
     std::vector<std::pair<int64_t, int64_t>> inflight;  // (lo, hi) of new seqs in flight
     bool overQuota = false;
-    bool broken = false;  // the type index could not be brought in line with the files: writes refuse
-    std::string brokenWhy;
 
-    // The type's writer thread owns these (and init / replay before threads run).
+    // The type's writer thread owns these (and init before threads run).
     uint32_t owner = 0;
     struct Conn* idx = nullptr;  // type index (writer)
-    struct Conn* jdb = nullptr;  // journal
-    int64_t jcut = 0;            // journal rows <= jcut are applied to the index
 
     std::atomic<int64_t> idxBytes{0}, ftsBytes{0};  // T/ files, set by the maintenance thread
     std::mutex ftsMu;
@@ -447,13 +493,15 @@ struct alignas(64) Bell {
 
 // Work for a type's writer thread: a slot's write op, or internal work
 // (quota, REBUILD) whose waiter (the long-work thread) watches `done`.
+// Internal ops (never a slot's): a feed's stream compaction.
+constexpr int kOpCompact = 1000;
 struct Internal {
     std::atomic<bool> done{false};
     int32_t status = P4_OK;
     std::string err;
-    int64_t a = 0, b = 0;  // QUOTA: records, bytes; REBUILD: entries, mismatches
+    int64_t a = 0, b = 0;  // QUOTA: records, bytes; REBUILD: entries, mismatches; COMPACT: bytes before, after
     std::vector<std::pair<uint32_t, int64_t>> seqs;  // QUOTA: the (feed, seq) row sets to delete
-    uint32_t what = 0;          // REBUILD
+    uint32_t what = 0;          // REBUILD; COMPACT: the feed id
     std::string firstBad;       // REBUILD 8: the first damaged file
 };
 struct WriteTask {
@@ -627,52 +675,61 @@ int32_t engineRegisterType(P4Engine* e, const uint8_t* spec, size_t n, std::stri
 int32_t engineActivate(P4Engine* e);
 int32_t engineStop(P4Engine* e, double deadlineMs);
 int32_t engineStats(P4Engine* e, uint8_t* out, int32_t cap);
-// The type index and journal, made on the type's first write (lazy T/ files).
+// The type index, made on the type's first write (lazy T/ files).
 int32_t typeFilesEnsure(Type* t, std::string* err);
 // The feed of (provider, source); ("", "") is local. mu held. create: register
-// it (its file is made by its first write); *made is set when it is new.
+// it (its files are made by its first write); *made is set when it is new.
 Feed* feedFor(Type* t, const std::string& provider, const std::string& source, bool create, bool* made = nullptr);
 Feed* feedRestore(Type* t, uint32_t fid, const std::string& provider, const std::string& source, const std::string& name);  // mu held
 uint32_t tokFor(Type* t, const std::string& token, const std::string& peer, bool create, bool* made = nullptr);  // mu held
 std::string pathJoin(const std::string& a, const std::string& b);
 
-// ---- journal.cpp ------------------------------------------------------------------------------
-// J_FEED and J_TOK register ids; J_TOUCH names a feed file a write changes;
-// J_MOVE a record whose rows leave a file (local) for another file in the
-// same write. A write journals them (synchronous=FULL) with the seq
-// reservation before its first file commit; open replays the tail: the ids
-// are registered, a move cut between its two files is finished (the source
-// file's rows of the seq go once another file holds it), and every touched
-// feed file's counters (committed with its rows) are mirrored into the type
-// index.
-enum JOp : int { J_FEED = 1, J_TOK = 2, J_TOUCH = 3, J_MOVE = 4 };
-int32_t journalOpen(Type* t, std::string* err);
-int32_t journalReplay(Type* t, std::string* err);  // at open, before any read (M8); also after a failed index commit
+// ---- stream.cpp: a feed's record stream ----------------------------------------------------------------
+// P/<TYPE>/<name>.fsdata for generation 0, <name>.<gen>.fsdata after.
+std::string streamPath(const Feed* f, uint32_t gen);
+// The feed's current stream, opened (made when absent) on first use. The
+// writer's and the open's (readers use streamAt).
+std::shared_ptr<Stream> streamCur(Feed* f, int32_t* rc);
+// The stream of generation gen for a reader whose snapshot names gen: the
+// current one, or the one a compaction just replaced while it is kept. nullptr
+// with *rc == P4_OK: that generation is gone (the snapshot is older than the
+// grace: the caller starts a new read transaction).
+std::shared_ptr<Stream> streamAt(Feed* f, uint32_t gen, int32_t* rc);
+// The record bytes of the frame at off: its size prefix must be len.
+int32_t streamRead(Stream* s, int64_t off, int64_t len, std::string* out);
+// Appends bytes at off (the caller's end); syncs when sync is set.
+int32_t streamWrite(Stream* s, int64_t off, const uint8_t* p, size_t n);
+int32_t streamSync(Stream* s);
+int32_t streamTruncate(Stream* s, int64_t size, bool sync);
+int64_t streamSize(Stream* s);
+// The stream generation a read transaction sees (the file's meta 'gen').
+int32_t snapGen(Conn* c, uint32_t* gen);
+// Closes the feed's streams (engine stop).
+void streamClose(Feed* f);
 
 // ---- type_index.cpp -----------------------------------------------------------------------------
-int32_t typeIndexOpen(Type* t, std::string* err);  // load the registries and the feeds' counters
-// A feed's mirror in the type index (its counters, live instances and tokens).
-struct FeedSnap {
-    uint32_t fid = 0;
-    std::string provider, source, name;
-    Counters k;
-    bool indexed = true;
-    std::map<InstId, InstCount> inst;
-    std::map<uint32_t, TokCount> tokc;
-};
-FeedSnap feedSnapOf(Feed* f);  // Type::mu held
-int indexPutFeed(Conn* idx, const FeedSnap& f);           // SQLite rc
-int indexPutTok(Conn* idx, uint32_t id, const TokDef& d);  // the registry row
-int indexPutNextSeq(Conn* idx, int64_t nextSeq);
+// The registries: feed(fid, provider, source, name, gen) and tok(id, token,
+// peer). Nothing else: a feed file's counters are in the file (read at open).
+int32_t typeIndexOpen(Type* t, std::string* err);
+int indexPutFeed(Conn* idx, const Feed& f, uint32_t gen);  // SQLite rc (Type::mu not needed: the strings are fixed)
+int indexPutTok(Conn* idx, uint32_t id, const TokDef& d);   // SQLite rc
 
 // ---- partition.cpp (feed files) -------------------------------------------------------------------
 // The writer connection of a feed file (made with its schema on first use), pinned for the caller.
 Conn* writerPin(P4Engine* e, Feed* f, int32_t* rc, std::string* err);
 void writerUnpin(P4Engine* e, Feed* f);
+void writerDrop(P4Engine* e, Feed* f);  // closes the feed's unpinned writer connection (before its file goes)
 int32_t fileCreateIndexes(Type* t, Conn* c, bool local);
 int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes);
-int writeMeta(Conn* c, const Counters& k, int64_t now);  // in the caller's write transaction; SQLite rc
-int readMeta(Conn* c, Counters* k, bool* indexed);       // SQLite rc
+// A feed file's meta: its counters, the stream's committed mark and generation.
+struct FileMeta {
+    Counters k;
+    bool indexed = true;
+    int64_t mark = 0;
+    uint32_t gen = 0;
+};
+int writeMeta(Conn* c, const Counters& k, int64_t now, int64_t mark, uint32_t gen);  // in the caller's write transaction; SQLite rc
+int readMeta(Conn* c, FileMeta* m);                                                    // SQLite rc
 int readInst(Feed* f, Conn* c, std::map<InstId, InstCount>* out);  // SQLite rc; strings from the file's dictionary
 int readTokc(Type* t, Conn* c, std::map<uint32_t, TokCount>* out);  // SQLite rc; tokens registered as needed
 int writeTokc(Type* t, Conn* c, const std::map<uint32_t, TokCount>& before, const std::map<uint32_t, TokCount>& after);
@@ -687,6 +744,11 @@ std::string dictUrl(Conn* c, uint32_t id);   // "" for 0
 int32_t seqOfCid(Conn* c, bool indexed, const uint8_t key[32], int64_t* seq);
 // Whether a feed file holds rows of seq (its rid range).
 int32_t fileHoldsSeq(Conn* c, int64_t seq, bool* held);
+// A feed at open (before any read, M8): its counters, instances and tokens
+// from its file, its stream cut to the committed mark, a missing or damaged
+// index rebuilt from the stream, a crashed compaction's leftovers unlinked.
+// *moved: the seqs its `moved` table names (moves into it from local).
+int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err);
 void putGroup(P4Engine* e, uint32_t writer, Type* t, std::vector<WriteTask*>& tasks);
 // The supersede identity of a stored record (unsealed bytes only).
 std::string identityOf(const ps::TypeConfig& tc, const uint8_t* d, size_t n);
@@ -701,6 +763,7 @@ struct RowR {
     std::string url;
     int64_t at = 0;
     int64_t ts = 0, len = 0;   // ts: this copy's (a record's copies share the record's, except a COPY that keeps its own, C-39 E6)
+    int64_t off = -1;          // its frame in the file's stream (-1: a new row whose frame the commit appends)
     std::string sig, fcols;
     bool sealed = false;
     bool hasD = false;
@@ -754,7 +817,7 @@ public:
     RecState* byKey(uint32_t fid, const uint8_t key[32], int32_t* rc);
     RecState* bySeq(uint32_t fid, int64_t seq, int32_t* rc, const uint8_t* keyIfNew = nullptr);
     RecState* known(uint32_t fid, int64_t seq);  // already loaded by this write
-    int32_t loadD(uint32_t fid, RowR& r);         // the stored bytes of an existing row
+    int32_t loadD(uint32_t fid, RowR& r);         // the stored bytes of an existing row (its frame)
     // A delivery to the record's file: copy `copy.tok` (its data in `copy`,
     // used when the copy is new) with the given instances of the file's feed.
     // Every copy of the record then appears with every instance (local rows
@@ -769,20 +832,20 @@ public:
     void deliver(RecState* r, const RowR& copy, const std::vector<Inst>& insts, Out* out);
     void dropAll(RecState* r);
     const std::vector<RecState*>& records() const { return order_; }
-    // Journal, the feed files (feeds before local), then the type index.
+    // The registries (new feeds and tokens), then the feed files (feeds
+    // before local): each appends its new frames to its stream, syncs it,
+    // and commits its rows with the stream's mark.
     int32_t commit();
     bool migrate = false;  // migrate mode: instance times are the caller's (C-36), new files without indexes
-    bool replaying = false;  // journal replay's own repair: no journal rows, no replay on a failed index commit
     int64_t now = 0;
     std::vector<IdentNew> idents;
     std::set<uint32_t> committedFids, failedFids;
-    int64_t jlast = 0;  // the journal id this write ended at
 private:
     RecState* make(uint32_t fid, int64_t seq, const uint8_t* key);
     int32_t loadRows(RecState* r);
-    int32_t journalWrite();
-    int32_t commitFile(Feed* f, const std::vector<RecState*>& recs);
-    int32_t indexCommit();
+    int32_t registryWrite();
+    int32_t frames(Feed* f, const std::vector<RecState*>& recs, std::string* out, int64_t end);
+    int32_t commitFile(Feed* f, const std::vector<RecState*>& recs, const std::vector<int64_t>& movesIn);
     void fill(RecState* r);
     std::deque<RecState> store_;
     std::vector<RecState*> order_;
@@ -795,6 +858,15 @@ void supersedeOp(P4Engine* e, Type* t, WriteTask* task);
 void deleteOp(P4Engine* e, Type* t, WriteTask* task);
 void quotaWork(P4Engine* e, Type* t, Internal* in);    // in->seqs: delete these records
 void rebuildWork(P4Engine* e, Type* t, Internal* in);  // in->what: 1, 2, 8
+// A feed's stream rewritten with its live frames only, as the next generation
+// (a pure stream again), its rows repointed in one transaction; the old
+// generation is unlinked once no reader holds it. in->what: the feed id.
+void compactWork(P4Engine* e, Type* t, Internal* in);
+// Whether a feed's stream is worth compacting (its dead share). Type::mu held.
+bool compactDue(const Feed* f);
+// A missing or damaged index made again from the feed's stream (at open,
+// after every other feed of the type is open: fresh seqs). *indexed: records.
+int32_t rebuildFeed(P4Engine* e, Type* t, Feed* f, int64_t* indexed, std::string* err);
 
 // ---- reader.cpp -----------------------------------------------------------------------------------
 int32_t runRead(P4Lane* L, uint32_t op);  // ops 10-17 on a lane

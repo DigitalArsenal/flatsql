@@ -1,19 +1,23 @@
-// Store format 4: feed files and the PUT path (CONTRACT C-37, C-38, §3.7).
+// Store format 4: feed files and the PUT path (CONTRACT C-37, C-38, §3.7;
+// BRIEF4: the records in a pure FlatBuffer stream, SQLite holding the index).
 //
-// A feed file (one source feed x standard) is the feed's table:
-//   r(rid PK, seq, n, b, c, u, at, cid, e, k, ts, f, x, d, w = coalesce(e, ts))
+// A feed is its record stream P/<TYPE>/<feed>.fsdata (stream.cpp) and its
+// index file P/<TYPE>/<feed>.db, the feed's table:
+//   r(rid PK, seq, n, b, c, u, at, cid, e, k, ts, f, x, off, len, w = coalesce(e, ts))
 //     rid = seq << 16 | j: a record's rows are one rowid range (arrival order);
 //     n the publishing node (node: producer token, peer), b the batch (batch:
 //     batch, producer peer, producer key; 0 on local rows), c the content key
 //     and u the url (small ids, 0 = ""), at when this feed delivered it;
-//     d the record bytes verbatim (sealed bytes when sealed), x the
-//     signature, f a sealed record's extracted COL values.
+//     off, len the record's frame in the stream ([u32 len][bytes] at off: the
+//     bytes verbatim, sealed bytes when sealed), x the signature, f a sealed
+//     record's extracted COL values. No record bytes are in SQLite.
 //   indexes: r_s(seq) arrival, r_c(cid) the file's one CID index, r_ke(k, e)
 //     object + epoch, r_w(w DESC) epoch, r_b(b) batch; r_a(at DESC) delivery
 //     time (a feed file) or r_t(ts DESC) the copies' time (local)
 //   inst(b, c, ...) each instance's counters; tokc(producer, ...) each
-//   token's copies; ident(h, seq) ingest identities (IQC); meta: the file's
-//   counters
+//   token's copies; ident(h, seq) ingest identities (IQC); moved(seq) the
+//   local records this feed took in (a move's intent, finished at open);
+//   meta: the file's counters, the stream's committed mark and generation
 // The file is the feed: its provider and source are in its meta, never in a row.
 //
 // A PUT group (one or more queued PUT calls of a type, at most group-commit
@@ -22,9 +26,9 @@
 // there by its CID (ingest: a record new to a feed gets its own seq, C-38
 // (3)) or by format 1's rowid (migrate: the same seq in every feed holding
 // it); seqs assigned for new records in input order (format 1's rowids,
-// C-39 E1); then the journal, the feed files and the type index commit
-// (record.cpp), and every call is acked after its records are durable and
-// visible (C-4).
+// C-39 E1); then each feed appends its new frames to its stream, syncs it and
+// commits its rows (record.cpp), and every call is acked after its records
+// are durable and visible (C-4).
 #include <algorithm>
 
 #include "internal.h"
@@ -45,9 +49,10 @@ const char* kFileSchema =
     "CREATE TABLE IF NOT EXISTS tokc(producer TEXT PRIMARY KEY, n INTEGER NOT NULL, bytes INTEGER NOT NULL, mints, maxts,"
     " maxseq) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS ident(h BLOB PRIMARY KEY, seq INTEGER NOT NULL) WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS moved(seq INTEGER PRIMARY KEY);"
     "CREATE TABLE IF NOT EXISTS r(rid INTEGER PRIMARY KEY, seq INTEGER NOT NULL, n INTEGER NOT NULL, b INTEGER NOT NULL,"
     " c INTEGER NOT NULL, u INTEGER NOT NULL, at INTEGER NOT NULL, cid BLOB NOT NULL, e INTEGER, k, ts INTEGER NOT NULL,"
-    " f BLOB, x BLOB, d BLOB NOT NULL, w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL);";
+    " f BLOB, x BLOB, off INTEGER NOT NULL, len INTEGER NOT NULL, w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL);";
 }  // namespace
 
 // The file's indexes (C-37 (4), C-38 (1)): arrival seq (r_s: the seqs alone,
@@ -117,8 +122,11 @@ int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes) {
         sqlite3_reset(s);
         return r == SQLITE_DONE;
     };
-    bool ok = meta("format", "4") && meta("layout", "feed") && meta("type", t->name) && meta("provider", f->provider) &&
-              meta("source", f->source) && meta("fid", std::to_string(f->fid));
+    bool ok = meta("format", "4") && meta("layout", "feed+stream") && meta("type", t->name) &&
+              meta("provider", f->provider) && meta("source", f->source) && meta("fid", std::to_string(f->fid));
+    // The stream's committed mark and generation (integers, as writeMeta writes them).
+    if (ok) ok = c->exec(("INSERT OR REPLACE INTO meta(k, v) VALUES('mark', 0), ('gen', " + std::to_string(f->gen) + ")").c_str()) ==
+                 SQLITE_OK;
     if (ok) ok = c->exec(indexes ? indexDdl(t, f->local).c_str() : "INSERT OR IGNORE INTO meta(k, v) VALUES('ix', 0)") == SQLITE_OK;
     if (!ok) {
         c->exec("ROLLBACK");
@@ -132,7 +140,7 @@ int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes) {
     return P4_OK;
 }
 
-int writeMeta(Conn* c, const Counters& k, int64_t now) {
+int writeMeta(Conn* c, const Counters& k, int64_t now, int64_t mark, uint32_t gen) {
     const bool any = k.rows > 0;
     const struct {
         const char* k;
@@ -145,6 +153,7 @@ int writeMeta(Conn* c, const Counters& k, int64_t now) {
               {"rbytes", true, k.rbytes},
               {"copies", true, k.copies},
               {"cbytes", true, k.cbytes},
+              {"fbytes", true, k.fbytes},
               {"minseq", any && k.minseq != INT64_MAX, k.minseq},
               {"maxseq", true, k.maxseq},
               {"minw", any && k.minw != INT64_MAX, k.minw},
@@ -153,6 +162,8 @@ int writeMeta(Conn* c, const Counters& k, int64_t now) {
               {"maxts", true, k.maxts},
               {"mine", k.mine != INT64_MAX, k.mine},
               {"maxe", k.maxe != INT64_MIN, k.maxe},
+              {"mark", true, mark},
+              {"gen", true, int64_t(gen)},
               {"updated", true, now}};
     for (auto& x : kv) {
         sqlite3_stmt* s = c->get(S_META_SET);
@@ -167,9 +178,9 @@ int writeMeta(Conn* c, const Counters& k, int64_t now) {
     return SQLITE_OK;
 }
 
-int readMeta(Conn* c, Counters* k, bool* indexed) {
-    *k = Counters();
-    *indexed = true;
+int readMeta(Conn* c, FileMeta* m) {
+    *m = FileMeta();
+    Counters* k = &m->k;
     sqlite3_stmt* s = c->sql("SELECT k, v FROM meta");
     if (!s) return SQLITE_ERROR;
     int r;
@@ -186,6 +197,7 @@ int readMeta(Conn* c, Counters* k, bool* indexed) {
         else if (n == "rbytes") k->rbytes = v;
         else if (n == "copies") k->copies = v;
         else if (n == "cbytes") k->cbytes = v;
+        else if (n == "fbytes") k->fbytes = v;
         else if (n == "minseq") k->minseq = v;
         else if (n == "maxseq") k->maxseq = v;
         else if (n == "minw") k->minw = v;
@@ -194,7 +206,9 @@ int readMeta(Conn* c, Counters* k, bool* indexed) {
         else if (n == "maxts") k->maxts = v;
         else if (n == "mine") k->mine = v;
         else if (n == "maxe") k->maxe = v;
-        else if (n == "ix") *indexed = v != 0;
+        else if (n == "ix") m->indexed = v != 0;
+        else if (n == "mark") m->mark = v;
+        else if (n == "gen") m->gen = uint32_t(v);
     }
     sqlite3_reset(s);
     return r == SQLITE_DONE ? SQLITE_OK : r;
@@ -483,7 +497,12 @@ Conn* writerPin(Engine* e, Feed* f, int32_t* rc, std::string* err) {
         f->lru = e->wlru.begin();
         f->inLru = true;
     }
-    // Closing a connection may checkpoint: the maintenance thread does it.
+    // Closing a connection may checkpoint: the maintenance thread does it
+    // (before the threads start, the open closes them itself).
+    if (!victims.empty() && !e->started) {
+        for (Conn* v : victims) delete v;
+        victims.clear();
+    }
     if (!victims.empty()) {
         {
             std::lock_guard<std::mutex> g(e->maintMu);
@@ -502,6 +521,117 @@ Conn* writerPin(Engine* e, Feed* f, int32_t* rc, std::string* err) {
 void writerUnpin(Engine* e, Feed* f) {
     std::lock_guard<std::mutex> g(e->wconnMu);
     if (f->wPins > 0) f->wPins--;
+}
+
+void writerDrop(Engine* e, Feed* f) {
+    Conn* c = nullptr;
+    {
+        std::lock_guard<std::mutex> g(e->wconnMu);
+        if (!f->w || f->wPins > 0) return;
+        c = f->w;
+        f->w = nullptr;
+        if (f->inLru) e->wlru.erase(f->lru);
+        f->inLru = false;
+        e->nWConn--;
+    }
+    delete c;
+}
+
+// ---- open ------------------------------------------------------------------------------------------
+namespace {
+bool damaged(int rc) { return (rc & 0xff) == SQLITE_CORRUPT || (rc & 0xff) == SQLITE_NOTADB; }
+}  // namespace
+
+int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err) {
+    Engine* e = t->e;
+    moved->clear();
+    if (!ioExists(f->path)) {
+        // No index: a feed never written, or an index that is gone. A stream
+        // without its index (the registered generation, or the next one a
+        // compaction committed after the registry last named it) is indexed
+        // again from its frames (rebuildFeed, after every feed is open).
+        std::lock_guard<std::mutex> g(t->mu);
+        f->created = false;
+        for (uint32_t gen : {f->regGen + 1, f->regGen})
+            if (ioExists(streamPath(f, gen))) {
+                f->gen = gen;
+                return P4_E_CORRUPT;  // the caller rebuilds
+            }
+        return P4_OK;
+    }
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        f->created = true;  // the writer open completes a schema a crash cut before its commit
+    }
+    int32_t st = P4_OK;
+    std::string er;
+    Conn* c = writerPin(e, f, &st, &er);
+    if (!c) {
+        if (st == P4_E_CORRUPT) return P4_E_CORRUPT;  // a damaged index: rebuilt from the stream
+        if (err) *err = "open " + f->path + ": " + er;
+        return st;
+    }
+    FileMeta m;
+    std::map<InstId, InstCount> inst;
+    std::map<uint32_t, TokCount> tokc;
+    int r = readMeta(c, &m);
+    if (r == SQLITE_OK) r = readInst(f, c, &inst);
+    if (r == SQLITE_OK) r = readTokc(t, c, &tokc);
+    if (r == SQLITE_OK) {
+        sqlite3_stmt* q = c->sql("SELECT seq FROM moved");
+        if (!q) r = SQLITE_ERROR;
+        while (q && (r = sqlite3_step(q)) == SQLITE_ROW) moved->push_back(sqlite3_column_int64(q, 0));
+        if (q) sqlite3_reset(q);
+        if (r == SQLITE_DONE) r = SQLITE_OK;
+    }
+    writerUnpin(e, f);
+    if (r != SQLITE_OK) {
+        if (damaged(r)) return P4_E_CORRUPT;
+        if (err) *err = "read " + f->path + ": " + std::to_string(r);
+        return statusOfSqlite(r);
+    }
+    // The stream: cut back to the committed mark (bytes past it were never
+    // acknowledged). A stream shorter than its mark lost acknowledged frames:
+    // the feed is quarantined (P4_E_CORRUPT, named), never silently cut.
+    f->gen = m.gen;
+    bool quarantine = false;
+    if (m.mark > 0 || ioExists(streamPath(f, m.gen))) {
+        std::shared_ptr<Stream> sp = streamCur(f, &st);
+        if (!sp) {
+            if (err) *err = "open " + streamPath(f, m.gen);
+            return st;
+        }
+        const int64_t size = streamSize(sp.get());
+        if (size < 0) {
+            if (err) *err = "size " + sp->path;
+            return P4_E_IO;
+        }
+        if (size > m.mark) {
+            st = streamTruncate(sp.get(), m.mark, true);
+            if (st != P4_OK) {
+                if (err) *err = "cut " + sp->path;
+                return st;
+            }
+        } else if (size < m.mark) {
+            quarantine = true;
+        }
+    }
+    // A compaction cut by a crash: the next generation it was writing, or the
+    // one it replaced and had not unlinked yet.
+    ioUnlink(streamPath(f, m.gen + 1));
+    if (m.gen > 0) ioUnlink(streamPath(f, m.gen - 1));
+    std::lock_guard<std::mutex> g(t->mu);
+    f->k = m.k;
+    f->indexed = m.indexed;
+    f->inst = std::move(inst);
+    f->tokc = std::move(tokc);
+    f->end = m.mark;
+    f->streamBytes = m.mark;
+    f->movedRows = !moved->empty();
+    f->movedDone = moved->empty();
+    if (quarantine) f->quarantined = true;
+    if (m.k.maxseq >= t->nextSeq) t->nextSeq = m.k.maxseq + 1;
+    return P4_OK;
 }
 
 // The supersede identity of a stored record (unsealed bytes only).
@@ -857,27 +987,39 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
         while ((rc = sqlite3_step(q)) == SQLITE_ROW) cand.push_back({sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 1)});
         sqlite3_reset(q);
     }
+    int32_t frc = P4_OK;
     if (rc == SQLITE_DONE) {
-        sqlite3_stmt* dq = c->get(S_R_D);
+        // Each candidate's bytes: its frame in the feed's stream.
+        std::shared_ptr<Stream> stream = cand.empty() ? nullptr : streamCur(f, &frc);
+        sqlite3_stmt* dq = c->get(S_R_FRAME);
         int64_t last = 0;
+        std::string bytes;
         for (auto& x : cand) {
+            if (frc != P4_OK) break;
             if (x.second == last) continue;  // one row per record decides
             sqlite3_bind_int64(dq, 1, x.first);
             const int r2 = sqlite3_step(dq);
-            std::string id;
-            if (r2 == SQLITE_ROW)
-                id = identityOf(sp_->tc, static_cast<const uint8_t*>(sqlite3_column_blob(dq, 0)), size_t(sqlite3_column_bytes(dq, 0)));
+            int64_t off = -1, len = 0;
+            if (r2 == SQLITE_ROW) {
+                off = sqlite3_column_int64(dq, 0);
+                len = sqlite3_column_int64(dq, 1);
+            }
             sqlite3_reset(dq);
             if (r2 != SQLITE_ROW && r2 != SQLITE_DONE) {
                 rc = r2;
                 break;
             }
             last = x.second;
-            if (id == r.supIdentity) seqs.push_back(x.second);
+            if (off < 0) continue;
+            frc = streamRead(stream.get(), off, len, &bytes);
+            if (frc != P4_OK) break;
+            if (identityOf(sp_->tc, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()) == r.supIdentity)
+                seqs.push_back(x.second);
         }
     }
     writerUnpin(e_, f);
     if (rc != SQLITE_DONE) return statusOfSqlite(rc);
+    if (frc != P4_OK) return frc;
     for (int64_t s : seqs) {
         int32_t lrc = P4_OK;
         RecState* other = w.bySeq(scope, s, &lrc);
@@ -1217,6 +1359,7 @@ int32_t Group::absorbLocal(WriteCtx& w, RecState* local, RecState* into) {
         RowR m = x;
         m.loaded = false;
         m.rid = 0;
+        m.off = -1;  // its frame is in local's stream: the feed's commit frames the bytes again
         m.inst = false;
         m.urlSet = false;
         m.stamp = false;
@@ -1325,6 +1468,7 @@ int32_t Group::migrate(WriteCtx& w, Call& c, Rec& r) {
             RowR m = x;
             m.loaded = false;
             m.rid = 0;
+            m.off = -1;  // its frame is in local's stream
             m.inst = false;
             m.urlSet = false;
             m.nId = m.bId = m.cId = m.uId = 0;
@@ -1398,10 +1542,7 @@ void Group::run(std::vector<WriteTask*>& tasks) {
     }
     {
         std::lock_guard<std::mutex> g(t_->mu);
-        if (t_->broken) {
-            const std::string why = t_->brokenWhy;
-            fail(P4_E_IO, "the type index is behind its feed files: " + why);
-        } else {
+        {
             // The feeds of every call's tags, local when a call may need it
             // (an untagged ingest, any migration), and each call's token (copy).
             for (Call& c : calls_) {

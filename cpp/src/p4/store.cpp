@@ -1,5 +1,6 @@
 // Store format 4: the store (markers, the type catalog, registration,
 // activation, stop, stats) and the feed / token registry.
+#include <algorithm>
 #include <cstdio>
 
 #include "flatsql/flatsql_io.h"
@@ -200,29 +201,86 @@ bool markersActivated(const Markers& m) {
            m.migratedFormat == 4;
 }
 
-// The type index and journal: opened (made when absent), the journal's tail
-// replayed (the touched feed files' counters mirrored into the index) before
-// any read (M8), the seq floor applied.
+// The type index opened (made when absent), then every feed it names, before
+// any read (M8): each feed file's counters, instances and tokens read from
+// the file, its stream cut back to its committed mark; a missing or damaged
+// index rebuilt from its stream (after the other feeds: its records get fresh
+// seqs above theirs); a move a crash cut between a feed and local finished
+// (the local rows of a seq the feed took in go once the feed holds it).
 int32_t typeFilesOpen(Type* t, std::string* err) {
     int32_t rc = typeIndexOpen(t, err);
     if (rc != P4_OK) return rc;
-    rc = journalOpen(t, err);
-    if (rc != P4_OK) return rc;
+    std::vector<Feed*> feeds;
     {
-        // Every feed the index names, against the disk: a missing file
-        // without records is made again by its next write; a missing file
-        // with records is quarantined (P4_E_CORRUPT, named), never silently
-        // remade.
         std::lock_guard<std::mutex> g(t->mu);
-        for (auto& f : t->feeds) {
-            f->created = ioExists(f->path);
-            if (!f->created && f->k.recs > 0) f->quarantined = true;
+        for (auto& f : t->feeds)
+            if (f->provider.rfind("\x1f#", 0) != 0) feeds.push_back(f.get());
+    }
+    std::vector<Feed*> rebuild;
+    std::vector<std::pair<Feed*, int64_t>> moved;
+    for (Feed* f : feeds) {
+        std::vector<int64_t> mv;
+        rc = feedOpen(t, f, &mv, err);
+        if (rc == P4_E_CORRUPT) {
+            rebuild.push_back(f);
+            continue;
+        }
+        if (rc != P4_OK) return rc;
+        for (int64_t seq : mv) moved.push_back({f, seq});
+    }
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        if (t->nextSeq < int64_t(t->e->cfg.gseqFloor)) t->nextSeq = int64_t(t->e->cfg.gseqFloor);
+    }
+    for (Feed* f : rebuild) {
+        int64_t n = 0;
+        rc = rebuildFeed(t->e, t, f, &n, err);
+        if (rc != P4_OK) return rc;
+    }
+    if (!moved.empty()) {
+        Feed* local;
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            local = feedFor(t, "", "", false);
+            if (local && !local->created) local = nullptr;
+        }
+        std::vector<int64_t> finished;
+        if (local) {
+            WriteCtx w(t->e, t);
+            for (auto& m : moved) {
+                bool held = false;
+                int32_t st = P4_OK;
+                std::string er;
+                Conn* c = writerPin(t->e, m.first, &st, &er);
+                if (!c) {
+                    if (err) *err = "open " + m.first->path + ": " + er;
+                    return st;
+                }
+                st = fileHoldsSeq(c, m.second, &held);
+                writerUnpin(t->e, m.first);
+                if (st != P4_OK) return st;
+                if (!held) continue;
+                RecState* r = w.bySeq(local->fid, m.second, &st);
+                if (!r) {
+                    if (err) *err = "move of seq " + std::to_string(m.second) + ": " + w.err;
+                    return st;
+                }
+                if (!r->existed) continue;
+                w.dropAll(r);
+                finished.push_back(m.second);
+            }
+            rc = w.commit();
+            if (rc != P4_OK) {
+                if (err) *err = "finishing moves: " + w.err;
+                return rc;
+            }
+            // The moved records keep their full-text rows (the feed holds the seq).
+            std::lock_guard<std::mutex> g(t->ftsGoneMu);
+            for (int64_t seq : finished) t->ftsGone.erase(std::remove(t->ftsGone.begin(), t->ftsGone.end(), seq), t->ftsGone.end());
         }
     }
-    rc = journalReplay(t, err);
-    if (rc != P4_OK) return rc;
     std::lock_guard<std::mutex> g(t->mu);
-    if (t->nextSeq < int64_t(t->e->cfg.gseqFloor)) t->nextSeq = int64_t(t->e->cfg.gseqFloor);
+    for (Feed* f : feeds) f->movedDone = true;
     t->visRecompute();
     return P4_OK;
 }
@@ -235,7 +293,6 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
     t->spec_ = sp;
     t->pDir = pathJoin(pathJoin(e->cfg.root, "P"), t->name);
     t->pIdx = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".idx");
-    t->pJnl = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".jnl");
     t->pFts = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".fts");
     t->pSpec = pathJoin(pathJoin(e->cfg.root, "T"), t->name + ".spec");
     // Every feed file of a type is written by one writer thread (one writer
@@ -246,7 +303,7 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
         t->nextSeq = int64_t(e->cfg.gseqFloor);
         t->visRecompute();
     }
-    if (!ioExists(t->pIdx) && !ioExists(t->pJnl)) return P4_OK;
+    if (!ioExists(t->pIdx)) return P4_OK;
     const int32_t rc = typeFilesOpen(t, err);
     if (rc != P4_OK) return rc;
     t->hasFiles.store(true, std::memory_order_release);
@@ -298,8 +355,6 @@ int32_t typeFilesEnsure(Type* t, std::string* err) {
     if (rc != P4_OK) {
         delete t->idx;
         t->idx = nullptr;
-        delete t->jdb;
-        t->jdb = nullptr;
         return rc;
     }
     t->hasFiles.store(true, std::memory_order_release);
@@ -424,7 +479,7 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     e->cfg.gseqFloor = floor;
     rc = mailboxInit(e, err);
     if (rc != P4_OK) return rc;
-    // Types: the catalog, then each type's spec; the type index and journal
+    // Types: the catalog, then each type's spec; the type index and the feeds
     // tail of the types that have them.
     for (const std::string& name : names) {
         std::vector<uint8_t> fb, tlv;
@@ -502,13 +557,8 @@ int32_t engineActivate(Engine* e) {
             if (t->hasFiles.load()) types.push_back(t.get());
     }
     for (Type* t : types) {
-        // The type index is written with every write (nothing pending); the
-        // migration's journal, applied, goes at rest with its free pages (no
-        // writer runs on a store being activated).
-        if (t->jdb) {
-            t->jdb->exec("DELETE FROM j");
-            t->jdb->exec("VACUUM");
-        }
+        // Every stream is synced at each commit; the index files and the type
+        // index are checkpointed into their files.
         std::vector<std::string> paths;
         {
             std::lock_guard<std::mutex> g(t->mu);
@@ -516,7 +566,6 @@ int32_t engineActivate(Engine* e) {
                 if (f->created) paths.push_back(f->path);
         }
         paths.push_back(t->pIdx);
-        paths.push_back(t->pJnl);
         for (const std::string& path : paths) {
             Conn* c = nullptr;
             if (openConn(path, OpenKind::Maint, 1024, 0, &c, nullptr) != SQLITE_OK) return P4_E_IO;
@@ -566,7 +615,7 @@ int32_t engineStats(Engine* e, uint8_t* out, int32_t cap) {
     // allocator counts (0 without the surface).
     v[kStHeap] = p4sql_heap_used();
     v[kStHeapPeak] = p4sql_heap_peak();
-    v[kStPendingBytes] = 0;  // the type index is written with every write
+    v[kStPendingBytes] = 0;  // nothing is held back: every write commits its feeds
     v[kStLiveFiles] = files;
     v[kStTypes] = types;
     v[kStPartitions] = feeds;

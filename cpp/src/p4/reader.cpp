@@ -163,6 +163,27 @@ void ReaderPool::closeAll() {
 
 namespace {
 
+// The stream generation of a feed file's read transaction, which the caller
+// has begun and not yet read in: its first read (the file's meta) fixes the
+// snapshot. A generation a compaction has since replaced and no longer keeps
+// starts the transaction over (bounded).
+int32_t snapStream(Feed* f, Conn* c, std::shared_ptr<Stream>* out) {
+    out->reset();
+    for (int tries = 0; tries < 4; tries++) {
+        if (tries) {
+            c->exec("COMMIT");
+            c->exec("BEGIN");
+        }
+        uint32_t gen = 0;
+        int32_t st = snapGen(c, &gen);
+        if (st != P4_OK) return st;
+        *out = streamAt(f, gen, &st);
+        if (st != P4_OK) return st;
+        if (*out) return P4_OK;
+    }
+    return P4_E_BUSY;
+}
+
 // ---- the scan ---------------------------------------------------------------------------------------
 struct FRef {
     Feed* f = nullptr;
@@ -177,7 +198,7 @@ struct RowV {
     int fi = -1;  // FRef index
     int64_t rid = 0;
     uint32_t n = 0, b = 0, c = 0, u = 0;
-    int64_t at = 0, ts = 0, len = 0, e = 0;
+    int64_t at = 0, ts = 0, len = 0, e = 0, off = -1;
     bool hasE = false;
     KVal k;
     uint8_t key[32];
@@ -975,8 +996,13 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
                        std::map<std::pair<int64_t, int>, std::vector<RowV>>* out) {
     FRef& fr = files_[size_t(fi)];
     const bool nd = needData();
+    std::shared_ptr<p4::Stream> stream;  // the feed's record stream (Scan::Stream is a walk)
+    if (nd) {
+        const int32_t st = snapStream(fr.f, c, &stream);
+        if (st != P4_OK) return st;
+    }
     if (!dictEnsure(fr.f, c)) return P4_E_IO;
-    sqlite3_stmt* q = c->get(nd ? S_R_SEQD : S_R_SEQ);
+    sqlite3_stmt* q = c->get(S_R_SEQ);
     if (!q) return P4_E_INTERNAL;
     for (int64_t seq : seqs) {
         sqlite3_bind_int64(q, 1, seq << 16);
@@ -1003,8 +1029,13 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
             if (sqlite3_column_type(q, 11) != SQLITE_NULL)
                 x.sig.assign(static_cast<const char*>(sqlite3_column_blob(q, 11)), size_t(sqlite3_column_bytes(q, 11)));
             x.len = sqlite3_column_int64(q, 12);
-            if (nd && sqlite3_column_type(q, 13) != SQLITE_NULL) {
-                x.data.assign(static_cast<const char*>(sqlite3_column_blob(q, 13)), size_t(sqlite3_column_bytes(q, 13)));
+            x.off = sqlite3_column_int64(q, 13);
+            if (nd) {
+                const int32_t st = streamRead(stream.get(), x.off, x.len, &x.data);
+                if (st != P4_OK) {
+                    sqlite3_reset(q);
+                    return st;
+                }
                 x.hasData = true;
             }
             NodeDef nodeDef;
@@ -1819,9 +1850,11 @@ int32_t heldRows(P4Lane* L, Type* t, const uint8_t key[32], bool hydrate, bool t
         std::vector<RowV> rows;
         int64_t seq = 0;
         c->exec("BEGIN");
-        int32_t st = seqOfCid(c, fr.indexed, key, &seq);
+        std::shared_ptr<p4::Stream> stream;
+        int32_t st = hydrate ? snapStream(f, c, &stream) : P4_OK;
+        if (st == P4_OK) st = seqOfCid(c, fr.indexed, key, &seq);
         if (st == P4_OK && seq && seq <= vis && !dictEnsure(f, c)) st = P4_E_IO;
-        sqlite3_stmt* q = st == P4_OK && seq && seq <= vis ? c->get(hydrate ? S_R_SEQD : S_R_SEQ) : nullptr;
+        sqlite3_stmt* q = st == P4_OK && seq && seq <= vis ? c->get(S_R_SEQ) : nullptr;
         if (st == P4_OK && seq && seq <= vis && !q) st = P4_E_INTERNAL;
         if (q) {
             sqlite3_bind_int64(q, 1, seq << 16);
@@ -1844,8 +1877,10 @@ int32_t heldRows(P4Lane* L, Type* t, const uint8_t key[32], bool hydrate, bool t
                 if (sqlite3_column_type(q, 11) != SQLITE_NULL)
                     v.sig.assign(static_cast<const char*>(sqlite3_column_blob(q, 11)), size_t(sqlite3_column_bytes(q, 11)));
                 v.len = sqlite3_column_int64(q, 12);
-                if (hydrate && sqlite3_column_type(q, 13) != SQLITE_NULL) {
-                    v.data.assign(static_cast<const char*>(sqlite3_column_blob(q, 13)), size_t(sqlite3_column_bytes(q, 13)));
+                v.off = sqlite3_column_int64(q, 13);
+                if (hydrate) {
+                    st = streamRead(stream.get(), v.off, v.len, &v.data);
+                    if (st != P4_OK) break;
                     v.hasData = true;
                 }
                 NodeDef nd;
@@ -2683,20 +2718,30 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
             // last commit, and the T/ files as the maintenance thread last
             // measured them. A file not written since the open is measured
             // once. Rollback journals: none in WAL mode (0).
+            // `db` is the feeds' data: each index file and each stream (its
+            // committed end, plus a generation a compaction replaced until it
+            // goes); `files` counts the feeds.
             std::vector<std::pair<Feed*, std::string>> unread;
             int64_t db = 0, wal = 0, jn = 0, free = 0;
             size_t files = 0;
             std::vector<std::string> paths;
+            std::vector<Feed*> feeds;
             {
                 std::lock_guard<std::mutex> g(t->mu);
                 for (auto& f : t->feeds) {
                     if (!f->created) continue;
                     files++;
                     paths.push_back(f->path);
+                    feeds.push_back(f.get());
                     if (f->dbBytes < 0) unread.push_back({f.get(), f->path});
                     else db += f->dbBytes;
+                    db += f->streamBytes;
                     free += f->freeBytes;
                 }
+            }
+            for (Feed* f : feeds) {
+                std::lock_guard<std::mutex> g(f->smu);
+                db += f->retiredBytes;
             }
             for (auto& u : unread) {
                 const int64_t n = std::max<int64_t>(0, ioSize(u.second));
@@ -2705,7 +2750,7 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
                 if (u.first->dbBytes < 0) u.first->dbBytes = n;
             }
             for (const std::string& p : paths) wal += walBytesOf(t->e, p);
-            const int64_t idx = t->idxBytes.load(std::memory_order_relaxed) + walBytesOf(t->e, t->pIdx) + walBytesOf(t->e, t->pJnl);
+            const int64_t idx = t->idxBytes.load(std::memory_order_relaxed) + walBytesOf(t->e, t->pIdx);
             const int64_t fts = t->ftsBytes.load(std::memory_order_relaxed) + walBytesOf(t->e, t->pFts);
             o.enc.beginRow();
             putText(o.enc, t->name);

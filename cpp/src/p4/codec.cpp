@@ -419,16 +419,18 @@ int64_t ioSize(const std::string& path) {
 // ---- SQLite connections ------------------------------------------------------------------
 const char* stmtSql(StmtId id) {
     switch (id) {
-        // feed file: a record's rows are the rid range [seq << 16, seq << 16 | 0xffff]
-        case S_R_SEQ: return "SELECT rid, n, b, c, u, at, cid, e, k, ts, f, x, length(d) FROM r WHERE rid>=?1 AND rid<=?2";
-        case S_R_SEQD: return "SELECT rid, n, b, c, u, at, cid, e, k, ts, f, x, length(d), d FROM r WHERE rid>=?1 AND rid<=?2";
-        case S_R_D: return "SELECT d FROM r WHERE rid=?1";
+        // feed file: a record's rows are the rid range [seq << 16, seq << 16 | 0xffff];
+        // a row's bytes are the stream frame at off ([u32 len][bytes])
+        case S_R_SEQ: return "SELECT rid, n, b, c, u, at, cid, e, k, ts, f, x, len, off FROM r WHERE rid>=?1 AND rid<=?2";
+        case S_R_FRAME: return "SELECT off, len FROM r WHERE rid=?1";
         case S_R_INS:
-            return "INSERT INTO r(rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,d) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)";
+            return "INSERT INTO r(rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,off,len) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)";
         case S_R_DEL: return "DELETE FROM r WHERE rid=?1";
         case S_R_URL: return "UPDATE r SET u=?2 WHERE rid=?1";
+        case S_R_OFF: return "UPDATE r SET off=?2 WHERE rid=?1";
         case S_R_MAXRID: return "SELECT max(rid) FROM r WHERE rid>=?1 AND rid<=?2";
         case S_META_SET: return "INSERT OR REPLACE INTO meta(k,v) VALUES(?1,?2)";
+        case S_META_GEN: return "SELECT v FROM meta WHERE k='gen'";
         case S_NODE_INS: return "INSERT INTO node(id,producer,peer) VALUES(?1,?2,?3)";
         case S_BATCH_INS: return "INSERT INTO batch(id,batch,ppeer,pkey) VALUES(?1,?2,?3,?4)";
         case S_CKEY_GET: return "SELECT id FROM ckey WHERE ckey=?1";
@@ -447,10 +449,7 @@ const char* stmtSql(StmtId id) {
         case S_IDENT_INS: return "INSERT OR REPLACE INTO ident(h,seq) VALUES(?1,?2)";
         case S_TOKC_PUT: return "INSERT OR REPLACE INTO tokc(producer,n,bytes,mints,maxts,maxseq) VALUES(?1,?2,?3,?4,?5,?6)";
         case S_TOKC_DEL: return "DELETE FROM tokc WHERE producer=?1";
-        // journal
-        case S_J_INS: return "INSERT INTO j(op,fid,seq,k,s,v) VALUES(?1,?2,?3,?4,?5,?6)";
-        case S_J_DEL: return "DELETE FROM j WHERE id<=?1";
-        case S_JM_SET: return "INSERT OR REPLACE INTO jm(k,v) VALUES(?1,?2)";
+        case S_MOVED_INS: return "INSERT OR IGNORE INTO moved(seq) VALUES(?1)";
         default: return nullptr;
     }
 }
@@ -603,12 +602,10 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
     const bool reader = kind == OpenKind::Reader;
     std::string uri = fileUri(path) + "?share=1";
     if (reader) uri += "&ra=1";
-    if (kind == OpenKind::Writer || kind == OpenKind::Journal || kind == OpenKind::Index) uri += "&dsync=1";
+    if (kind == OpenKind::Writer || kind == OpenKind::Index) uri += "&dsync=1";
     sqlite3* db = nullptr;
     const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX |
-                      (kind == OpenKind::Writer || kind == OpenKind::Index || kind == OpenKind::Journal
-                           ? SQLITE_OPEN_CREATE
-                           : 0);
+                      (kind == OpenKind::Writer || kind == OpenKind::Index ? SQLITE_OPEN_CREATE : 0);
     int rc = sqlite3_open_v2(uri.c_str(), &db, flags, "flatsql_io");
     if (rc != SQLITE_OK) {
         if (err) *err = db ? sqlite3_errmsg(db) : "open failed";
@@ -618,7 +615,7 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
     sqlite3_extended_result_codes(db, 1);
     sqlite3_busy_timeout(db, kind == OpenKind::Reader ? 2000 : 30000);
     char sql[512];
-    if (kind == OpenKind::Writer || kind == OpenKind::Index || kind == OpenKind::Journal) {
+    if (kind == OpenKind::Writer || kind == OpenKind::Index) {
         std::snprintf(sql, sizeof sql, "PRAGMA page_size=%u", pageSize ? pageSize : 4096);
         sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
         // A new file's switch to WAL commits through a rollback journal;
@@ -633,9 +630,8 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
             return rc;
         }
     }
-    // FULL everywhere: a flush trims the journal right after its type-index
-    // commit, so that commit must be durable first (NORMAL lost acknowledged
-    // records to a power loss between the two: t_power_loss).
+    // FULL everywhere: the ack follows an index commit that a power loss
+    // cannot take back (its stream frames were synced before it).
     const char* sync = "FULL";
     std::snprintf(sql, sizeof sql,
                   "PRAGMA synchronous=%s; PRAGMA cache_size=-%u; PRAGMA mmap_size=0; PRAGMA temp_store=MEMORY;"

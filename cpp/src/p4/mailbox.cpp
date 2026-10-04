@@ -505,6 +505,7 @@ void writerLoop(Engine* e, uint32_t wi) {
             if (tasks[0]->internal) {
                 Internal* in = tasks[0]->internal;
                 if (op == P4_OPC_QUOTA_GC) quotaWork(e, t, in);
+                else if (op == kOpCompact) compactWork(e, t, in);
                 else rebuildWork(e, t, in);
                 in->done.store(true, std::memory_order_release);
             } else if (op == P4_OPC_PUT) {
@@ -733,20 +734,14 @@ int32_t engineStop(Engine* e, double deadlineMs) {
             delete t->idx;
             t->idx = nullptr;
         }
-        if (t->jdb) {
-            // The rows the type index applied go (the index commits are durable).
-            if (t->jcut > 0) {
-                sqlite3_stmt* q = t->jdb->get(S_J_DEL);
-                if (q) {
-                    sqlite3_bind_int64(q, 1, t->jcut);
-                    sqlite3_step(q);
-                    sqlite3_reset(q);
-                }
-                t->jcut = 0;
+        {
+            // The streams (a generation a compaction replaced is unlinked now).
+            std::vector<Feed*> fs;
+            {
+                std::lock_guard<std::mutex> g(t->mu);
+                for (auto& f : t->feeds) fs.push_back(f.get());
             }
-            sqlite3_wal_checkpoint_v2(t->jdb->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
-            delete t->jdb;
-            t->jdb = nullptr;
+            for (Feed* f : fs) streamClose(f);
         }
         if (t->fts) {
             delete t->fts;

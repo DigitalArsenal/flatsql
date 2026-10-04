@@ -1,21 +1,26 @@
 // Store format 4: removals and repair on a type's writer (CONTRACT C-37
-// (7), (9), C-38; design §4 W-f/W-g/W-i; §3.5 REBUILD).
+// (7), (9), C-38; design §4 W-f/W-g/W-i; §3.5 REBUILD; BRIEF4).
 //   SUPERSEDE  one feed file: its rows whose batch is not the kept one, a
 //              chunk of 32,768 rows per transaction; a record left with no
 //              row in the file leaves the feed.
 //   DELETE     every row of the CIDs, in every feed file (each file's CID index).
 //   QUOTA      the type's oldest record row sets by arrival (the feed files
 //              merged by seq).
+//   These remove index rows; the stream keeps the frames until a compaction
+//   writes the live ones into the next generation (COMPACT).
 //   REBUILD    1 the feed files' secondary indexes (after a migration's bulk
-//              append); 2 the feed files' counters recounted from their rows
-//              and mirrored into the type index; 8 the same comparison
-//              changing nothing, plus PRAGMA integrity_check on every file
-//              (C-27).
+//              append); 2 the feed files' counters recounted from their rows;
+//              8 the same comparison changing nothing, every row's frame
+//              checked in its stream, plus PRAGMA integrity_check on every
+//              index file and the type index (C-27).
+//   An index that is missing or damaged at open is rebuilt from its stream
+//   (rebuildFeed).
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
 
+#include "flatsql/flatsql_io.h"
 #include "internal.h"
 
 namespace flatsql {
@@ -305,7 +310,7 @@ void quotaWork(Engine* e, Type* t, Internal* in) {
     }
 }
 
-// ---- REBUILD -----------------------------------------------------------------------------------------
+// ---- REBUILD ----------------------------------------------------------------------------------------
 namespace {
 void why(const char* what, const std::string& where, int64_t a, int64_t b) {
 #if !defined(__wasm__)
@@ -334,21 +339,22 @@ bool fileIntact(const std::string& path) {
 // One feed file's rows, recounted: its counters, its instances and its
 // tokens' copies, record by record in rid order. Also whether each record's
 // rows are its copies x its instances (local records: one row per copy) and
-// one CID.
+// one CID, and whether every frame a row names is in the stream below the
+// mark with its size prefix.
 struct FileCount {
     Counters k;
     std::map<InstId, InstCount> inst;
     std::map<uint32_t, TokCount> tokc;
-    int64_t records = 0, u2bad = 0;
+    int64_t records = 0, u2bad = 0, framesBad = 0;
 };
-int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc) {
+int32_t countFile(Type* t, Feed* f, Conn* c, Stream* stream, int64_t mark, FileCount* fc) {
     std::shared_ptr<const Spec> sp = t->spec();
     if (!dictEnsure(f, c)) return P4_E_IO;
-    sqlite3_stmt* q = c->sql("SELECT rid, seq, n, b, c, at, cid, e, k, ts, length(d) FROM r ORDER BY rid");
+    sqlite3_stmt* q = c->sql("SELECT rid, seq, n, b, c, at, cid, e, k, ts, len, off FROM r ORDER BY rid");
     if (!q) return P4_E_INTERNAL;
     struct RowC {
         uint32_t tok, b, cc;
-        int64_t len, ts;
+        int64_t len, ts, off;
         std::string key;
     };
     bool have = false;
@@ -356,16 +362,26 @@ int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc) {
     bool hasE = false;
     std::vector<RowC> rows;
     int32_t st = P4_OK;
+    auto frameOk = [&](int64_t off, int64_t len) {
+        if (off < 0 || off + 4 + len > mark || !stream) return false;
+        uint8_t p[4];
+        if (flatsql_io_read(stream->h, p, 4, double(off)) != 4) return false;
+        return ld32(p) == uint32_t(len);
+    };
     auto flush = [&]() {
         if (!have) return;
         Counters& k = fc->k;
         int64_t bytes = 0;
         std::map<uint32_t, int64_t> cp;
         std::map<InstId, int64_t> instLen;
+        std::map<int64_t, int64_t> frames;
         bool localRows = false, oneCid = true;
         for (const RowC& r : rows) {
             bytes += r.len;
             oneCid = oneCid && r.key == rows[0].key;
+            auto fit = frames.find(r.off);
+            if (fit == frames.end()) frames[r.off] = r.len;
+            else if (fit->second != r.len) fc->framesBad++;  // one frame, two lengths
             auto it = cp.find(r.tok);
             if (it == cp.end() || r.len < it->second) cp[r.tok] = r.len;
             if (!r.b) {
@@ -375,6 +391,10 @@ int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc) {
             const InstId id(r.b, r.cc);
             auto il = instLen.find(id);
             if (il == instLen.end() || r.len < il->second) instLen[id] = r.len;
+        }
+        for (auto& kv : frames) {
+            k.fbytes += kv.second + 4;
+            if (!frameOk(kv.first, kv.second)) fc->framesBad++;
         }
         int64_t minLen = INT64_MAX, sumLen = 0;
         for (auto& kv : cp) {
@@ -434,6 +454,7 @@ int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc) {
         x.b = uint32_t(sqlite3_column_int64(q, 3));
         x.cc = uint32_t(sqlite3_column_int64(q, 4));
         x.len = sqlite3_column_int64(q, 10);
+        x.off = sqlite3_column_int64(q, 11);
         if (sqlite3_column_bytes(q, 6) == 32) x.key.assign(static_cast<const char*>(sqlite3_column_blob(q, 6)), 32);
         NodeDef nd;
         if (!dictNode(f, c, n, &nd)) {
@@ -470,7 +491,7 @@ int32_t countFile(Type* t, Feed* f, Conn* c, FileCount* fc) {
 
 bool sameCounts(const Counters& a, const Counters& b) {
     return a.rows == b.rows && a.recs == b.recs && a.bytes == b.bytes && a.nnull == b.nnull && a.rbytes == b.rbytes &&
-           a.copies == b.copies && a.cbytes == b.cbytes;
+           a.copies == b.copies && a.cbytes == b.cbytes && a.fbytes == b.fbytes;
 }
 bool sameInst(const std::map<InstId, InstCount>& a, const std::map<InstId, InstCount>& b) {
     if (a.size() != b.size()) return false;
@@ -490,56 +511,6 @@ bool sameTokc(const std::map<uint32_t, TokCount>& a, const std::map<uint32_t, To
         if (it == b.end() || it->second.n != kv.second.n || it->second.bytes != kv.second.bytes) return false;
     }
     return true;
-}
-
-// A feed's mirror as the type index holds it.
-int32_t readMirror(Conn* x, uint32_t fid, Counters* k, std::map<InstId, InstCount>* inst, std::map<uint32_t, TokCount>* tokc,
-                   bool* present) {
-    *present = false;
-    sqlite3_stmt* s = x->sql("SELECT rows, recs, bytes, nnull, rbytes, copies, cbytes FROM feed WHERE fid=?1");
-    if (!s) return P4_E_INTERNAL;
-    sqlite3_bind_int64(s, 1, fid);
-    int r = sqlite3_step(s);
-    if (r == SQLITE_ROW) {
-        *present = true;
-        k->rows = sqlite3_column_int64(s, 0);
-        k->recs = sqlite3_column_int64(s, 1);
-        k->bytes = sqlite3_column_int64(s, 2);
-        k->nnull = sqlite3_column_int64(s, 3);
-        k->rbytes = sqlite3_column_int64(s, 4);
-        k->copies = sqlite3_column_int64(s, 5);
-        k->cbytes = sqlite3_column_int64(s, 6);
-    }
-    sqlite3_reset(s);
-    if (r != SQLITE_ROW && r != SQLITE_DONE) return statusOfSqlite(r);
-    s = x->sql("SELECT b, c, batch, ppeer, pkey, ckey, n, bytes FROM inst WHERE fid=?1 AND n>0");
-    if (!s) return P4_E_INTERNAL;
-    sqlite3_bind_int64(s, 1, fid);
-    while ((r = sqlite3_step(s)) == SQLITE_ROW) {
-        InstCount& ic = (*inst)[InstId(uint32_t(sqlite3_column_int64(s, 0)), uint32_t(sqlite3_column_int64(s, 1)))];
-        auto txt = [&](int i) {
-            const unsigned char* p = sqlite3_column_text(s, i);
-            return p ? std::string(reinterpret_cast<const char*>(p)) : std::string();
-        };
-        ic.batch = txt(2);
-        ic.ppeer = txt(3);
-        ic.pkey = txt(4);
-        ic.ckey = txt(5);
-        ic.n = sqlite3_column_int64(s, 6);
-        ic.bytes = sqlite3_column_int64(s, 7);
-    }
-    sqlite3_reset(s);
-    if (r != SQLITE_DONE) return statusOfSqlite(r);
-    s = x->sql("SELECT tok, n, bytes FROM ftok WHERE fid=?1 AND n>0");
-    if (!s) return P4_E_INTERNAL;
-    sqlite3_bind_int64(s, 1, fid);
-    while ((r = sqlite3_step(s)) == SQLITE_ROW) {
-        TokCount& tc = (*tokc)[uint32_t(sqlite3_column_int64(s, 0))];
-        tc.n = sqlite3_column_int64(s, 1);
-        tc.bytes = sqlite3_column_int64(s, 2);
-    }
-    sqlite3_reset(s);
-    return r == SQLITE_DONE ? P4_OK : statusOfSqlite(r);
 }
 }  // namespace
 
@@ -576,32 +547,29 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
                 in->err = "indexes of " + f->path;
                 return;
             }
-            FeedSnap s;
-            {
-                std::lock_guard<std::mutex> g(t->mu);
-                f->indexed = true;
-                s = feedSnapOf(f);
-            }
-            int r = t->idx->exec("BEGIN IMMEDIATE");
-            if (r == SQLITE_OK) r = indexPutFeed(t->idx, s);
-            if (r == SQLITE_OK) r = t->idx->exec("COMMIT");
-            if (r != SQLITE_OK) {
-                t->idx->exec("ROLLBACK");
-                in->status = statusOfSqlite(r);
-                in->err = "type index";
-                return;
-            }
+            std::lock_guard<std::mutex> g(t->mu);
+            f->indexed = true;
         }
         e->bump(kStRebuilds);
     }
     if (in->what & (2 | 8)) {
         const bool fix = (in->what & 2) != 0;
-        Conn* x = t->idx;
         int64_t entries = 0, mismatches = 0;
-        std::vector<FeedSnap> repaired;
         for (Feed* f : feeds) {
-            // 1. The file's counters, instances and tokens from its rows,
-            //    against its meta, the engine's and the type index's.
+            // 1. The file's counters, instances and tokens from its rows (and
+            //    every row's frame in the stream), against its meta and the
+            //    engine's. This runs on the type's writer: the stream's end and
+            //    generation are the committed ones.
+            int32_t st = P4_OK;
+            std::shared_ptr<Stream> stream;
+            if (f->end > 0) {
+                stream = streamCur(f, &st);
+                if (!stream) {
+                    in->status = st;
+                    in->err = "stream of " + f->path;
+                    return;
+                }
+            }
             Conn* c = nullptr;
             if (openConn(f->path, OpenKind::Maint, 4096, 0, &c, nullptr) != SQLITE_OK) {
                 in->status = P4_E_IO;
@@ -610,12 +578,11 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             }
             c->exec("BEGIN");
             FileCount fc;
-            int32_t st = countFile(t, f, c, &fc);
-            Counters stored;
-            bool indexed = true;
+            st = countFile(t, f, c, stream.get(), f->end, &fc);
+            FileMeta stored;
             std::map<InstId, InstCount> storedInst;
             std::map<uint32_t, TokCount> storedTokc;
-            if (st == P4_OK && (readMeta(c, &stored, &indexed) != SQLITE_OK || readInst(f, c, &storedInst) != SQLITE_OK ||
+            if (st == P4_OK && (readMeta(c, &stored) != SQLITE_OK || readInst(f, c, &storedInst) != SQLITE_OK ||
                                 readTokc(t, c, &storedTokc) != SQLITE_OK))
                 st = P4_E_IO;
             c->exec("COMMIT");
@@ -626,43 +593,42 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
                 return;
             }
             entries += fc.records;
-            Counters mem, mir;
-            std::map<InstId, InstCount> memInst, mirInst;
-            std::map<uint32_t, TokCount> memTokc, mirTokc;
+            Counters mem;
+            std::map<InstId, InstCount> memInst;
+            std::map<uint32_t, TokCount> memTokc;
             {
                 std::lock_guard<std::mutex> g(t->mu);
                 mem = f->k;
                 memInst = f->inst;
                 memTokc = f->tokc;
             }
-            bool present = false;
-            st = readMirror(x, f->fid, &mir, &mirInst, &mirTokc, &present);
-            if (st != P4_OK) {
-                in->status = st;
-                in->err = "type index mirror of " + f->path;
-                return;
-            }
-            const bool fileBad = !sameCounts(fc.k, stored) || !sameInst(fc.inst, storedInst) || !sameTokc(fc.tokc, storedTokc);
+            const bool fileBad = !sameCounts(fc.k, stored.k) || !sameInst(fc.inst, storedInst) || !sameTokc(fc.tokc, storedTokc);
             const bool memBad = !sameCounts(fc.k, mem) || !sameInst(fc.inst, memInst) || !sameTokc(fc.tokc, memTokc);
-            const bool mirBad = !present || !sameCounts(fc.k, mir) || !sameInst(fc.inst, mirInst) || !sameTokc(fc.tokc, mirTokc);
+            const bool markBad = stored.mark != f->end || stored.gen != f->gen ||
+                                 (stream && streamSize(stream.get()) != f->end);
             if (fileBad) {
                 mismatches++;
-                why("file counters rows", f->path, stored.rows, fc.k.rows);
-                why("file counters recs", f->path, stored.recs, fc.k.recs);
+                why("file counters rows", f->path, stored.k.rows, fc.k.rows);
+                why("file counters recs", f->path, stored.k.recs, fc.k.recs);
+                why("file counters fbytes", f->path, stored.k.fbytes, fc.k.fbytes);
             }
             if (memBad) {
                 mismatches++;
                 why("engine counters recs", f->path, mem.recs, fc.k.recs);
             }
-            if (mirBad) {
+            if (markBad) {
                 mismatches++;
-                why("type index mirror recs", f->path, mir.recs, fc.k.recs);
+                why("stream mark", f->path, stored.mark, f->end);
             }
             if (fc.u2bad) {
                 mismatches += fc.u2bad;
                 why("rows not copies x instances", f->path, fc.u2bad, 0);
             }
-            if (fix && (fileBad || memBad || mirBad)) {
+            if (fc.framesBad) {
+                mismatches += fc.framesBad;
+                why("rows naming no frame of the stream", f->path, fc.framesBad, 0);
+            }
+            if (fix && (fileBad || memBad)) {
                 // The file's counters rewritten from its rows (its writer),
                 // keeping the times and bounds the rows cannot give back.
                 int32_t ps = P4_OK;
@@ -719,8 +685,8 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
                 }
                 if (r == SQLITE_OK) r = w->exec("DELETE FROM tokc");
                 if (r == SQLITE_OK) r = writeTokc(t, w, {}, fc.tokc);
-                fc.k.maxseq = std::max(fc.k.maxseq, stored.maxseq);
-                if (r == SQLITE_OK) r = writeMeta(w, fc.k, nowSec());
+                fc.k.maxseq = std::max(fc.k.maxseq, stored.k.maxseq);
+                if (r == SQLITE_OK) r = writeMeta(w, fc.k, nowSec(), f->end, f->gen);
                 if (r == SQLITE_OK) r = w->exec("COMMIT");
                 if (r != SQLITE_OK) w->exec("ROLLBACK");
                 writerUnpin(e, f);
@@ -733,35 +699,308 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
                 f->k = fc.k;
                 f->inst = fc.inst;
                 f->tokc = fc.tokc;
-                repaired.push_back(feedSnapOf(f));
             }
             if (!fileIntact(f->path)) {
                 mismatches++;
                 if (in->firstBad.empty()) in->firstBad = f->path;
             }
         }
-        if (fix && !repaired.empty()) {
-            int r = x->exec("BEGIN IMMEDIATE");
-            for (const FeedSnap& s : repaired)
-                if (r == SQLITE_OK) r = indexPutFeed(x, s);
-            if (r == SQLITE_OK) r = x->exec("COMMIT");
-            if (r != SQLITE_OK) {
-                x->exec("ROLLBACK");
-                in->status = statusOfSqlite(r);
-                in->err = "type index commit";
-                return;
-            }
+        // C-27: the type index too.
+        if (!fileIntact(t->pIdx)) {
+            mismatches++;
+            if (in->firstBad.empty()) in->firstBad = t->pIdx;
         }
-        // C-27: the type index and the journal too.
-        for (const std::string* p : {&t->pIdx, &t->pJnl})
-            if (!fileIntact(*p)) {
-                mismatches++;
-                if (in->firstBad.empty()) in->firstBad = *p;
-            }
         in->a = entries;
         in->b = mismatches;
         e->bump(kStRebuilds);
     }
+}
+
+// ---- COMPACT -----------------------------------------------------------------------------------------
+// A stream is compacted once more than half of it is dead (frames no live row
+// names) and the dead part is at least 1 MiB.
+bool compactDue(const Feed* f) {
+    const int64_t dead = f->end - f->k.fbytes;
+    return f->created && !f->quarantined && f->end > 0 && dead >= (int64_t(1) << 20) && dead * 2 > f->end;
+}
+
+void compactWork(Engine* e, Type* t, Internal* in) {
+    Feed* f;
+    bool due;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        f = t->feedById(in->what);
+        due = f && compactDue(f);
+    }
+    if (!due) return;
+    in->a = f->end;
+    int32_t st = P4_OK;
+    std::string er;
+    Conn* c = writerPin(e, f, &st, &er);
+    if (!c) {
+        in->status = st;
+        in->err = er;
+        return;
+    }
+    // 1. The live frames, in stream order (arrival), and their new offsets.
+    std::vector<std::pair<int64_t, int64_t>> rows;  // (rid, off)
+    std::map<int64_t, int64_t> live;                // off -> len
+    {
+        sqlite3_stmt* q = c->sql("SELECT rid, off, len FROM r");
+        int r = q ? SQLITE_OK : SQLITE_ERROR;
+        while (q && (r = sqlite3_step(q)) == SQLITE_ROW) {
+            rows.push_back({sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 1)});
+            live[sqlite3_column_int64(q, 1)] = sqlite3_column_int64(q, 2);
+        }
+        if (q) sqlite3_reset(q);
+        if (r != SQLITE_DONE) {
+            writerUnpin(e, f);
+            in->status = statusOfSqlite(r);
+            in->err = "rows of " + f->path;
+            return;
+        }
+    }
+    std::shared_ptr<Stream> old = streamCur(f, &st);
+    const uint32_t gen = f->gen + 1;
+    std::shared_ptr<Stream> next;
+    if (old) {
+        // The next generation from scratch (a leftover of a cut compaction is cut to 0).
+        const std::string path = streamPath(f, gen);
+        const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()),
+                                          FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC |
+                                              FLATSQL_IO_CREATE_PARENTS);
+        if (h < 0) {
+            st = h == FLATSQL_IO_ERR_NOSPACE ? P4_E_NOSPACE : P4_E_IO;
+        } else {
+            next = std::make_shared<Stream>();
+            next->path = path;
+            next->gen = gen;
+            next->h = h;
+        }
+    }
+    std::map<int64_t, int64_t> moved;  // old off -> new off
+    int64_t at = 0;
+    std::string buf;
+    for (auto it = live.begin(); st == P4_OK && it != live.end(); ++it) {
+        std::string bytes;
+        st = streamRead(old.get(), it->first, it->second, &bytes);
+        if (st != P4_OK) break;
+        moved[it->first] = at + int64_t(buf.size());
+        uint8_t p[4];
+        st32(p, uint32_t(bytes.size()));
+        buf.append(reinterpret_cast<const char*>(p), 4);
+        buf.append(bytes);
+        if (buf.size() >= (4u << 20)) {
+            st = streamWrite(next.get(), at, reinterpret_cast<const uint8_t*>(buf.data()), buf.size());
+            at += int64_t(buf.size());
+            buf.clear();
+        }
+    }
+    if (st == P4_OK && !buf.empty()) {
+        st = streamWrite(next.get(), at, reinterpret_cast<const uint8_t*>(buf.data()), buf.size());
+        at += int64_t(buf.size());
+    }
+    if (st == P4_OK) st = streamSync(next.get());
+    if (st != P4_OK) {
+        writerUnpin(e, f);
+        if (next) next->drop.store(true);
+        in->status = st;
+        in->err = "compact " + f->path;
+        return;
+    }
+    // 2. The swap: readers find the new generation as soon as the commit
+    //    shows it to them, and the old one while their snapshot names it.
+    {
+        std::lock_guard<std::mutex> g(f->smu);
+        f->retired = old;
+        f->retiredBytes = in->a;
+        f->retireAt = monoNs() + 30ull * 1000 * 1000 * 1000;
+        f->stream = next;
+        f->gen = gen;
+    }
+    // 3. One transaction: every row repointed, the new generation and mark.
+    Counters k;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        k = f->k;
+    }
+    int r = c->exec("BEGIN IMMEDIATE");
+    sqlite3_stmt* q = r == SQLITE_OK ? c->get(S_R_OFF) : nullptr;
+    if (r == SQLITE_OK && !q) r = SQLITE_ERROR;
+    for (size_t i = 0; r == SQLITE_OK && i < rows.size(); i++) {
+        sqlite3_bind_int64(q, 1, rows[i].first);
+        sqlite3_bind_int64(q, 2, moved[rows[i].second]);
+        r = sqlite3_step(q);
+        sqlite3_reset(q);
+        if (r == SQLITE_DONE) r = SQLITE_OK;
+    }
+    if (r == SQLITE_OK) r = writeMeta(c, k, nowSec(), at, gen);
+    if (r == SQLITE_OK) r = c->exec("COMMIT");
+    if (r != SQLITE_OK) {
+        c->exec("ROLLBACK");
+        writerUnpin(e, f);
+        {
+            std::lock_guard<std::mutex> g(f->smu);
+            f->stream = old;
+            f->retired.reset();
+            f->retiredBytes = 0;
+            f->gen = gen - 1;
+        }
+        next->drop.store(true);
+        in->status = statusOfSqlite(r);
+        in->err = "compact commit " + f->path;
+        return;
+    }
+    writerUnpin(e, f);
+    old->drop.store(true);  // unlinked when the last reader holding it lets go
+    f->end = at;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        f->streamBytes = at;
+    }
+    // The registry follows (a missing index's rebuild reads it; open also
+    // tries the generation after the registered one).
+    if (t->idx) {
+        int x = t->idx->exec("BEGIN IMMEDIATE");
+        if (x == SQLITE_OK) x = indexPutFeed(t->idx, *f, gen);
+        if (x == SQLITE_OK) x = t->idx->exec("COMMIT");
+        if (x != SQLITE_OK) t->idx->exec("ROLLBACK");
+        else {
+            std::lock_guard<std::mutex> g(t->mu);
+            f->regGen = gen;
+        }
+    }
+    in->b = at;
+    e->bump(kStRebuilds);
+}
+
+// ---- an index rebuilt from its stream ----------------------------------------------------------------
+// The feed's index is missing or damaged at open: the damaged file goes, and
+// a new one is built from the stream's frames. Keys come from the bytes (the
+// CID is the sha256 of the frame's FlatBuffer, the epoch and object key are
+// extracted). What only the index held is gone: each record gets a fresh seq,
+// the open's clock as its ts and delivery time, an empty publishing node, and
+// (a source feed) one instance with an empty batch. A frame whose CID the
+// feed already indexed, a sealed frame (its CID is the plaintext's), or a
+// frame that does not parse stays in the stream unindexed. The stream is cut
+// after its last whole frame.
+int32_t rebuildFeed(Engine* e, Type* t, Feed* f, int64_t* indexed, std::string* err) {
+    *indexed = 0;
+    writerDrop(e, f);
+    e->rpool.dropPath(f->path);
+    for (const char* sfx : {"", "-wal", "-shm", "-journal"}) ioUnlink(f->path + sfx);
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        f->created = false;
+        f->indexed = true;
+        f->k = Counters();
+        f->inst.clear();
+        f->tokc.clear();
+        f->quarantined = false;
+    }
+    {
+        std::lock_guard<std::mutex> g(f->dictMu);
+        f->dict = Dict();
+    }
+    int32_t st = P4_OK;
+    std::shared_ptr<Stream> stream = streamCur(f, &st);
+    if (!stream) {
+        if (err) *err = "open " + streamPath(f, f->gen);
+        return st;
+    }
+    const int64_t size = streamSize(stream.get());
+    if (size < 0) return P4_E_IO;
+    std::shared_ptr<const Spec> sp = t->spec();
+    const ps::TypeConfig& tc = sp->tc;
+    // The whole frames.
+    std::vector<std::pair<int64_t, uint32_t>> frames;
+    int64_t at = 0;
+    while (at + 4 <= size) {
+        uint8_t p[4];
+        if (flatsql_io_read(stream->h, p, 4, double(at)) != 4) break;
+        const uint32_t n = ld32(p);
+        if (at + 4 + int64_t(n) > size) break;
+        frames.push_back({at, n});
+        at += 4 + int64_t(n);
+    }
+    if (at < size) {
+        st = streamTruncate(stream.get(), at, true);
+        if (st != P4_OK) return st;
+    }
+    f->end = at;
+    uint32_t tok;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        tok = tokFor(t, std::string(), std::string(), true);
+    }
+    std::unordered_set<std::string> seen;
+    const int64_t now = nowSec();
+    for (size_t i = 0; i < frames.size();) {
+        WriteCtx w(e, t);
+        std::vector<RecState*> fresh;
+        for (; i < frames.size() && fresh.size() < 4096; i++) {
+            std::string bytes;
+            if (streamRead(stream.get(), frames[i].first, frames[i].second, &bytes) != P4_OK) continue;
+            const uint8_t* d = reinterpret_cast<const uint8_t*>(bytes.data());
+            if (ps::sealedEnvelopeValid(d, bytes.size())) continue;
+            std::string frame(bytes.size() + 4, '\0');
+            st32(reinterpret_cast<uint8_t*>(&frame[0]), uint32_t(bytes.size()));
+            std::memcpy(&frame[4], bytes.data(), bytes.size());
+            if (tc.checkFrame(reinterpret_cast<const uint8_t*>(frame.data()), uint32_t(frame.size())) != 0) continue;
+            uint8_t dg[32], key[32];
+            ps::sha256(d, bytes.size(), dg);
+            cidKeyFromDigest(dg, key);
+            if (!seen.insert(std::string(reinterpret_cast<const char*>(key), 32)).second) continue;
+            ps::Extracted x;
+            uint8_t scratch[2048];
+            tc.extract(reinterpret_cast<const uint8_t*>(frame.data()), frame.size(), &x, scratch, sizeof scratch);
+            int32_t rc = P4_OK;
+            RecState* rs = w.byKey(f->fid, key, &rc);
+            if (!rs) return rc;
+            rs->hasE = x.hasEpoch;
+            rs->e = x.epochSec;
+            rs->ts = now;
+            rs->w = rs->hasE ? rs->e : now;
+            if (x.objectCol >= 0 && x.objectCol < int(ps::kMaxCols) && x.cols[x.objectCol].present) {
+                const ps::ColValue& cv = x.cols[x.objectCol];
+                if (cv.isU64) {
+                    rs->k.type = 1;
+                    rs->k.i = int64_t(cv.u);
+                } else {
+                    rs->k.type = 3;
+                    rs->k.s.assign(reinterpret_cast<const char*>(cv.s), cv.n);
+                }
+            }
+            RowR copy;
+            copy.tok = tok;
+            copy.ts = now;
+            copy.len = int64_t(bytes.size());
+            copy.off = frames[i].first;
+            std::vector<WriteCtx::Inst> insts;
+            if (!f->local) insts.push_back(WriteCtx::Inst{std::string(), std::string(), std::string(), std::string(), std::string(), now});
+            WriteCtx::Out out;
+            w.deliver(rs, copy, insts, &out);
+            fresh.push_back(rs);
+        }
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            for (RecState* rs : fresh) rs->seq = t->nextSeq++;
+        }
+        st = w.commit();
+        if (st != P4_OK) {
+            if (err) *err = "rebuild " + f->path + ": " + w.err;
+            return st;
+        }
+        *indexed += int64_t(fresh.size());
+    }
+    if (frames.empty()) {
+        // Nothing to index: an empty index file, so the feed opens as created.
+        Conn* c = writerPin(e, f, &st, nullptr);
+        if (!c) return st;
+        writerUnpin(e, f);
+    }
+    e->bump(kStRebuilds);
+    return P4_OK;
 }
 
 }  // namespace p4
