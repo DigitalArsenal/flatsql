@@ -13,11 +13,12 @@
 // walked from byte 0 to its end with no FlatSQL code: back-to-back
 // [u32 LE size][FlatBuffer] frames, each a PNM table with its file
 // identifier, ending exactly at the end of the file, and every index row
-// names one of its frames (off, len). Every 3rd call also writes to a feed
-// of its own, new to the store, so kills land between a new feed's first
-// frames and its first commit: no row of a source feed may come back without
-// its batch (an unacknowledged record is absent or present with its tag,
-// never a record with blank provenance; GATES-stream-r1 B1).
+// names one of its frames (off, len). Every 4th step also sends four calls
+// at once, each to a feed of its own, new to the store, so kills land between
+// new feeds' first frames and their first commits: no row of a source feed
+// may come back without its batch (an unacknowledged record is absent or
+// present with its tag, never a record with blank provenance;
+// GATES-stream-r1 B1).
 // The loop's two halves (t_kill_run, t_kill_check) are also tests of their
 // own, so the wasm build's host drives the same loop (scripts/p4-wasm-suite.mjs).
 #include <unistd.h>
@@ -201,16 +202,22 @@ Batch killBatch(const std::string& peer, const std::string& batch, uint64_t from
 // in each); every 4th call (from the second) sends the same new records from
 // all three producers at once, each to its own feed (50-record calls);
 // every 13th call supersedes a batch of prov@src and every 11th deletes the
-// oldest arrivals down to a 4 MiB quota; every 3rd first sends 64 new records
-// to a feed new to the store.
+// oldest arrivals down to a 4 MiB quota; every 4th first sends four calls at
+// once, each with 64 new records to a feed new to the store.
 void killWorkStep(int c, uint64_t* id) {
-    if (c % 3 == 2) {
-        Result r = put(killBatch("producer1", "f" + std::to_string(*id), *id, 64, 3));
-        if (r.status != P4_OK) {
-            std::fprintf(stderr, "  put failed: %d %s\n", r.status, r.err.c_str());
-            std::_Exit(1);
+    if (c % 4 == 3) {
+        std::vector<uint32_t> slots;
+        for (int k = 0; k < 4; k++) {
+            slots.push_back(submit(P4_OPC_PUT, encodePut(killBatch("producer1", "f" + std::to_string(*id), *id, 64, 3))));
+            *id += 64;
         }
-        *id += 64;
+        for (uint32_t sl : slots) {
+            Result r = wait(sl);
+            if (r.status != P4_OK) {
+                std::fprintf(stderr, "  put failed: %d %s\n", r.status, r.err.c_str());
+                std::_Exit(1);
+            }
+        }
     }
     Batch b = killBatch("producer" + std::to_string(c % 3), "b" + std::to_string(c / 7), *id, 500, c % 3);
     if (c % 5 == 4)
