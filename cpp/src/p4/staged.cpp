@@ -368,6 +368,20 @@ int64_t stagedMismatches(Feed* f, Conn* c) {
 }
 
 // ---- the merge ------------------------------------------------------------------------------------------
+namespace {
+// Native test builds: P4_MERGE_DEBUG=1 logs each merge's start and end on
+// stderr (the kill-during-merge test times its kills by them).
+void mergeLog(const char* what, const Feed* f, size_t rows, int rc) {
+#if !defined(__wasm__)
+    if (!std::getenv("P4_MERGE_DEBUG")) return;
+    std::fprintf(stderr, "%s %s rows %zu rc %d\n", what, f->path.c_str(), rows, rc);
+    std::fflush(stderr);
+#else
+    (void)what; (void)f; (void)rows; (void)rc;
+#endif
+}
+}  // namespace
+
 int32_t mergeFeed(Engine* e, Type* t, Feed* f, std::string* err) {
     std::shared_ptr<const Staged> v;
     {
@@ -401,6 +415,7 @@ int32_t mergeFeed(Engine* e, Type* t, Feed* f, std::string* err) {
     std::snprintf(sql, sizeof sql, "PRAGMA cache_spill=-%llu", (unsigned long long)std::max<uint64_t>(budgetKiB, kWriterSpillKiB));
     c->exec(sql);
     int rc = c->exec("BEGIN IMMEDIATE");
+    mergeLog("merge-begin", f, rows.size(), rc);
     sqlite3_stmt* q = rc == SQLITE_OK ? c->sql("UPDATE r SET m=1 WHERE rid=?1 AND m=0") : nullptr;
     if (rc == SQLITE_OK && !q) rc = SQLITE_ERROR;
     std::vector<int64_t> merged;
@@ -417,6 +432,7 @@ int32_t mergeFeed(Engine* e, Type* t, Feed* f, std::string* err) {
     const bool ids = !v->idents.empty();
     if (rc == SQLITE_OK && ids) rc = c->exec("INSERT OR REPLACE INTO ident(h, seq) SELECT h, seq FROM idst ORDER BY rowid; DELETE FROM idst");
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
+    mergeLog("merge-end", f, rows.size(), rc);
     if (rc != SQLITE_OK) {
         if (err) *err = "merge " + f->path + ": " + sqlite3_errmsg(c->db) + " (" + std::to_string(rc) + ")";
         c->exec("ROLLBACK");
@@ -499,12 +515,6 @@ void mergeStep(Engine* e, uint32_t writer) {
         if (run) {
             std::string err;
             const int32_t mrc = mergeFeed(e, pick->type, pick, &err);
-#if !defined(__wasm__)
-            static const bool dbg = std::getenv("P4_MERGE_DEBUG") != nullptr;
-            if (dbg)
-                std::fprintf(stderr, "merge %s rows %lld due %d over %d: %d %s %.0f ms\n", pick->path.c_str(), (long long)pickRows,
-                             int(pickDue), int(over), mrc, err.c_str(), double(monoNs() - now) / 1e6);
-#endif
             if (mrc != P4_OK) {
                 // Nothing changed: the rows stay staged and are merged later.
                 std::lock_guard<std::mutex> g(pick->type->mu);

@@ -21,8 +21,13 @@
 // GATES-stream-r1 B1).
 // The loop's two halves (t_kill_run, t_kill_check) are also tests of their
 // own, so the wasm build's host drives the same loop (scripts/p4-wasm-suite.mjs).
+// t_kill_merge kills inside the indexer's merges of staged rows (BRIEF4
+// ruling (B)): the kill follows the start of a merge transaction, and every
+// call acknowledged before it must be there with its batch; the same checks
+// as t_kill run on the store.
 #include <unistd.h>
 #if !defined(__wasm__)
+#include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #endif
@@ -31,6 +36,7 @@
 #include <filesystem>
 #include <map>
 #include <random>
+#include <set>
 #include <unordered_set>
 
 #include "flatsql/flatsql_io.h"
@@ -463,6 +469,199 @@ P4_SLOW_TEST(t_kill) {
     }
     std::printf("  t_kill: %d pass, %d fail of %d rounds\n", pass, fail, rounds);
     CHECK_EQ(fail, 0, "every round");
+    removeTree(root);
+}
+#endif
+
+#if !defined(__wasm__)
+namespace {
+// Every acknowledged call of a t_kill_merge child is there: each record (GET
+// finds its CID) and, for a source feed's call, its delivery (TAGS lists
+// the feed's source with the call's batch).
+struct Acked {
+    int c = 0, n = 0, feed = 0;
+    uint64_t from = 0;
+    std::string batch;
+};
+bool ackedCheck(const std::string& root, const std::vector<Acked>& acked, std::string* why) {
+    EngineOpts o;
+    if (openEngine(root, o) != P4_OK || registerType(killType()) != P4_OK) {
+        *why = "reopen failed";
+        closeEngine();
+        return false;
+    }
+    int64_t lost = 0, untagged = 0, checked = 0;
+    for (const Acked& a : acked) {
+        std::vector<std::vector<uint8_t>> cids;
+        for (int i = 0; i < a.n; i++) {
+            uint8_t c[36];
+            cidOf(killFrame(a.from + uint64_t(i)), c);
+            cids.push_back(std::vector<uint8_t>(c, c + 36));
+        }
+        Result g = get("PNM", cids, false);
+        std::set<std::string> have;
+        for (size_t k = 0; k < g.rows.size(); k++) have.insert(g.s(k, "cid"));
+        for (auto& c : cids) lost += have.count(cidText(c.data())) ? 0 : 1;
+        checked += a.n;
+        if (a.feed == 2) continue;
+        TlvW tw;
+        tw.text(1, "PNM");
+        std::vector<uint8_t> cl(4);
+        fp::st32(cl.data(), uint32_t(cids.size()));
+        for (auto& c : cids) cl.insert(cl.end(), c.begin(), c.end());
+        tw.raw(40, cl.data(), cl.size());
+        Result tg = call(P4_OPC_TAGS, tw.b);
+        std::set<std::string> tagged;
+        const std::string src = a.feed == 0 ? "src" : kOddSource;
+        for (size_t k = 0; k < tg.rows.size(); k++)
+            if (tg.s(k, "source") == src && tg.s(k, "batch") == a.batch) tagged.insert(tg.s(k, "cid"));
+        for (auto& c : cids) untagged += tagged.count(cidText(c.data())) ? 0 : 1;
+    }
+    closeEngine();
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "acked calls %zu records %lld lost %lld untagged %lld", acked.size(), (long long)checked, (long long)lost,
+                  (long long)untagged);
+    *why = buf;
+    return lost == 0 && untagged == 0;
+}
+}  // namespace
+
+// The kill -9 loop timed into merges: the child ingests with a small index
+// flush threshold (a merge per 2,000 staged rows of a feed) and logs each
+// merge's start and end (P4_MERGE_DEBUG) and each acknowledged call; the
+// parent kills it 0-4 ms after the k-th merge start, then checks the store
+// (t_kill's checks) and every acknowledged call.
+P4_SLOW_TEST(t_kill_merge) {
+    const int rounds = int(argInt("rounds", 100));
+    const std::string root = scratchDir("killmerge") + "/fsql4";
+    std::mt19937 rng(uint32_t(argInt("seed", 1)));
+    int pass = 0, fail = 0, inMerge = 0;
+    std::vector<Acked> acked;  // over every round: the store keeps them all
+    for (int round = 1; round <= rounds; round++) {
+        std::fflush(stdout);
+        std::fflush(stderr);
+        int po[2], pe[2];
+        if (pipe(po) != 0 || pipe(pe) != 0) {
+            CHECK(false, "pipe");
+            return;
+        }
+        const pid_t pid = fork();
+        if (pid == 0) {
+            setenv("P4_MERGE_DEBUG", "1", 1);
+            dup2(po[1], 1);
+            dup2(pe[1], 2);
+            close(po[0]);
+            close(pe[0]);
+            EngineOpts o;
+            o.flushEntries = 2000;
+            o.writers = 2;
+            if (openEngine(root, o) != P4_OK || registerType(killType()) != P4_OK) _exit(2);
+            uint64_t id = uint64_t(round) * 100000000ull;
+            for (int c = 0;; c++) {
+                const int feed = c % 3;
+                const std::string batch = "m" + std::to_string(round) + "-" + std::to_string(c);
+                // every 5th call delivers 400 earlier records again under the
+                // other producer: copies and new instances of staged and
+                // merged records
+                const uint64_t from = c % 5 == 4 ? id - 1600 : id;
+                Batch b = killBatch("producer" + std::to_string(c % 2), batch, from, 400, feed);
+                Result r = put(b);
+                if (r.status != P4_OK) _exit(1);
+                std::printf("ACK %d %llu %d %d %s\n", c, (unsigned long long)from, 400, feed, batch.c_str());
+                std::fflush(stdout);
+                if (c % 5 != 4) id += 400;
+            }
+        }
+        close(po[1]);
+        close(pe[1]);
+        const int want = 1 + int(rng() % 12);
+        const uint64_t delayUs = rng() % 4000;
+        int begins = 0;
+        bool killed = false;
+        std::string outBuf, errBuf;
+        std::map<std::string, int> open;  // merges begun and not ended, by file
+        std::vector<Acked> got;
+        auto lines = [&](std::string& buf, bool isErr) {
+            size_t nl;
+            while ((nl = buf.find('\n')) != std::string::npos) {
+                const std::string line = buf.substr(0, nl);
+                buf.erase(0, nl + 1);
+                if (isErr) {
+                    const bool b = line.rfind("merge-begin ", 0) == 0, e = line.rfind("merge-end ", 0) == 0;
+                    if (b || e) {
+                        const std::string path = line.substr(line.find(' ') + 1, line.find(" rows ") - line.find(' ') - 1);
+                        open[path] += b ? 1 : -1;
+                        if (b) begins++;
+                    }
+                } else if (line.rfind("ACK ", 0) == 0) {
+                    Acked a;
+                    char bt[64] = {};
+                    unsigned long long from = 0;
+                    if (std::sscanf(line.c_str(), "ACK %d %llu %d %d %63s", &a.c, &from, &a.n, &a.feed, bt) == 5) {
+                        a.from = from;
+                        a.batch = bt;
+                        got.push_back(a);
+                    }
+                }
+            }
+        };
+        const uint64_t until = flatsql::ps::monoNs() + 30000000000ull;
+        bool eofO = false, eofE = false;
+        while (!eofO || !eofE) {
+            if (!killed && (begins >= want || flatsql::ps::monoNs() > until)) {
+                flatsql::ps::sleepNs(delayUs * 1000);
+                kill(pid, SIGKILL);
+                killed = true;
+            }
+            pollfd fds[2] = {{po[0], POLLIN, 0}, {pe[0], POLLIN, 0}};
+            if (poll(fds, 2, 50) <= 0) continue;
+            char buf[65536];
+            for (int k = 0; k < 2; k++) {
+                if (!(fds[k].revents & (POLLIN | POLLHUP))) continue;
+                const ssize_t n = read(fds[k].fd, buf, sizeof buf);
+                if (n <= 0) {
+                    (k ? eofE : eofO) = true;
+                    continue;
+                }
+                (k ? errBuf : outBuf).append(buf, size_t(n));
+                lines(k ? errBuf : outBuf, k == 1);
+                // the kill follows the k-th merge start as closely as the delay says
+                if (!killed && begins >= want) break;
+            }
+        }
+        close(po[0]);
+        close(pe[0]);
+        int st = 0;
+        waitpid(pid, &st, 0);
+        bool merging = false;
+        for (auto& kv : open) merging = merging || kv.second > 0;
+        if (merging) inMerge++;
+        acked.insert(acked.end(), got.begin(), got.end());
+        std::string why, why2;
+        const bool ok1 = killCheck(root, &why);
+        const bool ok2 = ackedCheck(root, acked, &why2);
+        if (ok1 && ok2) {
+            pass++;
+            if (round == 1 || round == rounds)
+                std::printf("  round %d: %s; %s; merges begun %d, killed inside one: %d\n", round, why.c_str(), why2.c_str(), begins,
+                            int(merging));
+        } else {
+            fail++;
+            std::printf("  round %d FAIL: %s; %s; merges begun %d, killed inside one: %d\n", round, why.c_str(), why2.c_str(), begins,
+                        int(merging));
+            if (argInt("stop-on-fail", 0)) {
+                std::printf("  store kept: %s\n", root.c_str());
+                CHECK_EQ(fail, 0, "every round");
+                return;
+            }
+        }
+        if (round % 25 == 0)
+            std::printf("  t_kill_merge: %d rounds, %d pass, %d fail, %d killed inside a merge (load %.1f)\n", round, pass, fail, inMerge,
+                        loadAvg());
+    }
+    std::printf("  t_kill_merge: %d pass, %d fail of %d rounds; %d killed inside a merge transaction\n", pass, fail, rounds, inMerge);
+    CHECK_EQ(fail, 0, "every round");
+    CHECK(inMerge > rounds / 4, "kills land inside merges");
     removeTree(root);
 }
 #endif
