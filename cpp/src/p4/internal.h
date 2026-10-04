@@ -51,7 +51,7 @@
 // writer's indexer thread later merges a feed's staged rows into those
 // indexes in one large transaction (m=1). Until then the reads that use them
 // take the staged rows from the feed's in-memory view (Staged), which each
-// commit and each merge replace and a read pins before its SQL runs.
+// commit and each merge replace and a read step pins before its SQL runs.
 //
 // Threads: writers (every feed of a type is written by the type's one writer
 // thread; a file has one writer connection), each with its indexer thread
@@ -290,9 +290,10 @@ struct StRun {
 using IdentKey = std::array<uint8_t, 32>;
 // A feed's staged rows and staged ingest identities (idst), as one commit or
 // merge left them. Immutable: the indexer publishes a new one (Feed::staged,
-// Type::mu); a read pins the one it starts with, before its SQL runs, so a
-// row merged after the pin is in both (and collapses: same key, same seq),
-// one merged before it in the index only.
+// Type::mu); a read step pins the one current when it starts, before its SQL
+// transaction, and lets it go when the step ends, so a row merged after the
+// pin is in both (and collapses: same key, same seq), one merged before it in
+// the index only.
 class Staged {
 public:
     std::vector<std::shared_ptr<const StRun>> runs;

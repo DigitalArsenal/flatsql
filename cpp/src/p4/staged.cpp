@@ -13,8 +13,10 @@
 //
 // A feed's in-memory view (Staged) holds what the reads that use those
 // indexes need of each staged row. A view is immutable; each commit and
-// each merge publishes a new one; a read pins one before its SQL runs. A row
-// merged after a read's pin is in both the view and the index: the same row,
+// each merge publishes a new one; a read step pins one before its SQL
+// transaction starts (and lets it go when the step ends: a walk's chunk, an
+// EPOCH pass over a file). A row merged after the pin is in both the view
+// and the index: the same row,
 // so the same key and seq, and the read's per-record collapse takes it once.
 // A row merged before the pin is in the index only; a staged one in the view
 // only. Reads never wait on a merge.

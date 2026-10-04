@@ -229,25 +229,35 @@ intent journal.
      the feed's **view** of its staged rows is replaced (below);
   9. *indexer:* publish (visible-through) and ack every call of the round, in
      plan order: the ack follows the commits (C-4).
-- **The merge** (the indexer, between rounds): one feed per transaction, its
-  staged rows (at most twice `flushEntries`, CID order: `r_c`'s pages filled
-  one after the other) set `m=1`, which puts them in `r_c`, `r_ke` and
-  `r_w`, and `idst` moved into `ident`; then the feed's view without them.
-  The transaction keeps its dirty pages in memory up to a quarter of the hard
-  heap (at most 256 MiB), so each page is written once. A feed is due when it
-  holds `flushEntries` staged rows (config tag 42, "index flush entries",
-  131,072 by default), when it has had no new rows for 2 s (a quiet feed
-  ends fully indexed), or, while all staged rows together pass 4 x
-  `flushEntries`, when it holds the most. The due feeds are merged one after
-  the other until calls wait for their ack; past 8 x `flushEntries` staged
-  rows the merges go first. A failed merge changes nothing (tried again 2 s
-  later). REBUILD 1 merges everything. Stats 14 and 15 ("index flushes",
-  "index flush entries") count the merges and the rows merged.
+- **The merge** (the indexer, between rounds, and every 250 ms while no
+  round waits): one feed per transaction, its staged rows (at most twice
+  `flushEntries`, CID order: `r_c`'s pages filled one after the other) set
+  `m=1`, which puts them in `r_c`, `r_ke` and `r_w`, and `idst` moved into
+  `ident`; then the feed's view without them. The transaction keeps its
+  dirty pages in memory up to a quarter of the hard heap (at most 256 MiB),
+  so each page is written once. A merge costs about every page of the feed's
+  three random-keyed indexes whatever it carries, so it waits for many rows:
+  - a feed is **due** when it holds `flushEntries` staged rows (config tag
+    42, "index flush entries", 131,072 by default), or when it has had no
+    new rows for 30 s (a quiet feed ends fully indexed; a delivery that
+    follows within the window shares the merge);
+  - the due feeds are merged one after the other until calls wait for their
+    ack;
+  - the views of every feed are **capped** (§7): past half the cap the feed
+    holding the most staged rows is merged even when not due; past the cap
+    the merges go on before any more acks (the acks wait).
+
+  A failed merge changes nothing (tried again 2 s later). REBUILD 1 merges
+  everything. Stats 14 and 15 ("index flushes", "index flush entries") count
+  the merges and the rows merged.
 - **The view** (`Staged`, per feed): what the reads that use `r_c`, `r_ke`
   or `r_w` need of each staged row (rid, CID, epoch, object key, w, delivery
-  time, ts), in a few sorted runs, and the staged identities. It is
-  immutable: each commit and each merge publishes a new one, a read pins the
-  one it starts with.
+  time, ts), in a few runs each sorted four ways (rid; CID; object, epoch;
+  w), and the staged identities. It is immutable: each commit and each merge
+  publishes a new one (a commit adds a run, runs merge as they grow; a run
+  that loses rows, to a merge or a delete, is copied without them, so a view
+  never keeps merged rows' memory). A read step pins the one current when it
+  starts (§6).
 
   A group is planned on the state its type's pending units leave its records
   in (their seeds); planning reads go through the reader pool and see
@@ -417,17 +427,23 @@ its feed that matches the lane filter (§3.6), or in a newest-first page (SCAN
 and source from the file and the rest from its ids: never blank when the
 record has a tag.
 
-- **Staged rows:** `r_c`, `r_ke` and `r_w` hold merged rows only. A scan
-  pins each file's view before any of its SQL runs, and every walk or probe
-  through those indexes also takes the view's rows in the same order and
-  range (a CID or object probe, a CID or w walk chunk, an object's epochs).
-  A row merged after the pin comes from both with the same key and seq and
-  collapses (a record's entries are adjacent in every order); one merged
-  before it is in the index only; a staged one in the view only. Walks
-  through `r_s`, `r_a`, `r_t` and the rows themselves (one rid range of
-  table `r`) see staged rows directly. Reads never wait on a merge (WAL
-  snapshots, an immutable view). The planner's lookups (dedupe by CID, CAT
-  supersede by object, identities) take the view the same way.
+- **Staged rows:** `r_c`, `r_ke` and `r_w` hold merged rows only. Every
+  walk or probe through them also takes the file's view's rows in the same
+  order and range (a CID or object probe, a CID or w walk chunk, an object's
+  epochs). Each step (a walk's chunk, the predicates' probes, an EPOCH pass
+  over a file, GET's probe of a file) pins the view before its SQL
+  transaction starts and lets it go when it ends, as each step already has a
+  read transaction of its own: a view outlives no step, and no step waits on
+  the host. A row merged after the pin comes from both with the same key and
+  seq and collapses (a record's entries are adjacent in every order); one
+  merged before it is in the step's SQL snapshot, which starts after the
+  pin; a staged one in the view only. Walks through `r_s`, `r_a`, `r_t` and
+  the rows themselves (one rid range of table `r`) see staged rows directly.
+  Reads never wait on a merge (WAL snapshots, an immutable view). The
+  planner's lookups (dedupe by CID, CAT supersede by object, identities)
+  take the view the same way. Staged rows cost reads nothing measurable:
+  500k staged rows over 300 feeds, every read shape within noise of the
+  same store all merged.
 - **A18 (C-31):** `<TYPE>@<source>` is the newest N records of that type from
   that source (the source's feed files' `r_s`, newest first, merged); `<TYPE>`
   the type's newest N (every feed file's `r_s`, merged). Every other filter
@@ -509,10 +525,23 @@ files.
 - Nothing is held back beyond the pipeline: at most 16 planned units per
   writer wait for their round; a unit's seed is its type's pending units'
   touched records only.
-- The views of staged rows: about 130 bytes per staged row (its keys and
-  four sorted pointers); the merges keep all of them below about 8 x
-  `flushEntries` rows (1M by default) plus a round. A merge transaction
-  holds up to a quarter of the hard heap (at most 256 MiB) of dirty pages.
+- **The views of staged rows** are C++ heap beside SQLite's, in the 2 GiB
+  wasm memory. A staged row is 128 bytes on wasm32 (the row 112, its four
+  sorted pointers 16; native 120 + 32) plus its object key's text past the
+  string's inline buffer (10 bytes on wasm32), and an identity 40 bytes. The
+  cap over every feed's view is 8 x `flushEntries` rows (1,048,576 by
+  default: 128 MiB at 128 bytes a row) or a quarter of the hard heap (160 MiB
+  by default), whichever comes first; the merges keep the views under it
+  (§3), and a round adds at most 16 units per writer before the next check
+  (65,536 rows at 4,096-record calls: 8 MiB). So at most about 235 MB with
+  the default 8 writers; SQLite's 640 MiB, the mailbox (~140 MiB at the
+  default slots) and the views stay well inside 2 GiB. Briefly beside them:
+  a superseded view a running read step still holds (one step, never across
+  a wait on the host) and a publish's new orders. Measured native: 152 bytes
+  a row on the 5M bench (76 MB at 500k staged rows), 178 on W01 (35-character
+  MPE keys, IQC identities).
+- A merge transaction holds up to a quarter of the hard heap (at most 256
+  MiB) of dirty pages (SQLite heap, inside the hard heap).
 - Streams: one open handle per feed (and a replaced generation while kept).
 
 ## 8. The artifact
@@ -544,8 +573,11 @@ cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=30
   records land in another feed, so records sit in two or three feed files,
   a row set in each; the same new records from three producers at once,
   each to its own feed; a batch supersede every 13th call; a 4 MiB quota
-  every 11th), is killed with SIGKILL at a random point, and the store is
-  checked: every index passes `integrity_check`; a CID has one seq in each
+  every 11th; every 4th step four calls at once, each to a feed new to the
+  store, `prov@fresh-<id>`, so kills land between new feeds' first frames
+  and their first commits: GATES-stream-r1 B1), is killed with SIGKILL at a
+  random point, and the store is checked: a source feed's row never comes
+  back without its batch; every index passes `integrity_check`; a CID has one seq in each
   feed file and a seq one CID; no CID is both in local and in a feed file;
   every CID on disk is found by GET; the count
   equals the (feed file, CID) pairs on disk; REBUILD 8 finds no mismatch;
@@ -557,7 +589,8 @@ cpp/build/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=30
   there and every acknowledged tag instance still lists its source,
   REBUILD 8 is clean, the count equals the records of a full scan, each
   with its own seq. Its index flush threshold (2,000) and `t_kill`'s (5,000)
-  make the merges frequent, so both loops crash inside merges too.
+  make the merges frequent (and the views' cap, 8 x the threshold, holds
+  acks back often), so both loops crash inside merges too.
 - **`t_kill_merge`:** the kill -9 loop timed into merges: a child ingests
   with a 2,000-row flush threshold and logs each merge's start and end
   (`P4_MERGE_DEBUG`, native test builds) and each acknowledged call; the
