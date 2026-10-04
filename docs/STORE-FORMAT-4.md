@@ -186,20 +186,22 @@ intent journal.
      frame the record already has in that feed when the bytes are the same,
      else a new frame, appended to the feed's stream at the writer's end
      offset (not synced). The writer then plans the next group;
-  7. *indexer:* the type index, only for a new feed or token;
-  8. *indexer:* each feed, feeds before local: **its stream synced first**,
-     then its index in one transaction (rows, its counters, instances, tokens,
-     identities, moves, and the stream's new `mark`);
-  9. *indexer:* publish (visible-through) and ack: the ack follows the
-     commits (C-4).
+  7. *indexer:* a **round** takes every unit queued for it (the writer keeps
+     up to 16 planned units in flight): the type index first, only for a new
+     feed or token;
+  8. *indexer:* each feed file the round touches, feeds before local, in ONE
+     transaction for the whole round: the units' rows in plan order, its
+     counters, instances, tokens, identities and moves; **its stream synced
+     first**, then the transaction commits with the stream's new `mark`;
+  9. *indexer:* publish (visible-through) and ack every call of the round, in
+     plan order: the ack follows the commits (C-4).
 
-  Units are committed and answered in the order they were planned: the writer
-  hands its indexer the next unit only once the previous one is done. The
-  next group of the same type is planned on the state the unit still being
-  committed leaves its records in (its seed); planning reads go through the
-  reader pool and see committed rows only. A failed commit cuts the streams
-  it appended to back to their marks, and a group planned on it is answered
-  with the error, unstored. Planning never writes SQLite.
+  A group is planned on the state its type's pending units leave its records
+  in (their seeds); planning reads go through the reader pool and see
+  committed rows only; planning never writes SQLite. A failed round fails
+  its calls, and every unit after it on that writer (poison) until the writer
+  has cut the streams they appended to back to their marks; those calls are
+  answered with the error, unstored.
 - **SUPERSEDE** (`provider`, `source`, keep): one feed; its rows whose batch
   is not the kept one go, a chunk of 32,768 rows per transaction; a record
   left with no row in the feed leaves it.
@@ -422,9 +424,9 @@ files.
   heap is past three quarters of the soft limit. A `SQLITE_NOMEM` open
   closes the idle readers and tries once more.
 - Writer connections are an LRU (tag 21); the LRU never closes a pinned one.
-- Nothing is held back in memory: a unit is committed by its indexer right
-  after it is planned; the next unit's seed is the pending unit's touched
-  records only.
+- Nothing is held back beyond the pipeline: at most 16 planned units per
+  writer wait for their round; a unit's seed is its type's pending units'
+  touched records only.
 - Streams: one open handle per feed (and a replaced generation while kept).
 
 ## 8. The artifact
