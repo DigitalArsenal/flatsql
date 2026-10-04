@@ -126,8 +126,11 @@ struct Field {
     static Field f64(const std::string& n, double v) { Field f; f.name = n; f.kind = kDouble; f.d = v; return f; }
     static Field raw(const std::string& n, std::vector<uint8_t> v) { Field f; f.name = n; f.kind = kBytes; f.bytes = std::move(v); return f; }
 };
-// A frame: [u32 size][FlatBuffer with the type's file identifier].
-std::vector<uint8_t> buildFrame(const TestType& t, const std::vector<Field>& fields);
+// A frame: [u32 size][FlatBuffer with the type's file identifier]. Built
+// size-prefixed (its fields aligned from the prefix, as a producer's builder
+// plus [4:] leaves them) or, startAligned, as a bare FlatBuffer with the size
+// put in front (aligned from the record's own start).
+std::vector<uint8_t> buildFrame(const TestType& t, const std::vector<Field>& fields, bool startAligned = false);
 std::vector<uint8_t> ommFrame(uint32_t norad, const std::string& objectId, const std::string& epoch, double mm = 15.5,
                               size_t pad = 0);
 std::vector<uint8_t> mpeFrame(const std::string& entity, double epoch, double x = 1.0);

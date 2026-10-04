@@ -232,7 +232,7 @@ TestType pnmLikeType(const std::string& name) {
     return x;
 }
 
-std::vector<uint8_t> buildFrame(const TestType& t, const std::vector<Field>& fields) {
+std::vector<uint8_t> buildFrame(const TestType& t, const std::vector<Field>& fields, bool startAligned) {
     const reflection::Object* root = t.schema->root_table();
     flatbuffers::FlatBufferBuilder b(512);
     std::vector<std::pair<uint16_t, uint32_t>> offs;
@@ -263,6 +263,13 @@ std::vector<uint8_t> buildFrame(const TestType& t, const std::vector<Field>& fie
     for (const auto& o : offs) b.AddOffset(o.first, flatbuffers::Offset<void>(o.second));
     const auto end = b.EndTable(start);
     char fid[5] = {char(t.fid[0]), char(t.fid[1]), char(t.fid[2]), char(t.fid[3]), 0};
+    if (startAligned) {
+        b.Finish(flatbuffers::Offset<flatbuffers::Table>(end), fid);
+        std::vector<uint8_t> out(4);
+        flatsql::p4::st32(out.data(), b.GetSize());
+        out.insert(out.end(), b.GetBufferPointer(), b.GetBufferPointer() + b.GetSize());
+        return out;
+    }
     b.FinishSizePrefixed(flatbuffers::Offset<flatbuffers::Table>(end), fid);
     return std::vector<uint8_t>(b.GetBufferPointer(), b.GetBufferPointer() + b.GetSize());
 }
