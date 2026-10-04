@@ -305,7 +305,25 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
     }
     if (!ioExists(t->pIdx)) return P4_OK;
     const int32_t rc = typeFilesOpen(t, err);
-    if (rc != P4_OK) return rc;
+    if (rc != P4_OK) {
+        // The caller deletes the type: nothing the open made may outlive it
+        // (its feeds sit in the writer LRU, which engineStop walks).
+        std::vector<Feed*> fs;
+        {
+            std::lock_guard<std::mutex> g(t->mu);
+            for (auto& f : t->feeds) fs.push_back(f.get());
+        }
+        for (Feed* f : fs) {
+            writerDrop(e, f);
+            e->rpool.dropPath(f->path);
+            streamClose(f);
+            std::lock_guard<std::mutex> g(t->mu);
+            stagedPublish(e, f, nullptr, false);
+        }
+        delete t->idx;
+        t->idx = nullptr;
+        return rc;
+    }
     t->hasFiles.store(true, std::memory_order_release);
     typeFileBytes(t);
     return P4_OK;
