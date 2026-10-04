@@ -74,7 +74,7 @@ std::shared_ptr<Stream> streamAt(Feed* f, uint32_t gen, int32_t* rc) {
     return s;
 }
 
-int32_t streamRead(Stream* s, int64_t off, int64_t len, std::string* out) {
+int32_t streamRead(Stream* s, int64_t off, int64_t len, std::string* out, bool frame) {
     if (off < 0 || len < 0 || len > (int64_t(1) << 31) - 8) return P4_E_CORRUPT;
     out->resize(size_t(len) + 4);
     size_t got = 0;
@@ -85,7 +85,7 @@ int32_t streamRead(Stream* s, int64_t off, int64_t len, std::string* out) {
         got += size_t(n);
     }
     if (ld32(reinterpret_cast<const uint8_t*>(out->data())) != uint32_t(len)) return P4_E_CORRUPT;
-    out->erase(0, 4);
+    if (!frame) out->erase(0, 4);
     return P4_OK;
 }
 

@@ -648,8 +648,11 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
                 if (!s || status != P4_OK) break;
                 sqlite3_bind_int64(s, 1, seq << 16);
                 sqlite3_bind_int64(s, 2, (seq << 16) | 0xffff);
+                // The frame with its size prefix, as format 1 hands it: a record
+                // whose 8-byte fields align to a prefix the producer cut off
+                // verifies from that origin, any other from its own (C-46 (3)).
                 if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 2) == SQLITE_NULL &&
-                    streamRead(stream.get(), sqlite3_column_int64(s, 0), sqlite3_column_int64(s, 1), &bytes) == P4_OK) {
+                    streamRead(stream.get(), sqlite3_column_int64(s, 0), sqlite3_column_int64(s, 1), &bytes, true) == P4_OK) {
                     std::string text, err;
                     if (reflectedRecordSearchText(sp->tc.bfbs().data(), sp->tc.bfbs().size(), fid,
                                                   reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), text, &err)) {
