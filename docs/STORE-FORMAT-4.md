@@ -141,8 +141,10 @@ REBUILD 1), so an index either has no schema or a complete one.
 | `feed(fid, provider, source, name, gen)` | feed id <-> (provider, source), file name, and the stream generation (an index rebuilt from its stream reads it) |
 | `tok(id, token, peer)` | the type's producer tokens in order (the lowest id is the first copy, C-12) |
 
-A write registers a new feed or token here before the first feed commit that
-uses it. Each feed's counters live in its own index (read at open); the
+A write registers a new feed or token here while its type's writer plans it,
+before any file of a new feed exists (only that writer and the open use the
+type index): every feed file on disk belongs to a registered feed, which
+every open visits and recovers. Each feed's counters live in its own index (read at open); the
 type's totals (records, copies, bytes, bounds) are sums over the feeds, so
 HEAD with no filter, SUMMARY 1 and 2 never open a feed file. There is no
 intent journal.
@@ -184,11 +186,13 @@ intent journal.
      rowids, C-39 E1); they stay above visible-through until committed;
   6. *writer:* each new row's rid (after its record's live rows) and frame: a
      frame the record already has in that feed when the bytes are the same,
-     else a new frame, appended to the feed's stream at the writer's end
-     offset (not synced). The writer then plans the next group;
+     else a new frame. New feeds and tokens go into the type index
+     (`synchronous=FULL`), and a new feed's index file is made (created
+     durably, its schema committed with `mark` 0) before its first frame. The
+     frames are appended to the feed's stream at the writer's end offset (not
+     synced). The writer then plans the next group;
   7. *indexer:* a **round** takes every unit queued for it (the writer keeps
-     up to 16 planned units in flight): the type index first, only for a new
-     feed or token;
+     up to 16 planned units in flight);
   8. *indexer:* each feed file the round touches, feeds before local, in ONE
      transaction for the whole round: the units' rows in plan order, its
      counters, instances, tokens, identities and moves; **its stream synced
@@ -198,7 +202,8 @@ intent journal.
 
   A group is planned on the state its type's pending units leave its records
   in (their seeds); planning reads go through the reader pool and see
-  committed rows only; planning never writes SQLite. A failed round fails
+  committed rows only; planning writes SQLite only to register a new feed or
+  token and to make a new feed's index file. A failed round fails
   its calls, and every unit after it on that writer (poison) until the writer
   has cut the streams they appended to back to their marks; those calls are
   answered with the error, unstored.
@@ -242,7 +247,11 @@ before it serves (M8), visits every feed the type index names:
 3. a compaction cut by a crash leaves the next generation (unlinked) or the
    replaced one not yet unlinked (unlinked);
 4. an index that is missing (or damaged: `SQLITE_CORRUPT`/`NOTADB`) is rebuilt
-   from its stream after the other feeds are open: the damaged file goes, and
+   from its stream after the other feeds are open. A feed's index file exists
+   before its first frame (step 6 of a PUT), so a stream without one lost its
+   index; a feed whose first commit a crash cut has its index with `mark` 0,
+   and step 2 cuts its frames (never acknowledged) instead of indexing them
+   (GATES-stream-r1 B1). The rebuild: the damaged file goes, and
    every whole frame is indexed again with its keys taken from the bytes (the
    CID is the sha256 of the frame's FlatBuffer; epoch and object key are
    extracted). What only the index held is gone: each record gets a fresh
