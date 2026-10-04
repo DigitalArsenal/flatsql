@@ -756,7 +756,8 @@ int32_t Scan::open() {
     lo_ = s_.seqAfter > 0 ? s_.seqAfter : 0;
     if (!s_.search.empty()) {
         // FTS5 (background index; C-4's exception), checked a page at a time.
-        if (!sp_->fullText || !ioExists(t_->pFts)) return P4_E_UNSUPPORTED;
+        // A type without records answers none (below).
+        if (!sp_->fullText || (t_->hasFiles.load(std::memory_order_acquire) && !ioExists(t_->pFts))) return P4_E_UNSUPPORTED;
         fts_ = true;
     }
     if (s_.order == 0) s_.order = P4_ORDER_SEQ_ASC;
@@ -3053,8 +3054,11 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
             std::string state;
             int64_t through;
             {
+                // A type without records yet has nothing to index: ready, so a
+                // search answers no rows as format 1 does (C-46 (2)).
                 std::lock_guard<std::mutex> g(t->ftsMu);
-                state = !sp->fullText ? "off" : t->ftsState == 2 ? "ready" : "building";
+                const bool empty = !t->hasFiles.load(std::memory_order_acquire);
+                state = !sp->fullText ? "off" : t->ftsState == 2 || empty ? "ready" : "building";
                 through = t->ftsThrough;
             }
             o.enc.beginRow();
