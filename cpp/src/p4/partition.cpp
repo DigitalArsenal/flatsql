@@ -3,7 +3,7 @@
 //
 // A feed is its record stream P/<TYPE>/<feed>.fsdata (stream.cpp) and its
 // index file P/<TYPE>/<feed>.db, the feed's table:
-//   r(rid PK, seq, n, b, c, u, at, cid, e, k, ts, f, x, off, len, m, w = coalesce(e, ts),
+//   r(rid PK, seq, n, b, c, u, at, cid, e, k, ts, f, x, off, len, kk, m, w = coalesce(e, ts),
 //     cp = substr(cid, 1, 8))
 //     rid = seq << 16 | j: a record's rows are one rowid range (arrival order);
 //     n the publishing node (node: producer token, peer), b the batch (batch:
@@ -11,12 +11,14 @@
 //     and u the url (small ids, 0 = ""), at when this feed delivered it;
 //     off, len the record's frame in the stream ([u32 len][bytes] at off: the
 //     bytes verbatim, sealed bytes when sealed), x the signature, f a sealed
-//     record's extracted COL values, m 0 while the row is staged (staged.cpp).
-//     No record bytes are in SQLite.
+//     record's extracted COL values, kk the object key's id (okey: each
+//     object key once, so the object index holds a small integer, not the
+//     key), m 0 while the row is staged (staged.cpp). No record bytes are in
+//     SQLite.
 //   indexes: r_s(seq) arrival, r_b(b) batch, r_a(at DESC) delivery time (a
 //     feed file) or r_t(ts DESC) the copies' time (local): every row; r_c(cp)
 //     the file's one CID index (the CID key's first 8 bytes; a lookup checks the
-//     whole CID in the row), r_ke(k, e) object + epoch, r_w(w DESC) epoch:
+//     whole CID in the row), r_ke(kk, e) object + epoch, r_w(w DESC) epoch:
 //     merged rows (WHERE m=1); r_m(rid) the staged rows (WHERE m=0)
 //   inst(b, c, ...) each instance's counters; tokc(producer, ...) each
 //   token's copies; ident(h, seq) ingest identities (IQC), idst(h, seq) the
@@ -56,9 +58,10 @@ const char* kFileSchema =
     "CREATE TABLE IF NOT EXISTS ident(h BLOB PRIMARY KEY, seq INTEGER NOT NULL) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS idst(h BLOB NOT NULL, seq INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS moved(seq INTEGER PRIMARY KEY);"
+    "CREATE TABLE IF NOT EXISTS okey(id INTEGER PRIMARY KEY, k NOT NULL UNIQUE);"
     "CREATE TABLE IF NOT EXISTS r(rid INTEGER PRIMARY KEY, seq INTEGER NOT NULL, n INTEGER NOT NULL, b INTEGER NOT NULL,"
     " c INTEGER NOT NULL, u INTEGER NOT NULL, at INTEGER NOT NULL, cid BLOB NOT NULL, e INTEGER, k, ts INTEGER NOT NULL,"
-    " f BLOB, x BLOB, off INTEGER NOT NULL, len INTEGER NOT NULL, m INTEGER NOT NULL DEFAULT 1,"
+    " f BLOB, x BLOB, off INTEGER NOT NULL, len INTEGER NOT NULL, kk INTEGER, m INTEGER NOT NULL DEFAULT 1,"
     " w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL, cp BLOB GENERATED ALWAYS AS (substr(cid, 1, 8)) VIRTUAL);";
 }  // namespace
 
@@ -76,7 +79,8 @@ const char* kFileSchema =
 // them in large batches, and r_m lists the staged rows (staged.cpp). r_c is
 // keyed on cp, the CID key's first 8 bytes: an entry is ~20 bytes instead of
 // ~44, and a merge touches about every page of it; cp order is CID order (a
-// walk orders a cp group by the CID).
+// walk orders a cp group by the CID). r_ke is keyed on kk, the object key's
+// okey id: a few bytes whatever the key's length.
 namespace {
 // The indexes' DDL and the meta row that records them (no transaction).
 std::string indexDdl(Type* t, bool local) {
@@ -88,7 +92,7 @@ std::string indexDdl(Type* t, bool local) {
         "CREATE INDEX IF NOT EXISTS r_b ON r(b);"
         "CREATE INDEX IF NOT EXISTS r_m ON r(rid) WHERE m=0;";
     ddl += local ? "CREATE INDEX IF NOT EXISTS r_t ON r(ts DESC);" : "CREATE INDEX IF NOT EXISTS r_a ON r(at DESC);";
-    if (sp->hasObject) ddl += "CREATE INDEX IF NOT EXISTS r_ke ON r(k, e) WHERE m=1;";
+    if (sp->hasObject) ddl += "CREATE INDEX IF NOT EXISTS r_ke ON r(kk, e) WHERE m=1;";
     ddl += "INSERT OR REPLACE INTO meta(k, v) VALUES('ix', 1);";
     return ddl;
 }
@@ -469,7 +473,7 @@ Conn* writerPin(Engine* e, Feed* f, int32_t* rc, std::string* err) {
         }
     }
     Conn* c = nullptr;
-    const int r = openConn(f->path, OpenKind::Writer, e->cfg.writerCacheKiB, sp->pageSize, &c, err);
+    const int r = openConn(f->path, OpenKind::Writer, e->cfg.writerCacheKiB, kIndexPageSize, &c, err);
     if (r != SQLITE_OK) {
         *rc = statusOfSqlite(r);
         if (err) *err = f->path + ": " + *err + " (" + std::to_string(r) + ")";
@@ -1046,7 +1050,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
     Conn* c = planAcquire(e_, f, &st, &er);
     if (!c) return st;
     std::vector<int64_t> seqs;
-    sqlite3_stmt* q = c->sql("SELECT rid, seq FROM r INDEXED BY r_ke WHERE k=?1 AND m=1 AND seq<>?2");
+    sqlite3_stmt* q = c->sql("SELECT rid, seq FROM r INDEXED BY r_ke WHERE kk=(SELECT id FROM okey WHERE k=?1) AND m=1 AND seq<>?2");
     int rc = SQLITE_ERROR;
     std::vector<std::pair<int64_t, int64_t>> cand;
     if (q) {

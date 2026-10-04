@@ -423,11 +423,15 @@ const char* stmtSql(StmtId id) {
         // a row's bytes are the stream frame at off ([u32 len][bytes])
         case S_R_SEQ: return "SELECT rid, n, b, c, u, at, cid, e, k, ts, f, x, len, off FROM r WHERE rid>=?1 AND rid<=?2";
         case S_R_FRAME: return "SELECT off, len FROM r WHERE rid=?1";
+        // kk: the object key's okey id (S_OKEY_INS first)
         case S_R_INS:
-            return "INSERT INTO r(rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,off,len) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)";
+            return "INSERT INTO r(rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,off,len,kk) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,"
+                   "(SELECT id FROM okey WHERE k=?10))";
         // a staged row (m=0): outside r_c, r_ke and r_w until the indexer merges it
         case S_R_STAGE:
-            return "INSERT INTO r(rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,off,len,m) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,0)";
+            return "INSERT INTO r(rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,off,len,kk,m) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,"
+                   "(SELECT id FROM okey WHERE k=?10),0)";
+        case S_OKEY_INS: return "INSERT OR IGNORE INTO okey(k) VALUES(?1)";
         case S_R_DEL: return "DELETE FROM r WHERE rid=?1";
         case S_R_URL: return "UPDATE r SET u=?2 WHERE rid=?1";
         case S_R_OFF: return "UPDATE r SET off=?2 WHERE rid=?1";

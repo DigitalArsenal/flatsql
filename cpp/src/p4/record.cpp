@@ -905,6 +905,12 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
                     rc = SQLITE_INTERNAL;  // frames() gives every new row its frame
                     break;
                 }
+                if (r->k.type != 0) {  // the object key's id (okey), once per key
+                    sqlite3_stmt* ok = c->get(S_OKEY_INS);
+                    r->k.bind(ok, 1);
+                    bad(sqlite3_step(ok));
+                    sqlite3_reset(ok);
+                }
                 // A row of an indexed file is staged (m=0); a migration's
                 // append (no secondary indexes until REBUILD 1) is not.
                 sqlite3_stmt* q = c->get(x.indexed ? S_R_STAGE : S_R_INS);

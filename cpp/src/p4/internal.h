@@ -212,7 +212,7 @@ enum StmtId : int {
     S_R_SEQ, S_R_FRAME, S_R_INS, S_R_DEL, S_R_URL, S_R_OFF, S_R_MAXRID, S_META_SET, S_META_GEN,
     S_NODE_INS, S_BATCH_INS, S_CKEY_GET, S_CKEY_INS, S_URL_GET, S_URL_TEXT, S_URL_INS, S_CKEY_TEXT,
     S_INST_PUT, S_INST_DEL, S_R_CID, S_R_CIDSCAN, S_IDENT_GET, S_IDENT_INS, S_TOKC_PUT, S_TOKC_DEL,
-    S_MOVED_INS, S_R_STAGE, S_IDST_INS,
+    S_MOVED_INS, S_R_STAGE, S_IDST_INS, S_OKEY_INS,
     S_COUNT
 };
 struct Conn {
@@ -236,6 +236,12 @@ enum class OpenKind { Writer, Reader, IndexReader, Index, Maint };
 // any to the WAL (a spilled page touched again is written again). A merge
 // raises it to its own budget for its transaction.
 constexpr uint32_t kWriterSpillKiB = 32768;
+// A feed index file's page size, whatever the spec's tag 8 says: the file
+// holds index rows only (no record bytes), every commit writes each page it
+// dirties whole, and a page smaller than the VFS's 4 KiB sector drags its
+// sector-mates along (the VFS claims no power-safe overwrite). WRITE-AMP:
+// IQC's 16 KiB pages wrote 30% more.
+constexpr uint32_t kIndexPageSize = 4096;
 int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t pageSize, Conn** out,
              std::string* err);
 int32_t statusOfSqlite(int rc);  // SQLite result -> P4 status (BUSY and I/O errors are errors, never misses)
@@ -443,7 +449,7 @@ struct Spec {
     std::string name;
     std::vector<uint8_t> bytes;  // the registered TLV
     ps::TypeConfig tc;
-    uint32_t pageSize = 4096;
+    uint32_t pageSize = 4096;  // spec tag 8: accepted and kept; a feed index uses kIndexPageSize
     bool identity = false;
     uint64_t a18Bound = 10000;
     uint8_t epochProfile = 0;

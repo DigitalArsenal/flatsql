@@ -626,7 +626,7 @@ int32_t Scan::candidatesFromPreds(bool* used) {
         if (!c) return statusOfSqlite(rc);
         const std::string sql = std::string("SELECT seq, w, cid, ") + ovCol +
                                 (s_.hasCid ? " FROM r INDEXED BY r_c WHERE cp=substr(?1, 1, 8) AND cid=?1 AND m=1 AND seq>?2 AND seq<=?3"
-                                           : " FROM r INDEXED BY r_ke WHERE k=?1 AND m=1 AND seq>?2 AND seq<=?3");
+                                           : " FROM r INDEXED BY r_ke WHERE kk=(SELECT id FROM okey WHERE k=?1) AND m=1 AND seq>?2 AND seq<=?3");
         sqlite3_stmt* q = c->sql(sql);
         if (!q) {
             e_->rpool.release(c);
@@ -1515,15 +1515,19 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
         int orc = 0;
         Conn* c = e_->rpool.acquire(files_[fi].path, OpenKind::Reader, &orc, nullptr);
         if (!c) return statusOfSqlite(orc);
-        sqlite3_stmt* firstK = c->sql("SELECT k FROM r INDEXED BY r_ke WHERE k IS NOT NULL AND m=1 ORDER BY k LIMIT 1");
-        sqlite3_stmt* nextK = c->sql("SELECT k FROM r INDEXED BY r_ke WHERE k>?1 AND m=1 ORDER BY k LIMIT 1");
-        sqlite3_stmt* below = c->sql("SELECT e, cid, seq FROM r INDEXED BY r_ke WHERE k=?1 AND m=1 AND e<=?2 AND e>=?3 AND seq>?4"
+        // The object index holds each key's okey id (kk): the objects are
+        // okey's rows, in key order (a key whose rows are gone finds none),
+        // each one's entity its key; an object predicate's values are looked
+        // up there.
+        sqlite3_stmt* keys = c->sql("SELECT id, k FROM okey ORDER BY k");
+        sqlite3_stmt* keyId = c->sql("SELECT id FROM okey WHERE k=?1");
+        sqlite3_stmt* below = c->sql("SELECT e, cid, seq FROM r INDEXED BY r_ke WHERE kk=?1 AND m=1 AND e<=?2 AND e>=?3 AND seq>?4"
                                      " AND seq<=?5 ORDER BY e DESC");
-        sqlite3_stmt* above = c->sql("SELECT e, cid, seq FROM r INDEXED BY r_ke WHERE k=?1 AND m=1 AND e>=?2 AND e<=?3 AND seq>?4"
+        sqlite3_stmt* above = c->sql("SELECT e, cid, seq FROM r INDEXED BY r_ke WHERE kk=?1 AND m=1 AND e>=?2 AND e<=?3 AND seq>?4"
                                      " AND seq<=?5 ORDER BY e ASC");
-        sqlite3_stmt* noK = c->sql("SELECT e, cid, seq FROM r INDEXED BY r_ke WHERE k IS NULL AND m=1 AND e>=?1 AND e<=?2 AND seq>?3"
+        sqlite3_stmt* noK = c->sql("SELECT e, cid, seq FROM r INDEXED BY r_ke WHERE kk IS NULL AND m=1 AND e>=?1 AND e<=?2 AND seq>?3"
                                    " AND seq<=?4");
-        if (!firstK || !nextK || !below || !above || !noK) {
+        if (!keys || !keyId || !below || !above || !noK) {
             e_->rpool.release(c);
             *handled = false;
             best->clear();
@@ -1545,12 +1549,13 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
         c->exec("BEGIN");
         // The first e-group (in rank order) of one object's run that has a
         // record passing the filters: its lowest-CID passing record. The
-        // merged rows (q) and the object's staged rows (sk, (e, rid) order)
-        // are read together in rank order.
-        auto pick = [&](sqlite3_stmt* q, const KVal& k, const std::vector<const StRow*>* sk, bool down, Pick* out) -> int32_t {
+        // merged rows (q, the object's okey id kk; 0: none here) and its
+        // staged rows (sk, (e, rid) order) are read together in rank order.
+        auto pick = [&](sqlite3_stmt* q, int64_t kk, const std::vector<const StRow*>* sk, bool down, Pick* out) -> int32_t {
             const int64_t lim = down ? std::min(at, wHi) : std::max(at, wLo);
             if (down ? lim < wLo : lim > wHi) return 0;
-            k.bind(q, 1);
+            if (kk) sqlite3_bind_int64(q, 1, kk);
+            else sqlite3_bind_null(q, 1);
             sqlite3_bind_int64(q, 2, lim);
             sqlite3_bind_int64(q, 3, down ? wLo : wHi);
             sqlite3_bind_int64(q, 4, lo_);
@@ -1634,16 +1639,16 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
             }
             return have ? 1 : 0;
         };
-        auto object = [&](const KVal& k, const std::vector<const StRow*>* sk) -> int32_t {
+        auto object = [&](const KVal& k, int64_t kk, const std::vector<const StRow*>* sk) -> int32_t {
             Pick b, a;
             int got = 0;
             if (profile != 4) {
-                const int32_t r = pick(below, k, sk, true, &b);
+                const int32_t r = pick(below, kk, sk, true, &b);
                 if (r < 0) return r;
                 got |= r;
             }
             if (profile != 3) {
-                const int32_t r = pick(above, k, sk, false, &a);
+                const int32_t r = pick(above, kk, sk, false, &a);
                 if (r < 0) return r;
                 got |= r << 1;
             }
@@ -1666,34 +1671,41 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                 if (kv.type == 3) kv.s = v.s;
                 std::vector<const StRow*> sk;
                 if (st) st->ofK(kv, &sk);
-                rc = object(kv, st ? &sk : nullptr);
+                kv.bind(keyId, 1);
+                int64_t kk = 0;
+                const int kr = sqlite3_step(keyId);
+                if (kr == SQLITE_ROW) kk = sqlite3_column_int64(keyId, 0);
+                sqlite3_reset(keyId);
+                if (kr != SQLITE_ROW && kr != SQLITE_DONE) rc = statusOfSqlite(kr);
+                if (rc == P4_OK && (kk || !sk.empty())) rc = object(kv, kk, st ? &sk : nullptr);
                 if (rc != P4_OK) break;
             }
         } else {
-            // The merged objects (one r_ke seek each) and the staged ones,
-            // merged in key order.
+            // okey's keys (one r_ke seek each for the merged rows) and the
+            // staged rows' keys (every one of them is in okey: a staged row's
+            // key is added with it), merged in key order.
             KVal sqlK;
+            int64_t sqlId = 0;
             bool haveSql = false;
-            int r = sqlite3_step(firstK);
-            if (r == SQLITE_ROW) {
-                sqlK.from(firstK, 0);
-                haveSql = true;
-            }
-            sqlite3_reset(firstK);
-            if (r != SQLITE_ROW && r != SQLITE_DONE) rc = statusOfSqlite(r);
+            int r;
+            auto nextSql = [&]() {
+                r = sqlite3_step(keys);
+                haveSql = r == SQLITE_ROW;
+                if (haveSql) {
+                    sqlId = sqlite3_column_int64(keys, 0);
+                    sqlK.from(keys, 1);
+                }
+                if (r != SQLITE_ROW && r != SQLITE_DONE) rc = statusOfSqlite(r);
+            };
+            nextSql();
             while (rc == P4_OK && (haveSql || oi < stObj.size())) {
                 const int cmp = !haveSql ? 1 : oi >= stObj.size() ? -1 : kCmp(sqlK, stObj[oi].first);
                 const KVal k = cmp <= 0 ? sqlK : stObj[oi].first;
-                rc = object(k, cmp >= 0 ? &stObj[oi].second : nullptr);
+                rc = object(k, cmp <= 0 ? sqlId : 0, cmp >= 0 ? &stObj[oi].second : nullptr);
                 if (cmp >= 0) oi++;
-                if (rc != P4_OK || cmp > 0) continue;
-                k.bind(nextK, 1);
-                r = sqlite3_step(nextK);
-                haveSql = r == SQLITE_ROW;
-                if (haveSql) sqlK.from(nextK, 0);
-                sqlite3_reset(nextK);
-                if (r != SQLITE_ROW && r != SQLITE_DONE) rc = statusOfSqlite(r);
+                if (rc == P4_OK && cmp <= 0) nextSql();
             }
+            sqlite3_reset(keys);
             // Records without an object: each its own entity (its CID).
             if (rc == P4_OK) {
                 const int64_t a0 = profile == 4 ? std::max(at, wLo) : wLo;
