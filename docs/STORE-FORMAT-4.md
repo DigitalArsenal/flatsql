@@ -534,7 +534,7 @@ files.
   by default), whichever comes first; the merges keep the views under it
   (§3), and a round adds at most 16 units per writer before the next check
   (65,536 rows at 4,096-record calls: 8 MiB). So at most about 235 MB with
-  the default 8 writers; SQLite's 640 MiB, the mailbox (~140 MiB at the
+  8 writers (the most the defaults pick: cores - 1, at most 8); SQLite's 640 MiB, the mailbox (~140 MiB at the
   default slots) and the views stay well inside 2 GiB. Briefly beside them:
   a superseded view a running read step still holds (one step, never across
   a wait on the host) and a publish's new orders. Measured native: 152 bytes
