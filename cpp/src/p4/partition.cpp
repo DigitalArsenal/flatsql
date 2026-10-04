@@ -3,7 +3,8 @@
 //
 // A feed is its record stream P/<TYPE>/<feed>.fsdata (stream.cpp) and its
 // index file P/<TYPE>/<feed>.db, the feed's table:
-//   r(rid PK, seq, n, b, c, u, at, cid, e, k, ts, f, x, off, len, m, w = coalesce(e, ts))
+//   r(rid PK, seq, n, b, c, u, at, cid, e, k, ts, f, x, off, len, m, w = coalesce(e, ts),
+//     cp = substr(cid, 1, 8))
 //     rid = seq << 16 | j: a record's rows are one rowid range (arrival order);
 //     n the publishing node (node: producer token, peer), b the batch (batch:
 //     batch, producer peer, producer key; 0 on local rows), c the content key
@@ -13,8 +14,9 @@
 //     record's extracted COL values, m 0 while the row is staged (staged.cpp).
 //     No record bytes are in SQLite.
 //   indexes: r_s(seq) arrival, r_b(b) batch, r_a(at DESC) delivery time (a
-//     feed file) or r_t(ts DESC) the copies' time (local): every row; r_c(cid)
-//     the file's one CID index, r_ke(k, e) object + epoch, r_w(w DESC) epoch:
+//     feed file) or r_t(ts DESC) the copies' time (local): every row; r_c(cp)
+//     the file's one CID index (the CID key's first 8 bytes; a lookup checks the
+//     whole CID in the row), r_ke(k, e) object + epoch, r_w(w DESC) epoch:
 //     merged rows (WHERE m=1); r_m(rid) the staged rows (WHERE m=0)
 //   inst(b, c, ...) each instance's counters; tokc(producer, ...) each
 //   token's copies; ident(h, seq) ingest identities (IQC), idst(h, seq) the
@@ -57,7 +59,7 @@ const char* kFileSchema =
     "CREATE TABLE IF NOT EXISTS r(rid INTEGER PRIMARY KEY, seq INTEGER NOT NULL, n INTEGER NOT NULL, b INTEGER NOT NULL,"
     " c INTEGER NOT NULL, u INTEGER NOT NULL, at INTEGER NOT NULL, cid BLOB NOT NULL, e INTEGER, k, ts INTEGER NOT NULL,"
     " f BLOB, x BLOB, off INTEGER NOT NULL, len INTEGER NOT NULL, m INTEGER NOT NULL DEFAULT 1,"
-    " w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL);";
+    " w INTEGER GENERATED ALWAYS AS (coalesce(e, ts)) VIRTUAL, cp BLOB GENERATED ALWAYS AS (substr(cid, 1, 8)) VIRTUAL);";
 }  // namespace
 
 // The file's indexes (C-37 (4), C-38 (1)): arrival seq (r_s: the seqs alone,
@@ -71,14 +73,17 @@ const char* kFileSchema =
 // ts); neither holds a CID (ties are put in order from the rows).
 // r_c, r_ke and r_w take random keys: they hold merged rows only (WHERE m=1),
 // so an ack writes none of their pages; the indexer merges staged rows into
-// them in large batches, and r_m lists the staged rows (staged.cpp).
+// them in large batches, and r_m lists the staged rows (staged.cpp). r_c is
+// keyed on cp, the CID key's first 8 bytes: an entry is ~20 bytes instead of
+// ~44, and a merge touches about every page of it; cp order is CID order (a
+// walk orders a cp group by the CID).
 namespace {
 // The indexes' DDL and the meta row that records them (no transaction).
 std::string indexDdl(Type* t, bool local) {
     std::shared_ptr<const Spec> sp = t->spec();
     std::string ddl =
         "CREATE INDEX IF NOT EXISTS r_s ON r(seq);"
-        "CREATE INDEX IF NOT EXISTS r_c ON r(cid) WHERE m=1;"
+        "CREATE INDEX IF NOT EXISTS r_c ON r(cp) WHERE m=1;"
         "CREATE INDEX IF NOT EXISTS r_w ON r(w DESC) WHERE m=1;"
         "CREATE INDEX IF NOT EXISTS r_b ON r(b);"
         "CREATE INDEX IF NOT EXISTS r_m ON r(rid) WHERE m=0;";

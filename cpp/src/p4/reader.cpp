@@ -625,7 +625,7 @@ int32_t Scan::candidatesFromPreds(bool* used) {
         Conn* c = e_->rpool.acquire(fr.path, OpenKind::Reader, &rc, nullptr);
         if (!c) return statusOfSqlite(rc);
         const std::string sql = std::string("SELECT seq, w, cid, ") + ovCol +
-                                (s_.hasCid ? " FROM r INDEXED BY r_c WHERE cid=?1 AND m=1 AND seq>?2 AND seq<=?3"
+                                (s_.hasCid ? " FROM r INDEXED BY r_c WHERE cp=substr(?1, 1, 8) AND cid=?1 AND m=1 AND seq>?2 AND seq<=?3"
                                            : " FROM r INDEXED BY r_ke WHERE k=?1 AND m=1 AND seq>?2 AND seq<=?3");
         sqlite3_stmt* q = c->sql(sql);
         if (!q) {
@@ -957,8 +957,12 @@ int32_t Scan::fetch(Stream& s) {
         // r_c holds the merged rows; the staged rows of the same CID
         // interval come from the view.
         if (!fr.indexed) rc = P4_E_UNSUPPORTED;
-        sqlite3_stmt* q = rc == P4_OK ? c->sql("SELECT rid, w, cid FROM r INDEXED BY r_c WHERE (cid, rid) > (?1, ?2) AND m=1 AND rid>=?3"
-                                               " AND rid<=?4 ORDER BY cid, rid LIMIT ?5")
+        // cp (r_c's key) is the CID key's first 8 bytes: cp order is CID order,
+        // a cp group put in order by the CID; the walk seeks to the resume
+        // CID's prefix (bound as a blob of its own: a zero-length one at the
+        // start, never NULL).
+        sqlite3_stmt* q = rc == P4_OK ? c->sql("SELECT rid, w, cid FROM r INDEXED BY r_c WHERE cp>=?6 AND (cid, rid) > (?1, ?2) AND m=1"
+                                               " AND rid>=?3 AND rid<=?4 ORDER BY cp, cid, rid LIMIT ?5")
                                       : nullptr;
         if (rc == P4_OK && !q) rc = P4_E_INTERNAL;
         if (rc == P4_OK) {
@@ -971,6 +975,8 @@ int32_t Scan::fetch(Stream& s) {
             sqlite3_bind_int64(q, 3, ridLo);
             sqlite3_bind_int64(q, 4, ridHi);
             sqlite3_bind_int64(q, 5, int64_t(chunk_));
+            if (s.rCid.size() >= 8) sqlite3_bind_blob(q, 6, s.rCid.data(), 8, SQLITE_TRANSIENT);
+            else sqlite3_bind_zeroblob(q, 6, 0);
             rc = read(q, 2);
             bool full = got.size() >= chunk_;
             if (rc == P4_OK && fr.st && fr.st->rows) {

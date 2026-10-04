@@ -446,7 +446,8 @@ const char* stmtSql(StmtId id) {
             return "INSERT OR REPLACE INTO inst(b,c,n,bytes,minw,maxw,minseq,maxseq,first,updated,maxat,maxts,url)"
                    " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
         case S_INST_DEL: return "DELETE FROM inst WHERE b=?1 AND c=?2";
-        case S_R_CID: return "SELECT seq FROM r INDEXED BY r_c WHERE cid=?1 AND m=1 LIMIT 1";
+        // r_c holds the CID's first 8 bytes (cp): the whole CID is matched in the row
+        case S_R_CID: return "SELECT seq FROM r INDEXED BY r_c WHERE cp=substr(?1, 1, 8) AND cid=?1 AND m=1 LIMIT 1";
         case S_R_CIDSCAN: return "SELECT seq FROM r WHERE cid=?1 LIMIT 1";
         case S_IDENT_GET: return "SELECT seq FROM ident WHERE h=?1";
         case S_IDENT_INS: return "INSERT OR REPLACE INTO ident(h,seq) VALUES(?1,?2)";
