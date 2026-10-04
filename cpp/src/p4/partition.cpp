@@ -730,16 +730,14 @@ std::string encodeCols(const ps::Extracted& x, uint32_t nCols) {
 
 bool liveRows(const RecState* r);
 
-// A PUT group as a pipeline unit: plan() on the type's writer, apply() and
-// finish() on the writer's indexer (or abort() on the writer when the unit it
-// was planned on failed).
+// A PUT group as a pipeline unit: plan() on the type's writer; its commit
+// (in a round, applyRound) and finish() on the writer's indexer.
 class Group final : public PutUnit {
 public:
     Group(Engine* e, Type* t) : e_(e), t_(t) { type = t; }
-    void plan(std::vector<WriteTask*>& tasks, const PutUnit* prev);
-    int32_t apply() override;
-    void finish(int32_t rc) override;
-    void abort(int32_t rc, const std::string& why) override;
+    void plan(std::vector<WriteTask*>& tasks, const std::vector<const PutUnit*>& prevs);
+    WriteCtx* applyCtx() override { return applying_ ? w_.get() : nullptr; }
+    void finish(int32_t rc, const std::string& why) override;
     void resetStreams() override {
         if (w_) w_->resetStreams();
     }
@@ -1552,7 +1550,7 @@ int32_t Group::migrate(WriteCtx& w, Call& c, Rec& r) {
     return P4_OK;
 }
 
-void Group::plan(std::vector<WriteTask*>& tasks, const PutUnit* prev) {
+void Group::plan(std::vector<WriteTask*>& tasks, const std::vector<const PutUnit*>& prevs) {
     sp_ = t_->spec();
     for (WriteTask* wt : tasks) {
         Call c;
@@ -1608,12 +1606,17 @@ void Group::plan(std::vector<WriteTask*>& tasks, const PutUnit* prev) {
     }
     w_ = std::make_unique<WriteCtx>(e_, t_);
     WriteCtx& w = *w_;
-    // The type's previous unit, still being applied: its records' state after
-    // it is where this group starts (the index files show only what it has
+    // The type's units still being applied: their records' state after them
+    // is where this group starts (the index files show only what is
     // committed).
-    if (prev && prev->type == t_ && prev->ctx()) {
-        w.seed(*prev->ctx());
-        seeded = true;
+    {
+        std::vector<const WriteCtx*> seeds;
+        for (const PutUnit* p : prevs)
+            if (p->type == t_ && p->ctx()) seeds.push_back(p->ctx());
+        if (!seeds.empty()) {
+            w.seed(seeds);
+            seeded = true;
+        }
     }
     w.migrate = false;
     for (Call& c : calls_)
@@ -1662,8 +1665,6 @@ void Group::plan(std::vector<WriteTask*>& tasks, const PutUnit* prev) {
     applying_ = true;
 }
 
-int32_t Group::apply() { return applying_ ? w_->apply() : P4_OK; }
-
 void Group::release() {
     if (!inflight_.second) return;
     std::lock_guard<std::mutex> g(t_->mu);
@@ -1676,25 +1677,18 @@ void Group::release() {
     t_->visRecompute();
 }
 
-void Group::finish(int32_t rc) {
+void Group::finish(int32_t rc, const std::string& why) {
     release();
-    if (rc != P4_OK) fail(rc, "commit failed: " + (w_ ? w_->err : std::string()));
+    if (rc != P4_OK) fail(rc, "commit failed: " + why);
     respond();
 }
 
-void Group::abort(int32_t rc, const std::string& why) {
-    if (w_) w_->resetStreams();
-    applying_ = false;
-    release();
-    fail(rc, why);
-    respond();
-}
 
 }  // namespace
 
-std::unique_ptr<PutUnit> putPlan(Engine* e, Type* t, std::vector<WriteTask*>& tasks, const PutUnit* prev) {
+std::unique_ptr<PutUnit> putPlan(Engine* e, Type* t, std::vector<WriteTask*>& tasks, const std::vector<const PutUnit*>& prevs) {
     auto g = std::make_unique<Group>(e, t);
-    g->plan(tasks, prev);
+    g->plan(tasks, prevs);
     return g;
 }
 

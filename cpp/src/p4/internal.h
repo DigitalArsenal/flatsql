@@ -521,13 +521,18 @@ struct WriterState {
     std::mutex mu;
     std::deque<Type*> ready;  // types with a backlog
     // The writer's indexer thread and its queue (imu): units in plan order.
+    // A round takes every queued unit. After a failed round the indexer fails
+    // every unit it takes (poison) until the writer has cut the streams back.
     std::mutex imu;
     std::condition_variable icv, dcv;  // work for the indexer; a unit done
     std::deque<PutUnit*> iq;
     bool istop = false;
+    int32_t poison = P4_OK;
     std::thread indexer;
-    // The writer's: the unit its indexer applies (or will), at most one.
-    std::unique_ptr<PutUnit> pending;
+    // The writer's: its units not yet collected, oldest first.
+    std::deque<std::unique_ptr<PutUnit>> pending;
+    bool failing = false;          // a collected unit failed: recover before planning
+    std::set<Feed*> resetFeeds;    // the feeds the failed units appended to
 };
 
 // Reader connections: one pool for every thread, inside the engine's one
@@ -813,6 +818,23 @@ struct IdentNew {
     uint8_t h[32];
     RecState* rec;
 };
+// One feed file's index transaction in a commit round (applyRound): the
+// round's writes apply their rows to it in plan order, then it commits once,
+// its stream synced first.
+struct FileTxn {
+    Feed* f = nullptr;
+    struct Conn* c = nullptr;
+    Dict dict;
+    Counters k;
+    std::map<InstId, InstCount> inst;
+    std::map<uint32_t, TokCount> tokc, tokcBefore;
+    std::set<InstId> changedInst;
+    std::vector<int64_t> ftsDrop;  // full-text rows to delete after the commit
+    int64_t newEnd = 0;            // the stream's mark after the round's frames
+    bool indexed = true, clearMoved = false, deleted = false, epochEdge = false, moves = false, open = false;
+    int rc = 0;
+};
+
 // One type's write context (the type's writer thread).
 class WriteCtx {
 public:
@@ -857,23 +879,29 @@ public:
     // After a failed apply: the feeds this write appended to go back to their
     // committed marks.
     void resetStreams();
-    // The type's previous unit, still being applied: its records' state after
-    // it is this write's starting point (planning reads see only committed
-    // rows).
-    void seed(const WriteCtx& prev);
+    // The type's units still being applied, oldest first: their records'
+    // state after them is this write's starting point (planning reads see
+    // only committed rows).
+    void seed(const std::vector<const WriteCtx*>& prevs);
     bool seededFeed(uint32_t fid) const;
     void seededWithK(uint32_t fid, const KVal& k, std::vector<RecState*>* out) const;  // seeded records of an object key
     RecState* seededIdent(uint32_t fid, const uint8_t h[32]) const;                     // a seeded ingest identity
     bool migrate = false;  // migrate mode: instance times are the caller's (C-36), new files without indexes
     int64_t now = 0;
     std::vector<IdentNew> idents;
-    std::set<uint32_t> committedFids, failedFids;
+    // The commit round's steps (applyRound): new feeds and tokens into the
+    // type index; the feed files this write touches (feeds before local) and
+    // whether it changes one; its rows applied to a feed's round transaction.
+    int32_t registryWrite();
+    const std::vector<uint32_t>& files() const { return fileOrder_; }
+    bool fileChanges(uint32_t fid) const;
+    int32_t fileBegin(FileTxn& x, Feed* f);
+    int32_t fileApply(FileTxn& x);
+    bool pending() const { return any_; }  // prepared with something to commit
 private:
     RecState* make(uint32_t fid, int64_t seq, const uint8_t* key);
     int32_t loadRows(RecState* r);
-    int32_t registryWrite();
     int32_t frames(Feed* f, const std::vector<RecState*>& recs, std::string* out, int64_t end);
-    int32_t commitFile(Feed* f, const std::vector<RecState*>& recs, const std::vector<int64_t>& movesIn);
     void fill(RecState* r);
     void snapshot();
     std::deque<RecState> store_;
@@ -892,6 +920,10 @@ private:
     std::map<std::pair<uint32_t, std::string>, std::vector<RecState*>> seedK_;
     std::map<std::pair<uint32_t, std::string>, RecState*> seedIdent_;
 };
+// A commit round over several prepared writes (the indexer's), or one
+// (WriteCtx::apply). A failure fails the round; files committed before it stay.
+int32_t applyRound(P4Engine* e, const std::vector<WriteCtx*>& units, std::string* err);
+int32_t fileCommit(P4Engine* e, Type* t, FileTxn& x, std::string* err);
 // Planning reads go through the reader pool (committed rows): the writer
 // connection belongs to the indexer.
 Conn* planAcquire(P4Engine* e, Feed* f, int32_t* rc, std::string* err);
@@ -908,17 +940,17 @@ void planRelease(P4Engine* e, Conn* c);
 class PutUnit {
 public:
     virtual ~PutUnit() = default;
-    virtual int32_t apply() = 0;                                 // the indexer
-    virtual void finish(int32_t rc) = 0;                         // the indexer: in-flight seqs released, calls answered
-    virtual void abort(int32_t rc, const std::string& why) = 0;  // the writer: the unit it was planned on failed
-    virtual void resetStreams() = 0;                             // the writer: after a failed apply
+    virtual WriteCtx* applyCtx() = 0;      // the indexer: the prepared write to commit, or nullptr
+    virtual void finish(int32_t rc, const std::string& why) = 0;  // the indexer: in-flight seqs released, calls answered
+    virtual void resetStreams() = 0;       // the writer: after a failed round
     virtual const WriteCtx* ctx() const = 0;
     Type* type = nullptr;
-    bool seeded = false;  // planned on the previous unit's state
+    bool seeded = false;  // planned on pending units' state
     std::atomic<bool> done{false};
     int32_t status = P4_OK;
 };
-std::unique_ptr<PutUnit> putPlan(P4Engine* e, Type* t, std::vector<WriteTask*>& tasks, const PutUnit* prev);
+// prevs: the writer's pending units, oldest first (those of the type seed it).
+std::unique_ptr<PutUnit> putPlan(P4Engine* e, Type* t, std::vector<WriteTask*>& tasks, const std::vector<const PutUnit*>& prevs);
 
 // ---- remove.cpp ----------------------------------------------------------------------------------
 void supersedeOp(P4Engine* e, Type* t, WriteTask* task);

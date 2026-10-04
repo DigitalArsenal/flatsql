@@ -485,65 +485,102 @@ bool takeGroup(Engine* e, uint32_t wi, Type** tp, std::vector<WriteTask*>* out) 
 }
 
 // ---- the PUT pipeline -------------------------------------------------------------------------------
-// The writer plans a group and appends its frames while its indexer applies
-// the previous unit (syncs the streams, commits the index rows, acks). The
-// writer hands a unit over only once the previous one is done, so units are
-// applied and answered in plan order.
+// The writer plans groups and appends their frames; its indexer commits them
+// in rounds: each round takes every queued unit and gives each feed file it
+// touches ONE transaction (stream synced first), then acks the round's calls.
+// Units are committed and answered in plan order. A group is planned on the
+// state the type's pending units leave its records in (their seeds).
 
-// The writer's pending unit, once done. A failed one cuts its streams back to
-// their marks, and fails `next` when next was planned on its state (returns
-// true: next is answered).
-bool collect(Engine* e, WriterState& ws, PutUnit* next) {
-    (void)e;
-    PutUnit* p = ws.pending.get();
-    if (!p) return false;
-    {
-        std::unique_lock<std::mutex> g(ws.imu);
-        ws.dcv.wait(g, [&] { return p->done.load(std::memory_order_acquire); });
-    }
-    bool aborted = false;
-    if (p->status != P4_OK) {
-        p->resetStreams();
-        if (next && next->seeded) {
-            next->abort(p->status, "an earlier write of this type failed before this one could commit: nothing stored");
-            aborted = true;
+constexpr size_t kMaxPending = 16;  // planned but not yet committed, per writer
+
+// The pending units at the front that are done (block: wait for the front
+// one). A failed one stops the collection: the writer recovers first.
+void collect(WriterState& ws, bool block) {
+    while (!ws.pending.empty()) {
+        PutUnit* p = ws.pending.front().get();
+        if (!p->done.load(std::memory_order_acquire)) {
+            if (!block) return;
+            std::unique_lock<std::mutex> g(ws.imu);
+            ws.dcv.wait(g, [&] { return p->done.load(std::memory_order_acquire); });
         }
+        if (p->status != P4_OK) {
+            ws.failing = true;
+            return;
+        }
+        ws.pending.pop_front();
+        block = false;
     }
-    ws.pending.reset();
-    return aborted;
+}
+
+// After a failed round: every pending unit done (the indexer fails each one
+// after the failure: poison), the streams they appended to cut back to their
+// committed marks, then the indexer applies again.
+void recover(WriterState& ws) {
+    for (auto& u : ws.pending) {
+        std::unique_lock<std::mutex> g(ws.imu);
+        ws.dcv.wait(g, [&] { return u->done.load(std::memory_order_acquire); });
+    }
+    for (auto& u : ws.pending)
+        if (u->status != P4_OK) u->resetStreams();
+    ws.pending.clear();
+    std::lock_guard<std::mutex> g(ws.imu);
+    ws.poison = P4_OK;
+    ws.failing = false;
+}
+
+// Every pending unit committed (the writer's own index work runs next).
+void drain(WriterState& ws) {
+    while (!ws.pending.empty() && !ws.failing) collect(ws, true);
+    if (ws.failing) recover(ws);
 }
 
 void runPut(Engine* e, uint32_t wi, Type* t, std::vector<WriteTask*>& tasks) {
     WriterState& ws = *e->writers[wi];
-    std::unique_ptr<PutUnit> u = putPlan(e, t, tasks, ws.pending.get());
-    if (collect(e, ws, u.get())) return;
+    collect(ws, false);
+    if (ws.failing) recover(ws);
+    std::vector<const PutUnit*> prevs;
+    for (auto& u : ws.pending) prevs.push_back(u.get());
+    std::unique_ptr<PutUnit> u = putPlan(e, t, tasks, prevs);
     PutUnit* raw = u.get();
-    ws.pending = std::move(u);
+    ws.pending.push_back(std::move(u));
     {
         std::lock_guard<std::mutex> g(ws.imu);
         ws.iq.push_back(raw);
     }
     ws.icv.notify_one();
+    while (ws.pending.size() > kMaxPending && !ws.failing) collect(ws, true);
 }
 
 void indexerLoop(Engine* e, uint32_t wi) {
     tThread = e->firstOfClass[1] + wi;
     WriterState& ws = *e->writers[wi];
     for (;;) {
-        PutUnit* u = nullptr;
+        std::vector<PutUnit*> round;
+        int32_t poison;
         {
             std::unique_lock<std::mutex> g(ws.imu);
             ws.icv.wait(g, [&] { return !ws.iq.empty() || ws.istop; });
             if (ws.iq.empty()) break;
-            u = ws.iq.front();
-            ws.iq.pop_front();
+            round.assign(ws.iq.begin(), ws.iq.end());
+            ws.iq.clear();
+            poison = ws.poison;
         }
-        const int32_t rc = u->apply();
-        u->status = rc;
-        u->finish(rc);
+        int32_t rc = poison;
+        std::string why = "an earlier write on this writer failed before this one could commit: nothing stored";
+        if (rc == P4_OK) {
+            std::vector<WriteCtx*> ctxs;
+            for (PutUnit* u : round)
+                if (WriteCtx* w = u->applyCtx()) ctxs.push_back(w);
+            if (!ctxs.empty()) rc = applyRound(e, ctxs, &why);
+        }
+        for (PutUnit* u : round) {
+            u->status = rc;
+            u->finish(rc, why);
+        }
         {
             std::lock_guard<std::mutex> g(ws.imu);
-            u->done.store(true, std::memory_order_release);
+            if (rc != P4_OK && ws.poison == P4_OK) ws.poison = rc;
+            for (PutUnit* u : round) u->done.store(true, std::memory_order_release);
         }
         ws.dcv.notify_all();
     }
@@ -575,7 +612,7 @@ void writerLoop(Engine* e, uint32_t wi) {
             } else {
                 // Everything else reads and writes the index files itself:
                 // the indexer is idle first.
-                collect(e, ws, nullptr);
+                drain(ws);
                 if (tasks[0]->internal) {
                     Internal* in = tasks[0]->internal;
                     if (op == P4_OPC_QUOTA_GC) quotaWork(e, t, in);
@@ -596,14 +633,15 @@ void writerLoop(Engine* e, uint32_t wi) {
             std::lock_guard<std::mutex> g(e->writers[wi]->mu);
             idle = e->writers[wi]->ready.empty();
         }
-        if (idle && ws.pending) {
-            // Nothing to plan: the pending unit, once its indexer is done
+        if (idle && !ws.pending.empty()) {
+            // Nothing to plan: the pending units, as their rounds are done
             // (a short wait, then new calls are routed again).
-            if (ws.pending->done.load(std::memory_order_acquire)) {
-                collect(e, ws, nullptr);
-            } else {
+            collect(ws, false);
+            if (ws.failing) recover(ws);
+            if (!ws.pending.empty()) {
                 std::unique_lock<std::mutex> g(ws.imu);
-                ws.dcv.wait_for(g, std::chrono::milliseconds(1));
+                PutUnit* front = ws.pending.front().get();
+                ws.dcv.wait_for(g, std::chrono::milliseconds(1), [&] { return front->done.load(std::memory_order_acquire); });
             }
             continue;
         }
