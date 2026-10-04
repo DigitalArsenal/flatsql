@@ -1218,7 +1218,7 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
             sqlite3_stmt* s = c->sql("SELECT min(seq), max(seq) FROM r");
             if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) {
                 k.minseq = sqlite3_column_int64(s, 0);
-                k.maxseq = std::max(k.maxseq, sqlite3_column_int64(s, 1));
+                k.maxseq = std::max<int64_t>(k.maxseq, sqlite3_column_int64(s, 1));
             }
             if (s) sqlite3_reset(s);
             // r_w holds the merged rows, the view the staged ones.
