@@ -5,14 +5,14 @@
   "size": 2246620,
   "files": {
     "flatsql-p4-threads.wasm": {
-      "sha256": "fe65b36fe8c4d015c25c76e4ccca5bd84c18ffc3cb05b045a2ae85bb3a4dbe21",
-      "sri": "sha384-P6lKs/Bq402OdF5RlNAfc1qgguMAPL3mD1ramESHFv6wPaZk1UCAsG+/J+S+ntxz",
-      "size": 2925356
+      "sha256": "7ae31439a7e79f9063c9c77ad2df5402d9efec063934b6a34d7837e4e56f0b7e",
+      "sri": "sha384-yj8D7WLENlcGGcSdpC9aERBHSKqBMFtFuqWVc6rMVkWvwNpVohHHUnpFNHXbjtxo",
+      "size": 2936308
     },
     "flatsql-ps-threads.wasm": {
-      "sha256": "b310425d5380dc549cfa010f6ea2dbc337d4faf356eb2b9b00eca3b30bb3259c",
-      "sri": "sha384-4CjMIQbXxTFN5J89ibTIPP1+eq3flK4ZbGz+plgPfvi6GLDzYhKDu/i55z9HNQu/",
-      "size": 2680137
+      "sha256": "aa1ed58de773347c478215a763328f2aca9bca795c0944a85247e53b2433736a",
+      "sri": "sha384-ZTcxIdR1ya/icHbvLaKv9rOjJcsXQ0NXXN3BQOuIwk86iF73DqqQM8vz9PtNmpqq",
+      "size": 2680218
     },
     "flatsql-wasi-noeh.wasm": {
       "sha256": "2d5da3b3b3ed4d1a210a9890dafa5cabf4c09491fd7aab39bef251f2e4b96364",
