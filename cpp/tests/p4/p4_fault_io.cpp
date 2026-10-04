@@ -13,14 +13,16 @@
 //   - every record whose PUT was acknowledged is there, and every
 //     acknowledged tag instance still lists its source (C-4: the ack follows
 //     the commit, so a power loss cannot take it);
-//   - REBUILD 8 finds no mismatch (each feed file's counters and the type
-//     index's mirrors against the rows, and PRAGMA integrity_check on every
-//     file, C-27);
+//   - REBUILD 8 finds no mismatch (each feed file's counters against the
+//     rows, every row's frame in its stream, and PRAGMA integrity_check on
+//     every index file and the type index, C-27);
 //   - the count equals the records a full scan returns (C-38: a record of
 //     two feeds once per feed; each answer its own seq), and no VFS node is
 //     left open after the close;
-//   - P/PNM holds the three feed files and their sidecars only, flat: the
-//     odd source's file is its escaped name (C-37 (1)).
+//   - P/PNM holds the three feeds' files (index, sidecars, stream) only,
+//     flat: the odd source's file is its escaped name (C-37 (1));
+//   - every stream walks as a stock reader walks it (BRIEF4): back-to-back
+//     [u32 LE size][FlatBuffer] frames ending exactly at the end of the file.
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -86,17 +88,55 @@ std::vector<uint8_t> faultFrame(uint64_t id) {
 const char* const kOddSource = "s rc/../2 %41?#\xC3\xA9";
 const char* const kOddFeedFile = "prov@s%20rc%2F..%2F2%20%2541%3F%23%C3%A9.db";
 
-// A path under P/PNM that is not one of the three feed files or a sidecar
-// of one ("" when there is none).
+// A feed's file name without its kind: "<feed>.db" (and its -wal, -shm,
+// -journal) and "<feed>.fsdata" / "<feed>.<generation>.fsdata" give "<feed>";
+// anything else gives "".
+std::string feedOfFile(std::string n) {
+    for (const char* sfx : {"-wal", "-shm", "-journal"}) {
+        const size_t k = std::strlen(sfx);
+        if (n.size() > k && n.compare(n.size() - k, k, sfx) == 0) n.resize(n.size() - k);
+    }
+    if (n.size() > 3 && n.compare(n.size() - 3, 3, ".db") == 0) return n.substr(0, n.size() - 3);
+    if (n.size() > 7 && n.compare(n.size() - 7, 7, ".fsdata") == 0) {
+        n.resize(n.size() - 7);
+        const size_t dot = n.rfind('.');
+        if (dot != std::string::npos && dot + 1 < n.size() && n.find_first_not_of("0123456789", dot + 1) == std::string::npos)
+            n.resize(dot);
+        return n;
+    }
+    return "";
+}
+
+// A path under P/PNM that is not one of the three feeds' files (index,
+// sidecars, stream) ("" when there is none).
 std::string strayPath(FaultFs& fs, const std::string& root) {
     const std::string dir = root + "/P/PNM/";
+    const std::string odd = std::string(kOddFeedFile).substr(0, std::strlen(kOddFeedFile) - 3);
     for (const std::string& p : fs.list(dir)) {
-        std::string n = p.substr(dir.size());
-        for (const char* sfx : {"-wal", "-shm", "-journal"}) {
-            const size_t k = std::strlen(sfx);
-            if (n.size() > k && n.compare(n.size() - k, k, sfx) == 0) n.resize(n.size() - k);
+        const std::string n = feedOfFile(p.substr(dir.size()));
+        if (n != "prov@src" && n != "local" && n != odd) return p;
+    }
+    return "";
+}
+
+// Every stream under P/PNM after the reopen, walked as a stock reader walks
+// it: back-to-back [u32 LE size][FlatBuffer] frames, each a "$PNM" buffer,
+// ending exactly at the end of the file ("" when all walk clean).
+std::string streamWalk(FaultFs& fs, const std::string& root) {
+    const std::string dir = root + "/P/PNM/";
+    for (const std::string& p : fs.list(dir)) {
+        if (p.size() < 7 || p.compare(p.size() - 7, 7, ".fsdata") != 0) continue;
+        const std::vector<uint8_t> b = fs.contents(p);
+        size_t at = 0;
+        while (at < b.size()) {
+            if (b.size() - at < 4) return p + ": a torn size prefix at " + std::to_string(at);
+            const uint32_t len = fp::ld32(&b[at]);
+            if (b.size() - at - 4 < len) return p + ": a frame past the end at " + std::to_string(at);
+            const uint8_t* fb = &b[at + 4];
+            if (len < 8 || fp::ld32(fb) + 4 > len || std::memcmp(fb + 4, "$PNM", 4) != 0)
+                return p + ": not a $PNM FlatBuffer at " + std::to_string(at);
+            at += 4 + len;
         }
-        if (n != "prov@src.db" && n != "local.db" && n != kOddFeedFile) return p;
     }
     return "";
 }
@@ -297,6 +337,8 @@ P4_SLOW_TEST(t_power_loss) {
         Check ck = checkStore(root, want, wantInst);
         const std::string stray = strayPath(fs, root);
         if (!stray.empty()) ck.fail("not a feed file of the workload: " + stray);
+        const std::string walk = streamWalk(fs, root);
+        if (!walk.empty()) ck.fail("stream: " + walk);
         if (ck.ok) pass++;
         else {
             fail++;

@@ -2,13 +2,18 @@
 // engine ingests (three producers, three feeds: two source feeds and the
 // local file, the same records in more than one feed, copies, batch
 // supersede, quota) until it is killed at a random point; the parent reopens
-// the store and checks it: integrity_check on every file, one seq per CID in
-// each feed file (C-38: a record of two feeds is a row set in each, with its
-// own seq), no CID both in local and in a feed file (an untagged write of a
-// held record is a copy in its feeds; a tagged write takes a local record
-// into its feed), every CID found by GET, the record count (once per feed),
-// REBUILD 8 (each file's counters and the type index's mirrors against the
-// rows) and seqs above the old ones.
+// the store and checks it: integrity_check on every index file, one seq per
+// CID in each feed file (C-38: a record of two feeds is a row set in each,
+// with its own seq), no CID both in local and in a feed file (an untagged
+// write of a held record is a copy in its feeds; a tagged write takes a local
+// record into its feed), every CID found by GET, the record count (once per
+// feed), REBUILD 8 (each file's counters against the rows, every row's frame
+// in its stream), the bytes GET returns (each record's CID recomputed from
+// them) and seqs above the old ones. Every stream (BRIEF4) is
+// walked from byte 0 to its end with no FlatSQL code: back-to-back
+// [u32 LE size][FlatBuffer] frames, each a PNM table with its file
+// identifier, ending exactly at the end of the file, and every index row
+// names one of its frames (off, len).
 // The loop's two halves (t_kill_run, t_kill_check) are also tests of their
 // own, so the wasm build's host drives the same loop (scripts/p4-wasm-suite.mjs).
 #include <unistd.h>
@@ -62,6 +67,33 @@ std::string integrity(const std::string& path) {
     return out;
 }
 
+// A stream walked as a stock reader walks it: [u32 LE size][FlatBuffer]
+// frames from byte 0, each buffer's root offset inside it and its file
+// identifier "$PNM", the last frame ending exactly at the end of the file.
+// *frames: off -> len. "" when it walks clean, else why not.
+std::string walkStream(const std::string& path, std::map<int64_t, int64_t>* frames) {
+    frames->clear();
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) return "absent";
+    std::vector<uint8_t> b;
+    uint8_t chunk[65536];
+    size_t n;
+    while ((n = std::fread(chunk, 1, sizeof chunk, fp)) > 0) b.insert(b.end(), chunk, chunk + n);
+    std::fclose(fp);
+    size_t at = 0;
+    while (at < b.size()) {
+        if (b.size() - at < 4) return "a torn size prefix at " + std::to_string(at);
+        const uint32_t len = fp::ld32(&b[at]);
+        if (b.size() - at - 4 < len) return "a frame past the end at " + std::to_string(at);
+        const uint8_t* fb = &b[at + 4];
+        if (len < 8 || fp::ld32(fb) + 4 > len || std::memcmp(fb + 4, "$PNM", 4) != 0)
+            return "not a $PNM FlatBuffer at " + std::to_string(at);
+        (*frames)[int64_t(at)] = len;
+        at += 4 + len;
+    }
+    return "";
+}
+
 std::vector<std::string> partitionFiles(const std::string& root, const std::string& type) {
     std::vector<std::string> out;
     std::error_code ec;
@@ -79,19 +111,35 @@ std::vector<std::string> partitionFiles(const std::string& root, const std::stri
 const char* const kOddSource = "s rc/../2 %41?#\xC3\xA9";
 const char* const kOddFeedFile = "prov@s%20rc%2F..%2F2%20%2541%3F%23%C3%A9.db";
 
-// What is in P/<type> other than the feed files the workload writes
-// (prov@src, the odd feed, local) and their -wal/-shm/-journal: a
-// directory, or another file. Empty when the layout is right.
+// A feed's file name without its kind: "<feed>.db" (and its -wal, -shm,
+// -journal) and "<feed>.fsdata" / "<feed>.<generation>.fsdata" give "<feed>";
+// anything else gives "".
+std::string feedOfFile(std::string n) {
+    for (const char* sfx : {"-wal", "-shm", "-journal"}) {
+        const size_t k = std::strlen(sfx);
+        if (n.size() > k && n.compare(n.size() - k, k, sfx) == 0) n.resize(n.size() - k);
+    }
+    if (n.size() > 3 && n.compare(n.size() - 3, 3, ".db") == 0) return n.substr(0, n.size() - 3);
+    if (n.size() > 7 && n.compare(n.size() - 7, 7, ".fsdata") == 0) {
+        n.resize(n.size() - 7);
+        const size_t dot = n.rfind('.');
+        if (dot != std::string::npos && dot + 1 < n.size() && n.find_first_not_of("0123456789", dot + 1) == std::string::npos)
+            n.resize(dot);
+        return n;
+    }
+    return "";
+}
+
+// What is in P/<type> other than the feeds the workload writes (prov@src,
+// the odd feed, local): their index files with -wal/-shm/-journal and their
+// streams. A directory, or another file. Empty when the layout is right.
 std::string strayEntries(const std::string& root, const std::string& type) {
     std::string out;
     std::error_code ec;
+    const std::string odd = std::string(kOddFeedFile).substr(0, std::strlen(kOddFeedFile) - 3);
     for (auto& d : std::filesystem::directory_iterator(root + "/P/" + type, ec)) {
-        std::string n = d.path().filename().string();
-        for (const char* sfx : {"-wal", "-shm", "-journal"}) {
-            const size_t k = std::strlen(sfx);
-            if (n.size() > k && n.compare(n.size() - k, k, sfx) == 0) n.resize(n.size() - k);
-        }
-        if (d.is_directory() || (n != "prov@src.db" && n != "local.db" && n != kOddFeedFile)) out += " " + d.path().filename().string();
+        const std::string n = feedOfFile(d.path().filename().string());
+        if (d.is_directory() || (n != "prov@src" && n != "local" && n != odd)) out += " " + d.path().filename().string();
     }
     return out;
 }
@@ -217,7 +265,7 @@ bool killCheck(const std::string& root, std::string* why) {
     std::map<std::string, int64_t> diskSeq;      // (file, CID) -> its one seq in that file
     std::map<std::pair<std::string, int64_t>, std::string> seqCid;  // (file, seq) -> its one CID
     std::unordered_set<std::string> localCids, feedCids;  // a record is local only while no feed holds it
-    int64_t rows = 0, maxSeq = 0, missing = 0, diskSplit = 0;
+    int64_t rows = 0, maxSeq = 0, missing = 0, diskSplit = 0, frames = 0, unframed = 0;
     size_t files = 0;
     std::vector<std::vector<uint8_t>> sample;
     for (auto& f : partitionFiles(root, "PNM")) {
@@ -227,9 +275,35 @@ bool killCheck(const std::string& root, std::string* why) {
             return false;
         }
         files++;
+        // The feed's stream, as a stock reader walks it (the generation the
+        // index's meta names).
         sqlite3* db = nullptr;
         openSide(f, &db);
         sqlite3_stmt* q;
+        int64_t gen = 0, mark = 0;
+        sqlite3_prepare_v2(db, "SELECT k, v FROM meta WHERE k IN ('gen', 'mark')", -1, &q, nullptr);
+        while (sqlite3_step(q) == SQLITE_ROW)
+            (std::strcmp(reinterpret_cast<const char*>(sqlite3_column_text(q, 0)), "gen") == 0 ? gen : mark) = sqlite3_column_int64(q, 1);
+        sqlite3_finalize(q);
+        const std::string base = f.substr(0, f.size() - 3);
+        const std::string sp = gen == 0 ? base + ".fsdata" : base + "." + std::to_string(gen) + ".fsdata";
+        std::map<int64_t, int64_t> fr;
+        std::string walk = mark == 0 && !std::filesystem::exists(sp) ? std::string() : walkStream(sp, &fr);
+        std::error_code sec;
+        if (walk.empty() && mark != 0 && int64_t(std::filesystem::file_size(sp, sec)) != mark) walk = "size != mark";
+        if (!walk.empty()) {
+            *why = "stream " + sp + ": " + walk;
+            sqlite3_close(db);
+            closeEngine();
+            return false;
+        }
+        frames += int64_t(fr.size());
+        sqlite3_prepare_v2(db, "SELECT off, len FROM r", -1, &q, nullptr);
+        while (sqlite3_step(q) == SQLITE_ROW) {
+            auto it = fr.find(sqlite3_column_int64(q, 0));
+            if (it == fr.end() || it->second != sqlite3_column_int64(q, 1)) unframed++;
+        }
+        sqlite3_finalize(q);
         sqlite3_prepare_v2(db, "SELECT seq, cid FROM r", -1, &q, nullptr);
         while (sqlite3_step(q) == SQLITE_ROW) {
             rows++;
@@ -257,15 +331,20 @@ bool killCheck(const std::string& root, std::string* why) {
     // P/PNM holds the three feed files (and sidecars) only, flat: the odd
     // source's file is its escaped name, not a decoded path.
     const std::string stray = strayEntries(root, "PNM");
-    // every CID on disk is found by GET (its first feed file's row set: one seq)
-    int64_t split = 0;
+    // every CID on disk is found by GET (its first feed file's row set: one
+    // seq), with the bytes it arrived with (its CID recomputed from them)
+    int64_t split = 0, badBytes = 0;
     for (size_t i = 0; i < sample.size(); i += 512) {
         std::vector<std::vector<uint8_t>> part(sample.begin() + long(i), sample.begin() + long(std::min(sample.size(), i + 512)));
-        Result g = get("PNM", part, false, true);
+        Result g = get("PNM", part, true, true);
         std::map<std::string, int64_t> seqOf;
         for (size_t k = 0; k < g.rows.size(); k++) {
             auto it = seqOf.emplace(g.s(k, "cid"), g.i(k, "seq")).first;
             if (it->second != g.i(k, "seq")) split++;
+            const std::string cid = g.s(k, "cid"), data = g.s(k, "data");
+            uint8_t want[32], got[32];
+            flatsql::ps::sha256(reinterpret_cast<const uint8_t*>(data.data()), data.size(), got);
+            if (!fp::cidDigestFromText(cid.data(), cid.size(), want) || std::memcmp(want, got, 32) != 0) badBytes++;
         }
         missing += int64_t(part.size()) - int64_t(seqOf.size());
     }
@@ -289,15 +368,15 @@ bool killCheck(const std::string& root, std::string* why) {
     if (nodesLeft) std::fprintf(stderr, "  check: %lld VFS nodes left open after close\n", (long long)nodesLeft);
     char buf[256];
     std::snprintf(buf, sizeof buf,
-                  "files %zu rows %lld cids %zu records %zu local %zu local+feed %lld count %lld missing %lld split %lld disk-split %lld"
-                  " mismatches %lld above %d nodes %lld",
-                  files, (long long)rows, distinct.size(), diskSeq.size(), localCids.size(), (long long)localAndFeed, (long long)count,
-                  (long long)missing, (long long)split, (long long)diskSplit,
+                  "files %zu rows %lld frames %lld unframed %lld cids %zu records %zu local %zu local+feed %lld count %lld missing %lld"
+                  " bad-bytes %lld split %lld disk-split %lld mismatches %lld above %d nodes %lld",
+                  files, (long long)rows, (long long)frames, (long long)unframed, distinct.size(), diskSeq.size(), localCids.size(),
+                  (long long)localAndFeed, (long long)count, (long long)missing, (long long)badBytes, (long long)split, (long long)diskSplit,
                   (long long)mism, int(above), (long long)nodesLeft);
     *why = buf;
     if (!stray.empty()) *why += "; stray entries in P/PNM:" + stray;
     return stray.empty() && missing == 0 && split == 0 && diskSplit == 0 && localAndFeed == 0 && count == int64_t(diskSeq.size()) && mism == 0 &&
-           above && nodesLeft == 0;
+           above && nodesLeft == 0 && unframed == 0 && badBytes == 0;
 }
 }  // namespace
 
