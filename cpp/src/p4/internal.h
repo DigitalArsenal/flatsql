@@ -69,6 +69,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <initializer_list>
@@ -690,9 +691,11 @@ struct P4Engine {
     std::vector<std::unique_ptr<flatsql::p4::Type>> types;
     std::unordered_map<std::string, flatsql::p4::Type*> typeByName;
 
-    // mailbox memory
+    // mailbox memory (mailboxInit's calloc; freed with the engine, which a
+    // re-init deletes only after engineStop joined every thread)
     uint8_t* mem = nullptr;
     size_t memBytes = 0;
+    ~P4Engine() { std::free(mem); }
     uint32_t nSlots[2] = {0, 0};
     uint8_t* slotBase[2] = {nullptr, nullptr};
     uint32_t slotStride[2] = {0, 0};
