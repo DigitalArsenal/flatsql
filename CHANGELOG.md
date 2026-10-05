@@ -1,9 +1,16 @@
 # Changelog
 
-## Unreleased
+## 3.7.1
 
-Store format 4 follow-ups (CONTRACT C-46). Every answer is 3.7.0's except where C-46 (1)-(3)
-make it format 1's and (6) makes a crash a refusal.
+Store format 4 follow-ups (CONTRACT C-46, C-47, C-48). Every answer is 3.7.0's except where
+C-46 (1)-(3) make it format 1's and (6) makes a crash a refusal. C-47 accepts three epoch edge
+cases where format 1's answer depends on the CPU (a clamped epoch's coverage day caps the year
+at 9999; a NaN epoch is not indexed; a type whose epochs all sit at one clamped extreme reports
+that SUMMARY bound as NULL) and moves SandboxedSelect `SELECT *` rendering (C-46 (4)) to SDN.
+C-48 accepts three format-1 defects format 4 does not copy (SDN-side: a `TYPE@source` fast-path
+select answers only that source; a NUL inside a text value keeps the whole string; a sealed type
+with a binary schema registers CID-only). Equivalence with format 1, field by field: 237 shapes,
+195 equal, 1 equal (C-12 copy), 41 accepted, 0 different.
 - EPOCH counts and limited pages push the limit down again (a58f818/226872c's design on the
   stream engine): a count probes each entity until one feed has a pick within the max delta; a
   page whose offset + limit fits 4,096 probes only its first entities and stops a text-keyed
