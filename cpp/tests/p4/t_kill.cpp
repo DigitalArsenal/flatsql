@@ -56,23 +56,34 @@ namespace {
 // under the engine's connections.
 // The URI names exactly `path` (feed file names carry %HH escapes; SQLite
 // decodes %HH in a URI path and ends it at '?' or '#').
+// The engine runs beside it: its background threads open their own
+// connections to the same files (the full-text catch-up's pool readers right
+// after open), and while one of them recovers the file's WAL, or closes as
+// the file's last connection (EXCLUSIVE for its checkpoint), SQLite answers
+// this connection SQLITE_BUSY. It waits, as every engine connection does.
 int openSide(const std::string& path, sqlite3** db) {
     std::string uri = "file://";
     for (char c : path) uri += c == '%' ? std::string("%25") : c == '?' ? std::string("%3F") : c == '#' ? std::string("%23") : std::string(1, c);
     uri += "?share=1";
-    return sqlite3_open_v2(uri.c_str(), db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, flatsql::kFlatSqlVfsName);
+    const int rc = sqlite3_open_v2(uri.c_str(), db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, flatsql::kFlatSqlVfsName);
+    if (rc == SQLITE_OK) sqlite3_busy_timeout(*db, 30000);
+    return rc;
 }
 
+// "ok", integrity_check's first row, or why the check could not run (an
+// error is not a verdict on the file).
 std::string integrity(const std::string& path) {
     sqlite3* db = nullptr;
     if (openSide(path, &db) != SQLITE_OK) {
+        const std::string why = std::string("not checked: open: ") + (db ? sqlite3_errmsg(db) : "out of memory");
         sqlite3_close(db);
-        return "open failed";
+        return why;
     }
     sqlite3_stmt* s = nullptr;
-    std::string out = "?";
-    if (sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &s, nullptr) == SQLITE_OK && sqlite3_step(s) == SQLITE_ROW)
-        out = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
+    int rc = sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &s, nullptr);
+    if (rc == SQLITE_OK) rc = sqlite3_step(s);
+    const std::string out = rc == SQLITE_ROW ? std::string(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)))
+                                             : "not checked: " + std::string(sqlite3_errmsg(db)) + " (" + std::to_string(sqlite3_extended_errcode(db)) + ")";
     sqlite3_finalize(s);
     sqlite3_close(db);
     return out;
@@ -298,8 +309,9 @@ bool killCheck(const std::string& root, std::string* why) {
     size_t files = 0;
     std::vector<std::vector<uint8_t>> sample;
     for (auto& f : partitionFiles(root, "PNM")) {
-        if (integrity(f) != "ok") {
-            *why = "integrity_check " + f;
+        const std::string ic = integrity(f);
+        if (ic != "ok") {
+            *why = "integrity_check " + f + ": " + ic.substr(0, 200);
             closeEngine();
             return false;
         }
