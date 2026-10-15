@@ -14,22 +14,25 @@ on:
 
 # Publish `flatsql` to npm only from GitHub Actions via OIDC trusted publishing.
 # Do not attempt local `npm publish` for this package from developer machines.
-# Required for NPM provenance / trusted publishing
-permissions:
-  contents: write
-  id-token: write
+# NPM provenance / trusted publishing needs id-token: write, which only the
+# publish job holds (security audit SEC-042/SEC-044); every other job reads.
+permissions: {}
 
 jobs:
   build:
     name: Build
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
 
@@ -40,7 +43,7 @@ jobs:
         run: npm run build
 
       - name: Setup Emscripten
-        uses: mymindstorm/setup-emsdk@v14
+        uses: mymindstorm/setup-emsdk@6ab9eb1bda2574c4ddb79809fc9247783eaf9021 # v14
         with:
           version: "4.0.23"
           actions-cache-folder: "emsdk-cache"
@@ -98,7 +101,7 @@ jobs:
           ls -la sdm/ || true
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: npm-package
           path: |
@@ -112,21 +115,25 @@ jobs:
 
   test:
     name: Test Package
+    permissions:
+      contents: read
     needs: build
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: npm-package
           path: ./
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
 
@@ -156,21 +163,31 @@ jobs:
 
   publish:
     name: Publish to NPM
+    # Publishes with npm provenance: only from a v* tag or main, in the
+    # npm-publish environment (owner's required reviewers). npm's trusted
+    # publisher for flatsql should require this environment.
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    environment: npm-publish
+    permissions:
+      contents: write # create the GitHub release
+      id-token: write # npm provenance / trusted publishing
     needs: [build, test]
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: npm-package
           path: ./
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
@@ -188,7 +205,9 @@ jobs:
 
       - name: Update package.json version
         if: startsWith(github.ref, 'refs/tags/v')
-        run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version --allow-same-version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Publish to NPM (dry run)
         if: github.event.inputs.dry_run == 'true'
@@ -198,10 +217,13 @@ jobs:
         if: github.event.inputs.dry_run != 'true'
         run: npm publish --access public --provenance
 
+      # The GitHub CLI with this job's token, not a third-party action holding
+      # contents: write.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi
