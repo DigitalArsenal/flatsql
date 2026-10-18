@@ -420,6 +420,8 @@ private:
     int32_t resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Row>>* out);
     bool evaluate(int64_t seq, std::vector<RowV>& rows, Row* out);
     int32_t loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::map<std::pair<int64_t, int>, std::vector<RowV>>* out);
+    int32_t loadRowsEach(int fi, Conn* c, p4::Stream* stream, const std::vector<int64_t>& seqs,
+                         std::map<std::pair<int64_t, int>, std::vector<RowV>>* out);
     int32_t ftsHits(const std::vector<int64_t>& seqs, std::unordered_set<int64_t>* hit);
     bool needData() const;
     bool laneMatch(const RowV& r) const;
@@ -1123,6 +1125,86 @@ int32_t Scan::page(std::vector<Cand>* out) {
 }
 
 // ---- rows ---------------------------------------------------------------------------------------------
+namespace {
+// A feed row's columns (S_R_SEQ), without its frame.
+void rowColumns(sqlite3_stmt* q, int fi, RowV* x) {
+    x->fi = fi;
+    x->rid = sqlite3_column_int64(q, 0);
+    x->n = uint32_t(sqlite3_column_int64(q, 1));
+    x->b = uint32_t(sqlite3_column_int64(q, 2));
+    x->c = uint32_t(sqlite3_column_int64(q, 3));
+    x->u = uint32_t(sqlite3_column_int64(q, 4));
+    x->at = sqlite3_column_int64(q, 5);
+    std::memcpy(x->key, sqlite3_column_blob(q, 6), 32);
+    x->hasE = sqlite3_column_type(q, 7) != SQLITE_NULL;
+    x->e = sqlite3_column_int64(q, 7);
+    x->k.from(q, 8);
+    x->ts = sqlite3_column_int64(q, 9);
+    x->sealed = sqlite3_column_type(q, 10) != SQLITE_NULL;
+    if (x->sealed) x->fcols.assign(static_cast<const char*>(sqlite3_column_blob(q, 10)), size_t(sqlite3_column_bytes(q, 10)));
+    if (sqlite3_column_type(q, 11) != SQLITE_NULL)
+        x->sig.assign(static_cast<const char*>(sqlite3_column_blob(q, 11)), size_t(sqlite3_column_bytes(q, 11)));
+    x->len = sqlite3_column_int64(q, 12);
+    x->off = sqlite3_column_int64(q, 13);
+}
+
+// A row's producer and tag batch from the feed's dictionary.
+bool rowDict(Feed* f, Conn* c, RowV* x) {
+    NodeDef nodeDef;
+    if (!dictNode(f, c, x->n, &nodeDef)) return false;
+    x->producer = nodeDef.producer;
+    x->peer = nodeDef.peer;
+    if (x->b) {
+        BatchDef bd;
+        if (!dictBatch(f, c, x->b, &bd)) return false;
+        x->inst = true;
+        x->batch = bd.batch;
+        x->ppeer = bd.ppeer;
+        x->pkey = bd.pkey;
+    }
+    return true;
+}
+
+// Frames a read joins into one: the next starts within kFrameGap of the
+// previous one's end, up to kFrameRun bytes (a seq-ordered page of a feed is
+// one contiguous run of its stream).
+constexpr int64_t kFrameGap = 4096, kFrameRun = int64_t(1) << 20;
+
+// The rows' frames, the stream read in offset order with neighbors joined;
+// false when any read is short or a frame's size prefix differs (the caller
+// then reads them one by one, which says why).
+bool readFrames(p4::Stream* s, std::vector<RowV*>& rows) {
+    std::sort(rows.begin(), rows.end(), [](const RowV* a, const RowV* b) { return a->off < b->off; });
+    std::string buf;
+    for (size_t i = 0; i < rows.size();) {
+        if (rows[i]->off < 0 || rows[i]->len < 0 || rows[i]->len > (int64_t(1) << 31) - 8) return false;
+        const int64_t from = rows[i]->off;
+        int64_t to = from + rows[i]->len + 4;
+        size_t j = i + 1;
+        while (j < rows.size() && rows[j]->off >= from && rows[j]->off <= to + kFrameGap && rows[j]->len >= 0 &&
+               std::max(to, rows[j]->off + rows[j]->len + 4) - from <= kFrameRun) {
+            to = std::max(to, rows[j]->off + rows[j]->len + 4);
+            j++;
+        }
+        if (streamReadRange(s, from, size_t(to - from), &buf) != P4_OK) return false;
+        for (size_t k = i; k < j; k++) {
+            RowV* x = rows[k];
+            const size_t at = size_t(x->off - from);
+            if (ld32(reinterpret_cast<const uint8_t*>(buf.data() + at)) != uint32_t(x->len)) return false;
+            x->data.assign(buf.data() + at + 4, size_t(x->len));
+            x->hasData = true;
+        }
+        i = j;
+    }
+    return true;
+}
+}  // namespace
+
+// The rows of a page's seqs in one feed file, with their frames when the
+// scan needs data. A dense page (most seq-ordered walks) reads one rid range,
+// a sparse one seeks each seq; frames are read in offset order, neighbors
+// joined; content keys and urls once each. Any failure re-reads the file the
+// one-by-one way (loadRowsEach), so a damaged file answers exactly as before.
 int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
                        std::map<std::pair<int64_t, int>, std::vector<RowV>>* out) {
     FRef& fr = files_[size_t(fi)];
@@ -1135,6 +1217,69 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
     if (!dictEnsure(fr.f, c)) return P4_E_IO;
     sqlite3_stmt* q = c->get(S_R_SEQ);
     if (!q) return P4_E_INTERNAL;
+    if (seqs.empty()) return P4_OK;
+    std::vector<std::vector<RowV>*> slot(seqs.size());
+    for (size_t i = 0; i < seqs.size(); i++) slot[i] = &(*out)[{seqs[i], fi}];
+    auto fallback = [&]() {
+        for (int64_t seq : seqs) (*out)[{seq, fi}].clear();
+        return loadRowsEach(fi, c, stream.get(), seqs, out);
+    };
+    const bool dense = seqs.back() - seqs.front() < int64_t(2 * seqs.size()) + 16;
+    int64_t loaded = 0;
+    for (size_t i = 0; i < seqs.size(); i = dense ? seqs.size() : i + 1) {
+        const int64_t lo = dense ? seqs.front() : seqs[i], hi = dense ? seqs.back() : seqs[i];
+        sqlite3_bind_int64(q, 1, lo << 16);
+        sqlite3_bind_int64(q, 2, (hi << 16) | 0xffff);
+        size_t at = i;
+        int r;
+        while ((r = sqlite3_step(q)) == SQLITE_ROW) {
+            if (sqlite3_column_bytes(q, 6) != 32) continue;
+            const int64_t seq = sqlite3_column_int64(q, 0) >> 16;
+            while (at < seqs.size() && seqs[at] < seq) at++;
+            if (at == seqs.size() || seqs[at] != seq) continue;  // a seq between the page's
+            RowV x;
+            rowColumns(q, fi, &x);
+            if (!rowDict(fr.f, c, &x)) {
+                sqlite3_reset(q);
+                return fallback();
+            }
+            slot[at]->push_back(std::move(x));
+            loaded++;
+        }
+        sqlite3_reset(q);
+        if (r != SQLITE_DONE) return fallback();
+    }
+    if (nd) {
+        std::vector<RowV*> rows;
+        rows.reserve(size_t(loaded));
+        for (auto* v : slot)
+            for (RowV& x : *v) rows.push_back(&x);
+        if (!readFrames(stream.get(), rows)) return fallback();
+    }
+    std::unordered_map<uint32_t, std::string> ckeys, urls;
+    for (auto* v : slot)
+        for (RowV& x : *v) {
+            L_->bytesRead += uint64_t(x.len) + 64;
+            if (x.c) {
+                auto it = ckeys.find(x.c);
+                x.ckey = it != ckeys.end() ? it->second : (ckeys[x.c] = dictCkey(c, x.c));
+            }
+            if (x.u && (s_.needTags || s_.lane)) {
+                auto it = urls.find(x.u);
+                x.url = it != urls.end() ? it->second : (urls[x.u] = dictUrl(c, x.u));
+            }
+        }
+    return P4_OK;
+}
+
+// loadRows one seq and one frame at a time (3.7.2's reads): the reference a
+// failed batched read falls back to.
+int32_t Scan::loadRowsEach(int fi, Conn* c, p4::Stream* stream, const std::vector<int64_t>& seqs,
+                           std::map<std::pair<int64_t, int>, std::vector<RowV>>* out) {
+    FRef& fr = files_[size_t(fi)];
+    const bool nd = needData();
+    sqlite3_stmt* q = c->get(S_R_SEQ);
+    if (!q) return P4_E_INTERNAL;
     for (int64_t seq : seqs) {
         sqlite3_bind_int64(q, 1, seq << 16);
         sqlite3_bind_int64(q, 2, (seq << 16) | 0xffff);
@@ -1143,49 +1288,18 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
         while ((r = sqlite3_step(q)) == SQLITE_ROW) {
             if (sqlite3_column_bytes(q, 6) != 32) continue;
             RowV x;
-            x.fi = fi;
-            x.rid = sqlite3_column_int64(q, 0);
-            x.n = uint32_t(sqlite3_column_int64(q, 1));
-            x.b = uint32_t(sqlite3_column_int64(q, 2));
-            x.c = uint32_t(sqlite3_column_int64(q, 3));
-            x.u = uint32_t(sqlite3_column_int64(q, 4));
-            x.at = sqlite3_column_int64(q, 5);
-            std::memcpy(x.key, sqlite3_column_blob(q, 6), 32);
-            x.hasE = sqlite3_column_type(q, 7) != SQLITE_NULL;
-            x.e = sqlite3_column_int64(q, 7);
-            x.k.from(q, 8);
-            x.ts = sqlite3_column_int64(q, 9);
-            x.sealed = sqlite3_column_type(q, 10) != SQLITE_NULL;
-            if (x.sealed) x.fcols.assign(static_cast<const char*>(sqlite3_column_blob(q, 10)), size_t(sqlite3_column_bytes(q, 10)));
-            if (sqlite3_column_type(q, 11) != SQLITE_NULL)
-                x.sig.assign(static_cast<const char*>(sqlite3_column_blob(q, 11)), size_t(sqlite3_column_bytes(q, 11)));
-            x.len = sqlite3_column_int64(q, 12);
-            x.off = sqlite3_column_int64(q, 13);
+            rowColumns(q, fi, &x);
             if (nd) {
-                const int32_t st = streamRead(stream.get(), x.off, x.len, &x.data);
+                const int32_t st = streamRead(stream, x.off, x.len, &x.data);
                 if (st != P4_OK) {
                     sqlite3_reset(q);
                     return st;
                 }
                 x.hasData = true;
             }
-            NodeDef nodeDef;
-            if (!dictNode(fr.f, c, x.n, &nodeDef)) {
+            if (!rowDict(fr.f, c, &x)) {
                 sqlite3_reset(q);
                 return P4_E_CORRUPT;
-            }
-            x.producer = nodeDef.producer;
-            x.peer = nodeDef.peer;
-            if (x.b) {
-                BatchDef bd;
-                if (!dictBatch(fr.f, c, x.b, &bd)) {
-                    sqlite3_reset(q);
-                    return P4_E_CORRUPT;
-                }
-                x.inst = true;
-                x.batch = bd.batch;
-                x.ppeer = bd.ppeer;
-                x.pkey = bd.pkey;
             }
             L_->bytesRead += uint64_t(x.len) + 64;
             rows.push_back(std::move(x));
