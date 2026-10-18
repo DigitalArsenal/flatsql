@@ -420,8 +420,6 @@ private:
     int32_t resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Row>>* out);
     bool evaluate(int64_t seq, std::vector<RowV>& rows, Row* out);
     int32_t loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::map<std::pair<int64_t, int>, std::vector<RowV>>* out);
-    int32_t loadRowsEach(int fi, Conn* c, p4::Stream* stream, const std::vector<int64_t>& seqs,
-                         std::map<std::pair<int64_t, int>, std::vector<RowV>>* out);
     int32_t ftsHits(const std::vector<int64_t>& seqs, std::unordered_set<int64_t>* hit);
     bool needData() const;
     bool laneMatch(const RowV& r) const;
@@ -1170,14 +1168,14 @@ bool rowDict(Feed* f, Conn* c, RowV* x) {
 // one contiguous run of its stream).
 constexpr int64_t kFrameGap = 4096, kFrameRun = int64_t(1) << 20;
 
-// The rows' frames, the stream read in offset order with neighbors joined;
-// false when any read is short or a frame's size prefix differs (the caller
-// then reads them one by one, which says why).
-bool readFrames(p4::Stream* s, std::vector<RowV*>& rows) {
+// The rows' frames, the stream read in offset order with neighbors joined:
+// P4_E_IO when a read fails, P4_E_CORRUPT when a frame runs past the stream's
+// end or its size prefix differs.
+int32_t readFrames(p4::Stream* s, std::vector<RowV*>& rows) {
     std::sort(rows.begin(), rows.end(), [](const RowV* a, const RowV* b) { return a->off < b->off; });
     std::string buf;
     for (size_t i = 0; i < rows.size();) {
-        if (rows[i]->off < 0 || rows[i]->len < 0 || rows[i]->len > (int64_t(1) << 31) - 8) return false;
+        if (rows[i]->off < 0 || rows[i]->len < 0 || rows[i]->len > (int64_t(1) << 31) - 8) return P4_E_CORRUPT;
         const int64_t from = rows[i]->off;
         int64_t to = from + rows[i]->len + 4;
         size_t j = i + 1;
@@ -1186,25 +1184,25 @@ bool readFrames(p4::Stream* s, std::vector<RowV*>& rows) {
             to = std::max(to, rows[j]->off + rows[j]->len + 4);
             j++;
         }
-        if (streamReadRange(s, from, size_t(to - from), &buf) != P4_OK) return false;
+        const int32_t st = streamReadRange(s, from, size_t(to - from), &buf);
+        if (st != P4_OK) return st;
         for (size_t k = i; k < j; k++) {
             RowV* x = rows[k];
             const size_t at = size_t(x->off - from);
-            if (ld32(reinterpret_cast<const uint8_t*>(buf.data() + at)) != uint32_t(x->len)) return false;
+            if (ld32(reinterpret_cast<const uint8_t*>(buf.data() + at)) != uint32_t(x->len)) return P4_E_CORRUPT;
             x->data.assign(buf.data() + at + 4, size_t(x->len));
             x->hasData = true;
         }
         i = j;
     }
-    return true;
+    return P4_OK;
 }
 }  // namespace
 
 // The rows of a page's seqs in one feed file, with their frames when the
 // scan needs data. A dense page (most seq-ordered walks) reads one rid range,
 // a sparse one seeks each seq; frames are read in offset order, neighbors
-// joined; content keys and urls once each. Any failure re-reads the file the
-// one-by-one way (loadRowsEach), so a damaged file answers exactly as before.
+// joined; content keys and urls once each.
 int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
                        std::map<std::pair<int64_t, int>, std::vector<RowV>>* out) {
     FRef& fr = files_[size_t(fi)];
@@ -1220,10 +1218,6 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
     if (seqs.empty()) return P4_OK;
     std::vector<std::vector<RowV>*> slot(seqs.size());
     for (size_t i = 0; i < seqs.size(); i++) slot[i] = &(*out)[{seqs[i], fi}];
-    auto fallback = [&]() {
-        for (int64_t seq : seqs) (*out)[{seq, fi}].clear();
-        return loadRowsEach(fi, c, stream.get(), seqs, out);
-    };
     const bool dense = seqs.back() - seqs.front() < int64_t(2 * seqs.size()) + 16;
     int64_t loaded = 0;
     for (size_t i = 0; i < seqs.size(); i = dense ? seqs.size() : i + 1) {
@@ -1241,20 +1235,21 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
             rowColumns(q, fi, &x);
             if (!rowDict(fr.f, c, &x)) {
                 sqlite3_reset(q);
-                return fallback();
+                return P4_E_CORRUPT;
             }
             slot[at]->push_back(std::move(x));
             loaded++;
         }
         sqlite3_reset(q);
-        if (r != SQLITE_DONE) return fallback();
+        if (r != SQLITE_DONE) return statusOfSqlite(r);
     }
     if (nd) {
         std::vector<RowV*> rows;
         rows.reserve(size_t(loaded));
         for (auto* v : slot)
             for (RowV& x : *v) rows.push_back(&x);
-        if (!readFrames(stream.get(), rows)) return fallback();
+        const int32_t st = readFrames(stream.get(), rows);
+        if (st != P4_OK) return st;
     }
     std::unordered_map<uint32_t, std::string> ckeys, urls;
     for (auto* v : slot)
@@ -1269,52 +1264,6 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
                 x.url = it != urls.end() ? it->second : (urls[x.u] = dictUrl(c, x.u));
             }
         }
-    return P4_OK;
-}
-
-// loadRows one seq and one frame at a time (3.7.2's reads): the reference a
-// failed batched read falls back to.
-int32_t Scan::loadRowsEach(int fi, Conn* c, p4::Stream* stream, const std::vector<int64_t>& seqs,
-                           std::map<std::pair<int64_t, int>, std::vector<RowV>>* out) {
-    FRef& fr = files_[size_t(fi)];
-    const bool nd = needData();
-    sqlite3_stmt* q = c->get(S_R_SEQ);
-    if (!q) return P4_E_INTERNAL;
-    for (int64_t seq : seqs) {
-        sqlite3_bind_int64(q, 1, seq << 16);
-        sqlite3_bind_int64(q, 2, (seq << 16) | 0xffff);
-        int r;
-        std::vector<RowV>& rows = (*out)[{seq, fi}];
-        while ((r = sqlite3_step(q)) == SQLITE_ROW) {
-            if (sqlite3_column_bytes(q, 6) != 32) continue;
-            RowV x;
-            rowColumns(q, fi, &x);
-            if (nd) {
-                const int32_t st = streamRead(stream, x.off, x.len, &x.data);
-                if (st != P4_OK) {
-                    sqlite3_reset(q);
-                    return st;
-                }
-                x.hasData = true;
-            }
-            if (!rowDict(fr.f, c, &x)) {
-                sqlite3_reset(q);
-                return P4_E_CORRUPT;
-            }
-            L_->bytesRead += uint64_t(x.len) + 64;
-            rows.push_back(std::move(x));
-        }
-        sqlite3_reset(q);
-        if (r != SQLITE_DONE) return statusOfSqlite(r);
-    }
-    // Content keys and urls of the rows with an instance.
-    for (auto& kv : *out) {
-        if (kv.first.second != fi) continue;
-        for (RowV& x : kv.second) {
-            if (x.c) x.ckey = dictCkey(c, x.c);
-            if (x.u && (s_.needTags || s_.lane)) x.url = dictUrl(c, x.u);
-        }
-    }
     return P4_OK;
 }
 
