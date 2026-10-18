@@ -924,17 +924,36 @@ struct IdentNew {
     uint8_t h[32];
     RecState* rec;
 };
+// A feed's instances as one index transaction leaves them: only those it
+// changes, each taken from the feed's committed table (Type::mu) when first
+// touched; the table itself is never copied, so a transaction costs what it
+// changes, not what the feed holds. The commit writes them and then publishes
+// them (one left without records goes); a rollback drops them.
+struct InstTxn {
+    std::map<InstId, InstCount> changed;
+    InstCount& touch(Type* t, const Feed* f, const InstId& id);
+    void publish(Feed* f);  // Type::mu held
+};
+// The dictionary entries one index transaction adds to its feed's (ids past
+// the feed's when it began); the feed's dictionary is never copied. Interning
+// looks in the feed's (Feed::dictMu), then in these; the commit publishes them.
+struct DictTxn {
+    uint32_t node0 = 0, batch0 = 0;  // the feed's entries when the transaction began
+    Dict add;
+    void begin(const Dict& d);
+    void publish(Dict& d);  // Feed::dictMu held
+};
+
 // One feed file's index transaction in a commit round (applyRound): the
 // round's writes apply their rows to it in plan order, then it commits once,
 // its stream synced first.
 struct FileTxn {
     Feed* f = nullptr;
     struct Conn* c = nullptr;
-    Dict dict;
+    DictTxn dict;
     Counters k;
-    std::map<InstId, InstCount> inst;
+    InstTxn inst;
     std::map<uint32_t, TokCount> tokc, tokcBefore;
-    std::set<InstId> changedInst;
     std::vector<int64_t> ftsDrop;  // full-text rows to delete after the commit
     int64_t newEnd = 0;            // the stream's mark after the round's frames
     // Staged rows: the feed's view at the transaction's start, the rows it

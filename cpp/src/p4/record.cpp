@@ -640,11 +640,25 @@ struct InstAgg {
     std::string url;
 };
 
-uint32_t internNode(Dict& d, Conn* c, const std::string& producer, const std::string& peer, int* rc) {
+// A node's or batch's id in the feed's dictionary (Feed::dictMu), else in the
+// transaction's additions (0: none).
+uint32_t dictId(Feed* f, const DictTxn& d, bool node, const std::string& k) {
+    {
+        std::lock_guard<std::mutex> g(f->dictMu);
+        const auto& m = node ? f->dict.nodeId : f->dict.batchId;
+        auto it = m.find(k);
+        if (it != m.end()) return it->second;
+    }
+    const auto& m = node ? d.add.nodeId : d.add.batchId;
+    auto it = m.find(k);
+    return it != m.end() ? it->second : 0;
+}
+
+uint32_t internNode(DictTxn& dt, Feed* f, Conn* c, const std::string& producer, const std::string& peer, int* rc) {
     const std::string k = nodeKey(producer, peer);
-    auto it = d.nodeId.find(k);
-    if (it != d.nodeId.end()) return it->second;
-    const uint32_t id = uint32_t(d.node.size() + 1);
+    if (const uint32_t known = dictId(f, dt, true, k)) return known;
+    Dict& d = dt.add;
+    const uint32_t id = dt.node0 + uint32_t(d.node.size() + 1);
     sqlite3_stmt* q = c->get(S_NODE_INS);
     if (!q) {
         *rc = SQLITE_ERROR;
@@ -664,11 +678,11 @@ uint32_t internNode(Dict& d, Conn* c, const std::string& producer, const std::st
     return id;
 }
 
-uint32_t internBatch(Dict& d, Conn* c, const RowR& x, int* rc) {
+uint32_t internBatch(DictTxn& dt, Feed* f, Conn* c, const RowR& x, int* rc) {
     const std::string k = batchKey(x.batch, x.ppeer, x.pkey);
-    auto it = d.batchId.find(k);
-    if (it != d.batchId.end()) return it->second;
-    const uint32_t id = uint32_t(d.batch.size() + 1);
+    if (const uint32_t known = dictId(f, dt, false, k)) return known;
+    Dict& d = dt.add;
+    const uint32_t id = dt.batch0 + uint32_t(d.batch.size() + 1);
     sqlite3_stmt* q = c->get(S_BATCH_INS);
     if (!q) {
         *rc = SQLITE_ERROR;
@@ -735,6 +749,60 @@ std::map<uint32_t, int64_t> copiesOf(const RecState* r, bool after) {
 }
 }  // namespace
 
+// ---- a transaction's instances and dictionary additions --------------------------------------------------
+InstCount& InstTxn::touch(Type* t, const Feed* f, const InstId& id) {
+    auto it = changed.find(id);
+    if (it != changed.end()) return it->second;
+    InstCount base;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        auto b = f->inst.find(id);
+        if (b != f->inst.end()) base = b->second;
+    }
+    return changed.emplace(id, std::move(base)).first->second;
+}
+
+void InstTxn::publish(Feed* f) {
+    for (auto& kv : changed) {
+        if (kv.second.n <= 0) f->inst.erase(kv.first);
+        else f->inst[kv.first] = std::move(kv.second);
+    }
+    changed.clear();
+}
+
+void DictTxn::begin(const Dict& d) {
+    node0 = uint32_t(d.node.size());
+    batch0 = uint32_t(d.batch.size());
+    add = Dict();
+}
+
+// Ids only grow, densely from 1: an addition a reader already loaded from the
+// committed file is there; a gap (the feed's dictionary behind the file) is
+// left to the next load.
+void DictTxn::publish(Dict& d) {
+    for (size_t i = 0; i < add.node.size(); i++) {
+        const uint32_t id = node0 + uint32_t(i + 1);
+        if (id <= d.node.size()) continue;
+        if (id != d.node.size() + 1) {
+            d.loaded = false;
+            break;
+        }
+        d.nodeId[nodeKey(add.node[i].producer, add.node[i].peer)] = id;
+        d.node.push_back(std::move(add.node[i]));
+    }
+    for (size_t i = 0; i < add.batch.size(); i++) {
+        const uint32_t id = batch0 + uint32_t(i + 1);
+        if (id <= d.batch.size()) continue;
+        if (id != d.batch.size() + 1) {
+            d.loaded = false;
+            break;
+        }
+        d.batchId[batchKey(add.batch[i].batch, add.batch[i].ppeer, add.batch[i].pkey)] = id;
+        d.batch.push_back(std::move(add.batch[i]));
+    }
+    add = Dict();
+}
+
 // ---- a feed's index transaction in a commit round -------------------------------------------------------
 // Whether this write changes the feed file fid (rows, its moves, identities).
 bool WriteCtx::fileChanges(uint32_t fid) const {
@@ -788,12 +856,11 @@ int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
     }
     {
         std::lock_guard<std::mutex> g(f->dictMu);
-        x.dict = f->dict;
+        x.dict.begin(f->dict);
     }
     {
         std::lock_guard<std::mutex> g(t->mu);
         x.k = f->k;
-        x.inst = f->inst;
         x.tokc = f->tokc;
         x.indexed = f->indexed;
         x.clearMoved = f->movedRows && f->movedDone;
@@ -830,7 +897,6 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
     auto ne = newEnd_.find(f->fid);
     if (ne != newEnd_.end()) x.newEnd = std::max(x.newEnd, ne->second);
     int& rc = x.rc;
-    Dict& dict = x.dict;
     Counters& k = x.k;
     auto bad = [&](int r) {
         if (rc == SQLITE_OK && r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) rc = r;
@@ -856,7 +922,7 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
         for (RowR& y : r->rows) {
             if (rc != SQLITE_OK) break;
             if (!y.loaded || !y.inst || y.bId) continue;
-            y.bId = internBatch(dict, c, y, &rc);
+            y.bId = internBatch(x.dict, f, c, y, &rc);
             y.cId = internText(c, S_CKEY_GET, S_CKEY_INS, y.ckey, &rc);
         }
     std::vector<RecState*> sorted = recs;
@@ -894,8 +960,8 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
                     TokDef* d = t->tokById(y.tok);
                     producer = d ? d->token : std::string();
                 }
-                y.nId = internNode(dict, c, producer, y.peer, &rc);
-                y.bId = y.inst ? internBatch(dict, c, y, &rc) : 0;
+                y.nId = internNode(x.dict, f, c, producer, y.peer, &rc);
+                y.bId = y.inst ? internBatch(x.dict, f, c, y, &rc) : 0;
                 y.cId = y.inst ? internText(c, S_CKEY_GET, S_CKEY_INS, y.ckey, &rc) : 0;
                 y.uId = y.inst ? internText(c, S_URL_GET, S_URL_INS, y.url, &rc) : 0;
                 if (rc != SQLITE_OK) break;
@@ -1062,8 +1128,7 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
             // leaves (format 1's decrementSourceSummary, C-39 E5).
             const bool restamp = r->restamp && a.b && !a.a;
             if (a.a == a.b && !a.changed && a.lenA == a.lenB && !restamp) continue;
-            x.changedInst.insert(kv.first);
-            InstCount& ic = x.inst[kv.first];
+            InstCount& ic = x.inst.touch(t, f, kv.first);
             if (ic.n == 0 && a.any) {
                 ic.batch = a.any->batch;
                 ic.ppeer = a.any->ppeer;
@@ -1162,11 +1227,11 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
         e->bump(kStJournalSyncs);
     }
     Counters& k = x.k;
-    for (const InstId& id : x.changedInst) {
+    for (const auto& kv : x.inst.changed) {
         if (rc != SQLITE_OK) break;
-        auto it = x.inst.find(id);
-        if (it == x.inst.end() || it->second.n <= 0) {
-            if (it != x.inst.end()) x.inst.erase(it);
+        const InstId& id = kv.first;
+        const InstCount& ic = kv.second;
+        if (ic.n <= 0) {
             sqlite3_stmt* q = c->get(S_INST_DEL);
             sqlite3_bind_int64(q, 1, id.first);
             sqlite3_bind_int64(q, 2, id.second);
@@ -1174,7 +1239,6 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
             sqlite3_reset(q);
             continue;
         }
-        const InstCount& ic = it->second;
         sqlite3_stmt* q = c->get(S_INST_PUT);
         sqlite3_bind_int64(q, 1, id.first);
         sqlite3_bind_int64(q, 2, id.second);
@@ -1208,18 +1272,21 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
         x.stNew = x.stBase;
     }
     if (rc == SQLITE_OK && x.deleted) {
-        // The bounds again (the ends of the seq and w indexes: O(log n)); a
-        // file without the indexes (a migration before REBUILD 1) walks.
+        // The bounds again (the ends of the rowid and w indexes: O(log n)); a
+        // file without the indexes (a migration before REBUILD 1) walks for w.
+        // A row's rid is its seq << 16 plus its index in the record, so the
+        // first and last rows by rid hold the least and greatest seq (one
+        // SELECT of both min() and max() would scan every row).
         if (k.rows <= 0) {
             const int64_t keep = k.maxseq;
             k = Counters();
             k.maxseq = keep;  // seqs never go back
         } else {
-            sqlite3_stmt* s = c->sql("SELECT min(seq), max(seq) FROM r");
-            if (s && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 0) != SQLITE_NULL) {
-                k.minseq = sqlite3_column_int64(s, 0);
-                k.maxseq = std::max<int64_t>(k.maxseq, sqlite3_column_int64(s, 1));
-            }
+            sqlite3_stmt* s = c->sql("SELECT seq FROM r ORDER BY rid LIMIT 1");
+            if (s && sqlite3_step(s) == SQLITE_ROW) k.minseq = sqlite3_column_int64(s, 0);
+            if (s) sqlite3_reset(s);
+            s = c->sql("SELECT seq FROM r ORDER BY rid DESC LIMIT 1");
+            if (s && sqlite3_step(s) == SQLITE_ROW) k.maxseq = std::max<int64_t>(k.maxseq, sqlite3_column_int64(s, 0));
             if (s) sqlite3_reset(s);
             // r_w holds the merged rows, the view the staged ones.
             k.minw = INT64_MAX;
@@ -1280,7 +1347,7 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
     e->bump(kStGroupCommits);
     {
         std::lock_guard<std::mutex> g(f->dictMu);
-        if (x.dict.node.size() >= f->dict.node.size() && x.dict.batch.size() >= f->dict.batch.size()) f->dict = std::move(x.dict);
+        x.dict.publish(f->dict);
     }
     if (!x.ftsDrop.empty()) {
         std::lock_guard<std::mutex> g(t->ftsGoneMu);
@@ -1295,7 +1362,7 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
     f->streamBytes = x.newEnd;
     if (stChanged) stagedPublish(e, f, x.stNew, !x.stAdd.empty() || !x.idAdd.empty());
     f->k = k;
-    f->inst = std::move(x.inst);
+    x.inst.publish(f);
     f->tokc = std::move(x.tokc);
     f->created = true;
     if (x.clearMoved) f->movedRows = false;
