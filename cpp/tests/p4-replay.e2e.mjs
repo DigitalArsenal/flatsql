@@ -278,6 +278,27 @@ for (let rep = 0; rep < reps; rep++) {
   }
   console.log(`repetition ${rep + 1}/${reps} done (load ${b0.load})`);
 }
+// The independent reference: stock SQLite on the same index and frames, the
+// read workloads only, each repetition on a fresh clone (cold, then warm).
+const stockRuns = {}; // workload -> pass -> [{wall_ms, cpu_ms, rows}]
+for (let rep = 0; rep < reps; rep++) {
+  for (const workload of WORKLOADS.filter((w) => READS.has(w))) {
+    const clone = join(work, `clone-${process.pid}-${cloneN++}`);
+    run('cp', ['-c', '-R', fixture, clone]);
+    try {
+      const r = spawnSync(arms.new, ['--test=p4_replay', '--phase=stock', `--store=${clone}`, `--workload=${workload}`, `--gp=${seedTsv}`,
+        `--passes=${1 + WARM_PASSES}`], { encoding: 'utf8', maxBuffer: 64 << 20 });
+      const lines = (r.stdout || '').split('\n').filter((l) => l.startsWith('REPLAY_STOCK ')).map((l) => JSON.parse(l.slice(13)));
+      if (r.status !== 0 || !lines.length) fail(`stock ${workload}: exit ${r.status ?? r.signal}\n${(r.stderr || '').slice(-2000)}`);
+      const kinds = {};
+      for (const l of lines) (kinds[l.pass] ??= []).push(l);
+      for (const [kind, ls] of Object.entries(kinds))
+        ((stockRuns[workload] ??= {})[kind] ??= []).push({ ...ls[0], wall_ms: med(ls.map((l) => l.wall_ms)), cpu_ms: med(ls.map((l) => l.cpu_ms)) });
+    } finally {
+      rmSync(clone, { recursive: true, force: true });
+    }
+  }
+}
 const b1 = bounds();
 console.log(`bounds after: ${JSON.stringify(b1)}`);
 const syncMs = Math.min(b0.sync_ms_median, b1.sync_ms_median);
@@ -298,8 +319,13 @@ for (const workload of WORKLOADS) {
       const ac = byArm.base.map((p) => p.cpu_ms), bc = byArm.new.map((p) => p.cpu_ms);
       const syncs = med(byArm.new.map((p) => p.syncs));
       const bound = syncs > 0 ? syncs * syncMs : 0;
+      const sk = stockRuns[workload]?.[pass];
+      const stockRows = sk ? med(sk.map((x) => x.rows)) : null;
+      const nrows = med(byArm.new.map((p) => p.rows));
       rows.push({ runtime, workload, pass, base_med: med(a), base_p95: q(a, 0.95), new_med: med(b), new_p95: q(b, 0.95),
-        speedup: med(a) / med(b), base_cpu: med(ac), new_cpu: med(bc), syncs, bound_ms: bound, rows: med(byArm.new.map((p) => p.rows)) });
+        speedup: med(a) / med(b), base_cpu: med(ac), new_cpu: med(bc), syncs, bound_ms: bound, rows: nrows,
+        stock_ms: sk ? med(sk.map((x) => x.wall_ms)) : null, stock_rows: stockRows });
+      if (sk && stockRows !== nrows) console.error(`note: ${workload}|${pass}: stock SQLite answered ${stockRows} rows, the engine ${nrows}: not the same question`);
       const p = slowerP(a, b);
       if (p <= ALPHA) {
         failed = true;
@@ -309,9 +335,9 @@ for (const workload of WORKLOADS) {
   }
 }
 const f = (x) => (x < 0 ? 'n/a' : x >= 100 ? x.toFixed(0) : x.toFixed(2));
-console.log(`\nruntime workload pass | ${BASE_TAG} median/p95 ms | this build median/p95 ms | speedup | cpu ms ${BASE_TAG} -> this | syncs (bound ms at ${syncMs.toFixed(2)} ms/sync) | rows`);
+console.log(`\nruntime workload pass | ${BASE_TAG} median/p95 ms | this build median/p95 ms | speedup | cpu ms ${BASE_TAG} -> this | syncs (bound ms at ${syncMs.toFixed(2)} ms/sync) | rows | stock SQLite ms`);
 for (const r of rows)
-  console.log(`${r.runtime} ${r.workload} ${r.pass} | ${f(r.base_med)}/${f(r.base_p95)} | ${f(r.new_med)}/${f(r.new_p95)} | ${r.speedup.toFixed(2)}x | ${f(r.base_cpu)} -> ${f(r.new_cpu)} | ${r.syncs} (${f(r.bound_ms)}) | ${r.rows}`);
+  console.log(`${r.runtime} ${r.workload} ${r.pass} | ${f(r.base_med)}/${f(r.base_p95)} | ${f(r.new_med)}/${f(r.new_p95)} | ${r.speedup.toFixed(2)}x | ${f(r.base_cpu)} -> ${f(r.new_cpu)} | ${r.syncs} (${f(r.bound_ms)}) | ${r.rows} | ${r.stock_ms == null ? 'n/a' : f(r.stock_ms)}`);
 writeFileSync(join(work, 'replay-results.json'), JSON.stringify({ bounds: [b0, b1], memcpy, rows }, null, 1));
 console.log(failed ? 'FAIL: p4 replay' : `PASS: p4 replay (every answer the same on both builds, ${RUNTIMES.join(' and ')})`);
 process.exit(failed ? 1 : 0);

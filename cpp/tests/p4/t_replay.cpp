@@ -55,6 +55,8 @@
 #include <thread>
 #include <vector>
 
+#include <sqlite3.h>
+
 #include "flatsql/ps/platform.h"
 #include "flatsql/ps/result_block.h"
 #include "internal.h"
@@ -512,6 +514,136 @@ const std::map<std::string, Work>& reads() {
     return m;
 }
 
+#if !defined(__wasm__)
+// ---- the independent reference ---------------------------------------------------------------------
+// Stock SQLite (this build's 3.53.4 amalgamation through its own unix VFS, no
+// FlatSQL VFS and no format-4 engine) asked each read workload's question in
+// SQL on the same feed index, with the same indexes, and each answer's frames
+// read with one pread apiece in answer order: a yardstick, not an
+// implementation. Staged rows (m=0) sit outside the partial indexes, so each
+// query adds them through r_m. Prints REPLAY_STOCK lines: wall, CPU, rows and
+// frame bytes (the rows must equal the engine's, or the yardstick asked
+// something else).
+struct StockDb {
+    sqlite3* db = nullptr;
+    int fd = -1;
+    std::string err;
+    explicit StockDb(const std::string& feed) {
+        if (sqlite3_open_v2(("file:" + feed + ".db").c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI, "unix") != SQLITE_OK)
+            err = db ? sqlite3_errmsg(db) : "open";
+        else
+            sqlite3_exec(db, "PRAGMA query_only=1; PRAGMA mmap_size=0", nullptr, nullptr, nullptr);
+        fd = ::open((feed + ".fsdata").c_str(), O_RDONLY);
+        if (fd < 0) err = "open stream";
+    }
+    ~StockDb() {
+        if (db) sqlite3_close_v2(db);
+        if (fd >= 0) ::close(fd);
+    }
+    sqlite3_stmt* prep(const char* q) {
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db, q, -1, &st, nullptr) != SQLITE_OK) err = std::string(q) + ": " + sqlite3_errmsg(db);
+        return st;
+    }
+    // Reads the frames of a statement's (off, len) columns 0 and 1.
+    bool frames(sqlite3_stmt* st, int64_t* rows, int64_t* bytes, int64_t* lastCol2) {
+        std::vector<uint8_t> buf;
+        int rc;
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            const int64_t off = sqlite3_column_int64(st, 0), len = sqlite3_column_int64(st, 1);
+            if (lastCol2) *lastCol2 = sqlite3_column_int64(st, 2);
+            buf.resize(size_t(len) + 4);
+            if (::pread(fd, buf.data(), buf.size(), off_t(off)) != ssize_t(buf.size())) return false;
+            (*rows)++;
+            *bytes += len;
+        }
+        sqlite3_reset(st);
+        return rc == SQLITE_DONE;
+    }
+};
+
+void stock(const std::string& root, const std::string& workload, const Probe& p, int passes) {
+    for (int pass = 0; pass < passes; pass++) {
+        StockDb s(root + "/P/OMM/space-track.org@gp_history");
+        if (!s.err.empty()) {
+            std::fprintf(stderr, "stock: %s\n", s.err.c_str());
+            return;
+        }
+        Clock c;
+        c.start();
+        int64_t rows = 0, bytes = 0;
+        bool ok = true;
+        if (workload == "sync_norad") {
+            sqlite3_stmt* kk = s.prep("SELECT id FROM okey WHERE k=?1");
+            sqlite3_stmt* q = s.prep(
+                "SELECT off, len, rid FROM (SELECT off, len, w, rid FROM r INDEXED BY r_ke WHERE kk=?1 AND m=1 AND e BETWEEN ?2 AND ?3"
+                " UNION ALL SELECT off, len, w, rid FROM r INDEXED BY r_m WHERE m=0 AND kk=?1 AND e BETWEEN ?2 AND ?3)"
+                " ORDER BY w, rid LIMIT 100 OFFSET ?4");
+            for (uint32_t norad : p.norads) {
+                if (!ok || !kk || !q) break;
+                sqlite3_bind_int64(kk, 1, norad);
+                const int64_t id = sqlite3_step(kk) == SQLITE_ROW ? sqlite3_column_int64(kk, 0) : -1;
+                sqlite3_reset(kk);
+                for (int64_t off = 0;; off += 100) {
+                    const int64_t before = rows;
+                    sqlite3_bind_int64(q, 1, id);
+                    sqlite3_bind_int64(q, 2, p.epochLo);
+                    sqlite3_bind_int64(q, 3, p.epochHi);
+                    sqlite3_bind_int64(q, 4, off);
+                    ok = s.frames(q, &rows, &bytes, nullptr);
+                    if (!ok || rows - before < 100) break;
+                }
+            }
+            sqlite3_finalize(kk);
+            sqlite3_finalize(q);
+        } else if (workload == "sync_window") {
+            sqlite3_stmt* q = s.prep("SELECT off, len, seq FROM r INDEXED BY r_s WHERE seq>?3 AND e BETWEEN ?1 AND ?2 ORDER BY seq LIMIT 1000");
+            for (const auto& win : p.windows) {
+                int64_t after = 0;
+                for (;;) {
+                    if (!q) break;
+                    const int64_t before = rows;
+                    sqlite3_bind_int64(q, 1, win.first);
+                    sqlite3_bind_int64(q, 2, win.second);
+                    sqlite3_bind_int64(q, 3, after);
+                    ok = s.frames(q, &rows, &bytes, &after);
+                    if (!ok || rows - before < 1000) break;
+                }
+            }
+            sqlite3_finalize(q);
+        } else if (workload == "latest") {
+            // Every object's greatest epoch (the probe instant follows every
+            // epoch), the lowest CID among ties: one pass over the rows (a
+            // seek per object would also walk the staged rows per object).
+            sqlite3_stmt* q = s.prep(
+                "SELECT off, len FROM (SELECT off, len, row_number() OVER (PARTITION BY kk ORDER BY e DESC, cid) AS n"
+                " FROM r WHERE kk IS NOT NULL AND e IS NOT NULL) WHERE n=1");
+            if (q) ok = s.frames(q, &rows, &bytes, nullptr);
+            sqlite3_finalize(q);
+        } else if (workload == "explorer") {
+            sqlite3_stmt* q = s.prep("SELECT off, len, seq FROM r INDEXED BY r_s WHERE seq<?1 ORDER BY seq DESC LIMIT 100");
+            int64_t before = INT64_MAX;
+            for (int page = 0; page < 100 && q; page++) {
+                const int64_t had = rows;
+                sqlite3_bind_int64(q, 1, before);
+                ok = s.frames(q, &rows, &bytes, &before);
+                if (!ok || rows == had) break;
+            }
+            sqlite3_finalize(q);
+        } else {
+            return;
+        }
+        if (!s.err.empty() || !ok) {
+            std::fprintf(stderr, "stock %s: %s\n", workload.c_str(), s.err.empty() ? "read failed" : s.err.c_str());
+            return;
+        }
+        std::printf("REPLAY_STOCK {\"workload\":\"%s\",\"pass\":\"%s\",\"wall_ms\":%.3f,\"cpu_ms\":%.3f,\"rows\":%lld,\"bytes\":%lld}\n",
+                    workload.c_str(), pass ? "warm" : "cold", c.wallMs(), c.cpuMs(), (long long)rows, (long long)bytes);
+        std::fflush(stdout);
+    }
+}
+#endif
+
 }  // namespace
 
 P4_SLOW_TEST(p4_replay) {
@@ -521,6 +653,10 @@ P4_SLOW_TEST(p4_replay) {
 #if !defined(__wasm__)
     if (phase == "bounds") {
         bounds(argStr("store", ""));
+        return;
+    }
+    if (phase == "stock") {
+        stock(root, argStr("workload", ""), probeOf(readGp(argStr("gp", "")), int(argInt("probes", 200))), int(argInt("passes", 1)));
         return;
     }
 #endif
