@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.7.5
+
+The p4 replay E2E fits the gauntlet's budget; the engine and its wasm are 3.7.4's (byte for byte).
+- The gate replays a slice: a 1 GB sea feed, three days of gp_history (182,508 OMMs), 32,768
+  OMMs ingested, a 64-tile lead and 8 retention pages; 5 repetitions, native and WasmEdge AOT,
+  the same Mann-Whitney slower test against 3.7.2.
+- Each build builds its own fixture from the same input, so a build whose files 3.7.2 cannot read
+  is still compared on the same data; one process per build, runtime and repetition runs every
+  workload, each on its own fresh clone.
+- The 15 GB replay is `cpp/tests/p4-replay.bench.mjs`, outside the gate.
+
 ## 3.7.4
 
 Store format 4 reads a page's frames in fewer, larger reads. Every answer is 3.7.3's.
