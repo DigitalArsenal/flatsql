@@ -28,8 +28,10 @@
 // line: NORAD, OBJECT_ID, OBJECT_NAME, EPOCH, CREATION_DATE, MEAN_MOTION,
 // ECCENTRICITY, INCLINATION, TLE) as ingest PUTs, a day file per batch tag.
 // --phase=run runs --workload on --store (--gp-day: the day gp_ingest
-// writes); --passes=N repeats a read workload in the same process (the first
-// pass is the cold cache, the others warm). Every answer goes into the hash: a build that
+// writes; both may be comma lists, one store per workload, run in turn in the
+// one process); --passes=N repeats a read workload in the same process (the
+// first pass is the cold cache, the others warm); --lead-tiles (512) and
+// --retention-pages (20) size wxf_lead and retention. Every answer goes into the hash: a build that
 // answers differently hashes differently.
 #include <fcntl.h>
 #if defined(__wasm__)
@@ -400,7 +402,8 @@ void wRetention(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
     const int64_t through = hd.i(0, "through");
     const int64_t before = kT0 + 4 * 86400;
     int64_t after = 0;
-    for (int page = 0; page < 20; page++) {
+    const int pages = int(argInt("retention-pages", 20));
+    for (int page = 0; page < pages; page++) {
         CallOpts bulk;
         bulk.cls = P4_CLASS_BULK;
         Result s = call(P4_OPC_SCAN, retentionScan(kBig, before, through, after), bulk);
@@ -428,7 +431,8 @@ void wRetention(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
 void wLead(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
     const std::vector<uint8_t> values = payloadOf(size_t(argInt("payload", 8616)));
     const int64_t ts = kT0 + 5 * 86400;
-    for (int64_t tile = 0; tile < 512; tile++) {
+    const int64_t tiles = argInt("lead-tiles", 512);
+    for (int64_t tile = 0; tile < tiles; tile++) {
         Result r = put(tileBatch(kBig, "lead-tile-" + std::to_string(tile), "lead", tile, ts, values));
         h->result(r);
         (*ops)++;
@@ -646,6 +650,10 @@ void stock(const std::string& root, const std::string& workload, const Probe& p,
 
 }  // namespace
 
+namespace {
+void runOne(const std::string& root, const std::string& workload);
+}  // namespace
+
 P4_SLOW_TEST(p4_replay) {
     const std::string root = argStr("store", "") + "/fsql4";
     REQUIRE(root != "/fsql4", "--store");
@@ -696,7 +704,19 @@ P4_SLOW_TEST(p4_replay) {
         report("replay.fixture.seconds", double(flatsql::ps::monoNs() - t0) / 1e9, "s");
         return;
     }
-    const std::string workload = argStr("workload", "");
+    // --workload and --store may be comma lists of the same length: the
+    // workloads run in turn in this one process, each on its own store.
+    std::vector<std::string> workloads, stores;
+    for (auto* v : {&workloads, &stores}) {
+        std::stringstream ss(argStr(v == &workloads ? "workload" : "store", ""));
+        for (std::string x; std::getline(ss, x, ',');) v->push_back(x);
+    }
+    REQUIRE(workloads.size() == stores.size(), "--workload and --store: one store per workload");
+    for (size_t i = 0; i < workloads.size(); i++) runOne(stores[i] + "/fsql4", workloads[i]);
+}
+
+namespace {
+void runOne(const std::string& root, const std::string& workload) {
     Clock c;
     Hash h;
     int64_t rows = 0, ops = 0;
@@ -745,3 +765,4 @@ P4_SLOW_TEST(p4_replay) {
     }
     closeEngine(600000);
 }
+}  // namespace

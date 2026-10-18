@@ -5,13 +5,23 @@
 //
 // Builds the native format-4 test client twice: this checkout, and v3.7.2's
 // engine with this checkout's replay test (cpp/tests/p4/t_replay.cpp and
-// wxf_fixture.h: the requests, not the engine). The fixture is built once, by
-// 3.7.2: p4_record_scaling's 15 GB sea feed (P4_REPLAY_WXF_BYTES) and ten days
-// of real Space-Track gp_history OMMs ingested as the node ingests them. Every
-// measured run gets its own APFS clone of it (cp -c: no second copy of the
-// data). For each repetition (P4_REPLAY_REPS, default 5) and workload the two
-// builds run in alternating order, each in a fresh process on a fresh clone:
-// the first pass is cold, the read workloads' later passes warm. It prints,
+// wxf_fixture.h: the requests, not the engine). Each build builds its own
+// fixture from the same input (a build's store format is its own: 3.7.2 cannot
+// read this build's files, nor this build 3.7.2's), once per source tree:
+// p4_record_scaling's sea feed (P4_REPLAY_WXF_BYTES) and days of real
+// Space-Track gp_history OMMs ingested as the node ingests them. Every measured
+// workload gets its own APFS clone of it (cp -c: no second copy of the data).
+// For each repetition (P4_REPLAY_REPS, default 5) the two builds run in
+// alternating order, each in one fresh process that runs every workload in
+// turn, each on its fresh clone: a workload's first pass is cold, the read
+// workloads' later passes warm.
+//
+// Two profiles (P4_REPLAY_PROFILE): "gate" (the default, the gauntlet's E2E,
+// under 300 s with its build caches warm) replays a slice: a 1 GB sea feed,
+// three seed days, 32,768 OMMs of the ingest day, a 64-tile lead and 8
+// retention pages; "full" (p4-replay.bench.mjs, outside the gate) replays the
+// 15 GB sea feed, ten seed days, the whole ingest day, a 512-tile lead and 20
+// retention pages. It prints,
 // per workload, each build's median and p95 wall and CPU time, the speedup,
 // the bound (durable syncs x this disk's sync latency, or the bytes at memcpy
 // rate) and stock SQLite 3.53.4 on the same index and frames, and fails when
@@ -36,7 +46,8 @@
 //
 // Environment: FLATBUFFERS_DIR (else the sibling flatbuffers checkout),
 // P4_REPLAY_DIR (work directory; default the system temp directory),
-// P4_REPLAY_FIXTURE (a fixture directory to build once and reuse),
+// P4_REPLAY_FIXTURES (where the fixtures are built and kept; default the work
+// directory),
 // P4_REPLAY_GP (the gp_history by-creation root, default
 // /opt/data/sdn-archive/spacetrack/gp_history/by-creation), P4_REPLAY_REPS,
 // P4_REPLAY_WORKLOADS (comma list), P4_REPLAY_WXF_BYTES.
@@ -51,18 +62,26 @@ import { createGunzip } from 'node:zlib';
 const cpp = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repo = resolve(cpp, '..');
 const BASE_TAG = 'v3.7.2';
+const PROFILES = {
+  gate: { wxfBytes: 1e9, seedDays: 3, dayRows: 32768, leadTiles: 64, retentionPages: 8, warm: 2, boundsMb: 512 },
+  full: { wxfBytes: 15e9, seedDays: 10, dayRows: 0, leadTiles: 512, retentionPages: 20, warm: 3, boundsMb: 2048 },
+};
+const PROFILE = process.env.P4_REPLAY_PROFILE || 'gate';
+const prof = PROFILES[PROFILE];
+if (!prof) throw new Error(`P4_REPLAY_PROFILE: unknown profile ${PROFILE}`);
 const reps = Number(process.env.P4_REPLAY_REPS || 5);
-const wxfBytes = Number(process.env.P4_REPLAY_WXF_BYTES || 15e9);
+const wxfBytes = Number(process.env.P4_REPLAY_WXF_BYTES || prof.wxfBytes);
 const gpRoot = process.env.P4_REPLAY_GP || '/opt/data/sdn-archive/spacetrack/gp_history/by-creation';
 const SEED_DAYS = ['2026-09-16', '2026-09-17', '2026-09-18', '2026-09-19', '2026-09-20', '2026-09-21', '2026-09-22', '2026-09-23',
-  '2026-09-24', '2026-09-25'];
+  '2026-09-24', '2026-09-25'].slice(0, prof.seedDays);
 const INGEST_DAY = '2026-09-26';
 const WORKLOADS = (process.env.P4_REPLAY_WORKLOADS || 'gp_ingest,wxf_lead,sync_norad,sync_window,latest,retention,explorer,open')
   .split(',').filter(Boolean);
 const RUNTIMES = (process.env.P4_REPLAY_RUNTIMES || 'native,aot').split(',').filter(Boolean);
 for (const r of RUNTIMES) if (r !== 'native' && r !== 'aot') throw new Error(`P4_REPLAY_RUNTIMES: unknown runtime ${r}`);
+const t0 = Date.now();
 const READS = new Set(['sync_norad', 'sync_window', 'latest', 'explorer']);
-const WARM_PASSES = 3;
+const WARM_PASSES = prof.warm;
 
 function fail(msg) {
   console.error(`FAIL: ${msg}`);
@@ -174,37 +193,51 @@ async function gpTsv(out, days) {
   await new Promise((res) => w.end(res));
   execFileSync('mv', [`${out}.tmp`, out]);
 }
-const seedTsv = join(work, 'gp-seed.tsv');
-const dayTsv = join(work, 'gp-day.tsv');
+const seedTsv = join(work, prof.seedDays === 10 ? 'gp-seed.tsv' : `gp-seed-${prof.seedDays}d.tsv`);
 await gpTsv(seedTsv, SEED_DAYS);
+let dayTsv = join(work, 'gp-day.tsv');
 await gpTsv(dayTsv, [INGEST_DAY]);
+if (prof.dayRows) {
+  const slice = join(work, `gp-day-${prof.dayRows}.tsv`);
+  if (!existsSync(slice)) writeFileSync(slice, readFileSync(dayTsv, 'utf8').split('\n').slice(0, prof.dayRows).join('\n') + '\n');
+  dayTsv = slice;
+}
 
 function freeBytes(dir) {
   const s = statfsSync(dir);
   return Number(s.bavail) * Number(s.bsize);
 }
 
-// The fixture, once (3.7.2 builds it: the store a node on 3.7.2 holds).
-const fixture = process.env.P4_REPLAY_FIXTURE || join(work, 'fixture');
-const stamp = join(fixture, 'REPLAY-FIXTURE');
+// The fixtures: each build's own, from the same input, once per source tree.
+const fixtureRoot = process.env.P4_REPLAY_FIXTURES || work;
 const want = `wxf=${wxfBytes} seed=${SEED_DAYS.join(',')}`;
-if (!existsSync(stamp) || readFileSync(stamp, 'utf8') !== want) {
-  if (freeBytes(work) < wxfBytes * 1.15 + 22 * 2 ** 30) fail(`${work}: not enough free disk for a ${(wxfBytes / 1e9).toFixed(1)} GB fixture`);
-  rmSync(fixture, { recursive: true, force: true });
-  mkdirSync(fixture, { recursive: true });
-  run(arms.base, ['--test=p4_record_scaling', `--store=${fixture}`, `--bytes=${Math.round(wxfBytes)}`, '--build-only=1']);
-  run(arms.base, ['--test=p4_replay', '--phase=build', `--store=${fixture}`, `--gp=${seedTsv}`]);
+function fixtureOf(arm, src) {
+  const name = `fixture-${PROFILE}-${arm}-`;
+  const dir = join(fixtureRoot, name + treeHash(src));
+  const stamp = join(dir, 'REPLAY-FIXTURE');
+  if (existsSync(stamp) && readFileSync(stamp, 'utf8') === want) return dir;
+  // A fixture of this profile and build from other sources is stale.
+  for (const e of readdirSync(fixtureRoot)) if (e.startsWith(name)) rmSync(join(fixtureRoot, e), { recursive: true, force: true });
+  if (freeBytes(fixtureRoot) < wxfBytes * 1.15 + 22 * 2 ** 30) fail(`${fixtureRoot}: not enough free disk for a ${(wxfBytes / 1e9).toFixed(1)} GB fixture`);
+  mkdirSync(dir, { recursive: true });
+  run(arms[arm], ['--test=p4_record_scaling', `--store=${dir}`, `--bytes=${Math.round(wxfBytes)}`, '--build-only=1'], { stdio: ['ignore', 'ignore', 'inherit'] });
+  run(arms[arm], ['--test=p4_replay', '--phase=build', `--store=${dir}`, `--gp=${seedTsv}`], { stdio: ['ignore', 'ignore', 'inherit'] });
   writeFileSync(stamp, want);
+  return dir;
 }
+mkdirSync(fixtureRoot, { recursive: true });
+const fixtures = { base: fixtureOf('base', join(baseSrc, 'cpp')), new: fixtureOf('new', cpp) };
+console.log(`profile ${PROFILE}: builds and fixtures ready at ${((Date.now() - t0) / 1000).toFixed(0)} s`);
 
-// One process on a fresh clone of the fixture; its REPLAY lines.
+// One process runs the workloads in turn, each on a fresh clone of the
+// build's fixture; each workload's REPLAY lines.
 let cloneN = 0;
-function measure(runtime, arm, workload, extra = []) {
-  const clone = join(work, `clone-${process.pid}-${cloneN++}`);
-  run('cp', ['-c', '-R', fixture, clone]);
+function measure(runtime, arm, workloads) {
+  const clones = workloads.map(() => join(work, `clone-${process.pid}-${cloneN++}`));
+  for (const c of clones) run('cp', ['-c', '-R', fixtures[arm], c]);
   try {
-    const args = ['--test=p4_replay', '--phase=run', `--store=${clone}`, `--workload=${workload}`, `--gp=${seedTsv}`,
-      `--gp-day=${dayTsv}`, ...extra];
+    const args = ['--test=p4_replay', '--phase=run', `--store=${clones.join(',')}`, `--workload=${workloads.join(',')}`, `--gp=${seedTsv}`,
+      `--gp-day=${dayTsv}`, `--passes=${1 + WARM_PASSES}`, `--lead-tiles=${prof.leadTiles}`, `--retention-pages=${prof.retentionPages}`];
     const r = runtime === 'native'
       ? spawnSync(arms[arm], args, { encoding: 'utf8', maxBuffer: 64 << 20 })
       : spawnSync(aot.bin, ['-test.run', '^TestP4ReplayAOT$', '-test.timeout', '2h'], {
@@ -212,18 +245,22 @@ function measure(runtime, arm, workload, extra = []) {
         env: { ...process.env, P4_REPLAY_AOT_WASM: aot.wasm[arm], P4_REPLAY_AOT_CACHE: aot.cache, P4_REPLAY_AOT_ROOT: work,
           P4_REPLAY_AOT_ARGS: args.join('\x1f') },
       });
-    const lines = (r.stdout || '').split('\n');
-    const passes = lines.filter((l) => l.startsWith('REPLAY {')).map((l) => JSON.parse(l.slice(7)));
-    const after = lines.filter((l) => l.startsWith('REPLAY_AFTER ')).map((l) => JSON.parse(l.slice(13)));
-    if (r.status !== 0 || !passes.length) fail(`${runtime} ${arm} ${workload}: exit ${r.status ?? r.signal}\n${(r.stdout || '').slice(-2000)}${(r.stderr || '').slice(-2000)}`);
-    return { passes, after: after[0]?.hash ?? '' };
+    const out = {};
+    const of = (w) => (out[w] ??= { passes: [], after: '' });
+    for (const l of (r.stdout || '').split('\n')) {
+      if (l.startsWith('REPLAY {')) { const p = JSON.parse(l.slice(7)); of(p.workload).passes.push(p); }
+      if (l.startsWith('REPLAY_AFTER ')) { const p = JSON.parse(l.slice(13)); of(p.workload).after = p.hash; }
+    }
+    if (r.status !== 0 || workloads.some((w) => !out[w]?.passes.length))
+      fail(`${runtime} ${arm} ${workloads.join(',')}: exit ${r.status ?? r.signal}\n${(r.stdout || '').slice(-2000)}${(r.stderr || '').slice(-2000)}`);
+    return out;
   } finally {
-    rmSync(clone, { recursive: true, force: true });
+    for (const c of clones) rmSync(c, { recursive: true, force: true });
   }
 }
 
 function bounds() {
-  const r = spawnSync(arms.new, ['--test=p4_replay', '--phase=bounds', `--store=${work}`], { encoding: 'utf8' });
+  const r = spawnSync(arms.new, ['--test=p4_replay', '--phase=bounds', `--store=${work}`, `--bounds-mb=${prof.boundsMb}`], { encoding: 'utf8' });
   const l = (r.stdout || '').split('\n').find((x) => x.startsWith('REPLAY_BOUNDS '));
   if (!l) fail(`bounds: ${r.stdout}${r.stderr}`);
   return JSON.parse(l.slice(14));
@@ -273,15 +310,15 @@ const results = {}; // runtime -> workload -> pass -> arm -> [{wall, cpu, syncs}
 const hashes = {}; // workload|pass -> Set, over both builds and both runtimes
 let failed = false;
 for (let rep = 0; rep < reps; rep++) {
-  for (const workload of WORKLOADS) {
-    for (const runtime of RUNTIMES) {
-      const order = rep % 2 ? ['new', 'base'] : ['base', 'new'];
-      for (const arm of order) {
-        const m = measure(runtime, arm, workload, READS.has(workload) ? [`--passes=${1 + WARM_PASSES}`] : []);
+  for (const runtime of RUNTIMES) {
+    const order = rep % 2 ? ['new', 'base'] : ['base', 'new'];
+    for (const arm of order) {
+      const all = measure(runtime, arm, WORKLOADS);
+      for (const workload of WORKLOADS) {
         // One sample per process and pass kind: a process's warm passes are
         // not independent of each other, so they count as their median.
         const kinds = {};
-        for (const p of m.passes) {
+        for (const p of all[workload].passes) {
           (kinds[p.pass] ??= []).push(p);
           (hashes[`${workload}|${p.pass}`] ??= new Set()).add(p.hash);
         }
@@ -289,11 +326,11 @@ for (let rep = 0; rep < reps; rep++) {
           const one = { ...ps[0], wall_ms: med(ps.map((p) => p.wall_ms)), cpu_ms: med(ps.map((p) => p.cpu_ms)) };
           (((results[runtime] ??= {})[workload] ??= {})[kind] ??= { base: [], new: [] })[arm].push(one);
         }
-        if (m.after) (hashes[`${workload}|after`] ??= new Set()).add(m.after);
+        if (all[workload].after) (hashes[`${workload}|after`] ??= new Set()).add(all[workload].after);
       }
     }
   }
-  console.log(`repetition ${rep + 1}/${reps} done (load ${b0.load})`);
+  console.log(`repetition ${rep + 1}/${reps} done at ${((Date.now() - t0) / 1000).toFixed(0)} s (load ${b0.load})`);
 }
 // The independent reference: stock SQLite on the same index and frames, the
 // read workloads only, on a fresh clone (cold, then warm): a yardstick, not
@@ -302,7 +339,7 @@ const stockRuns = {}; // workload -> pass -> [{wall_ms, cpu_ms, rows}]
 for (let rep = 0; rep < Number(process.env.P4_REPLAY_STOCK_REPS || 1); rep++) {
   for (const workload of WORKLOADS.filter((w) => READS.has(w))) {
     const clone = join(work, `clone-${process.pid}-${cloneN++}`);
-    run('cp', ['-c', '-R', fixture, clone]);
+    run('cp', ['-c', '-R', fixtures.new, clone]);
     try {
       const r = spawnSync(arms.new, ['--test=p4_replay', '--phase=stock', `--store=${clone}`, `--workload=${workload}`, `--gp=${seedTsv}`,
         `--passes=2`], { encoding: 'utf8', maxBuffer: 64 << 20 });
@@ -356,6 +393,7 @@ const f = (x) => (x < 0 ? 'n/a' : x >= 100 ? x.toFixed(0) : x.toFixed(2));
 console.log(`\nruntime workload pass | ${BASE_TAG} median/p95 ms | this build median/p95 ms | speedup | cpu ms ${BASE_TAG} -> this | syncs (bound ms at ${syncMs.toFixed(2)} ms/sync) | rows | stock SQLite ms`);
 for (const r of rows)
   console.log(`${r.runtime} ${r.workload} ${r.pass} | ${f(r.base_med)}/${f(r.base_p95)} | ${f(r.new_med)}/${f(r.new_p95)} | ${r.speedup.toFixed(2)}x | ${f(r.base_cpu)} -> ${f(r.new_cpu)} | ${r.syncs} (${f(r.bound_ms)}) | ${r.rows} | ${r.stock_ms == null ? 'n/a' : f(r.stock_ms)}`);
-writeFileSync(join(work, 'replay-results.json'), JSON.stringify({ bounds: [b0, b1], memcpy, rows }, null, 1));
+writeFileSync(join(work, `replay-results-${PROFILE}.json`), JSON.stringify({ profile: PROFILE, bounds: [b0, b1], memcpy, rows }, null, 1));
+console.log(`${PROFILE} profile: ${((Date.now() - t0) / 1000).toFixed(0)} s`);
 console.log(failed ? 'FAIL: p4 replay' : `PASS: p4 replay (every answer the same on both builds, ${RUNTIMES.join(' and ')})`);
 process.exit(failed ? 1 : 0);
