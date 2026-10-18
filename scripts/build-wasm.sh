@@ -152,7 +152,7 @@ build_ps_linux() {
         -v "$tgz":/w/wasi-sdk.tar.gz:ro \
         -v "$PROJECT_ROOT/wasm":/w/out \
         ubuntu:22.04 bash -euc "
-            apt-get update -qq >/dev/null && apt-get install -y -qq cmake ninja-build >/dev/null
+            apt-get update -qq >/dev/null && apt-get install -y -qq cmake ninja-build g++ >/dev/null
             mkdir -p /opt/wasi-sdk && tar -xzf /w/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
             cmake -S /w/flatsql/cpp -B /tmp/b -G Ninja \
                 -DCMAKE_TOOLCHAIN_FILE=/w/flatsql/cpp/cmake/wasi-threads-toolchain.cmake \

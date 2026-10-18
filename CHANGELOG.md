@@ -1,5 +1,27 @@
 # Changelog
 
+## 3.8.0
+
+Store format 5 (`cpp/src/p4/FORMAT.md`, owner-approved 2026-10-18), first part.
+Format-4 stores are refused with `P4_E_FORMAT`. Nodes rebuild by re-sync; there is
+no migration.
+- Each feed is still one linear `[u32 LE size][FlatBuffer]` stream with records
+  verbatim. A stream starts with a genesis `$FCK` frame. Each commit round adds
+  one sibling `$FMB` frame per feed (SDS 1.255.0) holding every row's seq,
+  source ts, delivery, node, batch, url, signature, sealed columns and ingest
+  identity. Removals and moves are appended `$FMB` frames. The epoch and object
+  key are re-extracted from the record bytes; they are not stored.
+- An ack costs one stream sync (format 4: two). The index commit is not synced,
+  because the index is a cache of the stream.
+- Open recovers from the stream tail with each row's own seq and metadata. A
+  missing or damaged index is rebuilt from the `$FMB` chain.
+- p4 replay gate, 3.7.2 -> this build, native median: wxf_lead 799 -> 398 ms,
+  gp_ingest 531 -> 478 ms (1 sync per call). Kill -9 mid-lead (x3) and rebuilds
+  with every `.db` deleted answer exactly. `$FMB` is 76 B per row.
+- Not yet in this release: checkpoint `$FCK` and `$FSG` segments, IPFS ranges,
+  large-record DAGs. Compaction is deferred where live history needs the
+  segments.
+
 ## 3.7.6
 
 Store format 4's warm reads build no per-row strings and copy no record bytes. Every answer is
