@@ -277,6 +277,8 @@ table FCK {
   SEGMENT_DIGESTS:[ubyte];    // 32 B per segment: its raw-leaf CID digest
   COMMITS_ROOT_CID:[ubyte];   // the commits tree (§4.3) as of APPLIED_THROUGH
   PREVIOUS_FEED_ROOT_CID:[ubyte];
+  RECORD_BYTES:ulong;         // SDS 1.256.0: each record's smallest copy, summed; 0 when COUNTERS.ROWS is 0
+  MIN_W:long; MAX_W:long;     // SDS 1.256.0: w bounds over the rows; 0 when COUNTERS.ROWS is 0 (read as none)
 }
 root_type FCK;
 file_identifier "$FCK";
@@ -316,6 +318,7 @@ table FSG {
   TOKENS:[FMBEntry];         // TOKENS: per-producer counts as TEXT [token, n, bytes, mints, maxts, maxseq]
   PAIRS:[FSGPair];           // TOMBSTONES (KEY_HI = rid) and ROWS_BY_*, sorted by (KEY_HI, KEY_LO, RID)
   COLUMN:[ubyte];            // reserved (analytics task)
+  INSTANCE_URL_IDS:[uint];   // SDS 1.256.0: parallel to INSTANCES, each instance's latest url (a URL dictionary id; 0 = none)
 }
 root_type FSG;
 file_identifier "$FSG";
@@ -685,12 +688,10 @@ cpp/tests/p4-replay.e2e.mjs`):
 
 ## 13. Open points found in the build (to settle with an additive SDS amendment)
 
-- `FSGInstance` has no instance url, and `FCKCounters` has no record-bytes or
-  min/max w fields. After a compaction, restoring them exactly from segments
-  alone needs those fields. Until then, a feed that is compacted and then loses
-  its index is rebuilt with those values recounted from the live rows, so a
-  dead row's instance url can be lost. The SQLite index, when present, still
-  holds them.
+- Settled by SDS 1.256.0 (additive table fields; `FSGInstance` stays 88 B and
+  `FCKCounters` 120 B): `FSG.INSTANCE_URL_IDS` and `FCK.RECORD_BYTES`,
+  `MIN_W`, `MAX_W`. A compacted feed that loses its index reopens with every
+  instance url, including one only a dead row wrote, and exact counters.
 - LATEST, INSTANCES and TOKENS need a deletion marker. Today the code uses a
   zero RID or a zero count. TOMBSTONES need defined semantics for a reused
   `ROW_J`.

@@ -823,6 +823,11 @@ AnswerHashes allReadHashes(const Probe& probe) {
         wxf.result(call(P4_OPC_SCAN,w.b));
     }
     result["wxf_orders"]=wxf.hex();
+    // SUMMARY 1 (feed counters) and 3 (instances: url, first, updated).
+    for (uint8_t kind : {uint8_t(1),uint8_t(3)}) {
+        Hash summary; TlvW w; w.u8(45,kind); const Result sr=call(P4_OPC_SUMMARY,w.b); summary.result(sr);
+        result["summary_"+std::to_string(kind)]=summary.hex();
+    }
     return result;
 }
 size_t deleteIndexes(const std::string& root) {
@@ -877,20 +882,49 @@ bool checkpointProof(const std::string& root, const Probe& probe) {
         (unsigned long long)stats.checkpoints,(unsigned long long)stats.segmentBytes,(unsigned long long)stats.merged);
     return true;
 }
-bool compactionProof(const std::string& root,const Probe& probe) {
+// One instance whose latest url only a deleted row wrote: compaction drops
+// that row's frame, so its url survives only in the checkpoint
+// (FSG.INSTANCE_URL_IDS). Returns that instance's SUMMARY 3 url.
+std::string deadUrlInstance(const std::vector<Gp>& seed) {
+    const char* kept="https://replay.invalid/url-kept"; const char* dead="https://replay.invalid/url-dead";
+    auto batchOf=[&](const char* url,size_t from,size_t n) {
+        Batch b; b.type="OMM"; b.peer=kGpPeer; b.at=isoSec("2099-02-01T00:00:00");
+        b.tags.push_back(Tag{kGpProvider,kGpSource,url,"url-proof","","",""});
+        for (size_t j=from;j<from+n;j++) {
+            Gp g=seed[j%seed.size()]; g.tle+=" url-proof-"+std::to_string(j);
+            In in; in.frame=gpFrame(g); in.ts=isoSec(g.created); b.recs.push_back(std::move(in));
+        }
+        return b;
+    };
+    const Batch live=batchOf(kept,0,2), gone=batchOf(dead,2,1);
+    if (put(live).status!=P4_OK || put(gone).status!=P4_OK) return "";
+    uint8_t key[36]; cidOf(gone.recs[0].frame,key);
+    TlvW dw; dw.text(1,"OMM"); const auto list=cidList({std::vector<uint8_t>(key,key+36)},0,1); dw.raw(40,list.data(),list.size());
+    if (call(P4_OPC_DELETE,dw.b).status!=P4_OK) return "";
+    TlvW sw; sw.u8(45,3).text(1,"OMM"); const Result s=call(P4_OPC_SUMMARY,sw.b);
+    for (size_t i=0;i<s.rows.size();i++) if (s.s(i,"batch")=="url-proof" && s.i(i,"records")==2) return s.s(i,"source_url");
+    return "";
+}
+bool compactionProof(const std::string& root,const Probe& probe,const std::vector<Gp>& seed) {
     if (openNode(root,1)!=P4_OK || !registerAll()) return false;
     Hash retention; int64_t rows=0,ops=0; wRetention(probe,&retention,&rows,&ops);
+    const std::string deadUrl=deadUrlInstance(seed);
+    if (deadUrl!="https://replay.invalid/url-dead") { std::fprintf(stderr,"compaction: url-proof instance url '%s'\n",deadUrl.c_str()); closeEngine(600000); return false; }
     const auto before=allReadHashes(probe);
+    auto equal=[&](const AnswerHashes& got,const char* stage) {
+        for(const auto& h:before) if(got.at(h.first)!=h.second) std::fprintf(stderr,"compaction %s mismatch %s\n",stage,h.first.c_str());
+        return got==before;
+    };
     if(!forceCompaction()) { closeEngine(600000);return false; }
     const auto after=allReadHashes(probe); closeEngine(600000);
-    if(before!=after || !walkStore(root,true,nullptr,true)) return false;
+    if(!equal(after,"compacted") || !walkStore(root,true,nullptr,true)) return false;
     if(openNode(root,1)!=P4_OK || !registerAll()) return false;
     const auto reopened=allReadHashes(probe);closeEngine(600000);
-    if(before!=reopened || !deleteIndexes(root)) return false;
+    if(!equal(reopened,"reopened") || !deleteIndexes(root)) return false;
     if(openNode(root,1)!=P4_OK || !registerAll()) return false;
     const auto rebuilt=allReadHashes(probe);closeEngine(600000);
-    if(before!=rebuilt) return false;
-    std::printf("REPLAY_COMPACTION retention_rows=%lld reads=%zu genesis=first final_FCK=last chain=clean digests=matching answers=equal reopened=equal rebuilt=equal PASS\n",(long long)rows,before.size());
+    if(!equal(rebuilt,"rebuilt")) return false;
+    std::printf("REPLAY_COMPACTION retention_rows=%lld reads=%zu summary_1=%s summary_3=%s dead_row_url=checkpoint genesis=first final_FCK=last chain=clean digests=matching answers=equal reopened=equal rebuilt=equal PASS\n",(long long)rows,before.size(),before.at("summary_1").c_str(),before.at("summary_3").c_str());
     return true;
 }
 // A checkpoint prepares off the writer: hold the preparer once its snapshot
@@ -1258,8 +1292,9 @@ P4_SLOW_TEST(p4_replay) {
         return;
     }
     if (phase == "index-deleted" || phase == "compaction") {
-        const Probe p=probeOf(readGp(argStr("gp","")),int(argInt("probes",200)));
-        REQUIRE(phase=="index-deleted" ? checkpointProof(root,p) : compactionProof(root,p),phase);
+        const auto seed=readGp(argStr("gp",""));
+        const Probe p=probeOf(seed,int(argInt("probes",200)));
+        REQUIRE(!seed.empty() && (phase=="index-deleted" ? checkpointProof(root,p) : compactionProof(root,p,seed)),phase);
         return;
     }
 #endif

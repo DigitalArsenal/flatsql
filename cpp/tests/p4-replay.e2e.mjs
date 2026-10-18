@@ -118,13 +118,13 @@ process.env.TMPDIR = join(work, 'tmp');
 mkdirSync(process.env.TMPDIR, { recursive: true });
 
 // The SDS schemas format 5's frames are generated from: this checkout's
-// spacedatastandards.org devDependency (1.255.0), else the stack's pinned SDS.
+// spacedatastandards.org devDependency (1.256.0), else the stack's pinned SDS.
 function sdsSchemaDir() {
   const stack = process.env.GAUNTLET_STACK_ROOT;
   const candidates = [process.env.SDS_SCHEMA_DIR, join(repo, 'node_modules/spacedatastandards.org/schema'),
     stack && join(stack, 'repos/main-packages/spacedatastandards.org/schema')].filter(Boolean);
   const dir = candidates.find((d) => existsSync(join(d, 'FSG/main.fbs')));
-  if (!dir) fail(`SDS 1.255.0 schemas not found (tried ${candidates.join(', ')}): npm ci, or set SDS_SCHEMA_DIR`);
+  if (!dir) fail(`SDS 1.256.0 schemas not found (tried ${candidates.join(', ')}): npm ci, or set SDS_SCHEMA_DIR`);
   return dir;
 }
 const sdsDir = sdsSchemaDir();
@@ -197,7 +197,7 @@ function wasmTestBuild(name, src) {
     'cmake --build /w/out/build --target flatsql_p4_test_wasm -j 8 >/w/out/build.log 2>&1 || { tail -40 /w/out/build.log; exit 1; }',
     'cp /w/out/build/flatsql-p4-test.wasm /w/out/',
   ].join('\n');
-  // The SDS schemas the format-5 frames are generated from (the 1.255.0 devDependency).
+  // The SDS schemas the format-5 frames are generated from (the 1.256.0 devDependency).
   const sdsMount = ['-v', `${sdsDir}:/w/sds:ro`];
   run('docker', ['run', '--rm', '-w', '/w/out', ...(buildImage ? ['--network', 'none', '--entrypoint', '/bin/bash'] : []), ...sdsMount, '-v', `${src}:/w/flatsql/cpp:ro`, '-v', `${flatbuffers()}:/w/flatbuffers:ro`, '-v', `${sdk}:/w/wasi-sdk:ro`,
     '-v', `${out}:/w/out`, buildImage || 'ubuntu:22.04', ...(buildImage ? [] : ['bash']), '-euc', script], { stdio: ['ignore', 'inherit', 'inherit'] });

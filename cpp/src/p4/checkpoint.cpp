@@ -12,6 +12,7 @@ struct SegmentData {
     std::map<DictKey,FmbEntry> dictionary;
     std::map<uint32_t,CheckpointLatest> latest;
     std::map<InstId,InstCount> instances;
+    std::map<InstId,uint32_t> instanceUrls; // INSTANCE_URL_IDS, parallel to instances (0 = none)
     std::map<uint32_t,FmbEntry> tokens;
     std::set<uint64_t> tombstones;
     uint64_t size(uint8_t k) const { switch(k) { case 0:return dictionary.size(); case 1:return latest.size(); case 2:return instances.size(); case 3:return tokens.size(); default:return tombstones.size(); } }
@@ -84,7 +85,7 @@ bool number(const std::string& s,int64_t* out) {
 }
 bool instanceEqual(const InstCount& a,const InstCount& b) {
     return a.n==b.n && a.bytes==b.bytes && a.minw==b.minw && a.maxw==b.maxw && a.minseq==b.minseq && a.maxseq==b.maxseq &&
-      a.first==b.first && a.updated==b.updated && a.maxat==b.maxat && a.maxts==b.maxts;
+      a.first==b.first && a.updated==b.updated && a.maxat==b.maxat && a.maxts==b.maxts && a.url==b.url;
 }
 bool tokenEqual(const TokCount& a,const TokCount& b) {
     return a.n==b.n && a.bytes==b.bytes && a.mints==b.mints && a.maxts==b.maxts && a.maxseq==b.maxseq;
@@ -103,7 +104,10 @@ int32_t readSegment(Feed* f,Stream* stream,const CheckpointSegment& desc,Segment
         if(!e->OBJECT_KEY_ID() || e->RESERVED()) return P4_E_CORRUPT;
         out->latest[e->OBJECT_KEY_ID()]={e->OBJECT_KEY_ID(),e->EPOCH(),e->RID(),e->ROW_REF()};
     }
-    if(s->INSTANCES()) for(const auto* e:*s->INSTANCES()) {
+    const auto* urls=s->INSTANCE_URL_IDS();
+    if(urls && (!s->INSTANCES() || urls->size()!=s->INSTANCES()->size())) return P4_E_CORRUPT;
+    if(s->INSTANCES()) for(flatbuffers::uoffset_t i=0;i<s->INSTANCES()->size();i++) { const auto* e=s->INSTANCES()->Get(i);
+        out->instanceUrls[{e->BATCH_ID(),e->CONTENT_KEY_ID()}]=urls?urls->Get(i):0;
         InstCount x; x.n=int64_t(e->RECORDS()); x.bytes=int64_t(e->BYTES()); x.minw=e->MIN_W(); x.maxw=e->MAX_W();
         x.minseq=int64_t(e->MIN_SEQ()); x.maxseq=int64_t(e->MAX_SEQ()); x.first=e->FIRST(); x.updated=e->UPDATED(); x.maxat=e->MAX_AT(); x.maxts=e->MAX_TS();
         out->instances[{e->BATCH_ID(),e->CONTENT_KEY_ID()}]=std::move(x);
@@ -116,6 +120,7 @@ void merge(SegmentData* dst,const SegmentData& src) {
     for(const auto& x:src.dictionary) dst->dictionary[x.first]=x.second;
     for(const auto& x:src.latest) dst->latest[x.first]=x.second;
     for(const auto& x:src.instances) dst->instances[x.first]=x.second;
+    for(const auto& x:src.instanceUrls) dst->instanceUrls[x.first]=x.second;
     for(const auto& x:src.tokens) dst->tokens[x.first]=x.second;
     dst->tombstones.insert(src.tombstones.begin(),src.tombstones.end());
 }
@@ -125,21 +130,22 @@ void encodeSegment(Feed* f,uint8_t kind,uint8_t level,const SegmentData& data,co
     uint64_t applied,const Counters& counters,uint64_t* cursor,CheckpointPlan* plan,CheckpointSegment* desc) {
     flatbuffers::FlatBufferBuilder b; b.ForceDefaults(true);
     std::vector<flatbuffers::Offset<::FMBEntry>> entries,tokens;
-    std::vector<::FSGLatest> latest; std::vector<::FSGInstance> instances; std::vector<::FSGPair> pairs;
+    std::vector<::FSGLatest> latest; std::vector<::FSGInstance> instances; std::vector<::FSGPair> pairs; std::vector<uint32_t> urls;
     for(const auto& x:data.dictionary) entries.push_back(entry(b,x.second));
     for(const auto& x:data.tokens) tokens.push_back(entry(b,x.second));
     for(const auto& x:data.latest) { const auto& l=x.second; latest.emplace_back(l.objectKey,0,l.epoch,l.rid,l.rowRef); }
     for(const auto& item:data.instances) { const auto& x=item.second;
-        instances.emplace_back(item.first.first,item.first.second,uint64_t(x.n),uint64_t(x.bytes),x.minw,x.maxw,uint64_t(x.minseq),uint64_t(x.maxseq),x.first,x.updated,x.maxat,x.maxts); }
+        instances.emplace_back(item.first.first,item.first.second,uint64_t(x.n),uint64_t(x.bytes),x.minw,x.maxw,uint64_t(x.minseq),uint64_t(x.maxseq),x.first,x.updated,x.maxat,x.maxts);
+        auto u=data.instanceUrls.find(item.first); urls.push_back(u==data.instanceUrls.end()?0:u->second); }
     for(auto rid:data.tombstones) pairs.emplace_back(rid,0,rid,0);
     auto ev=b.CreateVector(entries),tv=b.CreateVector(tokens); auto lv=b.CreateVectorOfStructs(latest);
-    auto iv=b.CreateVectorOfStructs(instances); auto pv=b.CreateVectorOfStructs(pairs); auto rv=b.CreateVector(replaces);
+    auto iv=b.CreateVectorOfStructs(instances); auto uv=b.CreateVector(urls); auto pv=b.CreateVectorOfStructs(pairs); auto rv=b.CreateVector(replaces);
     desc->offset=*cursor; desc->kind=kind; desc->level=level; desc->coversThrough=applied; desc->entries=data.size(kind);
     desc->minSeq=counters.minseq==INT64_MAX?0:uint64_t(counters.minseq); desc->maxSeq=uint64_t(counters.maxseq);
     FSGBuilder root(b); root.add_SELF_OFFSET(desc->offset); root.add_PREVIOUS(0); root.add_FEED_ID(f->fid);
     root.add_KIND(fckSegmentKind(kind)); root.add_LEVEL(level); root.add_MIN_SEQ(desc->minSeq); root.add_MAX_SEQ(desc->maxSeq);
     root.add_COVERS_THROUGH(applied); root.add_REPLACES(rv);
-    if(kind==0) root.add_ENTRIES(ev); else if(kind==1) root.add_LATEST(lv); else if(kind==2) root.add_INSTANCES(iv); else if(kind==3) root.add_TOKENS(tv); else root.add_PAIRS(pv);
+    if(kind==0) root.add_ENTRIES(ev); else if(kind==1) root.add_LATEST(lv); else if(kind==2) { root.add_INSTANCES(iv); root.add_INSTANCE_URL_IDS(uv); } else if(kind==3) root.add_TOKENS(tv); else root.add_PAIRS(pv);
     auto x=root.Finish(); FinishFSGBuffer(b,x); desc->length=uint32_t(b.GetSize());
     std::vector<uint64_t> frame((b.GetSize()+7)/8); std::memcpy(frame.data(),b.GetBufferPointer(),b.GetSize());
     plan->frames.push_back(std::move(frame)); plan->lengths.push_back(desc->length); *cursor+=4+uint64_t(desc->length);
@@ -268,7 +274,8 @@ int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState*
     const auto* k=ck->COUNTERS(); out.counters.rows=int64_t(k->ROWS()); out.counters.recs=int64_t(k->RECORDS()); out.counters.bytes=int64_t(k->BYTES()); out.counters.nnull=int64_t(k->RECORDS_NO_EPOCH());
     out.counters.copies=int64_t(k->COPIES()); out.counters.cbytes=int64_t(k->COPY_BYTES()); out.counters.fbytes=int64_t(k->LIVE_FRAME_BYTES());
     out.counters.maxseq=int64_t(k->MAX_SEQ());
-    if(k->ROWS()) { out.counters.minseq=int64_t(k->MIN_SEQ()); out.counters.mints=k->MIN_TS(); out.counters.maxts=k->MAX_TS(); }
+    if(k->ROWS()) { out.counters.minseq=int64_t(k->MIN_SEQ()); out.counters.mints=k->MIN_TS(); out.counters.maxts=k->MAX_TS();
+        out.counters.rbytes=int64_t(ck->RECORD_BYTES()); out.counters.minw=ck->MIN_W(); out.counters.maxw=ck->MAX_W(); }
     if(k->RECORDS()>k->RECORDS_NO_EPOCH()) { out.counters.mine=k->MIN_EPOCH(); out.counters.maxe=k->MAX_EPOCH(); }
     const size_t count=ck->SEGMENTS()?ck->SEGMENTS()->size():0;
     if((ck->SEGMENT_DIGESTS()?ck->SEGMENT_DIGESTS()->size():0)!=count*32) return fail();
@@ -286,7 +293,10 @@ int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState*
     for(auto it=out.instances.begin();it!=out.instances.end();) {
         if(!it->second.n) { it=out.instances.erase(it); continue; }
         auto b=out.dictionary.find({2,it->first.first}); if(b!=out.dictionary.end() && b->second.text.size()==3) { it->second.batch=b->second.text[0]; it->second.ppeer=b->second.text[1]; it->second.pkey=b->second.text[2]; }
-        auto c=out.dictionary.find({3,it->first.second}); if(c!=out.dictionary.end() && c->second.text.size()==1) it->second.ckey=c->second.text[0]; ++it;
+        auto c=out.dictionary.find({3,it->first.second}); if(c!=out.dictionary.end() && c->second.text.size()==1) it->second.ckey=c->second.text[0];
+        auto u=data.instanceUrls.find(it->first); const uint32_t urlId=u==data.instanceUrls.end()?0:u->second;
+        if(urlId) { auto d=out.dictionary.find({4,urlId}); if(d==out.dictionary.end() || d->second.text.size()!=1) return fail(); it->second.url=d->second.text[0]; }
+        ++it;
     }
     for(const auto& item:data.tokens) { const auto& t=item.second.text; TokCount x;
         if(t.size()!=6 || !number(t[1],&x.n) || !number(t[2],&x.bytes) || !number(t[3],&x.mints) || !number(t[4],&x.maxts) || !number(t[5],&x.maxseq)) return fail(); if(x.n) out.tokens[item.first]=x;
@@ -311,6 +321,15 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
     for(const auto& x:old.latest) if(!out.latest.count(x.first)) deltas[1].latest[x.first]={x.first,INT64_MIN,0,0};
     for(const auto& x:out.instances) { auto it=old.instances.find(x.first); if(it==old.instances.end() || !instanceEqual(it->second,x.second)) deltas[2].instances[x.first]=x.second; }
     for(const auto& x:old.instances) if(!out.instances.count(x.first)) deltas[2].instances[x.first]=InstCount{};
+    if(!deltas[2].instances.empty()) {
+        std::map<std::string,uint32_t> urlIds;
+        for(const auto& x:out.dictionary) if(x.first.first==4 && x.second.text.size()==1) urlIds.emplace(x.second.text[0],x.first.second);
+        for(const auto& x:deltas[2].instances) {
+            uint32_t id=0;
+            if(!x.second.url.empty()) { auto u=urlIds.find(x.second.url); if(u==urlIds.end()) { if(err) *err="checkpoint instance url outside the url dictionary "+f->path; return P4_E_CORRUPT; } id=u->second; }
+            deltas[2].instanceUrls[x.first]=id;
+        }
+    }
     for(const auto& x:out.tokens) { auto it=old.tokens.find(x.first); if(it==old.tokens.end() || !tokenEqual(it->second,x.second)) deltas[3].tokens[x.first]=tokenEntry(x.first,x.second,out.dictionary.at({0,x.first}).text[0]); }
     for(const auto& x:old.tokens) if(!out.tokens.count(x.first)) deltas[3].tokens[x.first]=tokenEntry(x.first,TokCount{},out.dictionary.at({0,x.first}).text[0]);
     for(auto rid:out.tombstones) if(!old.tombstones.count(rid)) deltas[4].tombstones.insert(rid);
@@ -375,6 +394,7 @@ int32_t checkpointInstall(Feed* f,Stream* stream,CheckpointPlan& plan,int64_t* e
     auto cv=b.CreateVector(reinterpret_cast<const uint8_t*>(out.commitsRoot.data()),out.commitsRoot.size());
     auto pv=b.CreateVector(reinterpret_cast<const uint8_t*>(plan.previousRoot.data()),plan.previousRoot.size());
     out.offset=uint64_t(*end); FCKBuilder root(b); root.add_SELF_OFFSET(out.offset); root.add_PREVIOUS(*previous); root.add_FEED_ID(f->fid); root.add_TYPE(type); root.add_PROVIDER(provider); root.add_SOURCE(source); root.add_GENERATION(stream->gen); root.add_COMMITTED_AT(nowSec()); root.add_APPLIED_THROUGH(out.appliedThrough); root.add_TYPE_SEQ_HIGH(out.typeSeqHigh); root.add_COUNTERS(&k); root.add_SEGMENTS(sv); root.add_SEGMENT_DIGESTS(dv); root.add_COMMITS_ROOT_CID(cv); if(!plan.previousRoot.empty()) root.add_PREVIOUS_FEED_ROOT_CID(pv);
+    if(counters.rows) { root.add_RECORD_BYTES(uint64_t(counters.rbytes)); root.add_MIN_W(counters.minw); root.add_MAX_W(counters.maxw); }
     auto x=root.Finish(); FinishFCKBuffer(b,x); out.checkpointBytes+=b.GetSize()+4;
     out.feedRoot=feedDagCheckpointCid(b.GetBufferPointer(),b.GetSize());
     const int32_t rc=append(stream,b.GetBufferPointer(),b.GetSize(),end,"FCK"); if(rc!=P4_OK) return rc;

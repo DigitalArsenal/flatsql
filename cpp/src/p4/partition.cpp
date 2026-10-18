@@ -588,11 +588,9 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
     int rc=st==P4_OK?readMeta(c,&m):SQLITE_ERROR;
     const auto checkpoint=f->checkpoint;
     if(rc==SQLITE_OK && checkpoint && checkpoint->offset && checkpoint->holdsStateAt(uint64_t(m.mark))) {
-        // The schema omits rbytes/minw/maxw and the instance URL. Keep only
-        // those derived supplements in SQLite; all represented state comes
-        // from the verified checkpoint segments.
-        const int64_t rbytes=m.k.rbytes,minw=m.k.minw,maxw=m.k.maxw;
-        m.k=checkpoint->counters; m.k.rbytes=rbytes; m.k.minw=minw; m.k.maxw=maxw;
+        // All represented state comes from the verified checkpoint segments
+        // (SDS 1.256.0 carries rbytes/minw/maxw and each instance's url).
+        m.k=checkpoint->counters;
         inst=checkpoint->instances; tokc=checkpoint->tokens;
         Dict dictionary;
         for(const auto& entry:checkpoint->dictionary) {
@@ -609,15 +607,6 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
         }
         dictionary.loaded=true;
         { std::lock_guard<std::mutex> lock(f->dictMu); f->dict=std::move(dictionary); }
-        for(auto& item:inst) {
-            auto* q=c->sql("SELECT url FROM inst WHERE b=?1 AND c=?2");
-            if(!q) { rc=SQLITE_ERROR; break; }
-            sqlite3_bind_int64(q,1,item.first.first); sqlite3_bind_int64(q,2,item.first.second);
-            if(sqlite3_step(q)==SQLITE_ROW) {
-                const auto* value=sqlite3_column_text(q,0); if(value) item.second.url=reinterpret_cast<const char*>(value);
-            }
-            sqlite3_reset(q);
-        }
     } else {
         if(rc==SQLITE_OK) rc=readInst(f,c,&inst);
         if(rc==SQLITE_OK) rc=readTokc(t,c,&tokc);

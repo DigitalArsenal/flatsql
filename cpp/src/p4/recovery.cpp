@@ -85,12 +85,7 @@ int applyDictionary(Replay& r,const FMB* m) {
 // Install the checkpoint's historical state only after the row walk reaches
 // APPLIED_THROUGH. Earlier rows rebuild the row index without restamping it.
 void checkpointHistory(Replay& r,const CheckpointState& ck) {
-    auto history=ck.instances;
-    for(auto& item:history) {
-        const auto old=r.inst.find(item.first);
-        if(item.second.url.empty() && old!=r.inst.end()) item.second.url=old->second.url;
-    }
-    r.inst=std::move(history); r.tokc=ck.tokens; r.history=ck.counters;
+    r.inst=ck.instances; r.tokc=ck.tokens; r.history=ck.counters;
     r.feedHigh=uint64_t(ck.counters.maxseq); r.high=std::max(r.high,ck.typeSeqHigh);
 }
 const FMBSealed* sealedAt(const FMB* m,size_t row) {
