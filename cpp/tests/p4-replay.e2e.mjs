@@ -92,6 +92,13 @@ const t0 = Date.now();
 const READS = new Set(['sync_norad', 'sync_window', 'latest', 'explorer']);
 const WARM_PASSES = prof.warm;
 
+// Per-phase wall times (seconds since the previous mark).
+let lastMark = Date.now();
+function mark(name) {
+  const now = Date.now();
+  console.log(`E2E_PHASE ${name} s=${((now - lastMark) / 1000).toFixed(1)} total_s=${((now - t0) / 1000).toFixed(0)}`);
+  lastMark = now;
+}
 function fail(msg) {
   throw new Error(`FAIL: ${msg}`);
 }
@@ -291,6 +298,7 @@ function fixtureOf(arm, src) {
 mkdirSync(fixtureRoot, { recursive: true });
 const fixtures = Object.fromEntries(ARM_NAMES.map((name) => [name, fixtureOf(name, name === 'new' ? cpp : join(baseSrc, 'cpp'))]));
 console.log(`profile ${PROFILE}: builds and fixtures ready at ${((Date.now() - t0) / 1000).toFixed(0)} s`);
+mark('builds_and_fixtures');
 
 // One process runs the workloads in turn, each on a fresh clone of the
 // build's fixture; each workload's REPLAY lines.
@@ -349,6 +357,7 @@ function checkpointPhases(runtime, phases = ['index-deleted', 'compaction', 'che
       rmSync(clone, { recursive: true, force: true }); rmSync(reference, { recursive: true, force: true });
     }
     diskCheck(work);
+    mark(`checkpoint_${phase}`);
   }
 }
 
@@ -434,6 +443,7 @@ function crashPhases() {
     const r = spawnSync(bin, [`--test=${test}`, '--slow=1', '--rounds=30'], { encoding: 'utf8', maxBuffer: 64 << 20 });
     process.stdout.write(r.stdout || ''); process.stderr.write(r.stderr || '');
     if (r.status !== 0) fail(`${test}: exit ${r.status ?? r.signal}`);
+    mark(test);
   }
 }
 
@@ -525,6 +535,7 @@ for (let rep = 0; rep < reps; rep++) {
     }
   }
   console.log(`repetition ${rep + 1}/${reps} done at ${((Date.now() - t0) / 1000).toFixed(0)} s (load ${b0.load})`);
+  mark(`repetition_${rep + 1}`);
 }
 if (process.env.P4_REPLAY_DISCARD_BASE_FIXTURE === '1') {
   const baseline = realpathSync(fixtures.base);
@@ -554,6 +565,7 @@ for (let rep = 0; rep < Number(process.env.P4_REPLAY_STOCK_REPS || 1); rep++) {
     }
   }
 }
+mark('stock_sqlite');
 const b1 = bounds();
 console.log(`bounds after: ${JSON.stringify(b1)}`);
 const syncMs = Math.min(b0.sync_ms_median, b1.sync_ms_median);
@@ -598,6 +610,7 @@ for (const r of rows)
 // and the read workloads above already hash equal across them.
 checkpointPhases('native');
 ipfsPhase();
+mark('ipfs');
 crashPhases();
 // Exact same E2E: independently walk every stream, then kill a lead three
 // times and compare the acknowledged prefix before/after cache deletion.
@@ -608,6 +621,7 @@ for (const phase of ['walk', 'kill']) {
   process.stdout.write(r.stdout || '');
   process.stderr.write(r.stderr || '');
   if (r.status !== 0) failed = true;
+  mark(phase);
 }
 writeFileSync(join(work, `replay-results-${PROFILE}.json`), JSON.stringify({ profile: PROFILE, bounds: [b0, b1], memcpy, rows }, null, 1));
 console.log(`${PROFILE} profile: ${((Date.now() - t0) / 1000).toFixed(0)} s`);

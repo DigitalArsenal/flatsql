@@ -276,8 +276,9 @@ int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState*
     out.counters.maxseq=int64_t(k->MAX_SEQ());
     if(k->ROWS()) { out.counters.minseq=int64_t(k->MIN_SEQ()); out.counters.mints=k->MIN_TS(); out.counters.maxts=k->MAX_TS();
         out.counters.rbytes=int64_t(ck->RECORD_BYTES()); out.counters.minw=ck->MIN_W(); out.counters.maxw=ck->MAX_W(); }
-    // RECORDS_NO_EPOCH counts only under an epoch rule; without one no record has an epoch.
-    if(f->type->spec()->hasEpochRule && k->RECORDS()>k->RECORDS_NO_EPOCH()) { out.counters.mine=k->MIN_EPOCH(); out.counters.maxe=k->MAX_EPOCH(); }
+    // RECORDS_NO_EPOCH counts only under an epoch rule; without one no record
+    // has an epoch. (A generation check reads with no type: bounds unused.)
+    if((!f->type || f->type->spec()->hasEpochRule) && k->RECORDS()>k->RECORDS_NO_EPOCH()) { out.counters.mine=k->MIN_EPOCH(); out.counters.maxe=k->MAX_EPOCH(); }
     const size_t count=ck->SEGMENTS()?ck->SEGMENTS()->size():0;
     if((ck->SEGMENT_DIGESTS()?ck->SEGMENT_DIGESTS()->size():0)!=count*32) return fail();
     std::set<uint64_t> offsets;
