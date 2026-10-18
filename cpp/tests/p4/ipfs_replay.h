@@ -228,6 +228,56 @@ bool ipfsDagMemory() {
     std::printf("REPLAY_IPFS_DAG_MEMORY type=WXF source=gfs-0p25-sea rows=%lld resident_bytes=%lld bytes_per_row=%.1f\n",(long long)rows,(long long)(after-before),double(int64_t(after-before))/double(std::max<int64_t>(1,rows)));
     return true;
 }
+// Per-call DAG costs against feed size (review defects 3 and 6). On the gate's
+// WXF sea feed and on a small feed of the same lane shape, each round PUTs one
+// tile batch, then times FEED_ROOT, RANGES from the prior commit + 1, and the
+// commits root at the prior (now earlier) commit point. Each must cost the same
+// on both feeds: neither replays nor walks the whole feed. The earlier point's
+// root must equal the one a fresh cache computes, and the pruned RANGES must
+// hold every block of the full closure at or after its `from`.
+double ipfsMedian(std::vector<double> v) { std::sort(v.begin(),v.end()); return v.empty()?0:v[v.size()/2]; }
+bool ipfsDagScale() {
+    struct Arm { const char* source; flatsql::p4::Feed* feed=nullptr; std::vector<double> root,ranges,earlier; size_t fullRows=0,tailRows=0; double fullMs=0; uint64_t lastPoint=0; std::string lastRoot; };
+    Arm arms[2]; arms[0].source=kBig; arms[1].source="dag-scale-small";
+    const auto values=payloadOf(1024);
+    for(int t=0;t<8;t++) { const auto r=put(tileBatch(arms[1].source,"scale-seed-"+std::to_string(t),"seed",t,kT0+t,values)); if(r.status!=P4_OK)return ipfsFail("scale seed PUT: "+r.err); }
+    auto commitRoot=[](flatsql::p4::Feed* feed,uint64_t point,std::string* cid) {
+        int32_t rc=P4_OK; auto stream=flatsql::p4::streamCur(feed,&rc); if(!stream) return rc==P4_OK?int32_t(P4_E_BUSY):rc;
+        std::string err; return flatsql::p4::feedDagCommitRoot(feed,stream.get(),point,uint64_t(flatsql::p4::streamSize(stream.get())),cid,&err);
+    };
+    for(auto& a:arms) {
+        IpfsFeed f; f.type="WXF"; f.provider=kProvider; f.source=a.source; a.feed=ipfsEngineFeed(f); if(!a.feed||!ipfsRefreshRoot(&f))return ipfsFail("scale feed");
+        { const uint64_t t0=flatsql::ps::monoNs(); const auto full=ipfsCall(P4_OPC_RANGES,ipfsRequest(f)); if(full.status!=P4_OK)return ipfsFail("scale full ranges"); a.fullMs=double(flatsql::ps::monoNs()-t0)/1e6; a.fullRows=full.rows.size(); }
+        for(int round=0;round<7;round++) {
+            const uint64_t prior=f.unit; std::string priorRoot; if(commitRoot(a.feed,prior,&priorRoot)!=P4_OK)return ipfsFail("scale commit root at the cache point");
+            const auto w=put(tileBatch(a.source,"scale-"+std::to_string(round),"scale",1000000+round,kT0+100000+round,values)); if(w.status!=P4_OK)return ipfsFail("scale PUT: "+w.err);
+            uint64_t t0=flatsql::ps::monoNs(); if(!ipfsRefreshRoot(&f))return false; a.root.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
+            if(f.unit<=prior)return ipfsFail("scale PUT not committed at ack");
+            auto tail=ipfsRequest(f); tail.u64(80,prior+1);
+            t0=flatsql::ps::monoNs(); const auto r=ipfsCall(P4_OPC_RANGES,tail); a.ranges.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
+            if(r.status!=P4_OK||r.rows.empty())return ipfsFail("scale tail ranges: "+r.err);
+            for(size_t i=0;i<r.rows.size();i++)if(uint64_t(r.i(i,"unit"))<=prior)return ipfsFail("scale tail ranges before from");
+            a.tailRows=r.rows.size();
+            std::string again; t0=flatsql::ps::monoNs(); const int32_t rc=commitRoot(a.feed,prior,&again); a.earlier.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
+            if(rc!=P4_OK||again!=priorRoot)return ipfsFail("scale earlier commit root not answered from the cache");
+            a.lastPoint=prior; a.lastRoot=priorRoot;
+            if(round==6) {
+                std::set<std::pair<std::string,uint64_t>> pruned; for(size_t i=0;i<r.rows.size();i++) pruned.insert({r.s(i,"cid"),uint64_t(r.i(i,"unit"))});
+                const auto full=ipfsCall(P4_OPC_RANGES,ipfsRequest(f)); if(full.status!=P4_OK)return ipfsFail("scale full ranges after");
+                for(size_t i=0;i<full.rows.size();i++)if(uint64_t(full.i(i,"unit"))>prior&&!pruned.count({full.s(i,"cid"),uint64_t(full.i(i,"unit"))}))return ipfsFail("pruned ranges omit a block of the full closure");
+            }
+        }
+        // A fresh cache computes the same commits root at that earlier point.
+        flatsql::p4::feedDagReset(a.feed); std::string fresh;
+        if(commitRoot(a.feed,a.lastPoint,&fresh)!=P4_OK||fresh!=a.lastRoot)return ipfsFail("earlier commit root differs from a fresh cache's");
+        if(!ipfsRefreshRoot(&f))return false;
+    }
+    const double big[3]={ipfsMedian(arms[0].root),ipfsMedian(arms[0].ranges),ipfsMedian(arms[0].earlier)},small[3]={ipfsMedian(arms[1].root),ipfsMedian(arms[1].ranges),ipfsMedian(arms[1].earlier)};
+    bool flat=true; for(int i=0;i<3;i++) flat=flat&&big[i]<=2*small[i]+1.0;
+    std::printf("REPLAY_DAG_SCALE big_full_ranges_rows=%zu small_full_ranges_rows=%zu big_full_ranges_ms=%.2f small_full_ranges_ms=%.2f feed_root_ms=%.3f/%.3f tail_ranges_ms=%.3f/%.3f tail_rows=%zu/%zu earlier_commit_root_ms=%.4f/%.4f bound=big<=2*small+1ms earlier=cached fresh=equal pruned=complete %s\n",
+        arms[0].fullRows,arms[1].fullRows,arms[0].fullMs,arms[1].fullMs,big[0],small[0],big[1],small[1],arms[0].tailRows,arms[1].tailRows,big[2],small[2],flat?"PASS":"FAIL");
+    return flat?true:ipfsFail("DAG per-call cost grows with the feed");
+}
 bool ipfsProof(const std::string& store,const Probe& probe) {
     const uint64_t phaseStart=flatsql::ps::monoNs();
     if(openNode(store,1)!=P4_OK||!registerAll()||registerType(iqcType())!=P4_OK)return false;
@@ -333,6 +383,8 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
     // Leave exposure enabled for the full reader window. A generation must
     // still exist after both time and work have passed, until release arrives.
     const uint64_t deadline=compactAt+uint64_t(30500)*1000000;
+    // The per-call DAG cost check runs inside the reader window's wait.
+    if(!ipfsDagScale())return false;
     while(flatsql::ps::monoNs()<deadline)std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if(!std::filesystem::exists(oldPath))return ipfsFail("unreleased generation deleted after reader window");
     auto release=ipfsRequest(lf);release.u64(80,oldUnit).u32(82,oldGeneration);

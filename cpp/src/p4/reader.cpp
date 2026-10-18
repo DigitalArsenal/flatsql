@@ -3304,7 +3304,8 @@ int32_t opIpfs(P4Lane* L,const std::vector<Tlv>& v,uint32_t op) {
             for(const auto& d:drops) { o.enc.beginRow(); o.enc.blob(d.cid.data(),d.cid.size()); o.enc.i64(d.unit); putText(o.enc,f->provider); putText(o.enc,f->source); o.enc.i64(d.generation); o.enc.endRow(); rc=o.rowDone(); if(rc!=P4_OK) break; }
             continue;
         }
-        DagSnapshot snapshot; rc=feedDagSnapshot(f,&snapshot,&err); if(rc!=P4_OK) break;
+        // FEED_ROOT needs only the root; RANGES walks only what changed since `from`.
+        DagSnapshot snapshot; rc=feedDagSnapshot(f,&snapshot,&err,from,op!=P4_OPC_FEED_ROOT); if(rc!=P4_OK) break;
         if(op==P4_OPC_FEED_ROOT) {
             o.enc.beginRow(); putText(o.enc,f->provider); putText(o.enc,f->source); o.enc.blob(snapshot.root.data(),snapshot.root.size()); o.enc.i64(snapshot.through); o.enc.i64(snapshot.generation); o.enc.i64(feedBlockedGenerations(f)); o.enc.endRow(); rc=o.rowDone();
         } else for(const auto& b:snapshot.blocks) {

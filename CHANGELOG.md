@@ -1,5 +1,28 @@
 # Changelog
 
+## 3.10.1
+
+Store format 5 IPFS layout: per-call costs no longer grow with the feed
+(`cpp/src/p4/FORMAT.md` §4.3, §5, §12).
+- `RANGES` from a commit walks only the DAG nodes rewritten at or after it:
+  the new units, the rewritten units and their spine. `FEED_ROOT` computes only
+  the root. On the gate's WXF sea feed (110,915 blocks), a pull after one round
+  takes 0.089 ms (14 blocks); the whole-closure walk took 68.6 ms.
+- The derived DAG cache only moves forward. A commits root asked for an earlier
+  commit point comes from the roots it recorded (4 µs); the feed is never
+  replayed from genesis for it. A point the cache never stopped at returns
+  `P4_E_BUSY`.
+- The replay E2E (`REPLAY_DAG_SCALE`) times `FEED_ROOT`, `RANGES` from the
+  prior commit and the earlier commits root on the sea feed and on a small feed
+  of the same lane shape. Each must stay within 2x + 1 ms of the small feed's.
+  The earlier root must equal a fresh cache's, and the pruned `RANGES` must
+  hold every block of the full closure past its `from`.
+- FORMAT.md §5 records the measured PUT ack latency while a checkpoint
+  prepares: p50/p99 9.04/10.44 ms, against 8.80/13.95 ms with none, plus a
+  73 ms install step on one round. Basis: the 3.10.0 replay gate, native, on
+  the gate fixture (1 GB WXF sea feed and 3 seed days of OMM), one run on a
+  28-core Mac Studio at a load average of 23.7.
+
 ## 3.10.0
 
 Store format 5, part 3: the IPFS layout (`cpp/src/p4/FORMAT.md` §4, §5, §6,

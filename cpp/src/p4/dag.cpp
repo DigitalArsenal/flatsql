@@ -96,6 +96,8 @@ struct DagState {
     // unit and the nodes on its right/affected spine. Empty positions vanish.
     std::vector<std::vector<Link>> tree;
     std::set<size_t> dirty;
+    // Commits roots by the commit points builds stopped at (most recent kept).
+    std::map<uint64_t,std::string> commitRoots;
 };
 struct DagHistory {
     // Caches remain generation-scoped. A compaction must not erase drops
@@ -240,7 +242,10 @@ void updateTree(DagState& s,uint64_t through) {
 // CIDs the cache holds.
 class Closure {
 public:
-    Closure(const DagState& s,uint64_t end,std::vector<DagBlock>* out):s_(s),end_(end),out_(out) {}
+    // Only blocks with unit >= from are output. A node's unit is the commit
+    // that last rewrote it, never earlier than any block below it, so a node
+    // before `from` is pruned with its subtree.
+    Closure(const DagState& s,uint64_t end,std::vector<DagBlock>* out,uint64_t from=0):s_(s),end_(end),from_(from),out_(out) {}
     bool root(const std::vector<IpldLink>& links,const std::string& dir,uint64_t unit) {
         if(!node(ipldDagPb(links,&dir),unit,nullptr)) return false;
         if(!raw(s_.checkpoint,P4_RANGE_FCK) || !tree(s_.tree.size()-1,0)) return false;
@@ -255,16 +260,18 @@ private:
         DagBlock b; b.kind=P4_RANGE_LINK; b.unit=unit; b.cid=ipldCid(IpldDagPb,bytes.data(),bytes.size());
         if(expect && b.cid!=*expect) return false;
         const bool isNew=first(b.cid); if(fresh) *fresh=isNew;
-        if(isNew) { b.bytes=bytes; b.length=bytes.size(); out_->push_back(std::move(b)); }
+        if(isNew && unit>=from_) { b.bytes=bytes; b.length=bytes.size(); out_->push_back(std::move(b)); }
         return true;
     }
     bool raw(const Raw& r,uint32_t kind,uint64_t unit=UINT64_MAX) {
         DagBlock b=rawBlock(s_,r,kind); if(unit!=UINT64_MAX) b.unit=unit; if(!first(b.cid)) return true;
         if(b.offset>end_ || b.length>end_-b.offset) return false;
-        out_->push_back(std::move(b)); return true;
+        if(b.unit>=from_) out_->push_back(std::move(b));
+        return true;
     }
     bool tree(size_t level,size_t index) {
         const Link& self=s_.tree[level][index]; bool fresh=false;
+        if(self.unit<from_) return true;
         if(!node(ipldDagPb(treeLinks(s_,level,index)),self.unit,&fresh,&self.cid)) return false;
         if(!fresh) return true;
         const size_t count=level?s_.tree[level-1].size():s_.units.size();
@@ -275,13 +282,14 @@ private:
         return true;
     }
     bool unit(const Unit& u) {
+        if(u.node.unit<from_) return true;
         bool fresh=false; if(!node(ipldDagPb(unitLinks(s_,u)),u.node.unit,&fresh,&u.node.cid)) return false;
         if(!fresh) return true;
         for(uint32_t i=u.firstFrame;i<u.firstFrame+u.frameCount;i++) {
             const Frame& f=s_.frames[i]; if(!f.refs) continue;
             if(!f.large) { if(!raw({f.at,f.length,f.digest},P4_RANGE_RECORD,u.metadata.at)) return false; continue; }
             const Large& big=s_.large.at(f.at); if(!first(big.cid)) continue;
-            DagBlock root; root.cid=big.cid; root.bytes=big.node; root.length=big.node.size(); root.unit=u.metadata.at; root.kind=P4_RANGE_LARGE_ROOT; out_->push_back(std::move(root));
+            if(u.metadata.at>=from_) { DagBlock root; root.cid=big.cid; root.bytes=big.node; root.length=big.node.size(); root.unit=u.metadata.at; root.kind=P4_RANGE_LARGE_ROOT; out_->push_back(std::move(root)); }
             for(size_t j=0;j<big.leaves.size();j++) {
                 const uint64_t at=f.at+j*IpldChunkSize;
                 if(!raw({at,uint32_t(std::min<uint64_t>(IpldChunkSize,f.length-j*IpldChunkSize)),big.leaves[j]},P4_RANGE_LARGE_LEAF,u.metadata.at)) return false;
@@ -289,12 +297,20 @@ private:
         }
         return raw(u.metadata,P4_RANGE_FMB);
     }
-    const DagState& s_; uint64_t end_; std::vector<DagBlock>* out_; std::unordered_set<std::string> seen_;
+    const DagState& s_; uint64_t end_,from_; std::vector<DagBlock>* out_; std::unordered_set<std::string> seen_;
 };
-int32_t build(Feed* feed,Stream* stream,uint64_t previous,uint64_t end,DagSnapshot* out,std::string* err,bool closure=true) {
+int32_t build(Feed* feed,Stream* stream,uint64_t previous,uint64_t end,DagSnapshot* out,std::string* err,bool closure=true,uint64_t from=0) {
     if(!feed->dagHistory) feed->dagHistory=std::make_shared<DagHistory>();
     auto& ptr=feed->dagHistory->generations[stream->gen];
-    if(!ptr || ptr->end>end) {
+    if(ptr && ptr->last!=UINT64_MAX && previous<ptr->last) {
+        // The cache never goes back. An earlier point's commits root is one
+        // it recorded when a build stopped there; nothing replays the feed.
+        const auto it=ptr->commitRoots.find(previous);
+        if(closure || it==ptr->commitRoots.end()) { if(err) *err="DAG cache is past commit point "+std::to_string(previous); return P4_E_BUSY; }
+        DagSnapshot result; result.through=previous; result.generation=stream->gen; result.commitsRoot=it->second;
+        *out=std::move(result); return P4_OK;
+    }
+    if(!ptr) {
         ptr=std::make_shared<DagState>(); ptr->gen=stream->gen;
         const auto& root=feed->type->e->cfg.root; ptr->path=stream->path;
         if(ptr->path.compare(0,root.size(),root)==0 && ptr->path.size()>root.size() && ptr->path[root.size()]=='/') ptr->path.erase(0,root.size()+1);
@@ -310,11 +326,12 @@ int32_t build(Feed* feed,Stream* stream,uint64_t previous,uint64_t end,DagSnapsh
     updateTree(s,previous);
     DagSnapshot result; result.through=previous; result.generation=stream->gen;
     const Link& commits=s.tree.back().front(); const Link segments=linkOf(segmentLinks(s),previous);
+    s.commitRoots[previous]=commits.cid; while(s.commitRoots.size()>4096) s.commitRoots.erase(s.commitRoots.begin());
     const std::string dir=ipldUnixfsDirectory();
     const std::vector<IpldLink> rootLinks={{rawCid(s.checkpoint.digest),"checkpoint",0},{commits.cid,"commits",0},{segments.cid,"segments",0}};
     const std::string rootBytes=ipldDagPb(rootLinks,&dir);
     result.root=ipldCid(IpldDagPb,rootBytes.data(),rootBytes.size()); result.commitsRoot=commits.cid;
-    if(closure && !Closure(s,end,&result.blocks).root(rootLinks,dir,previous)) return P4_E_CORRUPT;
+    if(closure && !Closure(s,end,&result.blocks,from).root(rootLinks,dir,previous)) return P4_E_CORRUPT;
     *out=std::move(result); return P4_OK;
 }
 // Read the three cache values in one SQLite snapshot, then pin that stream
@@ -393,7 +410,7 @@ std::string feedDagCheckpointCid(const void* bytes,size_t length) {
     const std::string data=ipldUnixfsDirectory(),root=ipldDagPb(links,&data);
     return ipldCid(0x70,root.data(),root.size());
 }
-int32_t feedDagSnapshot(Feed* f,DagSnapshot* out,std::string* err) {
+int32_t feedDagSnapshot(Feed* f,DagSnapshot* out,std::string* err,uint64_t from,bool closure) {
     uint64_t previous=0,end=0; std::shared_ptr<Stream> stream;
     int32_t rc;
     {
@@ -402,7 +419,7 @@ int32_t feedDagSnapshot(Feed* f,DagSnapshot* out,std::string* err) {
         // point another builder already passed (smu holders never take dagMu).
         std::lock_guard<std::mutex> lock(f->dagMu);
         rc=committedStream(f,&stream,&previous,&end,err); if(rc!=P4_OK) return rc;
-        rc=build(f,stream.get(),previous,end,out,err); if(rc!=P4_OK) return rc;
+        rc=build(f,stream.get(),previous,end,out,err,closure,from); if(rc!=P4_OK) return rc;
     }
     out->stream=std::move(stream);
     // Released generations whose files have left the retained set no longer
