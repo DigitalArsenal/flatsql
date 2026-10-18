@@ -42,7 +42,7 @@
 // P4_REPLAY_WORKLOADS (comma list), P4_REPLAY_WXF_BYTES.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -103,11 +103,28 @@ for (const f of ['t_replay.cpp', 'wxf_fixture.h']) writeFileSync(join(baseSrc, '
 const arms = { base: build('base', join(baseSrc, 'cpp')), new: build('new', cpp) };
 
 // The aot runtime: each build's wasm test command, and the SDN harness.
+// The sources a wasm test command is built from, hashed (build directories
+// left out): a rebuild of the same sources reuses the command.
+function treeHash(dir) {
+  const h = createHash('sha256');
+  const walk = (d) => {
+    for (const e of readdirSync(d, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
+      if (e.name.startsWith('build') || e.name === 'node_modules' || e.name.startsWith('.')) continue;
+      const f = join(d, e.name);
+      if (e.isDirectory()) walk(f);
+      else if (e.isFile()) h.update(`${f.slice(dir.length)}\0`).update(readFileSync(f));
+    }
+  };
+  walk(dir);
+  h.update(flatbuffers());
+  return h.digest('hex').slice(0, 16);
+}
 function wasmTestBuild(name, src) {
   const arch = process.arch === 'arm64' ? 'arm64' : 'x86_64';
   const tgz = join(process.env.XDG_CACHE_HOME || join(homedir(), '.cache'), 'flatsql', `wasi-sdk-30.0-${arch}-linux.tar.gz`);
   if (!existsSync(tgz)) fail(`${tgz} missing: scripts/build-wasm.sh --ps --linux fetches and checks it`);
-  const out = join(work, `wasm-${name}`);
+  const out = join(work, `wasm-${name}-${treeHash(src)}`);
+  if (existsSync(join(out, 'flatsql-p4-test.wasm'))) return join(out, 'flatsql-p4-test.wasm');
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
   const script = [
@@ -279,15 +296,16 @@ for (let rep = 0; rep < reps; rep++) {
   console.log(`repetition ${rep + 1}/${reps} done (load ${b0.load})`);
 }
 // The independent reference: stock SQLite on the same index and frames, the
-// read workloads only, each repetition on a fresh clone (cold, then warm).
+// read workloads only, on a fresh clone (cold, then warm): a yardstick, not
+// a comparison, so one repetition (P4_REPLAY_STOCK_REPS).
 const stockRuns = {}; // workload -> pass -> [{wall_ms, cpu_ms, rows}]
-for (let rep = 0; rep < reps; rep++) {
+for (let rep = 0; rep < Number(process.env.P4_REPLAY_STOCK_REPS || 1); rep++) {
   for (const workload of WORKLOADS.filter((w) => READS.has(w))) {
     const clone = join(work, `clone-${process.pid}-${cloneN++}`);
     run('cp', ['-c', '-R', fixture, clone]);
     try {
       const r = spawnSync(arms.new, ['--test=p4_replay', '--phase=stock', `--store=${clone}`, `--workload=${workload}`, `--gp=${seedTsv}`,
-        `--passes=${1 + WARM_PASSES}`], { encoding: 'utf8', maxBuffer: 64 << 20 });
+        `--passes=2`], { encoding: 'utf8', maxBuffer: 64 << 20 });
       const lines = (r.stdout || '').split('\n').filter((l) => l.startsWith('REPLAY_STOCK ')).map((l) => JSON.parse(l.slice(13)));
       if (r.status !== 0 || !lines.length) fail(`stock ${workload}: exit ${r.status ?? r.signal}\n${(r.stderr || '').slice(-2000)}`);
       const kinds = {};
