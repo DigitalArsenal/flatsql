@@ -442,7 +442,8 @@ it applied.
 
 **Background work** keeps its own syncs off the ack path:
 - WAL checkpoints (they sync);
-- `$FCK`/`$FSG` frames (synced with the next round, or alone when idle);
+- `$FCK`/`$FSG` preparation (a background thread, §6) and frames (synced with
+  the next round, or alone when idle);
 - merges of staged rows.
 
 **Registration** follows the ack:
@@ -465,6 +466,19 @@ it applied.
    changed kind: dictionary entries, latest-per-object, instances, tokens,
    tombstones, and the item-5 row orders where enabled.
 2. Append the segments, then the `$FCK` that lists every live segment.
+
+**Off the PUT path.**
+- Preparation (step 1) runs on a background thread. It folds a due feed from
+  one SQLite read snapshot and the stream prefix that snapshot names.
+- The feed's appender installs the prepared plan as a short step at its next
+  round boundary (or when idle), appending the segments and the `$FCK`. No PUT
+  waits for a fold. A plan whose base changed is dropped, and the feed is
+  prepared again while it stays due.
+- `APPLIED_THROUGH` is the prepare point: the end of the last `$FMB` in that
+  snapshot. Rounds acknowledged while the plan was prepared sit between
+  `APPLIED_THROUGH` and the `$FCK`.
+- Open and recovery fold every `$FMB` after `APPLIED_THROUGH`, including those
+  before the `$FCK`.
 
 **LSM.**
 - When a kind has 4 segments at a level, they merge into one at the next level
@@ -698,8 +712,7 @@ cpp/tests/p4-replay.e2e.mjs`):
 - LATEST, INSTANCES and TOKENS need a deletion marker. Today the code uses a
   zero RID or a zero count. TOMBSTONES need defined semantics for a reused
   `ROW_J`.
-- The before-export checkpoint applies only once the export op exists (the IPFS
-  layout release).
+- Settled in 3.10.0: the CAR export writes a checkpoint first (§6, §8).
 
 ## 14. Owner decisions (2026-10-18)
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.10.0
+
+Store format 5, part 3: the IPFS layout (`cpp/src/p4/FORMAT.md` §4, §5, §6,
+§8, §10).
+- IPFS layout ops: `RANGES` (per-record `(range, CID)` tuples), `FEED_ROOT`,
+  `DROPS`, `EXPOSURE` and `RELEASE`.
+- Records over 1 MiB get UnixFS DAGs whose root CIDs are byte-equal to Kubo's
+  `ipfs add --cid-version=1 --raw-leaves --chunker=size-1048576`.
+- The feed root DAG (checkpoint, commits tree, segments) is a pure function of
+  the frames. Its resident state is 88.9 B per row (was 515.3).
+- CARv2 export and restore. The export writes a checkpoint first, and
+  `ipfs dag import` takes the CAR byte for byte.
+- Release protocol: physical removal waits for the node's release. Naming a
+  retired generation releases all of it; `through` applies only to the current
+  generation.
+- SDS 1.256.0 fields (`FSG.INSTANCE_URL_IDS`, `FCK.RECORD_BYTES`, `MIN_W`,
+  `MAX_W`): a compacted feed with its index deleted rebuilds exactly, including
+  urls that only dead rows wrote.
+- Checkpoint preparation runs off the PUT path, on a background thread from one
+  SQLite read snapshot. The appender installs it at the next round.
+
 ## 3.9.0
 
 Store format 5, part 2: checkpoints and state segments (`cpp/src/p4/FORMAT.md`
