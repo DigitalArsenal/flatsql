@@ -3,8 +3,16 @@
 
 let Module = null;
 let api = null;
+let runtime = null;
 
-export async function initFlatSQL(moduleFactory) {
+// One engine instance per realm: every caller shares it (the wrappers below
+// close over one Module and its api).
+export function initFlatSQL(moduleFactory) {
+    runtime ??= start(moduleFactory);
+    return runtime;
+}
+
+async function start(moduleFactory) {
     Module = await moduleFactory();
 
     // Wrap C functions using cwrap
@@ -71,6 +79,10 @@ export async function initFlatSQL(moduleFactory) {
         getRawFlatBufferSequence: Module.cwrap('flatsql_get_raw_flatbuffer_sequence', 'number', []),
         getStorageBuffer: Module.cwrap('flatsql_get_storage_buffer', 'number', ['number']),
         getStorageSize: Module.cwrap('flatsql_get_storage_size', 'number', ['number']),
+
+        // Database-key encryption (field-encryption format 3)
+        setEncryptionKey: Module.cwrap('flatsql_set_encryption_key', 'number', ['number', 'number', 'number', 'number']),
+        ingestOneEncrypted: Module.cwrap('flatsql_ingest_one_encrypted', 'number', ['number', 'number', 'number', 'number', 'number', 'string']),
     };
 
     return new FlatSQL();
@@ -327,6 +339,36 @@ export class FlatSQLDatabase {
      * Get the underlying storage buffer info
      * Returns { ptr: number, size: number }
      */
+    // Set the database key: SQL decrypts the schema's (encrypted) columns
+    // with it. The engine copies the key; the caller may wipe its own copy.
+    setEncryptionKey(key) {
+        const ptr = Module._malloc(key.length);
+        try {
+            Module.HEAPU8.set(key, ptr);
+            if (!api.setEncryptionKey(this._handle, ptr, key.length, 0)) throw new Error(api.getError());
+        } finally {
+            Module.HEAPU8.fill(0, ptr, ptr + key.length);
+            Module._free(ptr);
+        }
+    }
+
+    // Encrypt a plaintext record (no size prefix) under the sequence it gets
+    // and ingest it. schema: the table's .bfbs (flatc --bfbs-builtins).
+    ingestOneEncrypted(data, schema) {
+        const dataPtr = Module._malloc(data.length);
+        const schemaPtr = Module._malloc(schema.length);
+        try {
+            Module.HEAPU8.set(data, dataPtr);
+            Module.HEAPU8.set(schema, schemaPtr);
+            const sequence = api.ingestOneEncrypted(this._handle, dataPtr, data.length, schemaPtr, schema.length, null);
+            if (sequence < 0) throw new Error(api.getError());
+            return sequence;
+        } finally {
+            Module._free(dataPtr);
+            Module._free(schemaPtr);
+        }
+    }
+
     getStorageInfo() {
         return {
             ptr: api.getStorageBuffer(this._handle),
