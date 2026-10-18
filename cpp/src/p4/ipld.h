@@ -24,7 +24,8 @@ std::string ipldUnixfsDirectory();
 bool ipldLarge(const void* bytes,size_t size,IpldLarge* out);
 bool ipldLargeFromDigests(uint64_t size,const std::string& digests,IpldLarge* out);
 // Called by the one replay E2E; includes the two published interoperability
-// vectors and a reproducible two-leaf file (one MiB 'a', then one MiB 'b').
+// vectors and a two-leaf file (one MiB 'a', then one MiB 'b') whose root is
+// Kubo's (`ipfs add --raw-leaves --chunker=size-1048576 --cid-version=1`).
 bool ipldGoldenVectors(std::string* twoLeafRoot=nullptr);
 } }
 #endif

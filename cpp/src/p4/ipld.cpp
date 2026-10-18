@@ -131,6 +131,8 @@ bool ipldGoldenVectors(std::string* twoLeafRoot) {
        data!=ipldUnixfsFile(2*IpldChunkSize,{IpldChunkSize,IpldChunkSize}) ||
        links[0].cid!=ipldCid(IpldRaw,payload.data(),IpldChunkSize) ||
        links[1].cid!=ipldCid(IpldRaw,payload.data()+IpldChunkSize,IpldChunkSize)) return false;
+    // Kubo 0.43.0: ipfs add -n -Q --raw-leaves --chunker=size-1048576 --cid-version=1
+    if(ipldBase32(file.rootCid)!="bafybeiebzbu5i2sni4g7dn7nnmgxsz2zrr5auaw2fdfm6o6ytihlvfmjfa") return false;
     if(twoLeafRoot) *twoLeafRoot=ipldBase32(file.rootCid);
     return true;
 }

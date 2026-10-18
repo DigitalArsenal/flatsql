@@ -235,7 +235,7 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
     int64_t identitySeq=0;if(!ipfsIdentityFixture(&identitySeq))return false;
     std::setvbuf(stdout,nullptr,_IOLBF,0);
     std::string twoLeaf;if(!flatsql::p4::ipldGoldenVectors(&twoLeaf))return ipfsFail("published IPLD golden vectors");
-    std::printf("REPLAY_IPFS_GOLDEN empty_UnixFS=bafybeif7ztnhq65lumvvtr4ekcwd2ifwgm3awq4zfr3srh462rwyinlb4y hello_raw=bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4 two_leaf=%s payload=1048576*a+1048576*b cross_check=ipfs_add_required PASS\n",twoLeaf.c_str());
+    std::printf("REPLAY_IPFS_GOLDEN empty_UnixFS=bafybeif7ztnhq65lumvvtr4ekcwd2ifwgm3awq4zfr3srh462rwyinlb4y hello_raw=bafkreifjjcie6lypi6ny7amxnfftagclbuxndqonfipmb64f2km2devei4 two_leaf=%s payload=1048576*a+1048576*b kubo=0.43.0 PASS\n",twoLeaf.c_str());
     Batch large;large.type="WXF";large.peer=kPeer;large.at=kT0;large.tags.push_back({"ipfs-e2e","large","https://example.invalid/large","large-vectors","","",""});
     std::vector<std::string> largeRoots;
     for(size_t n:{size_t(3u<<20),size_t(3u<<19)}) {
@@ -243,6 +243,11 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
         if(rec.frame.size()>n+4)return ipfsFail("large fixture size");
         rec.frame.resize(n+4,0x5a);flatsql::p4::st32(rec.frame.data(),uint32_t(n));
         const auto node=ipfsLargeReference(rec.frame.data()+4,n);largeRoots.push_back(ipfsCid(node.data(),node.size(),0x70));large.recs.push_back(std::move(rec));
+    }
+    // The E2E hands the same record bytes to Kubo (`ipfs add`) when it has one.
+    if(const std::string kubo=argStr("kubo-dir","");!kubo.empty()) for(const auto& rec:large.recs) {
+        std::ofstream out(kubo+"/large-"+std::to_string(rec.frame.size()-4)+".bin",std::ios::binary);
+        out.write(reinterpret_cast<const char*>(rec.frame.data()+4),std::streamsize(rec.frame.size()-4));if(!out)return ipfsFail("kubo input write");
     }
     const auto wrote=put(large);if(wrote.status!=P4_OK||wrote.rows.size()!=2)return ipfsFail("large fixture PUT: "+wrote.err);
     for(size_t i=0;i<wrote.rows.size();i++)if(wrote.i(i,"reject"))return ipfsFail("large fixture reject "+std::to_string(wrote.i(i,"reject")));
@@ -317,6 +322,7 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
         uint64_t blocks=0;if(!ipfsCar(path,f,&blocks))return false;carBlocks+=blocks;
         auto& m=metrics[f.type];m.records+=f.records;m.links+=f.linkBytes;m.car+=first.bytes;m.stream+=first.liveStreamBytes;m.rangeUs+=rangeUs*f.blocks.size();m.tuples+=f.blocks.size();m.feeds++;
         cars.push_back({f.type,path});sourceFeedIds[path]=feed->fid;
+        std::printf("REPLAY_IPFS_CAR_FILE type=%s source=%s root=%s blocks=%llu path=%s\n",f.type.c_str(),f.source.c_str(),flatsql::p4::ipldBase32(f.root).c_str(),(unsigned long long)blocks,path.c_str());
         std::printf("REPLAY_IPFS_RANGE type=%s source=%s tuples=%zu us_per_tuple=%.3f hashes=matching closure=exact PASS\n",f.type.c_str(),f.source.c_str(),f.blocks.size(),rangeUs);
         auto partial=ipfsRequest(f);partial.u64(80,f.unit);const auto tail=ipfsCall(P4_OPC_RANGES,partial);if(tail.status!=P4_OK)return ipfsFail("range from commit");
         for(size_t i=0;i<tail.rows.size();i++)if(uint64_t(tail.i(i,"unit"))<f.unit)return ipfsFail("range inclusive commit bound");

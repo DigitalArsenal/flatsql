@@ -354,18 +354,78 @@ function checkpointPhases(runtime, phases = ['index-deleted', 'compaction', 'che
 
 
 // The IPFS protocol phase is part of the same replay gate, on a fresh clone.
-// Its independent parsers and measurements run in C++, natively only.
+// Its independent parsers and measurements run in C++, natively only; Kubo
+// then checks the same bytes when `ipfs` is on PATH.
 function ipfsPhase() {
   diskCheck(work, wxfBytes * 3);
   const clone = join(work, `clone-${process.pid}-${cloneN++}`);
+  const kuboDir = join(work, `kubo-${process.pid}`);
   run('cp', ['-c', '-R', fixtures.new, clone]);
+  mkdirSync(kuboDir, { recursive: true });
   try {
     const r = runtimeRun('native', 'new', ['--test=p4_replay', '--phase=ipfs', `--store=${clone}`,
-      `--gp=${seedTsv}`, `--retention-pages=${prof.retentionPages}`]);
+      `--gp=${seedTsv}`, `--retention-pages=${prof.retentionPages}`, `--kubo-dir=${kuboDir}`]);
     process.stdout.write(r.stdout || ''); process.stderr.write(r.stderr || '');
     if (r.status !== 0 || !(r.stdout || '').includes('REPLAY_IPFS wall_ms=')) fail(`native IPFS: exit ${r.status ?? r.signal}`);
-  } finally { rmSync(clone, { recursive: true, force: true }); }
+    kuboInterop(r.stdout, kuboDir);
+  } finally { rmSync(clone, { recursive: true, force: true }); rmSync(kuboDir, { recursive: true, force: true }); }
   diskCheck(work);
+}
+// Kubo (an independent IPFS implementation) against FlatSQL's bytes: `ipfs
+// add` of the large records gives FlatSQL's UnixFS roots, and two exported
+// CARv2 files import into a throwaway offline repo with their roots pinned,
+// then `ipfs dag export` of each root gives back exactly the CAR's blocks.
+function kuboInterop(stdout, dir) {
+  const version = spawnSync('ipfs', ['version', '--number'], { encoding: 'utf8' });
+  if (version.error || version.status !== 0) {
+    console.log(`REPLAY_IPFS_KUBO SKIP reason=${version.error ? `ipfs not on PATH (${version.error.code})` : `ipfs version exited ${version.status}`}`);
+    return;
+  }
+  const env = { ...process.env, IPFS_PATH: join(dir, 'repo') };
+  const ipfs = (args, opts = {}) => {
+    const r = spawnSync('ipfs', args, { env, encoding: opts.encoding ?? 'utf8', maxBuffer: 1 << 30 });
+    if (r.status !== 0) fail(`ipfs ${args.join(' ')}: exit ${r.status ?? r.signal}: ${String(r.stderr).slice(-500)}`);
+    return r.stdout;
+  };
+  ipfs(['init', '--profile=test', '-e']);
+  const field = (line, key) => (line.match(new RegExp(`(?:^| )${key}=(\\S+)`)) || [])[1];
+  const lines = stdout.split('\n');
+  const largeLine = lines.find((l) => l.startsWith('REPLAY_IPFS_LARGE '));
+  if (!largeLine) fail('Kubo: no REPLAY_IPFS_LARGE line');
+  const added = [];
+  for (const [bytes, key] of [[3145728, 'root_3m'], [1572864, 'root_1_5m']]) {
+    const cid = ipfs(['add', '-n', '-Q', '--raw-leaves', '--chunker=size-1048576', '--cid-version=1', join(dir, `large-${bytes}.bin`)]).trim();
+    if (cid !== field(largeLine, key)) fail(`Kubo: ipfs add of the ${bytes} B record gives ${cid}, FlatSQL ${field(largeLine, key)}`);
+    added.push(cid);
+  }
+  // CARv1 sections: [varint length][CID][block]; v2 wraps v1 at its data offset.
+  const varint = (b, at) => { let v = 0, s = 0; for (;;) { const c = b[at++]; v += (c & 127) * 2 ** s; s += 7; if (c < 128) return [v, at]; } };
+  const blocksOf = (v1) => {
+    let [n, at] = varint(v1, 0); at += n; const out = [];
+    while (at < v1.length) { [n, at] = varint(v1, at); out.push(v1.subarray(at, at + n).toString('hex')); at += n; }
+    return out;
+  };
+  const cars = lines.filter((l) => l.startsWith('REPLAY_IPFS_CAR_FILE ') &&
+    ((field(l, 'type') === 'WXF' && field(l, 'source') === 'gfs-0p25-small') || field(l, 'source') === 'large'));
+  if (cars.length !== 2) fail(`Kubo: expected the WXF small and large feeds' CAR files, found ${cars.length}`);
+  const imported = [];
+  for (const line of cars) {
+    const path = field(line, 'path'), root = field(line, 'root');
+    const imp = ipfs(['dag', 'import', '--pin-roots', '--stats', path]);
+    if (!imp.includes(`Pinned root\t${root}\tsuccess`) && !imp.includes(`Pinned root ${root} success`)) fail(`Kubo: dag import did not pin ${root}: ${imp.slice(0, 300)}`);
+    if (!ipfs(['pin', 'ls', '--type=recursive', root]).startsWith(`${root} recursive`)) fail(`Kubo: ${root} is not pinned recursively`);
+    const car = readFileSync(path);
+    // CARv2 header after the 11-byte pragma: 16 B characteristics, then data offset and size.
+    const v1 = car.subarray(Number(car.readBigUInt64LE(27)), Number(car.readBigUInt64LE(27) + car.readBigUInt64LE(35)));
+    const exported = ipfs(['dag', 'export', root], { encoding: 'buffer' });
+    const mine = blocksOf(v1), theirs = blocksOf(exported);
+    const have = new Set(mine);
+    const same = mine.length === theirs.length && have.size === mine.length && theirs.every((x) => have.has(x));
+    if (!same) fail(`Kubo: dag export of ${root} gives ${theirs.length} blocks, the CAR holds ${mine.length}`);
+    if (mine.length !== Number(field(line, 'blocks'))) fail(`Kubo: CAR block count ${mine.length} != FlatSQL's ${field(line, 'blocks')}`);
+    imported.push(`${field(line, 'source')}:${mine.length}:${exported.equals(v1) ? 'byte_equal' : 'same_blocks'}`);
+  }
+  console.log(`REPLAY_IPFS_KUBO version=${version.stdout.trim()} add_roots=${added.join(',')} add=equal dag_import=${imported.join(',')} pinned=recursive export=complete PASS`);
 }
 function crashPhases() {
   for (const test of ['t_kill', 't_power_loss']) {
