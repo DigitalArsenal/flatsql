@@ -73,6 +73,10 @@ enum {
  * both empty = local). Tag 80 u64: inclusive from-commit for RANGES/DROPS,
  * through-commit for RELEASE. Tag 81 u8: EXPOSURE (0 default, 1 on).
  * Tag 82 u32: RELEASE generation (default current); offsets are generation-local.
+ * RELEASE of a generation older than the current one releases that whole
+ * (immutable) generation; tag 80 is ignored. RELEASE of the current generation
+ * releases every older one once tag 80 reaches its compaction checkpoint (the
+ * first FCK after genesis), and is a no-op before that.
  * RANGES: path,offset,length,cid,kind,unit,block,provider,source,generation.
  * Paths are relative to config root; inline block bytes only for dag-pb nodes.
  * LINK unit is its publication/change commit, including rewrites of old units.

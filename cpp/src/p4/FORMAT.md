@@ -621,7 +621,10 @@ trigger):
    root.
 3. The node re-registers the same CIDs at their new `(path, offset)` and pin-
    updates to the new root. Record CIDs do not change, because records are
-   verbatim. Then it releases generation `g`.
+   verbatim. Then it releases generation `g`: `release(feed, g)` releases all
+   of the immutable generation `g` whatever through-commit it names, and
+   `release(feed, through)` on `g+1` releases `g` once `through` reaches the
+   compaction's final `$FCK`.
 4. Unlink `g` after the release and after the 30 s reader window (format 4).
 
 A node that never releases blocks compaction, and the store reports it as a

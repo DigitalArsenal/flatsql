@@ -352,6 +352,9 @@ int32_t feedRelease(Feed* f,uint32_t generation,uint64_t through) {
         if(f->retired && f->retired->gen<generation) retire.push_back(f->retired->gen);
         for(const auto& old:f->olderRetired) if(old.stream->gen<generation) retire.push_back(old.stream->gen);
     } else retire.push_back(generation);
+    // A retired generation is immutable: naming it releases all of it. Its
+    // last commit can be a frame the node never saw (appended after its last
+    // FEED_ROOT and before the swap), so `through` never applies to it.
     for(uint32_t old:retire) {
         uint64_t need=UINT64_MAX;
         { std::lock_guard<std::mutex> lock(f->smu); const auto it=f->releaseRequired.find(old); if(it!=f->releaseRequired.end()) need=it->second; }
@@ -359,7 +362,6 @@ int32_t feedRelease(Feed* f,uint32_t generation,uint64_t through) {
             int32_t rc=P4_OK; auto stream=streamAt(f,old,&rc); if(!stream) { if(rc!=P4_OK) return rc; continue; }
             uint64_t end; rc=retiredBounds(stream.get(),&need,&end); if(rc!=P4_OK) return rc;
         }
-        if(old==generation && through<need) continue;
         std::lock_guard<std::mutex> lock(f->smu);
         f->releaseRequired[old]=need; f->releasedThrough[old]=need;
     }
