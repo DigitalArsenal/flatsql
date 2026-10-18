@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.9.0
+
+Store format 5, part 2: checkpoints and state segments (`cpp/src/p4/FORMAT.md`
+§3.2, §3.3, §6, §9). Stores from 3.8.0 are refused; nodes rebuild.
+- `$FCK` checkpoints are written on the §6 cadence. Each lists LSM-merged
+  `$FSG` segments: dictionary, latest per object, instances, tokens and
+  tombstones.
+- Open reads the newest checkpoint's segments plus the tail `$FMB`s.
+- With every index file deleted, open finds the newest `$FCK` by a tail search
+  and rebuilds the row index from the `$FMB` chain. On the 15 GB replay fixture
+  that is 2.6 s for the checkpoint open and 18.5 s for the row-index rebuild,
+  and every answer is equal.
+- Compaction runs again where 3.8.0 deferred it. It writes consolidated `$FMB`s
+  and fresh segments.
+- Segments are 4.8% of an OMM stream (328 B records) and 0.7% of a WXF stream.
+  Checkpoints are under 0.01%.
+- p4 replay gate, 3.7.2 -> this build, native median: wxf_lead 826 -> 431 ms,
+  explorer warm 87.8 -> 9.4 ms, sync_window warm 142 -> 78 ms, latest warm
+  112 -> 87 ms.
+
 ## 3.8.0
 
 Store format 5 (`cpp/src/p4/FORMAT.md`, owner-approved 2026-10-18), first part.
