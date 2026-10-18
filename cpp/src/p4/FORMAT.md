@@ -1,9 +1,9 @@
-# FlatSQL feed format: linear FlatBuffers, in-situ IPFS (store format 4, layout 2)
+# FlatSQL feed format: linear FlatBuffers, in-situ IPFS (store format 5)
 
-Status: **proposed for owner review (2026-10-18).** No layout-2 code lands before
-the owner approves this file. The as-built description of layout 1 is
-`docs/STORE-FORMAT-4.md`; once layout 2 lands, that file describes it and links here
-for the bytes.
+Status: **approved by the owner, 2026-10-18**, with the four decisions in §13.
+This file is the frozen spec for store format 5. Format 4 (as built) is
+`docs/STORE-FORMAT-4.md`. When format 5 lands, that file is replaced by a
+format-5 one that links here for the bytes.
 
 Scope: a feed's bytes on disk, what an acknowledgement promises, how a feed is
 rebuilt from its own stream, and how a feed maps to IPLD (per-record CIDs,
@@ -29,14 +29,19 @@ needs.
    4-byte file identifier. The non-record frames are SDS tables (§3). A stock
    FlatBuffers reader walks the file from byte 0 and dispatches on the
    identifier. It needs no FlatSQL code.
-5. **No back-compat.** Layout-1 stores are refused with `P4_E_FORMAT`, and nodes
+5. **No back-compat.** Format-4 stores are refused with `P4_E_FORMAT`, and nodes
    rebuild by re-sync (stack AGENTS.md).
+6. **Each value lives in exactly one place** (owner, 2026-10-18). A value that
+   can be re-derived from the record bytes is not stored again: epoch and object
+   key are re-extracted on rebuild. `$FMB` holds only what the bytes cannot
+   give. Checkpoint segments are derived snapshots that can be discarded; the
+   authoritative data is the records plus their `$FMB` frames.
 
 ## 1. Files
 
 ```
 <data>/fsql4/
-  STORE                    64 B, magic FSQ4, format 4, layout 2 (layout 1 => P4_E_FORMAT)
+  STORE                    64 B, magic FSQ4, format 5 (format 4 => P4_E_FORMAT)
   T/<TYPE>.spec            registered spec TLV (unchanged)
   T/<TYPE>.idx             type index: CACHE (feed and token registries, rebuilt from the streams)
   T/<TYPE>.fts             full text: CACHE (unchanged)
@@ -44,7 +49,7 @@ needs.
   P/<TYPE>/<feed>.db       SQLite index: CACHE (optional per workload once FIX segments land, §7)
 ```
 
-The changes from layout 1:
+The changes from format 4:
 - The stream carries metadata, checkpoint and segment frames beside the records.
 - The `.db` and `.idx` stop being needed for durability.
 - `inst`, `tokc`, `ident`/`idst`, `moved` and `meta` become derived state.
@@ -108,7 +113,7 @@ next frame at F + 4 + N; the file ends exactly at a frame end.
   record CID stays the raw sha2-256 of the whole range (SDN's key). IPFS sees the
   DAG root and its 1 MiB raw leaves.
 - **Shared frames.** A record's copies and instances share one frame when the
-  bytes are equal (as layout 1). A row that points at an earlier frame adds no
+  bytes are equal (as format 4). A row that points at an earlier frame adds no
   record frame.
 
 ### 2.3 What a stock reader sees
@@ -132,7 +137,7 @@ SDS ruling (sds-oracle, 2026-10-18, against SDS HEAD 1.251.0; npm latest is
 
 Proposed: three new standards, **FMB**, **FCK** and **FIX** (codes free), as an
 additive SDS minor release (1.255.0 or later), followed by a flatsql pin bump.
-The layout-2 code builds against the released SDS. Neither tree carries an
+The format-5 code builds against the released SDS. Neither tree carries an
 internal schema.
 
 Conventions:
@@ -152,23 +157,23 @@ Conventions:
 enum fmbDictKind : ubyte { TOKEN, NODE, BATCH, CONTENT_KEY, URL, OBJECT_KEY }
 enum fmbRemoveReason : ubyte { DELETE, SUPERSEDE, CAT_SUPERSEDE, QUOTA, RETENTION, MOVED_OUT }
 
-/// One row = one delivery of one record to this feed (rid = SEQ << 16 | ROW_J). 48 bytes.
+/// One row = one delivery of one record to this feed (rid = SEQ << 16 | ROW_J). 40 bytes.
+/// No epoch or object key: both are re-extracted from the record bytes (principle 6).
 struct FMBRow {
   OFFSET:ulong;          // F of the record frame (this round's, or an earlier shared frame)
   SEQ:ulong;             // the record's seq in the type's seq space
-  SOURCE_TS:long;        // the copy's source timestamp
-  EPOCH:long;            // INT64_MIN: none
+  SOURCE_TS:long;        // the copy's source timestamp: a PUT field (tag 53 entry), not in the bytes
   LENGTH:uint;           // N of the record frame
-  OBJECT_KEY_ID:uint;    // FMBEntry OBJECT_KEY id; 0 none
   GROUP:ushort;          // index into GROUPS
   ROW_J:ushort;          // j of the rid
   FLAGS:uint;            // bit0 NEW_FRAME (frame written this round), bit1 SEALED, bit2 LARGE,
                          // bit3 MOVED_IN (local -> feed, seq kept), bit4 COMPACTED (re-emitted by a compaction),
                          // bit5 COPY, bit6 RETAG, others 0
+  RESERVED:uint;         // 0
 }
 /// What a call's rows share. 24 bytes.
 struct FMBGroup {
-  DELIVERED_AT:long;     // the feed's delivery time (layout 1's `at`)
+  DELIVERED_AT:long;     // the feed's delivery time (format 4's `at`)
   NODE_ID:uint;          // NODE (producer, peer)
   BATCH_ID:uint;         // BATCH (batch, producer peer, producer key)
   CONTENT_KEY_ID:uint;
@@ -178,8 +183,10 @@ struct FMBRemove { SEQ:ulong; ROW_J:uint; REASON:fmbRemoveReason; }   // ROW_J 0
 struct FMBUrl    { SEQ:ulong; ROW_J:uint; URL_ID:uint; }               // a DUP moving a row's url (C-3)
 table FMBEntry   { KIND:fmbDictKind; ID:uint; TEXT:[string]; }         // TOKEN [token, peer]; NODE [producer, peer];
                                                                        // BATCH [batch, ppeer, pkey]; others [value]
-table FMBSignature { ROW:uint; BYTES:[ubyte]; }                        // layout 1's `x`
-table FMBSealed  { ROW:uint; LEAF_DIGEST:[ubyte]; COLUMNS:[ubyte]; }   // ciphertext sha2-256; layout 1's `f`
+table FMBSignature { ROW:uint; BYTES:[ubyte]; }                        // format 4's `x`
+table FMBSealed  { ROW:uint; EPOCH:long; OBJECT_KEY_ID:uint;          // ciphertext cannot be re-extracted, so a sealed
+                   LEAF_DIGEST:[ubyte]; COLUMNS:[ubyte]; }             // row's epoch/key live here only; LEAF_DIGEST:
+                                                                       // ciphertext sha2-256; COLUMNS: format 4's `f`
 table FMBIdentity { ROW:uint; HASH:[ubyte]; }                          // IQC ingest identity (32 B)
 table FMBLarge   { ROW:uint; ROOT_CID:[ubyte]; ROOT_NODE:[ubyte]; LEAF_DIGESTS:[ubyte]; }  // §4.2
 
@@ -190,7 +197,8 @@ table FMB {
   COMMITTED_AT:long;         // the round's clock (restamps instances on removals, C-39 E5)
   TYPE_SEQ_HIGH:ulong;       // the type's highest seq issued so far (seqs never go back)
   ROWS:[FMBRow];             // in plan order; at most 65,536 per frame (a round splits beyond)
-  DIGESTS:[ubyte];           // 32 B per row: the record CID's digest
+  DIGESTS:[ubyte];           // 32 B per NEW_FRAME row, in row order: the record CID's digest
+                             // (a shared-frame row takes the digest of the frame it names)
   GROUPS:[FMBGroup];
   DICTIONARY:[FMBEntry];     // entries first used by this round (deltas)
   REMOVALS:[FMBRemove];
@@ -205,14 +213,20 @@ file_identifier "$FMB";
 ```
 
 What the vectors cover:
-- `ROWS` and `GROUPS` hold every column of layout 1's row `r`.
-- `DICTIONARY` covers `node`, `batch`, `ckey`, `url`, `okey` and the type's `tok`.
+- `ROWS` and `GROUPS` hold every column of format 4's row `r`.
+- `DICTIONARY` covers `node`, `batch`, `ckey`, `url` and the type's `tok`.
+  `OBJECT_KEY` entries are written only for sealed rows. Other rows' object
+  keys come from their bytes, with ids given in order of first appearance in
+  the stream, so a rebuild gives the same ids.
+- **Why the digest stays.** It is the commit's integrity check (§9) and the
+  record's key. Without it, recovery could not tell a torn record frame from a
+  good one, and a rebuild would have to re-hash every byte.
 - `IDENTITIES` covers `ident`.
 - `MOVED_IN` rows plus a `MOVED_OUT` removal in local cover `moved`.
 
 `inst`, `tokc` and the counters are folds over the rows.
 
-Layout 1 changed four things in place. Each is now an appended frame:
+Format 4 changed four things in place. Each is now an appended frame:
 - **DELETE, SUPERSEDE, CAT supersede, QUOTA, retention.** An `$FMB` with
   `REMOVALS` and no rows.
 - **A DUP's url.** `URLS`.
@@ -228,7 +242,7 @@ enum fckSegmentKind : ubyte {          // the FIX kinds, §3.3
   ROWS_BY_SEQ, ROWS_BY_OBJECT_EPOCH, ROWS_BY_CID, ROWS_BY_W, ROWS_BY_AT,   // item 5
   COLUMN = 64, ZONE_MAP = 65, ROLLUP = 66                                 // reserved: analytics, 64..127
 }
-struct FCKCounters {                   // layout 1's meta counters
+struct FCKCounters {                   // format 4's meta counters
   ROWS:ulong; RECORDS:ulong; BYTES:ulong; RECORDS_NO_EPOCH:ulong;
   COPIES:ulong; COPY_BYTES:ulong; LIVE_FRAME_BYTES:ulong;
   MIN_SEQ:ulong; MAX_SEQ:ulong; MIN_EPOCH:long; MAX_EPOCH:long;
@@ -272,7 +286,7 @@ struct FIXPair {             // the one sorted entry shape. 32 bytes
   ROW_REF:ulong;             // (F of the FMB holding the row) << 16 | row index in it
 }
 struct FIXLatest { OBJECT_KEY_ID:uint; RESERVED:uint; EPOCH:long; RID:ulong; ROW_REF:ulong; }  // 32 B
-struct FIXInstance {         // layout 1's inst row. 88 B
+struct FIXInstance {         // format 4's inst row. 88 B
   BATCH_ID:uint; CONTENT_KEY_ID:uint; RECORDS:ulong; BYTES:ulong; MIN_W:long; MAX_W:long;
   MIN_SEQ:ulong; MAX_SEQ:ulong; FIRST:long; UPDATED:long; MAX_AT:long; MAX_TS:long;
 }
@@ -390,7 +404,7 @@ feed root                       dag-pb UnixFS Directory, links sorted by name
 durable in the stream. The index may be behind after a power loss, and
 recovery (§9) restores it from the `$FMB` frames.
 
-**What it costs.** Layout 1 pays a stream sync plus an index commit sync per
+**What it costs.** Format 4 pays a stream sync plus an index commit sync per
 call, so a single-feed call drops from 2 syncs to 1. A call that also creates a
 feed pays once for the feed: the new file, its genesis `$FCK` and a directory
 sync. A new token has no extra sync, because it lives in the `$FMB`
@@ -398,7 +412,7 @@ dictionary.
 
 **Order of persistence.** The index commit is written only after its stream
 sync returned. A persisted index commit therefore never names bytes the stream
-lost (layout 1's invariant). The index's `mark` is the end of the last `$FMB`
+lost (format 4's invariant). The index's `mark` is the end of the last `$FMB`
 it applied.
 
 **Background work** keeps its own syncs off the ack path:
@@ -486,9 +500,20 @@ The same state always gives the same CAR bytes. There is no custom container.
 - A restored backup is a feed and serves as a table.
 - A backup set is a feed-root DAG of the same shape, so it can be pinned,
   announced, backed up and restored like any feed: recursive storage.
-- A feed's backups are cataloged as records of their own feed (one record per
-  CAR: its root, its CAR CID, as-of seq, size). That catalog is itself backed
-  up the same way. The catalog's record type is an open question in §12.
+- **The backup catalog is a feed of `$DPM` records** (owner, 2026-10-18), one
+  record per CAR. The node writes them, because a DPM is signed by its provider.
+  The catalog feed is itself backed up the same way.
+  - `DATASET_ID` is `<TYPE>/<provider>@<source>`. `UPDATE_ID` is the feed root
+    CID's text. `PROVIDER_PEER_ID`, `PUBLISH_TIMESTAMP` and `PROVIDER_SIGNATURE`
+    come from the node.
+  - Each CAR is one `ASSETS` entry, `TRANSPORT_KIND = CONTENT_ADDRESS`:
+    `CID` and `DATA_ROOT` are the feed root, `BYTE_LENGTH` is the CAR's size and
+    `FILE_NAME` is the CAR's name.
+  - DPM lacks two things, so this is a proposed **DPM amendment** (additive, in
+    the same SDS release as FMB/FCK/FIX):
+    - `publicationAssetKind.CAR_ARCHIVE`, appended;
+    - `DPMAsset.THROUGH_SEQ:ulong`, the highest seq the archive covers (its
+      as-of point).
 
 ## 9. Crash recovery from the stream tail
 
@@ -508,20 +533,20 @@ safe even when a crash persisted later pages before earlier ones.
 1. **Start.**
    - With an index: start at its `mark`. A stream shorter than its mark lost
      acknowledged frames, and the feed is quarantined (`P4_E_CORRUPT`, named), as
-     in layout 1.
+     in format 4.
    - Without one: find the newest `$FCK` by the tail search below and load its
      segments.
 2. **Walk** forward from the start, collecting record frames until a candidate
    commit point. If the candidate verifies, apply it with **its** seqs and
    metadata. Rows get no fresh seqs and provenance is never blank (unlike
-   layout 1's rebuild).
+   format 4's rebuild).
 3. **Cut the tail.** At EOF, or at a torn or unverifiable frame, cut the stream
    back to the end of the last commit point. Those bytes were never
    acknowledged and never registered.
 4. **Finish moves.** A `MOVED_IN` row in a feed whose `MOVED_OUT` is missing in
    local gets its removal `$FMB` appended to local.
 5. **Rebuild caches** as needed:
-   - the views from the index's staged rows (as layout 1);
+   - the views from the index's staged rows (as format 4);
    - a missing or damaged `.db` from the `$FMB` chain;
    - a missing `.idx` from the genesis frames.
 
@@ -536,12 +561,13 @@ safe even when a crash persisted later pages before earlier ones.
   sequential read of the file.
 
 **Rebuilding the SQLite index without its file.**
-- Follow `PREVIOUS` back from the tail and read only the `$FMB` frames (about
-  80 B per row).
-- Then apply them forward in one bulk transaction, with the secondary indexes
-  built after.
-- The record bytes are not read, and nothing is re-hashed except the tail after
-  the newest checkpoint.
+- Walk the stream forward in one sequential read. Apply each `$FMB` in one
+  bulk transaction, with the secondary indexes built after.
+- The epoch and object key of each unsealed row are re-extracted from its
+  record frame, which is already in the read buffer (principle 6).
+- Nothing is re-hashed except the tail after the newest checkpoint.
+- Open without the SQLite index needs none of this: the newest `$FCK` and its
+  segments already hold the epoch and object orders.
 
 ## 10. Retention and compaction (pins and filestore first)
 
@@ -569,7 +595,7 @@ trigger):
 3. The node re-registers the same CIDs at their new `(path, offset)` and pin-
    updates to the new root. Record CIDs do not change, because records are
    verbatim. Then it releases generation `g`.
-4. Unlink `g` after the release and after the 30 s reader window (layout 1).
+4. Unlink `g` after the release and after the 30 s reader window (format 4).
 
 A node that never releases blocks compaction, and the store reports it as a
 stat. It never loses data.
@@ -595,6 +621,12 @@ All of these are on the node:
 - **Unpin on retention and compaction**, per §10, then `release`.
 - **E2E.** A second node pins a feed root (or imports the CAR) and restores it
   through FlatSQL. Every replay answer hashes equal to the first node's.
+- **Format-5 names.** The store-format names move to 5:
+  `store-migrate --to 5`, `format5proof` (was `format4proof`), and the layout
+  checks. The lead-per-call task (`sdn-format4-lead-per-call-20261018`) becomes
+  format 5's.
+- **Backup catalog.** Write one signed `$DPM` per CAR into the catalog feed
+  (§8).
 
 ## 12. How this meets each owner requirement, and what it costs
 
@@ -604,16 +636,16 @@ E = estimated; the implementing release measures it.
 | Owner requirement | How | Cost |
 |---|---|---|
 | On disk stays linear `[u32 size][FlatBuffer]`, appended in order; any FlatBuffer reader opens it | §2: one stream per feed generation; four frame kinds told apart by identifier; no header, padding or trailer | metadata frames are copied to an aligned buffer when read (open/rebuild only): negligible |
-| Everything to rebuild a table is FlatBuffers: sibling per-record metadata frames, never an envelope, plus periodic checkpoints | §3.1 `$FMB` per feed per round (all of `r`, the dictionaries, removals); §3.2–3.3 `$FCK` + `$FIX`; SQLite, the type index and the views become caches | `$FMB` = 80 B/row (48 B struct + 32 B digest) + 24 B/call + dictionary deltas. Gate fixture (M sizes): OMM 623,462 rows → 49.9 MB = **+24%** on a 204.7 MB stream (328 B records); WXF sea 1,720,179 rows → 137.6 MB = **+0.9%** on 15.0 GB (8.7 KB records), plus about 11 MB (E) for its 191,131 batch strings. Checkpoint segments: ≤ 25% of appended bytes by the cadence rule, typically about 1–2% (E); LSM write amplification about log4(segments) (E) |
-| Pin records in situ: each record one contiguous range, raw-leaf CIDv1 (sha256) = record CID, Kubo filestore nocopy | §2.2, §4.1: the stored CID is already the range's sha256 (`kVerifyCid`, default on); the node registers `(path, off, len, CID)` | write path: **0 extra hashing** (the digest exists); 80 B/row in `$FMB` (above). Kubo side (E): about 150–200 B per filestore entry in its datastore, about 50–60% of OMM's stream bytes and about 2% of WXF's: why exposure is opt-in per feed |
+| Everything to rebuild a table is FlatBuffers: sibling per-record metadata frames, never an envelope, plus periodic checkpoints | §3.1 `$FMB` per feed per round (all of `r`, the dictionaries, removals); §3.2–3.3 `$FCK` + `$FIX`; SQLite, the type index and the views become caches | `$FMB` = 72 B/row (40 B struct + 32 B digest) + 24 B/call + dictionary deltas. Gate fixture (M sizes): OMM 623,462 rows → 44.9 MB = **+22%** on a 204.7 MB stream (328 B records); WXF sea 1,720,179 rows → 123.9 MB = **+0.8%** on 15.0 GB (8.7 KB records), plus about 11 MB (E) for its 191,131 batch strings. Checkpoint segments: ≤ 25% of appended bytes by the cadence rule, typically about 1–2% (E); LSM write amplification about log4(segments) (E) |
+| Pin records in situ: each record one contiguous range, raw-leaf CIDv1 (sha256) = record CID, Kubo filestore nocopy | §2.2, §4.1: the stored CID is already the range's sha256 (`kVerifyCid`, default on); the node registers `(path, off, len, CID)` | write path: **0 extra hashing** (the digest exists); 72 B/row in `$FMB` (above). Kubo side (E): about 150–200 B per filestore entry in its datastore, about 50–60% of OMM's stream bytes and about 2% of WXF's: why exposure is opt-in per feed |
 | Records over 1 MiB are a DAG of raw-leaf sub-ranges | §4.2: 1 MiB leaves; UnixFS root byte-equal to `ipfs add --raw-leaves --chunker=size-1048576` | about 410 B root node + 32 B per leaf in `FMBLarge`; no fixture record exceeds 1 MiB (M: max 8,720 B) |
 | Backups and archives are IPLD CARv2 (record blocks, index segments, checkpoint root DAG); backups are tables themselves | §8: deterministic CARv2 of the feed root; restore = the same apply path as recovery; a restored CAR is a feed | CAR overhead (E): about 40 B per block section + 40 B index entry: OMM about 1.25x its live stream, WXF about 1.01x. dag-pb links about 44 B per record (in the node's blockstore, not FlatSQL's) |
 | Announce roots, not records; IPFS per feed, off by default; restricted feeds never registered or served | §4.3, §11: FlatSQL computes roots and range tuples for every feed (cheap, and needed for backups); registration, providing and serving are the node's per-feed policy | DHT load: one provider record per feed root per checkpoint, instead of per record |
 | FlatBuffer index segments may replace SQLite per workload within about 10% | §3.3, §6, §7: `FIXPair` sorted vectors, LSM, whole-segment retention, behind the same reader interface | 32 B per row per order (5 orders = 160 B/row) against SQLite's 193 B/row for OMM (M: 120.7 MB / 623,462) and 180 B/row for WXF (M: 309.8 MB / 1,720,179) |
 | Room for analytics column segments | `fckSegmentKind` 64–127 and `FIX.COLUMN` reserved; root link `"columns"` reserved; no code (YAGNI) | none |
-| Zero back-compat | layout 1 refused (`P4_E_FORMAT`); nodes rebuild by re-sync | one re-sync per node |
+| Zero back-compat | format 4 refused (`P4_E_FORMAT`); nodes rebuild by re-sync | one re-sync per node |
 | Ack and durability | §5: one stream sync per touched stream; index commit unsynced (WAL NORMAL) | **M: 4.79 ms per sync** (F_FULLFSYNC, gate: 16 syncs = 76.66 ms). Gate `wxf_lead` 746 ms with 128 syncs (613 ms) → 64 syncs, about **−307 ms (−41%)**; `gp_ingest` 476 ms with 16 → 8, about **−38 ms (−8%)** (E from M) |
-| Crash recovery from the tail | §9: commit chain + digest-checked `$FMB`s; tail search ≤ about 64 MiB | open without the index (E): newest `$FCK` + segments + tail ≤ 64 MiB, **about 1 s**. Rebuilding the 15 GB fixture's SQLite index from `$FMB`s (E): read about 0.19 GB of `$FMB`, bulk-insert 2.34M rows, **about 10–20 s**, against layout 1's rebuild, which re-hashes 15 GB with FlatSQL's software sha256 and loses seqs and provenance |
+| Crash recovery from the tail | §9: commit chain + digest-checked `$FMB`s; tail search ≤ about 64 MiB | open without the index (E): newest `$FCK` + segments + tail ≤ 64 MiB, **about 1 s**. Rebuilding the 15 GB fixture's SQLite index from the stream (E): one sequential read of 15.2 GB, about 1 µs/row of re-extraction, bulk-insert 2.34M rows, **about 15–30 s**, against format 4's rebuild, which re-hashes 15 GB with FlatSQL's software sha256 and loses seqs and provenance |
 | Read through IPFS vs direct | not a format change | (E) direct warm `pread` 5–20 µs/record; through the local filestore +30–100 µs/block (datastore lookup, `pread`, Kubo's re-hash); remote = network RTT + that. The sdn child measures it |
 
 What the releases measure (each its own release, `cmd node
@@ -627,18 +659,21 @@ cpp/tests/p4-replay.e2e.mjs`):
   CID, and the large-record root matches `ipfs add`.
 - **Item 5:** every workload against SQLite (the 10% bar).
 
-## 13. Open questions for the owner
+## 13. Owner decisions (2026-10-18)
 
-1. **Codes.** `FMB` / `FCK` / `FIX` as new SDS standards (1.255.0 or later),
-   with flatsql bumped from its 1.206.0 pin. Should they be published to every
-   SDS registry like any standard, or marked FlatSQL-internal in the SDS
-   catalog?
-2. **OMM metadata overhead.** For 328 B records, `$FMB` adds 24% to the stream.
-   It drops to about 18% if `SOURCE_TS`/`EPOCH`/`OBJECT_KEY_ID` are re-extracted
-   from the record bytes on rebuild instead of stored, at about +1 µs/row of
-   rebuild CPU. Stored is proposed.
-3. **The backup catalog's record type** (§8): an existing SDS table (`DPM`, which
-   is CID-addressed), or a field on `FCK`?
-4. **Layout naming.** This is "store format 4, layout 2", refused by layout
-   checks as before (C-46 (6)). Should it be "format 5" instead (sdn's
-   `store-migrate --to 4` and `format4proof` names would follow)?
+1. **SDS codes.** `FMB`, `FCK` and `FIX` are published as ordinary SDS standards
+   in every registry, through the SDS publish workflow (1.255.0 or later),
+   together with the DPM amendment (§8). flatsql's SDS pin moves up from 1.206.0.
+2. **Re-extract, do not store.** `EPOCH` and `OBJECT_KEY_ID` are re-extracted
+   from the record bytes on rebuild and are not in `$FMB`.
+   - `SOURCE_TS` stays. It is a PUT field (the tag 53 entry), not part of the
+     record bytes, so `$FMB` is its only place.
+   - Sealed rows keep their epoch and key in `FMBSealed`, because ciphertext
+     cannot be re-extracted.
+   - Net cost: 72 B per row (+22% for OMM), not the 60 B (about 18%) assumed
+     when the question was asked.
+3. **The backup catalog is `$DPM`**, amended additively (§8). There is no new
+   table.
+4. **Store format 5.** The `STORE` header says 5, and format-4 stores are
+   refused with `P4_E_FORMAT`. The sdn names follow in the sdn child tasks
+   (§11).
