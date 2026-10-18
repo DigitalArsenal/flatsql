@@ -251,9 +251,12 @@ int32_t retiredBounds(Stream* stream,uint64_t* previous,uint64_t* end,uint64_t* 
 int32_t feedDagAt(Feed* f,Stream* stream,uint64_t previous,uint64_t end,DagSnapshot* out,std::string* err) {
     std::lock_guard<std::mutex> lock(f->dagMu); return build(f,stream,previous,end,out,err);
 }
-int32_t feedDagCommitRoot(Feed* f,Stream* stream,uint64_t previous,uint64_t end,std::string* cid,std::string* err) {
-    std::lock_guard<std::mutex> lock(f->dagMu); DagSnapshot result;
+int32_t feedDagCommitRootHeld(Feed* f,Stream* stream,uint64_t previous,uint64_t end,std::string* cid,std::string* err) {
+    DagSnapshot result;
     const int32_t rc=build(f,stream,previous,end,&result,err,false); if(rc==P4_OK) *cid=std::move(result.commitsRoot); return rc;
+}
+int32_t feedDagCommitRoot(Feed* f,Stream* stream,uint64_t previous,uint64_t end,std::string* cid,std::string* err) {
+    std::lock_guard<std::mutex> lock(f->dagMu); return feedDagCommitRootHeld(f,stream,previous,end,cid,err);
 }
 std::string feedDagCheckpointCid(const void* bytes,size_t length) {
     std::vector<uint64_t> aligned((length+7)/8); std::memcpy(aligned.data(),bytes,length);
@@ -274,8 +277,15 @@ std::string feedDagCheckpointCid(const void* bytes,size_t length) {
 }
 int32_t feedDagSnapshot(Feed* f,DagSnapshot* out,std::string* err) {
     uint64_t previous=0,end=0; std::shared_ptr<Stream> stream;
-    int32_t rc=committedStream(f,&stream,&previous,&end,err); if(rc!=P4_OK) return rc;
-    rc=feedDagAt(f,stream.get(),previous,end,out,err); if(rc!=P4_OK) return rc;
+    int32_t rc;
+    {
+        // The snapshot's committed point is read under dagMu, as every
+        // builder's is: the cache only moves forward, never resets for a
+        // point another builder already passed (smu holders never take dagMu).
+        std::lock_guard<std::mutex> lock(f->dagMu);
+        rc=committedStream(f,&stream,&previous,&end,err); if(rc!=P4_OK) return rc;
+        rc=build(f,stream.get(),previous,end,out,err); if(rc!=P4_OK) return rc;
+    }
     out->stream=std::move(stream);
     // Released generations whose files have left the retained set no longer
     // need an in-memory replay cache. Never nest the stream and DAG locks.

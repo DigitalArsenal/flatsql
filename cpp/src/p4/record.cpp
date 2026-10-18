@@ -828,6 +828,9 @@ int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
         std::lock_guard<std::mutex> g(f->dictMu);
         x.dict.begin(f->dict);
     }
+    // A checkpoint prepared off the writer goes in at this round boundary:
+    // this round's sync makes it durable and its commit publishes it.
+    checkpointInstallReady(f);
     {
         std::lock_guard<std::mutex> g(t->mu);
         x.k = f->k;

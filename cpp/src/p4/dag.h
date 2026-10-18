@@ -22,6 +22,10 @@ int32_t feedDagSnapshot(Feed*,DagSnapshot*,std::string* err);
 // Writer/checkpoint-only view; never publishes unacknowledged ranges.
 int32_t feedDagAt(Feed*,Stream*,uint64_t previous,uint64_t end,DagSnapshot*,std::string* err);
 int32_t feedDagCommitRoot(Feed*,Stream*,uint64_t previous,uint64_t end,std::string*,std::string* err);
+// The same with Feed::dagMu already held. The cache is incremental: an end
+// before its own replays the generation, so callers ask at a mark no cache
+// build can have passed (a committed mark read while dagMu is held).
+int32_t feedDagCommitRootHeld(Feed*,Stream*,uint64_t previous,uint64_t end,std::string*,std::string* err);
 std::string feedDagCheckpointCid(const void* bytes,size_t length);
 int32_t feedDagDrops(Feed*,uint64_t from,std::vector<DagDrop>*,std::string* err);
 int32_t feedExposure(Feed*,bool);

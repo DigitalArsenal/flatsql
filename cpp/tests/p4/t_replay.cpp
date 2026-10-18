@@ -75,6 +75,7 @@
 #include "ipld.h"
 #include "car.h"
 #endif
+#include "checkpoint.h"
 #define P4_REPLAY_FORMAT5 1
 #else
 #define P4_REPLAY_FORMAT5 0
@@ -737,7 +738,7 @@ void stock(const std::string& root, const std::string& workload, const Probe& p,
 struct StoreWalk {
     uint64_t streams=0, rows=0, bytes=0, records=0, commits=0, checkpoints=0, checkpointBytes=0, segmentBytes=0, merged=0;
 };
-bool walkStore(const std::string& root, bool emitStats, StoreWalk* totals=nullptr, bool compacted=false) {
+bool walkStore(const std::string& root, bool emitStats, StoreWalk* totals=nullptr, bool compacted=false, const std::string& onlyType="") {
     StoreWalk sum;
     std::map<std::string, StoreWalk> byType;
     std::error_code ec;
@@ -745,6 +746,7 @@ bool walkStore(const std::string& root, bool emitStats, StoreWalk* totals=nullpt
     std::map<std::pair<std::string, uint32_t>, std::pair<uint32_t, std::filesystem::directory_entry>> newest;
     for (const auto& file : std::filesystem::recursive_directory_iterator(root + "/P", ec)) {
         if (file.path().extension() != ".fsdata") continue;
+        if (!onlyType.empty() && file.path().parent_path().filename() != onlyType) continue;
         if (!compacted) { streams.push_back(file); continue; }
         // Retired generations remain during the reader grace window. Select
         // each feed's new generation from its verified genesis, not its name.
@@ -890,6 +892,92 @@ bool compactionProof(const std::string& root,const Probe& probe) {
     if(before!=rebuilt) return false;
     std::printf("REPLAY_COMPACTION retention_rows=%lld reads=%zu genesis=first final_FCK=last chain=clean digests=matching answers=equal reopened=equal rebuilt=equal PASS\n",(long long)rows,before.size());
     return true;
+}
+// A checkpoint prepares off the writer: hold the preparer once its snapshot
+// is taken and time PUTs to the same feed against PUTs with none preparing;
+// then the plan installs (after those PUTs: FMBs sit between its
+// APPLIED_THROUGH and its FCK) and every answer survives reopen and rebuild.
+bool prepareProof(const std::string& root,const Probe& probe,const std::vector<Gp>& seed) {
+    using flatsql::p4::Feed;
+    const size_t per=256, timedPuts=32, warmPuts=8;
+    std::vector<Batch> small; size_t made=0;
+    auto batchOf=[&](size_t n) {
+        Batch b; b.type="OMM"; b.peer=kGpPeer; b.at=isoSec("2099-01-01T00:00:00");
+        b.tags.push_back(Tag{kGpProvider,kGpSource,kGpUrl,"prepare-hold","","",""});
+        for (size_t j=0;j<n;j++,made++) {
+            Gp g=seed[made%seed.size()]; g.tle+=" prepare-"+std::to_string(made);
+            In in; in.frame=gpFrame(g); in.ts=isoSec(g.created); b.recs.push_back(std::move(in));
+        }
+        return b;
+    };
+    for (size_t i=0;i<warmPuts+2*timedPuts;i++) small.push_back(batchOf(per));
+    if (openNode(root,1)!=P4_OK || !registerAll()) return false;
+    auto* e=flatsql::p4::currentEngine();
+    Feed* target=nullptr;
+    for (const auto& t : e->types) if (t->name=="OMM") {
+        std::lock_guard<std::mutex> g(t->mu);
+        for (const auto& f : t->feeds) if (f && f->provider==kGpProvider && f->source==kGpSource) target=f.get();
+    }
+    if (!target) { closeEngine(600000); return false; }
+    std::mutex mu; std::condition_variable cv; bool holding=false, release=false;
+    flatsql::p4::checkpointPreparedHook=[&](Feed* f) {
+        if (f!=target) return;
+        std::unique_lock<std::mutex> g(mu); holding=true; cv.notify_all(); cv.wait(g,[&]{ return release; });
+    };
+    auto checkpointOf=[&]() { std::lock_guard<std::mutex> g(target->type->mu); return target->checkpoint; };
+    auto isHolding=[&]() { std::lock_guard<std::mutex> g(mu); return holding; };
+    // A staged-row merge holds its round's acks whether or not a checkpoint
+    // prepares; PUTs a merge ran under are counted, not timed.
+    size_t nextSmall=0, merges=0;
+    auto timed=[&](std::vector<double>* ms) {
+        const Batch& b=small[nextSmall++];
+        const uint64_t flushes=e->stat[flatsql::p4::kStIndexFlushes].load(), t0=flatsql::ps::monoNs();
+        Result r=put(b);
+        const double took=double(flatsql::ps::monoNs()-t0)/1e6;
+        if (r.status!=P4_OK || r.rows.size()!=b.recs.size()) { std::fprintf(stderr,"prepare PUT %d %s\n",r.status,r.err.c_str()); return false; }
+        if (e->stat[flatsql::p4::kStIndexFlushes].load()!=flushes) merges++; else if (ms) ms->push_back(took);
+        return true;
+    };
+    auto fail=[&](const char* why) {
+        std::fprintf(stderr,"checkpoint-prepare: %s\n",why);
+        { std::lock_guard<std::mutex> g(mu); release=true; } cv.notify_all();
+        closeEngine(600000); flatsql::p4::checkpointPreparedHook=nullptr; return false;
+    };
+    // Baseline: nothing prepares (the feed is not due). Then the feed is
+    // queued as its writer queues a due feed.
+    std::vector<double> baseMs, heldMs;
+    const auto before=checkpointOf();
+    for (size_t i=0;i<warmPuts;i++) if (!timed(nullptr)) return fail("PUT");
+    for (size_t i=0;i<timedPuts;i++) if (!timed(&baseMs)) return fail("PUT");
+    if (isHolding() || checkpointOf()!=before) return fail("a checkpoint prepared during the baseline");
+    flatsql::p4::checkpointSchedule(target);
+    { std::unique_lock<std::mutex> g(mu); if (!cv.wait_for(g,std::chrono::seconds(5),[&]{ return holding; })) return fail("the preparer never took its snapshot"); }
+    while (heldMs.size()<timedPuts && nextSmall<small.size()) if (!timed(&heldMs)) return fail("PUT");
+    if (checkpointOf()!=before || heldMs.size()<timedPuts/2 || baseMs.size()<timedPuts/2) return fail("windows");
+    { std::lock_guard<std::mutex> g(mu); release=true; } cv.notify_all();
+    const uint64_t installStart=flatsql::ps::monoNs();
+    std::shared_ptr<flatsql::p4::CheckpointState> installed=before;
+    while (installed==before && flatsql::ps::monoNs()-installStart<10000000000ull) { flatsql::ps::sleepNs(1000000); installed=checkpointOf(); }
+    const double installMs=double(flatsql::ps::monoNs()-installStart)/1e6;
+    flatsql::p4::checkpointPreparedHook=nullptr;
+    // The PUTs during the hold sit between its APPLIED_THROUGH and its $FCK.
+    if (installed==before || !installed || installed->current || installed->appliedThrough>=installed->offset) return fail("no installed checkpoint after the held PUTs");
+    const std::string index=target->path;
+    const auto want=allReadHashes(probe); closeEngine(600000);
+    if (!walkStore(root,false,nullptr,false,"OMM")) { std::fprintf(stderr,"checkpoint-prepare: stream walk\n"); return false; }
+    if (openNode(root,1)!=P4_OK || !registerAll()) return false;
+    const auto reopened=allReadHashes(probe); closeEngine(600000);
+    if (reopened!=want) { std::fprintf(stderr,"checkpoint-prepare: reopened hash mismatch\n"); return false; }
+    for (const char* suffix : {"","-wal","-shm"}) std::filesystem::remove(index+suffix);
+    if (openNode(root,1)!=P4_OK || !registerAll()) return false;
+    const auto rebuilt=allReadHashes(probe); closeEngine(600000);
+    if (rebuilt!=want) { std::fprintf(stderr,"checkpoint-prepare: rebuilt hash mismatch\n"); return false; }
+    auto pct=[](std::vector<double> v,double q) { std::sort(v.begin(),v.end()); return v[std::min(v.size()-1,size_t(q*double(v.size()-1)+0.5))]; };
+    const double b50=pct(baseMs,0.5),b99=pct(baseMs,0.99),h50=pct(heldMs,0.5),h99=pct(heldMs,0.99);
+    const bool within=h50<=1.25*b50+1.0;
+    std::printf("REPLAY_CHECKPOINT_PREPARE timed_puts=%zu+%zux%zu base_p50_ms=%.2f base_p99_ms=%.2f preparing_p50_ms=%.2f preparing_p99_ms=%.2f bound=preparing_p50<=1.25*base_p50+1ms merge_puts_untimed=%zu install_ms=%.1f fmbs_between_applied_through_and_fck=yes answers=equal reopened=equal rebuilt=equal %s\n",
+        baseMs.size(),heldMs.size(),per,b50,b99,h50,h99,merges,installMs,within?"PASS":"FAIL");
+    return within;
 }
 
 #if !defined(__wasm__)
@@ -1164,6 +1252,11 @@ P4_SLOW_TEST(p4_replay) {
     REQUIRE(root != "/fsql4", "--store");
     const std::string phase = argStr("phase", "run");
 #if P4_REPLAY_FORMAT5
+    if (phase == "checkpoint-prepare") {
+        const auto seed=readGp(argStr("gp",""));
+        REQUIRE(!seed.empty() && prepareProof(root,probeOf(seed,int(argInt("probes",40))),seed),phase);
+        return;
+    }
     if (phase == "index-deleted" || phase == "compaction") {
         const Probe p=probeOf(readGp(argStr("gp","")),int(argInt("probes",200)));
         REQUIRE(phase=="index-deleted" ? checkpointProof(root,p) : compactionProof(root,p),phase);

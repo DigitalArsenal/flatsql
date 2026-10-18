@@ -327,7 +327,10 @@ function runtimeRun(runtime, arm, args) {
         P4_REPLAY_AOT_ARGS: args.join('\x1f') },
     });
 }
-function checkpointPhases(runtime, phases = ['index-deleted', 'compaction']) {
+// checkpoint-prepare: a PUT's ack while a checkpoint prepares off the writer
+// (its preparer held after its snapshot) against PUTs with none preparing.
+const PHASE_LINE = { 'index-deleted': 'REPLAY_INDEX_DELETED ', compaction: 'REPLAY_COMPACTION ', 'checkpoint-prepare': 'REPLAY_CHECKPOINT_PREPARE ' };
+function checkpointPhases(runtime, phases = ['index-deleted', 'compaction', 'checkpoint-prepare']) {
   for (const phase of phases) {
     diskCheck(work, phase === 'compaction' ? wxfBytes * 1.15 : 0);
     const clone = join(work, `clone-${process.pid}-${cloneN++}`);
@@ -340,7 +343,7 @@ function checkpointPhases(runtime, phases = ['index-deleted', 'compaction']) {
       const r = runtimeRun(runtime, 'new', args);
       console.log(`checkpoint phase runtime=${runtime} profile=${PROFILE}`);
       process.stdout.write(r.stdout || ''); process.stderr.write(r.stderr || '');
-      if (r.status !== 0 || !(r.stdout || '').includes(phase === 'index-deleted' ? 'REPLAY_INDEX_DELETED ' : 'REPLAY_COMPACTION '))
+      if (r.status !== 0 || !(r.stdout || '').includes(PHASE_LINE[phase]))
         fail(`${runtime} ${phase}: exit ${r.status ?? r.signal}`);
     } finally {
       rmSync(clone, { recursive: true, force: true }); rmSync(reference, { recursive: true, force: true });

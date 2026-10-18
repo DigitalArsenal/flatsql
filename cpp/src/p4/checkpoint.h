@@ -2,6 +2,7 @@
 #ifndef FLATSQL_P4_CHECKPOINT_H
 #define FLATSQL_P4_CHECKPOINT_H
 #include "internal.h"
+#include <functional>
 namespace flatsql { namespace p4 {
 struct CheckpointLatest {
     uint32_t objectKey=0;
@@ -69,8 +70,19 @@ int32_t checkpointInstall(Feed*,Stream*,CheckpointPlan&,int64_t* end,uint64_t* p
 // once the surrounding sync succeeds.
 int32_t checkpointAppend(Feed*,Conn*,Stream*,const Counters&,int64_t* end,uint64_t* previous,
                          CheckpointState* state,bool fresh,std::string* err);
-// Standalone close/idle checkpoint; stream and SQLite mark are published together.
-int32_t checkpointFeed(Feed*,bool force,std::string* err,bool syncNow=true);
+// Standalone checkpoint on the drained writer (close, export, or an idle
+// install's sync); stream and SQLite mark are published together.
+int32_t checkpointFeed(Feed*,bool force,std::string* err);
+// Off-writer preparation (checkpoint_worker.cpp). Schedule queues a due feed
+// for the preparation thread; the feed's appender (its indexer at a round
+// boundary, or the drained writer when idle) installs the ready plan, whose
+// frames are synced with that round (or alone) and published by its commit.
+void checkpointSchedule(Feed*);
+int32_t checkpointInstallReady(Feed*);
+void checkpointLoop(Engine*);
+void checkpointWorkerStop(Engine*);
+// Test-only: runs on the preparation thread once its snapshot is taken.
+extern std::function<void(Feed*)> checkpointPreparedHook;
 bool checkpointDue(const Feed*,bool idle=false);
 } }
 #endif

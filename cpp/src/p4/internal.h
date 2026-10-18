@@ -405,6 +405,7 @@ struct RetiredGeneration {
     uint64_t retireAt = 0;
 };
 struct CheckpointState;
+struct CheckpointPlan;
 struct DagState;
 struct DagHistory;
 struct Feed {
@@ -446,6 +447,10 @@ struct Feed {
     uint32_t gen = 0;
     // The committed mark (Type::mu; the indexer sets it with each commit).
     std::shared_ptr<CheckpointState> pendingCheckpoint; // appended, synced by next round or idle
+    // Prepared off the writer, installed at a round boundary (Type::mu).
+    std::shared_ptr<CheckpointPlan> checkpointPlan;
+    bool checkpointPreparing = false;
+    uint64_t checkpointRetryAt = 0;  // after a failed preparation (monoNs)
     std::shared_ptr<CheckpointState> checkpoint; // immutable checkpoint state, Type::mu
     uint64_t checkpointOpenNs = 0, rowIndexRebuildNs = 0;
     uint64_t checkpointRows = 0, checkpointAt = 0; // rows since checkpoint; last commit monoNs
@@ -776,6 +781,13 @@ struct P4Engine {
     std::condition_variable slowCv;
     std::deque<uint32_t> slowQ;
     bool slowStop = false;
+    // Checkpoint preparation (checkpoint_worker.cpp): feeds to fold off
+    // their writer, one at a time.
+    std::thread ckThread;
+    std::mutex ckMu;
+    std::condition_variable ckCv;
+    std::deque<flatsql::p4::Feed*> ckQ;
+    bool ckStop = false;
 
     flatsql::p4::SlotHeader* slot(uint32_t i) {
         const int p = i < nSlots[0] ? 0 : 1;

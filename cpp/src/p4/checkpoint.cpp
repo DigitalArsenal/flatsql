@@ -398,12 +398,12 @@ bool checkpointDue(const Feed* f,bool idle) {
     return uint64_t(f->mark)-lastEnd>=std::max<uint64_t>(64ull<<20,4*segmentBytes) || f->checkpointRows>=65536 ||
         (idle && f->checkpointAt && monoNs()-f->checkpointAt>=30000000000ull);
 }
-int32_t checkpointFeed(Feed* f,bool force,std::string* err,bool syncNow) {
+int32_t checkpointFeed(Feed* f,bool force,std::string* err) {
     Engine* e=f->type->e; Counters counters; CheckpointState state; int64_t end,start; uint64_t previous; bool pending=false;
     { std::lock_guard<std::mutex> g(f->type->mu);
         if(!f->created || f->quarantined || !f->mark || (!force && !checkpointDue(f,true))) return P4_OK;
         if(f->checkpoint && uint64_t(f->mark)==f->checkpoint->end && !f->pendingCheckpoint && !f->checkpoint->commitsRoot.empty()) return P4_OK;
-        pending=bool(f->pendingCheckpoint); if(pending && !syncNow) return P4_OK;
+        pending=bool(f->pendingCheckpoint);
         if(pending) state=*f->pendingCheckpoint; else if(f->checkpoint) state=*f->checkpoint;
         counters=f->k; start=f->mark; end=pending?int64_t(state.end):start; previous=pending?state.offset:f->lastCommit;
     }
@@ -411,10 +411,6 @@ int32_t checkpointFeed(Feed* f,bool force,std::string* err,bool syncNow) {
     std::shared_ptr<Stream> stream=streamCur(f,&rc);
     if(rc==P4_OK && f->end!=end) { writerUnpin(e,f); return P4_E_BUSY; }
     if(rc==P4_OK && !pending) rc=checkpointAppend(f,c,stream.get(),counters,&end,&previous,&state,false,err);
-    if(rc==P4_OK && !syncNow) {
-        std::lock_guard<std::mutex> g(f->type->mu); f->pendingCheckpoint=std::make_shared<CheckpointState>(std::move(state)); f->end=end;
-        writerUnpin(e,f); return P4_OK;
-    }
     if(rc==P4_OK) rc=streamSync(stream.get());
     if(rc==P4_OK) {
         int sql=c->exec("BEGIN IMMEDIATE");
