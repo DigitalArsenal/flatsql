@@ -74,6 +74,7 @@
 #if !defined(__wasm__)
 #include "ipld.h"
 #include "car.h"
+#include "dag.h"
 #endif
 #include "checkpoint.h"
 #define P4_REPLAY_FORMAT5 1
@@ -825,7 +826,7 @@ AnswerHashes allReadHashes(const Probe& probe) {
     result["wxf_orders"]=wxf.hex();
     // SUMMARY 1 (feed counters) and 3 (instances: url, first, updated).
     for (uint8_t kind : {uint8_t(1),uint8_t(3)}) {
-        Hash summary; TlvW w; w.u8(45,kind); const Result sr=call(P4_OPC_SUMMARY,w.b); summary.result(sr);
+        Hash summary; TlvW w; w.u8(45,kind); summary.result(call(P4_OPC_SUMMARY,w.b));
         result["summary_"+std::to_string(kind)]=summary.hex();
     }
     return result;

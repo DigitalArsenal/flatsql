@@ -30,6 +30,8 @@ std::string feedDagCheckpointCid(const void* bytes,size_t length);
 int32_t feedDagDrops(Feed*,uint64_t from,std::vector<DagDrop>*,std::string* err);
 int32_t feedExposure(Feed*,bool);
 int32_t feedRelease(Feed*,uint32_t generation,uint64_t through);
+// Drops the feed's derived DAG caches; the next use rebuilds them from the stream.
+void feedDagReset(Feed*);
 uint64_t feedBlockedGenerations(Feed*);
 } }
 #endif

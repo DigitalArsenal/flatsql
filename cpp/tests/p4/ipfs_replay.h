@@ -2,6 +2,11 @@
 // it obtains ranges through the mailbox and parses protobuf/CAR independently.
 #ifndef FLATSQL_P4_IPFS_REPLAY_H
 #define FLATSQL_P4_IPFS_REPLAY_H
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#else
+#include <malloc.h>
+#endif
 
 struct IpfsBlock {
     std::string cid, path, bytes;
@@ -175,9 +180,14 @@ bool ipfsFeeds(std::vector<IpfsFeed>* feeds) {
         for(size_t i=0;i<r.rows.size();i++) {IpfsFeed f;f.type=type;f.provider=r.s(i,"provider");f.source=r.s(i,"source");f.root=r.s(i,"cid");f.unit=uint64_t(r.i(i,"unit"));f.generation=uint32_t(r.i(i,"generation"));feeds->push_back(std::move(f));}
     }return !feeds->empty();
 }
-bool ipfsRangeRecordSet(const IpfsFeed& f,std::set<std::string>* out,std::set<std::string>* exposed=nullptr,std::set<std::string>* all=nullptr) {
+// One RANGES answer (one snapshot): record CIDs, exposed CIDs, and every
+// CID with its unit, and the snapshot's generation.
+bool ipfsRangeRecordSet(const IpfsFeed& f,std::set<std::string>* out,std::set<std::string>* exposed=nullptr,std::map<std::string,uint64_t>* all=nullptr,uint32_t* generation=nullptr) {
     const auto r=ipfsCall(P4_OPC_RANGES,ipfsRequest(f));if(r.status!=P4_OK)return ipfsFail("retention ranges: "+r.err);
-    for(size_t i=0;i<r.rows.size();i++) {if(r.i(i,"kind")<=3)out->insert(r.s(i,"cid"));if(exposed&&r.i(i,"kind")!=7)exposed->insert(r.s(i,"cid"));if(all)all->insert(r.s(i,"cid"));}return true;
+    if(generation)*generation=r.rows.empty()?UINT32_MAX:uint32_t(r.i(0,"generation"));
+    for(size_t i=0;i<r.rows.size();i++) {if(r.i(i,"kind")<=3)out->insert(r.s(i,"cid"));if(exposed&&r.i(i,"kind")!=7)exposed->insert(r.s(i,"cid"));if(all)all->emplace(r.s(i,"cid"),uint64_t(r.i(i,"unit")));
+        if(generation&&uint32_t(r.i(i,"generation"))!=*generation)return ipfsFail("one RANGES answer spans generations");}
+    return true;
 }
 bool ipfsIdentityFixture(int64_t* seq) {
     Batch b;b.type="IQC";b.peer="identity-first";b.at=kT0;b.tags.push_back({"ipfs-e2e","identity","https://example.invalid/identity","first","","",""});
@@ -198,9 +208,30 @@ bool ipfsIdentityHash(int64_t seq,std::string* out) {
     sqlite3_finalize(q);sqlite3_close(db);if(!ok||count!=1)return ipfsFail("identity did not survive original-row removal / CAR restore");
     TlvW scan;scan.text(1,"IQC").u8(2,1).u64(3,10).u8(5,P4_ORDER_SEQ_ASC);hash.result(ipfsCall(P4_OPC_SCAN,scan));*out=hash.hex();return true;
 }
+// Bytes the allocator holds for the process (live allocations only).
+uint64_t ipfsHeapInUse() {
+#if defined(__APPLE__)
+    malloc_statistics_t st{}; malloc_zone_statistics(nullptr,&st); return uint64_t(st.size_in_use);
+#else
+    return uint64_t(mallinfo2().uordblks);
+#endif
+}
+// The resident derived DAG of the gate's largest feed (the WXF sea feed),
+// measured as the allocator's growth across one rebuild of its cache.
+bool ipfsDagMemory() {
+    IpfsFeed sea;sea.type="WXF";sea.provider="noaa-ncep";sea.source="gfs-0p25-sea";
+    auto* feed=ipfsEngineFeed(sea);if(!feed)return ipfsFail("sea feed missing");
+    flatsql::p4::feedDagReset(feed);
+    const uint64_t before=ipfsHeapInUse();
+    { flatsql::p4::DagSnapshot snapshot;std::string err;if(flatsql::p4::feedDagSnapshot(feed,&snapshot,&err)!=P4_OK)return ipfsFail("sea DAG: "+err); }
+    const uint64_t after=ipfsHeapInUse();int64_t rows=0;{std::lock_guard<std::mutex> g(feed->type->mu);rows=feed->k.rows;}
+    std::printf("REPLAY_IPFS_DAG_MEMORY type=WXF source=gfs-0p25-sea rows=%lld resident_bytes=%lld bytes_per_row=%.1f\n",(long long)rows,(long long)(after-before),double(int64_t(after-before))/double(std::max<int64_t>(1,rows)));
+    return true;
+}
 bool ipfsProof(const std::string& store,const Probe& probe) {
     const uint64_t phaseStart=flatsql::ps::monoNs();
     if(openNode(store,1)!=P4_OK||!registerAll()||registerType(iqcType())!=P4_OK)return false;
+    if(!ipfsDagMemory())return false;
     int64_t identitySeq=0;if(!ipfsIdentityFixture(&identitySeq))return false;
     std::setvbuf(stdout,nullptr,_IOLBF,0);
     std::string twoLeaf;if(!flatsql::p4::ipldGoldenVectors(&twoLeaf))return ipfsFail("published IPLD golden vectors");
@@ -223,8 +254,8 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
     // Take the exact block sets before retention. This includes large roots
     // and every chunk, so a whole-range CID accidentally exposed is caught.
     std::vector<IpfsFeed> before;if(!ipfsFeeds(&before))return false;
-    std::set<std::string> prior,priorExposed;std::map<std::pair<std::string,std::string>,std::set<std::string>> priorClosure;
-    for(auto& f:before)if(f.type=="WXF"&&!ipfsRangeRecordSet(f,&prior,&priorExposed,&priorClosure[{f.provider,f.source}]))return false;
+    std::set<std::string> prior,priorExposed;std::map<std::pair<std::string,std::string>,std::map<std::string,uint64_t>> priorClosure;std::map<std::pair<std::string,std::string>,uint32_t> priorGeneration;
+    for(auto& f:before)if(f.type=="WXF"&&!ipfsRangeRecordSet(f,&prior,&priorExposed,&priorClosure[{f.provider,f.source}],&priorGeneration[{f.provider,f.source}]))return false;
     Hash retained;int64_t retentionRows=0,retentionOps=0;wRetention(probe,&retained,&retentionRows,&retentionOps);
     uint8_t largeKey[36];cidOf(large.recs[0].frame,largeKey);TlvW dw;dw.text(1,"WXF");
     const auto list=cidList({std::vector<uint8_t>(largeKey,largeKey+36)},0,1);dw.raw(40,list.data(),list.size());
@@ -237,15 +268,21 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
     if(drops.status!=P4_OK)return ipfsFail("drop list: "+drops.err);
     for(size_t i=0;i<drops.rows.size();i++) {if(drops.i(i,"unit")<=0)return ipfsFail("drop missing commit unit");const auto cid=drops.s(i,"cid");allDrops.insert(cid);if(prior.count(cid))dropped.insert(cid);}
     if(removed.empty()||removed!=dropped)return ipfsFail("drop list differs from removed record blocks: expected "+std::to_string(removed.size())+" got "+std::to_string(dropped.size()));
-    live.clear();liveExposed.clear();for(auto& f:after)if(f.type=="WXF"&&!ipfsRangeRecordSet(f,&live,&liveExposed))return false;
-    size_t deltaBlocks=0;
-    for(const auto& f:after)if(f.type=="WXF") {
+    // Incremental pulls: within one generation, every block new since the
+    // prior answer carries a unit past the prior FEED_ROOT's commit, so a
+    // RANGES from that commit + 1 finds it. Each side is one RANGES answer
+    // with its own generation (a background compaction can land between calls).
+    live.clear();liveExposed.clear();size_t deltaBlocks=0;
+    for(auto& f:after)if(f.type=="WXF") {
+        std::map<std::string,uint64_t> closure;uint32_t generation=0;if(!ipfsRangeRecordSet(f,&live,&liveExposed,&closure,&generation))return false;
         const IpfsFeed* old=nullptr;for(const auto& candidate:before)if(candidate.type==f.type&&candidate.provider==f.provider&&candidate.source==f.source)old=&candidate;
-        if(!old)return ipfsFail("incremental range old feed");std::set<std::string> unused,closure;
-        if(!ipfsRangeRecordSet(f,&unused,nullptr,&closure))return false;
-        auto request=ipfsRequest(f);request.u64(80,old->generation==f.generation?old->unit+1:0);const auto delta=ipfsCall(P4_OPC_RANGES,request);
-        if(delta.status!=P4_OK)return ipfsFail("incremental ranges");std::set<std::string> added;for(size_t i=0;i<delta.rows.size();i++)added.insert(delta.s(i,"cid"));
-        for(const auto& cid:closure)if(!priorClosure[{f.provider,f.source}].count(cid)) {if(!added.count(cid))return ipfsFail("incremental ranges omit rewritten DAG unit/link");deltaBlocks++;}
+        if(!old)return ipfsFail("incremental range old feed");
+        const auto key=std::make_pair(f.provider,f.source);
+        const uint64_t from=generation==priorGeneration[key]&&generation==old->generation?old->unit+1:0;
+        for(const auto& block:closure)if(!priorClosure[key].count(block.first)) {
+            if(block.second<from)return ipfsFail("incremental ranges omit rewritten DAG unit/link: source="+f.source+" unit="+std::to_string(block.second)+" from="+std::to_string(from)+" generation="+std::to_string(generation));
+            deltaBlocks++;
+        }
     }
     std::printf("REPLAY_IPFS_INCREMENTAL new_closure_blocks=%zu delta=complete PASS\n",deltaBlocks);
     size_t metadataDrops=0;

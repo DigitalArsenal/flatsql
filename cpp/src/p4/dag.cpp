@@ -330,6 +330,7 @@ int32_t feedDagDrops(Feed* f,uint64_t from,std::vector<DagDrop>* out,std::string
     }
     return P4_OK;
 }
+void feedDagReset(Feed* f) { std::lock_guard<std::mutex> lock(f->dagMu); f->dag.reset(); f->dagHistory.reset(); }
 int32_t feedExposure(Feed* f,bool on) { f->ipfsExposed.store(on); f->type->e->kickMaintenance(); return P4_OK; }
 int32_t feedRelease(Feed* f,uint32_t generation,uint64_t through) {
     uint32_t current;
