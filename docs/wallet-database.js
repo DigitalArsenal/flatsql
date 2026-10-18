@@ -8,11 +8,13 @@
  * record, from the content key and the record's sequence) and SQL reads them
  * decrypted in this session. The page keeps no copy of the content key.
  *
- * Reopening the database in a later session needs the wallet to unwrap the
- * content key (sdn.wallet.key-unwrap.v1, after the user approves).
+ * The page saves the database in this browser as ciphertext: the exported
+ * records and the wrapped key, nothing that opens them. Reopening it in a later
+ * session asks the wallet to unwrap the content key (unwrapKey, after the user
+ * approves); the engine then reads the records under it again.
  */
 
-import { databaseContext, encodeTable, wrapContentKey } from './wallet-field-keys.js';
+import { databaseContext, encodeTable, unwrapContentKey, wrapContentKey } from './wallet-field-keys.js';
 
 export const TABLE = 'Contact';
 export const FILE_ID = 'CNTC';
@@ -61,6 +63,55 @@ export async function createWalletDatabase(flatsql, walletKey, count) {
         db.setEncryptionKey(contentKey);
         for (let id = 1; id <= count; id += 1) db.ingestOneEncrypted(contactRecord(id), SCHEMA_BFBS);
         return { db, envelope };
+    } catch (err) {
+        db?.destroy();
+        throw err;
+    } finally {
+        contentKey.fill(0);
+    }
+}
+
+// ---- Saved in this browser: ciphertext only ----
+
+const SAVED = 'flatsql.wallet-database.v1';
+const toBase64 = (bytes) => btoa(Array.from(bytes, (b) => String.fromCharCode(b)).join(''));
+const fromBase64 = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+
+/** Save the open database's records (encrypted at rest) and its wrapped key. */
+export function saveWalletDatabase({ db, envelope }) {
+    const saved = { context: envelope.context, enc: toBase64(envelope.enc), kmf: toBase64(envelope.kmf), records: toBase64(db.exportData()) };
+    try {
+        globalThis.localStorage.setItem(SAVED, JSON.stringify(saved));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** The saved database, or null. */
+export function savedWalletDatabase() {
+    try {
+        const saved = JSON.parse(globalThis.localStorage.getItem(SAVED) ?? 'null');
+        if (!saved) return null;
+        return { envelope: { context: saved.context, enc: fromBase64(saved.enc), kmf: fromBase64(saved.kmf) }, records: fromBase64(saved.records) };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Reopen the saved database: the wallet unwraps its content key (asking the
+ * user), the engine loads the encrypted records under it.
+ */
+export async function reopenWalletDatabase(flatsql, saved) {
+    const contentKey = await unwrapContentKey(saved.envelope);
+    let db = null;
+    try {
+        db = flatsql.createDatabase(SCHEMA, 'wallet-keyed');
+        db.registerFileId(FILE_ID, TABLE);
+        db.setEncryptionKey(contentKey);
+        db.loadAndRebuild(saved.records);
+        return { db, envelope: saved.envelope };
     } catch (err) {
         db?.destroy();
         throw err;

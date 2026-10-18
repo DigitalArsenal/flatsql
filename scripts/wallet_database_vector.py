@@ -9,7 +9,7 @@ format 3: K = HKDF-SHA256(contentKey, "flatbuffers-buffer-v3" || BE32(seq)),
 IV = BE32(position of the value's first byte) || 12 zero bytes.
 
 stdin: JSON {"seedHex", "account", "encHex", "kmfHex", "exportHex"}.
-stdout: JSON {"publicKeyHex", "context", "rows": [{"id", "name", "email",
+stdout: JSON {"publicKeyHex", "context", "contentKeyHex", "rows": [{"id", "name", "email",
 "phone"}...]} or {"publicKeyHex", "refused": reason}.
 """
 
@@ -132,7 +132,8 @@ def main() -> int:
         out["refused"] = str(error)
         json.dump(out, sys.stdout)
         return 0
-    stream = bytes.fromhex(request["exportHex"])
+    out["contentKeyHex"] = content_key.hex()
+    stream = bytes.fromhex(request.get("exportHex", ""))
     out["rows"] = [open_record(content_key, seq, rec) for seq, rec in enumerate(records(stream), start=1)]
     json.dump(out, sys.stdout)
     return 0

@@ -1982,6 +1982,7 @@
             <div class="wallet-db-row">
                 <button class="demo-btn" id="walletDbSignIn" type="button">Sign in</button>
                 <button class="demo-btn" id="walletDbCreate" type="button" disabled>Create encrypted database (100 contacts)</button>
+                <button class="demo-btn" id="walletDbReopen" type="button" disabled>Reopen saved database</button>
             </div>
             <div class="wallet-db-row">
                 <input type="text" class="query-input" id="walletDbQuery" aria-label="SQL over the encrypted database" value="SELECT id, name, email, phone FROM Contact LIMIT 20">
@@ -1997,7 +1998,8 @@
                 <p>First stored record: email and phone are ciphertext at rest</p>
                 <code id="walletDbStored"></code>
             </div>
-            <p>Each database gets its own random content key. The page wraps it to your wallet's encryption key and the engine encrypts the email and phone columns of every record under it; SQL reads them decrypted in this session only. Reopening the database in a later session needs the next wallet release, in which the wallet unwraps the key after you approve.</p>
+            <p>Each database gets its own random content key. The page wraps it to your wallet's encryption key and the engine encrypts the email and phone columns of every record under it; SQL reads them decrypted in this session only. The page saves the database in this browser as ciphertext; a later session reopens it only through your wallet.</p>
+            <p id="walletDbOpenNote"></p>
         </div>
 
         <div class="schema-panel">
@@ -2659,8 +2661,8 @@ flatsql --schema app.fbs --load data.bin \\
         });
     </script>
     <script type="module">
-        import { watchWallet, signIn, bytesToHex } from './wallet-field-keys.js';
-        import { createWalletDatabase, TABLE } from './wallet-database.js';
+        import { watchWallet, signIn, bytesToHex, walletOpensHere, SITE_ORIGIN } from './wallet-field-keys.js';
+        import { createWalletDatabase, reopenWalletDatabase, saveWalletDatabase, savedWalletDatabase, TABLE } from './wallet-database.js';
 
         const el = (id) => document.getElementById(id);
         let walletKey = null;
@@ -2679,6 +2681,10 @@ flatsql --schema app.fbs --load data.bin \\
         function renderStatus() {
             el('walletDbSignIn').hidden = Boolean(walletKey);
             el('walletDbCreate').disabled = !walletKey;
+            el('walletDbReopen').disabled = !(walletOpensHere() && walletKey && savedWalletDatabase());
+            el('walletDbOpenNote').textContent = walletOpensHere()
+                ? 'Reopen asks your wallet to unwrap the saved database key. It asks you first, and unwraps only keys sealed to your account for this site.'
+                : `Reopening through your wallet is off at this address. The wallet unwraps this site's keys only on the site's own origin, ${SITE_ORIGIN}, because every site on ${location.origin} shares one origin.`;
             if (!walletKey) {
                 el('walletDbStatus').textContent = 'Sign in with your wallet to create a database only your wallet can unlock.';
             } else if (!database) {
@@ -2707,36 +2713,58 @@ flatsql --schema app.fbs --load data.bin \\
             }
         }
 
+        // Show an open database: its wrapped key and stored (encrypted) records.
+        function show(next, status) {
+            database?.db.destroy();
+            database = next;
+            const stored = database.db.exportData();
+            const first = stored.subarray(4, 4 + new DataView(stored.buffer, stored.byteOffset).getUint32(0, true));
+            const box = el('walletDbEnvelope');
+            el('walletDbEnc').textContent = bytesToHex(database.envelope.enc);
+            el('walletDbKmf').textContent = bytesToHex(database.envelope.kmf);
+            el('walletDbStored').textContent = bytesToHex(first);
+            box.dataset.encHex = bytesToHex(database.envelope.enc);
+            box.dataset.kmfHex = bytesToHex(database.envelope.kmf);
+            box.dataset.exportHex = bytesToHex(stored);
+            box.hidden = false;
+            el('walletDbRun').disabled = false;
+            el('walletDbStatus').textContent = status;
+            runQuery();
+        }
+
         async function create() {
             el('walletDbCreate').disabled = true;
             el('walletDbStatus').textContent = 'Creating…';
             try {
-                database?.db.destroy();
-                database = null;
-                const flatsql = await runtime();
-                database = await createWalletDatabase(flatsql, walletKey, 100);
-                const stored = database.db.exportData();
-                const first = stored.subarray(4, 4 + new DataView(stored.buffer, stored.byteOffset).getUint32(0, true));
-                const box = el('walletDbEnvelope');
-                el('walletDbEnc').textContent = bytesToHex(database.envelope.enc);
-                el('walletDbKmf').textContent = bytesToHex(database.envelope.kmf);
-                el('walletDbStored').textContent = bytesToHex(first);
-                box.dataset.encHex = bytesToHex(database.envelope.enc);
-                box.dataset.kmfHex = bytesToHex(database.envelope.kmf);
-                box.dataset.exportHex = bytesToHex(stored);
-                box.hidden = false;
-                el('walletDbRun').disabled = false;
-                el('walletDbStatus').textContent = `100 contacts in ${TABLE}, encrypted under a content key wrapped to your wallet (${database.envelope.context}).`;
-                runQuery();
+                const created = await createWalletDatabase(await runtime(), walletKey, 100);
+                const saved = saveWalletDatabase(created);
+                show(created, `100 contacts in ${TABLE}, encrypted under a content key wrapped to your wallet (${created.envelope.context}).`
+                    + (saved ? ' Saved in this browser as ciphertext.' : ''));
             } catch (err) {
                 el('walletDbStatus').textContent = err.message;
             } finally {
-                el('walletDbCreate').disabled = !walletKey;
+                renderStatus();
+            }
+        }
+
+        // The button stays on while the wallet is asked: a request the user
+        // cancels in the wallet never settles here, and asking again is a
+        // fresh request.
+        async function reopen() {
+            const saved = savedWalletDatabase();
+            el('walletDbStatus').textContent = 'Waiting for your wallet…';
+            try {
+                const reopened = await reopenWalletDatabase(await runtime(), saved);
+                show(reopened, `Reopened the saved database: your wallet unwrapped its key (${reopened.envelope.context}).`);
+                el('walletDbEnvelope').dataset.reopened = 'true';
+            } catch (err) {
+                el('walletDbStatus').textContent = err.message;
             }
         }
 
         el('walletDbSignIn').addEventListener('click', () => { signIn().catch(renderStatus); });
         el('walletDbCreate').addEventListener('click', create);
+        el('walletDbReopen').addEventListener('click', reopen);
         el('walletDbRun').addEventListener('click', runQuery);
         watchWallet((key) => {
             walletKey = key;
