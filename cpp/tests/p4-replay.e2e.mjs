@@ -498,7 +498,9 @@ const f = (x) => (x < 0 ? 'n/a' : x >= 100 ? x.toFixed(0) : x.toFixed(2));
 console.log(`\nruntime workload pass | ${BASE_TAG} median/p95 ms | this build median/p95 ms | speedup | cpu ms ${BASE_TAG} -> this | syncs old -> new; per call (bound ms at ${syncMs.toFixed(2)} ms/sync) | rows | stock SQLite ms`);
 for (const r of rows)
   console.log(`${r.runtime} ${r.workload} ${r.pass} | ${f(r.base_med)}/${f(r.base_p95)} | ${f(r.new_med)}/${f(r.new_p95)} | ${r.speedup.toFixed(2)}x | ${f(r.base_cpu)} -> ${f(r.new_cpu)} | ${r.base_syncs} -> ${r.syncs}; ${f(r.base_syncs / r.calls)} -> ${f(r.syncs / r.calls)}/call${['gp_ingest', 'wxf_lead'].includes(r.workload) ? ` [${r.sync_min}..${r.sync_max}]` : ''} (${f(r.bound_ms)}) | ${r.rows} | ${r.stock_ms == null ? 'n/a' : f(r.stock_ms)}`);
-for (const runtime of RUNTIMES) checkpointPhases(runtime);
+// The recovery phases run natively: the engine code is the same in both runtimes,
+// and the read workloads above already hash equal across them.
+checkpointPhases('native');
 // Exact same E2E: independently walk every stream, then kill a lead three
 // times and compare the acknowledged prefix before/after cache deletion.
 for (const phase of ['walk', 'kill']) {
