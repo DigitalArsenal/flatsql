@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.7.2
+
+Store format 4: a write's cost on a feed no longer grows with the feed. Every answer is 3.7.1's.
+- A feed's index transaction keeps only the instances it changes (each taken from the feed's
+  committed table when first touched) and the dictionary entries it adds; 3.7.1 copied the
+  feed's whole instance table and dictionary into every commit round and replaced them at the
+  commit, destroying the old copies under the type's lock.
+- A delete's seq bounds are the first and last rows by rowid (two seeks); 3.7.1's
+  `SELECT min(seq), max(seq) FROM r` scanned every row of the seq index.
+- p4_record_scaling (cpp/tests/p4, its E2E cpp/tests/p4-record-scaling.e2e.mjs), native, a
+  15.0 GB WXF feed of 191,331 nine-record tile batches: a 512-tile GFS lead 40.1 s -> 5.3 s
+  (each tile now its two durable syncs), a 500-record retention page (SCAN + DELETE) 0.134 s
+  -> 0.020 s, and while a lead writes to each of two feeds 0.237 s -> 0.038 s (2,006 -> 11,857
+  records/s). The wasm32 test build under the Node wasi-threads host: lead 43.1 s -> 9.9 s, page
+  0.172 s -> 0.037 s. The query results hash the same on both engines; REBUILD 8 finds no
+  mismatch.
+
 ## 3.7.1
 
 Store format 4 follow-ups (CONTRACT C-46, C-47, C-48). Every answer is 3.7.0's except where
