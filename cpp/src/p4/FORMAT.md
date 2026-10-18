@@ -399,6 +399,14 @@ feed root                       dag-pb UnixFS Directory, links sorted by name
     tree's right spine (O(depth) nodes), the segments node and the root.
   - Retention or a delete rewrites the touched units and their spine.
   - Compaction rewrites the whole tree.
+- **Pulling a change.** Every node of the DAG carries the commit that last
+  rewrote it, and no block below a node is newer than the node. `RANGES` from a
+  commit therefore walks only the nodes rewritten at or after it: the new
+  units, the rewritten units and their spine. `FEED_ROOT` computes only the
+  root. Neither walks the feed (§12 has the cost).
+- **One forward cache.** The derived DAG is built forward only. A commits root
+  asked for an earlier commit point is the one recorded when a build stopped
+  there (the last 4,096 points are kept); the feed is never replayed for it.
 - **What `PREVIOUS_FEED_ROOT_CID` gives.** Inside the `$FCK` it is just bytes:
   a raw leaf has no links. History is reachable on purpose but never pinned
   by the current root.
@@ -445,6 +453,25 @@ it applied.
 - `$FCK`/`$FSG` preparation (a background thread, §6) and frames (synced with
   the next round, or alone when idle);
 - merges of staged rows.
+
+**Measured: a checkpoint preparing does not slow the ack.** PUT ack latency,
+p50/p99:
+
+| | p50 | p99 |
+|---|---|---|
+| No checkpoint preparing | 8.80 ms | 13.95 ms |
+| A checkpoint preparing | 9.04 ms | 10.44 ms |
+
+Installing the prepared checkpoint takes about 73 ms, once, on the round where
+the appender installs it.
+
+Basis: FlatSQL 3.10.0's replay gate (`REPLAY_CHECKPOINT_PREPARE`, native):
+- the gate fixture, a 1 GB WXF sea feed and 3 seed days of OMM (182,508
+  records);
+- 32 PUTs timed with no checkpoint preparing, and 32 rounds of 256 PUTs timed
+  while one prepares;
+- one run on a 28-core Apple M-series Mac Studio, with a 1-minute load average
+  of 23.7 (peak 30.4) from other work.
 
 **Registration** follows the ack:
 - The node pulls `(range, CID)` tuples only for acknowledged rounds, so a
@@ -691,6 +718,7 @@ E = estimated; the implementing release measures it.
 | Ack and durability | §5: one stream sync per touched stream; index commit unsynced (WAL NORMAL) | **M: 4.79 ms per sync** (F_FULLFSYNC, gate: 16 syncs = 76.66 ms). Gate `wxf_lead` 746 ms with 128 syncs (613 ms) → 64 syncs, about **−307 ms (−41%)**; `gp_ingest` 476 ms with 16 → 8, about **−38 ms (−8%)** (E from M) |
 | Crash recovery from the tail | §9: commit chain + digest-checked `$FMB`s; tail search ≤ about 64 MiB | open without the index (E): newest `$FCK` + segments + tail ≤ 64 MiB, **about 1 s**. Rebuilding the 15 GB fixture's SQLite index from the stream (E): one sequential read of 15.2 GB, about 1 µs/row of re-extraction, bulk-insert 2.34M rows, **about 15–30 s**, against format 4's rebuild, which re-hashes 15 GB with FlatSQL's software sha256 and loses seqs and provenance |
 | Read through IPFS vs direct | not a format change | (E) direct warm `pread` 5–20 µs/record; through the local filestore +30–100 µs/block (datastore lookup, `pread`, Kubo's re-hash); remote = network RTT + that. The sdn child measures it |
+| The node pulls per acknowledged round, so a pull costs what changed, not the feed | §4.3: `RANGES` from a commit walks only the nodes rewritten since; `FEED_ROOT` computes only the root; an earlier commits root comes from the forward cache | M (gate WXF sea feed, 110,915 blocks, against a 92-block feed of the same lane shape; medians of 7 rounds): `FEED_ROOT` 0.109 / 0.064 ms; `RANGES` from the prior commit 0.089 / 0.038 ms (14 blocks); earlier commits root 4 / 3 µs. The whole-closure `RANGES` on the sea feed costs 68.6 ms |
 
 What the releases measure (each its own release, `cmd node
 cpp/tests/p4-replay.e2e.mjs`):

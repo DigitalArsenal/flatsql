@@ -17,13 +17,17 @@ struct DagSnapshot {
 };
 struct DagDrop { std::string cid; uint64_t unit=0; uint32_t generation=0; };
 struct DagState;
-int32_t feedDagSnapshot(Feed*,DagSnapshot*,std::string* err);
+// The feed's root at its committed point. With closure, also the root's
+// closure; `from` keeps only blocks whose unit is at or after it, walking
+// only the nodes rewritten since (cost follows the change, not the feed).
+int32_t feedDagSnapshot(Feed*,DagSnapshot*,std::string* err,uint64_t from=0,bool closure=true);
 // Writer/checkpoint-only view; never publishes unacknowledged ranges.
 int32_t feedDagAt(Feed*,Stream*,uint64_t previous,uint64_t end,DagSnapshot*,std::string* err);
 int32_t feedDagCommitRoot(Feed*,Stream*,uint64_t previous,uint64_t end,std::string*,std::string* err);
-// The same with Feed::dagMu already held. The cache is incremental: an end
-// before its own replays the generation, so callers ask at a mark no cache
-// build can have passed (a committed mark read while dagMu is held).
+// The same with Feed::dagMu already held. The cache only moves forward: an
+// earlier commit point is answered from the commits roots it recorded at the
+// points it was built to, never by replaying the generation; a point it never
+// stopped at is P4_E_BUSY (callers ask at a committed mark read under dagMu).
 int32_t feedDagCommitRootHeld(Feed*,Stream*,uint64_t previous,uint64_t end,std::string*,std::string* err);
 std::string feedDagCheckpointCid(const void* bytes,size_t length);
 int32_t feedDagDrops(Feed*,uint64_t from,std::vector<DagDrop>*,std::string* err);
