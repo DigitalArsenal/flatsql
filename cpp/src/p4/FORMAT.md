@@ -46,7 +46,7 @@ needs.
   T/<TYPE>.idx             type index: CACHE (feed and token registries, rebuilt from the streams)
   T/<TYPE>.fts             full text: CACHE (unchanged)
   P/<TYPE>/<feed>[.<gen>].fsdata   THE FEED: the linear frame stream (§2)
-  P/<TYPE>/<feed>.db       SQLite index: CACHE (optional per workload once FIX segments land, §7)
+  P/<TYPE>/<feed>.db       SQLite index: CACHE (optional per workload once FSG segments land, §7)
 ```
 
 The changes from format 4:
@@ -77,10 +77,10 @@ next frame at F + 4 + N; the file ends exactly at a frame end.
 | record | the type's (`$OMM`, `$WXF`, ...) or a sealed envelope | a NEW record or new bytes enter the feed | the record bytes exactly as they arrived |
 | metadata | `$FMB` | once per feed per commit round, after that round's record frames; also alone for removals | the round's rows, dictionary additions and removals (§3.1) |
 | checkpoint | `$FCK` | at stream creation (genesis), then on the cadence in §6 | the feed's identity, counters and live segment list (§3.2) |
-| segment | `$FIX` | at checkpoints and in LSM merges | an immutable sorted state segment (§3.3) |
+| segment | `$FSG` | at checkpoints and in LSM merges | an immutable sorted state segment (§3.3) |
 
 - **Reserved identifiers.** A type cannot be registered with the identifier `FMB`,
-  `FCK` or `FIX`. A record of another type is refused if it carries one of them
+  `FCK` or `FSG`. A record of another type is refused if it carries one of them
   (`P4_REJ_FID`, as today), so no record frame can pose as a metadata frame.
 - **The commit chain.** Every non-record frame carries `SELF_OFFSET` (its own `F`)
   and `PREVIOUS` (the `F` of the non-record frame before it). Genesis has
@@ -120,7 +120,7 @@ next frame at F + 4 + N; the file ends exactly at a frame end.
 
 - A loop from byte 0 reads `N`, slices `[F+4, F+4+N)`, reads the identifier and
   verifies with that root type.
-- The SDS readers for `$FMB`/`$FCK`/`$FIX` (§3) decode the metadata.
+- The SDS readers for `$FMB`/`$FCK`/`$FSG` (§3) decode the metadata.
 - To list a feed's live records with no FlatSQL code, follow the newest
   checkpoint's segments, or replay the metadata frames (§9).
 - `fsdata-reader-check.py` is extended to all four kinds.
@@ -135,10 +135,14 @@ SDS ruling (sds-oracle, 2026-10-18, against SDS HEAD 1.251.0; npm latest is
   dictionary.
 - REC wraps a record, which rule 0.2 forbids.
 
-Proposed: three new standards, **FMB**, **FCK** and **FIX** (codes free), as an
+Proposed: three new standards, **FMB**, **FCK** and **FSG**, as an
 additive SDS minor release (1.255.0 or later), followed by a flatsql pin bump.
 The format-5 code builds against the released SDS. Neither tree carries an
 internal schema.
+
+The segment code is `FSG` (FlatSQL segment), not the `FIX` first proposed:
+GPX already has a field named `FIX`, and REC's union scope refuses a table
+with that name. FSG joins FSB and FSO in the FlatSQL family.
 
 Conventions:
 - Fixed-width per-row data is in structs (zero-copy vectors).
@@ -237,7 +241,7 @@ Format 4 changed four things in place. Each is now an appended frame:
 ### 3.2 `$FCK`: checkpoint (small; the state lives in segments)
 
 ```fbs
-enum fckSegmentKind : ubyte {          // the FIX kinds, §3.3
+enum fckSegmentKind : ubyte {          // the FSG kinds, §3.3
   DICTIONARY, LATEST, INSTANCES, TOKENS, TOMBSTONES,
   ROWS_BY_SEQ, ROWS_BY_OBJECT_EPOCH, ROWS_BY_CID, ROWS_BY_W, ROWS_BY_AT,   // item 5
   COLUMN = 64, ZONE_MAP = 65, ROLLUP = 66                                 // reserved: analytics, 64..127
@@ -248,7 +252,7 @@ struct FCKCounters {                   // format 4's meta counters
   MIN_SEQ:ulong; MAX_SEQ:ulong; MIN_EPOCH:long; MAX_EPOCH:long;
   MIN_TS:long; MAX_TS:long; MIN_AT:long; MAX_AT:long;
 }
-struct FCKSegment {                    // one live FIX frame. 48 bytes
+struct FCKSegment {                    // one live FSG frame. 48 bytes
   OFFSET:ulong; LENGTH:uint; KIND:fckSegmentKind; LEVEL:ubyte; RESERVED:ushort;
   MIN_SEQ:ulong; MAX_SEQ:ulong; COVERS_THROUGH:ulong; ENTRIES:ulong;
 }
@@ -277,20 +281,20 @@ file_identifier "$FCK";
   (run 3's suggestion, made LSM so the checkpoint stays small). Each segment is
   sorted by object id, and the newest entry wins across segments.
 
-### 3.3 `$FIX`: immutable state segment
+### 3.3 `$FSG`: immutable state segment
 
 ```fbs
-struct FIXPair {             // the one sorted entry shape. 32 bytes
+struct FSGPair {             // the one sorted entry shape. 32 bytes
   KEY_HI:ulong; KEY_LO:ulong;
   RID:ulong;                 // SEQ << 16 | ROW_J
   ROW_REF:ulong;             // (F of the FMB holding the row) << 16 | row index in it
 }
-struct FIXLatest { OBJECT_KEY_ID:uint; RESERVED:uint; EPOCH:long; RID:ulong; ROW_REF:ulong; }  // 32 B
-struct FIXInstance {         // format 4's inst row. 88 B
+struct FSGLatest { OBJECT_KEY_ID:uint; RESERVED:uint; EPOCH:long; RID:ulong; ROW_REF:ulong; }  // 32 B
+struct FSGInstance {         // format 4's inst row. 88 B
   BATCH_ID:uint; CONTENT_KEY_ID:uint; RECORDS:ulong; BYTES:ulong; MIN_W:long; MAX_W:long;
   MIN_SEQ:ulong; MAX_SEQ:ulong; FIRST:long; UPDATED:long; MAX_AT:long; MAX_TS:long;
 }
-table FIX {
+table FSG {
   SELF_OFFSET:ulong;
   PREVIOUS:ulong;
   FEED_ID:uint;
@@ -300,14 +304,14 @@ table FIX {
   COVERS_THROUGH:ulong;
   REPLACES:[ulong];          // F of the segments an LSM merge replaced
   ENTRIES:[FMBEntry];        // DICTIONARY, sorted by (KIND, ID)
-  LATEST:[FIXLatest];        // LATEST, sorted by OBJECT_KEY_ID
-  INSTANCES:[FIXInstance];   // INSTANCES, sorted by (BATCH_ID, CONTENT_KEY_ID)
+  LATEST:[FSGLatest];        // LATEST, sorted by OBJECT_KEY_ID
+  INSTANCES:[FSGInstance];   // INSTANCES, sorted by (BATCH_ID, CONTENT_KEY_ID)
   TOKENS:[FMBEntry];         // TOKENS: per-producer counts as TEXT [token, n, bytes, mints, maxts, maxseq]
-  PAIRS:[FIXPair];           // TOMBSTONES (KEY_HI = rid) and ROWS_BY_*, sorted by (KEY_HI, KEY_LO, RID)
+  PAIRS:[FSGPair];           // TOMBSTONES (KEY_HI = rid) and ROWS_BY_*, sorted by (KEY_HI, KEY_LO, RID)
   COLUMN:[ubyte];            // reserved (analytics task)
 }
-root_type FIX;
-file_identifier "$FIX";
+root_type FSG;
+file_identifier "$FSG";
 ```
 
 How the item-5 orders fill `PAIRS`:
@@ -321,7 +325,7 @@ How the item-5 orders fill `PAIRS`:
 | `ROWS_BY_AT` | at XOR 2^63 | 0 |
 
 - `ROW_REF` reaches every other column of the row in its `$FMB` with one read.
-- `FIX` field layout is **frozen when item 5 lands** (§7). The kinds above
+- `FSG` field layout is **frozen when item 5 lands** (§7). The kinds above
   `TOMBSTONES` are provisional until then; everything else in §3 is frozen by
   this review.
 
@@ -337,7 +341,7 @@ How the item-5 orders fill `PAIRS`:
 - FlatSQL exposes these tuples through a new read op. It answers RB1 rows
   `(gen path, offset, length, cid, kind, unit)` for a feed and a commit range,
   and the node pulls them per acknowledged round (§5).
-- Non-record frames (`$FMB`, `$FCK`, `$FIX`) are raw leaves the same way. The
+- Non-record frames (`$FMB`, `$FCK`, `$FSG`) are raw leaves the same way. The
   DAG links them in situ too.
 
 ### 4.2 Records over 1 MiB
@@ -371,7 +375,7 @@ feed root                       dag-pb UnixFS Directory, links sorted by name
 ├── "commits"    -> commits tree                       dag-pb, no Data; fanout <= 1,024
 │     └── ... -> commit unit (one per FMB, stream order)  dag-pb, no Data, links in stream order:
 │                  NEW record frames (raw leaf | §4.2 root), then the $FMB frame (raw leaf)
-├── "segments"   -> node linking each live $FIX frame (raw leaf, in situ), in FCK.SEGMENTS order
+├── "segments"   -> node linking each live $FSG frame (raw leaf, in situ), in FCK.SEGMENTS order
 └── "columns"    -> reserved for the analytics column segments (absent until that task lands)
 ```
 
@@ -417,7 +421,7 @@ it applied.
 
 **Background work** keeps its own syncs off the ack path:
 - WAL checkpoints (they sync);
-- `$FCK`/`$FIX` frames (synced with the next round, or alone when idle);
+- `$FCK`/`$FSG` frames (synced with the next round, or alone when idle);
 - merges of staged rows.
 
 **Registration** follows the ack:
@@ -457,12 +461,12 @@ instances, tokens or latest.
 
 - The SQLite index (`<feed>.db`) stays the default. It is a cache rebuilt from
   the `$FMB` chain (§9).
-- FIX row-order segments replace it **per workload** only if every replay
+- FSG row-order segments replace it **per workload** only if every replay
   workload on the 15 GB fixture is within about 10% of SQLite (native and AOT).
 - Reads go through the same `p4_reader.h` / virtual-table interface over
   "segments + tail": the in-memory view of rows after the newest checkpoint
   plays the part that `Staged` plays today.
-- The `FIX` layout freezes when item 5 lands. Until then only kinds below
+- The `FSG` layout freezes when item 5 lands. Until then only kinds below
   `ROWS_BY_SEQ` are written.
 
 ## 8. Backups and archives: CARv2
@@ -510,7 +514,7 @@ The same state always gives the same CAR bytes. There is no custom container.
     `CID` and `DATA_ROOT` are the feed root, `BYTE_LENGTH` is the CAR's size and
     `FILE_NAME` is the CAR's name.
   - DPM lacks two things, so this is a proposed **DPM amendment** (additive, in
-    the same SDS release as FMB/FCK/FIX):
+    the same SDS release as FMB/FCK/FSG):
     - `publicationAssetKind.CAR_ARCHIVE`, appended;
     - `DPMAsset.THROUGH_SEQ:ulong`, the highest seq the archive covers (its
       as-of point).
@@ -526,7 +530,7 @@ commit chain. An `$FMB` **verifies** when all of these hold:
   and it;
 - each such frame's sha2-256 equals the row's digest (or `LEAF_DIGEST`, sealed).
 
-An `$FCK`/`$FIX` verifies on the first three. The digest check makes recovery
+An `$FCK`/`$FSG` verifies on the first three. The digest check makes recovery
 safe even when a crash persisted later pages before earlier ones.
 
 **Open, per feed:**
@@ -583,7 +587,7 @@ safe even when a crash persisted later pages before earlier ones.
    is not exposed is released implicitly.
 
 The stream is append-only, so no byte under a live filestore entry is ever
-changed. Retention by arrival drops whole FIX segments (§6).
+changed. Retention by arrival drops whole FSG segments (§6).
 
 **Compaction** (a stream more than half dead, at least 1 MiB dead; unchanged
 trigger):
@@ -636,13 +640,13 @@ E = estimated; the implementing release measures it.
 | Owner requirement | How | Cost |
 |---|---|---|
 | On disk stays linear `[u32 size][FlatBuffer]`, appended in order; any FlatBuffer reader opens it | §2: one stream per feed generation; four frame kinds told apart by identifier; no header, padding or trailer | metadata frames are copied to an aligned buffer when read (open/rebuild only): negligible |
-| Everything to rebuild a table is FlatBuffers: sibling per-record metadata frames, never an envelope, plus periodic checkpoints | §3.1 `$FMB` per feed per round (all of `r`, the dictionaries, removals); §3.2–3.3 `$FCK` + `$FIX`; SQLite, the type index and the views become caches | `$FMB` = 72 B/row (40 B struct + 32 B digest) + 24 B/call + dictionary deltas. Gate fixture (M sizes): OMM 623,462 rows → 44.9 MB = **+22%** on a 204.7 MB stream (328 B records); WXF sea 1,720,179 rows → 123.9 MB = **+0.8%** on 15.0 GB (8.7 KB records), plus about 11 MB (E) for its 191,131 batch strings. Checkpoint segments: ≤ 25% of appended bytes by the cadence rule, typically about 1–2% (E); LSM write amplification about log4(segments) (E) |
+| Everything to rebuild a table is FlatBuffers: sibling per-record metadata frames, never an envelope, plus periodic checkpoints | §3.1 `$FMB` per feed per round (all of `r`, the dictionaries, removals); §3.2–3.3 `$FCK` + `$FSG`; SQLite, the type index and the views become caches | `$FMB` = 72 B/row (40 B struct + 32 B digest) + 24 B/call + dictionary deltas. Gate fixture (M sizes): OMM 623,462 rows → 44.9 MB = **+22%** on a 204.7 MB stream (328 B records); WXF sea 1,720,179 rows → 123.9 MB = **+0.8%** on 15.0 GB (8.7 KB records), plus about 11 MB (E) for its 191,131 batch strings. Checkpoint segments: ≤ 25% of appended bytes by the cadence rule, typically about 1–2% (E); LSM write amplification about log4(segments) (E) |
 | Pin records in situ: each record one contiguous range, raw-leaf CIDv1 (sha256) = record CID, Kubo filestore nocopy | §2.2, §4.1: the stored CID is already the range's sha256 (`kVerifyCid`, default on); the node registers `(path, off, len, CID)` | write path: **0 extra hashing** (the digest exists); 72 B/row in `$FMB` (above). Kubo side (E): about 150–200 B per filestore entry in its datastore, about 50–60% of OMM's stream bytes and about 2% of WXF's: why exposure is opt-in per feed |
 | Records over 1 MiB are a DAG of raw-leaf sub-ranges | §4.2: 1 MiB leaves; UnixFS root byte-equal to `ipfs add --raw-leaves --chunker=size-1048576` | about 410 B root node + 32 B per leaf in `FMBLarge`; no fixture record exceeds 1 MiB (M: max 8,720 B) |
 | Backups and archives are IPLD CARv2 (record blocks, index segments, checkpoint root DAG); backups are tables themselves | §8: deterministic CARv2 of the feed root; restore = the same apply path as recovery; a restored CAR is a feed | CAR overhead (E): about 40 B per block section + 40 B index entry: OMM about 1.25x its live stream, WXF about 1.01x. dag-pb links about 44 B per record (in the node's blockstore, not FlatSQL's) |
 | Announce roots, not records; IPFS per feed, off by default; restricted feeds never registered or served | §4.3, §11: FlatSQL computes roots and range tuples for every feed (cheap, and needed for backups); registration, providing and serving are the node's per-feed policy | DHT load: one provider record per feed root per checkpoint, instead of per record |
-| FlatBuffer index segments may replace SQLite per workload within about 10% | §3.3, §6, §7: `FIXPair` sorted vectors, LSM, whole-segment retention, behind the same reader interface | 32 B per row per order (5 orders = 160 B/row) against SQLite's 193 B/row for OMM (M: 120.7 MB / 623,462) and 180 B/row for WXF (M: 309.8 MB / 1,720,179) |
-| Room for analytics column segments | `fckSegmentKind` 64–127 and `FIX.COLUMN` reserved; root link `"columns"` reserved; no code (YAGNI) | none |
+| FlatBuffer index segments may replace SQLite per workload within about 10% | §3.3, §6, §7: `FSGPair` sorted vectors, LSM, whole-segment retention, behind the same reader interface | 32 B per row per order (5 orders = 160 B/row) against SQLite's 193 B/row for OMM (M: 120.7 MB / 623,462) and 180 B/row for WXF (M: 309.8 MB / 1,720,179) |
+| Room for analytics column segments | `fckSegmentKind` 64–127 and `FSG.COLUMN` reserved; root link `"columns"` reserved; no code (YAGNI) | none |
 | Zero back-compat | format 4 refused (`P4_E_FORMAT`); nodes rebuild by re-sync | one re-sync per node |
 | Ack and durability | §5: one stream sync per touched stream; index commit unsynced (WAL NORMAL) | **M: 4.79 ms per sync** (F_FULLFSYNC, gate: 16 syncs = 76.66 ms). Gate `wxf_lead` 746 ms with 128 syncs (613 ms) → 64 syncs, about **−307 ms (−41%)**; `gp_ingest` 476 ms with 16 → 8, about **−38 ms (−8%)** (E from M) |
 | Crash recovery from the tail | §9: commit chain + digest-checked `$FMB`s; tail search ≤ about 64 MiB | open without the index (E): newest `$FCK` + segments + tail ≤ 64 MiB, **about 1 s**. Rebuilding the 15 GB fixture's SQLite index from the stream (E): one sequential read of 15.2 GB, about 1 µs/row of re-extraction, bulk-insert 2.34M rows, **about 15–30 s**, against format 4's rebuild, which re-hashes 15 GB with FlatSQL's software sha256 and loses seqs and provenance |
@@ -661,7 +665,7 @@ cpp/tests/p4-replay.e2e.mjs`):
 
 ## 13. Owner decisions (2026-10-18)
 
-1. **SDS codes.** `FMB`, `FCK` and `FIX` are published as ordinary SDS standards
+1. **SDS codes.** `FMB`, `FCK` and `FSG` are published as ordinary SDS standards
    in every registry, through the SDS publish workflow (1.255.0 or later),
    together with the DPM amendment (§8). flatsql's SDS pin moves up from 1.206.0.
 2. **Re-extract, do not store.** `EPOCH` and `OBJECT_KEY_ID` are re-extracted
