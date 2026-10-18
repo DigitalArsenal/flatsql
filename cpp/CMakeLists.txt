@@ -44,7 +44,7 @@ set(FLATSQL_SDS_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated-sds")
 set(FLATSQL_SDS_HEADERS)
 foreach(SDS_TABLE FMB FCK FSG)
     if(NOT EXISTS "${SDS_SCHEMA_DIR}/${SDS_TABLE}/main.fbs")
-        message(FATAL_ERROR "SDS 1.255.0 schema missing: ${SDS_SCHEMA_DIR}/${SDS_TABLE}/main.fbs")
+        message(FATAL_ERROR "SDS 1.256.0 schema missing: ${SDS_SCHEMA_DIR}/${SDS_TABLE}/main.fbs")
     endif()
     set(SDS_HEADER "${FLATSQL_SDS_GENERATED_DIR}/${SDS_TABLE}/main_generated.h")
     add_custom_command(OUTPUT "${SDS_HEADER}"

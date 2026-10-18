@@ -16,6 +16,7 @@
 
 #include "internal.h"
 #include "checkpoint.h"
+#include "car.h"
 #include "sql_bridge.h"
 
 namespace flatsql {
@@ -545,20 +546,34 @@ void release(WriterState& ws) {
     ws.hold = false;
 }
 
-// Checkpoints run only while the writer owns both pipeline stages. A completed
-// round is already acknowledged, so checkpoint construction never extends it.
+// A due checkpoint is prepared off the writer (checkpoint_worker.cpp) and
+// installed by the feed's indexer at its next round. Idle, the drained writer
+// installs a ready plan alone and syncs it; stop checkpoints synchronously.
 void checkpointWriter(Engine* e, uint32_t wi, bool idle, bool force) {
-    std::vector<Feed*> feeds;
+    std::vector<Feed*> due, ready;
     { std::lock_guard<std::mutex> g(e->typesMu);
       for (auto& type : e->types) if (type->owner == wi) {
         std::lock_guard<std::mutex> tg(type->mu);
-        for (auto& f : type->feeds)
-          if (f->created && !f->quarantined && (force || checkpointDue(f.get(), idle))) feeds.push_back(f.get());
+        for (auto& f : type->feeds) {
+          if (!f->created || f->quarantined) continue;
+          if (idle && (f->checkpointPlan || f->pendingCheckpoint || force)) ready.push_back(f.get());
+          else if (checkpointDue(f.get(), idle)) due.push_back(f.get());
+        }
       }
     }
-    if (feeds.empty()) return;
+    for (Feed* f : due) checkpointSchedule(f);
+    if (ready.empty()) return;
     WriterState& ws = *e->writers[wi]; drain(ws);
-    for (Feed* f : feeds) { std::string err; checkpointFeed(f, force, &err, idle || force); }
+    for (Feed* f : ready) {
+        std::string err;
+        if (!force) {
+            // A stale plan is dropped here; a due feed is prepared again.
+            checkpointInstallReady(f);
+            std::lock_guard<std::mutex> g(f->type->mu);
+            if (!f->pendingCheckpoint) continue;
+        }
+        checkpointFeed(f, force, &err);
+    }
     release(ws);
 }
 
@@ -652,6 +667,7 @@ void writerLoop(Engine* e, uint32_t wi) {
                     Internal* in = tasks[0]->internal;
                     if (op == P4_OPC_QUOTA_GC) quotaWork(e, t, in);
                     else if (op == kOpCompact) compactWork(e, t, in);
+                    else if (op == kOpCarExport || op == kOpCarRestore) carWork(t, op, in);
                     else rebuildWork(e, t, in);
                     in->done.store(true, std::memory_order_release);
                 } else if (op == P4_OPC_SUPERSEDE) {
@@ -738,7 +754,7 @@ void runSlot(P4Lane* L, uint32_t slot) {
     }
     const uint32_t op = h->op;
     int32_t status;
-    if (op >= P4_OPC_GET && op <= P4_OPC_SUMMARY) {
+    if (op >= P4_OPC_GET && op <= P4_OPC_RELEASE) {
         status = runRead(L, op);
         (void)status;
         return;  // runRead finishes the slot
@@ -828,6 +844,8 @@ int32_t startThreads(Engine* e) {
         else e->threads.emplace_back(laneLoop, e, i, cls);
     }
     e->slowThread = std::thread(slowLoop, e);
+    e->ckStop = false;
+    e->ckThread = std::thread(checkpointLoop, e);
     e->started = true;
     return int32_t(e->nThreads);
 }
@@ -846,6 +864,7 @@ int32_t engineStop(Engine* e, double deadlineMs) {
             e->slowCv.notify_all();
         }
         if (e->slowThread.joinable()) e->slowThread.join();
+        checkpointWorkerStop(e);
         for (;;) {
             bool all = true;
             for (uint32_t i = 0; i < e->nThreads; i++) all = all && e->bells[i].state.load() == 2;
@@ -879,6 +898,7 @@ int32_t engineStop(Engine* e, double deadlineMs) {
         std::vector<Feed*> feeds;
         { std::lock_guard<std::mutex> g(t->mu); for (auto& f : t->feeds) if (f->created && !f->quarantined) feeds.push_back(f.get()); }
         for (Feed* f : feeds) { std::string err; const int32_t rc = checkpointFeed(f, true, &err); if (checkpointStatus == P4_OK && rc != P4_OK) checkpointStatus = rc; }
+        { std::lock_guard<std::mutex> g(t->mu); for (auto& f : t->feeds) f->checkpointPlan.reset(); }  // unused plans pin their streams
     }
     // Close every writer connection with a TRUNCATE checkpoint.
     std::vector<Conn*> conns;

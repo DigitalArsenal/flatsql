@@ -9,8 +9,18 @@
 #undef FLATBUFFERS_GENERATED_MAIN_H_
 #include "FSG/main_generated.h"
 #include <map>
+#include <vector>
 #include "frames.h"
 namespace flatsql { namespace p4 {
+// An FMB side table (SEALED, LARGE, SIGNATURES, IDENTITIES) indexed by ROW
+// once per frame; empty when the table is absent. False on a ROW outside the
+// frame's rows or a repeated ROW.
+template<class T> bool fmbByRow(const flatbuffers::Vector<flatbuffers::Offset<T>>* table,size_t rows,std::vector<const T*>* out) {
+    out->clear(); if(!table) return true; out->assign(rows,nullptr);
+    for(const auto* x:*table) { if(x->ROW()>=rows || (*out)[x->ROW()]) return false; (*out)[x->ROW()]=x; }
+    return true;
+}
+template<class T> const T* fmbRow(const std::vector<const T*>& byRow,size_t row) { return row<byRow.size()?byRow[row]:nullptr; }
 bool verifyFmbCommit(const ::FMB*,uint64_t,uint64_t,uint32_t,const std::map<uint64_t,FmbFrameProof>&);
 } }
 #endif

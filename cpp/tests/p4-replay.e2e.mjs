@@ -54,11 +54,12 @@
 // (explicitly skip the baseline), P4_REPLAY_BASE_SOURCE (local extracted v3.7.2
 // tree; never changes the self-building default), P4_REPLAY_BASE_FIXTURE
 // or P4_REPLAY_NEW_FIXTURE (matching locally built fixture; measurements use
-// clones), P4_REPLAY_BOUNDS_MB (local bounds scratch size), and
+// clones), P4_REPLAY_WASM_IMAGE (prebuilt cmake/ninja/g++ image; builds
+// with Docker networking disabled), P4_REPLAY_BOUNDS_MB (local bounds scratch size), and
 // P4_REPLAY_DISCARD_BASE_FIXTURE=1 (remove a work-local baseline after its runs).
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
+import { closeSync, createReadStream, createWriteStream, existsSync, openSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -91,6 +92,13 @@ const t0 = Date.now();
 const READS = new Set(['sync_norad', 'sync_window', 'latest', 'explorer']);
 const WARM_PASSES = prof.warm;
 
+// Per-phase wall times (seconds since the previous mark).
+let lastMark = Date.now();
+function mark(name) {
+  const now = Date.now();
+  console.log(`E2E_PHASE ${name} s=${((now - lastMark) / 1000).toFixed(1)} total_s=${((now - t0) / 1000).toFixed(0)}`);
+  lastMark = now;
+}
 function fail(msg) {
   throw new Error(`FAIL: ${msg}`);
 }
@@ -117,13 +125,13 @@ process.env.TMPDIR = join(work, 'tmp');
 mkdirSync(process.env.TMPDIR, { recursive: true });
 
 // The SDS schemas format 5's frames are generated from: this checkout's
-// spacedatastandards.org devDependency (1.255.0), else the stack's pinned SDS.
+// spacedatastandards.org devDependency (1.256.0), else the stack's pinned SDS.
 function sdsSchemaDir() {
   const stack = process.env.GAUNTLET_STACK_ROOT;
   const candidates = [process.env.SDS_SCHEMA_DIR, join(repo, 'node_modules/spacedatastandards.org/schema'),
     stack && join(stack, 'repos/main-packages/spacedatastandards.org/schema')].filter(Boolean);
   const dir = candidates.find((d) => existsSync(join(d, 'FSG/main.fbs')));
-  if (!dir) fail(`SDS 1.255.0 schemas not found (tried ${candidates.join(', ')}): npm ci, or set SDS_SCHEMA_DIR`);
+  if (!dir) fail(`SDS 1.256.0 schemas not found (tried ${candidates.join(', ')}): npm ci, or set SDS_SCHEMA_DIR`);
   return dir;
 }
 const sdsDir = sdsSchemaDir();
@@ -133,7 +141,7 @@ function build(name, src) {
   run('cmake', ['-S', src, '-B', dir, '-DCMAKE_BUILD_TYPE=Release', `-DFLATBUFFERS_DIR=${flatbuffers()}`, `-DSDS_SCHEMA_DIR=${sdsDir}`], {
     stdio: ['ignore', 'ignore', 'inherit'],
   });
-  run('nice', ['cmake', '--build', dir, '--target', 'flatsql_p4_test', '-j', '8'], { stdio: ['ignore', 'ignore', 'inherit'] });
+  run('nice', ['cmake', '--build', dir, '--target', 'flatsql_p4_test', ...(name === 'new' ? ['flatsql_p4_fault_test'] : []), '-j', '8'], { stdio: ['ignore', 'ignore', 'inherit'] });
   return join(dir, 'flatsql_p4_test');
 }
 
@@ -182,18 +190,24 @@ function wasmTestBuild(name, src) {
   if (existsSync(join(out, 'flatsql-p4-test.wasm'))) return join(out, 'flatsql-p4-test.wasm');
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
+  const sdk = join(work, `wasi-sdk-30-${arch}`);
+  if (!existsSync(join(sdk, '.ready')) || !existsSync(join(sdk, 'bin/clang'))) {
+    mkdirSync(sdk, { recursive: true });
+    run('tar', ['-xzf', tgz, '-C', sdk, '--strip-components=1']);
+    writeFileSync(join(sdk, '.ready'), 'wasi-sdk-30.0\n');
+  }
+  const buildImage = process.env.P4_REPLAY_WASM_IMAGE;
   const script = [
-    'apt-get update -qq >/dev/null && apt-get install -y -qq cmake ninja-build g++ >/dev/null',
-    'mkdir -p /opt/wasi-sdk && tar -xzf /w/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1',
-    'cmake -S /w/flatsql/cpp -B /tmp/b -G Ninja -DCMAKE_TOOLCHAIN_FILE=/w/flatsql/cpp/cmake/wasi-threads-toolchain.cmake' +
-      ' -DWASI_SDK_PREFIX=/opt/wasi-sdk -DFLATBUFFERS_DIR=/w/flatbuffers -DSDS_SCHEMA_DIR=/w/sds -DCMAKE_BUILD_TYPE=Release >/dev/null',
-    'cmake --build /tmp/b --target flatsql_p4_test_wasm -j 8 >/tmp/build.log 2>&1 || { tail -40 /tmp/build.log; exit 1; }',
-    'cp /tmp/b/flatsql-p4-test.wasm /w/out/',
+    ...(buildImage ? [] : ['apt-get update -qq >/dev/null && apt-get install -y -qq cmake ninja-build g++ >/dev/null']),
+    'cmake -S /w/flatsql/cpp -B /w/out/build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/w/flatsql/cpp/cmake/wasi-threads-toolchain.cmake' +
+      ' -DWASI_SDK_PREFIX=/w/wasi-sdk -DFLATBUFFERS_DIR=/w/flatbuffers -DSDS_SCHEMA_DIR=/w/sds -DCMAKE_BUILD_TYPE=Release >/dev/null',
+    'cmake --build /w/out/build --target flatsql_p4_test_wasm -j 8 >/w/out/build.log 2>&1 || { tail -40 /w/out/build.log; exit 1; }',
+    'cp /w/out/build/flatsql-p4-test.wasm /w/out/',
   ].join('\n');
-  // The SDS schemas the format-5 frames are generated from (the 1.255.0 devDependency).
+  // The SDS schemas the format-5 frames are generated from (the 1.256.0 devDependency).
   const sdsMount = ['-v', `${sdsDir}:/w/sds:ro`];
-  run('docker', ['run', '--rm', ...sdsMount, '-v', `${src}:/w/flatsql/cpp:ro`, '-v', `${flatbuffers()}:/w/flatbuffers:ro`, '-v', `${tgz}:/w/wasi-sdk.tar.gz:ro`,
-    '-v', `${out}:/w/out`, 'ubuntu:22.04', 'bash', '-euc', script], { stdio: ['ignore', 'inherit', 'inherit'] });
+  run('docker', ['run', '--rm', '-w', '/w/out', ...(buildImage ? ['--network', 'none', '--entrypoint', '/bin/bash'] : []), ...sdsMount, '-v', `${src}:/w/flatsql/cpp:ro`, '-v', `${flatbuffers()}:/w/flatbuffers:ro`, '-v', `${sdk}:/w/wasi-sdk:ro`,
+    '-v', `${out}:/w/out`, buildImage || 'ubuntu:22.04', ...(buildImage ? [] : ['bash']), '-euc', script], { stdio: ['ignore', 'inherit', 'inherit'] });
   return join(out, 'flatsql-p4-test.wasm');
 }
 function aotSetup() {
@@ -207,7 +221,7 @@ function aotSetup() {
   const overlay = join(work, 'aot-overlay.json');
   writeFileSync(overlay, JSON.stringify({ Replace: { [join(pkg, 'zz_p4_replay_aot_test.go')]: join(cpp, 'tests/p4/aot/replay_aot_test.go') } }));
   const bin = join(work, 'p4-replay-aot.test');
-  const env = { ...process.env, WASMEDGE_DIR: wasmedge, GOFLAGS: '-p=6' };
+  const env = { ...process.env, WASMEDGE_DIR: wasmedge, GOFLAGS: '-p=6 -buildvcs=false' };
   for (const k of Object.keys(env)) if (k.startsWith('CGO_') || k === 'WASMEDGE_LIB_DIR') delete env[k];
   run(join(sdn, 'scripts/go-with-wasmedge.sh'), ['test', '-c', '-overlay', overlay, '-o', bin, './internal/flatsqlrt'],
     { cwd: join(sdn, 'sdn-server'), env, stdio: ['ignore', 'ignore', 'inherit'] });
@@ -284,6 +298,7 @@ function fixtureOf(arm, src) {
 mkdirSync(fixtureRoot, { recursive: true });
 const fixtures = Object.fromEntries(ARM_NAMES.map((name) => [name, fixtureOf(name, name === 'new' ? cpp : join(baseSrc, 'cpp'))]));
 console.log(`profile ${PROFILE}: builds and fixtures ready at ${((Date.now() - t0) / 1000).toFixed(0)} s`);
+mark('builds_and_fixtures');
 
 // One process runs the workloads in turn, each on a fresh clone of the
 // build's fixture; each workload's REPLAY lines.
@@ -320,7 +335,10 @@ function runtimeRun(runtime, arm, args) {
         P4_REPLAY_AOT_ARGS: args.join('\x1f') },
     });
 }
-function checkpointPhases(runtime, phases = ['index-deleted', 'compaction']) {
+// checkpoint-prepare: a PUT's ack while a checkpoint prepares off the writer
+// (its preparer held after its snapshot) against PUTs with none preparing.
+const PHASE_LINE = { 'index-deleted': 'REPLAY_INDEX_DELETED ', compaction: 'REPLAY_COMPACTION ', 'checkpoint-prepare': 'REPLAY_CHECKPOINT_PREPARE ' };
+function checkpointPhases(runtime, phases = ['index-deleted', 'compaction', 'checkpoint-prepare']) {
   for (const phase of phases) {
     diskCheck(work, phase === 'compaction' ? wxfBytes * 1.15 : 0);
     const clone = join(work, `clone-${process.pid}-${cloneN++}`);
@@ -333,12 +351,112 @@ function checkpointPhases(runtime, phases = ['index-deleted', 'compaction']) {
       const r = runtimeRun(runtime, 'new', args);
       console.log(`checkpoint phase runtime=${runtime} profile=${PROFILE}`);
       process.stdout.write(r.stdout || ''); process.stderr.write(r.stderr || '');
-      if (r.status !== 0 || !(r.stdout || '').includes(phase === 'index-deleted' ? 'REPLAY_INDEX_DELETED ' : 'REPLAY_COMPACTION '))
+      if (r.status !== 0 || !(r.stdout || '').includes(PHASE_LINE[phase]))
         fail(`${runtime} ${phase}: exit ${r.status ?? r.signal}`);
     } finally {
       rmSync(clone, { recursive: true, force: true }); rmSync(reference, { recursive: true, force: true });
     }
     diskCheck(work);
+    mark(`checkpoint_${phase}`);
+  }
+}
+
+
+// The IPFS protocol phase is part of the same replay gate, on a fresh clone.
+// Its independent parsers and measurements run in C++, natively only; Kubo
+// then checks the same bytes when `ipfs` is on PATH. The phase spends most
+// of its wall time in the 30 s retired-reader window, so it runs in the
+// background while the crash and recovery phases run: start() returns the
+// function that waits for it and checks it.
+function ipfsPhaseStart() {
+  diskCheck(work, wxfBytes * 3);
+  const clone = join(work, `clone-${process.pid}-${cloneN++}`);
+  const kuboDir = join(work, `kubo-${process.pid}`);
+  run('cp', ['-c', '-R', fixtures.new, clone]);
+  mkdirSync(kuboDir, { recursive: true });
+  const outPath = join(kuboDir, 'ipfs.stdout'), errPath = join(kuboDir, 'ipfs.stderr');
+  const out = openSync(outPath, 'w'), err = openSync(errPath, 'w');
+  const child = spawn(arms.new, ['--test=p4_replay', '--phase=ipfs', `--store=${clone}`,
+    `--gp=${seedTsv}`, `--retention-pages=${prof.retentionPages}`, `--kubo-dir=${kuboDir}`], { stdio: ['ignore', out, err] });
+  closeSync(out); closeSync(err);
+  // A failure elsewhere ends this E2E; never leave this exact child behind.
+  process.once('exit', () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+  const exited = new Promise((done) => child.on('exit', (code, signal) => done({ code, signal })));
+  return async () => {
+    try {
+      const { code, signal } = await exited;
+      const stdout = readFileSync(outPath, 'utf8');
+      process.stdout.write(stdout); process.stderr.write(readFileSync(errPath, 'utf8'));
+      if (code !== 0 || !stdout.includes('REPLAY_IPFS wall_ms=')) fail(`native IPFS: exit ${code ?? signal}`);
+      kuboInterop(stdout, kuboDir);
+    } finally { rmSync(clone, { recursive: true, force: true }); rmSync(kuboDir, { recursive: true, force: true }); }
+    diskCheck(work);
+  };
+}
+// Kubo (an independent IPFS implementation) against FlatSQL's bytes: `ipfs
+// add` of the large records gives FlatSQL's UnixFS roots, and two exported
+// CARv2 files import into a throwaway offline repo with their roots pinned,
+// then `ipfs dag export` of each root gives back exactly the CAR's blocks.
+function kuboInterop(stdout, dir) {
+  const version = spawnSync('ipfs', ['version', '--number'], { encoding: 'utf8' });
+  if (version.error || version.status !== 0) {
+    console.log(`REPLAY_IPFS_KUBO SKIP reason=${version.error ? `ipfs not on PATH (${version.error.code})` : `ipfs version exited ${version.status}`}`);
+    return;
+  }
+  const env = { ...process.env, IPFS_PATH: join(dir, 'repo') };
+  const ipfs = (args, opts = {}) => {
+    const r = spawnSync('ipfs', args, { env, encoding: opts.encoding ?? 'utf8', maxBuffer: 1 << 30 });
+    if (r.status !== 0) fail(`ipfs ${args.join(' ')}: exit ${r.status ?? r.signal}: ${String(r.stderr).slice(-500)}`);
+    return r.stdout;
+  };
+  ipfs(['init', '--profile=test', '-e']);
+  const field = (line, key) => (line.match(new RegExp(`(?:^| )${key}=(\\S+)`)) || [])[1];
+  const lines = stdout.split('\n');
+  const largeLine = lines.find((l) => l.startsWith('REPLAY_IPFS_LARGE '));
+  if (!largeLine) fail('Kubo: no REPLAY_IPFS_LARGE line');
+  const added = [];
+  for (const [bytes, key] of [[3145728, 'root_3m'], [1572864, 'root_1_5m']]) {
+    const cid = ipfs(['add', '-n', '-Q', '--raw-leaves', '--chunker=size-1048576', '--cid-version=1', join(dir, `large-${bytes}.bin`)]).trim();
+    if (cid !== field(largeLine, key)) fail(`Kubo: ipfs add of the ${bytes} B record gives ${cid}, FlatSQL ${field(largeLine, key)}`);
+    added.push(cid);
+  }
+  // CARv1 sections: [varint length][CID][block]; v2 wraps v1 at its data offset.
+  const varint = (b, at) => { let v = 0, s = 0; for (;;) { const c = b[at++]; v += (c & 127) * 2 ** s; s += 7; if (c < 128) return [v, at]; } };
+  const blocksOf = (v1) => {
+    let [n, at] = varint(v1, 0); at += n; const out = [];
+    while (at < v1.length) { [n, at] = varint(v1, at); out.push(v1.subarray(at, at + n).toString('hex')); at += n; }
+    return out;
+  };
+  const cars = lines.filter((l) => l.startsWith('REPLAY_IPFS_CAR_FILE ') &&
+    ((field(l, 'type') === 'WXF' && field(l, 'source') === 'gfs-0p25-small') || field(l, 'source') === 'large'));
+  if (cars.length !== 2) fail(`Kubo: expected the WXF small and large feeds' CAR files, found ${cars.length}`);
+  const imported = [];
+  for (const line of cars) {
+    const path = field(line, 'path'), root = field(line, 'root');
+    const imp = ipfs(['dag', 'import', '--pin-roots', '--stats', path]);
+    if (!imp.includes(`Pinned root\t${root}\tsuccess`) && !imp.includes(`Pinned root ${root} success`)) fail(`Kubo: dag import did not pin ${root}: ${imp.slice(0, 300)}`);
+    if (!ipfs(['pin', 'ls', '--type=recursive', root]).startsWith(`${root} recursive`)) fail(`Kubo: ${root} is not pinned recursively`);
+    const car = readFileSync(path);
+    // CARv2 header after the 11-byte pragma: 16 B characteristics, then data offset and size.
+    const v1 = car.subarray(Number(car.readBigUInt64LE(27)), Number(car.readBigUInt64LE(27) + car.readBigUInt64LE(35)));
+    const exported = ipfs(['dag', 'export', root], { encoding: 'buffer' });
+    const mine = blocksOf(v1), theirs = blocksOf(exported);
+    const have = new Set(mine);
+    const same = mine.length === theirs.length && have.size === mine.length && theirs.every((x) => have.has(x));
+    if (!same) fail(`Kubo: dag export of ${root} gives ${theirs.length} blocks, the CAR holds ${mine.length}`);
+    if (mine.length !== Number(field(line, 'blocks'))) fail(`Kubo: CAR block count ${mine.length} != FlatSQL's ${field(line, 'blocks')}`);
+    imported.push(`${field(line, 'source')}:${mine.length}:${exported.equals(v1) ? 'byte_equal' : 'same_blocks'}`);
+  }
+  console.log(`REPLAY_IPFS_KUBO version=${version.stdout.trim()} add_roots=${added.join(',')} add=equal dag_import=${imported.join(',')} pinned=recursive export=complete PASS`);
+}
+function crashPhases() {
+  for (const test of ['t_kill', 't_power_loss']) {
+    diskCheck(work);
+    const bin = test === 't_kill' ? arms.new : join(work, 'build-new', 'flatsql_p4_fault_test');
+    const r = spawnSync(bin, [`--test=${test}`, '--slow=1', '--rounds=30'], { encoding: 'utf8', maxBuffer: 64 << 20 });
+    process.stdout.write(r.stdout || ''); process.stderr.write(r.stderr || '');
+    if (r.status !== 0) fail(`${test}: exit ${r.status ?? r.signal}`);
+    mark(test);
   }
 }
 
@@ -389,7 +507,8 @@ function slowerP(base, mine) {
 }
 
 if (NEW_ONLY) {
-  for (const runtime of RUNTIMES) checkpointPhases(runtime, PROFILE === 'full' ? ['index-deleted'] : undefined);
+  checkpointPhases('native', PROFILE === 'full' ? ['index-deleted'] : undefined);
+  if (PROFILE === 'gate') { const ipfsDone = ipfsPhaseStart(); crashPhases(); await ipfsDone(); }
   console.log(`${PROFILE} profile: ${((Date.now() - t0) / 1000).toFixed(0)} s`);
   console.log(`PASS: p4 replay ${PROFILE} new-only (checkpoint open, row-index rebuild and every read answer equal)`);
   process.exit(0);
@@ -429,6 +548,7 @@ for (let rep = 0; rep < reps; rep++) {
     }
   }
   console.log(`repetition ${rep + 1}/${reps} done at ${((Date.now() - t0) / 1000).toFixed(0)} s (load ${b0.load})`);
+  mark(`repetition_${rep + 1}`);
 }
 if (process.env.P4_REPLAY_DISCARD_BASE_FIXTURE === '1') {
   const baseline = realpathSync(fixtures.base);
@@ -458,6 +578,7 @@ for (let rep = 0; rep < Number(process.env.P4_REPLAY_STOCK_REPS || 1); rep++) {
     }
   }
 }
+mark('stock_sqlite');
 const b1 = bounds();
 console.log(`bounds after: ${JSON.stringify(b1)}`);
 const syncMs = Math.min(b0.sync_ms_median, b1.sync_ms_median);
@@ -501,6 +622,8 @@ for (const r of rows)
 // The recovery phases run natively: the engine code is the same in both runtimes,
 // and the read workloads above already hash equal across them.
 checkpointPhases('native');
+const ipfsDone = ipfsPhaseStart();
+crashPhases();
 // Exact same E2E: independently walk every stream, then kill a lead three
 // times and compare the acknowledged prefix before/after cache deletion.
 for (const phase of ['walk', 'kill']) {
@@ -510,7 +633,10 @@ for (const phase of ['walk', 'kill']) {
   process.stdout.write(r.stdout || '');
   process.stderr.write(r.stderr || '');
   if (r.status !== 0) failed = true;
+  mark(phase);
 }
+await ipfsDone();
+mark('ipfs_remainder');
 writeFileSync(join(work, `replay-results-${PROFILE}.json`), JSON.stringify({ profile: PROFILE, bounds: [b0, b1], memcpy, rows }, null, 1));
 console.log(`${PROFILE} profile: ${((Date.now() - t0) / 1000).toFixed(0)} s`);
 console.log(failed ? 'FAIL: p4 replay' : `PASS: p4 replay (every answer the same on both builds, ${RUNTIMES.join(' and ')})`);

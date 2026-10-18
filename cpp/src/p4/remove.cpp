@@ -794,6 +794,19 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         due = compactEligible(f) && (in->force || compactDue(f));
     }
     if (!due) return;
+    {
+        // The first rewrite publishes replacement ranges. Until the node
+        // releases those old ranges, another rewrite would move them again
+        // and accumulate generations whose registrations remain unresolved.
+        std::lock_guard<std::mutex> lock(f->smu);
+        bool blocked=f->retired && !streamGenerationReleased(f,f->retired->gen);
+        for(const auto& old:f->olderRetired) blocked=blocked || !streamGenerationReleased(f,old.stream->gen);
+        if(blocked) {
+            in->status=P4_E_BUSY;
+            in->err="compaction awaits IPFS generation release";
+            return;
+        }
+    }
     in->a = f->end;  // the writer's own work, its indexer idle: the end is the mark
     int32_t st = P4_OK;
     std::string er;
@@ -924,9 +937,11 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     }
     if (st == P4_OK && (!chunkRows.empty() || firstChunk)) flushCommit();
     Counters k;
+    uint64_t retiredThrough=0;
     {
         std::lock_guard<std::mutex> g(t->mu);
         k = f->k;
+        retiredThrough=f->lastCommit;
     }
     CheckpointState state;
     if (st == P4_OK && !writeEvent) { compactWriteEvent(f, true); writeEvent = true; }
@@ -949,6 +964,8 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         f->retired = old;
         f->retiredBytes = in->a;
         f->retireAt = monoNs() + 30ull * 1000 * 1000 * 1000;
+        f->releaseRequired[old->gen] = retiredThrough;
+        f->releasedThrough.erase(old->gen);
         f->stream = next;
         f->gen = gen;
     }
@@ -975,6 +992,8 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         {
             std::lock_guard<std::mutex> g(f->smu);
             f->stream = old;
+            f->releaseRequired.erase(old->gen);
+            f->releasedThrough.erase(old->gen);
             f->retired.reset();
             f->retiredBytes = 0;
             if (!f->olderRetired.empty()) {
@@ -995,12 +1014,12 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     // Maintenance permits unlink only after release and the reader window;
     // existing readers then keep their generation until their last read ends.
     f->end = at;
-    f->lastCommit = previous;
     f->streamHigh = uint64_t(t->nextSeq - 1);
     f->metadataBytes = at - k.fbytes;
     {
         std::lock_guard<std::mutex> g(t->mu);
         f->mark = at;
+        f->lastCommit = previous;
         f->streamBytes = at;
         // The new snapshot includes every historical dictionary ID.
         f->checkpoint = std::make_shared<CheckpointState>(std::move(state));

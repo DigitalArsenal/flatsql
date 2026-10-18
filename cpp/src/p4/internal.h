@@ -405,6 +405,8 @@ struct RetiredGeneration {
     uint64_t retireAt = 0;
 };
 struct CheckpointState;
+struct CheckpointPlan;
+struct DagHistory;
 struct Feed {
     Type* type = nullptr;
     uint32_t fid = 0;
@@ -428,6 +430,10 @@ struct Feed {
     // the record stream (smu): the current generation, and the generation a
     // compaction replaced, kept for readers on an older snapshot until retireAt
     std::mutex smu;
+    std::mutex dagMu;
+    std::shared_ptr<DagHistory> dagHistory; // retained generations' derived drops
+    std::atomic<bool> ipfsExposed{false};
+    std::map<uint32_t,uint64_t> releaseRequired, releasedThrough; // smu, generation-scoped offsets
     std::shared_ptr<Stream> stream;
     std::shared_ptr<Stream> retired;
     std::vector<RetiredGeneration> olderRetired;
@@ -439,6 +445,10 @@ struct Feed {
     uint32_t gen = 0;
     // The committed mark (Type::mu; the indexer sets it with each commit).
     std::shared_ptr<CheckpointState> pendingCheckpoint; // appended, synced by next round or idle
+    // Prepared off the writer, installed at a round boundary (Type::mu).
+    std::shared_ptr<CheckpointPlan> checkpointPlan;
+    bool checkpointPreparing = false;
+    uint64_t checkpointRetryAt = 0;  // after a failed preparation (monoNs)
     std::shared_ptr<CheckpointState> checkpoint; // immutable checkpoint state, Type::mu
     uint64_t checkpointOpenNs = 0, rowIndexRebuildNs = 0;
     uint64_t checkpointRows = 0, checkpointAt = 0; // rows since checkpoint; last commit monoNs
@@ -612,6 +622,8 @@ struct alignas(64) Bell {
 // (quota, REBUILD) whose waiter (the long-work thread) watches `done`.
 // Internal ops (never a slot's): a feed's stream compaction.
 constexpr int kOpCompact = 1000;
+constexpr int kOpCarExport = 1001, kOpCarRestore = 1002;
+struct CarStats;
 struct Internal {
     bool force = false; // explicit compaction request, independent of dead-byte heuristic
     std::atomic<bool> done{false};
@@ -621,6 +633,9 @@ struct Internal {
     std::vector<std::pair<uint32_t, int64_t>> seqs;  // QUOTA: the (feed, seq) row sets to delete
     uint32_t what = 0;          // REBUILD; COMPACT: the feed id
     std::string firstBad;       // REBUILD 8: the first damaged file
+    std::string archivePath;
+    CarStats* archiveStats = nullptr;
+    Feed** restoredFeed = nullptr;
 };
 struct WriteTask {
     uint32_t slot = 0;
@@ -764,6 +779,13 @@ struct P4Engine {
     std::condition_variable slowCv;
     std::deque<uint32_t> slowQ;
     bool slowStop = false;
+    // Checkpoint preparation (checkpoint_worker.cpp): feeds to fold off
+    // their writer, one at a time.
+    std::thread ckThread;
+    std::mutex ckMu;
+    std::condition_variable ckCv;
+    std::deque<flatsql::p4::Feed*> ckQ;
+    bool ckStop = false;
 
     flatsql::p4::SlotHeader* slot(uint32_t i) {
         const int p = i < nSlots[0] ? 0 : 1;
@@ -821,6 +843,8 @@ int32_t typeFilesEnsure(Type* t, std::string* err);
 // it (its files are made by its first write); *made is set when it is new.
 Feed* feedFor(Type* t, const std::string& provider, const std::string& source, bool create, bool* made = nullptr);
 Feed* feedRestore(Type* t, uint32_t fid, const std::string& provider, const std::string& source, const std::string& name);  // mu held
+// Reserve a CAR's source ID in a fresh registry slot, preserving gaps. mu held.
+Feed* feedRestoreFresh(Type*, uint32_t fid, const std::string& provider, const std::string& source, std::string* err);
 uint32_t tokFor(Type* t, const std::string& token, const std::string& peer, bool create, bool* made = nullptr);  // mu held
 std::string pathJoin(const std::string& a, const std::string& b);
 
@@ -880,6 +904,7 @@ struct FileMeta {
 };
 int writeMeta(Conn* c, const Counters& k, int64_t now, int64_t mark, uint32_t gen);  // in the caller's write transaction; SQLite rc
 int readMeta(Conn* c, FileMeta* m);                                                    // SQLite rc
+int readInstRows(Conn* c, std::vector<std::pair<InstId, InstCount>>* rows);  // SQLite rc; the live rows, ids only
 int readInst(Feed* f, Conn* c, std::map<InstId, InstCount>* out);  // SQLite rc; strings from the file's dictionary
 int readTokc(Type* t, Conn* c, std::map<uint32_t, TokCount>* out);  // SQLite rc; tokens registered as needed
 int writeTokc(Type* t, Conn* c, const std::map<uint32_t, TokCount>& before, const std::map<uint32_t, TokCount>& after);

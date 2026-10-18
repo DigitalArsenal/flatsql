@@ -165,7 +165,7 @@
                 <span>$FMB · $FCK · $FSG</span>
                 <span>CIDv1 raw · sha2-256</span>
                 <span>CARv2 backups</span>
-                <span>SDS 1.255.0</span>
+                <span>SDS 1.256.0</span>
             </div>
         </div>
     </section>
@@ -200,7 +200,7 @@
 <li><strong>One record is one contiguous byte range.</strong> The raw-leaf CIDv1 (sha2-256) of that range is the record&#39;s IPFS block. Ranges are never changed while a filestore entry can name them.</li>
 <li><strong>Every frame is a standard FlatBuffer.</strong> Each frame is identified by its 4-byte file identifier. The non-record frames are SDS tables (<a class="sref" href="#s3">§3</a>). A stock FlatBuffers reader walks the file from byte 0 and dispatches on the identifier. It needs no FlatSQL code.</li>
 <li><strong>One format.</strong> A store in an earlier format is refused with <code>P4_E_FORMAT</code>, and a node rebuilds it by re-syncing its feeds.</li>
-<li><strong>Each value lives in exactly one place.</strong> A value that can be re-derived from the record bytes is not stored again: the epoch and the object key are re-extracted on rebuild. <code>$FMB</code> holds only what the bytes cannot give. Checkpoint segments are derived snapshots that can be discarded; the authoritative data is the records plus their <code>$FMB</code> frames.</li>
+<li><strong>Each value lives in exactly one place.</strong> A value that can be re-derived from the record bytes is not stored again: the epoch and the object key are re-extracted on rebuild. <code>$FMB</code> holds only what the bytes cannot give. Between compactions, checkpoint segments are derived snapshots that can be discarded: the authoritative data is the records plus their <code>$FMB</code> frames. A compaction drops the <code>$FMB</code>s of dead rows. After that, the state those rows left behind (instance and token totals and times, dictionary ids) lives only in the new generation&#39;s segments, which are then authoritative for it.</li>
 </ol>
 <h2 id="s1"><a class="anchor" href="#s1" aria-label="Link to this section">#</a><span class="num">1</span>Files</h2>
 <div class="code"><pre><code>&lt;data&gt;/fsql4/
@@ -271,7 +271,7 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <li>To list a feed&#39;s live records with no FlatSQL code, follow the newest checkpoint&#39;s segments, or replay the metadata frames (<a class="sref" href="#s9">§9</a>).</li>
 </ul>
 <h2 id="s3"><a class="anchor" href="#s3" aria-label="Link to this section">#</a><span class="num">3</span>Metadata, checkpoint and segment tables</h2>
-<p>The three non-record kinds are SDS standards in the FlatSQL family, beside FSB and FSO: <strong>FMB</strong> (batch metadata), <strong>FCK</strong> (checkpoint) and <strong>FSG</strong> (segment), released in SDS 1.255.0. The schemas below are those standards. No earlier SDS table fits these roles:</p>
+<p>The three non-record kinds are SDS standards in the FlatSQL family, beside FSB and FSO: <strong>FMB</strong> (batch metadata), <strong>FCK</strong> (checkpoint) and <strong>FSG</strong> (segment), as of SDS 1.256.0. The schemas below are those standards. No earlier SDS table fits these roles:</p>
 <ul>
 <li>FSB is opaque by contract: a reader must not interpret its data.</li>
 <li>PNM announces a single object.</li>
@@ -347,7 +347,7 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <p>What the vectors hold:</p>
 <ul>
 <li><code>ROWS</code> and <code>GROUPS</code> hold every column of a row.</li>
-<li><code>DICTIONARY</code> holds the node, batch, content-key, url and token strings that the round uses first. <code>OBJECT_KEY</code> entries are written only for sealed rows. Other rows&#39; object keys come from their bytes, with ids given in order of first appearance in the stream, so a rebuild gives the same ids.</li>
+<li><code>DICTIONARY</code> holds the node, batch, content-key, url and token strings that the round uses first. <code>OBJECT_KEY</code> entries are written only for sealed rows; their one <code>TEXT</code> is the key typed as the extractor gives it: <code>i</code> + decimal for an integer key, <code>s</code> + the text for a string key. Other rows&#39; object keys come from their bytes, with ids given in order of first appearance in the stream, so a rebuild gives the same ids.</li>
 <li><strong>Why the digest stays.</strong> It is the commit&#39;s integrity check (<a class="sref" href="#s9">§9</a>) and the record&#39;s key. Without it, recovery could not tell a torn record frame from a good one, and a rebuild would have to re-hash every byte.</li>
 <li><code>IDENTITIES</code> holds the rows&#39; ingest identities.</li>
 <li>A move is <code>MOVED_IN</code> rows in the feed plus a <code>MOVED_OUT</code> removal in the local feed.</li>
@@ -390,6 +390,8 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
   SEGMENT_DIGESTS:[ubyte];    <span class="c">// 32 B per segment: its raw-leaf CID digest</span>
   COMMITS_ROOT_CID:[ubyte];   <span class="c">// the commits tree (<a class="sref" href="#s4-3">§4.3</a>) as of APPLIED_THROUGH</span>
   PREVIOUS_FEED_ROOT_CID:[ubyte];
+  RECORD_BYTES:ulong;         <span class="c">// each record's smallest copy, summed; 0 when COUNTERS.ROWS is 0</span>
+  MIN_W:long; MAX_W:long;     <span class="c">// w bounds over the rows; 0 when COUNTERS.ROWS is 0 (read as none)</span>
 }
 <span class="k">root_type</span> FCK;
 <span class="k">file_identifier</span> "$FCK";</code></pre></div>
@@ -423,6 +425,7 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
   TOKENS:[FMBEntry];         <span class="c">// TOKENS: per-producer counts as TEXT [token, n, bytes, mints, maxts, maxseq]</span>
   PAIRS:[FSGPair];           <span class="c">// TOMBSTONES (KEY_HI = rid) and ROWS_BY_*, sorted by (KEY_HI, KEY_LO, RID)</span>
   COLUMN:[ubyte];            <span class="c">// reserved (analytics)</span>
+  INSTANCE_URL_IDS:[uint];   <span class="c">// parallel to INSTANCES, each instance's latest url (a URL dictionary id; 0 = none)</span>
 }
 <span class="k">root_type</span> FSG;
 <span class="k">file_identifier</span> "$FSG";</code></pre></div>
@@ -494,11 +497,13 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 </ol>
 <p><strong>What an acknowledgment promises.</strong> The record bytes and every column of their rows are durable in the stream. The index may be behind after a power loss, and recovery (<a class="sref" href="#s9">§9</a>) restores it from the <code>$FMB</code> frames.</p>
 <p><strong>Sync cost.</strong> A call pays one sync per touched stream. Syncing the index as well would make it two, so a single-feed call drops from 2 syncs to 1. A call that also creates a feed pays once for the feed: the new file, its genesis <code>$FCK</code> and a directory sync. A new token adds no sync, because it lives in the <code>$FMB</code> dictionary.</p>
+<p><strong>SQLite never syncs on the acknowledgment path.</strong> The index files open through a VFS shim (<code>flatsql_p4_cache</code>) whose <code>xSync</code> is a no-op outside WAL checkpoints and connection close, so a WAL restart&#39;s header sync is skipped too. A power loss can therefore drop index commits, but never acknowledged data. Checkpoints keep SQLite&#39;s own sync order.</p>
+<p><strong>Split rounds.</strong> A round whose feed rows exceed 65,536 writes several <code>$FMB</code>s. The acknowledgment follows the sync of all of them. Recovery may apply a durable prefix of an unacknowledged round; such records were never acknowledged and are kept, as any durable but unacknowledged write is.</p>
 <p><strong>Order of persistence.</strong> The index commit is written only after its stream sync returned. A persisted index commit therefore never names bytes the stream lost. The index&#39;s <code>mark</code> is the end of the last <code>$FMB</code> it applied.</p>
 <p><strong>Background work</strong> keeps its own syncs off the acknowledgment path:</p>
 <ul>
 <li>WAL checkpoints (they sync);</li>
-<li><code>$FCK</code> and <code>$FSG</code> frames (synced with the next round, or alone when idle);</li>
+<li><code>$FCK</code> and <code>$FSG</code> preparation (a background thread, <a class="sref" href="#s6">§6</a>) and frames (synced with the next round, or alone when idle);</li>
 <li>merges of staged rows.</li>
 </ul>
 <p><strong>Registration</strong> follows the acknowledgment:</p>
@@ -519,6 +524,13 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <li>Fold the rows since <code>APPLIED_THROUGH</code> into new level-0 segments, one per changed kind: dictionary entries, latest-per-object, instances, tokens, tombstones, and the row orders where enabled (<a class="sref" href="#s7">§7</a>).</li>
 <li>Append the segments, then the <code>$FCK</code> that lists every live segment.</li>
 </ol>
+<p><strong>Off the PUT path.</strong></p>
+<ul>
+<li>Preparation (step 1) runs on a background thread. It folds a due feed from one SQLite read snapshot and the stream prefix that snapshot names.</li>
+<li>The feed&#39;s appender installs the prepared plan as a short step at its next round boundary (or when idle), appending the segments and the <code>$FCK</code>. No PUT waits for a fold. A plan whose base changed is dropped, and the feed is prepared again while it stays due.</li>
+<li><code>APPLIED_THROUGH</code> is the prepare point: the end of the last <code>$FMB</code> in that snapshot. Rounds acknowledged while the plan was prepared sit between <code>APPLIED_THROUGH</code> and the <code>$FCK</code>.</li>
+<li>Open and recovery fold every <code>$FMB</code> after <code>APPLIED_THROUGH</code>, including those before the <code>$FCK</code>.</li>
+</ul>
 <p><strong>LSM.</strong></p>
 <ul>
 <li>When a kind has 4 segments at a level, they merge into one at the next level (newest wins; tombstones drop the rows they name).</li>
@@ -561,7 +573,7 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <li><strong>The backup catalog is a feed of <code>$DPM</code> records</strong>, one record per CAR. The node writes them, because a DPM is signed by its provider. The catalog feed is itself backed up the same way.<ul>
 <li><code>DATASET_ID</code> is <code>&lt;TYPE&gt;/&lt;provider&gt;@&lt;source&gt;</code>. <code>UPDATE_ID</code> is the feed root CID&#39;s text. <code>PROVIDER_PEER_ID</code>, <code>PUBLISH_TIMESTAMP</code> and <code>PROVIDER_SIGNATURE</code> come from the node.</li>
 <li>Each CAR is one <code>ASSETS</code> entry, <code>TRANSPORT_KIND = CONTENT_ADDRESS</code>: <code>CID</code> and <code>DATA_ROOT</code> are the feed root, <code>BYTE_LENGTH</code> is the CAR&#39;s size and <code>FILE_NAME</code> is the CAR&#39;s name.</li>
-<li>Two additive DPM fields, in the same SDS release as FMB, FCK and FSG (1.255.0), carry the rest:<ul>
+<li>Two additive DPM fields, in the same SDS release as FMB, FCK and FSG (1.256.0), carry the rest:<ul>
 <li><code>publicationAssetKind.CAR_ARCHIVE</code>;</li>
 <li><code>DPMAsset.THROUGH_SEQ:ulong</code>, the highest seq the archive covers (its as-of point).</li>
 </ul>
@@ -601,7 +613,7 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <li>Read the stream backward in 1 MiB chunks.</li>
 <li>A candidate is a position <code>p</code> with <code>&quot;$FCK&quot;</code> at <code>p</code>, giving <code>F = p - 8</code>.</li>
 <li>Accept it only if all of these hold: it verifies, <code>SELF_OFFSET = F</code>, its <code>PREVIOUS</code> names a frame that ends exactly at <code>F</code> and verifies as a commit point, and the forward walk from it reaches EOF or a torn tail.</li>
-<li>The checkpoint cadence bounds the search to about 64 MiB. On any doubt, the search falls back to a forward walk of the size prefixes, which is a sequential read of the file.</li>
+<li>The checkpoint cadence bounds the search to <code>max(64 MiB, 4 x live segment bytes)</code> plus one round. On any doubt, the search falls back to a forward walk of the size prefixes, which is a sequential read of the file.</li>
 </ul>
 <p><strong>Rebuilding the SQLite index without its file.</strong></p>
 <ul>
@@ -622,9 +634,9 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <p>The stream is append-only, so no byte under a live filestore entry is ever changed. Retention by arrival drops whole <code>FSG</code> segments (<a class="sref" href="#s6">§6</a>).</p>
 <p><strong>Compaction</strong> (a stream more than half dead, with at least 1 MiB dead):</p>
 <ol>
-<li>Write generation <code>g+1</code>: genesis <code>$FCK</code>, the live record frames in stream order, consolidated <code>$FMB</code>s (rows <code>COMPACTED</code>, new offsets, at most 65,536 per frame), fresh segments, and the final <code>$FCK</code>. Then sync.</li>
+<li>Write generation <code>g+1</code>: the genesis <code>$FCK</code>, then the live record frames in stream order in chunks of at most 65,536 rows, each chunk followed by its consolidated <code>$FMB</code> (rows <code>COMPACTED</code>, new offsets), then fresh segments and the final <code>$FCK</code>. Then sync.</li>
 <li>Repoint the index (one transaction) and publish the moved ranges and the new root.</li>
-<li>The node re-registers the same CIDs at their new <code>(path, offset)</code> and pin-updates to the new root. Record CIDs do not change, because records are verbatim. Then it releases generation <code>g</code>.</li>
+<li>The node re-registers the same CIDs at their new <code>(path, offset)</code> and pin-updates to the new root. Record CIDs do not change, because records are verbatim. Then it releases generation <code>g</code>: <code>release(feed, g)</code> releases all of the immutable generation <code>g</code> whatever through-commit it names, and <code>release(feed, through)</code> on <code>g+1</code> releases <code>g</code> once <code>through</code> reaches the compaction&#39;s final <code>$FCK</code>.</li>
 <li>Unlink <code>g</code> after the release and after the 30 s reader window.</li>
 </ol>
 <p>A node that never releases blocks compaction, and the store reports it as a stat. It never loses data.</p>
@@ -655,8 +667,22 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <tr><td>Crash recovery from the tail</td><td><a class="sref" href="#s9">§9</a>: commit chain + digest-checked <code>$FMB</code>s; tail search within about 64 MiB</td><td>open without the index (E): newest <code>$FCK</code> + segments + tail of at most 64 MiB, <strong>about 1 s</strong>. Rebuilding the 15 GB fixture&#39;s SQLite index from the stream (E): one sequential read of 15.2 GB, about 1 µs/row of re-extraction and a bulk insert of 2.34M rows, <strong>about 15–30 s</strong></td></tr>
 <tr><td>Reads through IPFS or direct</td><td>not a format change</td><td>(E) direct warm <code>pread</code> 5–20 µs/record; through the local filestore +30–100 µs/block (datastore lookup, <code>pread</code>, Kubo&#39;s re-hash); remote = network round trip + that</td></tr>
 </tbody></table></div>
+<h3 id="measured-in-the-implementation"><a class="anchor" href="#measured-in-the-implementation" aria-label="Link to this section">#</a>Measured in the implementation</h3>
+<p>Measured as each part of the format was built (FlatSQL 3.8.0 to 3.10.0): the replay gate&#39;s native medians against store format 4 (FlatSQL 3.7.2) as the baseline, and the 15 GB replay fixture.</p>
+<div class="table-wrap"><table><thead><tr><th>Property</th><th>Measured</th></tr></thead><tbody>
+<tr><td>One stream sync per acknowledgment</td><td><code>wxf_lead</code> 799 → 398 ms; <code>gp_ingest</code> 531 → 478 ms</td></tr>
+<tr><td><code>$FMB</code> size</td><td>76 B per row</td></tr>
+<tr><td>Crash recovery</td><td>kill -9 in the middle of a lead (3 runs) and rebuilds with every <code>.db</code> deleted answer exactly</td></tr>
+<tr><td>Open and rebuild with every index file deleted (15 GB fixture)</td><td>checkpoint open 2.6 s; row-index rebuild 18.5 s; every answer equal</td></tr>
+<tr><td>Checkpoint segments</td><td>4.8% of an OMM stream (328 B records) and 0.7% of a WXF stream; checkpoints under 0.01%</td></tr>
+<tr><td>Replay with checkpoints and segments</td><td><code>wxf_lead</code> 826 → 431 ms; explorer warm 87.8 → 9.4 ms; <code>sync_window</code> warm 142 → 78 ms; latest warm 112 → 87 ms</td></tr>
+<tr><td>Feed root DAG resident state</td><td>88.9 B per row</td></tr>
+<tr><td>Records over 1 MiB</td><td>root CIDs byte-equal to Kubo&#39;s <code>ipfs add --cid-version=1 --raw-leaves --chunker=size-1048576</code></td></tr>
+<tr><td>CARv2 export</td><td><code>ipfs dag import</code> takes the CAR byte for byte</td></tr>
+<tr><td>A compacted feed with its index deleted</td><td>rebuilds exactly, including urls that only dead rows wrote</td></tr>
+</tbody></table></div>
 
-            <p class="source">Source: <a href="https://github.com/DigitalArsenal/flatsql/blob/d1124ca88c/cpp/src/p4/FORMAT.md" target="_blank" rel="noopener"><code>cpp/src/p4/FORMAT.md</code></a> in the FlatSQL repository, commit <code>d1124ca88c</code>. The schemas are the SDS standards FMB, FCK and FSG (SDS 1.255.0).</p>
+            <p class="source">Source: <a href="https://github.com/DigitalArsenal/flatsql/blob/b70c1ace86/cpp/src/p4/FORMAT.md" target="_blank" rel="noopener"><code>cpp/src/p4/FORMAT.md</code></a> in the FlatSQL repository, commit <code>b70c1ace86</code>. The schemas are the SDS standards FMB, FCK and FSG (SDS 1.256.0).</p>
         </article>
     </div>
 

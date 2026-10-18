@@ -277,6 +277,8 @@ table FCK {
   SEGMENT_DIGESTS:[ubyte];    // 32 B per segment: its raw-leaf CID digest
   COMMITS_ROOT_CID:[ubyte];   // the commits tree (§4.3) as of APPLIED_THROUGH
   PREVIOUS_FEED_ROOT_CID:[ubyte];
+  RECORD_BYTES:ulong;         // SDS 1.256.0: each record's smallest copy, summed; 0 when COUNTERS.ROWS is 0
+  MIN_W:long; MAX_W:long;     // SDS 1.256.0: w bounds over the rows; 0 when COUNTERS.ROWS is 0 (read as none)
 }
 root_type FCK;
 file_identifier "$FCK";
@@ -316,6 +318,7 @@ table FSG {
   TOKENS:[FMBEntry];         // TOKENS: per-producer counts as TEXT [token, n, bytes, mints, maxts, maxseq]
   PAIRS:[FSGPair];           // TOMBSTONES (KEY_HI = rid) and ROWS_BY_*, sorted by (KEY_HI, KEY_LO, RID)
   COLUMN:[ubyte];            // reserved (analytics task)
+  INSTANCE_URL_IDS:[uint];   // SDS 1.256.0: parallel to INSTANCES, each instance's latest url (a URL dictionary id; 0 = none)
 }
 root_type FSG;
 file_identifier "$FSG";
@@ -439,7 +442,8 @@ it applied.
 
 **Background work** keeps its own syncs off the ack path:
 - WAL checkpoints (they sync);
-- `$FCK`/`$FSG` frames (synced with the next round, or alone when idle);
+- `$FCK`/`$FSG` preparation (a background thread, §6) and frames (synced with
+  the next round, or alone when idle);
 - merges of staged rows.
 
 **Registration** follows the ack:
@@ -462,6 +466,19 @@ it applied.
    changed kind: dictionary entries, latest-per-object, instances, tokens,
    tombstones, and the item-5 row orders where enabled.
 2. Append the segments, then the `$FCK` that lists every live segment.
+
+**Off the PUT path.**
+- Preparation (step 1) runs on a background thread. It folds a due feed from
+  one SQLite read snapshot and the stream prefix that snapshot names.
+- The feed's appender installs the prepared plan as a short step at its next
+  round boundary (or when idle), appending the segments and the `$FCK`. No PUT
+  waits for a fold. A plan whose base changed is dropped, and the feed is
+  prepared again while it stays due.
+- `APPLIED_THROUGH` is the prepare point: the end of the last `$FMB` in that
+  snapshot. Rounds acknowledged while the plan was prepared sit between
+  `APPLIED_THROUGH` and the `$FCK`.
+- Open and recovery fold every `$FMB` after `APPLIED_THROUGH`, including those
+  before the `$FCK`.
 
 **LSM.**
 - When a kind has 4 segments at a level, they merge into one at the next level
@@ -618,7 +635,10 @@ trigger):
    root.
 3. The node re-registers the same CIDs at their new `(path, offset)` and pin-
    updates to the new root. Record CIDs do not change, because records are
-   verbatim. Then it releases generation `g`.
+   verbatim. Then it releases generation `g`: `release(feed, g)` releases all
+   of the immutable generation `g` whatever through-commit it names, and
+   `release(feed, through)` on `g+1` releases `g` once `through` reaches the
+   compaction's final `$FCK`.
 4. Unlink `g` after the release and after the 30 s reader window (format 4).
 
 A node that never releases blocks compaction, and the store reports it as a
@@ -685,17 +705,14 @@ cpp/tests/p4-replay.e2e.mjs`):
 
 ## 13. Open points found in the build (to settle with an additive SDS amendment)
 
-- `FSGInstance` has no instance url, and `FCKCounters` has no record-bytes or
-  min/max w fields. After a compaction, restoring them exactly from segments
-  alone needs those fields. Until then, a feed that is compacted and then loses
-  its index is rebuilt with those values recounted from the live rows, so a
-  dead row's instance url can be lost. The SQLite index, when present, still
-  holds them.
+- Settled by SDS 1.256.0 (additive table fields; `FSGInstance` stays 88 B and
+  `FCKCounters` 120 B): `FSG.INSTANCE_URL_IDS` and `FCK.RECORD_BYTES`,
+  `MIN_W`, `MAX_W`. A compacted feed that loses its index reopens with every
+  instance url, including one only a dead row wrote, and exact counters.
 - LATEST, INSTANCES and TOKENS need a deletion marker. Today the code uses a
   zero RID or a zero count. TOMBSTONES need defined semantics for a reused
   `ROW_J`.
-- The before-export checkpoint applies only once the export op exists (the IPFS
-  layout release).
+- Settled in 3.10.0: the CAR export writes a checkpoint first (§6, §8).
 
 ## 14. Owner decisions (2026-10-18)
 

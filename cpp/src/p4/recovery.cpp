@@ -85,12 +85,7 @@ int applyDictionary(Replay& r,const FMB* m) {
 // Install the checkpoint's historical state only after the row walk reaches
 // APPLIED_THROUGH. Earlier rows rebuild the row index without restamping it.
 void checkpointHistory(Replay& r,const CheckpointState& ck) {
-    auto history=ck.instances;
-    for(auto& item:history) {
-        const auto old=r.inst.find(item.first);
-        if(item.second.url.empty() && old!=r.inst.end()) item.second.url=old->second.url;
-    }
-    r.inst=std::move(history); r.tokc=ck.tokens; r.history=ck.counters;
+    r.inst=ck.instances; r.tokc=ck.tokens; r.history=ck.counters;
     r.feedHigh=uint64_t(ck.counters.maxseq); r.high=std::max(r.high,ck.typeSeqHigh);
 }
 const FMBSealed* sealedAt(const FMB* m,size_t row) {
@@ -408,7 +403,7 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
         moved->assign(replay.moved.begin(),replay.moved.end());
         return P4_OK;
     }
-    if(haveCheckpoint && meta.mark==int64_t(checkpoint->end)) checkpointHistory(replay,*checkpoint);
+    if(haveCheckpoint && checkpoint->holdsStateAt(uint64_t(meta.mark))) checkpointHistory(replay,*checkpoint);
     else if(readInst(f,c,&replay.inst)!=SQLITE_OK || readTokc(t,c,&replay.tokc)!=SQLITE_OK) return P4_E_CORRUPT;
     auto* nodes=c->sql("SELECT id,producer FROM node"); if(!nodes) return P4_E_IO;
     while(sqlite3_step(nodes)==SQLITE_ROW) {
@@ -427,7 +422,7 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
         rc=applyEntries(replay,entries); if(rc!=SQLITE_OK) return fail(statusOfSqlite(rc));
     }
     bool restoredHistory=haveCheckpoint && uint64_t(at)>=checkpoint->appliedThrough;
-    if(restoredHistory && (uint64_t(at)==checkpoint->appliedThrough || uint64_t(at)==checkpoint->end))
+    if(restoredHistory && (uint64_t(at)==checkpoint->appliedThrough || checkpoint->holdsStateAt(uint64_t(at))))
         checkpointHistory(replay,*checkpoint);
     while(at+12<=size) {
         std::string prefix;
@@ -488,7 +483,10 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
                 auto newer=std::make_shared<CheckpointState>();
                 if(checkpointReadAt(f,stream.get(),uint64_t(at),newer.get(),err)!=P4_OK) break;
                 checkpoint=newer; f->checkpoint=newer; haveCheckpoint=true;
-                checkpointHistory(replay,*checkpoint); restoredHistory=true;
+                // The walk already applied any $FMB between its APPLIED_THROUGH
+                // and here: only a checkpoint with none replaces the walk's history.
+                if(checkpoint->current) checkpointHistory(replay,*checkpoint);
+                restoredHistory=true;
             }
             if(at && ck->COUNTERS()) {
                 const auto* counters=ck->COUNTERS();
