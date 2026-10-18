@@ -83,17 +83,28 @@ const char* kGpUrl = "https://www.space-track.org/basicspacedata/query/class/gp_
 const char* kGpPeer = "12D3KooWReplayFixturePeer";
 
 // A 128-bit multiply-mix hash over a canonical form of every answer, eight
-// bytes a step (the client's own cost stays small beside the engine's).
+// bytes a step over four independent lanes (the client's own cost, inside the
+// timed pass, stays small beside the engine's).
 struct Hash {
-    uint64_t a = 0xcbf29ce484222325ull, b = 0x84222325cbf29ce4ull;
+    uint64_t a[4] = {0xcbf29ce484222325ull, 1, 2, 3}, b[4] = {0x84222325cbf29ce4ull, 5, 6, 7};
+    uint32_t lane = 0;
     static uint64_t rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
     void word(uint64_t w) {
-        a = rotl((a ^ w) * 0x9e3779b97f4a7c15ull, 29);
-        b = rotl((b + w) * 0xc2b2ae3d27d4eb4full, 31) ^ a;
+        const uint32_t k = lane++ & 3;
+        a[k] = rotl((a[k] ^ w) * 0x9e3779b97f4a7c15ull, 29);
+        b[k] = rotl((b[k] + w) * 0xc2b2ae3d27d4eb4full, 31) ^ a[k];
     }
     void bytes(const void* p, size_t n) {
         const uint8_t* q = static_cast<const uint8_t*>(p);
         size_t i = 0;
+        for (; i + 32 <= n; i += 32) {
+            uint64_t w[4];
+            std::memcpy(w, q + i, 32);
+            for (int k = 0; k < 4; k++) {
+                a[k] = rotl((a[k] ^ w[k]) * 0x9e3779b97f4a7c15ull, 29);
+                b[k] = rotl((b[k] + w[k]) * 0xc2b2ae3d27d4eb4full, 31) ^ a[k];
+            }
+        }
         for (; i + 8 <= n; i += 8) {
             uint64_t w;
             std::memcpy(&w, q + i, 8);
@@ -102,6 +113,14 @@ struct Hash {
         uint64_t w = 0;
         std::memcpy(&w, q + i, n - i);
         word(w ^ (uint64_t(n - i) << 56));
+    }
+    // A read pass's answers, hashed once its clock has stopped (flush): the
+    // hash is the harness's work, not the engine's.
+    std::vector<Result> kept;
+    void keep(Result&& r) { kept.push_back(std::move(r)); }
+    void flush() {
+        for (const Result& r : kept) result(r);
+        kept.clear();
     }
     void i64(int64_t v) { word(uint64_t(v)); }
     void str(const std::string& s) {
@@ -121,8 +140,13 @@ struct Hash {
             }
     }
     std::string hex() const {
+        uint64_t x = 0, y = 0;
+        for (int k = 0; k < 4; k++) {
+            x = rotl((x ^ a[k]) * 0x9e3779b97f4a7c15ull, 29);
+            y = rotl((y + b[k]) * 0xc2b2ae3d27d4eb4full, 31) ^ x;
+        }
         char buf[40];
-        std::snprintf(buf, sizeof buf, "%016llx%016llx", (unsigned long long)a, (unsigned long long)b);
+        std::snprintf(buf, sizeof buf, "%016llx%016llx", (unsigned long long)x, (unsigned long long)y);
         return buf;
     }
 };
@@ -156,9 +180,17 @@ struct Clock {
         wall0 = flatsql::ps::monoNs();
         cpu0 = cpu();
         sync0 = syncs();
+        wall = -1;
+        cpuSpent = -2;
     }
-    double wallMs() const { return double(flatsql::ps::monoNs() - wall0) / 1e6; }
-    double cpuMs() const { return cpu0 < 0 ? -1 : (cpu() - cpu0) * 1e3; }
+    // stop() freezes the pass's times (before its answers are hashed).
+    double wall = -1, cpuSpent = -2;
+    void stop() {
+        wall = double(flatsql::ps::monoNs() - wall0) / 1e6;
+        cpuSpent = cpu0 < 0 ? -1 : (cpu() - cpu0) * 1e3;
+    }
+    double wallMs() const { return wall >= 0 ? wall : double(flatsql::ps::monoNs() - wall0) / 1e6; }
+    double cpuMs() const { return cpuSpent > -2 ? cpuSpent : cpu0 < 0 ? -1 : (cpu() - cpu0) * 1e3; }
 };
 
 void emit(const std::string& workload, const char* pass, const Clock& c, const Hash& h, int64_t rows, int64_t ops) {
@@ -342,10 +374,11 @@ void wSyncNorad(const Probe& p, Hash* h, int64_t* rows, int64_t* ops) {
             w.text(1, "OMM").u8(2, 1).u64(3, 100).u64(4, off).u8(5, P4_ORDER_W_ASC);
             w.raw(17, k.data(), k.size()).raw(17, e.data(), e.size());
             Result r = call(P4_OPC_SCAN, w.b);
-            h->result(r);
             (*ops)++;
             *rows += int64_t(r.rows.size());
-            if (r.status != P4_OK || r.rows.size() < 100) break;
+            const bool last = r.status != P4_OK || r.rows.size() < 100;
+            h->keep(std::move(r));
+            if (last) break;
         }
     }
 }
@@ -359,12 +392,12 @@ void wSyncWindow(const Probe& p, Hash* h, int64_t* rows, int64_t* ops) {
             w.text(1, "OMM").u8(2, 1).u64(3, 1000).u8(5, P4_ORDER_SEQ_ASC).i64(6, after);
             w.raw(17, e.data(), e.size());
             Result r = call(P4_OPC_SCAN, w.b);
-            h->result(r);
             (*ops)++;
             *rows += int64_t(r.rows.size());
-            if (r.status != P4_OK || r.rows.empty()) break;
-            for (size_t i = 0; i < r.rows.size(); i++) after = std::max(after, r.i(i, "seq"));
-            if (r.rows.size() < 1000) break;
+            const bool none = r.status != P4_OK || r.rows.empty(), last = none || r.rows.size() < 1000;
+            for (size_t i = 0; !none && i < r.rows.size(); i++) after = std::max(after, r.i(i, "seq"));
+            h->keep(std::move(r));
+            if (last) break;
         }
     }
 }
@@ -375,9 +408,9 @@ void wLatest(const Probe& p, Hash* h, int64_t* rows, int64_t* ops) {
     CallOpts o;
     o.timeoutMs = 600000;
     Result r = call(P4_OPC_EPOCH, w.b, o);
-    h->result(r);
     (*ops)++;
     *rows += int64_t(r.rows.size());
+    h->keep(std::move(r));
 }
 
 void wExplorer(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
@@ -387,11 +420,12 @@ void wExplorer(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
         w.text(1, "OMM").u8(2, 1).u64(3, 100).u8(5, P4_ORDER_SEQ_DESC);
         if (before > 1) w.i64(7, before - 1);
         Result r = call(P4_OPC_SCAN, w.b);
-        h->result(r);
         (*ops)++;
         *rows += int64_t(r.rows.size());
-        if (r.status != P4_OK || r.rows.empty()) break;
-        before = r.i(r.rows.size() - 1, "seq");
+        const bool none = r.status != P4_OK || r.rows.empty();
+        if (!none) before = r.i(r.rows.size() - 1, "seq");
+        h->keep(std::move(r));
+        if (none) break;
     }
 }
 
@@ -738,6 +772,8 @@ void runOne(const std::string& root, const std::string& workload) {
             rows = ops = 0;
             c.start();
             it->second(probe, &ph, &rows, &ops);
+            c.stop();
+            ph.flush();
             emit(workload, pass ? "warm" : "cold", c, ph, rows, ops);
         }
     } else if (workload == "gp_ingest" || workload == "wxf_lead" || workload == "retention") {

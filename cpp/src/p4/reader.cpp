@@ -206,7 +206,53 @@ struct FRef {
     Counters k;
 };
 
-// A row of a feed file, as a scan reads it.
+// A record's bytes where they were read: a slice of one read of the stream
+// (shared by the rows that read joined), the frame's u32 size prefix just
+// before it. Nothing copies the bytes (the stream's frames, as they are).
+struct Bytes {
+    std::shared_ptr<const std::string> buf;
+    size_t at = 0, n = 0;
+    const char* data() const { return buf ? buf->data() + at : nullptr; }
+    size_t size() const { return n; }
+    const uint8_t* frame() const { return reinterpret_cast<const uint8_t*>(data()) - 4; }  // [u32 size][bytes]
+};
+
+// A feed file's dictionary entries a read has met, copied once per read
+// (the feed's own dictionary can be replaced under it): rows point at them.
+struct DictView {
+    std::deque<NodeDef> nodes;
+    std::deque<BatchDef> batches;
+    std::vector<const NodeDef*> nodeOf;    // id -> entry
+    std::vector<const BatchDef*> batchOf;  // id -> entry
+    std::unordered_map<uint32_t, std::string> ckeys, urls;
+    const NodeDef* node(Feed* f, Conn* c, uint32_t id) {
+        if (id < nodeOf.size() && nodeOf[id]) return nodeOf[id];
+        NodeDef d;
+        if (!dictNode(f, c, id, &d)) return nullptr;
+        if (id >= nodeOf.size()) nodeOf.resize(size_t(id) + 1);
+        nodes.push_back(std::move(d));
+        return nodeOf[id] = &nodes.back();
+    }
+    const BatchDef* batch(Feed* f, Conn* c, uint32_t id) {
+        if (id < batchOf.size() && batchOf[id]) return batchOf[id];
+        BatchDef d;
+        if (!dictBatch(f, c, id, &d)) return nullptr;
+        if (id >= batchOf.size()) batchOf.resize(size_t(id) + 1);
+        batches.push_back(std::move(d));
+        return batchOf[id] = &batches.back();
+    }
+    const std::string& ckey(Conn* c, uint32_t id) {
+        auto it = ckeys.find(id);
+        return it != ckeys.end() ? it->second : (ckeys[id] = dictCkey(c, id));
+    }
+    const std::string& url(Conn* c, uint32_t id) {
+        auto it = urls.find(id);
+        return it != urls.end() ? it->second : (urls[id] = dictUrl(c, id));
+    }
+};
+
+// A row of a feed file, as a scan reads it: its strings are views of the
+// read's DictView, its bytes a slice of the read buffer.
 struct RowV {
     int fi = -1;  // FRef index
     int64_t rid = 0;
@@ -215,11 +261,13 @@ struct RowV {
     bool hasE = false;
     KVal k;
     uint8_t key[32];
-    std::string sig, fcols, data;
+    std::string sig, fcols;
+    Bytes data;
     bool sealed = false, hasData = false;
-    std::string producer, peer;
+    std::string_view producer, peer;
     bool inst = false;
-    std::string batch, ppeer, pkey, ckey, url;
+    std::string_view batch, ppeer, pkey, ckey, url;
+    int64_t seq() const { return rid >> 16; }
 };
 
 // A record answered (its row set in one feed file): its chosen row and
@@ -230,10 +278,14 @@ struct Row {
     bool hasE = false;
     uint8_t key[32];
     KVal k;
-    std::string producer, peer, sig, data, fcols;
+    // The strings are views of the scan's: its files' names and its copy of
+    // their dictionaries (a Row lives no longer than the Scan that made it).
+    std::string_view producer, peer;
+    std::string sig, fcols;
+    Bytes data;
     bool sealed = false, hasData = false;
     bool hasTag = false;
-    std::string provider, source, url, batch, ckey, ppeer, pkey;
+    std::string_view provider, source, url, batch, ckey, ppeer, pkey;
     int64_t at = 0;
     std::vector<int64_t> ats;  // every matching instance's at (HEAD max_at)
 };
@@ -329,10 +381,10 @@ bool predOn(const Spec2::Pred& p, bool present, int64_t i, const std::string* s,
 // smallest identity.
 int tagCmp(const Row& a, const RowV& b, const FRef& fb, bool newest) {
     if (a.at != b.at) return (a.at < b.at) != newest ? -1 : 1;
-    const std::string* x[6] = {&a.provider, &a.source, &a.batch, &a.ckey, &a.ppeer, &a.pkey};
-    const std::string* y[6] = {&fb.provider, &fb.source, &b.batch, &b.ckey, &b.ppeer, &b.pkey};
+    const std::string_view x[6] = {a.provider, a.source, a.batch, a.ckey, a.ppeer, a.pkey};
+    const std::string_view y[6] = {fb.provider, fb.source, b.batch, b.ckey, b.ppeer, b.pkey};
     for (int i = 0; i < 6; i++) {
-        const int c = x[i]->compare(*y[i]);
+        const int c = x[i].compare(y[i]);
         if (c) return c < 0 ? -1 : 1;
     }
     return 0;
@@ -412,19 +464,20 @@ private:
     int32_t candidatesFromPreds(bool* used);
     int32_t page(std::vector<Cand>* out);  // the next page of candidates in order; empty at the end
     int32_t fetch(Stream& s);
+    int32_t fetchChunk(Stream& s);
     int32_t fill(Stream& s);  // fetches until the stream has an entry or is done
     bool before(const Ent& a, int fa, const Ent& b, int fb) const;
     bool keyed() const { return wo_ == kWDesc || wo_ == kWAsc || wo_ == kAtDesc || wo_ == kAtDescSeq || wo_ == kTsDesc; }
     bool byAt() const { return wo_ == kAtDesc || wo_ == kAtDescSeq; }  // a walk by delivery time (SCAN 5/6)
     int64_t orderValue(const Row& r) const;  // the answered row's value in a keyed walk
     int32_t resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Row>>* out);
-    bool evaluate(int64_t seq, std::vector<RowV>& rows, Row* out);
-    int32_t loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::map<std::pair<int64_t, int>, std::vector<RowV>>* out);
+    bool evaluate(int64_t seq, const RowV* rows, const RowV* end, Row* out);
+    int32_t loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::vector<RowV>* out);
     int32_t ftsHits(const std::vector<int64_t>& seqs, std::unordered_set<int64_t>* hit);
     bool needData() const;
     bool laneMatch(const RowV& r) const;
     bool copyMatch(const RowV& r) const;
-    uint32_t tokOf(const std::string& producer);
+    uint32_t tokOf(std::string_view producer);
     int32_t check();
 
     P4Lane* L_;
@@ -441,14 +494,19 @@ private:
     std::vector<Stream> streams_;
     std::vector<int> heap_;  // stream indexes with entries; the front is the next in order
     bool heapReady_ = false;
-    size_t chunk_ = 512;
+    size_t chunk_ = 512, chunkMax_ = 512;  // a walk's chunk: sized to the limit, doubling to chunkMax_
+    size_t pageWant_ = 512;                // the next candidate page's size
     std::vector<Cand> cands_;  // candidates from the predicates (in order), when used
     bool candMode_ = false;
     size_t candAt_ = 0;
     std::deque<Row> queue_;
     Row out_;
     uint64_t skipped_ = 0, emitted_ = 0;
-    std::unordered_map<std::string, uint32_t> tokIds_;
+    std::unordered_map<const char*, uint32_t> tokIds_;  // by the producer's DictView text
+    std::deque<DictView> dv_;                           // per FRef index
+    std::vector<std::vector<int64_t>> want_;            // resolve's seqs per FRef index
+    std::vector<RowV> rows_;                            // resolve's rows, grouped by (seq, fi)
+    size_t pageMin_ = 0;                                // the candidate page's floor (grows on rejects)
 };
 
 int32_t Scan::check() {
@@ -460,16 +518,16 @@ int32_t Scan::check() {
     return P4_OK;
 }
 
-uint32_t Scan::tokOf(const std::string& producer) {
-    auto it = tokIds_.find(producer);
+uint32_t Scan::tokOf(std::string_view producer) {
+    auto it = tokIds_.find(producer.data());
     if (it != tokIds_.end()) return it->second;
     uint32_t id;
     {
         std::lock_guard<std::mutex> g(t_->mu);
-        id = tokFor(t_, producer, std::string(), false);
+        id = tokFor(t_, std::string(producer), std::string(), false);
     }
     if (!id) id = UINT32_MAX;
-    tokIds_[producer] = id;
+    tokIds_[producer.data()] = id;
     return id;
 }
 
@@ -482,9 +540,9 @@ bool Scan::needData() const {
 bool Scan::laneMatch(const RowV& r) const {
     if (!r.inst) return false;
     const FRef& f = files_[size_t(r.fi)];
-    const std::string* v[6] = {&f.provider, &f.source, &r.batch, &r.ckey, &r.ppeer, &r.pkey};
+    const std::string_view v[6] = {f.provider, f.source, r.batch, r.ckey, r.ppeer, r.pkey};
     for (int i = 0; i < 6; i++)
-        if (s_.lfSet[i] && *v[i] != s_.lf[i]) return false;
+        if (s_.lfSet[i] && v[i] != s_.lf[i]) return false;
     return true;
 }
 
@@ -786,7 +844,9 @@ int32_t Scan::open() {
         done_ = true;
         return P4_OK;
     }
-    chunk_ = std::max<size_t>(32, std::min<size_t>(512, 1024 / files_.size()));
+    chunkMax_ = std::max<size_t>(32, std::min<size_t>(512, 1024 / files_.size()));
+    // A limited scan reads what its first page needs, then doubles.
+    chunk_ = s_.limit ? std::min<size_t>(chunkMax_, std::max<uint64_t>(32, s_.limit + s_.offset + 1)) : chunkMax_;
     for (size_t i = 0; i < files_.size(); i++) {
         Stream s;
         s.fi = int(i);
@@ -828,6 +888,12 @@ bool Scan::before(const Ent& a, int fa, const Ent& b, int fb) const {
 
 // The next chunk of one feed file's walk.
 int32_t Scan::fetch(Stream& s) {
+    const int32_t rc = fetchChunk(s);
+    chunk_ = std::min(chunkMax_, chunk_ * 2);
+    return rc;
+}
+
+int32_t Scan::fetchChunk(Stream& s) {
     if (s.done) return P4_OK;
     const FRef& fr = files_[size_t(s.fi)];
     const std::shared_ptr<const Staged> view = staged(fr);
@@ -1073,7 +1139,7 @@ int32_t Scan::fill(Stream& s) {
 int32_t Scan::page(std::vector<Cand>* out) {
     out->clear();
     if (candMode_) {
-        for (size_t i = 0; i < 256 && candAt_ < cands_.size(); i++) out->push_back(cands_[candAt_++]);
+        for (size_t i = 0; i < std::min<size_t>(256, pageWant_) && candAt_ < cands_.size(); i++) out->push_back(cands_[candAt_++]);
         if (candAt_ >= cands_.size()) done_ = true;
         return P4_OK;
     }
@@ -1091,7 +1157,7 @@ int32_t Scan::page(std::vector<Cand>* out) {
             }
         }
     }
-    const size_t kPage = 512;
+    const size_t kPage = pageWant_;
     while (out->size() < kPage && !heap_.empty()) {
         std::pop_heap(heap_.begin(), heap_.end(), later);
         const int i = heap_.back();
@@ -1146,19 +1212,20 @@ void rowColumns(sqlite3_stmt* q, int fi, RowV* x) {
     x->off = sqlite3_column_int64(q, 13);
 }
 
-// A row's producer and tag batch from the feed's dictionary.
-bool rowDict(Feed* f, Conn* c, RowV* x) {
-    NodeDef nodeDef;
-    if (!dictNode(f, c, x->n, &nodeDef)) return false;
-    x->producer = nodeDef.producer;
-    x->peer = nodeDef.peer;
+// A row's producer and tag batch: views of the read's copy of the feed's
+// dictionary entries.
+bool rowDict(Feed* f, Conn* c, DictView& dv, RowV* x) {
+    const NodeDef* nd = dv.node(f, c, x->n);
+    if (!nd) return false;
+    x->producer = nd->producer;
+    x->peer = nd->peer;
     if (x->b) {
-        BatchDef bd;
-        if (!dictBatch(f, c, x->b, &bd)) return false;
+        const BatchDef* bd = dv.batch(f, c, x->b);
+        if (!bd) return false;
         x->inst = true;
-        x->batch = bd.batch;
-        x->ppeer = bd.ppeer;
-        x->pkey = bd.pkey;
+        x->batch = bd->batch;
+        x->ppeer = bd->ppeer;
+        x->pkey = bd->pkey;
     }
     return true;
 }
@@ -1168,12 +1235,12 @@ bool rowDict(Feed* f, Conn* c, RowV* x) {
 // one contiguous run of its stream).
 constexpr int64_t kFrameGap = int64_t(64) << 10, kFrameRun = int64_t(4) << 20;
 
-// The rows' frames, the stream read in offset order with neighbors joined:
-// P4_E_IO when a read fails, P4_E_CORRUPT when a frame runs past the stream's
-// end or its size prefix differs.
+// The rows' frames, the stream read in offset order with neighbors joined;
+// each row's bytes are a slice of its read: P4_E_IO when a read fails,
+// P4_E_CORRUPT when a frame runs past the stream's end or its size prefix
+// differs.
 int32_t readFrames(p4::Stream* s, std::vector<RowV*>& rows) {
     std::sort(rows.begin(), rows.end(), [](const RowV* a, const RowV* b) { return a->off < b->off; });
-    std::string buf;
     for (size_t i = 0; i < rows.size();) {
         if (rows[i]->off < 0 || rows[i]->len < 0 || rows[i]->len > (int64_t(1) << 31) - 8) return P4_E_CORRUPT;
         const int64_t from = rows[i]->off;
@@ -1184,13 +1251,14 @@ int32_t readFrames(p4::Stream* s, std::vector<RowV*>& rows) {
             to = std::max(to, rows[j]->off + rows[j]->len + 4);
             j++;
         }
-        const int32_t st = streamReadRange(s, from, size_t(to - from), &buf);
+        auto buf = std::make_shared<std::string>();
+        const int32_t st = streamReadRange(s, from, size_t(to - from), buf.get());
         if (st != P4_OK) return st;
         for (size_t k = i; k < j; k++) {
             RowV* x = rows[k];
             const size_t at = size_t(x->off - from);
-            if (ld32(reinterpret_cast<const uint8_t*>(buf.data() + at)) != uint32_t(x->len)) return P4_E_CORRUPT;
-            x->data.assign(buf.data() + at + 4, size_t(x->len));
+            if (ld32(reinterpret_cast<const uint8_t*>(buf->data() + at)) != uint32_t(x->len)) return P4_E_CORRUPT;
+            x->data = Bytes{buf, at + 4, size_t(x->len)};
             x->hasData = true;
         }
         i = j;
@@ -1203,9 +1271,9 @@ int32_t readFrames(p4::Stream* s, std::vector<RowV*>& rows) {
 // scan needs data. A dense page (most seq-ordered walks) reads one rid range,
 // a sparse one seeks each seq; frames are read in offset order, neighbors
 // joined; content keys and urls once each.
-int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
-                       std::map<std::pair<int64_t, int>, std::vector<RowV>>* out) {
+int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::vector<RowV>* out) {
     FRef& fr = files_[size_t(fi)];
+    DictView& dv = dv_[size_t(fi)];
     const bool nd = needData();
     std::shared_ptr<p4::Stream> stream;  // the feed's record stream (Scan::Stream is a walk)
     if (nd) {
@@ -1216,10 +1284,8 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
     sqlite3_stmt* q = c->get(S_R_SEQ);
     if (!q) return P4_E_INTERNAL;
     if (seqs.empty()) return P4_OK;
-    std::vector<std::vector<RowV>*> slot(seqs.size());
-    for (size_t i = 0; i < seqs.size(); i++) slot[i] = &(*out)[{seqs[i], fi}];
+    const size_t first = out->size();
     const bool dense = seqs.back() - seqs.front() < int64_t(2 * seqs.size()) + 16;
-    int64_t loaded = 0;
     for (size_t i = 0; i < seqs.size(); i = dense ? seqs.size() : i + 1) {
         const int64_t lo = dense ? seqs.front() : seqs[i], hi = dense ? seqs.back() : seqs[i];
         sqlite3_bind_int64(q, 1, lo << 16);
@@ -1231,39 +1297,30 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs,
             const int64_t seq = sqlite3_column_int64(q, 0) >> 16;
             while (at < seqs.size() && seqs[at] < seq) at++;
             if (at == seqs.size() || seqs[at] != seq) continue;  // a seq between the page's
-            RowV x;
+            out->emplace_back();
+            RowV& x = out->back();
             rowColumns(q, fi, &x);
-            if (!rowDict(fr.f, c, &x)) {
+            if (!rowDict(fr.f, c, dv, &x)) {
                 sqlite3_reset(q);
                 return P4_E_CORRUPT;
             }
-            slot[at]->push_back(std::move(x));
-            loaded++;
         }
         sqlite3_reset(q);
         if (r != SQLITE_DONE) return statusOfSqlite(r);
     }
     if (nd) {
         std::vector<RowV*> rows;
-        rows.reserve(size_t(loaded));
-        for (auto* v : slot)
-            for (RowV& x : *v) rows.push_back(&x);
+        rows.reserve(out->size() - first);
+        for (size_t i = first; i < out->size(); i++) rows.push_back(&(*out)[i]);
         const int32_t st = readFrames(stream.get(), rows);
         if (st != P4_OK) return st;
     }
-    std::unordered_map<uint32_t, std::string> ckeys, urls;
-    for (auto* v : slot)
-        for (RowV& x : *v) {
-            L_->bytesRead += uint64_t(x.len) + 64;
-            if (x.c) {
-                auto it = ckeys.find(x.c);
-                x.ckey = it != ckeys.end() ? it->second : (ckeys[x.c] = dictCkey(c, x.c));
-            }
-            if (x.u && (s_.needTags || s_.lane)) {
-                auto it = urls.find(x.u);
-                x.url = it != urls.end() ? it->second : (urls[x.u] = dictUrl(c, x.u));
-            }
-        }
+    for (size_t i = first; i < out->size(); i++) {
+        RowV& x = (*out)[i];
+        L_->bytesRead += uint64_t(x.len) + 64;
+        if (x.c) x.ckey = dv.ckey(c, x.c);
+        if (x.u && (s_.needTags || s_.lane)) x.url = dv.url(c, x.u);
+    }
     return P4_OK;
 }
 
@@ -1341,13 +1398,9 @@ int32_t Scan::cols(const Row& r, ps::Extracted* x, uint8_t* scratch, size_t n) {
         return P4_OK;
     }
     if (!r.hasData) return P4_E_INTERNAL;
-    std::string frame(r.data.size() + 4, '\0');
-    st32(reinterpret_cast<uint8_t*>(&frame[0]), uint32_t(r.data.size()));
-    std::memcpy(&frame[4], r.data.data(), r.data.size());
-    // scratch must outlive x: the caller's.
-    static thread_local std::string keep;
-    keep.swap(frame);
-    sp_->tc.extract(reinterpret_cast<const uint8_t*>(keep.data()), keep.size(), x, scratch, n);
+    // The frame in place (its size prefix precedes the bytes); r's read
+    // buffer and the caller's scratch outlive x.
+    sp_->tc.extract(r.data.frame(), r.data.size() + 4, x, scratch, n);
     return P4_OK;
 }
 
@@ -1355,13 +1408,14 @@ int32_t Scan::cols(const Row& r, ps::Extracted* x, uint8_t* scratch, size_t n) {
 // not match. The copy is the lowest token's matching row (the first copy,
 // C-12); the tag the earliest matching instance (§3.6), or in a walk by
 // delivery time the newest, the delivery the record is ordered by (C-41 N9).
-bool Scan::evaluate(int64_t seq, std::vector<RowV>& rows, Row* out) {
-    if (rows.empty()) return false;
+bool Scan::evaluate(int64_t seq, const RowV* rows, const RowV* end, Row* out) {
+    if (rows == end) return false;
     if (s_.hasCid && std::memcmp(rows[0].key, s_.cidKey, 32) != 0) return false;
     const RowV* pick = nullptr;
     uint32_t pickTok = UINT32_MAX;
     bool pickLane = false;
-    for (const RowV& x : rows) {
+    for (const RowV* xp = rows; xp != end; xp++) {
+        const RowV& x = *xp;
         if (!copyMatch(x)) continue;
         const bool ln = !s_.lane || laneMatch(x);
         const uint32_t tk = tokOf(x.producer);
@@ -1395,7 +1449,8 @@ bool Scan::evaluate(int64_t seq, std::vector<RowV>& rows, Row* out) {
     if (s_.eNotNull && !r.hasE) return false;
     if (s_.eNull && r.hasE) return false;
     // matched tag
-    for (const RowV& x : rows) {
+    for (const RowV* xp = rows; xp != end; xp++) {
+        const RowV& x = *xp;
         if (!x.inst) continue;
         if (s_.lane && !laneMatch(x)) continue;
         const FRef& f = files_[size_t(x.fi)];
@@ -1464,20 +1519,25 @@ int64_t Scan::orderValue(const Row& r) const {
 }
 
 int32_t Scan::resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Row>>* out) {
-    std::map<int, std::vector<int64_t>> want;
-    for (const Cand& c : page) want[c.fi].push_back(c.seq);
-    std::map<std::pair<int64_t, int>, std::vector<RowV>> rows;
-    for (auto& kv : want) {
-        std::sort(kv.second.begin(), kv.second.end());
-        kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+    if (dv_.size() < files_.size()) dv_.resize(files_.size());
+    want_.resize(files_.size());
+    for (auto& w : want_) w.clear();
+    for (const Cand& c : page) want_[size_t(c.fi)].push_back(c.seq);
+    rows_.clear();
+    rows_.reserve(page.size() + page.size() / 2);
+    for (size_t fi = 0; fi < want_.size(); fi++) {
+        std::vector<int64_t>& seqs = want_[fi];
+        if (seqs.empty()) continue;
+        std::sort(seqs.begin(), seqs.end());
+        seqs.erase(std::unique(seqs.begin(), seqs.end()), seqs.end());
         int orc = 0;
-        Conn* c = e_->rpool.acquire(files_[size_t(kv.first)].path, OpenKind::Reader, &orc, nullptr);
+        Conn* c = e_->rpool.acquire(files_[fi].path, OpenKind::Reader, &orc, nullptr);
         if (!c) {
             e_->bump(kStReadErrors);
             return statusOfSqlite(orc);
         }
         c->exec("BEGIN");
-        const int32_t st = loadRows(kv.first, c, kv.second, &rows);
+        const int32_t st = loadRows(int(fi), c, seqs, &rows_);
         c->exec("COMMIT");
         e_->rpool.release(c);
         if (st != P4_OK) {
@@ -1485,6 +1545,22 @@ int32_t Scan::resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Ro
             return st;
         }
     }
+    // Each file's rows are in seq order (a record's rows adjacent): the
+    // groups, by (seq, fi).
+    struct G {
+        int64_t seq;
+        int fi;
+        uint32_t from, to;
+    };
+    std::vector<G> groups;
+    for (size_t i = 0; i < rows_.size();) {
+        size_t j = i + 1;
+        while (j < rows_.size() && rows_[j].fi == rows_[i].fi && rows_[j].seq() == rows_[i].seq()) j++;
+        groups.push_back(G{rows_[i].seq(), rows_[i].fi, uint32_t(i), uint32_t(j)});
+        i = j;
+    }
+    auto gLess = [](const G& a, const G& b) { return a.seq != b.seq ? a.seq < b.seq : a.fi < b.fi; };
+    if (!std::is_sorted(groups.begin(), groups.end(), gLess)) std::sort(groups.begin(), groups.end(), gLess);
     std::unordered_set<int64_t> hits;
     if (fts_) {
         std::vector<int64_t> seqs;
@@ -1492,12 +1568,13 @@ int32_t Scan::resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Ro
         const int32_t st = ftsHits(seqs, &hits);
         if (st != P4_OK) return st;
     }
+    out->reserve(out->size() + page.size());
     for (const Cand& c : page) {
         if (fts_ && !hits.count(c.seq)) continue;
-        auto it = rows.find({c.seq, c.fi});
-        if (it == rows.end()) continue;
+        auto it = std::lower_bound(groups.begin(), groups.end(), G{c.seq, c.fi, 0, 0}, gLess);
+        if (it == groups.end() || it->seq != c.seq || it->fi != c.fi) continue;
         Row r;
-        if (evaluate(c.seq, it->second, &r)) {
+        if (evaluate(c.seq, rows_.data() + it->from, rows_.data() + it->to, &r)) {
             if (c.checkOv && c.ov != orderValue(r)) continue;  // answered at its own row's value
             r.fid = files_[size_t(c.fi)].fid;
             out->push_back({c.seq, std::move(r)});
@@ -1546,6 +1623,11 @@ int32_t Scan::next(Row** out) {
         }
         if (done_ && (!candMode_ || candAt_ >= cands_.size())) return 0;
         std::vector<Cand> pg;
+        // A limited scan resolves what the limit still needs (no fewer than
+        // the floor that rejected candidates raised), at most 512.
+        const uint64_t taken = emitted_ + skipped_ + queue_.size();
+        const uint64_t need = s_.limit && s_.limit + s_.offset > taken ? s_.limit + s_.offset - taken : 0;
+        pageWant_ = need ? size_t(std::min<uint64_t>(512, std::max<uint64_t>(need, pageMin_))) : 512;
         rc = page(&pg);
         if (rc != P4_OK) return rc;
         if (pg.empty()) {
@@ -1555,6 +1637,7 @@ int32_t Scan::next(Row** out) {
         std::vector<std::pair<int64_t, Row>> got;
         rc = resolve(pg, &got);
         if (rc != P4_OK) return rc;
+        if (got.size() < pg.size()) pageMin_ = std::min<size_t>(512, std::max(2 * pageMin_, 2 * pg.size()));
         for (auto& g : got) queue_.push_back(std::move(g.second));
     }
 }
@@ -2077,7 +2160,7 @@ struct Out {
     }
 };
 
-void putText(ps::rb1::Encoder& enc, const std::string& s) { enc.text(s.data(), s.size()); }
+void putText(ps::rb1::Encoder& enc, std::string_view s) { enc.text(s.data(), s.size()); }
 
 void writeRec(Out& o, const Row& r, const std::string* entityKey, bool tagsNull) {
     auto& enc = o.enc;
@@ -2125,6 +2208,7 @@ struct Held {
         Feed* f;
         int64_t seq;
         std::vector<RowV> rows;
+        std::shared_ptr<DictView> dv;  // what the rows' strings view
     };
     std::vector<File> files;
 };
@@ -2156,6 +2240,7 @@ int32_t heldRows(P4Lane* L, Type* t, const uint8_t key[32], bool hydrate, bool t
         Conn* c = L->e->rpool.acquire(f->path, OpenKind::Reader, &orc, nullptr);
         if (!c) return statusOfSqlite(orc);
         std::vector<RowV> rows;
+        auto dv = std::make_shared<DictView>();
         int64_t seq = 0;
         c->exec("BEGIN");
         std::shared_ptr<p4::Stream> stream;
@@ -2187,27 +2272,13 @@ int32_t heldRows(P4Lane* L, Type* t, const uint8_t key[32], bool hydrate, bool t
                 v.len = sqlite3_column_int64(q, 12);
                 v.off = sqlite3_column_int64(q, 13);
                 if (hydrate) {
-                    st = streamRead(stream.get(), v.off, v.len, &v.data);
+                    std::vector<RowV*> one{&v};
+                    st = readFrames(stream.get(), one);
                     if (st != P4_OK) break;
-                    v.hasData = true;
                 }
-                NodeDef nd;
-                if (!dictNode(f, c, v.n, &nd)) {
+                if (!rowDict(f, c, *dv, &v)) {
                     st = P4_E_CORRUPT;
                     break;
-                }
-                v.producer = nd.producer;
-                v.peer = nd.peer;
-                if (v.b) {
-                    BatchDef bd;
-                    if (!dictBatch(f, c, v.b, &bd)) {
-                        st = P4_E_CORRUPT;
-                        break;
-                    }
-                    v.inst = true;
-                    v.batch = bd.batch;
-                    v.ppeer = bd.ppeer;
-                    v.pkey = bd.pkey;
                 }
                 L->rowsExamined++;
                 L->bytesRead += uint64_t(v.len);
@@ -2217,15 +2288,15 @@ int32_t heldRows(P4Lane* L, Type* t, const uint8_t key[32], bool hydrate, bool t
             if (st == P4_OK && r != SQLITE_DONE) st = statusOfSqlite(r);
             if (st == P4_OK && tags)
                 for (RowV& v : rows) {
-                    if (v.c) v.ckey = dictCkey(c, v.c);
-                    if (v.u) v.url = dictUrl(c, v.u);
+                    if (v.c) v.ckey = dv->ckey(c, v.c);
+                    if (v.u) v.url = dv->url(c, v.u);
                 }
         }
         c->exec("COMMIT");
         L->e->rpool.release(c);
         if (st != P4_OK) return st;
         if (!rows.empty()) {
-            out->files.push_back(Held::File{f, seq, std::move(rows)});
+            out->files.push_back(Held::File{f, seq, std::move(rows), std::move(dv)});
             if (firstOnly) return P4_OK;
         }
     }
@@ -2335,13 +2406,14 @@ int32_t opGet(P4Lane* L, const std::vector<Tlv>& v) {
         std::map<uint32_t, const RowV*> copies;
         std::map<std::string, uint32_t> ids;
         for (const RowV& x : hf.rows) {
-            auto it = ids.find(x.producer);
+            const std::string producer(x.producer);
+            auto it = ids.find(producer);
             uint32_t id;
             if (it == ids.end()) {
                 std::lock_guard<std::mutex> g(t->mu);
-                id = tokFor(t, x.producer, std::string(), false);
+                id = tokFor(t, producer, std::string(), false);
                 if (!id) id = UINT32_MAX - uint32_t(ids.size());
-                ids[x.producer] = id;
+                ids[producer] = id;
             } else {
                 id = it->second;
             }
@@ -2414,7 +2486,7 @@ int32_t opTags(P4Lane* L, const std::vector<Tlv>& v) {
                 uint32_t tok;
                 {
                     std::lock_guard<std::mutex> g(t->mu);
-                    tok = tokFor(t, x.producer, std::string(), false);
+                    tok = tokFor(t, std::string(x.producer), std::string(), false);
                 }
                 Merged* m = nullptr;
                 for (Merged& y : rows)
@@ -2422,7 +2494,8 @@ int32_t opTags(P4Lane* L, const std::vector<Tlv>& v) {
                         y.ppeer == x.ppeer && y.pkey == x.pkey)
                         m = &y;
                 if (!m) {
-                    rows.push_back(Merged{hf.f->provider, hf.f->source, x.batch, x.ckey, x.ppeer, x.pkey, x.url, x.producer,
+                    rows.push_back(Merged{hf.f->provider, hf.f->source, std::string(x.batch), std::string(x.ckey), std::string(x.ppeer),
+                                          std::string(x.pkey), std::string(x.url), std::string(x.producer),
                                           x.at, hf.seq, tok});
                     continue;
                 }
