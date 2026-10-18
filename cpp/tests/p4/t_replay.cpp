@@ -33,6 +33,9 @@
 // answers differently hashes differently.
 #include <fcntl.h>
 #include <sys/resource.h>
+#if defined(__APPLE__)
+#include <sys/clonefile.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -446,15 +449,23 @@ void bounds(const std::string& dir) {
     durableSync(fd);
     const double wMBs = double(total) / 1048576.0 / (double(flatsql::ps::monoNs() - t0) / 1e9);
     ::close(fd);
-    fd = ::open(path.c_str(), O_RDONLY);
+    // The read is cold: an APFS clone of the file shares its blocks but none
+    // of its cached pages (the same as the replay's per-run store clones).
+    const std::string cold = path + ".clone";
 #if defined(__APPLE__)
+    ::unlink(cold.c_str());
+    if (::clonefile(path.c_str(), cold.c_str(), 0) != 0) return;
+    fd = ::open(cold.c_str(), O_RDONLY);
     ::fcntl(fd, F_NOCACHE, 1);
+#else
+    fd = ::open(path.c_str(), O_RDONLY);
 #endif
     t0 = flatsql::ps::monoNs();
     for (size_t off = 0; off < total; off += block)
         if (::pread(fd, buf.data(), block, off_t(off)) != ssize_t(block)) break;
     const double rMBs = double(total) / 1048576.0 / (double(flatsql::ps::monoNs() - t0) / 1e9);
     ::close(fd);
+    ::unlink(cold.c_str());
     fd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0600);
     std::vector<double> lat;
     for (int i = 0; i < 200; i++) {
@@ -468,11 +479,13 @@ void bounds(const std::string& dir) {
     std::sort(lat.begin(), lat.end());
     std::vector<uint8_t> a(256u << 20, 1), b(256u << 20);
     t0 = flatsql::ps::monoNs();
+    volatile uint64_t sink = 0;
     for (int i = 0; i < 8; i++) {
-        a[size_t(i)] = uint8_t(i);
+        a[size_t(i) * 4096] = uint8_t(i);
         std::memcpy(b.data(), a.data(), a.size());
+        sink = sink + b[size_t(i) * 4096] + b[b.size() - 1 - size_t(i)];
     }
-    const double cGBs = 8.0 * double(a.size()) / 1e9 / (double(flatsql::ps::monoNs() - t0) / 1e9) + double(b[7]) * 0;
+    const double cGBs = 8.0 * double(a.size()) / 1e9 / (double(flatsql::ps::monoNs() - t0) / 1e9) + double(sink & 0) * 0;
     std::printf("REPLAY_BOUNDS {\"seq_write_MBps\":%.1f,\"seq_read_MBps\":%.1f,\"sync_ms_median\":%.3f,"
                 "\"sync_ms_p95\":%.3f,\"memcpy_GBps\":%.2f,\"load\":%.2f}\n",
                 wMBs, rMBs, lat.empty() ? 0 : lat[lat.size() / 2], lat.empty() ? 0 : lat[lat.size() * 95 / 100], cGBs,
