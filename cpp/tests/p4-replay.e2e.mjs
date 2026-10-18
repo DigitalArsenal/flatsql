@@ -3,9 +3,9 @@
 // spend their FlatSQL time in, replayed on flatsql 3.7.2 and on this checkout,
 // on the same data.
 //
-// Uses the prebuilt native clients: this checkout, and the cached v3.7.2's
-// engine with the matching replay requests. Offline runs never invoke git,
-// network or Docker, and keep their writes in cpp/build/replay-e2e. Each build has its own
+// Builds the native test client twice: this checkout, and v3.7.2's
+// engine with this checkout's replay test (cpp/tests/p4/t_replay.cpp and
+// wxf_fixture.h: the requests, not the engine). Each build builds its own
 // fixture from the same input (a build's store format is its own: 3.7.2 cannot
 // read this build's files, nor this build 3.7.2's), once per source tree:
 // p4_record_scaling's sea feed (P4_REPLAY_WXF_BYTES) and days of real
@@ -45,15 +45,16 @@
 // patched static WasmEdge the node links).
 //
 // Environment: FLATBUFFERS_DIR (else the sibling flatbuffers checkout),
-// P4_REPLAY_DIR (read-only baseline/input cache), P4_REPLAY_BINARY (the
-// prebuilt native client; default cpp/build/flatsql_p4_test),
+// P4_REPLAY_DIR (work directory; default the system temp directory),
+// P4_REPLAY_FIXTURES (where the fixtures are built and kept; default the work
+// directory), SDS_SCHEMA_DIR (else node_modules, else the stack's SDS),
 // P4_REPLAY_GP (the gp_history by-creation root, default
 // /opt/data/sdn-archive/spacetrack/gp_history/by-creation), P4_REPLAY_REPS,
 // P4_REPLAY_WORKLOADS (comma list), P4_REPLAY_WXF_BYTES.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createGunzip } from 'node:zlib';
@@ -98,27 +99,42 @@ function flatbuffers() {
   return dir;
 }
 
-// Offline execution keeps the baseline/input cache read-only and every build,
-// fixture and test write inside this checkout. No git, network or Docker.
-const offline = process.env.P4_REPLAY_OFFLINE !== '0';
-const cache = resolve(process.env.P4_REPLAY_DIR || join(cpp, 'build/replay-e2e'));
-const workDir = join(cpp, 'build/replay-e2e');
+const workDir = process.env.P4_REPLAY_DIR || join(tmpdir(), `flatsql-p4-replay-${createHash('sha256').update(repo).digest('hex').slice(0, 12)}`);
 mkdirSync(workDir, { recursive: true });
 // The host I/O confines the aot runtime's store to this root by its real path.
 const work = realpathSync(workDir);
 process.env.FLATSQL_P4_TEST_DIR = join(work, 'scratch');
 process.env.TMPDIR = join(work, 'tmp');
 mkdirSync(process.env.TMPDIR, { recursive: true });
-if (RUNTIMES.includes('aot') && offline)
-  fail('offline AOT needs a newly built wasm command; use P4_REPLAY_RUNTIMES=native (Docker is unavailable offline)');
 
-// The previously built 3.7.2 engine is an immutable offline reference.
-const baseSrc = join(cache, 'base');
-const baseBinary = join(cache, 'build-base/flatsql_p4_test');
-if (!existsSync(baseBinary)) fail(`offline baseline missing: ${baseBinary}`);
-const newBinary = process.env.P4_REPLAY_BINARY || join(cpp, 'build/flatsql_p4_test');
-if (!existsSync(newBinary)) fail(`build flatsql_p4_test first: ${newBinary}`);
-const arms = { base: baseBinary, new: newBinary };
+// The SDS schemas format 5's frames are generated from: this checkout's
+// spacedatastandards.org devDependency (1.255.0), else the stack's pinned SDS.
+function sdsSchemaDir() {
+  const stack = process.env.GAUNTLET_STACK_ROOT;
+  const candidates = [process.env.SDS_SCHEMA_DIR, join(repo, 'node_modules/spacedatastandards.org/schema'),
+    stack && join(stack, 'repos/main-packages/spacedatastandards.org/schema')].filter(Boolean);
+  const dir = candidates.find((d) => existsSync(join(d, 'FSG/main.fbs')));
+  if (!dir) fail(`SDS 1.255.0 schemas not found (tried ${candidates.join(', ')}): npm ci, or set SDS_SCHEMA_DIR`);
+  return dir;
+}
+const sdsDir = sdsSchemaDir();
+
+function build(name, src) {
+  const dir = join(work, `build-${name}`);
+  run('cmake', ['-S', src, '-B', dir, '-DCMAKE_BUILD_TYPE=Release', `-DFLATBUFFERS_DIR=${flatbuffers()}`, `-DSDS_SCHEMA_DIR=${sdsDir}`], {
+    stdio: ['ignore', 'ignore', 'inherit'],
+  });
+  run('nice', ['cmake', '--build', dir, '--target', 'flatsql_p4_test', '-j', '8'], { stdio: ['ignore', 'ignore', 'inherit'] });
+  return join(dir, 'flatsql_p4_test');
+}
+
+// 3.7.2's engine, this checkout's replay requests.
+const baseSrc = join(work, 'base');
+rmSync(baseSrc, { recursive: true, force: true });
+mkdirSync(baseSrc, { recursive: true });
+execFileSync('sh', ['-c', `git -C "${repo}" archive ${BASE_TAG} cpp | tar -x -C "${baseSrc}"`]);
+for (const f of ['t_replay.cpp', 'wxf_fixture.h']) writeFileSync(join(baseSrc, 'cpp/tests/p4', f), readFileSync(join(cpp, 'tests/p4', f)));
+const arms = { base: build('base', join(baseSrc, 'cpp')), new: build('new', cpp) };
 
 // The aot runtime: each build's wasm test command, and the SDN harness.
 // The sources a wasm test command is built from, hashed (build directories
@@ -154,8 +170,7 @@ function wasmTestBuild(name, src) {
     'cp /tmp/b/flatsql-p4-test.wasm /w/out/',
   ].join('\n');
   // The SDS schemas the format-5 frames are generated from (the 1.255.0 devDependency).
-  const sds = join(src, '..', 'node_modules', 'spacedatastandards.org', 'schema');
-  const sdsMount = existsSync(sds) ? ['-v', `${sds}:/w/sds:ro`] : [];
+  const sdsMount = ['-v', `${sdsDir}:/w/sds:ro`];
   run('docker', ['run', '--rm', ...sdsMount, '-v', `${src}:/w/flatsql/cpp:ro`, '-v', `${flatbuffers()}:/w/flatbuffers:ro`, '-v', `${tgz}:/w/wasi-sdk.tar.gz:ro`,
     '-v', `${out}:/w/out`, 'ubuntu:22.04', 'bash', '-euc', script], { stdio: ['ignore', 'inherit', 'inherit'] });
   return join(out, 'flatsql-p4-test.wasm');
@@ -195,7 +210,7 @@ async function gpTsv(out, days) {
   await new Promise((res) => w.end(res));
   execFileSync('mv', [`${out}.tmp`, out]);
 }
-const inputPath = (name) => existsSync(join(cache, name)) ? join(cache, name) : join(work, name);
+const inputPath = (name) => join(work, name);
 const seedTsv = inputPath(prof.seedDays === 10 ? 'gp-seed.tsv' : `gp-seed-${prof.seedDays}d.tsv`);
 await gpTsv(seedTsv, SEED_DAYS);
 let dayTsv = inputPath('gp-day.tsv');
@@ -212,16 +227,10 @@ function freeBytes(dir) {
 }
 
 // The fixtures: each build's own, from the same input, once per source tree.
-const fixtureRoot = work;
+const fixtureRoot = process.env.P4_REPLAY_FIXTURES || work;
 const want = `wxf=${wxfBytes} seed=${SEED_DAYS.join(',')}`;
 function fixtureOf(arm, src) {
   const name = `fixture-${PROFILE}-${arm}-`;
-  if (arm === 'base') {
-    const cached = readdirSync(cache).filter((n) => n.startsWith(name)).map((n) => join(cache, n))
-      .find((d) => existsSync(join(d, 'REPLAY-FIXTURE')) && readFileSync(join(d, 'REPLAY-FIXTURE'), 'utf8') === want);
-    if (!cached) fail(`offline ${BASE_TAG} fixture missing for ${want}`);
-    return cached;
-  }
   const dir = join(fixtureRoot, name + treeHash(src));
   const stamp = join(dir, 'REPLAY-FIXTURE');
   if (existsSync(stamp) && readFileSync(stamp, 'utf8') === want) return dir;
