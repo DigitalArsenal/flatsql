@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.7.3
+
+Store format 4 reads a page of rows in one pass. Every answer is 3.7.2's.
+- A dense page's rows load in one rid range of the index, and their frames in stream-offset
+  order with neighboring frames joined into one read; the type text of a row is read once per
+  page. 3.7.2 sought each row's index entry and read each frame separately.
+- p4_replay (cpp/tests/p4, its E2E cpp/tests/p4-replay.e2e.mjs): the node's format-4 workloads
+  on a 15 GB store (1.72M WXF records and 623k Space-Track OMMs), 3.7.2 and this build
+  interleaved, 5 repetitions, native: explorer paging (100 pages of 100 newest rows) 110 ms ->
+  65 ms cold and 96 ms -> 57 ms warm; EPOCH-window sync 292 ms -> 265 ms warm; nearest-epoch
+  latest 143 ms -> 128 ms warm. Every answer hashes the same on both builds.
+
 ## 3.7.2
 
 Store format 4: a write's cost on a feed no longer grows with the feed. Every answer is 3.7.1's.
