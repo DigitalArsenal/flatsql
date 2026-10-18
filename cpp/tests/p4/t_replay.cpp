@@ -20,6 +20,8 @@
 //   retention    ExpireRecords: 20 pages of SCAN (501 rows) + DELETE (500)
 //   explorer     the data explorer: 100 pages of 100 newest-first by the
 //                seq cursor (FullTablePageWithCursor), hydrated
+//   scan_all     the weather node's daily whole-lane scan: the sea feed in
+//                50,000-record hydrated seq pages, a tile writer beside it
 //   open         a restart: init (journal replay, WAL recovery), start, the
 //                type registrations and each type's HEAD
 //
@@ -49,6 +51,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -524,6 +527,69 @@ void wLead(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
         *rows += int64_t(r.rows.size());
         if (r.status != P4_OK) break;
     }
+}
+
+// The weather node's daily whole-lane scan (POST /api/v1/data/scan, no
+// cursor): datasync.Scan pages the sea feed 50,000 hydrated records at a time
+// in seq order by its row-id cursor through the snapshot's head, while the
+// node keeps acknowledging PUTs. The scan's records go into the hash; the
+// concurrent writer's tile PUTs (their ack latency against the same PUTs with
+// no scan) do not, since where they land beside the pages is timing.
+struct ScanAll {
+    int64_t records = 0, pages = 0, bytes = 0;
+    double scanMs = 0;
+    std::vector<double> idle, during;
+};
+ScanAll* scanAllOut = nullptr;
+void scanPuts(int64_t from, int64_t n, std::vector<double>* lat, const std::atomic<bool>* until) {
+    const std::vector<uint8_t> values = payloadOf(size_t(argInt("payload", 8616)));
+    // Alone: n PUTs. Beside the scan: PUTs until the scan ends.
+    for (int64_t t = from; until ? !until->load() : t < from + n; t++) {
+        const uint64_t t0 = flatsql::ps::monoNs();
+        Result r = put(tileBatch(kBig, "scan-put-" + std::to_string(t), "scanput", t, kT0 + 6 * 86400, values));
+        lat->push_back(double(flatsql::ps::monoNs() - t0) / 1e6);
+        if (r.status != P4_OK) break;
+    }
+}
+void wScanAll(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
+    ScanAll& out = *scanAllOut;
+    const int64_t puts = argInt("scan-puts", 32);
+    // The writer alone first: the ack latency with no scan.
+    scanPuts(0, puts, &out.idle, nullptr);
+    Result hd = head("WXF");
+    h->result(hd);
+    if (hd.status != P4_OK || hd.rows.size() != 1) return;
+    const int64_t through = hd.i(0, "through");
+    std::atomic<bool> done{false};
+    std::thread writer([&] { scanPuts(1000000, puts, &out.during, &done); });
+    const uint64_t t0 = flatsql::ps::monoNs();
+    int64_t after = 0;
+    for (;;) {
+        TlvW w;
+        w.text(1, "WXF").u8(2, 1).u64(3, 50000).u8(5, P4_ORDER_SEQ_ASC).i64(7, through).text(11, kProvider).text(12, kBig);
+        if (after) w.i64(6, after);
+        CallOpts o;
+        o.cls = P4_CLASS_BULK;
+        o.timeoutMs = 600000;
+        // A slow consumer (the node's JSON encoding): the page's ring fills
+        // and the engine waits for room while the writer keeps writing.
+        const uint32_t slot = submit(P4_OPC_SCAN, w.b, o);
+        if (const int64_t stall = argInt("scan-stall-ms", 0)) flatsql::ps::sleepNs(uint64_t(stall) * 1000000ull);
+        Result r = wait(slot, o.timeoutMs);
+        (*ops)++;
+        out.pages++;
+        const bool last = r.status != P4_OK || r.rows.size() < 50000;
+        for (size_t i = 0; i < r.rows.size(); i++) after = std::max(after, r.i(i, "seq"));
+        for (const auto& row : r.rows)
+            for (const auto& c : row) out.bytes += int64_t(c.s.size());
+        *rows += int64_t(r.rows.size());
+        h->result(r);  // streamed: a page is ~430 MB of records
+        if (last) break;
+    }
+    out.scanMs = double(flatsql::ps::monoNs() - t0) / 1e6;
+    out.records = *rows;
+    done.store(true);
+    writer.join();
 }
 
 // ---- the speed of light ------------------------------------------------------------------------------
@@ -1411,7 +1477,28 @@ void runOne(const std::string& root, const std::string& workload) {
     }
     const Probe probe = probeOf(readGp(argStr("gp", "")), int(argInt("probes", 200)));
     auto it = reads().find(workload);
-    if (it != reads().end()) {
+    if (workload == "scan_all") {
+        ScanAll sa;
+        scanAllOut = &sa;
+        Hash sh;
+        c.start();
+        wScanAll(probe, &sh, &rows, &ops);
+        c.stop();
+        scanAllOut = nullptr;
+        emit(workload, "cold", c, sh, rows, ops);
+        auto pct = [](std::vector<double> v, double q) {
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            return v[std::min(v.size() - 1, size_t(q * double(v.size())))];
+        };
+        std::printf("REPLAY_SCAN {\"records\":%lld,\"pages\":%lld,\"bytes\":%lld,\"scan_ms\":%.1f,\"records_per_s\":%.0f,"
+                    "\"put_idle_n\":%zu,\"put_idle_p50\":%.2f,\"put_idle_p99\":%.2f,\"put_scan_n\":%zu,\"put_scan_p50\":%.2f,"
+                    "\"put_scan_p99\":%.2f,\"put_scan_max\":%.2f}\n",
+                    (long long)sa.records, (long long)sa.pages, (long long)sa.bytes, sa.scanMs,
+                    sa.scanMs > 0 ? double(sa.records) * 1000.0 / sa.scanMs : 0.0, sa.idle.size(), pct(sa.idle, 0.5),
+                    pct(sa.idle, 0.99), sa.during.size(), pct(sa.during, 0.5), pct(sa.during, 0.99), pct(sa.during, 1.0));
+        std::fflush(stdout);
+    } else if (it != reads().end()) {
         const int passes = std::max(1, int(argInt("passes", 1)));
         for (int pass = 0; pass < passes; pass++) {
             Hash ph;
