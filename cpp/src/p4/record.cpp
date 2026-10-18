@@ -1,31 +1,10 @@
-// Store format 4: a record's rows in one feed file (CONTRACT C-37, C-38),
-// and how a write changes and commits them (BRIEF4: the bytes in the feed's
-// stream, the rows in its index).
-//
-// A record of a feed file is found by its CID (the file's one CID index) or
-// its seq; its rows are one rid range of that file (rid = seq << 16 | n):
-// every copy (producer token) appears with every instance (batch, content
-// key, producer peer and key) of the feed; a local record (no source) has one
-// row per copy. Every row points at its bytes' frame in the feed's stream;
-// the rows of a record whose bytes are the same share one frame. A write
-// loads the records it touches, changes their rows, then commits:
-//   1. the type index (synchronous=FULL), only when the write uses a feed or
-//      a producer token the registry does not hold yet (the writer, before
-//      any file of a new feed exists);
-//   2. each feed, feeds before local: its new frames appended to its stream
-//      (a new feed's index file made before its first frame) and synced,
-//      then its index file in one transaction (rows, the file's
-//      counters, its instances' and tokens' counters, its ingest identities,
-//      the moves it takes in, and the stream's new mark).
-// There is no ingest journal: a feed file's transaction is the whole truth
-// about that feed. Its new rows are staged (m=0: not in r_c, r_ke, r_w until
-// the indexer merges them, staged.cpp) and its ingest identities go to idst,
-// so the transaction writes appended pages only; the feed's view of staged
-// rows is published after the commit, before the ack. The one write that spans two files with one record is a
-// move (a local record taken into a feed): the feed's transaction records the
-// seq in its `moved` table, and open finishes a move a crash cut (the local
-// rows of the seq go once the feed holds it).
+// Store format 5: the stream commits each record's rows and provenance in
+// sibling SDS metadata frames. SQLite is a derived, staged index. Planning
+// assigns seqs and rids; the indexer appends each complete round, syncs its
+// touched streams, commits the indexes at NORMAL, then publishes the views.
+// Local-to-feed moves persist MOVED_IN first and MOVED_OUT in local second.
 #include <algorithm>
+#include <future>
 
 #include "internal.h"
 
@@ -376,6 +355,8 @@ void WriteCtx::fill(RecState* r) {
             n.sig = c.sig;
             n.fcols = c.fcols;
             n.sealed = c.sealed;
+            n.commitFlags = FmbCopy;
+            n.deliveryGroup = c.deliveryGroup;
             n.off = c.off;  // a frame already in this file (a loaded row's), or -1
             if (c.hasD) {
                 n.hasD = true;
@@ -415,6 +396,8 @@ void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& i
         n.sig = rep.sig;
         n.fcols = rep.fcols;
         n.sealed = rep.sealed;
+        n.commitFlags = r->existed ? ((!copyAt ? FmbCopy : 0) | (stamp ? FmbRetag : 0)) : 0;
+        n.deliveryGroup = copy.deliveryGroup;
         n.off = rep.off;  // a frame already in this file, or -1
         if (rep.hasD) {
             n.hasD = true;
@@ -477,19 +460,19 @@ void WriteCtx::deliver(RecState* r, const RowR& copy, const std::vector<Inst>& i
     fill(r);
 }
 
-void WriteCtx::dropAll(RecState* r) {
+void WriteCtx::dropAll(RecState* r, uint8_t reason) {
     for (RowR& x : r->rows)
         if (x.live()) {
             x.del = true;
+            x.removeReason = reason;
             r->touched = true;
         }
     sweep(r);
 }
 
 // ---- commit ---------------------------------------------------------------------------------------
-// New feeds and producer tokens go into the type index while the writer
-// plans, before any file of a new feed exists: every feed file on disk then
-// belongs to a registered feed, which a reopen opens and recovers.
+// Cache new feed and token ids while planning. Their durable definitions
+// live in genesis and FMB dictionary frames; this registry uses NORMAL.
 int32_t WriteCtx::registryWrite() {
     std::vector<Feed*> feeds;
     std::vector<std::pair<uint32_t, TokDef>> toks;
@@ -621,6 +604,7 @@ int32_t WriteCtx::frames(Feed* f, const std::vector<RecState*>& recs, std::strin
             }
             if (reuse) continue;
             x.off = end + int64_t(out->size());
+            x.newFrame = true;
             uint8_t p[4];
             st32(p, uint32_t(x.len));
             out->append(reinterpret_cast<const char*>(p), 4);
@@ -704,7 +688,8 @@ uint32_t internBatch(DictTxn& dt, Feed* f, Conn* c, const RowR& x, int* rc) {
 }
 
 // A content key's or url's id in the file (0 for "").
-uint32_t internText(Conn* c, StmtId get, StmtId ins, const std::string& s, int* rc) {
+uint32_t internText(Conn* c, StmtId get, StmtId ins, const std::string& s, int* rc,
+                    FmbCommit* metadata = nullptr, uint8_t kind = 0) {
     if (s.empty()) return 0;
     sqlite3_stmt* q = c->get(get);
     if (!q) {
@@ -733,7 +718,9 @@ uint32_t internText(Conn* c, StmtId get, StmtId ins, const std::string& s, int* 
         *rc = r;
         return 0;
     }
-    return uint32_t(sqlite3_last_insert_rowid(c->db));
+    id = uint32_t(sqlite3_last_insert_rowid(c->db));
+    if (metadata) metadata->dictionary.push_back(FmbEntry{kind, id, {s}});
+    return id;
 }
 
 // A record's copies over its rows (loaded = before, live = after): token ->
@@ -817,30 +804,12 @@ bool WriteCtx::fileChanges(uint32_t fid) const {
     return false;
 }
 
-// A feed's first frame: its index file comes first (the feed is registered
-// already). writerPin creates it durably, directory entry included, and
-// commits its schema with mark 0. A stream is then never without its index
-// unless the index was lost, and open cuts the frames past the index's mark
-// (never acknowledged) instead of indexing them as records with blank
-// provenance (GATES-stream-r1 B1).
-int32_t WriteCtx::fileCreate(Feed* f) {
-    {
-        std::lock_guard<std::mutex> g(t->mu);
-        if (f->created) return P4_OK;
-        if (migrate) f->indexed = false;  // a migration: REBUILD 1 adds the secondary indexes
-    }
-    int32_t st = P4_OK;
-    std::string er;
-    if (!writerPin(e, f, &st, &er)) {
-        err = "create " + f->path + ": " + er;
-        return st;
-    }
-    writerUnpin(e, f);
-    return P4_OK;
-}
-
 int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
     x.f = f;
+    if (migrate) {
+        std::lock_guard<std::mutex> g(t->mu);
+        if (!f->created) f->indexed = false;
+    }
     int32_t status = P4_OK;
     std::string er;
     x.c = writerPin(e, f, &status, &er);
@@ -863,15 +832,13 @@ int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
         x.k = f->k;
         x.tokc = f->tokc;
         x.indexed = f->indexed;
-        x.clearMoved = f->movedRows && f->movedDone;
         x.newEnd = f->mark;
+        x.previous = f->lastCommit;
         x.stBase = f->staged;
     }
     x.tokcBefore = x.tokc;
     x.rc = x.c->exec("BEGIN IMMEDIATE");
     x.open = true;
-    // The finished moves go; the round's are recorded with its rows.
-    if (x.rc == SQLITE_OK && x.clearMoved) x.rc = x.c->exec("DELETE FROM moved");
     return x.rc == SQLITE_OK ? P4_OK : statusOfSqlite(x.rc);
 }
 
@@ -894,28 +861,49 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
             return P4_E_INTERNAL;
         }
     }
-    auto ne = newEnd_.find(f->fid);
-    if (ne != newEnd_.end()) x.newEnd = std::max(x.newEnd, ne->second);
+    // The indexer alone owns stream appends. Planning keeps bytes for rows
+    // whose predecessor has not yet assigned a frame; resolve those stable
+    // rids now that preceding units have applied to this transaction.
+    for (RecState* r : recs)
+        for (RowR& y : r->rows) {
+            if (!y.loaded || y.off >= 0) continue;
+            sqlite3_stmt* q = c->get(S_R_FRAME);
+            if (!q) return P4_E_INTERNAL;
+            sqlite3_bind_int64(q, 1, y.rid);
+            const int rc = sqlite3_step(q);
+            if (rc == SQLITE_ROW) {
+                y.off = sqlite3_column_int64(q, 0);
+                y.len = sqlite3_column_int64(q, 1);
+            }
+            sqlite3_reset(q);
+            if (rc != SQLITE_ROW) return rc == SQLITE_DONE ? P4_E_CORRUPT : statusOfSqlite(rc);
+        }
+    int32_t frameStatus = P4_OK;
+    std::shared_ptr<Stream> stream = streamCur(f, &frameStatus);
+    if (!stream) return frameStatus;
+    const int64_t oldEnd = f->end;
+    if (x.recordStart < 0) x.recordStart = oldEnd;
+    newEnd_[f->fid] = oldEnd;
+    x.previous = f->lastCommit;
+    std::string framed;
+    frameStatus = frames(f, recs, &framed, oldEnd);
+    if (frameStatus == P4_OK && !framed.empty())
+        frameStatus = streamWrite(stream.get(), oldEnd, reinterpret_cast<const uint8_t*>(framed.data()), framed.size());
+    if (frameStatus != P4_OK) return frameStatus;
+    f->end = oldEnd + int64_t(framed.size());
+    newEnd_[f->fid] = f->end;
+    x.newEnd = f->end;
+    x.metadata.committedAt = now;
+    {
+        std::lock_guard<std::mutex> g(t->mu);
+        x.metadata.typeSeqHigh = uint64_t(t->nextSeq - 1);
+    }
     int& rc = x.rc;
     Counters& k = x.k;
     auto bad = [&](int r) {
         if (rc == SQLITE_OK && r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) rc = r;
     };
     auto mv = movesIn_.find(f->fid);
-    if (mv != movesIn_.end()) {
-        x.moves = true;
-        for (int64_t seq : mv->second) {
-            if (rc != SQLITE_OK) break;
-            sqlite3_stmt* q = c->get(S_MOVED_INS);
-            if (!q) {
-                rc = SQLITE_ERROR;
-                break;
-            }
-            sqlite3_bind_int64(q, 1, seq);
-            bad(sqlite3_step(q));
-            sqlite3_reset(q);
-        }
-    }
     // Rows an earlier write of the round or a previous unit added (this
     // write's seed) carry no file ids yet: their instance's ids are looked up.
     for (RecState* r : recs)
@@ -923,7 +911,7 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
             if (rc != SQLITE_OK) break;
             if (!y.loaded || !y.inst || y.bId) continue;
             y.bId = internBatch(x.dict, f, c, y, &rc);
-            y.cId = internText(c, S_CKEY_GET, S_CKEY_INS, y.ckey, &rc);
+            y.cId = internText(c, S_CKEY_GET, S_CKEY_INS, y.ckey, &rc, &x.metadata, 3);
         }
     std::vector<RecState*> sorted = recs;
     std::sort(sorted.begin(), sorted.end(), [](RecState* a, RecState* b) { return a->seq < b->seq; });
@@ -934,6 +922,15 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
         for (RowR& y : r->rows) {
             if (rc != SQLITE_OK) break;
             if (y.loaded && y.del) {
+                auto& pending = x.metadata.rows;
+                pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const FmbRow& row) {
+                    return row.seq == uint64_t(r->seq) && row.rowJ == uint16_t(y.rid & 0xffff);
+                }), pending.end());
+                auto& urls = x.metadata.urls;
+                urls.erase(std::remove_if(urls.begin(), urls.end(), [&](const FmbUrl& url) {
+                    return url.seq == uint64_t(r->seq) && url.rowJ == uint32_t(y.rid & 0xffff);
+                }), urls.end());
+                x.metadata.removals.push_back(FmbRemove{uint64_t(r->seq), uint32_t(y.rid & 0xffff), y.removeReason});
                 sqlite3_stmt* q = c->get(S_R_DEL);
                 sqlite3_bind_int64(q, 1, y.rid);
                 bad(sqlite3_step(q));
@@ -942,7 +939,8 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
                 // A staged row leaves the view (one this round staged, or the base's).
                 if (!x.stAdd.erase(y.rid)) x.stDrop.push_back(y.rid);
             } else if (y.loaded && y.urlSet) {
-                y.uId = internText(c, S_URL_GET, S_URL_INS, y.url, &rc);
+                y.uId = internText(c, S_URL_GET, S_URL_INS, y.url, &rc, &x.metadata, 4);
+                x.metadata.urls.push_back(FmbUrl{uint64_t(r->seq), uint32_t(y.rid & 0xffff), y.uId});
                 sqlite3_stmt* q = c->get(S_R_URL);
                 sqlite3_bind_int64(q, 1, y.rid);
                 sqlite3_bind_int64(q, 2, y.uId);
@@ -962,8 +960,8 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
                 }
                 y.nId = internNode(x.dict, f, c, producer, y.peer, &rc);
                 y.bId = y.inst ? internBatch(x.dict, f, c, y, &rc) : 0;
-                y.cId = y.inst ? internText(c, S_CKEY_GET, S_CKEY_INS, y.ckey, &rc) : 0;
-                y.uId = y.inst ? internText(c, S_URL_GET, S_URL_INS, y.url, &rc) : 0;
+                y.cId = y.inst ? internText(c, S_CKEY_GET, S_CKEY_INS, y.ckey, &rc, &x.metadata, 3) : 0;
+                y.uId = y.inst ? internText(c, S_URL_GET, S_URL_INS, y.url, &rc, &x.metadata, 4) : 0;
                 if (rc != SQLITE_OK) break;
                 if (y.off < 0) {
                     rc = SQLITE_INTERNAL;  // frames() gives every new row its frame
@@ -1195,8 +1193,197 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
         err = std::string(sqlite3_errmsg(c->db)) + " (" + std::to_string(rc) + ") " + f->path;
         return statusOfSqlite(rc);
     }
+    // Persist the semantic rows, in input plan order. The codec owns the SDS
+    // byte layout; this layer owns the ids and the row semantics.
+    for (RecState* r : recs) {
+        for (RowR& y : r->rows) {
+            if (y.loaded || y.del) continue;
+            const auto groupKey = std::make_tuple(y.deliveryGroup, y.at, y.nId, y.bId, y.cId, y.uId);
+            auto gi = x.groups.find(groupKey);
+            if (gi == x.groups.end()) {
+                const uint32_t id = uint32_t(x.metadata.groups.size());
+                x.metadata.groups.push_back(FmbGroup{y.at, y.nId, y.bId, y.cId, y.uId});
+                gi = x.groups.emplace(groupKey, id).first;
+            }
+            FmbRow row;
+            row.offset = uint64_t(y.off);
+            row.seq = uint64_t(r->seq);
+            row.sourceTs = y.ts;
+            row.length = uint32_t(y.len);
+            row.group = gi->second;
+            row.rowJ = uint16_t(y.rid & 0xffff);
+            row.flags = y.commitFlags | (y.newFrame ? FmbNewFrame : 0) | (y.sealed ? FmbSealed : 0) |
+                        (y.len > 1048576 ? FmbLarge : 0);
+            if (mv != movesIn_.end() && std::find(mv->second.begin(), mv->second.end(), r->seq) != mv->second.end())
+                row.flags |= FmbMovedIn;
+            cidDigestFromKey(r->key, row.digest.data());
+            row.signature = y.sig;
+            if (y.sealed) {
+                row.columns = y.fcols;
+                row.epoch = r->hasE ? r->e : INT64_MIN;
+                if (r->k.type) {
+                    sqlite3_stmt* q = c->sql("SELECT id FROM okey WHERE k=?1");
+                    if (!q) return P4_E_INTERNAL;
+                    r->k.bind(q, 1);
+                    const int qr = sqlite3_step(q);
+                    if (qr == SQLITE_ROW) row.objectKey = uint32_t(sqlite3_column_int64(q, 0));
+                    sqlite3_reset(q);
+                    if (qr != SQLITE_ROW) return P4_E_CORRUPT;
+                    if (x.objectKeys.insert(row.objectKey).second) {
+                        std::lock_guard<std::mutex> g(t->mu);
+                        if (!f->streamObjects.count(row.objectKey)) {
+                            const std::string text = (r->k.type == 1 ? "i" : "s") + r->k.text();
+                            x.metadata.dictionary.push_back(FmbEntry{5, row.objectKey, {text}});
+                        }
+                    }
+                }
+                if (!y.hasD) {
+                    const int32_t st = streamRead(stream.get(), y.off, y.len, &y.d);
+                    if (st != P4_OK) return st;
+                    y.hasD = true;
+                }
+                ps::sha256(reinterpret_cast<const uint8_t*>(y.d.data()), y.d.size(), row.leafDigest.data());
+            }
+            for (const IdentNew& identity : idents)
+                if (identity.rec == r) row.identity.assign(reinterpret_cast<const char*>(identity.h), 32);
+            x.metadata.rows.push_back(std::move(row));
+            if (x.tokens.insert(y.tok).second) {
+                std::lock_guard<std::mutex> g(t->mu);
+                if (!f->streamTokens.count(y.tok))
+                    if (const TokDef* td = t->tokById(y.tok))
+                        x.metadata.dictionary.push_back(FmbEntry{0, y.tok, {td->token, td->peer}});
+            }
+        }
+    }
     return P4_OK;
 }
+
+namespace {
+// Large rounds must interleave their record chunks and metadata: a later
+// FMB cannot claim NEW_FRAME bytes before the preceding commit point. The
+// same rewrite puts removal-only metadata before a round's replacement rows.
+// Only the unsynced tail is rewritten; acknowledged ranges never move.
+int32_t appendChunkedMetadata(FileTxn& x, Stream* stream) {
+    FmbCommit& metadata = x.metadata;
+    std::map<uint64_t, std::string> frames;
+    for (const FmbRow& row : metadata.rows) {
+        if (row.offset < uint64_t(x.recordStart) || frames.count(row.offset)) continue;
+        std::string bytes;
+        const int32_t st = streamRead(stream, int64_t(row.offset), row.length, &bytes, true);
+        if (st != P4_OK) return st;
+        frames.emplace(row.offset, std::move(bytes));
+    }
+    x.newEnd = x.recordStart;
+    bool dictionaryWritten = false;
+    if (!metadata.removals.empty()) {
+        FmbCommit removals;
+        removals.committedAt = metadata.committedAt;
+        removals.typeSeqHigh = metadata.typeSeqHigh;
+        removals.dictionary = metadata.dictionary;
+        removals.removals = metadata.removals;
+        const int64_t before = x.newEnd;
+        const int32_t st = streamAppendCommit(x.f, stream, removals, &x.newEnd, &x.previous);
+        if (st != P4_OK) return st;
+        x.metadataBytes += x.newEnd - before;
+        dictionaryWritten = true;
+    }
+    std::map<uint64_t, uint64_t> offsets;
+    for (size_t at = 0; at < metadata.rows.size(); at += 65536) {
+        FmbCommit part;
+        part.committedAt = metadata.committedAt;
+        part.typeSeqHigh = metadata.typeSeqHigh;
+        if (!dictionaryWritten) {
+            part.dictionary = metadata.dictionary;
+            dictionaryWritten = true;
+        }
+        const size_t count = std::min<size_t>(65536, metadata.rows.size() - at);
+        std::map<uint32_t, uint32_t> groups;
+        for (size_t j = 0; j < count; ++j) {
+            FmbRow row = metadata.rows[at + j];
+            const uint64_t oldOffset = row.offset;
+            row.flags &= ~FmbNewFrame;
+            if (oldOffset >= uint64_t(x.recordStart)) {
+                auto oi = offsets.find(oldOffset);
+                if (oi == offsets.end()) {
+                    oi = offsets.emplace(oldOffset, uint64_t(x.newEnd)).first;
+                    const std::string& bytes = frames.at(oldOffset);
+                    const int32_t st = streamWrite(stream, x.newEnd, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+                    if (st != P4_OK) return st;
+                    x.newEnd += int64_t(bytes.size());
+                    row.flags |= FmbNewFrame;
+                }
+                row.offset = oi->second;
+            }
+            auto gi = groups.find(row.group);
+            if (gi == groups.end()) {
+                gi = groups.emplace(row.group, uint32_t(part.groups.size())).first;
+                part.groups.push_back(metadata.groups.at(row.group));
+            }
+            row.group = gi->second;
+            // Rids stay fixed, including in pending units' immutable plans.
+            sqlite3_stmt* q = x.c->sql("UPDATE r SET off=?1 WHERE rid=?2");
+            if (!q) return P4_E_INTERNAL;
+            sqlite3_bind_int64(q, 1, int64_t(row.offset));
+            sqlite3_bind_int64(q, 2, int64_t(row.seq << 16) | row.rowJ);
+            const int rc = sqlite3_step(q);
+            sqlite3_reset(q);
+            if (rc != SQLITE_DONE) return statusOfSqlite(rc);
+            part.rows.push_back(std::move(row));
+        }
+        if (at + count == metadata.rows.size()) part.urls = metadata.urls;
+        const int64_t before = x.newEnd;
+        const int32_t st = streamAppendCommit(x.f, stream, part, &x.newEnd, &x.previous);
+        if (st != P4_OK) return st;
+        x.metadataBytes += x.newEnd - before;
+    }
+    return streamTruncate(stream, x.newEnd, false);
+}
+
+int32_t appendMetadata(FileTxn& x, std::string* err) {
+    if (x.metadataAppended) return P4_OK;
+    for (size_t i = 0; i < x.dict.add.node.size(); ++i) {
+        const NodeDef& d = x.dict.add.node[i];
+        x.metadata.dictionary.push_back(FmbEntry{1, x.dict.node0 + uint32_t(i + 1), {d.producer, d.peer}});
+    }
+    for (size_t i = 0; i < x.dict.add.batch.size(); ++i) {
+        const BatchDef& d = x.dict.add.batch[i];
+        x.metadata.dictionary.push_back(FmbEntry{2, x.dict.batch0 + uint32_t(i + 1), {d.batch, d.ppeer, d.pkey}});
+    }
+    int32_t st = P4_OK;
+    std::shared_ptr<Stream> stream = streamCur(x.f, &st);
+    if (stream) {
+        if (x.metadata.rows.size() > 65536 || (!x.metadata.removals.empty() && !x.metadata.rows.empty()))
+            st = appendChunkedMetadata(x, stream.get());
+        else {
+            const int64_t before = x.newEnd;
+            st = streamAppendCommit(x.f, stream.get(), x.metadata, &x.newEnd, &x.previous);
+            if (st == P4_OK) x.metadataBytes += x.newEnd - before;
+        }
+    }
+    if (st != P4_OK) {
+        *err = "metadata append " + streamPath(x.f, x.f->gen);
+        return st;
+    }
+    x.f->end = x.newEnd;
+    x.metadataAppended = true;
+    return P4_OK;
+}
+
+int32_t syncTransaction(Engine* e, FileTxn& x, std::string* err) {
+    if (x.streamSynced) return P4_OK;
+    int32_t st = appendMetadata(x, err);
+    if (st != P4_OK) return st;
+    std::shared_ptr<Stream> stream = streamCur(x.f, &st);
+    if (stream) st = streamSync(stream.get());
+    if (st != P4_OK) {
+        *err = "stream sync " + streamPath(x.f, x.f->gen);
+        return st;
+    }
+    e->bump(kStJournalSyncs);
+    x.streamSynced = true;
+    return P4_OK;
+}
+}  // namespace
 
 // The round's transaction of x.f: the stream synced first (the frames the
 // round's writes appended), then the instances, tokens, bounds and meta
@@ -1208,23 +1395,14 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
     auto bad = [&](int r) {
         if (rc == SQLITE_OK && r != SQLITE_OK && r != SQLITE_DONE && r != SQLITE_ROW) rc = r;
     };
-    int64_t oldMark;
-    {
-        std::lock_guard<std::mutex> g(t->mu);
-        oldMark = f->mark;
-    }
-    if (rc == SQLITE_OK && x.newEnd > oldMark) {
-        int32_t st = P4_OK;
-        std::shared_ptr<Stream> stream = streamCur(f, &st);
-        if (stream) st = streamSync(stream.get());
+    if (rc == SQLITE_OK) {
+        const int32_t st = syncTransaction(e, x, err);
         if (st != P4_OK) {
-            *err = "stream sync " + streamPath(f, f->gen);
             c->exec("ROLLBACK");
             writerUnpin(e, f);
             x.open = false;
             return st;
         }
-        e->bump(kStJournalSyncs);
     }
     Counters& k = x.k;
     for (const auto& kv : x.inst.changed) {
@@ -1326,6 +1504,31 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
         }
     }
     if (rc == SQLITE_OK) rc = writeMeta(c, k, nowSec(), x.newEnd, f->gen);
+    if (rc == SQLITE_OK) {
+        sqlite3_stmt* q = c->get(S_META_SET);
+        if (!q) rc = SQLITE_ERROR;
+        else {
+            sqlite3_bind_text(q, 1, "commit", -1, SQLITE_STATIC);
+            sqlite3_bind_int64(q, 2, int64_t(x.previous));
+            const int qr = sqlite3_step(q);
+            sqlite3_reset(q);
+            if (qr != SQLITE_DONE) rc = qr;
+        }
+    }
+    std::set<uint32_t> cacheTokens, cacheObjects;
+    std::set<int64_t> cacheMoves;
+    uint64_t cacheHigh = 0;
+    {
+        std::lock_guard<std::mutex> lock(t->mu);
+        cacheTokens = f->streamTokens; cacheObjects = f->streamObjects; cacheMoves = f->streamMoves;
+        cacheHigh = std::max(f->streamHigh, x.metadata.typeSeqHigh);
+    }
+    cacheTokens.insert(x.tokens.begin(), x.tokens.end());
+    cacheObjects.insert(x.objectKeys.begin(), x.objectKeys.end());
+    for (const auto& row : x.metadata.rows) if (row.flags & FmbMovedIn) cacheMoves.insert(int64_t(row.seq));
+    if (rc == SQLITE_OK)
+        rc = writeStreamCache(c, f, x.newEnd, x.previous, f->metadataBytes + x.metadataBytes,
+                              cacheHigh, cacheTokens, cacheObjects, cacheMoves);
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     x.open = false;
     if (rc != SQLITE_OK) {
@@ -1359,17 +1562,18 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
         f->freeBytes = freeBytes;
     }
     f->mark = x.newEnd;
+    f->lastCommit = x.previous;
+    f->streamHigh = cacheHigh;
+    f->metadataBytes += x.metadataBytes;
+    f->streamTokens = std::move(cacheTokens);
+    f->streamObjects = std::move(cacheObjects);
+    f->streamMoves = std::move(cacheMoves);
     f->streamBytes = x.newEnd;
     if (stChanged) stagedPublish(e, f, x.stNew, !x.stAdd.empty() || !x.idAdd.empty());
     f->k = k;
     x.inst.publish(f);
     f->tokc = std::move(x.tokc);
     f->created = true;
-    if (x.clearMoved) f->movedRows = false;
-    if (x.moves) {
-        f->movedRows = true;
-        f->movedDone = false;  // until the local file's commit takes the moved rows
-    }
     return P4_OK;
 }
 
@@ -1382,8 +1586,12 @@ int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* 
     std::map<Feed*, FileTxn> txns;
     std::vector<Feed*> feeds, locals;
     int32_t first = P4_OK;
+    const int64_t roundNow = nowSec();
     for (WriteCtx* w : units) {
         if (first != P4_OK) break;
+        // FMB carries one clock for the complete round. Use it for every
+        // instance update and removal restamp in the derived index too.
+        w->now = roundNow;
         for (uint32_t fid : w->files()) {
             if (!w->fileChanges(fid)) continue;
             Feed* f;
@@ -1409,6 +1617,31 @@ int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* 
         }
     }
     std::set<Feed*> committed;
+    // Different streams sync concurrently. A move's destination streams
+    // are durable before the local removal is even appended.
+    auto syncFeeds = [&](const std::vector<Feed*>& fs) {
+        if (first != P4_OK) return;
+        if (fs.size() == 1) {
+            first = syncTransaction(e, txns[fs.front()], err);
+            return;
+        }
+        std::vector<std::future<std::pair<int32_t, std::string>>> waits;
+        for (Feed* f : fs)
+            waits.push_back(std::async(std::launch::async, [&, f] {
+                std::string why;
+                const int32_t st = syncTransaction(e, txns.at(f), &why);
+                return std::make_pair(st, std::move(why));
+            }));
+        for (auto& wait : waits) {
+            auto result = wait.get();
+            if (first == P4_OK && result.first != P4_OK) {
+                first = result.first;
+                *err = std::move(result.second);
+            }
+        }
+    };
+    syncFeeds(feeds);
+    syncFeeds(locals);
     feeds.insert(feeds.end(), locals.begin(), locals.end());
     for (Feed* f : feeds) {
         FileTxn& x = txns[f];
@@ -1423,16 +1656,6 @@ int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* 
         first = fileCommit(e, f->type, x, err);
         if (first == P4_OK) committed.insert(f);
     }
-    // Every local file committed: the moves into the feeds are finished (the
-    // feeds' next commits drop their `moved` rows; open finishes the others).
-    bool localsOk = true;
-    for (Feed* f : locals) localsOk = localsOk && committed.count(f);
-    if (localsOk)
-        for (auto& kv : txns)
-            if (kv.second.moves && committed.count(kv.first)) {
-                std::lock_guard<std::mutex> g(kv.first->type->mu);
-                kv.first->movedDone = true;
-            }
     return first;
 }
 
@@ -1500,53 +1723,10 @@ int32_t WriteCtx::prepare() {
         for (RowR& x : r->rows)
             if (!x.loaded && !x.del) x.rid = next++;
     }
-    // New feeds and tokens registered, then frames appended to each feed's
-    // stream at its end (the writer's offset, past the frames of a unit still
-    // being applied); the apply syncs them.
+    // Planning never writes the stream: the indexer appends a complete round
+    // and its metadata as one contiguous commit unit.
     newEnd_.clear();
-    oldEnd_.clear();
     if (const int32_t rc = registryWrite()) return rc;
-    for (uint32_t fid : fileOrder_) {
-        Feed* f;
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            f = t->feedById(fid);
-        }
-        std::vector<RecState*> recs;
-        for (RecState* r : order_)
-            if (r->touched && r->fid == fid && r->seq) recs.push_back(r);
-        const int64_t oldEnd = f->end;
-        std::string fr;
-        int32_t st = frames(f, recs, &fr, oldEnd);
-        if (st == P4_OK && !fr.empty()) st = fileCreate(f);
-        if (st == P4_OK && !fr.empty()) {
-            std::shared_ptr<Stream> stream = streamCur(f, &st);
-            if (stream) st = streamWrite(stream.get(), oldEnd, reinterpret_cast<const uint8_t*>(fr.data()), fr.size());
-            if (st != P4_OK) {
-                err = "stream append " + streamPath(f, f->gen);
-                if (stream) streamTruncate(stream.get(), oldEnd, false);
-            }
-        }
-        if (st != P4_OK) {
-            // This write's frames so far go (a pending unit's stay below them).
-            for (auto& kv : oldEnd_) {
-                Feed* g2;
-                {
-                    std::lock_guard<std::mutex> g(t->mu);
-                    g2 = t->feedById(kv.first);
-                }
-                int32_t s2 = P4_OK;
-                std::shared_ptr<Stream> stream = g2 ? streamCur(g2, &s2) : nullptr;
-                if (stream) streamTruncate(stream.get(), kv.second, false);
-                if (g2) g2->end = kv.second;
-            }
-            newEnd_.clear();
-            return st;
-        }
-        oldEnd_[fid] = oldEnd;
-        f->end = oldEnd + int64_t(fr.size());
-        newEnd_[fid] = f->end;
-    }
     snapshot();
     return P4_OK;
 }
@@ -1580,10 +1760,13 @@ void WriteCtx::snapshot() {
             RowR y = x;
             if (!x.loaded) y.nId = y.bId = y.cId = y.uId = 0;
             y.loaded = true;
-            y.hasD = false;
-            y.d.clear();
-            y.srcFid = 0;
-            y.srcRid = 0;
+            if (y.off >= 0) {
+                y.hasD = false;
+                y.d.clear();
+                y.srcFid = 0;
+                y.srcRid = 0;
+            }
+            y.newFrame = false;
             y.urlSet = false;
             y.stamp = false;
             s.rows.push_back(std::move(y));

@@ -42,6 +42,7 @@
 #include "flatsql/flatsql_io.h"
 #include "internal.h"
 #include "p4/p4_test.h"
+#include "p4/frame_walk.h"
 
 using namespace p4t;
 namespace fp = flatsql::p4;
@@ -102,18 +103,14 @@ std::string walkStream(const std::string& path, std::map<int64_t, int64_t>* fram
     size_t n;
     while ((n = std::fread(chunk, 1, sizeof chunk, fp)) > 0) b.insert(b.end(), chunk, chunk + n);
     std::fclose(fp);
-    size_t at = 0;
-    while (at < b.size()) {
-        if (b.size() - at < 4) return "a torn size prefix at " + std::to_string(at);
-        const uint32_t len = fp::ld32(&b[at]);
-        if (b.size() - at - 4 < len) return "a frame past the end at " + std::to_string(at);
-        const uint8_t* fb = &b[at + 4];
-        if (len < 8 || fp::ld32(fb) + 4 > len || std::memcmp(fb + 4, "$PNM", 4) != 0)
-            return "not a $PNM FlatBuffer at " + std::to_string(at);
-        (*frames)[int64_t(at)] = len;
-        at += 4 + len;
-    }
-    return "";
+    FrameWalk result;
+    const std::string why = walkFrames(b.size(), [&](uint64_t off, void* dst, size_t n) {
+        if (off > b.size() || n > b.size() - off) return false;
+        std::memcpy(dst, b.data() + off, n);
+        return true;
+    }, "$PNM", &result);
+    *frames = std::move(result.frames);
+    return why;
 }
 
 std::vector<std::string> partitionFiles(const std::string& root, const std::string& type) {

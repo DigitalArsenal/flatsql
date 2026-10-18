@@ -1,4 +1,4 @@
-// Store format 4: the store (markers, the type catalog, registration,
+// Store format 5: the store (markers, the type catalog, registration,
 // activation, stop, stats) and the feed / token registry.
 #include <algorithm>
 #include <cstdio>
@@ -45,6 +45,10 @@ int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::s
     if (!validTypeName(s->name)) { *err = "spec: bad type name " + s->name; return P4_E_ARG; }
     const Tlv* fid = tlvFind(v, 2);
     if (!fid || fid->n != 4) { *err = "spec: tag 2 (file identifier) must be 4 bytes"; return P4_E_ARG; }
+    if (!std::memcmp(fid->v, "$FMB", 4) || !std::memcmp(fid->v, "$FCK", 4) || !std::memcmp(fid->v, "$FSG", 4)) {
+        *err = "spec: FMB, FCK and FSG identifiers are reserved";
+        return P4_E_ARG;
+    }
     bool bad = false;
     uint32_t u32 = 0;
     uint64_t u64 = 0;
@@ -197,8 +201,8 @@ int32_t writeMarkers(Engine* e, const uint8_t uuid[16], uint64_t floor, uint32_t
 }
 
 bool markersActivated(const Markers& m) {
-    return m.storeValid && m.migratedValid && std::memcmp(m.uuid, m.migratedUuid, 16) == 0 && m.format == 4 &&
-           m.migratedFormat == 4;
+    return m.storeValid && m.migratedValid && std::memcmp(m.uuid, m.migratedUuid, 16) == 0 && m.format == 5 &&
+           m.migratedFormat == 5;
 }
 
 // The type index opened (made when absent), then every feed it names, before
@@ -236,6 +240,10 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
         int64_t n = 0;
         rc = rebuildFeed(t->e, t, f, &n, err);
         if (rc != P4_OK) return rc;
+        std::vector<int64_t> mv;
+        rc = feedOpen(t, f, &mv, err);
+        if (rc != P4_OK) return rc;
+        for (int64_t seq : mv) moved.push_back({f, seq});
     }
     if (!moved.empty()) {
         Feed* local;
@@ -266,7 +274,7 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
                     return st;
                 }
                 if (!r->existed) continue;
-                w.dropAll(r);
+                w.dropAll(r, 5);  // MOVED_OUT: finish the already durable feed-side move.
                 finished.push_back(m.second);
             }
             rc = w.commit();
@@ -287,7 +295,7 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
 
 // A registered type. Its T/ files are opened only when they exist: a type
 // that never had a write costs its .spec and nothing else.
-int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std::string* err) {
+int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std::string* err, bool fresh = false) {
     t->e = e;
     t->name = sp->name;
     t->spec_ = sp;
@@ -303,7 +311,12 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
         t->nextSeq = int64_t(e->cfg.gseqFloor);
         t->visRecompute();
     }
-    if (!ioExists(t->pIdx)) return P4_OK;
+    if (!ioExists(t->pIdx)) {
+        std::vector<std::string> streams;
+        if (fresh) return P4_OK;
+        if (!p4ListStreams(t->pDir, &streams)) { *err = "missing type index requires stream directory enumeration"; return P4_E_UNSUPPORTED; }
+        if (streams.empty()) return P4_OK;
+    }
     const int32_t rc = typeFilesOpen(t, err);
     if (rc != P4_OK) {
         // The caller deletes the type: nothing the open made may outlive it
@@ -456,14 +469,14 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     Markers& m = e->markers;
     rc = readMarkers(e, &m);
     if (rc != P4_OK) { *err = "markers: read failed"; return rc; }
-    if (m.storeValid && (m.format > 4 || m.layout > 1)) { *err = "STORE is a newer format or layout"; return P4_E_FORMAT; }
-    if (m.migratedValid && m.migratedFormat > 4) { *err = "MIGRATED is a newer format"; return P4_E_FORMAT; }
+    if (m.storeValid && (m.format != 5 || m.layout > 1)) { *err = "STORE has an unsupported format or layout (requires format 5)"; return P4_E_FORMAT; }
+    if (m.migratedValid && m.migratedFormat != 5) { *err = "MIGRATED has an unsupported format (requires format 5)"; return P4_E_FORMAT; }
     const std::string catalog = pathJoin(pathJoin(e->cfg.root, "T"), "TYPES");
     const std::vector<std::string> names = catalogRead(catalog);
     uint64_t floor = e->cfg.gseqFloor;
     switch (e->cfg.createMode) {
         case 0:
-            if (!markersActivated(m)) { *err = "not an activated format-4 store (STORE and MIGRATED)"; return P4_E_FORMAT; }
+            if (!markersActivated(m)) { *err = "not an activated format-5 store (STORE and MIGRATED)"; return P4_E_FORMAT; }
             floor = m.gseqFloor;
             break;
         case 1:
@@ -555,7 +568,7 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
     rc = catalogAppend(pathJoin(tdir, "TYPES"), spec->name);
     if (rc != P4_OK) { *err = "type catalog write failed"; return rc; }
     auto t = std::make_unique<Type>();
-    rc = openType(e, t.get(), spec, err);
+    rc = openType(e, t.get(), spec, err, true);
     if (rc != P4_OK) return rc;
     e->typeByName[spec->name] = t.get();
     e->types.push_back(std::move(t));
@@ -603,7 +616,7 @@ int32_t engineActivate(Engine* e, std::string* err) {
             // handler): retry until it is done.
             int log = 0, ck = 0, r = SQLITE_BUSY;
             for (int tries = 0; tries < 600; tries++) {
-                r = sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &log, &ck);
+                r = cacheCheckpoint(c->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, &log, &ck);
                 if ((r & 0xff) != SQLITE_BUSY && (r & 0xff) != SQLITE_LOCKED) break;
                 ps::sleepNs(50ull * 1000 * 1000);
             }

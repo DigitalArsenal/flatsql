@@ -38,6 +38,9 @@
 #include <wasi/api.h>
 #else
 #include <sys/resource.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <poll.h>
 #endif
 #if defined(__APPLE__)
 #include <sys/clonefile.h>
@@ -50,6 +53,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
+#include <random>
 #include <map>
 #include <set>
 #include <sstream>
@@ -64,12 +69,22 @@
 #include "internal.h"
 #include "p4/p4_test.h"
 #include "p4/wxf_fixture.h"
+#if __has_include("FMB/main_generated.h")
+#include "p4/frame_walk.h"
+#define P4_REPLAY_FORMAT5 1
+#else
+#define P4_REPLAY_FORMAT5 0
+#endif
 
 namespace flatsql {
 namespace p4 {
 const std::string& lastError();
 }  // namespace p4
 }  // namespace flatsql
+
+#if defined(P4_REPLAY_NATIVE_IO)
+uint64_t p4ReplayIoSyncs();
+#endif
 
 using namespace p4t;
 using namespace p4t::wxf;
@@ -151,14 +166,33 @@ struct Hash {
     }
 };
 
-// The engine's durable syncs: stream syncs (kStJournalSyncs) and index
-// commits (kStGroupCommits, each a WAL sync), the write workloads' bound.
+// Native counts every real host sync, including SQLite WAL calls. Historical
+// binaries and WASM retain their existing engine counters for comparison.
 uint64_t syncs() {
+#if defined(P4_REPLAY_NATIVE_IO)
+    return p4ReplayIoSyncs();
+#else
     const std::vector<uint64_t> v = stats();
     return v.size() > size_t(flatsql::p4::kStJournalSyncs)
-               ? v[flatsql::p4::kStJournalSyncs] + v[flatsql::p4::kStGroupCommits]
+               ? v[flatsql::p4::kStJournalSyncs] + (P4_REPLAY_FORMAT5 ? 0 : v[flatsql::p4::kStGroupCommits])
                : 0;
+#endif
 }
+
+// Each measured single-feed PUT must issue exactly one host sync. The
+// aggregate is also reported, but cannot hide a zero-sync/two-sync pair.
+struct CallSyncs {
+    bool enabled = false;
+    uint64_t calls = 0, min = UINT64_MAX, max = 0;
+    bool observe(uint64_t before) {
+        if (!enabled) return true;
+        const uint64_t count = syncs() - before;
+        calls++; min = std::min(min, count); max = std::max(max, count);
+        if (count != 1) std::fprintf(stderr, "single-feed PUT call=%llu syncs=%llu (expected 1)\n",
+            (unsigned long long)calls, (unsigned long long)count);
+        return count == 1;
+    }
+} callSyncs;
 
 struct Clock {
     uint64_t wall0 = 0, sync0 = 0;
@@ -195,9 +229,10 @@ struct Clock {
 
 void emit(const std::string& workload, const char* pass, const Clock& c, const Hash& h, int64_t rows, int64_t ops) {
     std::printf("REPLAY {\"workload\":\"%s\",\"pass\":\"%s\",\"wall_ms\":%.3f,\"cpu_ms\":%.3f,\"hash\":\"%s\",\"rows\":%lld,"
-                "\"ops\":%lld,\"syncs\":%llu,\"load\":%.2f}\n",
+                "\"ops\":%lld,\"syncs\":%llu,\"sync_calls\":%llu,\"sync_min\":%llu,\"sync_max\":%llu,\"load\":%.2f}\n",
                 workload.c_str(), pass, c.wallMs(), c.cpuMs(), h.hex().c_str(), (long long)rows, (long long)ops,
-                (unsigned long long)(syncs() - c.sync0), loadAvg());
+                (unsigned long long)(syncs() - c.sync0), (unsigned long long)callSyncs.calls,
+                (unsigned long long)(callSyncs.calls ? callSyncs.min : 0), (unsigned long long)callSyncs.max, loadAvg());
     std::fflush(stdout);
 }
 
@@ -272,7 +307,9 @@ std::vector<Batch> dayBatches(const std::vector<Gp>& recs, const std::string& da
 // The PUTs, every outcome into the hash.
 bool ingest(const std::vector<Batch>& batches, Hash* h, int64_t* ops) {
     for (const Batch& b : batches) {
+        const uint64_t before = callSyncs.enabled ? syncs() : 0;
         Result r = put(b);
+        if (!callSyncs.observe(before)) return false;
         if (r.status != P4_OK || r.rows.size() != b.recs.size()) {
             std::fprintf(stderr, "  ingest: PUT %d %s\n", r.status, r.err.c_str());
             return false;
@@ -467,7 +504,9 @@ void wLead(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
     const int64_t ts = kT0 + 5 * 86400;
     const int64_t tiles = argInt("lead-tiles", 512);
     for (int64_t tile = 0; tile < tiles; tile++) {
+        const uint64_t before = callSyncs.enabled ? syncs() : 0;
         Result r = put(tileBatch(kBig, "lead-tile-" + std::to_string(tile), "lead", tile, ts, values));
+        CHECK(callSyncs.observe(before), "one host sync for every single-feed PUT");
         h->result(r);
         (*ops)++;
         *rows += int64_t(r.rows.size());
@@ -682,6 +721,290 @@ void stock(const std::string& root, const std::string& workload, const Probe& p,
 }
 #endif
 
+#if !defined(__wasm__) && P4_REPLAY_FORMAT5
+// A stock SDS reader: all frame offsets, chain links and sha256 digests are
+// checked independently of FlatSQL's recovery/index code.
+bool walkStore(const std::string& root, bool emitStats) {
+    uint64_t rows = 0, bytes = 0, records = 0, commits = 0, streams = 0;
+    std::error_code ec;
+    for (const auto& file : std::filesystem::recursive_directory_iterator(root + "/P", ec)) {
+        if (file.path().extension() != ".fsdata") continue;
+        const int fd = ::open(file.path().c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        FrameWalk result;
+        const std::string why = walkFrames(file.file_size(), [&](uint64_t off, void* dst, size_t n) {
+            return ::pread(fd, dst, n, off_t(off)) == ssize_t(n);
+        }, "$" + file.path().parent_path().filename().string(), &result);
+        ::close(fd);
+        if (!why.empty()) {
+            std::fprintf(stderr, "stock frame walk %s: %s\n", file.path().c_str(), why.c_str());
+            return false;
+        }
+        rows += result.rows; bytes += result.metadataBytes; records += result.records;
+        commits += result.commits; streams++;
+    }
+    if (emitStats) std::printf("REPLAY_WALK streams=%llu records=%llu commits=%llu rows=%llu FMB_bytes=%llu FMB_bytes_per_row=%.3f PASS\n",
+        (unsigned long long)streams, (unsigned long long)records, (unsigned long long)commits,
+        (unsigned long long)rows, (unsigned long long)bytes, rows ? double(bytes) / rows : 0.0);
+    return !ec && streams > 0;
+}
+
+struct LeadAck { int tile = 0; std::vector<int64_t> seq; };
+Batch crashTile(int tile) {
+    Batch b = tileBatch(kBig, "crash-tile-" + std::to_string(tile), "crash", tile, kT0 + 5 * 86400,
+                        payloadOf(size_t(argInt("payload", 8616))));
+    b.at += tile;
+    for (size_t j = 0; j < b.recs.size(); j++) b.recs[j].ts += tile * 9 + int64_t(j);
+    return b;
+}
+
+std::vector<LeadAck> readAcks(const std::string& path) {
+    std::ifstream in(path);
+    std::vector<LeadAck> acks;
+    for (std::string line; std::getline(in, line);) {
+        LeadAck ack;
+        std::stringstream ss(line);
+        ss >> ack.tile;
+        for (int64_t seq; ss >> seq;) ack.seq.push_back(seq);
+        if (ack.seq.size() == 9) acks.push_back(std::move(ack));
+    }
+    return acks;
+}
+
+// Check the whole survivor for duplicates and every logged ack against its
+// original seq and textual provenance; dictionary ids may be rebuilt.
+bool ackMetadata(const std::string& root, const std::vector<LeadAck>& acks, uint64_t* extra) {
+    sqlite3* db = nullptr;
+    const std::string path = root + "/P/WXF/" + kProvider + "@" + kBig + ".db";
+    if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, "unix") != SQLITE_OK) { sqlite3_close(db); return false; }
+    sqlite3_stmt* q = nullptr;
+    const char* sql = "SELECT r.seq,r.ts,r.at,node.producer,node.peer,batch.batch,url.url,r.cid FROM r "
+        "LEFT JOIN node ON node.id=r.n LEFT JOIN batch ON batch.id=r.b LEFT JOIN url ON url.id=r.u ORDER BY r.seq";
+    if (sqlite3_prepare_v2(db, sql, -1, &q, nullptr) != SQLITE_OK) { sqlite3_close(db); return false; }
+    std::map<int64_t, std::vector<std::string>> have;
+    std::set<std::string> cids;
+    bool ok = true;
+    auto txt = [&](int c) { const auto* p = sqlite3_column_text(q, c); return p ? std::string(reinterpret_cast<const char*>(p)) : ""; };
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        uint8_t digest[32], cid[36] = {1, 0x55, 0x12, 0x20};
+        if (sqlite3_column_bytes(q, 7) != 32) { ok = false; break; }
+        flatsql::p4::cidDigestFromKey(static_cast<const uint8_t*>(sqlite3_column_blob(q, 7)), digest);
+        std::memcpy(cid + 4, digest, 32);
+        std::vector<std::string> row{std::to_string(sqlite3_column_int64(q, 1)), std::to_string(sqlite3_column_int64(q, 2)),
+            txt(3), txt(4), txt(5), txt(6), cidText(cid)};
+        ok = have.emplace(sqlite3_column_int64(q, 0), row).second && cids.insert(row.back()).second && ok;
+    }
+    sqlite3_finalize(q); sqlite3_close(db);
+    for (const auto& ack : acks) {
+        const Batch b = crashTile(ack.tile);
+        for (size_t j = 0; j < b.recs.size(); j++) {
+            uint8_t cid[36]; cidOf(b.recs[j].frame, cid);
+            const std::vector<std::string> want{std::to_string(b.recs[j].ts), std::to_string(b.at),
+                "", b.peer, b.tags[0].batch, b.tags[0].url, cidText(cid)};
+            const auto it = have.find(ack.seq[j]);
+            // producer is the engine's stable token for this peer: compare to
+            // the reference separately, while requiring a populated node.
+            if (it == have.end() || it->second[2].empty()) { ok = false; continue; }
+            auto got = it->second; got[2].clear();
+            if (got != want) ok = false;
+        }
+    }
+    *extra = have.size() >= acks.size() * 9 ? have.size() - acks.size() * 9 : 0;
+    return ok;
+}
+
+std::string survivorHash(const std::string& root, int64_t through, const Probe& probe, double* reopenMs = nullptr) {
+    const uint64_t opened = flatsql::ps::monoNs();
+    if (openNode(root, 1) != P4_OK || !registerAll()) return "open-failed";
+    if (reopenMs) *reopenMs = double(flatsql::ps::monoNs() - opened) / 1e6;
+    Hash h;
+    for (const auto& read : reads()) {
+        int64_t rows = 0, ops = 0;
+        read.second(probe, &h, &rows, &ops);
+        h.flush();
+    }
+    // Replay the seq/window/explorer query shapes over WXF too, restricting
+    // to acknowledged seqs because a committed call may die before logging.
+    for (uint8_t order : {uint8_t(P4_ORDER_SEQ_ASC), uint8_t(P4_ORDER_SEQ_DESC), uint8_t(P4_ORDER_W_ASC)}) {
+        TlvW w;
+        w.text(1, "WXF").u8(2, 1).u64(3, 10000).u8(5, order).i64(7, through);
+        Result r = call(P4_OPC_SCAN, w.b);
+        if (r.status != P4_OK) { closeEngine(); return "scan-failed"; }
+        h.result(r);
+    }
+    TlvW rb; rb.u32(63, 8);
+    const Result checked = call(P4_OPC_REBUILD, rb.b);
+    bool clean = checked.status == P4_OK && checked.rows.size() == 2;
+    for (size_t i = 0; i < checked.rows.size(); i++) clean = clean && checked.i(i, "mismatches") == 0;
+    if (!clean) {
+        std::fprintf(stderr, "REBUILD8 status=%d rows=%zu error=%s\n", checked.status, checked.rows.size(), checked.err.c_str());
+        for (size_t i = 0; i < checked.rows.size(); i++) std::fprintf(stderr, "REBUILD8 type=%s mismatches=%lld\n",
+            checked.s(i, "type").c_str(), (long long)checked.i(i, "mismatches"));
+    }
+    closeEngine(600000);
+    return clean ? h.hex() : "rebuild8-failed";
+}
+
+bool formatGuards(const std::string& dir) {
+    for (uint16_t layout : {uint16_t(0), uint16_t(1), uint16_t(2)}) {
+        const std::string root = dir + "/format4-" + std::to_string(layout);
+        std::filesystem::remove_all(root);
+        std::filesystem::create_directories(root + "/T");
+        uint8_t marker[64], uuid[16] = {};
+        flatsql::p4::encodeStore(marker, uuid, 0, 1, 0);
+        flatsql::p4::st16(marker + 4, 4);
+        flatsql::p4::st16(marker + 6, layout);
+        flatsql::p4::st32(marker + 56, flatsql::ps::crc32c(marker, 56));
+        { std::ofstream f(root + "/STORE", std::ios::binary); f.write(reinterpret_cast<const char*>(marker), 64); }
+        { std::ofstream f(root + "/T/old.idx", std::ios::binary); f << "old index bytes must remain unchanged"; }
+        auto fingerprint = [&]() {
+            Hash h;
+            std::map<std::string, std::string> files;
+            for (const auto& f : std::filesystem::recursive_directory_iterator(root)) {
+                const std::string key = f.path().lexically_relative(root).string();
+                if (f.is_regular_file()) { std::ifstream in(f.path(), std::ios::binary); files[key] = std::string(std::istreambuf_iterator<char>(in), {}); }
+                else files[key] = "directory";
+            }
+            for (const auto& f : files) { h.str(f.first); h.str(f.second); }
+            return h.hex();
+        };
+        const auto before = fingerprint();
+        for (uint8_t mode : {uint8_t(0), uint8_t(1), uint8_t(2)}) {
+            if (openNode(root, mode) != P4_E_FORMAT || fingerprint() != before) return false;
+        }
+        std::filesystem::remove_all(root);
+    }
+    const std::string root = dir + "/reserved";
+    std::filesystem::remove_all(root);
+    if (openNode(root, 1) != P4_OK) return false;
+    for (const char* fid : {"$FMB", "$FCK", "$FSG"}) {
+        TestType type = pnmLikeType("RES");
+        std::memcpy(type.fid, fid, 4);
+        if (registerType(type) != P4_E_ARG) { closeEngine(); return false; }
+    }
+    if (registerType(wxfType()) != P4_OK) { closeEngine(); return false; }
+    for (const char* fid : {"$FMB", "$FCK", "$FSG"}) {
+        Batch b = crashTile(0);
+        b.recs.resize(1);
+        std::memcpy(b.recs[0].frame.data() + 8, fid, 4);
+        const Result r = put(b);
+        if (r.status != P4_OK || r.rows.size() != 1 || r.i(0, "reject") != P4_REJ_FID) { closeEngine(); return false; }
+    }
+    closeEngine();
+    std::filesystem::remove_all(root);
+    std::printf("REPLAY_FORMAT format4_layouts=0,1,2 create_modes=0,1,2 refused_unchanged=1 reserved=FMB,FCK,FSG record_FID=refused PASS\n");
+    return true;
+}
+
+bool killLead(const std::string& dir) {
+    if (!formatGuards(dir)) return false;
+    const uint32_t seed = uint32_t(argInt("seed", 20261018));
+    std::mt19937 rng(seed);
+    const int tiles = std::max(16, int(argInt("lead-tiles", 64)));
+    auto gp = readGp(argStr("gp", ""));
+    gp.resize(std::min<size_t>(gp.size(), 32768));
+    const Probe probe = probeOf(gp, int(argInt("probes", 200)));
+    std::printf("REPLAY_KILL seed=%u rounds=3 omm_seed_records=%zu read_workloads=sync_norad,sync_window,latest,explorer WXF=seq_asc,seq_desc,w_asc ack-prefix comparison (a synced call may survive before its ack log)\n", seed, gp.size());
+    for (int round = 1; round <= 3; round++) {
+        const std::string base = dir + "/round-" + std::to_string(round), root = base + "/survivor/fsql4", ref = base + "/reference/fsql4";
+        std::filesystem::remove_all(base);
+        std::filesystem::create_directories(base);
+        for (const auto& p : {root, ref}) {
+            if (openNode(p, 1) != P4_OK || !registerAll() || !ingest(dayBatches(gp, "2026-09-16"), nullptr, nullptr)) return false;
+            closeEngine(600000);
+        }
+        const std::string log = base + "/acks.log";
+        int pipefd[2];
+        if (::pipe(pipefd)) return false;
+        std::fflush(stdout); std::fflush(stderr);
+        const pid_t child = ::fork();
+        if (child == 0) {
+            ::close(pipefd[0]);
+            const int logfd = ::open(log.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
+            if (logfd < 0 || openNode(root, 1) != P4_OK || !registerAll()) _exit(2);
+            for (int tile = 0; tile < tiles; tile++) {
+                if (::write(pipefd[1], &tile, sizeof tile) != sizeof tile) _exit(3);
+                Result r = put(crashTile(tile));
+                if (r.status != P4_OK || r.rows.size() != 9) _exit(4);
+                std::string line = std::to_string(tile);
+                for (size_t j = 0; j < r.rows.size(); j++) line += " " + std::to_string(r.i(j, "seq"));
+                line += "\n";
+                if (::write(logfd, line.data(), line.size()) != ssize_t(line.size())) _exit(5);
+            }
+            _exit(6); // the parent must kill during the lead
+        }
+        ::close(pipefd[1]);
+        if (child < 0) { ::close(pipefd[0]); return false; }
+        const int target = 4 + int(rng() % unsigned(tiles - 8));
+        const unsigned delayUs = rng() % 2500;
+        int tile = -1;
+        while (tile < target && ::read(pipefd[0], &tile, sizeof tile) == sizeof tile) {}
+        flatsql::ps::sleepNs(uint64_t(delayUs) * 1000);
+        ::kill(child, SIGKILL);
+        int status = 0; ::waitpid(child, &status, 0); ::close(pipefd[0]);
+        if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) return false;
+        const auto acks = readAcks(log);
+        if (acks.empty()) return false;
+        const int64_t through = acks.back().seq.back();
+        const std::string got = survivorHash(root, through, probe);
+        if (got.size() != 32) { std::fprintf(stderr, "survivor: %s\n", got.c_str()); return false; }
+        uint64_t extra = 0;
+        if (!ackMetadata(root, acks, &extra) || !walkStore(root, false)) return false;
+        if (openNode(ref, 1) != P4_OK || !registerAll()) return false;
+        for (const auto& ack : acks) {
+            const Result r = put(crashTile(ack.tile));
+            if (r.status != P4_OK || r.rows.size() != 9) return false;
+            for (size_t j = 0; j < 9; j++) if (r.i(j, "seq") != ack.seq[j]) return false;
+        }
+        closeEngine(600000);
+        const std::string want = survivorHash(ref, through, probe);
+        if (got != want) { std::fprintf(stderr, "survivor/reference hash %s != %s\n", got.c_str(), want.c_str()); return false; }
+        std::printf("REPLAY_KILL round=%d target_call=%d delay_us=%u ack_calls=%zu ack_records=%zu recovered_unacked_records=%llu hash=%s metadata=exact duplicates=0 REBUILD8=clean chain=clean PASS\n",
+            round, target, delayUs, acks.size(), acks.size() * 9, (unsigned long long)extra, got.c_str());
+        size_t deleted = 0;
+        for (const auto& file : std::filesystem::recursive_directory_iterator(root)) {
+            const std::string name = file.path().filename().string();
+            if (file.path().extension() == ".db" || name.find(".db-") != std::string::npos) {
+                std::filesystem::remove(file.path()); deleted++;
+            }
+        }
+        const uint64_t begin = flatsql::ps::monoNs();
+        double rebuiltMs = 0;
+        const std::string rebuilt = survivorHash(root, through, probe, &rebuiltMs);
+        const double ms = double(flatsql::ps::monoNs() - begin) / 1e6;
+        if (rebuilt != want || !ackMetadata(root, acks, &extra) || !walkStore(root, false)) return false;
+        std::printf("REPLAY_REBUILD round=%d deleted_db_files=%zu rebuild_ms=%.3f verify_wall_ms=%.3f hash=%s metadata=exact REBUILD8=clean PASS\n", round, deleted, rebuiltMs, ms, rebuilt.c_str());
+        if (round == 2) {
+            const std::string damaged = root + "/P/WXF/" + kProvider + "@" + kBig + ".db";
+            const int fd = ::open(damaged.c_str(), O_RDWR);
+            const uint8_t badHeader[32] = {};
+            if (fd < 0) return false;
+            const bool damagedOk = ::pwrite(fd, badHeader, sizeof badHeader, 0) == sizeof badHeader;
+            ::close(fd);
+            if (!damagedOk) return false;
+            const uint64_t damageBegin = flatsql::ps::monoNs();
+            double damagedMs = 0;
+            if (survivorHash(root, through, probe, &damagedMs) != want || !ackMetadata(root, acks, &extra) || !walkStore(root, false)) return false;
+            std::printf("REPLAY_REBUILD damaged_db=WXF rebuild_ms=%.3f verify_wall_ms=%.3f hash=%s metadata=exact REBUILD8=clean PASS\n",
+                damagedMs, double(flatsql::ps::monoNs() - damageBegin) / 1e6, want.c_str());
+        }
+        if (round == 3) {
+            for (const auto& file : std::filesystem::directory_iterator(root + "/T")) {
+                const std::string name = file.path().filename().string();
+                if (file.path().extension() == ".idx" || name.find(".idx-") != std::string::npos) std::filesystem::remove(file.path());
+            }
+            const uint64_t idxBegin = flatsql::ps::monoNs();
+            double idxMs = 0;
+            if (survivorHash(root, through, probe, &idxMs) != want || !ackMetadata(root, acks, &extra)) return false;
+            std::printf("REPLAY_REBUILD type_indexes=missing genesis_and_TOKEN=restored rebuild_ms=%.3f verify_wall_ms=%.3f hash=%s PASS\n",
+                idxMs, double(flatsql::ps::monoNs() - idxBegin) / 1e6, want.c_str());
+        }
+        std::filesystem::remove_all(base);
+    }
+    return true;
+}
+#endif
+
 }  // namespace
 
 namespace {
@@ -693,6 +1016,16 @@ P4_SLOW_TEST(p4_replay) {
     REQUIRE(root != "/fsql4", "--store");
     const std::string phase = argStr("phase", "run");
 #if !defined(__wasm__)
+#if P4_REPLAY_FORMAT5
+    if (phase == "walk") {
+        REQUIRE(walkStore(root, true), "stock frame walk");
+        return;
+    }
+    if (phase == "kill") {
+        REQUIRE(killLead(argStr("store", "")), "seeded lead SIGKILL/rebuild proof");
+        return;
+    }
+#endif
     if (phase == "bounds") {
         bounds(argStr("store", ""));
         return;
@@ -751,6 +1084,7 @@ P4_SLOW_TEST(p4_replay) {
 
 namespace {
 void runOne(const std::string& root, const std::string& workload) {
+    callSyncs = CallSyncs();
     Clock c;
     Hash h;
     int64_t rows = 0, ops = 0;
@@ -785,6 +1119,7 @@ void runOne(const std::string& root, const std::string& workload) {
             batches = dayBatches(days[0].second, days[0].first);
             rows = int64_t(days[0].second.size());
         }
+        callSyncs.enabled = P4_REPLAY_FORMAT5 && (workload == "gp_ingest" || workload == "wxf_lead");
         c.start();
         if (workload == "gp_ingest") {
             REQUIRE(ingest(batches, &wh, &ops), "ingest");

@@ -1,16 +1,6 @@
-// Store format 4: the per-standard type index (CONTRACT C-38 (2)): the feed
-// registry and the type-wide token registry. It holds no per-record entry and
-// no counters: a record is found in its feed files (each keeps its own CID
-// index), a type-wide read merges the feed files, and each feed file's
-// counters are committed in the file with its rows and read at open.
-//
-//   feed(fid, provider, source, name, gen)   feed id <-> (provider, source), file name, and the
-//                                             stream generation (a missing index's rebuild reads it)
-//   tok(id, token, peer)                      the type's producer tokens (copies), in order
-//
-// A write registers a new feed or token here (synchronous=FULL) while its
-// type's writer plans it, before any file of a new feed exists. Only that
-// writer (and the open) uses this connection.
+// Store format 5: the disposable per-type feed and producer-token registries.
+// NORMAL WAL commits publish cache updates. Feed genesis and FMB TOKEN entries
+// are authoritative; a lost registry is reconstructed from those streams.
 #include <algorithm>
 
 #include "internal.h"
@@ -32,26 +22,21 @@ const char* ctext(sqlite3_stmt* s, int i) {
 
 int32_t typeIndexOpen(Type* t, std::string* err) {
     Conn* c = nullptr;
-    int rc = openConn(t->pIdx, OpenKind::Index, 512, 4096, &c, err);
-    if (rc != SQLITE_OK) return statusOfSqlite(rc);
-    // A type index holds the two registries and nothing else; one with other
-    // tables is an earlier format-4 build's (C-46 (6)): refused as it is.
-    sqlite3_stmt* old = c->sql("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT IN ('feed','tok')");
-    const int orc = old ? sqlite3_step(old) : SQLITE_ERROR;
-    if (old) sqlite3_reset(old);
-    if (orc != SQLITE_DONE) {
-        if (err) *err = t->pIdx + (orc == SQLITE_ROW ? ": a type index an earlier format-4 build wrote" : ": unreadable");
-        delete c;
-        return orc == SQLITE_ROW ? P4_E_FORMAT : statusOfSqlite(orc);
-    }
-    rc = c->exec(kIndexSchema);
-    if (rc != SQLITE_OK) {
-        if (err) *err = sqlite3_errmsg(c->db);
-        delete c;
-        return statusOfSqlite(rc);
+    bool damagedIndex=false;
+    int rc=SQLITE_OK;
+    for(int attempt=0;attempt<2;attempt++) {
+        rc=openConn(t->pIdx,OpenKind::Index,512,4096,&c,err);
+        if(rc==SQLITE_OK) rc=c->exec(kIndexSchema);
+        if(rc==SQLITE_OK) break;
+        delete c; c=nullptr;
+        if(attempt || ((rc&0xff)!=SQLITE_CORRUPT && (rc&0xff)!=SQLITE_NOTADB)) return statusOfSqlite(rc);
+        damagedIndex=true;
+        for(const char* suffix:{"","-wal","-shm","-journal"}) ioUnlink(t->pIdx+suffix);
     }
     sqlite3_wal_hook(c->db, walHook, t->e);  // its WAL is checkpointed by the maintenance thread
     t->idx = c;
+    const int32_t discovered = streamDiscover(t, c, err);
+    if (discovered != P4_OK && (discovered != P4_E_UNSUPPORTED || damagedIndex)) return discovered;
     std::lock_guard<std::mutex> g(t->mu);
     // Every registry read either completes or fails the open (M9): a statement
     // that cannot run must not read as an empty registry.

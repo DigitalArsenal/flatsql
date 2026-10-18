@@ -1,5 +1,5 @@
-/* FlatSQL store format 4 ("p4"): one SQLite file per partition (producer x
- * record type). The instance C ABI (CONTRACT.md §3.2-§3.4).
+/* FlatSQL store format 5 ("p4"): one authoritative FlatBuffer stream per
+ * feed, with a derived SQLite index. The instance C ABI (CONTRACT.md §3.2-§3.4).
  *
  * i32 and f64 only on the export boundary; everything else is bytes in shared
  * memory. Requests are TLV ([u16 tag][u32 len][value], little-endian,
@@ -30,7 +30,7 @@ extern "C" {
 #define P4_E_NOMEM         -2
 #define P4_E_IO            -3
 #define P4_E_CORRUPT       -4   /* the file is quarantined, never rewritten; reads elsewhere continue */
-#define P4_E_FORMAT        -5   /* store/file format or layout above this engine; marker/state mismatch; C-5 rule change */
+#define P4_E_FORMAT        -5   /* unsupported store/file format or layout; marker/state mismatch; C-5 rule change */
 #define P4_E_BUSY          -6   /* a queue or partition credit is full: nothing was done, retry; reader paths never wait */
 #define P4_E_CANCELLED     -7
 #define P4_E_BUDGET        -8   /* rows-examined, bytes-read, result rows/bytes, work or heap cap */

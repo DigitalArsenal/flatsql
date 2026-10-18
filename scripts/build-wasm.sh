@@ -147,6 +147,7 @@ build_ps_linux() {
     echo "Building flatsql-ps-threads.wasm and flatsql-p4-threads.wasm in Docker (Linux wasi-sdk $WASI_SDK_VERSION, $arch)..."
     docker run --rm \
         -v "$CPP_DIR":/w/flatsql/cpp:ro \
+        -v "$PROJECT_ROOT/node_modules/spacedatastandards.org/schema":/w/sds:ro \
         -v "$(cd "$fb" && pwd)":/w/flatbuffers:ro \
         -v "$tgz":/w/wasi-sdk.tar.gz:ro \
         -v "$PROJECT_ROOT/wasm":/w/out \
@@ -155,7 +156,7 @@ build_ps_linux() {
             mkdir -p /opt/wasi-sdk && tar -xzf /w/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
             cmake -S /w/flatsql/cpp -B /tmp/b -G Ninja \
                 -DCMAKE_TOOLCHAIN_FILE=/w/flatsql/cpp/cmake/wasi-threads-toolchain.cmake \
-                -DWASI_SDK_PREFIX=/opt/wasi-sdk -DFLATBUFFERS_DIR=/w/flatbuffers -DCMAKE_BUILD_TYPE=Release >/dev/null
+                -DWASI_SDK_PREFIX=/opt/wasi-sdk -DFLATBUFFERS_DIR=/w/flatbuffers -DSDS_SCHEMA_DIR=/w/sds -DCMAKE_BUILD_TYPE=Release >/dev/null
             cmake --build /tmp/b --target flatsql_ps_threads flatsql_p4_threads -j ${FLATSQL_BUILD_JOBS:-8}
             cp /tmp/b/flatsql-ps-threads.wasm /tmp/b/flatsql-p4-threads.wasm /w/out/"
 }

@@ -1,4 +1,4 @@
-# Store format 4 for wasm32-wasip1-threads (docs/STORE-FORMAT-4.md).
+# Store format 5 for wasm32-wasip1-threads (src/p4/FORMAT.md).
 # Included by CMakeLists.txt when the WASI toolchain is active
 # (cmake/wasi-threads-toolchain.cmake), next to flatsql_ps_wasm.cmake:
 #
@@ -79,6 +79,7 @@ target_include_directories(flatsql_p4_wasm PUBLIC
     ${FLATBUFFERS_INCLUDE_DIR}
 )
 target_compile_options(flatsql_p4_wasm PRIVATE ${FLATSQL_P4_WASM_FLAGS} -Wall -Wextra -Wno-unused-parameter)
+flatsql_p4_use_sds(flatsql_p4_wasm)
 target_link_libraries(flatsql_p4_wasm PUBLIC sqlite3_p4_wasm)
 
 # Shared memory imported as env.memory, shared, at most 32768 pages (2 GiB).

@@ -35,6 +35,7 @@
 #include "flatsql/ps/platform.h"
 #include "internal.h"
 #include "p4/p4_test.h"
+#include "p4/frame_walk.h"
 #include "ps/io_fault.h"
 
 using namespace p4t;
@@ -53,6 +54,21 @@ FaultFs& faultFs() {
     return *fs;
 }
 }  // namespace
+
+namespace flatsql { namespace p4 {
+bool p4ListStreams(const std::string& directory, std::vector<std::string>* names) {
+    names->clear();
+    const std::string prefix = directory + "/";
+    for (const std::string& path : faultFs().list(prefix)) {
+        if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0) continue;
+        const std::string name = path.substr(prefix.size());
+        if (name.find('/') == std::string::npos && name.size() > 7 && name.compare(name.size() - 7, 7, ".fsdata") == 0)
+            names->push_back(name);
+    }
+    std::sort(names->begin(), names->end());
+    return true;
+}
+} }  // namespace flatsql::p4
 
 extern "C" {
 int32_t flatsql_io_open(const char* path, int32_t pathLen, int32_t flags) { return faultFs().open(path, pathLen, flags); }
@@ -127,16 +143,13 @@ std::string streamWalk(FaultFs& fs, const std::string& root) {
     for (const std::string& p : fs.list(dir)) {
         if (p.size() < 7 || p.compare(p.size() - 7, 7, ".fsdata") != 0) continue;
         const std::vector<uint8_t> b = fs.contents(p);
-        size_t at = 0;
-        while (at < b.size()) {
-            if (b.size() - at < 4) return p + ": a torn size prefix at " + std::to_string(at);
-            const uint32_t len = fp::ld32(&b[at]);
-            if (b.size() - at - 4 < len) return p + ": a frame past the end at " + std::to_string(at);
-            const uint8_t* fb = &b[at + 4];
-            if (len < 8 || fp::ld32(fb) + 4 > len || std::memcmp(fb + 4, "$PNM", 4) != 0)
-                return p + ": not a $PNM FlatBuffer at " + std::to_string(at);
-            at += 4 + len;
-        }
+        FrameWalk result;
+        const std::string why = walkFrames(b.size(), [&](uint64_t off, void* dst, size_t n) {
+            if (off > b.size() || n > b.size() - off) return false;
+            std::memcpy(dst, b.data() + off, n);
+            return true;
+        }, "$PNM", &result);
+        if (!why.empty()) return p + ": " + why;
     }
     return "";
 }

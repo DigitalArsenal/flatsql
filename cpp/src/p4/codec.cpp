@@ -1,4 +1,4 @@
-// Store format 4: byte codecs (TLV, CIDs, markers, config), host-file helpers
+// Store format 5: byte codecs (TLV, CIDs, markers, config), host-file helpers
 // and the SQLite connection wrapper.
 #include "internal.h"
 
@@ -293,7 +293,7 @@ int32_t parseConfig(const uint8_t* p, size_t n, Config* c, std::string* err) {
 void encodeStore(uint8_t out[64], const uint8_t uuid[16], int64_t createdMs, uint64_t floor, uint32_t from) {
     std::memset(out, 0, 64);
     st32(out, 0x34515346u);  // "FSQ4"
-    st16(out + 4, 4);
+    st16(out + 4, 5);
     st16(out + 6, 1);
     std::memcpy(out + 8, uuid, 16);
     st64(out + 24, uint64_t(createdMs));
@@ -305,7 +305,7 @@ void encodeStore(uint8_t out[64], const uint8_t uuid[16], int64_t createdMs, uin
 void encodeMigrated(uint8_t out[40], const uint8_t uuid[16], int64_t writtenMs) {
     std::memset(out, 0, 40);
     st32(out, 0x4D515346u);  // "FSQM"
-    st16(out + 4, 4);
+    st16(out + 4, 5);
     std::memcpy(out + 8, uuid, 16);
     st64(out + 24, uint64_t(writtenMs));
     st32(out + 32, ps::crc32c(out, 32));
@@ -395,14 +395,6 @@ int32_t ioAppend(const std::string& path, const uint8_t* p, size_t n) {
     return rc;
 }
 
-int32_t ioTouch(const std::string& path) {
-    const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()),
-                                      FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS);
-    if (h < 0) return h == FLATSQL_IO_ERR_NOSPACE ? P4_E_NOSPACE : P4_E_IO;
-    flatsql_io_close(h);
-    return P4_OK;
-}
-
 int32_t ioUnlink(const std::string& path) {
     const int32_t rc = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_UNLINK);
     return rc >= 0 || rc == FLATSQL_IO_ERR_NOENT ? P4_OK : P4_E_IO;
@@ -458,7 +450,6 @@ const char* stmtSql(StmtId id) {
         case S_IDST_INS: return "INSERT INTO idst(h,seq) VALUES(?1,?2)";
         case S_TOKC_PUT: return "INSERT OR REPLACE INTO tokc(producer,n,bytes,mints,maxts,maxseq) VALUES(?1,?2,?3,?4,?5,?6)";
         case S_TOKC_DEL: return "DELETE FROM tokc WHERE producer=?1";
-        case S_MOVED_INS: return "INSERT OR IGNORE INTO moved(seq) VALUES(?1)";
         default: return nullptr;
     }
 }
@@ -517,7 +508,7 @@ Conn::~Conn() {
     for (auto*& s : st)
         if (s) sqlite3_finalize(s);
     for (auto& kv : dyn) sqlite3_finalize(kv.second);
-    if (db) sqlite3_close_v2(db);
+    if (db) cacheClose(db);
 }
 
 sqlite3_stmt* Conn::get(StmtId id) {
@@ -611,11 +602,12 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
     const bool reader = kind == OpenKind::Reader;
     std::string uri = fileUri(path) + "?share=1";
     if (reader) uri += "&ra=1";
-    if (kind == OpenKind::Writer || kind == OpenKind::Index) uri += "&dsync=1";
     sqlite3* db = nullptr;
     const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX |
                       (kind == OpenKind::Writer || kind == OpenKind::Index ? SQLITE_OPEN_CREATE : 0);
-    int rc = sqlite3_open_v2(uri.c_str(), &db, flags, "flatsql_io");
+    int rc = registerCacheVfs();
+    if (rc != SQLITE_OK) return rc;
+    rc = sqlite3_open_v2(uri.c_str(), &db, flags, "flatsql_p4_cache");
     if (rc != SQLITE_OK) {
         if (err) *err = db ? sqlite3_errmsg(db) : "open failed";
         sqlite3_close_v2(db);
@@ -627,11 +619,9 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
     if (kind == OpenKind::Writer || kind == OpenKind::Index) {
         std::snprintf(sql, sizeof sql, "PRAGMA page_size=%u", pageSize ? pageSize : 4096);
         sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
-        // A new file's switch to WAL commits through a rollback journal;
-        // EXTRA makes SQLite delete that journal durably (with dsync=1 the VFS
-        // fsyncs the directory), so a power loss cannot bring it back as a
-        // hot journal over the WAL. The pragma below sets the steady level.
-        sqlite3_exec(db, "PRAGMA synchronous=EXTRA", nullptr, nullptr, nullptr);
+        // These files can be reconstructed from the stream. The P4 cache
+        // VFS suppresses foreground syncs, including WAL-header creation.
+        sqlite3_exec(db, "PRAGMA synchronous=NORMAL", nullptr, nullptr, nullptr);
         rc = sqlite3_exec(db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
         if (rc != SQLITE_OK) {
             if (err) *err = sqlite3_errmsg(db);
@@ -639,9 +629,8 @@ int openConn(const std::string& path, OpenKind kind, uint32_t cacheKiB, uint32_t
             return rc;
         }
     }
-    // FULL everywhere: the ack follows an index commit that a power loss
-    // cannot take back (its stream frames were synced before it).
-    const char* sync = "FULL";
+    // The stream sync makes the ack durable; SQLite provides read-after-write.
+    const char* sync = "NORMAL";
     std::snprintf(sql, sizeof sql,
                   "PRAGMA synchronous=%s; PRAGMA cache_size=-%u; PRAGMA mmap_size=0; PRAGMA temp_store=MEMORY;"
                   " PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=%lld",

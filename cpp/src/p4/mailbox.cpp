@@ -872,7 +872,7 @@ int32_t engineStop(Engine* e, double deadlineMs) {
         e->maintQ.clear();
     }
     for (Conn* c : conns) {
-        sqlite3_wal_checkpoint_v2(c->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+        cacheCheckpoint(c->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
         e->bump(kStTruncate);
         delete c;
     }
@@ -880,7 +880,7 @@ int32_t engineStop(Engine* e, double deadlineMs) {
     for (Type* t : types) {
         t->hasFiles.store(false, std::memory_order_release);  // closed: nothing reads or flushes them again
         if (t->idx) {
-            sqlite3_wal_checkpoint_v2(t->idx->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+            cacheCheckpoint(t->idx->db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
             delete t->idx;
             t->idx = nullptr;
         }

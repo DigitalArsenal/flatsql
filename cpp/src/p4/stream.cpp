@@ -1,18 +1,9 @@
-// Store format 4: a feed's record stream (BRIEF4, owner 2026-10-03: "the
-// flatbuffers written to disk should be readable by a flatbuffer reader
-// directly").
-//
-// P/<TYPE>/<name>.fsdata holds the feed's records exactly as they arrived:
-// [u32 LE size][FlatBuffer] frames back to back, with no file header, magic,
-// per-frame tag, CRC, padding or trailer (format 1's .fsdata, flatsql commit
-// 645f86c). A sealed record's frame holds its sealed bytes. Everything else
-// (CID, seq, provenance, the frame's place) is in the feed's index file, whose
-// rows point at frames by (off, len).
-//
-// The writer appends at its end offset and syncs the stream before the index
-// transaction that commits the rows and the stream's mark (its indexed end):
-// the index never claims bytes the stream cannot back, and open cuts the
-// stream back to the mark (bytes past it were never acknowledged).
+// Store format 5: the authoritative feed stream (FORMAT.md sections 2 and 9).
+// P/<TYPE>/<name>.fsdata contains back-to-back [u32 LE size][FlatBuffer]
+// frames: verbatim records, genesis checkpoints, and sibling metadata.
+// The writer syncs the stream before committing its disposable SQLite cache.
+// Recovery verifies and applies complete commits after the cache's mark and
+// truncates only the remaining uncommitted or damaged tail.
 //
 // A compaction writes the live frames into the next generation
 // (<name>.<gen>.fsdata, a pure stream again) and repoints the rows in one
@@ -56,6 +47,21 @@ std::shared_ptr<Stream> streamCur(Feed* f, int32_t* rc) {
     std::shared_ptr<Stream> s;
     *rc = openStream(streamPath(f, f->gen), f->gen, true, &s);
     if (*rc != P4_OK) return nullptr;
+    if (f->mark == 0 && streamSize(s.get()) == 0) {
+        int64_t end = 0;
+        *rc = streamGenesis(f, s.get(), &end);
+        if (*rc == P4_OK) *rc = streamSync(s.get());
+        if (*rc != P4_OK) {
+            // A failed genesis was never acknowledged. Leave an empty stream
+            // so a later attempt cannot append records after a torn checkpoint.
+            streamTruncate(s.get(), 0, false);
+            return nullptr;
+        }
+        f->end = end;
+        f->lastCommit = 0;
+        f->metadataBytes = end;
+        f->mark = end;
+    }
     f->stream = s;
     return s;
 }

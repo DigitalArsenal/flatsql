@@ -1,4 +1,4 @@
-// Store format 4: feed files and the PUT path (CONTRACT C-37, C-38, §3.7;
+// Store format 5: feed files and the PUT path (CONTRACT C-37, C-38, §3.7;
 // BRIEF4: the records in a pure FlatBuffer stream, SQLite holding the index).
 //
 // A feed is its record stream P/<TYPE>/<feed>.fsdata (stream.cpp) and its
@@ -22,8 +22,8 @@
 //     merged rows (WHERE m=1); r_m(rid) the staged rows (WHERE m=0)
 //   inst(b, c, ...) each instance's counters; tokc(producer, ...) each
 //   token's copies; ident(h, seq) ingest identities (IQC), idst(h, seq) the
-//   staged ones (appended, merged into ident); moved(seq) the
-//   local records this feed took in (a move's intent, finished at open);
+//   staged ones (appended, merged into ident); moves are replayed from the
+//   stream's MOVED_IN rows and MOVED_OUT removals;
 //   meta: the file's counters, the stream's committed mark and generation
 // The file is the feed: its provider and source are in its meta, never in a row.
 //
@@ -57,7 +57,6 @@ const char* kFileSchema =
     " maxseq) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS ident(h BLOB PRIMARY KEY, seq INTEGER NOT NULL) WITHOUT ROWID;"
     "CREATE TABLE IF NOT EXISTS idst(h BLOB NOT NULL, seq INTEGER NOT NULL);"
-    "CREATE TABLE IF NOT EXISTS moved(seq INTEGER PRIMARY KEY);"
     "CREATE TABLE IF NOT EXISTS okey(id INTEGER PRIMARY KEY, k NOT NULL UNIQUE);"
     "CREATE TABLE IF NOT EXISTS r(rid INTEGER PRIMARY KEY, seq INTEGER NOT NULL, n INTEGER NOT NULL, b INTEGER NOT NULL,"
     " c INTEGER NOT NULL, u INTEGER NOT NULL, at INTEGER NOT NULL, cid BLOB NOT NULL, e INTEGER, k, ts INTEGER NOT NULL,"
@@ -140,7 +139,7 @@ int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes) {
         sqlite3_reset(s);
         return r == SQLITE_DONE;
     };
-    bool ok = meta("format", "4") && meta("layout", "feed+stream") && meta("type", t->name) &&
+    bool ok = meta("format", "5") && meta("layout", "feed+stream") && meta("type", t->name) &&
               meta("provider", f->provider) && meta("source", f->source) && meta("fid", std::to_string(f->fid));
     // The stream's committed mark and generation (integers, as writeMeta writes them).
     if (ok) ok = c->exec(("INSERT OR REPLACE INTO meta(k, v) VALUES('mark', 0), ('gen', " + std::to_string(f->gen) + ")").c_str()) ==
@@ -464,11 +463,10 @@ Conn* writerPin(Engine* e, Feed* f, int32_t* rc, std::string* err) {
         indexed = f->indexed;
     }
     if (!created) {
-        // The directory chain and the empty file, made durable, before SQLite opens it.
-        const int32_t r = ioTouch(f->path);
-        if (r != P4_OK) {
-            *rc = r;
-            if (err) *err = "create " + f->path;
+        // The authoritative stream creates and syncs the directory once.
+        // SQLite's disposable files need no separate directory sync.
+        if (!streamCur(f, rc)) {
+            if (err) *err = "create stream for " + f->path;
             return nullptr;
         }
     }
@@ -564,120 +562,41 @@ void writerDrop(Engine* e, Feed* f) {
 }
 
 // ---- open ------------------------------------------------------------------------------------------
-namespace {
-bool damaged(int rc) { return (rc & 0xff) == SQLITE_CORRUPT || (rc & 0xff) == SQLITE_NOTADB; }
-}  // namespace
-
 int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err) {
-    Engine* e = t->e;
-    moved->clear();
-    if (!ioExists(f->path)) {
-        // No index: a feed never written, or an index that is gone. A feed's
-        // index file is made before its first frame (WriteCtx::fileCreate),
-        // so a stream without one lost its index: that stream (the registered
-        // generation, or the next one a compaction committed after the
-        // registry last named it) is indexed again from its frames
-        // (rebuildFeed, after every feed is open).
-        std::lock_guard<std::mutex> g(t->mu);
-        f->created = false;
-        for (uint32_t gen : {f->regGen + 1, f->regGen})
-            if (ioExists(streamPath(f, gen))) {
-                f->gen = gen;
-                return P4_E_CORRUPT;  // the caller rebuilds
-            }
+    Engine* e=t->e; moved->clear();
+    if(!ioExists(f->path)) {
+        f->created=false;
+        for(uint32_t gen:{f->regGen+1,f->regGen}) if(streamGenerationComplete(f,gen)) { f->gen=gen; return P4_E_CORRUPT; }
         return P4_OK;
     }
-    {
-        std::lock_guard<std::mutex> g(t->mu);
-        f->created = true;  // the writer open completes a schema a crash cut before its commit
+    f->created=true;
+    int32_t st=P4_OK; Conn* c=writerPin(e,f,&st,err); if(!c) return st;
+    auto* format=c->sql("SELECT v FROM meta WHERE k='format'");
+    int qr=format?sqlite3_step(format):SQLITE_ERROR;
+    const int formatValue=qr==SQLITE_ROW?sqlite3_column_int(format,0):0;
+    if(format) sqlite3_reset(format);
+    if(formatValue!=5) { writerUnpin(e,f); return formatValue==4?P4_E_FORMAT:P4_E_CORRUPT; }
+    st=recoverFeed(t,f,c,moved,err);
+    FileMeta m; std::map<InstId,InstCount> inst; std::map<uint32_t,TokCount> tokc;
+    int rc=st==P4_OK?readMeta(c,&m):SQLITE_ERROR;
+    if(rc==SQLITE_OK) rc=readInst(f,c,&inst);
+    if(rc==SQLITE_OK) rc=readTokc(t,c,&tokc);
+    if(st==P4_OK && rc==SQLITE_OK && m.indexed && !f->quarantined) st=stagedLoad(e,f,c,err);
+    writerUnpin(e,f);
+    if(st!=P4_OK) return st;
+    if(rc!=SQLITE_OK) return statusOfSqlite(rc);
+    if(f->regGen!=m.gen) {
+        rc=indexPutFeed(t->idx,*f,m.gen); if(rc!=SQLITE_OK) return statusOfSqlite(rc);
+        f->regGen=m.gen;
     }
-    int32_t st = P4_OK;
-    std::string er;
-    Conn* c = writerPin(e, f, &st, &er);
-    if (!c) {
-        if (st == P4_E_CORRUPT) return P4_E_CORRUPT;  // a damaged index: rebuilt from the stream
-        if (err) *err = "open " + f->path + ": " + er;
-        return st;
-    }
-    // The current layout (C-45: staged rows, the keys' okey ids, the CID
-    // prefix); an index an earlier format-4 build wrote lacks some of it and
-    // is refused as it is (C-46 (6)).
-    if (!c->sql("SELECT r.m, r.kk, r.cp, okey.k, idst.h FROM r, okey, idst LIMIT 0")) {
-        const int pr = sqlite3_errcode(c->db);
-        writerUnpin(e, f);
-        if (damaged(pr)) return P4_E_CORRUPT;
-        if (err) *err = f->path + (pr == SQLITE_ERROR ? ": a feed index an earlier format-4 build wrote" : ": unreadable");
-        return pr == SQLITE_ERROR ? P4_E_FORMAT : statusOfSqlite(pr);
-    }
-    FileMeta m;
-    std::map<InstId, InstCount> inst;
-    std::map<uint32_t, TokCount> tokc;
-    int r = readMeta(c, &m);
-    if (r == SQLITE_OK) r = readInst(f, c, &inst);
-    if (r == SQLITE_OK) r = readTokc(t, c, &tokc);
-    if (r == SQLITE_OK) {
-        sqlite3_stmt* q = c->sql("SELECT seq FROM moved");
-        if (!q) r = SQLITE_ERROR;
-        while (q && (r = sqlite3_step(q)) == SQLITE_ROW) moved->push_back(sqlite3_column_int64(q, 0));
-        if (q) sqlite3_reset(q);
-        if (r == SQLITE_DONE) r = SQLITE_OK;
-    }
-    // The staged rows and identities: the view the reads take them from
-    // until the indexer merges them.
-    int32_t sst = P4_OK;
-    if (r == SQLITE_OK && m.indexed) sst = stagedLoad(e, f, c, err);
-    writerUnpin(e, f);
-    if (r != SQLITE_OK) {
-        if (damaged(r)) return P4_E_CORRUPT;
-        if (err) *err = "read " + f->path + ": " + std::to_string(r);
-        return statusOfSqlite(r);
-    }
-    if (sst != P4_OK) return sst == P4_E_CORRUPT ? P4_E_CORRUPT : sst;
-    // The stream: cut back to the committed mark (bytes past it were never
-    // acknowledged). A stream shorter than its mark lost acknowledged frames:
-    // the feed is quarantined (P4_E_CORRUPT, named), never silently cut.
-    f->gen = m.gen;
-    bool quarantine = false;
-    if (m.mark > 0 || ioExists(streamPath(f, m.gen))) {
-        std::shared_ptr<Stream> sp = streamCur(f, &st);
-        if (!sp) {
-            if (err) *err = "open " + streamPath(f, m.gen);
-            return st;
-        }
-        const int64_t size = streamSize(sp.get());
-        if (size < 0) {
-            if (err) *err = "size " + sp->path;
-            return P4_E_IO;
-        }
-        if (size > m.mark) {
-            st = streamTruncate(sp.get(), m.mark, true);
-            if (st != P4_OK) {
-                if (err) *err = "cut " + sp->path;
-                return st;
-            }
-        } else if (size < m.mark) {
-            quarantine = true;
-        }
-    }
-    // A compaction cut by a crash: the next generation it was writing, or the
-    // one it replaced and had not unlinked yet.
-    ioUnlink(streamPath(f, m.gen + 1));
-    if (m.gen > 0) ioUnlink(streamPath(f, m.gen - 1));
+    ioUnlink(streamPath(f,m.gen+1));
+    if(m.gen) ioUnlink(streamPath(f,m.gen-1));
     std::lock_guard<std::mutex> g(t->mu);
-    f->k = m.k;
-    f->indexed = m.indexed;
-    f->inst = std::move(inst);
-    f->tokc = std::move(tokc);
-    f->end = m.mark;
-    f->mark = m.mark;
-    f->streamBytes = m.mark;
-    f->movedRows = !moved->empty();
-    f->movedDone = moved->empty();
-    if (quarantine) {
-        f->quarantined = true;
-        stagedPublish(e, f, nullptr, false);  // never read or merged: its view goes
-    }
-    if (m.k.maxseq >= t->nextSeq) t->nextSeq = m.k.maxseq + 1;
+    f->k=m.k; f->indexed=m.indexed; f->inst=std::move(inst); f->tokc=std::move(tokc);
+    f->end=m.mark; f->mark=m.mark; f->streamBytes=m.mark;
+    f->movedRows=!moved->empty(); f->movedDone=moved->empty();
+    if(f->quarantined) stagedPublish(e,f,nullptr,false);
+    t->nextSeq=std::max(t->nextSeq,m.k.maxseq+1);
     return P4_OK;
 }
 
@@ -959,7 +878,7 @@ void Group::prepare(Rec& r, const Call& c) {
     }
     const int32_t fc = tc.checkFrame(r.frame, r.frameLen);
     if (fc) { r.reject = fc; return; }
-    if (tc.flags() & ps::TypeConfig::kVerifyCid) {
+    {
         uint8_t dg[32];
         ps::sha256(r.frame + 4, r.frameLen - 4, dg);
         if (std::memcmp(dg, r.cid36 + 4, 32) != 0) { r.reject = P4_REJ_CID; return; }
@@ -1023,7 +942,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
     auto it = supOf_.find(key);
     if (it != supOf_.end() && it->second != rs) {
         it->second->restamp = true;
-        w.dropAll(it->second);
+        w.dropAll(it->second, 2);
         e_->bump(kStCatSuperseded);
     }
     supOf_[key] = rs;
@@ -1053,7 +972,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
             if (lrc != P4_OK) return lrc;
             if (identityOf(sp_->tc, reinterpret_cast<const uint8_t*>(tmp.d.data()), tmp.d.size()) != r.supIdentity) continue;
             other->restamp = true;
-            w.dropAll(other);
+            w.dropAll(other, 2);
             e_->bump(kStCatSuperseded);
         }
     }
@@ -1122,7 +1041,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
         if (!other) return lrc;
         if (other == rs || !liveRows(other)) continue;  // a record the seed already holds gone
         other->restamp = true;  // C-39 E5: format 1's supersede restamps the lanes it leaves
-        w.dropAll(other);
+        w.dropAll(other, 2);
         e_->bump(kStCatSuperseded);
     }
     return P4_OK;
@@ -1168,6 +1087,7 @@ int32_t Group::identSeq(uint32_t fid, const uint8_t h[32], int64_t* seq) {
 RowR Group::copyOf(const Call& c, const Rec& r) const {
     RowR copy;
     copy.tok = c.tok;
+    copy.deliveryGroup = reinterpret_cast<uintptr_t>(&c);
     copy.peer = r.peer.empty() ? c.peer : r.peer;
     if (r.sigLen) copy.sig.assign(reinterpret_cast<const char*>(r.sig), r.sigLen);
     copy.hasD = true;
@@ -1309,6 +1229,7 @@ int32_t Group::ingest(WriteCtx& w, Call& c, Rec& r) {
                 if (x.live() && (!holder || x.tok < holder->tok)) holder = &x;
         if (holder) {
             copy.tok = c.tok;
+    copy.deliveryGroup = reinterpret_cast<uintptr_t>(&c);
             copy.peer = r.peer.empty() ? c.peer : r.peer;
             if (r.sigLen) copy.sig.assign(reinterpret_cast<const char*>(r.sig), r.sigLen);
             copy.len = holder->len;
@@ -1480,7 +1401,7 @@ int32_t Group::absorbLocal(WriteCtx& w, RecState* local, RecState* into) {
         WriteCtx::Out out;
         w.deliver(into, m, {}, &out);
     }
-    w.dropAll(local);
+    w.dropAll(local, 5);
     return P4_OK;
 }
 
@@ -1595,7 +1516,7 @@ int32_t Group::migrate(WriteCtx& w, Call& c, Rec& r) {
                 w.deliver(rs, mm, {}, &out);
             }
         }
-        w.dropAll(localHolder);
+        w.dropAll(localHolder, 5);
     }
     // C-21: a migrated record registers format 1's ingest identity in the
     // feed of its first tag instance.
