@@ -118,20 +118,22 @@ bool decodeBatch(const std::string& bytes,Batch* batch,std::map<uint64_t,Record>
     if(m->DICTIONARY()) for(const auto* d:*m->DICTIONARY()) out.dictionary.push_back(decodeEntry(d));
     if(m->REMOVALS()) for(const auto* r:*m->REMOVALS()) out.removals.push_back({r->SEQ(),r->ROW_J(),uint8_t(r->REASON())});
     if(m->URLS()) for(const auto* u:*m->URLS()) out.urls.push_back({u->SEQ(),u->ROW_J(),u->URL_ID()});
-    size_t di=0;
-    if(m->ROWS()) for(size_t j=0;j<m->ROWS()->size();j++) {
+    size_t di=0; const size_t rows=m->ROWS()?m->ROWS()->size():0;
+    std::vector<const ::FMBSignature*> signatures; std::vector<const ::FMBIdentity*> identities; std::vector<const ::FMBSealed*> sealedRows; std::vector<const ::FMBLarge*> largeRows;
+    if(!fmbByRow(m->SIGNATURES(),rows,&signatures) || !fmbByRow(m->IDENTITIES(),rows,&identities) || !fmbByRow(m->SEALED(),rows,&sealedRows) || !fmbByRow(m->LARGE(),rows,&largeRows)) return false;
+    for(size_t j=0;j<rows;j++) {
         const auto* r=m->ROWS()->Get(flatbuffers::uoffset_t(j)); FmbRow row;
         row.offset=r->OFFSET(); row.seq=r->SEQ(); row.sourceTs=r->SOURCE_TS(); row.length=r->LENGTH(); row.flags=r->FLAGS(); row.group=r->GROUP(); row.rowJ=r->ROW_J();
         if(row.group>=out.groups.size()) return false;
         if(row.flags&FmbNewFrame) { if(!m->DIGESTS() || di+32>m->DIGESTS()->size()) return false; std::memcpy(row.digest.data(),m->DIGESTS()->data()+di,32); di+=32; }
-        if(m->SIGNATURES()) for(const auto* x:*m->SIGNATURES()) if(x->ROW()==j && x->BYTES()) row.signature.assign(reinterpret_cast<const char*>(x->BYTES()->data()),x->BYTES()->size());
-        if(m->IDENTITIES()) for(const auto* x:*m->IDENTITIES()) if(x->ROW()==j && x->HASH()) row.identity.assign(reinterpret_cast<const char*>(x->HASH()->data()),x->HASH()->size());
+        if(const auto* x=fmbRow(signatures,j)) if(x->BYTES()) row.signature.assign(reinterpret_cast<const char*>(x->BYTES()->data()),x->BYTES()->size());
+        if(const auto* x=fmbRow(identities,j)) if(x->HASH()) row.identity.assign(reinterpret_cast<const char*>(x->HASH()->data()),x->HASH()->size());
         bool sealed=false;
-        if(m->SEALED()) for(const auto* x:*m->SEALED()) if(x->ROW()==j) { if(!x->LEAF_DIGEST() || x->LEAF_DIGEST()->size()!=32) return false; sealed=true; row.epoch=x->EPOCH(); row.objectKey=x->OBJECT_KEY_ID(); std::memcpy(row.leafDigest.data(),x->LEAF_DIGEST()->data(),32); if(x->COLUMNS()) row.columns.assign(reinterpret_cast<const char*>(x->COLUMNS()->data()),x->COLUMNS()->size()); }
+        if(const auto* x=fmbRow(sealedRows,j)) { if(!x->LEAF_DIGEST() || x->LEAF_DIGEST()->size()!=32) return false; sealed=true; row.epoch=x->EPOCH(); row.objectKey=x->OBJECT_KEY_ID(); std::memcpy(row.leafDigest.data(),x->LEAF_DIGEST()->data(),32); if(x->COLUMNS()) row.columns.assign(reinterpret_cast<const char*>(x->COLUMNS()->data()),x->COLUMNS()->size()); }
         if(bool(row.flags&FmbSealed)!=sealed) return false;
         if(row.flags&FmbNewFrame) {
             Record record; record.digest=row.digest; record.bytesDigest=(row.flags&FmbSealed)?row.leafDigest:row.digest; record.length=row.length; record.cid=ipldCidDigest(0x55,(row.flags&FmbSealed)?row.leafDigest.data():row.digest.data());
-            if(row.flags&FmbLarge) { bool found=false; if(m->LARGE()) for(const auto* x:*m->LARGE()) if(x->ROW()==j && x->ROOT_CID()) { record.cid.assign(reinterpret_cast<const char*>(x->ROOT_CID()->data()),x->ROOT_CID()->size()); found=true; } if(!found) return false; }
+            if(row.flags&FmbLarge) { const auto* x=fmbRow(largeRows,j); if(!x || !x->ROOT_CID()) return false; record.cid.assign(reinterpret_cast<const char*>(x->ROOT_CID()->data()),x->ROOT_CID()->size()); }
             if(!records->emplace(row.offset,std::move(record)).second) return false;
         }
         out.rows.push_back(std::move(row));

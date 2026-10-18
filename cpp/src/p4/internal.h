@@ -406,7 +406,6 @@ struct RetiredGeneration {
 };
 struct CheckpointState;
 struct CheckpointPlan;
-struct DagState;
 struct DagHistory;
 struct Feed {
     Type* type = nullptr;
@@ -432,7 +431,6 @@ struct Feed {
     // compaction replaced, kept for readers on an older snapshot until retireAt
     std::mutex smu;
     std::mutex dagMu;
-    std::shared_ptr<DagState> dag; // disposable stream-derived IPLD cache
     std::shared_ptr<DagHistory> dagHistory; // retained generations' derived drops
     std::atomic<bool> ipfsExposed{false};
     std::map<uint32_t,uint64_t> releaseRequired, releasedThrough; // smu, generation-scoped offsets

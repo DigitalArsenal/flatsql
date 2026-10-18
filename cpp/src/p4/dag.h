@@ -7,7 +7,6 @@ struct DagBlock {
     std::string cid,bytes,path;
     uint64_t offset=0,length=0,unit=0;
     uint32_t kind=0;
-    std::vector<std::string> links;
 };
 struct DagSnapshot {
     std::string root,commitsRoot;
