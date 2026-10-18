@@ -18,6 +18,7 @@ struct CheckpointSegment {
 struct CheckpointState {
     uint64_t offset=0,end=0,appliedThrough=0,typeSeqHigh=0;
     uint64_t segmentBytes=0,checkpointBytes=0;
+    std::string feedRoot,commitsRoot; // derived from this checkpoint, not extra authority
     Counters counters;
     std::map<std::pair<uint8_t,uint32_t>,FmbEntry> dictionary;
     std::map<uint32_t,CheckpointLatest> latest;

@@ -1,4 +1,5 @@
 #include "checkpoint.h"
+#include "dag.h"
 #include "sds_frames.h"
 #include <algorithm>
 #include <cstdio>
@@ -268,6 +269,8 @@ int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState*
     for(const auto& item:data.tokens) { const auto& t=item.second.text; TokCount x;
         if(t.size()!=6 || !number(t[1],&x.n) || !number(t[2],&x.bytes) || !number(t[3],&x.mints) || !number(t[4],&x.maxts) || !number(t[5],&x.maxseq)) return fail(); if(x.n) out.tokens[item.first]=x;
     }
+    out.feedRoot=feedDagCheckpointCid(p,n);
+    if(ck->COMMITS_ROOT_CID()) out.commitsRoot.assign(reinterpret_cast<const char*>(ck->COMMITS_ROOT_CID()->data()),ck->COMMITS_ROOT_CID()->size());
     *state=std::move(out); return P4_OK;
 }
 
@@ -301,14 +304,25 @@ int32_t checkpointAppend(Feed* f,Conn* c,Stream* stream,const Counters& counters
         }
     }
     std::sort(out.segments.begin(),out.segments.end(),[](const CheckpointSegment& a,const CheckpointSegment& b){return a.offset<b.offset;});
+    rc=feedDagCommitRoot(f,stream,*previous,uint64_t(*end),&out.commitsRoot,err); if(rc!=P4_OK) return rc;
     flatbuffers::FlatBufferBuilder b; auto type=b.CreateString(f->type->name),provider=b.CreateString(f->provider),source=b.CreateString(f->source);
     int64_t minAt=INT64_MAX,maxAt=0; for(const auto& x:out.instances) { minAt=std::min(minAt,x.second.first); maxAt=std::max(maxAt,x.second.maxat); }
     FCKCounters k(uint64_t(counters.rows),uint64_t(counters.recs),uint64_t(counters.bytes),uint64_t(counters.nnull),uint64_t(counters.copies),uint64_t(counters.cbytes),uint64_t(counters.fbytes),counters.minseq==INT64_MAX?0:uint64_t(counters.minseq),uint64_t(counters.maxseq),counters.mine==INT64_MAX?0:counters.mine,counters.maxe==INT64_MIN?0:counters.maxe,counters.mints==INT64_MAX?0:counters.mints,counters.maxts,minAt==INT64_MAX?0:minAt,maxAt);
     std::vector<::FCKSegment> segments; std::vector<uint8_t> digests;
     for(const auto& s:out.segments) { segments.emplace_back(s.offset,s.length,fckSegmentKind(s.kind),s.level,0,s.minSeq,s.maxSeq,s.coversThrough,s.entries); digests.insert(digests.end(),s.digest.begin(),s.digest.end()); out.segmentBytes+=s.length+4; }
     auto sv=b.CreateVectorOfStructs(segments); auto dv=b.CreateVector(digests);
-    out.offset=uint64_t(*end); FCKBuilder root(b); root.add_SELF_OFFSET(out.offset); root.add_PREVIOUS(*previous); root.add_FEED_ID(f->fid); root.add_TYPE(type); root.add_PROVIDER(provider); root.add_SOURCE(source); root.add_GENERATION(stream->gen); root.add_COMMITTED_AT(nowSec()); root.add_APPLIED_THROUGH(out.appliedThrough); root.add_TYPE_SEQ_HIGH(out.typeSeqHigh); root.add_COUNTERS(&k); root.add_SEGMENTS(sv); root.add_SEGMENT_DIGESTS(dv);
+    auto cv=b.CreateVector(reinterpret_cast<const uint8_t*>(out.commitsRoot.data()),out.commitsRoot.size());
+    std::string previousRoot=state->feedRoot;
+    if(previousRoot.empty() && fresh) { std::lock_guard<std::mutex> lock(f->type->mu); if(f->checkpoint) previousRoot=f->checkpoint->feedRoot; }
+    if(previousRoot.empty()) {
+        std::vector<uint64_t> genesis; uint32_t genesisSize=0;
+        rc=frame(stream,0,&genesis,&genesisSize); if(rc!=P4_OK) return rc;
+        previousRoot=feedDagCheckpointCid(genesis.data(),genesisSize);
+    }
+    auto pv=b.CreateVector(reinterpret_cast<const uint8_t*>(previousRoot.data()),previousRoot.size());
+    out.offset=uint64_t(*end); FCKBuilder root(b); root.add_SELF_OFFSET(out.offset); root.add_PREVIOUS(*previous); root.add_FEED_ID(f->fid); root.add_TYPE(type); root.add_PROVIDER(provider); root.add_SOURCE(source); root.add_GENERATION(stream->gen); root.add_COMMITTED_AT(nowSec()); root.add_APPLIED_THROUGH(out.appliedThrough); root.add_TYPE_SEQ_HIGH(out.typeSeqHigh); root.add_COUNTERS(&k); root.add_SEGMENTS(sv); root.add_SEGMENT_DIGESTS(dv); root.add_COMMITS_ROOT_CID(cv); if(!previousRoot.empty()) root.add_PREVIOUS_FEED_ROOT_CID(pv);
     auto x=root.Finish(); FinishFCKBuffer(b,x); out.checkpointBytes+=b.GetSize()+4;
+    out.feedRoot=feedDagCheckpointCid(b.GetBufferPointer(),b.GetSize());
     rc=append(stream,b,end,"FCK"); if(rc!=P4_OK) return rc; *previous=out.offset; out.end=uint64_t(*end); *state=std::move(out); return P4_OK;
 }
 
@@ -326,7 +340,7 @@ int32_t checkpointFeed(Feed* f,bool force,std::string* err,bool syncNow) {
     Engine* e=f->type->e; Counters counters; CheckpointState state; int64_t end,start; uint64_t previous; bool pending=false;
     { std::lock_guard<std::mutex> g(f->type->mu);
         if(!f->created || f->quarantined || !f->mark || (!force && !checkpointDue(f,true))) return P4_OK;
-        if(f->checkpoint && uint64_t(f->mark)==f->checkpoint->end && !f->pendingCheckpoint) return P4_OK;
+        if(f->checkpoint && uint64_t(f->mark)==f->checkpoint->end && !f->pendingCheckpoint && !f->checkpoint->commitsRoot.empty()) return P4_OK;
         pending=bool(f->pendingCheckpoint); if(pending && !syncNow) return P4_OK;
         if(pending) state=*f->pendingCheckpoint; else if(f->checkpoint) state=*f->checkpoint;
         counters=f->k; start=f->mark; end=pending?int64_t(state.end):start; previous=pending?state.offset:f->lastCommit;

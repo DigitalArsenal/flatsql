@@ -27,7 +27,11 @@ std::string streamPath(const Feed* f, uint32_t gen) {
 
 // Unexposed feeds are released implicitly. The IPFS integration supplies
 // this decision when a node must acknowledge registrations in the new file.
-__attribute__((weak)) bool streamGenerationReleased(const Feed*, uint32_t) { return true; }
+bool streamGenerationReleased(const Feed* f, uint32_t gen) {
+    if (!f->ipfsExposed.load()) return true;
+    const auto need=f->releaseRequired.find(gen), done=f->releasedThrough.find(gen);
+    return need!=f->releaseRequired.end() && done!=f->releasedThrough.end() && done->second>=need->second;
+}
 
 namespace {
 int32_t openStream(const std::string& path, uint32_t gen, bool create, std::shared_ptr<Stream>* out) {

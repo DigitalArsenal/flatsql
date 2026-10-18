@@ -65,8 +65,30 @@ enum {
     P4_OPC_PUT = 1, P4_OPC_SUPERSEDE = 2, P4_OPC_DELETE = 3, P4_OPC_QUOTA_GC = 4, P4_OPC_REBUILD = 5,
     P4_OPC_GET = 10, P4_OPC_TAGS = 11, P4_OPC_SCAN = 12, P4_OPC_HEAD = 13, P4_OPC_WINDOW = 14,
     P4_OPC_INDEX_PAGE = 15, P4_OPC_EPOCH = 16, P4_OPC_SUMMARY = 17,
+    P4_OPC_RANGES = 18, P4_OPC_FEED_ROOT = 19, P4_OPC_DROPS = 20,
+    P4_OPC_EXPOSURE = 21, P4_OPC_RELEASE = 22,
     P4_OPC_SQL = 30, P4_OPC_SURFACE = 31
 };
+/* IPFS ops: tag 1 type; tags 3/4 provider/source (both omitted = every feed,
+ * both empty = local). Tag 80 u64: inclusive from-commit for RANGES/DROPS,
+ * through-commit for RELEASE. Tag 81 u8: EXPOSURE (0 default, 1 on).
+ * Tag 82 u32: RELEASE generation (default current); offsets are generation-local.
+ * RANGES: path,offset,length,cid,kind,unit,block,provider,source,generation.
+ * Paths are relative to config root; inline block bytes only for dag-pb nodes.
+ * LINK unit is its publication/change commit, including rewrites of old units.
+ * FEED_ROOT: provider,source,cid,unit,generation,blocked_generations.
+ * DROPS: cid,unit,provider,source,generation. Includes removed records, large
+ * roots/leaves and obsolete raw metadata. Derived LINK blocks are reclaimed
+ * by pin-update/GC. Unit names the removal or replacement checkpoint.
+ * RANGES is the live closure in the current generation, filtered by unit.
+ * Reset the cursor when FEED_ROOT reports a changed generation.
+ * Exposure is runtime policy: the node must reapply it after opening a store
+ * before the 30-second retired-reader window expires.
+ * EXPOSURE/RELEASE return no rows. These run on a read lane; exposure/release
+ * change only the node's generation-release bookkeeping, never stream bytes.
+ */
+enum { P4_RANGE_RECORD=1, P4_RANGE_LARGE_LEAF=2, P4_RANGE_LARGE_ROOT=3,
+       P4_RANGE_FMB=4, P4_RANGE_FCK=5, P4_RANGE_FSG=6, P4_RANGE_LINK=7 };
 enum { P4_CLASS_WRITE = 1, P4_CLASS_INTERACTIVE = 2, P4_CLASS_BULK = 3, P4_CLASS_SANDBOX = 4,
        P4_CLASS_MAINTENANCE = 5 };
 enum { P4_SLOT_FREE = 0, P4_SLOT_CLAIMED = 1, P4_SLOT_QUEUED = 2, P4_SLOT_RUNNING = 3, P4_SLOT_DONE = 5 };

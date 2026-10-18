@@ -1,6 +1,7 @@
 // The format-5 stream codec. Generated SDS tables are confined to persistence.
 #include "internal.h"
 #include "checkpoint.h"
+#include "ipld.h"
 #include "sds_frames.h"
 #include "flatsql/flatsql_io.h"
 #include <algorithm>
@@ -33,7 +34,7 @@ bool verifyFmbCommit(const FMB* m,uint64_t at,uint64_t previous,uint32_t fid,
             (e->KIND()==fmbDictKind_TOKEN || e->KIND()==fmbDictKind_NODE?2:1);
         if(e->TEXT()->size()!=fields || (e->KIND()==fmbDictKind_TOKEN && e->ID()>10000000)) return false;
     }
-    std::set<uint32_t> sealedRows,signatureRows,identityRows;
+    std::set<uint32_t> sealedRows,signatureRows,identityRows,largeRows;
     if(m->SEALED()) for(const auto* s:*m->SEALED()) {
         if(s->ROW()>=rowCount || !(m->ROWS()->Get(s->ROW())->FLAGS()&FmbSealed) ||
            !s->LEAF_DIGEST() || s->LEAF_DIGEST()->size()!=32 || !sealedRows.insert(s->ROW()).second) return false;
@@ -42,6 +43,17 @@ bool verifyFmbCommit(const FMB* m,uint64_t at,uint64_t previous,uint32_t fid,
         if(s->ROW()>=rowCount || !s->BYTES() || !signatureRows.insert(s->ROW()).second) return false;
     if(m->IDENTITIES()) for(const auto* i:*m->IDENTITIES())
         if(i->ROW()>=rowCount || !i->HASH() || i->HASH()->size()!=32 || !identityRows.insert(i->ROW()).second) return false;
+    if(m->LARGE()) for(const auto* large:*m->LARGE()) {
+        if(large->ROW()>=rowCount || !(m->ROWS()->Get(large->ROW())->FLAGS()&FmbLarge) ||
+           !large->ROOT_CID() || !large->ROOT_NODE() || !large->LEAF_DIGESTS() ||
+           !largeRows.insert(large->ROW()).second) return false;
+        IpldLarge expected;
+        if(!ipldLargeFromDigests(m->ROWS()->Get(large->ROW())->LENGTH(),
+              std::string(reinterpret_cast<const char*>(large->LEAF_DIGESTS()->data()),large->LEAF_DIGESTS()->size()),&expected) ||
+           expected.rootCid.size()!=large->ROOT_CID()->size() || expected.rootNode.size()!=large->ROOT_NODE()->size() ||
+           std::memcmp(expected.rootCid.data(),large->ROOT_CID()->data(),expected.rootCid.size()) ||
+           std::memcmp(expected.rootNode.data(),large->ROOT_NODE()->data(),expected.rootNode.size())) return false;
+    }
     if(m->REMOVALS()) for(const auto* rm:*m->REMOVALS()) if(!rm->SEQ() || rm->SEQ()>uint64_t(INT64_MAX>>16) || (rm->ROW_J()!=UINT32_MAX && rm->ROW_J()>65535) || rm->REASON()>fmbRemoveReason_MOVED_OUT) return false;
     if(m->URLS()) for(const auto* u:*m->URLS()) if(!u->SEQ() || u->SEQ()>uint64_t(INT64_MAX>>16) || u->ROW_J()>65535) return false;
     size_t dg=0;
@@ -50,6 +62,8 @@ bool verifyFmbCommit(const FMB* m,uint64_t at,uint64_t previous,uint32_t fid,
         if(row->RESERVED()!=0 || (row->FLAGS()&~uint32_t(127)) || !row->SEQ() || row->SEQ()>uint64_t(INT64_MAX>>16) || row->OFFSET()>=at || row->LENGTH()<8 ||
            !m->GROUPS() || row->GROUP()>=m->GROUPS()->size()) return false;
         if((row->FLAGS()&FmbSealed) && !sealedRows.count(uint32_t(j))) return false;
+        if(bool(row->FLAGS()&FmbLarge)!=(row->LENGTH()>IpldChunkSize) ||
+           ((row->FLAGS()&FmbLarge) && !largeRows.count(uint32_t(j)))) return false;
         if(row->FLAGS()&FmbNewFrame) {
             auto it=pending.find(row->OFFSET());
             if(it==pending.end() || it->second.size!=row->LENGTH() || row->OFFSET()<=previous || row->OFFSET()+4+row->LENGTH()>at ||
@@ -72,17 +86,23 @@ int32_t streamGenesis(Feed* f, Stream* s, int64_t* end) {
     if(*end != 0) return P4_E_CORRUPT;
     flatbuffers::FlatBufferBuilder b;
     auto type=b.CreateString(f->type->name), provider=b.CreateString(f->provider), source=b.CreateString(f->source);
+    const std::string emptyNode=ipldDagPb({}), emptyCid=ipldCid(IpldDagPb,emptyNode.data(),emptyNode.size());
+    const auto commits=b.CreateVector(reinterpret_cast<const uint8_t*>(emptyCid.data()),emptyCid.size());
     FCKCounters counters(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
     FCKBuilder root(b);
     root.add_SELF_OFFSET(0); root.add_PREVIOUS(UINT64_MAX); root.add_FEED_ID(f->fid);
     root.add_TYPE(type); root.add_PROVIDER(provider); root.add_SOURCE(source);
     root.add_GENERATION(s->gen); root.add_COUNTERS(&counters);
+    root.add_COMMITS_ROOT_CID(commits);
     auto x=root.Finish(); FinishFCKBuffer(b,x);
     return appendBuffer(s,b,end);
 }
 
 int32_t streamAppendCommit(Feed* f, Stream* stream, const FmbCommit& m, int64_t* end, uint64_t* previous) {
     size_t at=0;
+    // Every writer, compaction and replay reaches this boundary. Derive the
+    // large-file DAG once per physical frame, directly from its written bytes.
+    std::unordered_map<uint64_t,IpldLarge> largeFrames;
     do {
         const size_t count=std::min<size_t>(65536,m.rows.size()-at);
         flatbuffers::FlatBufferBuilder b;
@@ -90,9 +110,25 @@ int32_t streamAppendCommit(Feed* f, Stream* stream, const FmbCommit& m, int64_t*
         std::vector<flatbuffers::Offset<FMBSignature>> signatures;
         std::vector<flatbuffers::Offset<FMBSealed>> sealed;
         std::vector<flatbuffers::Offset<FMBIdentity>> identities;
+        std::vector<flatbuffers::Offset<FMBLarge>> large;
         for(size_t j=0;j<count;j++) {
             const auto& r=m.rows[at+j];
-            rows.emplace_back(r.offset,r.seq,r.sourceTs,r.length,r.group,r.rowJ,r.flags,0);
+            const uint32_t flags=(r.flags&~uint32_t(FmbLarge)) | (r.length>IpldChunkSize?FmbLarge:0);
+            rows.emplace_back(r.offset,r.seq,r.sourceTs,r.length,r.group,r.rowJ,flags,0);
+            if(flags&FmbLarge) {
+                auto found=largeFrames.find(r.offset);
+                if(found==largeFrames.end()) {
+                    std::string record; const int32_t rc=streamRead(stream,int64_t(r.offset),r.length,&record);
+                    if(rc!=P4_OK) return rc;
+                    IpldLarge dag; if(!ipldLarge(record.data(),record.size(),&dag)) return P4_E_CORRUPT;
+                    found=largeFrames.emplace(r.offset,std::move(dag)).first;
+                }
+                const auto& dag=found->second;
+                const auto cid=b.CreateVector(reinterpret_cast<const uint8_t*>(dag.rootCid.data()),dag.rootCid.size());
+                const auto node=b.CreateVector(reinterpret_cast<const uint8_t*>(dag.rootNode.data()),dag.rootNode.size());
+                const auto leaves=b.CreateVector(reinterpret_cast<const uint8_t*>(dag.leafDigests.data()),dag.leafDigests.size());
+                large.push_back(CreateFMBLarge(b,uint32_t(j),cid,node,leaves));
+            }
             if(r.flags&FmbNewFrame) digests.insert(digests.end(),r.digest.begin(),r.digest.end());
             if(!r.signature.empty()) signatures.push_back(CreateFMBSignature(b,uint32_t(j),b.CreateVector(reinterpret_cast<const uint8_t*>(r.signature.data()),r.signature.size())));
             if(r.flags&FmbSealed) sealed.push_back(CreateFMBSealed(b,uint32_t(j),r.epoch,r.objectKey,b.CreateVector(r.leafDigest.data(),32),b.CreateVector(reinterpret_cast<const uint8_t*>(r.columns.data()),r.columns.size())));
@@ -114,11 +150,13 @@ int32_t streamAppendCommit(Feed* f, Stream* stream, const FmbCommit& m, int64_t*
         const auto rv=b.CreateVectorOfStructs(rows); const auto gv=b.CreateVectorOfStructs(groups);
         const auto dv=b.CreateVector(digests); const auto dict=b.CreateVector(dictionary); const auto rm=b.CreateVectorOfStructs(removals); const auto uv=b.CreateVectorOfStructs(urls);
         const auto sv=b.CreateVector(signatures); const auto ev=b.CreateVector(sealed); const auto iv=b.CreateVector(identities);
+        const auto lv=b.CreateVector(large);
         FMBBuilder root(b);
         root.add_SELF_OFFSET(uint64_t(*end)); root.add_PREVIOUS(*previous); root.add_FEED_ID(f->fid);
         root.add_COMMITTED_AT(m.committedAt); root.add_TYPE_SEQ_HIGH(m.typeSeqHigh);
         root.add_ROWS(rv); root.add_DIGESTS(dv); root.add_GROUPS(gv); root.add_DICTIONARY(dict);
         root.add_REMOVALS(rm); root.add_URLS(uv); root.add_SIGNATURES(sv); root.add_SEALED(ev); root.add_IDENTITIES(iv);
+        root.add_LARGE(lv);
         auto x=root.Finish(); FinishFMBBuffer(b,x);
         const uint64_t offset=uint64_t(*end);
         int32_t rc=appendBuffer(stream,b,end);

@@ -71,6 +71,10 @@
 #include "p4/wxf_fixture.h"
 #if __has_include("FMB/main_generated.h")
 #include "p4/frame_walk.h"
+#if !defined(__wasm__)
+#include "ipld.h"
+#include "car.h"
+#endif
 #define P4_REPLAY_FORMAT5 1
 #else
 #define P4_REPLAY_FORMAT5 0
@@ -890,6 +894,8 @@ bool compactionProof(const std::string& root,const Probe& probe) {
 
 #if !defined(__wasm__)
 
+#include "p4/ipfs_replay.h"
+
 struct LeadAck { int tile = 0; std::vector<int64_t> seq; };
 Batch crashTile(int tile) {
     Batch b = tileBatch(kBig, "crash-tile-" + std::to_string(tile), "crash", tile, kT0 + 5 * 86400,
@@ -1166,6 +1172,34 @@ P4_SLOW_TEST(p4_replay) {
 #endif
 #if !defined(__wasm__)
 #if P4_REPLAY_FORMAT5
+    if (phase == "car-export" || phase == "car-restore") {
+        // Native test-client archive commands; the node can adopt these same
+        // writer-serialized functions when it wires its backup ABI.
+        const std::string path=argStr("car","");
+        REQUIRE(!path.empty(),"--car must name the CARv2 file");
+        REQUIRE(openNode(root,1)==P4_OK && registerAll(),"archive store open");
+        auto* type=flatsql::p4::currentEngine()->findType(argStr("type",""));
+        REQUIRE(type,"--type must name a registered type");
+        flatsql::p4::CarStats stats; std::string err; int32_t rc=P4_E_ARG;
+        if(phase=="car-export") {
+            flatsql::p4::Feed* feed=nullptr;
+            { std::lock_guard<std::mutex> lock(type->mu);
+              for(const auto& f:type->feeds) if(f->created && f->provider==argStr("provider","") && f->source==argStr("source","")) feed=f.get(); }
+            REQUIRE(feed,"--provider/--source must name an existing feed (empty = local)");
+            rc=flatsql::p4::carExportFeed(feed,path,&stats,&err);
+        } else rc=flatsql::p4::carRestoreFeed(type,path,nullptr,&stats,&err);
+        if(rc!=P4_OK) std::fprintf(stderr,"CAR: %s\n",err.c_str());
+        REQUIRE(rc==P4_OK,"CAR archive command");
+        closeEngine(600000);
+        std::printf("REPLAY_CAR command=%s bytes=%llu blocks=%llu wall_ms=%.3f PASS\n",phase.c_str(),
+            (unsigned long long)stats.bytes,(unsigned long long)stats.blocks,double(stats.wallNs)/1e6);
+        return;
+    }
+    if (phase == "ipfs") {
+        const Probe p=probeOf(readGp(argStr("gp","")),int(argInt("probes",200)));
+        REQUIRE(ipfsProof(root,p),"IPFS range/DAG/CAR/release proof");
+        return;
+    }
     if (phase == "walk") {
         REQUIRE(walkStore(root, true), "stock frame walk");
         return;

@@ -416,6 +416,24 @@ Feed* feedRestore(Type* t, uint32_t fid, const std::string& provider, const std:
     return f;
 }
 
+Feed* feedRestoreFresh(Type* t,uint32_t fid,const std::string& provider,const std::string& source,std::string* err) {
+    auto collision=[&]() -> Feed* { if(err) *err="CAR destination feed identity or FEED_ID is already occupied"; return nullptr; };
+    if(!fid || fid>1000000) return collision();
+    auto identity=t->feedByKey.find(unitJoin({&provider,&source}));
+    if(identity!=t->feedByKey.end() && identity->second!=fid) return collision();
+    Feed* slot=t->feedById(fid);
+    const bool placeholder=slot && (slot->provider.rfind("\x1f#",0)==0 || slot->name.empty());
+    if(slot && !placeholder) {
+        if(slot->provider!=provider || slot->source!=source || slot->created || slot->mark || slot->registered) return collision();
+        return slot;
+    }
+    const std::string name=feedFileName(t,provider,source,fid);
+    slot=feedRestore(t,fid,provider,source,name);
+    // No stream or type-index registration exists until restore succeeds.
+    slot->registered=false;
+    return slot;
+}
+
 Feed* feedFor(Type* t, const std::string& provider, const std::string& source, bool create, bool* made) {
     if (made) *made = false;
     auto it = t->feedByKey.find(unitJoin({&provider, &source}));

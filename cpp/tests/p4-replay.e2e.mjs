@@ -54,7 +54,8 @@
 // (explicitly skip the baseline), P4_REPLAY_BASE_SOURCE (local extracted v3.7.2
 // tree; never changes the self-building default), P4_REPLAY_BASE_FIXTURE
 // or P4_REPLAY_NEW_FIXTURE (matching locally built fixture; measurements use
-// clones), P4_REPLAY_BOUNDS_MB (local bounds scratch size), and
+// clones), P4_REPLAY_WASM_IMAGE (prebuilt cmake/ninja/g++ image; builds
+// with Docker networking disabled), P4_REPLAY_BOUNDS_MB (local bounds scratch size), and
 // P4_REPLAY_DISCARD_BASE_FIXTURE=1 (remove a work-local baseline after its runs).
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -133,7 +134,7 @@ function build(name, src) {
   run('cmake', ['-S', src, '-B', dir, '-DCMAKE_BUILD_TYPE=Release', `-DFLATBUFFERS_DIR=${flatbuffers()}`, `-DSDS_SCHEMA_DIR=${sdsDir}`], {
     stdio: ['ignore', 'ignore', 'inherit'],
   });
-  run('nice', ['cmake', '--build', dir, '--target', 'flatsql_p4_test', '-j', '8'], { stdio: ['ignore', 'ignore', 'inherit'] });
+  run('nice', ['cmake', '--build', dir, '--target', 'flatsql_p4_test', ...(name === 'new' ? ['flatsql_p4_fault_test'] : []), '-j', '8'], { stdio: ['ignore', 'ignore', 'inherit'] });
   return join(dir, 'flatsql_p4_test');
 }
 
@@ -182,18 +183,24 @@ function wasmTestBuild(name, src) {
   if (existsSync(join(out, 'flatsql-p4-test.wasm'))) return join(out, 'flatsql-p4-test.wasm');
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
+  const sdk = join(work, `wasi-sdk-30-${arch}`);
+  if (!existsSync(join(sdk, '.ready')) || !existsSync(join(sdk, 'bin/clang'))) {
+    mkdirSync(sdk, { recursive: true });
+    run('tar', ['-xzf', tgz, '-C', sdk, '--strip-components=1']);
+    writeFileSync(join(sdk, '.ready'), 'wasi-sdk-30.0\n');
+  }
+  const buildImage = process.env.P4_REPLAY_WASM_IMAGE;
   const script = [
-    'apt-get update -qq >/dev/null && apt-get install -y -qq cmake ninja-build g++ >/dev/null',
-    'mkdir -p /opt/wasi-sdk && tar -xzf /w/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1',
-    'cmake -S /w/flatsql/cpp -B /tmp/b -G Ninja -DCMAKE_TOOLCHAIN_FILE=/w/flatsql/cpp/cmake/wasi-threads-toolchain.cmake' +
-      ' -DWASI_SDK_PREFIX=/opt/wasi-sdk -DFLATBUFFERS_DIR=/w/flatbuffers -DSDS_SCHEMA_DIR=/w/sds -DCMAKE_BUILD_TYPE=Release >/dev/null',
-    'cmake --build /tmp/b --target flatsql_p4_test_wasm -j 8 >/tmp/build.log 2>&1 || { tail -40 /tmp/build.log; exit 1; }',
-    'cp /tmp/b/flatsql-p4-test.wasm /w/out/',
+    ...(buildImage ? [] : ['apt-get update -qq >/dev/null && apt-get install -y -qq cmake ninja-build g++ >/dev/null']),
+    'cmake -S /w/flatsql/cpp -B /w/out/build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/w/flatsql/cpp/cmake/wasi-threads-toolchain.cmake' +
+      ' -DWASI_SDK_PREFIX=/w/wasi-sdk -DFLATBUFFERS_DIR=/w/flatbuffers -DSDS_SCHEMA_DIR=/w/sds -DCMAKE_BUILD_TYPE=Release >/dev/null',
+    'cmake --build /w/out/build --target flatsql_p4_test_wasm -j 8 >/w/out/build.log 2>&1 || { tail -40 /w/out/build.log; exit 1; }',
+    'cp /w/out/build/flatsql-p4-test.wasm /w/out/',
   ].join('\n');
   // The SDS schemas the format-5 frames are generated from (the 1.255.0 devDependency).
   const sdsMount = ['-v', `${sdsDir}:/w/sds:ro`];
-  run('docker', ['run', '--rm', ...sdsMount, '-v', `${src}:/w/flatsql/cpp:ro`, '-v', `${flatbuffers()}:/w/flatbuffers:ro`, '-v', `${tgz}:/w/wasi-sdk.tar.gz:ro`,
-    '-v', `${out}:/w/out`, 'ubuntu:22.04', 'bash', '-euc', script], { stdio: ['ignore', 'inherit', 'inherit'] });
+  run('docker', ['run', '--rm', '-w', '/w/out', ...(buildImage ? ['--network', 'none', '--entrypoint', '/bin/bash'] : []), ...sdsMount, '-v', `${src}:/w/flatsql/cpp:ro`, '-v', `${flatbuffers()}:/w/flatbuffers:ro`, '-v', `${sdk}:/w/wasi-sdk:ro`,
+    '-v', `${out}:/w/out`, buildImage || 'ubuntu:22.04', ...(buildImage ? [] : ['bash']), '-euc', script], { stdio: ['ignore', 'inherit', 'inherit'] });
   return join(out, 'flatsql-p4-test.wasm');
 }
 function aotSetup() {
@@ -207,7 +214,7 @@ function aotSetup() {
   const overlay = join(work, 'aot-overlay.json');
   writeFileSync(overlay, JSON.stringify({ Replace: { [join(pkg, 'zz_p4_replay_aot_test.go')]: join(cpp, 'tests/p4/aot/replay_aot_test.go') } }));
   const bin = join(work, 'p4-replay-aot.test');
-  const env = { ...process.env, WASMEDGE_DIR: wasmedge, GOFLAGS: '-p=6' };
+  const env = { ...process.env, WASMEDGE_DIR: wasmedge, GOFLAGS: '-p=6 -buildvcs=false' };
   for (const k of Object.keys(env)) if (k.startsWith('CGO_') || k === 'WASMEDGE_LIB_DIR') delete env[k];
   run(join(sdn, 'scripts/go-with-wasmedge.sh'), ['test', '-c', '-overlay', overlay, '-o', bin, './internal/flatsqlrt'],
     { cwd: join(sdn, 'sdn-server'), env, stdio: ['ignore', 'ignore', 'inherit'] });
@@ -342,6 +349,31 @@ function checkpointPhases(runtime, phases = ['index-deleted', 'compaction']) {
   }
 }
 
+
+// The IPFS protocol phase is part of the same replay gate, on a fresh clone.
+// Its independent parsers and measurements run in C++, natively only.
+function ipfsPhase() {
+  diskCheck(work, wxfBytes * 3);
+  const clone = join(work, `clone-${process.pid}-${cloneN++}`);
+  run('cp', ['-c', '-R', fixtures.new, clone]);
+  try {
+    const r = runtimeRun('native', 'new', ['--test=p4_replay', '--phase=ipfs', `--store=${clone}`,
+      `--gp=${seedTsv}`, `--retention-pages=${prof.retentionPages}`]);
+    process.stdout.write(r.stdout || ''); process.stderr.write(r.stderr || '');
+    if (r.status !== 0 || !(r.stdout || '').includes('REPLAY_IPFS wall_ms=')) fail(`native IPFS: exit ${r.status ?? r.signal}`);
+  } finally { rmSync(clone, { recursive: true, force: true }); }
+  diskCheck(work);
+}
+function crashPhases() {
+  for (const test of ['t_kill', 't_power_loss']) {
+    diskCheck(work);
+    const bin = test === 't_kill' ? arms.new : join(work, 'build-new', 'flatsql_p4_fault_test');
+    const r = spawnSync(bin, [`--test=${test}`, '--slow=1', '--rounds=30'], { encoding: 'utf8', maxBuffer: 64 << 20 });
+    process.stdout.write(r.stdout || ''); process.stderr.write(r.stderr || '');
+    if (r.status !== 0) fail(`${test}: exit ${r.status ?? r.signal}`);
+  }
+}
+
 function bounds() {
   diskCheck(work, boundsMb * 2 ** 20);
   const r = spawnSync(arms.new, ['--test=p4_replay', '--phase=bounds', `--store=${work}`, `--bounds-mb=${boundsMb}`], { encoding: 'utf8' });
@@ -389,7 +421,8 @@ function slowerP(base, mine) {
 }
 
 if (NEW_ONLY) {
-  for (const runtime of RUNTIMES) checkpointPhases(runtime, PROFILE === 'full' ? ['index-deleted'] : undefined);
+  checkpointPhases('native', PROFILE === 'full' ? ['index-deleted'] : undefined);
+  if (PROFILE === 'gate') { ipfsPhase(); crashPhases(); }
   console.log(`${PROFILE} profile: ${((Date.now() - t0) / 1000).toFixed(0)} s`);
   console.log(`PASS: p4 replay ${PROFILE} new-only (checkpoint open, row-index rebuild and every read answer equal)`);
   process.exit(0);
@@ -501,6 +534,8 @@ for (const r of rows)
 // The recovery phases run natively: the engine code is the same in both runtimes,
 // and the read workloads above already hash equal across them.
 checkpointPhases('native');
+ipfsPhase();
+crashPhases();
 // Exact same E2E: independently walk every stream, then kill a lead three
 // times and compare the acknowledged prefix before/after cache deletion.
 for (const phase of ['walk', 'kill']) {

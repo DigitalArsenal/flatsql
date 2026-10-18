@@ -16,6 +16,7 @@
 
 #include "internal.h"
 #include "checkpoint.h"
+#include "car.h"
 #include "sql_bridge.h"
 
 namespace flatsql {
@@ -652,6 +653,7 @@ void writerLoop(Engine* e, uint32_t wi) {
                     Internal* in = tasks[0]->internal;
                     if (op == P4_OPC_QUOTA_GC) quotaWork(e, t, in);
                     else if (op == kOpCompact) compactWork(e, t, in);
+                    else if (op == kOpCarExport || op == kOpCarRestore) carWork(t, op, in);
                     else rebuildWork(e, t, in);
                     in->done.store(true, std::memory_order_release);
                 } else if (op == P4_OPC_SUPERSEDE) {
@@ -738,7 +740,7 @@ void runSlot(P4Lane* L, uint32_t slot) {
     }
     const uint32_t op = h->op;
     int32_t status;
-    if (op >= P4_OPC_GET && op <= P4_OPC_SUMMARY) {
+    if (op >= P4_OPC_GET && op <= P4_OPC_RELEASE) {
         status = runRead(L, op);
         (void)status;
         return;  // runRead finishes the slot

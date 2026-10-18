@@ -39,6 +39,7 @@
 
 #include "internal.h"
 #include "checkpoint.h"
+#include "dag.h"
 #include "sql_bridge.h"
 
 namespace flatsql {
@@ -3280,6 +3281,40 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
     return rc;
 }
 
+// The IPFS surface reads only an acknowledged stream snapshot. Registration
+// policy and release acknowledgements are feed-local node decisions.
+int32_t opIpfs(P4Lane* L,const std::vector<Tlv>& v,uint32_t op) {
+    Out o(L); std::string type,provider,source,err; bool bad=false; uint64_t from=0; uint8_t on=0; uint32_t generation=UINT32_MAX;
+    tlvText(v,1,&type); const bool p=tlvText(v,3,&provider),s=tlvText(v,4,&source);
+    tlvU64(v,80,&from,&bad); tlvU8(v,81,&on,&bad); tlvU32(v,82,&generation,&bad);
+    if(op==P4_OPC_RANGES) o.header({"path","offset","length","cid","kind","unit","block","provider","source","generation"});
+    else if(op==P4_OPC_FEED_ROOT) o.header({"provider","source","cid","unit","generation","blocked_generations"});
+    else if(op==P4_OPC_DROPS) o.header({"cid","unit","provider","source","generation"});
+    else o.header({});
+    int32_t rc=P4_OK; Type* t=L->e->findType(type); std::vector<Feed*> feeds;
+    if(bad || p!=s || on>1 || ((op==P4_OPC_EXPOSURE || op==P4_OPC_RELEASE) && !p)) rc=P4_E_ARG;
+    else if(!t) rc=P4_E_NOTYPE;
+    else { std::lock_guard<std::mutex> lock(t->mu); for(auto& f:t->feeds) if(f->created && (!p || (f->provider==provider && f->source==source))) feeds.push_back(f.get()); }
+    for(Feed* f:feeds) {
+        if(rc!=P4_OK) break;
+        if(op==P4_OPC_EXPOSURE) { rc=feedExposure(f,on!=0); continue; }
+        if(op==P4_OPC_RELEASE) { uint32_t gen=generation; if(gen==UINT32_MAX) { std::lock_guard<std::mutex> lock(f->smu); gen=f->gen; } rc=feedRelease(f,gen,from); continue; }
+        if(op==P4_OPC_DROPS) {
+            std::vector<DagDrop> drops; rc=feedDagDrops(f,from,&drops,&err); if(rc!=P4_OK) break;
+            for(const auto& d:drops) { o.enc.beginRow(); o.enc.blob(d.cid.data(),d.cid.size()); o.enc.i64(d.unit); putText(o.enc,f->provider); putText(o.enc,f->source); o.enc.i64(d.generation); o.enc.endRow(); rc=o.rowDone(); if(rc!=P4_OK) break; }
+            continue;
+        }
+        DagSnapshot snapshot; rc=feedDagSnapshot(f,&snapshot,&err); if(rc!=P4_OK) break;
+        if(op==P4_OPC_FEED_ROOT) {
+            o.enc.beginRow(); putText(o.enc,f->provider); putText(o.enc,f->source); o.enc.blob(snapshot.root.data(),snapshot.root.size()); o.enc.i64(snapshot.through); o.enc.i64(snapshot.generation); o.enc.i64(feedBlockedGenerations(f)); o.enc.endRow(); rc=o.rowDone();
+        } else for(const auto& b:snapshot.blocks) {
+            if(b.unit<from) continue;
+            o.enc.beginRow(); putText(o.enc,b.path); o.enc.i64(b.offset); o.enc.i64(b.length); o.enc.blob(b.cid.data(),b.cid.size()); o.enc.i64(b.kind); o.enc.i64(b.unit); o.enc.blob(b.bytes.data(),b.bytes.size()); putText(o.enc,f->provider); putText(o.enc,f->source); o.enc.i64(snapshot.generation); o.enc.endRow(); rc=o.rowDone(); if(rc!=P4_OK) break;
+        }
+    }
+    L->e->bump(kStReads); o.finish(rc,err); return rc;
+}
+
 }  // namespace
 
 int32_t runRead(P4Lane* L, uint32_t op) {
@@ -3298,6 +3333,8 @@ int32_t runRead(P4Lane* L, uint32_t op) {
         case P4_OPC_INDEX_PAGE: return opIndexPage(L, v);
         case P4_OPC_EPOCH: return opEpoch(L, v);
         case P4_OPC_SUMMARY: return opSummary(L, v);
+        case P4_OPC_RANGES: case P4_OPC_FEED_ROOT: case P4_OPC_DROPS:
+        case P4_OPC_EXPOSURE: case P4_OPC_RELEASE: return opIpfs(L,v,op);
         default:
             respondEmpty(L, {}, P4_E_ARG, "unknown op");
             return P4_E_ARG;
