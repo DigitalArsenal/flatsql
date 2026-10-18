@@ -16,7 +16,9 @@
 // the bound (durable syncs x this disk's sync latency, or the bytes at memcpy
 // rate) and stock SQLite 3.53.4 on the same index and frames, and fails when
 // any answer hashes differently on the two builds (or across repetitions) or
-// a workload is slower than 3.7.2 (median 5% above, runs apart).
+// a workload is slower than 3.7.2 (exact one-sided Mann-Whitney U test,
+// p <= 0.005: at 5 repetitions every run of this build slower than every run
+// of 3.7.2).
 //
 // Environment: FLATBUFFERS_DIR (else the sibling flatbuffers checkout),
 // P4_REPLAY_DIR (work directory; default the system temp directory),
@@ -153,6 +155,37 @@ const q = (v, p) => {
 };
 const med = (v) => q(v, 0.5);
 
+// Slower is a test, not a comparison of two noisy medians: a bare median
+// comparison fails an unchanged (sync-bound) workload half the time. The exact
+// one-sided Mann-Whitney U test: U counts the pairs (3.7.2 run, this build's
+// run) where this build is faster (ties count a half); under the null (the
+// two builds' runs exchangeable) p = P(U <= observed), from the exact
+// distribution of U for these sample sizes. A workload fails at p <= ALPHA. At
+// 5 repetitions only complete separation qualifies (p = 1/252 = 0.004); over
+// this E2E's 20 workload passes the false-alarm rate is at most 8%
+// (Bonferroni), and a real slowdown of a few run-to-run deviations still
+// separates every run.
+const ALPHA = 0.005;
+function slowerP(base, mine) {
+  let u = 0;
+  for (const x of mine) for (const y of base) u += x < y ? 1 : x === y ? 0.5 : 0;
+  const m = mine.length, n = base.length;
+  // c[i][j][k]: orderings of i of mine and j of base with U = k.
+  const c = Array.from({ length: m + 1 }, () => Array.from({ length: n + 1 }, () => new Float64Array(m * n + 1)));
+  for (let i = 0; i <= m; i++)
+    for (let j = 0; j <= n; j++)
+      for (let k = 0; k <= i * j; k++) {
+        if (i === 0 || j === 0) { c[i][j][k] = k === 0 ? 1 : 0; continue; }
+        // the largest value is mine (U unchanged) or base (U gains i).
+        c[i][j][k] = c[i - 1][j][k] + (k >= i ? c[i][j - 1][k - i] : 0);
+      }
+  const all = c[m][n];
+  const total = all.reduce((x, y) => x + y, 0);
+  let at = 0;
+  for (let k = 0; k <= Math.floor(u); k++) at += all[k];
+  return at / total;
+}
+
 const b0 = bounds();
 console.log(`bounds: ${JSON.stringify(b0)}`);
 const results = {}; // workload -> pass -> arm -> [{wall, cpu, syncs}]
@@ -193,12 +226,10 @@ for (const workload of WORKLOADS) {
     const bound = syncs > 0 ? syncs * syncMs : 0;
     rows.push({ workload, pass, base_med: med(a), base_p95: q(a, 0.95), new_med: med(b), new_p95: q(b, 0.95), speedup: med(a) / med(b),
       base_cpu: med(ac), new_cpu: med(bc), syncs, bound_ms: bound, rows: bytes });
-    // Slower: the median past 3.7.2's by 5% and the two builds' runs apart
-    // (this build's lower quartile above 3.7.2's upper one), not one noisy
-    // cold run.
-    if (med(b) > med(a) * 1.05 && q(b, 0.25) > q(a, 0.75)) {
+    const p = slowerP(a, b);
+    if (p <= ALPHA) {
       failed = true;
-      console.error(`FAIL: ${key}: this build ${med(b).toFixed(1)} ms is slower than ${BASE_TAG} ${med(a).toFixed(1)} ms`);
+      console.error(`FAIL: ${key}: this build ${med(b).toFixed(1)} ms is slower than ${BASE_TAG} ${med(a).toFixed(1)} ms (Mann-Whitney p = ${p.toFixed(4)})`);
     }
   }
   if (hashes[`${workload}|after`] && hashes[`${workload}|after`].size !== 1) {
