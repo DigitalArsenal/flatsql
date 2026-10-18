@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.7.4
+
+Store format 4 reads a page's frames in fewer, larger reads. Every answer is 3.7.3's.
+- Frames up to 64 KiB apart join into one read (runs up to 4 MiB); 3.7.3 joined only frames
+  within 4 KiB. A cold random read costs about as much as 250 KB of sequential transfer, and a
+  warm one about as much as copying 64 KB.
+- p4_replay now also runs every workload the way SDN runs the engine: the wasm32 test command
+  under WasmEdge AOT, on sdn-server's flatsqlrt with the node's native host I/O. It also runs
+  stock SQLite 3.53.4 on the same index files as a yardstick.
+- 3.7.2 -> this build, 5 repetitions, median, native and then WasmEdge AOT:
+  - EPOCH-window sync, cold: 480 -> 355 ms native, 576 -> 436 ms AOT.
+  - Nearest-epoch latest, cold: 1,066 -> 982 ms native, 1,116 -> 997 ms AOT.
+  - Explorer paging, warm: 88 -> 52 ms native, 123 -> 70 ms AOT.
+  - Every answer hashes the same on both builds and both runtimes.
+
 ## 3.7.3
 
 Store format 4 reads a page of rows in one pass. Every answer is 3.7.2's.
