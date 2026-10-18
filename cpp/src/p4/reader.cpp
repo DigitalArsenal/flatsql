@@ -1166,7 +1166,7 @@ bool rowDict(Feed* f, Conn* c, RowV* x) {
 // Frames a read joins into one: the next starts within kFrameGap of the
 // previous one's end, up to kFrameRun bytes (a seq-ordered page of a feed is
 // one contiguous run of its stream).
-constexpr int64_t kFrameGap = 4096, kFrameRun = int64_t(1) << 20;
+constexpr int64_t kFrameGap = int64_t(64) << 10, kFrameRun = int64_t(4) << 20;
 
 // The rows' frames, the stream read in offset order with neighbors joined:
 // P4_E_IO when a read fails, P4_E_CORRUPT when a frame runs past the stream's
