@@ -57,9 +57,9 @@
 // clones), P4_REPLAY_WASM_IMAGE (prebuilt cmake/ninja/g++ image; builds
 // with Docker networking disabled), P4_REPLAY_BOUNDS_MB (local bounds scratch size), and
 // P4_REPLAY_DISCARD_BASE_FIXTURE=1 (remove a work-local baseline after its runs).
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
+import { closeSync, createReadStream, createWriteStream, existsSync, openSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -364,21 +364,34 @@ function checkpointPhases(runtime, phases = ['index-deleted', 'compaction', 'che
 
 // The IPFS protocol phase is part of the same replay gate, on a fresh clone.
 // Its independent parsers and measurements run in C++, natively only; Kubo
-// then checks the same bytes when `ipfs` is on PATH.
-function ipfsPhase() {
+// then checks the same bytes when `ipfs` is on PATH. The phase spends most
+// of its wall time in the 30 s retired-reader window, so it runs in the
+// background while the crash and recovery phases run: start() returns the
+// function that waits for it and checks it.
+function ipfsPhaseStart() {
   diskCheck(work, wxfBytes * 3);
   const clone = join(work, `clone-${process.pid}-${cloneN++}`);
   const kuboDir = join(work, `kubo-${process.pid}`);
   run('cp', ['-c', '-R', fixtures.new, clone]);
   mkdirSync(kuboDir, { recursive: true });
-  try {
-    const r = runtimeRun('native', 'new', ['--test=p4_replay', '--phase=ipfs', `--store=${clone}`,
-      `--gp=${seedTsv}`, `--retention-pages=${prof.retentionPages}`, `--kubo-dir=${kuboDir}`]);
-    process.stdout.write(r.stdout || ''); process.stderr.write(r.stderr || '');
-    if (r.status !== 0 || !(r.stdout || '').includes('REPLAY_IPFS wall_ms=')) fail(`native IPFS: exit ${r.status ?? r.signal}`);
-    kuboInterop(r.stdout, kuboDir);
-  } finally { rmSync(clone, { recursive: true, force: true }); rmSync(kuboDir, { recursive: true, force: true }); }
-  diskCheck(work);
+  const outPath = join(kuboDir, 'ipfs.stdout'), errPath = join(kuboDir, 'ipfs.stderr');
+  const out = openSync(outPath, 'w'), err = openSync(errPath, 'w');
+  const child = spawn(arms.new, ['--test=p4_replay', '--phase=ipfs', `--store=${clone}`,
+    `--gp=${seedTsv}`, `--retention-pages=${prof.retentionPages}`, `--kubo-dir=${kuboDir}`], { stdio: ['ignore', out, err] });
+  closeSync(out); closeSync(err);
+  // A failure elsewhere ends this E2E; never leave this exact child behind.
+  process.once('exit', () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+  const exited = new Promise((done) => child.on('exit', (code, signal) => done({ code, signal })));
+  return async () => {
+    try {
+      const { code, signal } = await exited;
+      const stdout = readFileSync(outPath, 'utf8');
+      process.stdout.write(stdout); process.stderr.write(readFileSync(errPath, 'utf8'));
+      if (code !== 0 || !stdout.includes('REPLAY_IPFS wall_ms=')) fail(`native IPFS: exit ${code ?? signal}`);
+      kuboInterop(stdout, kuboDir);
+    } finally { rmSync(clone, { recursive: true, force: true }); rmSync(kuboDir, { recursive: true, force: true }); }
+    diskCheck(work);
+  };
 }
 // Kubo (an independent IPFS implementation) against FlatSQL's bytes: `ipfs
 // add` of the large records gives FlatSQL's UnixFS roots, and two exported
@@ -495,7 +508,7 @@ function slowerP(base, mine) {
 
 if (NEW_ONLY) {
   checkpointPhases('native', PROFILE === 'full' ? ['index-deleted'] : undefined);
-  if (PROFILE === 'gate') { ipfsPhase(); crashPhases(); }
+  if (PROFILE === 'gate') { const ipfsDone = ipfsPhaseStart(); crashPhases(); await ipfsDone(); }
   console.log(`${PROFILE} profile: ${((Date.now() - t0) / 1000).toFixed(0)} s`);
   console.log(`PASS: p4 replay ${PROFILE} new-only (checkpoint open, row-index rebuild and every read answer equal)`);
   process.exit(0);
@@ -609,8 +622,7 @@ for (const r of rows)
 // The recovery phases run natively: the engine code is the same in both runtimes,
 // and the read workloads above already hash equal across them.
 checkpointPhases('native');
-ipfsPhase();
-mark('ipfs');
+const ipfsDone = ipfsPhaseStart();
 crashPhases();
 // Exact same E2E: independently walk every stream, then kill a lead three
 // times and compare the acknowledged prefix before/after cache deletion.
@@ -623,6 +635,8 @@ for (const phase of ['walk', 'kill']) {
   if (r.status !== 0) failed = true;
   mark(phase);
 }
+await ipfsDone();
+mark('ipfs_remainder');
 writeFileSync(join(work, `replay-results-${PROFILE}.json`), JSON.stringify({ profile: PROFILE, bounds: [b0, b1], memcpy, rows }, null, 1));
 console.log(`${PROFILE} profile: ${((Date.now() - t0) / 1000).toFixed(0)} s`);
 console.log(failed ? 'FAIL: p4 replay' : `PASS: p4 replay (every answer the same on both builds, ${RUNTIMES.join(' and ')})`);
