@@ -15,6 +15,7 @@
 #include <chrono>
 
 #include "internal.h"
+#include "checkpoint.h"
 #include "sql_bridge.h"
 
 namespace flatsql {
@@ -544,10 +545,28 @@ void release(WriterState& ws) {
     ws.hold = false;
 }
 
+// Checkpoints run only while the writer owns both pipeline stages. A completed
+// round is already acknowledged, so checkpoint construction never extends it.
+void checkpointWriter(Engine* e, uint32_t wi, bool idle, bool force) {
+    std::vector<Feed*> feeds;
+    { std::lock_guard<std::mutex> g(e->typesMu);
+      for (auto& type : e->types) if (type->owner == wi) {
+        std::lock_guard<std::mutex> tg(type->mu);
+        for (auto& f : type->feeds)
+          if (f->created && !f->quarantined && (force || checkpointDue(f.get(), idle))) feeds.push_back(f.get());
+      }
+    }
+    if (feeds.empty()) return;
+    WriterState& ws = *e->writers[wi]; drain(ws);
+    for (Feed* f : feeds) { std::string err; checkpointFeed(f, force, &err, idle || force); }
+    release(ws);
+}
+
 void runPut(Engine* e, uint32_t wi, Type* t, std::vector<WriteTask*>& tasks) {
     WriterState& ws = *e->writers[wi];
     collect(ws, false);
     if (ws.failing) recover(ws);
+    checkpointWriter(e, wi, false, false);
     std::vector<const PutUnit*> prevs;
     for (auto& u : ws.pending) prevs.push_back(u.get());
     std::unique_ptr<PutUnit> u = putPlan(e, t, tasks, prevs);
@@ -662,7 +681,8 @@ void writerLoop(Engine* e, uint32_t wi) {
             }
             continue;
         }
-        if (idle && e->queues[0].empty() && e->stopping.load()) break;
+        if (idle && e->queues[0].empty() && e->stopping.load()) { checkpointWriter(e, wi, true, true); break; }
+        if (idle && e->queues[0].empty()) checkpointWriter(e, wi, true, false);
         b.state.store(0, std::memory_order_seq_cst);
         if (idle && e->queues[0].empty() && b.doorbell.load(std::memory_order_acquire) == seq)
             ps::waitU32(&b.doorbell, seq, 50ull * 1000 * 1000);
@@ -853,6 +873,13 @@ int32_t engineStop(Engine* e, double deadlineMs) {
         std::lock_guard<std::mutex> g(e->typesMu);
         for (auto& t : e->types) types.push_back(t.get());
     }
+    int32_t checkpointStatus = P4_OK;
+    for (Type* t : types) {
+        if (!t->hasFiles.load(std::memory_order_acquire)) continue; // stop is idempotent, including after a crash
+        std::vector<Feed*> feeds;
+        { std::lock_guard<std::mutex> g(t->mu); for (auto& f : t->feeds) if (f->created && !f->quarantined) feeds.push_back(f.get()); }
+        for (Feed* f : feeds) { std::string err; const int32_t rc = checkpointFeed(f, true, &err); if (checkpointStatus == P4_OK && rc != P4_OK) checkpointStatus = rc; }
+    }
     // Close every writer connection with a TRUNCATE checkpoint.
     std::vector<Conn*> conns;
     {
@@ -898,7 +925,7 @@ int32_t engineStop(Engine* e, double deadlineMs) {
             t->fts = nullptr;
         }
     }
-    return P4_OK;
+    return checkpointStatus;
 }
 
 }  // namespace p4

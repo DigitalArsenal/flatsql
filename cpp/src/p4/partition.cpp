@@ -39,6 +39,7 @@
 #include <algorithm>
 
 #include "internal.h"
+#include "checkpoint.h"
 
 namespace flatsql {
 namespace p4 {
@@ -579,8 +580,42 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
     st=recoverFeed(t,f,c,moved,err);
     FileMeta m; std::map<InstId,InstCount> inst; std::map<uint32_t,TokCount> tokc;
     int rc=st==P4_OK?readMeta(c,&m):SQLITE_ERROR;
-    if(rc==SQLITE_OK) rc=readInst(f,c,&inst);
-    if(rc==SQLITE_OK) rc=readTokc(t,c,&tokc);
+    const auto checkpoint=f->checkpoint;
+    if(rc==SQLITE_OK && checkpoint && checkpoint->offset && checkpoint->end==uint64_t(m.mark)) {
+        // The schema omits rbytes/minw/maxw and the instance URL. Keep only
+        // those derived supplements in SQLite; all represented state comes
+        // from the verified checkpoint segments.
+        const int64_t rbytes=m.k.rbytes,minw=m.k.minw,maxw=m.k.maxw;
+        m.k=checkpoint->counters; m.k.rbytes=rbytes; m.k.minw=minw; m.k.maxw=maxw;
+        inst=checkpoint->instances; tokc=checkpoint->tokens;
+        Dict dictionary;
+        for(const auto& entry:checkpoint->dictionary) {
+            const auto& d=entry.second;
+            if(d.kind==1 && d.id && d.text.size()==2) {
+                if(dictionary.node.size()<d.id) dictionary.node.resize(d.id);
+                dictionary.node[d.id-1]={d.text[0],d.text[1]};
+                dictionary.nodeId[nodeKey(d.text[0],d.text[1])]=d.id;
+            } else if(d.kind==2 && d.id && d.text.size()==3) {
+                if(dictionary.batch.size()<d.id) dictionary.batch.resize(d.id);
+                dictionary.batch[d.id-1]={d.text[0],d.text[1],d.text[2]};
+                dictionary.batchId[batchKey(d.text[0],d.text[1],d.text[2])]=d.id;
+            }
+        }
+        dictionary.loaded=true;
+        { std::lock_guard<std::mutex> lock(f->dictMu); f->dict=std::move(dictionary); }
+        for(auto& item:inst) {
+            auto* q=c->sql("SELECT url FROM inst WHERE b=?1 AND c=?2");
+            if(!q) { rc=SQLITE_ERROR; break; }
+            sqlite3_bind_int64(q,1,item.first.first); sqlite3_bind_int64(q,2,item.first.second);
+            if(sqlite3_step(q)==SQLITE_ROW) {
+                const auto* value=sqlite3_column_text(q,0); if(value) item.second.url=reinterpret_cast<const char*>(value);
+            }
+            sqlite3_reset(q);
+        }
+    } else {
+        if(rc==SQLITE_OK) rc=readInst(f,c,&inst);
+        if(rc==SQLITE_OK) rc=readTokc(t,c,&tokc);
+    }
     if(st==P4_OK && rc==SQLITE_OK && m.indexed && !f->quarantined) st=stagedLoad(e,f,c,err);
     writerUnpin(e,f);
     if(st!=P4_OK) return st;
@@ -590,7 +625,39 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
         f->regGen=m.gen;
     }
     ioUnlink(streamPath(f,m.gen+1));
-    if(m.gen) ioUnlink(streamPath(f,m.gen-1));
+    if(m.gen) {
+        // The release timestamp is not durable. After a restart give every
+        // superseded generation a fresh reader window, including generations
+        // older than g-1 when several rewrites finished before shutdown.
+        std::vector<std::string> names;
+        if(!p4ListStreams(t->pDir,&names)) {
+            const std::string prior=streamPath(f,m.gen-1);
+            if(ioExists(prior)) names.push_back(prior.substr(prior.find_last_of('/')+1));
+        }
+        const std::string base=f->name+".",suffix=".fsdata";
+        const uint64_t retireAt=monoNs()+30000000000ull;
+        std::lock_guard<std::mutex> lock(f->smu);
+        for(const auto& name:names) {
+            uint64_t gen=0;
+            if(name!=f->name+suffix) {
+                if(name.size()<=base.size()+suffix.size() || name.compare(0,base.size(),base) ||
+                   name.compare(name.size()-suffix.size(),suffix.size(),suffix)) continue;
+                const std::string digits=name.substr(base.size(),name.size()-base.size()-suffix.size());
+                bool valid=true;
+                for(char ch:digits) {
+                    if(ch<'0' || ch>'9' || gen>(UINT32_MAX-uint32_t(ch-'0'))/10) { valid=false; break; }
+                    gen=gen*10+uint32_t(ch-'0');
+                }
+                if(!valid || std::to_string(gen)!=digits) continue;
+            }
+            if(gen>=m.gen || (f->retired && f->retired->gen==gen)) continue;
+            bool retained=false;
+            for(const auto& old:f->olderRetired) if(old.stream->gen==gen) { retained=true; break; }
+            if(retained) continue;
+            auto old=std::make_shared<Stream>(); old->gen=uint32_t(gen); old->path=streamPath(f,old->gen);
+            f->olderRetired.push_back({old,std::max<int64_t>(0,ioSize(old->path)),retireAt});
+        }
+    }
     std::lock_guard<std::mutex> g(t->mu);
     f->k=m.k; f->indexed=m.indexed; f->inst=std::move(inst); f->tokc=std::move(tokc);
     f->end=m.mark; f->mark=m.mark; f->streamBytes=m.mark;

@@ -1,5 +1,6 @@
 // The format-5 stream codec. Generated SDS tables are confined to persistence.
 #include "internal.h"
+#include "checkpoint.h"
 #include "sds_frames.h"
 #include "flatsql/flatsql_io.h"
 #include <algorithm>
@@ -78,23 +79,6 @@ int32_t streamGenesis(Feed* f, Stream* s, int64_t* end) {
     root.add_GENERATION(s->gen); root.add_COUNTERS(&counters);
     auto x=root.Finish(); FinishFCKBuffer(b,x);
     return appendBuffer(s,b,end);
-}
-int32_t streamCompactionEnd(Feed* f,Stream* stream,const Counters& k,int64_t* end,uint64_t* previous) {
-    flatbuffers::FlatBufferBuilder b;
-    auto type=b.CreateString(f->type->name), provider=b.CreateString(f->provider), source=b.CreateString(f->source);
-    int64_t minAt=INT64_MAX,maxAt=0;
-    for(const auto& item:f->inst) { minAt=std::min(minAt,item.second.first); maxAt=std::max(maxAt,item.second.maxat); }
-    FCKCounters counters(uint64_t(k.rows),uint64_t(k.recs),uint64_t(k.bytes),uint64_t(k.nnull),uint64_t(k.copies),
-        uint64_t(k.cbytes),uint64_t(k.fbytes),k.minseq==INT64_MAX?0:uint64_t(k.minseq),uint64_t(k.maxseq),
-        k.mine==INT64_MAX?0:k.mine,k.maxe==INT64_MIN?0:k.maxe,k.mints==INT64_MAX?0:k.mints,k.maxts,
-        minAt==INT64_MAX?0:minAt,maxAt);
-    FCKBuilder root(b);
-    root.add_SELF_OFFSET(uint64_t(*end)); root.add_PREVIOUS(*previous); root.add_FEED_ID(f->fid);
-    root.add_TYPE(type); root.add_PROVIDER(provider); root.add_SOURCE(source); root.add_GENERATION(stream->gen);
-    root.add_COMMITTED_AT(nowSec()); root.add_APPLIED_THROUGH(uint64_t(*end));
-    root.add_TYPE_SEQ_HIGH(uint64_t(f->type->nextSeq-1)); root.add_COUNTERS(&counters);
-    auto x=root.Finish(); FinishFCKBuffer(b,x);
-    uint64_t at=uint64_t(*end); int32_t rc=appendBuffer(stream,b,end); if(rc==P4_OK) *previous=at; return rc;
 }
 
 int32_t streamAppendCommit(Feed* f, Stream* stream, const FmbCommit& m, int64_t* end, uint64_t* previous) {
@@ -175,14 +159,28 @@ int32_t appendConsolidated(Feed* f,Conn* c,Stream* stream,int64_t* end,uint64_t*
             sqlite3_reset(q); if(rc!=SQLITE_DONE) return statusOfSqlite(rc);
         }
     }
-    std::unordered_set<int64_t> chosen;
-    if(rids) chosen.insert(rids->begin(),rids->end());
+    // A compaction visits the feed in record-frame order, in bounded chunks.
+    // Materialize just this chunk's keys so each FMB does indexed row seeks;
+    // scanning all rows for every chunk makes a large rewrite quadratic.
+    if(rids) {
+        int rc=c->exec("CREATE TEMP TABLE IF NOT EXISTS compact_rid(rid INTEGER PRIMARY KEY) WITHOUT ROWID; DELETE FROM compact_rid");
+        if(rc!=SQLITE_OK) return statusOfSqlite(rc);
+        auto* insert=c->sql("INSERT OR IGNORE INTO temp.compact_rid(rid) VALUES(?1)");
+        if(!insert) return P4_E_IO;
+        for(int64_t rid:*rids) {
+            sqlite3_bind_int64(insert,1,rid); rc=sqlite3_step(insert); sqlite3_reset(insert);
+            if(rc!=SQLITE_DONE) return statusOfSqlite(rc);
+        }
+    }
     std::unordered_set<uint64_t> frames;
     std::unordered_set<uint32_t> keys;
-    auto* q=c->sql("SELECT rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,off,len,kk FROM r ORDER BY rid");
+    auto* q=c->sql(rids?
+        "SELECT r.rid,r.seq,r.n,r.b,r.c,r.u,r.at,r.cid,r.e,r.k,r.ts,r.f,r.x,r.off,r.len,r.kk "
+        "FROM temp.compact_rid AS chosen CROSS JOIN r ON r.rid=chosen.rid ORDER BY chosen.rid":
+        "SELECT rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,off,len,kk FROM r ORDER BY rid");
     if(!q) return P4_E_IO; int rc;
     while((rc=sqlite3_step(q))==SQLITE_ROW) {
-        const int64_t rid=sqlite3_column_int64(q,0); if(rids && !chosen.count(rid)) continue;
+        const int64_t rid=sqlite3_column_int64(q,0);
         FmbRow row; row.seq=uint64_t(sqlite3_column_int64(q,1)); row.rowJ=uint16_t(rid&65535);
         row.offset=uint64_t(sqlite3_column_int64(q,13)); row.length=uint32_t(sqlite3_column_int64(q,14));
         row.sourceTs=sqlite3_column_int64(q,10); row.flags=FmbCompacted;
@@ -211,6 +209,7 @@ int32_t appendConsolidated(Feed* f,Conn* c,Stream* stream,int64_t* end,uint64_t*
         m.rows.push_back(std::move(row));
     }
     sqlite3_reset(q); if(rc!=SQLITE_DONE) return statusOfSqlite(rc);
+    if(rids && c->exec("DELETE FROM temp.compact_rid")!=SQLITE_OK) return P4_E_IO;
     if(m.rows.size()>65536) { if(err) *err="compaction chunk exceeds 65536 rows"; return P4_E_INTERNAL; }
     return streamAppendCommit(f,stream,m,end,previous);
 }
@@ -243,8 +242,8 @@ bool completedGeneration(Stream* stream,uint32_t fid,uint32_t gen) {
         std::string prefix; if(streamReadRange(stream,at,12,&prefix)!=P4_OK) break;
         uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data()));
         if(n<8 || n>(128u<<20) || int64_t(n)>size-at-4) break;
-        const bool fmb=!std::memcmp(prefix.data()+8,"$FMB",4), fck=!std::memcmp(prefix.data()+8,"$FCK",4);
-        if(fmb || fck) {
+        const bool fmb=!std::memcmp(prefix.data()+8,"$FMB",4), fck=!std::memcmp(prefix.data()+8,"$FCK",4), fsg=!std::memcmp(prefix.data()+8,"$FSG",4);
+        if(fmb || fck || fsg) {
             std::string data; if(streamRead(stream,at,n,&data)!=P4_OK) break;
             std::vector<uint64_t> aligned((n+7)/8); std::memcpy(aligned.data(),data.data(),n);
             auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier verifier(p,n);
@@ -252,11 +251,19 @@ bool completedGeneration(Stream* stream,uint32_t fid,uint32_t gen) {
                 if(!VerifyFMBBuffer(verifier)) break;
                 const auto* m=GetFMB(p);
                 if(!verifyFmbCommit(m,uint64_t(at),previous,fid,pending)) break;
+            } else if(fsg) {
+                if(!VerifyFSGBuffer(verifier)) break;
+                const auto* segment=GetFSG(p);
+                if(segment->SELF_OFFSET()!=uint64_t(at) || segment->PREVIOUS()!=previous || segment->FEED_ID()!=fid) break;
             } else {
                 if(!VerifyFCKBuffer(verifier)) break;
                 const auto* c=GetFCK(p);
                 if(c->SELF_OFFSET()!=uint64_t(at) || c->PREVIOUS()!=previous || c->FEED_ID()!=fid || c->GENERATION()!=gen) break;
-                if(at && c->APPLIED_THROUGH()==uint64_t(at) && c->COUNTERS()) complete=true;
+                if(at && c->APPLIED_THROUGH()<=uint64_t(at) && c->COUNTERS()) {
+                    Feed feed; feed.fid=fid; CheckpointState state; stream->gen=gen;
+                    if(checkpointReadAt(&feed,stream,uint64_t(at),&state,nullptr)!=P4_OK) break;
+                    complete=true;
+                }
             }
             previous=uint64_t(at); pending.clear();
         } else {

@@ -399,6 +399,12 @@ struct Stream {
     ~Stream();
 };
 
+struct RetiredGeneration {
+    std::shared_ptr<Stream> stream;
+    int64_t bytes = 0;
+    uint64_t retireAt = 0;
+};
+struct CheckpointState;
 struct Feed {
     Type* type = nullptr;
     uint32_t fid = 0;
@@ -424,6 +430,7 @@ struct Feed {
     std::mutex smu;
     std::shared_ptr<Stream> stream;
     std::shared_ptr<Stream> retired;
+    std::vector<RetiredGeneration> olderRetired;
     int64_t retiredBytes = 0;  // its size (DiskUsage counts it until it goes)
     uint64_t retireAt = 0;
     // The writer's (and the open's): the append offset (past the frames of a
@@ -431,6 +438,10 @@ struct Feed {
     int64_t end = 0;
     uint32_t gen = 0;
     // The committed mark (Type::mu; the indexer sets it with each commit).
+    std::shared_ptr<CheckpointState> pendingCheckpoint; // appended, synced by next round or idle
+    std::shared_ptr<CheckpointState> checkpoint; // immutable checkpoint state, Type::mu
+    uint64_t checkpointOpenNs = 0, rowIndexRebuildNs = 0;
+    uint64_t checkpointRows = 0, checkpointAt = 0; // rows since checkpoint; last commit monoNs
     int64_t metadataBytes = 0;  // committed non-record frame bytes
     uint64_t lastCommit = 0;  // last non-record frame in the append chain
     uint64_t streamHigh = 0;  // TYPE_SEQ_HIGH of this stream's committed chain
@@ -602,6 +613,7 @@ struct alignas(64) Bell {
 // Internal ops (never a slot's): a feed's stream compaction.
 constexpr int kOpCompact = 1000;
 struct Internal {
+    bool force = false; // explicit compaction request, independent of dead-byte heuristic
     std::atomic<bool> done{false};
     int32_t status = P4_OK;
     std::string err;
@@ -837,6 +849,7 @@ int64_t streamSize(Stream* s);
 int32_t snapGen(Conn* c, uint32_t* gen);
 // Closes the feed's streams (engine stop).
 void streamClose(Feed* f);
+bool streamGenerationReleased(const Feed*, uint32_t);
 
 // ---- type_index.cpp -----------------------------------------------------------------------------
 // The registries: feed(fid, provider, source, name, gen) and tok(id, token,

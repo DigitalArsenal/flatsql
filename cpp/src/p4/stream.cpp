@@ -25,6 +25,10 @@ std::string streamPath(const Feed* f, uint32_t gen) {
     return gen == 0 ? base + ".fsdata" : base + "." + std::to_string(gen) + ".fsdata";
 }
 
+// Unexposed feeds are released implicitly. The IPFS integration supplies
+// this decision when a node must acknowledge registrations in the new file.
+__attribute__((weak)) bool streamGenerationReleased(const Feed*, uint32_t) { return true; }
+
 namespace {
 int32_t openStream(const std::string& path, uint32_t gen, bool create, std::shared_ptr<Stream>* out) {
     int32_t flags = FLATSQL_IO_READ | FLATSQL_IO_WRITE;
@@ -71,6 +75,18 @@ std::shared_ptr<Stream> streamAt(Feed* f, uint32_t gen, int32_t* rc) {
     std::lock_guard<std::mutex> g(f->smu);
     if (f->stream && f->stream->gen == gen) return f->stream;
     if (f->retired && f->retired->gen == gen) return f->retired;
+    for (auto& retired : f->olderRetired) {
+        if (retired.stream->gen != gen) continue;
+        // Startup retirement tracks paths without spending an I/O handle on
+        // each one. Open lazily if an existing snapshot still names one.
+        if (retired.stream->h < 0) {
+            std::shared_ptr<Stream> opened;
+            *rc = openStream(retired.stream->path, gen, false, &opened);
+            if (*rc != P4_OK) return nullptr;
+            retired.stream = std::move(opened);
+        }
+        return retired.stream;
+    }
     if (f->stream || gen != f->gen) return nullptr;
     // Not opened since the engine opened: the snapshot's rows name it, so it exists.
     std::shared_ptr<Stream> s;
@@ -144,10 +160,12 @@ int32_t snapGen(Conn* c, uint32_t* gen) {
 
 void streamClose(Feed* f) {
     std::shared_ptr<Stream> a, b;
+    std::vector<RetiredGeneration> older;
     {
         std::lock_guard<std::mutex> g(f->smu);
         a.swap(f->stream);
         b.swap(f->retired);
+        older.swap(f->olderRetired);
     }
 }
 

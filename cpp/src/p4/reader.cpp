@@ -38,6 +38,7 @@
 #include <set>
 
 #include "internal.h"
+#include "checkpoint.h"
 #include "sql_bridge.h"
 
 namespace flatsql {
@@ -1720,6 +1721,74 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
         int orc = 0;
         Conn* c = e_->rpool.acquire(files_[fi].path, OpenKind::Reader, &orc, nullptr);
         if (!c) return statusOfSqlite(orc);
+        // A point at/past the feed's high epoch has the LATEST ranking.
+        // Resolve its immutable segment rids directly, then fold the actual
+        // tail FMB rows (moves can retain an older type seq). If a winning row was removed, use the ordinary
+        // object walk to recover the next surviving historical record.
+        std::shared_ptr<const CheckpointState> ck; uint64_t tailCommit=0;
+        { std::lock_guard<std::mutex> lock(t_->mu); ck=files_[fi].f->checkpoint; tailCommit=files_[fi].f->lastCommit; }
+        const bool latestEligible=ck && ck->offset && (profile==2 || profile==3) &&
+            at>=files_[fi].k.maxe && !needCheck && !s_.lane && s_.preds.empty() &&
+            !s_.seqAfter && !s_.seqThrough && !s_.bound && !s_.eNull &&
+            wLo==INT64_MIN && wHi>=files_[fi].k.maxe && ck->counters.maxseq<=hi_;
+        if(latestEligible) {
+            std::map<std::string,Pick> picks;
+            bool complete=true;
+            c->exec("BEGIN");
+            auto keep=[&](sqlite3_stmt* row) {
+                if(sqlite3_column_bytes(row,1)!=32 || sqlite3_column_type(row,3)==SQLITE_NULL) return;
+                Pick p; p.e=sqlite3_column_int64(row,3); p.seq=sqlite3_column_int64(row,2); p.fid=fid;
+                if(p.seq<=lo_ || p.seq>hi_ || p.e>at) { complete=false; return; }
+                std::memcpy(p.key,sqlite3_column_blob(row,1),32);
+                KVal key; key.from(row,0); std::string entity;
+                if(key.type) entity=key.type==1?std::to_string(key.i):key.s;
+                else { char cid[60]; cidTextFromKey(p.key,cid); entity.assign(cid,kCidText); }
+                const auto old=picks.find(entity);
+                if(old==picks.end() || better(p.e,p.key,old->second.e,old->second.key)) picks[entity]=p;
+                L_->rowsExamined++;
+            };
+            auto* row=c->sql("SELECT k,cid,seq,e FROM r WHERE rid=?1");
+            if(!row) complete=false;
+            for(const auto& item:ck->latest) {
+                if(!complete) break;
+                sqlite3_bind_int64(row,1,sqlite3_int64(item.second.rid));
+                const int result=sqlite3_step(row);
+                if(result==SQLITE_ROW) keep(row); else complete=false;
+                sqlite3_reset(row);
+            }
+            if(complete && tailCommit!=ck->offset) {
+                std::vector<uint64_t> tailRows; int32_t streamStatus=P4_OK;
+                auto stream=streamCur(files_[fi].f,&streamStatus);
+                if(!stream || checkpointTailRows(files_[fi].f,stream.get(),ck->end,tailCommit,&tailRows)!=P4_OK) complete=false;
+                for(uint64_t rid:tailRows) {
+                    if(!complete) break;
+                    sqlite3_bind_int64(row,1,sqlite3_int64(rid));
+                    const int result=sqlite3_step(row);
+                    if(result==SQLITE_ROW) keep(row);
+                    else if(result!=SQLITE_DONE) complete=false;
+                    sqlite3_reset(row);
+                }
+            }
+            // LATEST is keyed by object id; object-less records remain their
+            // own CID entities and are read from the existing row index.
+            auto* noObject=c->sql("SELECT k,cid,seq,e FROM r INDEXED BY r_ke WHERE kk IS NULL AND m=1 AND e IS NOT NULL");
+            if(!noObject) complete=false;
+            if(complete) {
+                int result;
+                while((result=sqlite3_step(noObject))==SQLITE_ROW) keep(noObject);
+                if(result!=SQLITE_DONE) complete=false;
+                sqlite3_reset(noObject);
+                if(st) {
+                    std::vector<std::pair<KVal,std::vector<const StRow*>>> objects; st->byObject(&objects);
+                    if(!objects.empty() && objects.front().first.type==0 && !objects.front().second.empty()) complete=false;
+                }
+            }
+            c->exec("COMMIT");
+            if(complete) {
+                for(const auto& item:picks) if(!skip(item.first)) take(item.first,item.second);
+                e_->rpool.release(c); continue;
+            }
+        }
         // The object index holds each key's okey id (kk): the objects are
         // okey's rows, in key order (a key whose rows are gone finds none),
         // each one's entity its key; an object predicate's values are looked
@@ -3164,6 +3233,7 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
             for (Feed* f : feeds) {
                 std::lock_guard<std::mutex> g(f->smu);
                 db += f->retiredBytes;
+                for (const auto& retired : f->olderRetired) db += retired.bytes;
             }
             for (auto& u : unread) {
                 const int64_t n = std::max<int64_t>(0, ioSize(u.second));

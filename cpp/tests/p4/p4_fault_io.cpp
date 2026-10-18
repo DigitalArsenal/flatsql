@@ -49,6 +49,10 @@ const std::string& lastError();
 }  // namespace flatsql
 
 namespace {
+// Target real state-frame writes for the first two crash rounds; the rest
+// retain the seeded random operation schedule and all five device modes.
+std::atomic<int> stateFaultKind{0};
+std::atomic<int> stateFaultHits{0};
 FaultFs& faultFs() {
     static FaultFs* fs = new FaultFs(true);
     return *fs;
@@ -73,7 +77,19 @@ bool p4ListStreams(const std::string& directory, std::vector<std::string>* names
 extern "C" {
 int32_t flatsql_io_open(const char* path, int32_t pathLen, int32_t flags) { return faultFs().open(path, pathLen, flags); }
 int32_t flatsql_io_read(int32_t h, void* dst, int32_t len, double off) { return faultFs().read(h, dst, len, off); }
-int32_t flatsql_io_write(int32_t h, const void* src, int32_t len, double off) { return faultFs().write(h, src, len, off); }
+int32_t flatsql_io_write(int32_t h, const void* src, int32_t len, double off) {
+    const int kind=stateFaultKind.load();
+    const auto* p=static_cast<const uint8_t*>(src);
+    if(kind && off>0 && len>=12 && !std::memcmp(p+8,kind==1?"$FSG":"$FCK",4) && stateFaultKind.exchange(0)==kind) {
+        const int32_t n=len/2;
+        const int32_t rc=faultFs().write(h,src,n,off);
+        if(rc!=n) return rc;
+        stateFaultHits++;
+        faultFs().armCrashAtOp(faultFs().mutatingOps()+1);
+        return faultFs().write(h,p+n,len-n,off+n); // freezes with only half a state frame written
+    }
+    return faultFs().write(h, src, len, off);
+}
 int32_t flatsql_io_truncate(int32_t h, double size) { return faultFs().truncate(h, size); }
 int32_t flatsql_io_sync(int32_t h) { return faultFs().sync(h); }
 double flatsql_io_size(int32_t h) { return faultFs().size(h); }
@@ -281,8 +297,11 @@ P4_SLOW_TEST(t_power_loss) {
             fail++;
             break;
         }
-        // The device freezes at a random mutating call ahead.
-        fs.armCrashAtOp(fs.mutatingOps() + 50 + rng() % 4000);
+        // Two deterministic torn state frames, then the original random loop.
+        const bool stateRound=round<=2;
+        const int hitsBefore=stateFaultHits.load();
+        stateFaultKind=stateRound?round:0;
+        fs.armCrashAtOp(stateRound?0:fs.mutatingOps() + 50 + rng() % 4000);
         std::atomic<bool> stop{false};
         std::mutex mu;
         std::set<std::string> newAcks;
@@ -326,7 +345,13 @@ P4_SLOW_TEST(t_power_loss) {
         for (int i = 0; i < 3000 && !fs.frozen(); i++) flatsql::ps::sleepNs(1000000);
         stop = true;
         for (auto& t : producers) t.join();
-        closeEngine(10000);  // the device is frozen: the stop's I/O fails, as on a dying machine
+        closeEngine(10000);  // close also forces the targeted idle checkpoint
+        if(stateRound) {
+            const bool landed=stateFaultHits.load()==hitsBefore+1 && fs.frozen();
+            std::printf("  t_power_loss: state_write=%s partial_write=1 crash=%s\n",round==1?"FSG":"FCK",landed?"landed":"missed");
+            if(!landed) { fail++; break; }
+        }
+        stateFaultKind=0;
         // This round's acknowledged records, all of them, and a sample of
         // the earlier rounds' (each was checked whole in its own round).
         std::vector<std::string> want(newAcks.begin(), newAcks.end());

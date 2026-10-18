@@ -36,7 +36,6 @@ struct FmbCommit {
 // Appends metadata, splitting at 65,536 rows. No sync: the round syncs once.
 int32_t streamAppendCommit(Feed*, Stream*, const FmbCommit&, int64_t* end, uint64_t* previous);
 int32_t streamGenesis(Feed*, Stream*, int64_t* end);
-int32_t streamCompactionEnd(Feed*,Stream*,const Counters&,int64_t* end,uint64_t* previous);
 int32_t recoverFeed(Type*,Feed*,Conn*,std::vector<int64_t>* moved,std::string* err);
 int32_t replayRebuildFeed(::P4Engine*,Type*,Feed*,int64_t* indexed,std::string* err);
 bool p4ListStreams(const std::string&,std::vector<std::string>*);

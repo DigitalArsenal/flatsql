@@ -46,6 +46,7 @@
 
 using namespace p4t;
 namespace fp = flatsql::p4;
+namespace flatsql { namespace p4 { P4Engine* currentEngine(); } }
 
 namespace {
 
@@ -437,15 +438,55 @@ P4_SLOW_TEST(t_kill_check) {
 }
 
 #if !defined(__wasm__)
+// First land exactly inside each new persistence path. The pause is a test
+// hook after a partial frame write, so the parent observes a real torn write.
+bool killStateWrite(const std::string& root,int round,const std::string& kind) {
+    int pe[2]; if(pipe(pe)!=0) return false;
+    const pid_t pid=fork();
+    if(pid==0) {
+        close(pe[0]); dup2(pe[1],2); close(pe[1]);
+        EngineOpts o; o.flushEntries=5000; o.writers=3;
+        if(openEngine(root,o)!=P4_OK || registerType(killType())!=P4_OK) _exit(2);
+        uint64_t id=uint64_t(round)*100000000ull;
+        for(int c=0;c<3;c++) killWorkStep(c,&id);
+        setenv("P4_STATE_DEBUG","1",1); setenv("P4_STATE_PAUSE_MS","100",1);
+        if(kind=="compaction") {
+            auto* e=fp::currentEngine();
+            for(const auto& t:e->types) for(const auto& f:t->feeds) if(f) {
+                fp::Internal in; in.what=f->fid; in.force=true;
+                if(fp::runOnWriter(e,t.get(),fp::kOpCompact,&in)!=P4_OK) _exit(3);
+            }
+        } else closeEngine(600000);
+        _exit(4);
+    }
+    close(pe[1]); if(pid<0) {close(pe[0]);return false;}
+    const std::string needle="state-write-begin "+kind+" ";
+    const uint64_t until=flatsql::ps::monoNs()+30000000000ull;
+    std::string buf; bool landed=false;
+    while(flatsql::ps::monoNs()<until) {
+        pollfd p{pe[0],POLLIN,0}; if(poll(&p,1,100)<=0) continue;
+        char chunk[4096]; const ssize_t n=read(pe[0],chunk,sizeof chunk); if(n<=0) break;
+        buf.append(chunk,size_t(n));
+        if(buf.find(needle)!=std::string::npos) {landed=true;break;}
+    }
+    kill(pid,SIGKILL); int st=0;waitpid(pid,&st,0);close(pe[0]);
+    if(!landed) std::fprintf(stderr,"state kill missed %s: %s\n",kind.c_str(),buf.c_str());
+    std::printf("  t_kill: state_write=%s partial_write=1 SIGKILL=%s\n",kind.c_str(),landed?"landed":"missed");
+    return landed && WIFSIGNALED(st) && WTERMSIG(st)==SIGKILL;
+}
 // The native loop: kill -9 an ingesting engine at a random point, check, repeat.
 P4_SLOW_TEST(t_kill) {
     const int rounds = int(argInt("rounds", 1000));
     const std::string root = scratchDir("kill") + "/fsql4";
     std::mt19937 rng(uint32_t(argInt("seed", 1)));
-    int pass = 0, fail = 0;
+    int pass = 0, fail = 0, stateKills = 0;
     for (int round = 1; round <= rounds; round++) {
         std::fflush(stdout);
-        const pid_t pid = fork();
+        const char* kinds[]={"FSG","FCK","compaction"};
+        const bool targeted=round<=3;
+        bool landed=true;
+        if(targeted) { landed=killStateWrite(root,round,kinds[round-1]); if(landed) stateKills++; }
+        const pid_t pid = targeted ? -1 : fork();
         if (pid == 0) {
             EngineOpts o;
             o.flushEntries = 5000;
@@ -457,12 +498,13 @@ P4_SLOW_TEST(t_kill) {
             uint64_t id = uint64_t(round) * 100000000ull;
             for (int c = 0;; c++) killWorkStep(c, &id);
         }
-        flatsql::ps::sleepNs(uint64_t(100 + rng() % 900) * 1000000ull + uint64_t(rng() % 3) * 1000000000ull / 4);
-        kill(pid, SIGKILL);
-        int st = 0;
-        waitpid(pid, &st, 0);
+        if(!targeted) {
+            flatsql::ps::sleepNs(uint64_t(100 + rng() % 900) * 1000000ull + uint64_t(rng() % 3) * 1000000000ull / 4);
+            kill(pid, SIGKILL);
+            int st = 0; waitpid(pid, &st, 0);
+        }
         std::string why;
-        if (killCheck(root, &why)) {
+        if (killCheck(root, &why) && landed) {
             pass++;
             if (round == 1 || round == rounds) std::printf("  round %d: %s\n", round, why.c_str());
         } else {
@@ -476,7 +518,8 @@ P4_SLOW_TEST(t_kill) {
         }
         if (round % 50 == 0) std::printf("  t_kill: %d rounds, %d pass, %d fail (load %.1f)\n", round, pass, fail, loadAvg());
     }
-    std::printf("  t_kill: %d pass, %d fail of %d rounds\n", pass, fail, rounds);
+    std::printf("  t_kill: %d pass, %d fail of %d rounds; %d killed inside FSG/FCK/compaction writes\n", pass, fail, rounds,stateKills);
+    CHECK_EQ(stateKills,std::min(rounds,3),"checkpoint, segment and compaction kill sites");
     CHECK_EQ(fail, 0, "every round");
     removeTree(root);
 }

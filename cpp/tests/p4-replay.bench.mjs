@@ -4,4 +4,7 @@
 // ingest day, a 512-tile lead and 20 retention pages; each build's fixture
 // needs about 17 GB of free disk). Same environment as the E2E.
 process.env.P4_REPLAY_PROFILE = 'full';
+// The owner's full-fixture measurement builds only the candidate by default.
+// Set P4_REPLAY_NEW_ONLY=0 explicitly for the two-arm performance benchmark.
+process.env.P4_REPLAY_NEW_ONLY ??= '1';
 await import('./p4-replay.e2e.mjs');

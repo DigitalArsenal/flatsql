@@ -242,6 +242,7 @@ int64_t storeBytes(Engine* e, bool inUse) {
                 {
                     std::lock_guard<std::mutex> g(f->smu);
                     total += f->retiredBytes;
+                    for (const auto& retired : f->olderRetired) total += retired.bytes;
                 }
                 total += sizeOf(f->path) + sizeOf(f->path + "-wal");
                 continue;
@@ -905,11 +906,19 @@ void slowLoop(Engine* e) {
                 }
             }
             for (Feed* f : fs) {
-                std::shared_ptr<Stream> gone;
+                std::vector<std::shared_ptr<Stream>> gone;
                 std::lock_guard<std::mutex> g(f->smu);
-                if (f->retired && now >= f->retireAt) {
-                    gone.swap(f->retired);
+                if (f->retired && now >= f->retireAt && streamGenerationReleased(f, f->retired->gen)) {
+                    f->retired->drop.store(true);
+                    gone.push_back(std::move(f->retired));
                     f->retiredBytes = 0;
+                    e->bump(kStUnlinked);
+                }
+                for (auto it = f->olderRetired.begin(); it != f->olderRetired.end();) {
+                    if (now < it->retireAt || !streamGenerationReleased(f, it->stream->gen)) { ++it; continue; }
+                    it->stream->drop.store(true);
+                    gone.push_back(std::move(it->stream));
+                    it = f->olderRetired.erase(it);
                     e->bump(kStUnlinked);
                 }
             }

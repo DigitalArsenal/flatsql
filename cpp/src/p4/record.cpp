@@ -7,6 +7,7 @@
 #include <future>
 
 #include "internal.h"
+#include "checkpoint.h"
 
 namespace flatsql {
 namespace p4 {
@@ -833,7 +834,8 @@ int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
         x.tokc = f->tokc;
         x.indexed = f->indexed;
         x.newEnd = f->mark;
-        x.previous = f->lastCommit;
+        x.previous = f->pendingCheckpoint ? f->pendingCheckpoint->offset : f->lastCommit;
+        if (f->pendingCheckpoint) x.metadataBytes = int64_t(f->pendingCheckpoint->end) - f->mark;
         x.stBase = f->staged;
     }
     x.tokcBefore = x.tokc;
@@ -884,7 +886,7 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
     const int64_t oldEnd = f->end;
     if (x.recordStart < 0) x.recordStart = oldEnd;
     newEnd_[f->fid] = oldEnd;
-    x.previous = f->lastCommit;
+    x.previous = f->pendingCheckpoint ? f->pendingCheckpoint->offset : f->lastCommit;
     std::string framed;
     frameStatus = frames(f, recs, &framed, oldEnd);
     if (frameStatus == P4_OK && !framed.empty())
@@ -1561,6 +1563,9 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
         f->dbBytes = dbBytes;
         f->freeBytes = freeBytes;
     }
+    if (f->pendingCheckpoint) { f->checkpoint = std::move(f->pendingCheckpoint); f->checkpointRows = 0; }
+    f->checkpointRows += x.metadata.rows.size();
+    f->checkpointAt = monoNs();
     f->mark = x.newEnd;
     f->lastCommit = x.previous;
     f->streamHigh = cacheHigh;
@@ -1842,7 +1847,7 @@ void WriteCtx::resetStreams() {
         int32_t st = P4_OK;
         std::shared_ptr<Stream> stream = streamCur(f, &st);
         if (stream && streamSize(stream.get()) > mark) streamTruncate(stream.get(), mark, false);
-        f->end = mark;
+        { std::lock_guard<std::mutex> g(t->mu); f->pendingCheckpoint.reset(); f->end = mark; }
     }
 }
 

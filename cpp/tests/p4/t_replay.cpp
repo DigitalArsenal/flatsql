@@ -79,6 +79,7 @@
 namespace flatsql {
 namespace p4 {
 const std::string& lastError();
+P4Engine* currentEngine();
 }  // namespace p4
 }  // namespace flatsql
 
@@ -372,7 +373,7 @@ std::vector<uint8_t> predOf(uint8_t field, uint8_t op, const std::vector<int64_t
 // The seed's shape the read workloads ask about: its NORAD IDs and epochs.
 struct Probe {
     std::vector<uint32_t> norads;  // a deterministic sample
-    int64_t epochLo = 0, epochHi = 0;
+    int64_t epochLo = 0, epochHi = 0, latestAt = 0;
     std::vector<std::pair<int64_t, int64_t>> windows;  // read_chunk epoch windows
 };
 
@@ -390,6 +391,7 @@ Probe probeOf(const std::vector<Gp>& seed, int n) {
     if (!ep.empty()) {
         p.epochLo = ep[ep.size() / 20];
         p.epochHi = ep[ep.size() - 1 - ep.size() / 20];
+        p.latestAt = ep.back() + 86400;
         // three six-hour windows inside the seed's epochs
         for (int k = 1; k <= 3; k++) {
             const int64_t mid = ep[ep.size() * size_t(k) / 4];
@@ -439,15 +441,19 @@ void wSyncWindow(const Probe& p, Hash* h, int64_t* rows, int64_t* ops) {
     }
 }
 
-void wLatest(const Probe& p, Hash* h, int64_t* rows, int64_t* ops) {
+void latestAt(const Probe& p, uint8_t profile, Hash* h, int64_t* rows, int64_t* ops) {
     TlvW w;
-    w.text(1, "OMM").u8(2, 1).u64(3, 250000).u8(30, 2).i64(31, p.epochHi + 86400).i64(32, 0);
+    w.text(1, "OMM").u8(2, 1).u64(3, 250000).u8(30, profile).i64(31, p.latestAt).i64(32, 0);
     CallOpts o;
     o.timeoutMs = 600000;
     Result r = call(P4_OPC_EPOCH, w.b, o);
     (*ops)++;
     *rows += int64_t(r.rows.size());
     h->keep(std::move(r));
+}
+
+void wLatest(const Probe& p, Hash* h, int64_t* rows, int64_t* ops) {
+    latestAt(p, 2, h, rows, ops);
 }
 
 void wExplorer(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
@@ -721,14 +727,45 @@ void stock(const std::string& root, const std::string& workload, const Probe& p,
 }
 #endif
 
-#if !defined(__wasm__) && P4_REPLAY_FORMAT5
+#if P4_REPLAY_FORMAT5
 // A stock SDS reader: all frame offsets, chain links and sha256 digests are
 // checked independently of FlatSQL's recovery/index code.
-bool walkStore(const std::string& root, bool emitStats) {
-    uint64_t rows = 0, bytes = 0, records = 0, commits = 0, streams = 0;
+struct StoreWalk {
+    uint64_t streams=0, rows=0, bytes=0, records=0, commits=0, checkpoints=0, checkpointBytes=0, segmentBytes=0, merged=0;
+};
+bool walkStore(const std::string& root, bool emitStats, StoreWalk* totals=nullptr, bool compacted=false) {
+    StoreWalk sum;
+    std::map<std::string, StoreWalk> byType;
     std::error_code ec;
+    std::vector<std::filesystem::directory_entry> streams;
+    std::map<std::pair<std::string, uint32_t>, std::pair<uint32_t, std::filesystem::directory_entry>> newest;
     for (const auto& file : std::filesystem::recursive_directory_iterator(root + "/P", ec)) {
         if (file.path().extension() != ".fsdata") continue;
+        if (!compacted) { streams.push_back(file); continue; }
+        // Retired generations remain during the reader grace window. Select
+        // each feed's new generation from its verified genesis, not its name.
+        const int fd = ::open(file.path().c_str(), O_RDONLY);
+        uint8_t prefix[4];
+        if (fd < 0) return false;
+        if (::pread(fd, prefix, 4, 0) != 4) { ::close(fd); return false; }
+        const uint32_t n = walkU32(prefix);
+        if (n < 8 || uint64_t(n) + 4 > file.file_size()) { ::close(fd); return false; }
+        std::vector<uint64_t> aligned((size_t(n) + 7) / 8);
+        auto* p = reinterpret_cast<uint8_t*>(aligned.data());
+        const bool read = ::pread(fd, p, n, 4) == ssize_t(n);
+        ::close(fd);
+        flatbuffers::Verifier verifier(p, n);
+        if (!read || !VerifyFCKBuffer(verifier)) return false;
+        const auto* genesis = GetFCK(p);
+        if (genesis->SELF_OFFSET() != 0 || genesis->PREVIOUS() != UINT64_MAX) return false;
+        const auto key = std::make_pair(file.path().parent_path().filename().string(), genesis->FEED_ID());
+        const auto found = newest.find(key);
+        if (found != newest.end() && found->second.first == genesis->GENERATION()) return false;
+        if (found == newest.end() || found->second.first < genesis->GENERATION())
+            newest[key] = {genesis->GENERATION(), file};
+    }
+    if (compacted) for (const auto& file : newest) streams.push_back(file.second.second);
+    for (const auto& file : streams) {
         const int fd = ::open(file.path().c_str(), O_RDONLY);
         if (fd < 0) return false;
         FrameWalk result;
@@ -736,18 +773,122 @@ bool walkStore(const std::string& root, bool emitStats) {
             return ::pread(fd, dst, n, off_t(off)) == ssize_t(n);
         }, "$" + file.path().parent_path().filename().string(), &result);
         ::close(fd);
-        if (!why.empty()) {
-            std::fprintf(stderr, "stock frame walk %s: %s\n", file.path().c_str(), why.c_str());
+        if (!why.empty() || (compacted && (!result.generation || !result.finalCheckpoint))) {
+            std::fprintf(stderr, "stock frame walk %s: %s\n", file.path().c_str(), why.empty() ? "compacted stream lacks generation/final FCK" : why.c_str());
             return false;
         }
-        rows += result.rows; bytes += result.metadataBytes; records += result.records;
-        commits += result.commits; streams++;
+        sum.rows += result.rows; sum.bytes += file.file_size(); sum.records += result.records;
+        sum.commits += result.commits; sum.streams++; sum.checkpoints += result.checkpoints;
+        sum.checkpointBytes += result.checkpointBytes; sum.segmentBytes += result.segmentBytes; sum.merged += result.mergedSegments;
+        auto& typeStats=byType[file.path().parent_path().filename().string()];
+        typeStats.bytes+=file.file_size(); typeStats.checkpointBytes+=result.checkpointBytes; typeStats.segmentBytes+=result.segmentBytes;
+        if (emitStats) std::printf("REPLAY_STREAM type=%s generation=%u stream_bytes=%llu FCK_count=%llu FCK_bytes=%llu FSG_bytes=%llu merged_segments=%llu checkpoint_pct=%.6f segment_pct=%.6f chain=clean digests=matching PASS\n",
+            file.path().parent_path().filename().c_str(), result.generation, (unsigned long long)file.file_size(),
+            (unsigned long long)result.checkpoints, (unsigned long long)result.checkpointBytes, (unsigned long long)result.segmentBytes,
+            (unsigned long long)result.mergedSegments, 100.0*result.checkpointBytes/file.file_size(),100.0*result.segmentBytes/file.file_size());
     }
-    if (emitStats) std::printf("REPLAY_WALK streams=%llu records=%llu commits=%llu rows=%llu FMB_bytes=%llu FMB_bytes_per_row=%.3f PASS\n",
-        (unsigned long long)streams, (unsigned long long)records, (unsigned long long)commits,
-        (unsigned long long)rows, (unsigned long long)bytes, rows ? double(bytes) / rows : 0.0);
-    return !ec && streams > 0;
+    if (emitStats) for (const auto& item : byType) {
+        const auto& t=item.second;
+        std::printf("REPLAY_OVERHEAD type=%s stream_bytes=%llu checkpoint_bytes=%llu segment_bytes=%llu checkpoint_pct=%.6f segment_pct=%.6f\n",
+            item.first.c_str(),(unsigned long long)t.bytes,(unsigned long long)t.checkpointBytes,(unsigned long long)t.segmentBytes,
+            100.0*t.checkpointBytes/t.bytes,100.0*t.segmentBytes/t.bytes);
+    }
+    if (totals) *totals=sum;
+    if (emitStats) std::printf("REPLAY_WALK streams=%llu records=%llu commits=%llu rows=%llu stream_bytes=%llu FCK_count=%llu FCK_bytes=%llu FSG_bytes=%llu merged_segments=%llu PASS\n",
+        (unsigned long long)sum.streams, (unsigned long long)sum.records, (unsigned long long)sum.commits, (unsigned long long)sum.rows,
+        (unsigned long long)sum.bytes, (unsigned long long)sum.checkpoints, (unsigned long long)sum.checkpointBytes,
+        (unsigned long long)sum.segmentBytes, (unsigned long long)sum.merged);
+    return !ec && sum.streams > 0;
 }
+
+using AnswerHashes = std::map<std::string,std::string>;
+AnswerHashes allReadHashes(const Probe& probe) {
+    AnswerHashes result;
+    for (const auto& read : reads()) {
+        Hash h; int64_t rows=0,ops=0;
+        read.second(probe,&h,&rows,&ops); h.flush(); result[read.first]=h.hex();
+    }
+    Hash heads;
+    for (const char* type : {"OMM","WXF"}) heads.result(head(type));
+    result["open"]=heads.hex();
+    Hash wxf;
+    for (uint8_t order : {uint8_t(P4_ORDER_SEQ_ASC),uint8_t(P4_ORDER_SEQ_DESC),uint8_t(P4_ORDER_W_ASC)}) {
+        TlvW w; w.text(1,"WXF").u8(2,1).u64(3,10000).u8(5,order);
+        wxf.result(call(P4_OPC_SCAN,w.b));
+    }
+    result["wxf_orders"]=wxf.hex();
+    return result;
+}
+size_t deleteIndexes(const std::string& root) {
+    std::vector<std::filesystem::path> paths;
+    for (const auto& f : std::filesystem::recursive_directory_iterator(root)) {
+        const auto name=f.path().filename().string();
+        for (const char* suffix : {".db",".idx",".fts"}) {
+            const auto p=name.rfind(suffix);
+            if (p!=std::string::npos && (p+std::strlen(suffix)==name.size() || name[p+std::strlen(suffix)]=='-')) { paths.push_back(f.path()); break; }
+        }
+    }
+    for (const auto& p : paths) std::filesystem::remove(p);
+    return paths.size();
+}
+bool forceCompaction() {
+    auto* e=flatsql::p4::currentEngine();
+    for (const auto& t : e->types) {
+        std::vector<uint32_t> ids;
+        { std::lock_guard<std::mutex> g(t->mu); for (const auto& f : t->feeds) if(f) ids.push_back(f->fid); }
+        for (uint32_t fid : ids) {
+            flatsql::p4::Internal in; in.what=fid; in.force=true;
+            if (flatsql::p4::runOnWriter(e,t.get(),flatsql::p4::kOpCompact,&in)!=P4_OK) {
+                std::fprintf(stderr,"force compaction: %s\n",in.err.c_str()); return false;
+            }
+        }
+    }
+    return true;
+}
+bool checkpointProof(const std::string& root, const Probe& probe) {
+    StoreWalk stats;
+    if (!walkStore(root,true,&stats) || stats.checkpoints<=stats.streams || !stats.merged) return false;
+    const std::string reference=argStr("reference","")+"/fsql4";
+    if (reference=="/fsql4" || openNode(reference,1)!=P4_OK || !registerAll()) return false;
+    const auto want=allReadHashes(probe); closeEngine(600000);
+    const size_t deleted=deleteIndexes(root);
+    if (!deleted) return false;
+    const uint64_t start=flatsql::ps::monoNs();
+    if (openNode(root,1)!=P4_OK || !registerAll()) return false;
+    const double totalMs=double(flatsql::ps::monoNs()-start)/1e6;
+    uint64_t checkpointNs=0,rebuildNs=0;
+    for (const auto& t : flatsql::p4::currentEngine()->types) for (const auto& f : t->feeds) if(f) {
+        checkpointNs+=f->checkpointOpenNs; rebuildNs+=f->rowIndexRebuildNs;
+    }
+    const auto got=allReadHashes(probe); closeEngine(600000);
+    for(const auto& h : want) {
+        auto it=got.find(h.first);
+        if(it==got.end() || it->second!=h.second) { std::fprintf(stderr,"index-deleted hash mismatch %s\n",h.first.c_str());return false; }
+        std::printf("REPLAY_INDEX_READ workload=%s hash=%s PASS\n",h.first.c_str(),h.second.c_str());
+    }
+    std::printf("REPLAY_INDEX_DELETED deleted_files=%zu open_from_checkpoint_ms=%.3f row_index_rebuild_ms=%.3f total_open_ms=%.3f stream_bytes=%llu FCK_count=%llu segment_bytes=%llu merged_segments=%llu answers=equal PASS\n",
+        deleted,double(checkpointNs)/1e6,double(rebuildNs)/1e6,totalMs,(unsigned long long)stats.bytes,
+        (unsigned long long)stats.checkpoints,(unsigned long long)stats.segmentBytes,(unsigned long long)stats.merged);
+    return true;
+}
+bool compactionProof(const std::string& root,const Probe& probe) {
+    if (openNode(root,1)!=P4_OK || !registerAll()) return false;
+    Hash retention; int64_t rows=0,ops=0; wRetention(probe,&retention,&rows,&ops);
+    const auto before=allReadHashes(probe);
+    if(!forceCompaction()) { closeEngine(600000);return false; }
+    const auto after=allReadHashes(probe); closeEngine(600000);
+    if(before!=after || !walkStore(root,true,nullptr,true)) return false;
+    if(openNode(root,1)!=P4_OK || !registerAll()) return false;
+    const auto reopened=allReadHashes(probe);closeEngine(600000);
+    if(before!=reopened || !deleteIndexes(root)) return false;
+    if(openNode(root,1)!=P4_OK || !registerAll()) return false;
+    const auto rebuilt=allReadHashes(probe);closeEngine(600000);
+    if(before!=rebuilt) return false;
+    std::printf("REPLAY_COMPACTION retention_rows=%lld reads=%zu genesis=first final_FCK=last chain=clean digests=matching answers=equal reopened=equal rebuilt=equal PASS\n",(long long)rows,before.size());
+    return true;
+}
+
+#if !defined(__wasm__)
 
 struct LeadAck { int tile = 0; std::vector<int64_t> seq; };
 Batch crashTile(int tile) {
@@ -1004,6 +1145,7 @@ bool killLead(const std::string& dir) {
     return true;
 }
 #endif
+#endif
 
 }  // namespace
 
@@ -1015,6 +1157,13 @@ P4_SLOW_TEST(p4_replay) {
     const std::string root = argStr("store", "") + "/fsql4";
     REQUIRE(root != "/fsql4", "--store");
     const std::string phase = argStr("phase", "run");
+#if P4_REPLAY_FORMAT5
+    if (phase == "index-deleted" || phase == "compaction") {
+        const Probe p=probeOf(readGp(argStr("gp","")),int(argInt("probes",200)));
+        REQUIRE(phase=="index-deleted" ? checkpointProof(root,p) : compactionProof(root,p),phase);
+        return;
+    }
+#endif
 #if !defined(__wasm__)
 #if P4_REPLAY_FORMAT5
     if (phase == "walk") {
@@ -1112,9 +1261,12 @@ void runOne(const std::string& root, const std::string& workload) {
         }
     } else if (workload == "gp_ingest" || workload == "wxf_lead" || workload == "retention") {
         Hash wh;
+        Probe afterProbe = probe;
         std::vector<Batch> batches;
         if (workload == "gp_ingest") {
-            const auto days = byDay(readGp(argStr("gp-day", "")));
+            const auto day = readGp(argStr("gp-day", ""));
+            afterProbe.latestAt = std::max(afterProbe.latestAt, probeOf(day, 1).latestAt);
+            const auto days = byDay(day);
             REQUIRE(days.size() == 1, "--gp-day: one day");
             batches = dayBatches(days[0].second, days[0].first);
             rows = int64_t(days[0].second.size());
@@ -1130,6 +1282,14 @@ void runOne(const std::string& root, const std::string& workload) {
         // What the writes left, read back: the same on both builds.
         Hash after;
         for (const char* t : {"OMM", "WXF"}) after.result(head(t));
+        if (workload == "gp_ingest") {
+            // Before close checkpoints the ingest, both point profiles must
+            // fold the new FMB tail into LATEST and match the baseline.
+            int64_t latestRows = 0, latestOps = 0;
+            latestAt(afterProbe, 2, &after, &latestRows, &latestOps);
+            latestAt(afterProbe, 3, &after, &latestRows, &latestOps);
+            after.flush();
+        }
         std::printf("REPLAY_AFTER {\"workload\":\"%s\",\"hash\":\"%s\"}\n", workload.c_str(), after.hex().c_str());
     } else {
         REQUIRE(false, "unknown --workload " + workload);

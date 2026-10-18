@@ -34,8 +34,12 @@ needs.
 6. **Each value lives in exactly one place** (owner, 2026-10-18). A value that
    can be re-derived from the record bytes is not stored again: epoch and object
    key are re-extracted on rebuild. `$FMB` holds only what the bytes cannot
-   give. Checkpoint segments are derived snapshots that can be discarded; the
-   authoritative data is the records plus their `$FMB` frames.
+   give. Between compactions, checkpoint segments are derived snapshots that
+   can be discarded: the authoritative data is the records plus their `$FMB`
+   frames. A compaction drops the `$FMB`s of dead rows. After that, the state
+   those rows left behind (instance and token totals and times, dictionary ids)
+   lives only in the new generation's segments, which are then authoritative
+   for it.
 
 ## 1. Files
 
@@ -574,7 +578,8 @@ safe even when a crash persisted later pages before earlier ones.
 - Accept it only if all of these hold: it verifies, `SELF_OFFSET = F`, its
   `PREVIOUS` names a frame that ends exactly at `F` and verifies as a commit
   point, and the forward walk from it reaches EOF or a torn tail.
-- The checkpoint cadence bounds the search to about 64 MiB. On any doubt, the
+- The checkpoint cadence bounds the search to `max(64 MiB, 4 x live segment
+  bytes)` plus one round. On any doubt, the
   search falls back to a forward walk of the size prefixes, which is a
   sequential read of the file.
 
@@ -605,9 +610,10 @@ changed. Retention by arrival drops whole FSG segments (§6).
 
 **Compaction** (a stream more than half dead, at least 1 MiB dead; unchanged
 trigger):
-1. Write generation `g+1`: genesis `$FCK`, the live record frames in stream
-   order, consolidated `$FMB`s (rows `COMPACTED`, new offsets, at most 65,536 per
-   frame), fresh segments, and the final `$FCK`. Then sync.
+1. Write generation `g+1`: the genesis `$FCK`, then the live record frames in
+   stream order in chunks of at most 65,536 rows, each chunk followed by its
+   consolidated `$FMB` (rows `COMPACTED`, new offsets), then fresh segments and
+   the final `$FCK`. Then sync.
 2. Repoint the index (one transaction) and publish the moved ranges and the new
    root.
 3. The node re-registers the same CIDs at their new `(path, offset)` and pin-
@@ -677,7 +683,21 @@ cpp/tests/p4-replay.e2e.mjs`):
   CID, and the large-record root matches `ipfs add`.
 - **Item 5:** every workload against SQLite (the 10% bar).
 
-## 13. Owner decisions (2026-10-18)
+## 13. Open points found in the build (to settle with an additive SDS amendment)
+
+- `FSGInstance` has no instance url, and `FCKCounters` has no record-bytes or
+  min/max w fields. After a compaction, restoring them exactly from segments
+  alone needs those fields. Until then, a feed that is compacted and then loses
+  its index is rebuilt with those values recounted from the live rows, so a
+  dead row's instance url can be lost. The SQLite index, when present, still
+  holds them.
+- LATEST, INSTANCES and TOKENS need a deletion marker. Today the code uses a
+  zero RID or a zero count. TOMBSTONES need defined semantics for a reused
+  `ROW_J`.
+- The before-export checkpoint applies only once the export op exists (the IPFS
+  layout release).
+
+## 14. Owner decisions (2026-10-18)
 
 1. **SDS codes.** `FMB`, `FCK` and `FSG` are published as ordinary SDS standards
    in every registry, through the SDS publish workflow (1.255.0 or later),

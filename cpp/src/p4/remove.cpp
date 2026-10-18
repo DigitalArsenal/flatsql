@@ -23,6 +23,7 @@
 #include <functional>
 
 #include "flatsql/flatsql_io.h"
+#include "checkpoint.h"
 #include "internal.h"
 
 namespace flatsql {
@@ -756,16 +757,32 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
 }
 
 // ---- COMPACT -----------------------------------------------------------------------------------------
+namespace {
+bool compactEligible(const Feed* f) { return f && f->created && !f->quarantined; }
+
+// Keep crash scheduling outside the rewrite itself. Native crash-loop runs
+// use this point after the first rewritten bytes, before they are committed.
+void compactWriteEvent(const Feed* f, bool beginning) {
+#ifndef __wasm__
+    if (!std::getenv("P4_STATE_DEBUG")) return;
+    std::fprintf(stderr, "state-write-%s compaction %s\n", beginning ? "begin" : "end", f->path.c_str());
+    std::fflush(stderr);
+    if (beginning) {
+        const char* pause = std::getenv("P4_STATE_PAUSE_MS");
+        if (pause) ps::sleepNs(uint64_t(std::max(0, std::min(60000, std::atoi(pause)))) * 1000000);
+    }
+#else
+    (void)f; (void)beginning;
+#endif
+}
+}  // namespace
+
 // A stream is compacted once more than half of it is dead (frames no live row
 // names) and the dead part is at least 1 MiB.
 bool compactDue(const Feed* f) {
-    // FMBs can consolidate live rows, but cannot snapshot the historical
-    // instance fields of rows that have since left. Preserve their original
-    // commits until FSG INSTANCES is available (FORMAT.md section 10).
-    if (!f->inst.empty()) return false;
     const int64_t recordBytes = f->mark - f->metadataBytes;
     const int64_t dead = recordBytes - f->k.fbytes;
-    return f->created && !f->quarantined && recordBytes > 0 && dead >= (int64_t(1) << 20) && dead * 2 > recordBytes;
+    return compactEligible(f) && recordBytes > 0 && dead >= (int64_t(1) << 20) && dead * 2 > recordBytes;
 }
 
 void compactWork(Engine* e, Type* t, Internal* in) {
@@ -774,78 +791,25 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     {
         std::lock_guard<std::mutex> g(t->mu);
         f = t->feedById(in->what);
-        due = f && compactDue(f);
+        due = compactEligible(f) && (in->force || compactDue(f));
     }
     if (!due) return;
     in->a = f->end;  // the writer's own work, its indexer idle: the end is the mark
     int32_t st = P4_OK;
     std::string er;
+    // Staged views contain stream offsets. Drain them before changing the
+    // generation so every future view uses the remapped SQLite rows.
+    st = mergeAll(e, t, &er);
+    if (st != P4_OK) {
+        in->status = st;
+        in->err = er;
+        return;
+    }
     Conn* c = writerPin(e, f, &st, &er);
     if (!c) {
         in->status = st;
         in->err = er;
         return;
-    }
-    // A consolidated stream omits old unsealed object-key assignments. Its
-    // replay could allocate one of those ids to another key before a sealed
-    // row (or a future write) names the original id. Keep this generation
-    // until compaction can remap the dictionary or checkpoint it in FSG.
-    {
-        sqlite3_stmt* q = c->sql("SELECT 1 FROM okey LIMIT 1");
-        const int rc = q ? sqlite3_step(q) : SQLITE_ERROR;
-        if (q) sqlite3_reset(q);
-        if (rc != SQLITE_DONE) {
-            writerUnpin(e, f);
-            if (rc == SQLITE_ROW) in->b = in->a;
-            else {
-                in->status = statusOfSqlite(rc);
-                in->err = "compact object dictionary " + f->path;
-            }
-            return;
-        }
-    }
-    // FCK has feed counters, not per-token history. Consolidation is safe
-    // only when the live rows still give every token its original bounds.
-    // Otherwise retain the old authoritative stream instead of losing those
-    // bounds when a future open rebuilds the SQLite cache.
-    {
-        std::map<uint32_t, TokCount> history;
-        {
-            std::lock_guard<std::mutex> g(t->mu);
-            history = f->tokc;
-        }
-        sqlite3_stmt* q = c->sql("SELECT node.producer,min(r.ts),max(r.ts),max(r.seq) "
-                                 "FROM r JOIN node ON node.id=r.n GROUP BY node.producer");
-        bool representable = q != nullptr;
-        int rc = SQLITE_ERROR;
-        size_t tokens = 0;
-        while (q && (rc = sqlite3_step(q)) == SQLITE_ROW) {
-            const char* name = reinterpret_cast<const char*>(sqlite3_column_text(q, 0));
-            uint32_t id = 0;
-            {
-                std::lock_guard<std::mutex> g(t->mu);
-                auto token = t->tokByToken.find(name ? name : "");
-                if (token != t->tokByToken.end()) id = token->second;
-            }
-            const auto h = history.find(id);
-            representable = representable && h != history.end() &&
-                h->second.mints == sqlite3_column_int64(q, 1) &&
-                h->second.maxts == sqlite3_column_int64(q, 2) &&
-                h->second.maxseq == sqlite3_column_int64(q, 3);
-            ++tokens;
-        }
-        if (q) sqlite3_reset(q);
-        if (rc != SQLITE_DONE) {
-            writerUnpin(e, f);
-            in->status = statusOfSqlite(rc);
-            in->err = "compact token history " + f->path;
-            return;
-        }
-        if (!representable || tokens != history.size()) {
-            writerUnpin(e, f);
-            in->b = in->a;
-            return;
-        }
     }
     // 1. The live frames, in stream order (arrival), and their new offsets.
     std::vector<std::pair<int64_t, int64_t>> rows;  // (rid, off)
@@ -856,19 +820,32 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         for (size_t i = 0; i < t->toks.size(); ++i) compactTokens.insert(uint32_t(i + 1));
     }
     {
-        sqlite3_stmt* q = c->sql("SELECT rid, off, len, kk, f IS NOT NULL FROM r");
+        sqlite3_stmt* q = c->sql("SELECT rid, off, len FROM r");
         int r = q ? SQLITE_OK : SQLITE_ERROR;
         while (q && (r = sqlite3_step(q)) == SQLITE_ROW) {
             rows.push_back({sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 1)});
             live[sqlite3_column_int64(q, 1)] = sqlite3_column_int64(q, 2);
-            if (sqlite3_column_int(q, 4) && sqlite3_column_int64(q, 3) > 0)
-                compactObjects.insert(uint32_t(sqlite3_column_int64(q, 3)));
         }
         if (q) sqlite3_reset(q);
         if (r != SQLITE_DONE) {
             writerUnpin(e, f);
             in->status = statusOfSqlite(r);
             in->err = "rows of " + f->path;
+            return;
+        }
+    }
+    // State segments preserve even dictionary IDs whose original rows have
+    // gone; future writes must not assign those IDs to another object.
+    {
+        sqlite3_stmt* q = c->sql("SELECT id FROM okey ORDER BY id");
+        int r = q ? SQLITE_OK : SQLITE_ERROR;
+        while (q && (r = sqlite3_step(q)) == SQLITE_ROW)
+            compactObjects.insert(uint32_t(sqlite3_column_int64(q, 0)));
+        if (q) sqlite3_reset(q);
+        if (r != SQLITE_DONE) {
+            writerUnpin(e, f);
+            in->status = statusOfSqlite(r);
+            in->err = "compact dictionary " + f->path;
             return;
         }
     }
@@ -904,11 +881,14 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     if (st == P4_OK && r != SQLITE_OK) st = statusOfSqlite(r);
     std::vector<int64_t> chunkRows;
     std::string buf;
-    bool firstChunk = true;
+    bool firstChunk = true, writeEvent = false;
     auto flushBytes = [&]() {
         if (st != P4_OK || buf.empty()) return;
         st = streamWrite(next.get(), at, reinterpret_cast<const uint8_t*>(buf.data()), buf.size());
-        if (st == P4_OK) at += int64_t(buf.size());
+        if (st == P4_OK) {
+            at += int64_t(buf.size());
+            if (!writeEvent) { compactWriteEvent(f, true); writeEvent = true; }
+        }
         buf.clear();
     };
     auto flushCommit = [&]() {
@@ -948,7 +928,9 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         std::lock_guard<std::mutex> g(t->mu);
         k = f->k;
     }
-    if (st == P4_OK) st = streamCompactionEnd(f, next.get(), k, &at, &previous);
+    CheckpointState state;
+    if (st == P4_OK && !writeEvent) { compactWriteEvent(f, true); writeEvent = true; }
+    if (st == P4_OK) st = checkpointAppend(f, c, next.get(), k, &at, &previous, &state, true, &er);
     if (st == P4_OK) st = streamSync(next.get());
     r = st == P4_OK ? SQLITE_OK : SQLITE_ERROR;
     if (st != P4_OK) {
@@ -963,6 +945,7 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     //    shows it to them, and the old one while their snapshot names it.
     {
         std::lock_guard<std::mutex> g(f->smu);
+        if (f->retired) f->olderRetired.push_back({f->retired, f->retiredBytes, f->retireAt});
         f->retired = old;
         f->retiredBytes = in->a;
         f->retireAt = monoNs() + 30ull * 1000 * 1000 * 1000;
@@ -994,6 +977,13 @@ void compactWork(Engine* e, Type* t, Internal* in) {
             f->stream = old;
             f->retired.reset();
             f->retiredBytes = 0;
+            if (!f->olderRetired.empty()) {
+                const auto& retired = f->olderRetired.back();
+                f->retired = retired.stream;
+                f->retiredBytes = retired.bytes;
+                f->retireAt = retired.retireAt;
+                f->olderRetired.pop_back();
+            }
             f->gen = gen - 1;
         }
         next->drop.store(true);
@@ -1002,7 +992,8 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         return;
     }
     writerUnpin(e, f);
-    old->drop.store(true);  // unlinked when the last reader holding it lets go
+    // Maintenance permits unlink only after release and the reader window;
+    // existing readers then keep their generation until their last read ends.
     f->end = at;
     f->lastCommit = previous;
     f->streamHigh = uint64_t(t->nextSeq - 1);
@@ -1011,9 +1002,10 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         std::lock_guard<std::mutex> g(t->mu);
         f->mark = at;
         f->streamBytes = at;
-        // Dictionary deltas belong to this generation. A removed sealed
-        // object's old definition was not copied and must be emitted again
-        // if a later row reuses its cached SQLite object-key id.
+        // The new snapshot includes every historical dictionary ID.
+        f->checkpoint = std::make_shared<CheckpointState>(std::move(state));
+        f->pendingCheckpoint.reset();
+        f->checkpointRows = 0;
         f->streamObjects = std::move(compactObjects);
         f->streamMoves.clear();
         f->streamTokens = std::move(compactTokens);
@@ -1031,6 +1023,7 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         }
     }
     in->b = at;
+    compactWriteEvent(f, false);
     e->bump(kStRebuilds);
 }
 
