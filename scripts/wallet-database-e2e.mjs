@@ -203,7 +203,9 @@ try {
   if (page.errors.length) fail(`page errors: ${page.errors.join(' | ')}`);
   console.log(`wallet-database E2E PASS: 100 contacts stored encrypted under a content key wrapped to the wallet; Python unwrapped it from the seed and decrypted every record to the SQL rows; another account refused; signed out cannot create; two databases, two keys`);
 } finally {
+  const exited = new Promise((resolve) => browser.once('exit', resolve));
   browser.kill();
+  await exited;
   server.close();
-  fs.rmSync(profile, { recursive: true, force: true });
+  fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }
