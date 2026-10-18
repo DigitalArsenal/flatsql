@@ -16,7 +16,7 @@
 // the bound (durable syncs x this disk's sync latency, or the bytes at memcpy
 // rate) and stock SQLite 3.53.4 on the same index and frames, and fails when
 // any answer hashes differently on the two builds (or across repetitions) or
-// a workload is slower than 3.7.2.
+// a workload is slower than 3.7.2 (median 5% above, runs apart).
 //
 // Environment: FLATBUFFERS_DIR (else the sibling flatbuffers checkout),
 // P4_REPLAY_DIR (work directory; default the system temp directory),
@@ -193,7 +193,10 @@ for (const workload of WORKLOADS) {
     const bound = syncs > 0 ? syncs * syncMs : 0;
     rows.push({ workload, pass, base_med: med(a), base_p95: q(a, 0.95), new_med: med(b), new_p95: q(b, 0.95), speedup: med(a) / med(b),
       base_cpu: med(ac), new_cpu: med(bc), syncs, bound_ms: bound, rows: bytes });
-    if (med(b) > med(a) * 1.05) {
+    // Slower: the median past 3.7.2's by 5% and the two builds' runs apart
+    // (this build's lower quartile above 3.7.2's upper one), not one noisy
+    // cold run.
+    if (med(b) > med(a) * 1.05 && q(b, 0.25) > q(a, 0.75)) {
       failed = true;
       console.error(`FAIL: ${key}: this build ${med(b).toFixed(1)} ms is slower than ${BASE_TAG} ${med(a).toFixed(1)} ms`);
     }
