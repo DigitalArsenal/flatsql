@@ -894,6 +894,7 @@ struct FileMeta {
 };
 int writeMeta(Conn* c, const Counters& k, int64_t now, int64_t mark, uint32_t gen);  // in the caller's write transaction; SQLite rc
 int readMeta(Conn* c, FileMeta* m);                                                    // SQLite rc
+int readInstRows(Conn* c, std::vector<std::pair<InstId, InstCount>>* rows);  // SQLite rc; the live rows, ids only
 int readInst(Feed* f, Conn* c, std::map<InstId, InstCount>* out);  // SQLite rc; strings from the file's dictionary
 int readTokc(Type* t, Conn* c, std::map<uint32_t, TokCount>* out);  // SQLite rc; tokens registered as needed
 int writeTokc(Type* t, Conn* c, const std::map<uint32_t, TokCount>& before, const std::map<uint32_t, TokCount>& after);

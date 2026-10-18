@@ -45,9 +45,9 @@ int32_t appliedEnd(Stream* stream,uint64_t previous,uint64_t* end) {
     }
     *end=0; return P4_OK;
 }
-int32_t append(Stream* stream,flatbuffers::FlatBufferBuilder& b,int64_t* end,const char* kind) {
-    std::vector<uint8_t> bytes(b.GetSize()+4); st32(bytes.data(),uint32_t(b.GetSize()));
-    std::memcpy(bytes.data()+4,b.GetBufferPointer(),b.GetSize());
+int32_t append(Stream* stream,const uint8_t* data,size_t size,int64_t* end,const char* kind) {
+    std::vector<uint8_t> bytes(size+4); st32(bytes.data(),uint32_t(size));
+    std::memcpy(bytes.data()+4,data,size);
 #ifndef __wasm__
     if(const char* pause=std::getenv("P4_STATE_PAUSE_MS")) {
         const size_t half=bytes.size()/2; int32_t rc=streamWrite(stream,*end,bytes.data(),half);
@@ -119,9 +119,11 @@ void merge(SegmentData* dst,const SegmentData& src) {
     for(const auto& x:src.tokens) dst->tokens[x.first]=x.second;
     dst->tombstones.insert(src.tombstones.begin(),src.tombstones.end());
 }
-int32_t writeSegment(Feed* f,Stream* stream,uint8_t kind,uint8_t level,const SegmentData& data,
-    const std::vector<uint64_t>& replaces,uint64_t applied,const Counters& counters,int64_t* end,uint64_t* previous,CheckpointSegment* desc) {
-    flatbuffers::FlatBufferBuilder b;
+// Encodes one segment at the provisional offset *cursor. Defaults are forced
+// so SELF_OFFSET, PREVIOUS and every REPLACES entry exist to be patched.
+void encodeSegment(Feed* f,uint8_t kind,uint8_t level,const SegmentData& data,const std::vector<uint64_t>& replaces,
+    uint64_t applied,const Counters& counters,uint64_t* cursor,CheckpointPlan* plan,CheckpointSegment* desc) {
+    flatbuffers::FlatBufferBuilder b; b.ForceDefaults(true);
     std::vector<flatbuffers::Offset<::FMBEntry>> entries,tokens;
     std::vector<::FSGLatest> latest; std::vector<::FSGInstance> instances; std::vector<::FSGPair> pairs;
     for(const auto& x:data.dictionary) entries.push_back(entry(b,x.second));
@@ -132,14 +134,26 @@ int32_t writeSegment(Feed* f,Stream* stream,uint8_t kind,uint8_t level,const Seg
     for(auto rid:data.tombstones) pairs.emplace_back(rid,0,rid,0);
     auto ev=b.CreateVector(entries),tv=b.CreateVector(tokens); auto lv=b.CreateVectorOfStructs(latest);
     auto iv=b.CreateVectorOfStructs(instances); auto pv=b.CreateVectorOfStructs(pairs); auto rv=b.CreateVector(replaces);
-    desc->offset=uint64_t(*end); desc->kind=kind; desc->level=level; desc->coversThrough=applied; desc->entries=data.size(kind);
+    desc->offset=*cursor; desc->kind=kind; desc->level=level; desc->coversThrough=applied; desc->entries=data.size(kind);
     desc->minSeq=counters.minseq==INT64_MAX?0:uint64_t(counters.minseq); desc->maxSeq=uint64_t(counters.maxseq);
-    FSGBuilder root(b); root.add_SELF_OFFSET(desc->offset); root.add_PREVIOUS(*previous); root.add_FEED_ID(f->fid);
+    FSGBuilder root(b); root.add_SELF_OFFSET(desc->offset); root.add_PREVIOUS(0); root.add_FEED_ID(f->fid);
     root.add_KIND(fckSegmentKind(kind)); root.add_LEVEL(level); root.add_MIN_SEQ(desc->minSeq); root.add_MAX_SEQ(desc->maxSeq);
     root.add_COVERS_THROUGH(applied); root.add_REPLACES(rv);
     if(kind==0) root.add_ENTRIES(ev); else if(kind==1) root.add_LATEST(lv); else if(kind==2) root.add_INSTANCES(iv); else if(kind==3) root.add_TOKENS(tv); else root.add_PAIRS(pv);
-    auto x=root.Finish(); FinishFSGBuffer(b,x); desc->length=uint32_t(b.GetSize()); ps::sha256(b.GetBufferPointer(),b.GetSize(),desc->digest.data());
-    int32_t rc=append(stream,b,end,"FSG"); if(rc==P4_OK) *previous=desc->offset; return rc;
+    auto x=root.Finish(); FinishFSGBuffer(b,x); desc->length=uint32_t(b.GetSize());
+    std::vector<uint64_t> frame((b.GetSize()+7)/8); std::memcpy(frame.data(),b.GetBufferPointer(),b.GetSize());
+    plan->frames.push_back(std::move(frame)); plan->lengths.push_back(desc->length); *cursor+=4+uint64_t(desc->length);
+}
+// Whether only $FSG frames lie in [from,to): size prefixes only.
+bool onlySegments(Stream* stream,uint64_t from,uint64_t to) {
+    while(from<to) {
+        if(to-from<12) return false;
+        std::string prefix; if(streamReadRange(stream,int64_t(from),12,&prefix)!=P4_OK || prefix.size()!=12) return false;
+        const uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data()));
+        if(n<8 || uint64_t(n)>to-from-4 || std::memcmp(prefix.data()+8,"$FSG",4)) return false;
+        from+=4+uint64_t(n);
+    }
+    return from==to;
 }
 // Metadata-only backward chain; unchanged latest entries retain their ROW_REF.
 struct TailChanges { std::map<uint64_t,uint64_t> rows; std::set<uint64_t> removed,removedSeqs; };
@@ -230,7 +244,15 @@ int32_t snapshot(Feed* f,Conn* c,Stream* stream,uint64_t previous,const Checkpoi
         }
         sqlite3_reset(q); if(rc!=SQLITE_DONE) return statusOfSqlite(rc);
     }
-    int sql=readInst(f,c,&state->instances); if(sql!=SQLITE_OK) return statusOfSqlite(sql);
+    // Names come from this snapshot's own dictionary: the feed's shared
+    // dictionary cache belongs to its writer.
+    std::vector<std::pair<InstId,InstCount>> rows; int sql=readInstRows(c,&rows); if(sql!=SQLITE_OK) return statusOfSqlite(sql);
+    for(auto& row:rows) {
+        auto b=state->dictionary.find({2,row.first.first}); if(b==state->dictionary.end() || b->second.text.size()!=3) return P4_E_CORRUPT;
+        row.second.batch=b->second.text[0]; row.second.ppeer=b->second.text[1]; row.second.pkey=b->second.text[2];
+        auto k=state->dictionary.find({3,row.first.second}); if(k!=state->dictionary.end() && k->second.text.size()==1) row.second.ckey=k->second.text[0];
+        state->instances[row.first]=std::move(row.second);
+    }
     sql=readTokc(f->type,c,&state->tokens); if(sql!=SQLITE_OK) return statusOfSqlite(sql);
     return latestSnapshot(f,c,stream,previous,old,state);
 }
@@ -269,17 +291,20 @@ int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState*
     for(const auto& item:data.tokens) { const auto& t=item.second.text; TokCount x;
         if(t.size()!=6 || !number(t[1],&x.n) || !number(t[2],&x.bytes) || !number(t[3],&x.mints) || !number(t[4],&x.maxts) || !number(t[5],&x.maxseq)) return fail(); if(x.n) out.tokens[item.first]=x;
     }
+    out.current=onlySegments(stream,out.appliedThrough,offset);
     out.feedRoot=feedDagCheckpointCid(p,n);
     if(ck->COMMITS_ROOT_CID()) out.commitsRoot.assign(reinterpret_cast<const char*>(ck->COMMITS_ROOT_CID()->data()),ck->COMMITS_ROOT_CID()->size());
     *state=std::move(out); return P4_OK;
 }
 
-int32_t checkpointAppend(Feed* f,Conn* c,Stream* stream,const Counters& counters,int64_t* end,uint64_t* previous,CheckpointState* state,bool fresh,std::string* err) {
-    CheckpointState out; const CheckpointState empty; const auto& old=fresh?empty:*state;
+int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint64_t mark,const Counters& counters,const CheckpointState& old,
+                          bool fresh,const std::string& commitsRoot,CheckpointPlan* plan,std::string* err) {
+    plan->at=mark; plan->previous=previous; plan->frames.clear(); plan->lengths.clear();
+    CheckpointState& out=plan->state; out=CheckpointState();
     out.tombstones=old.tombstones;
-    int32_t rc=appliedEnd(stream,*previous,&out.appliedThrough); if(rc!=P4_OK) return rc;
-    rc=snapshot(f,c,stream,*previous,old,counters,&out); if(rc!=P4_OK) { if(err) *err="checkpoint snapshot "+f->path; return rc; }
-    out.segments=old.segments; out.checkpointBytes=old.checkpointBytes;
+    int32_t rc=appliedEnd(stream,previous,&out.appliedThrough); if(rc!=P4_OK) return rc;
+    rc=snapshot(f,c,stream,previous,old,counters,&out); if(rc!=P4_OK) { if(err) *err="checkpoint snapshot "+f->path; return rc; }
+    out.segments=old.segments; out.checkpointBytes=old.checkpointBytes; out.commitsRoot=commitsRoot;
     SegmentData deltas[5];
     for(const auto& x:out.dictionary) { auto it=old.dictionary.find(x.first); if(it==old.dictionary.end() || it->second.text!=x.second.text) deltas[0].dictionary[x.first]=x.second; }
     for(const auto& x:out.latest) { auto it=old.latest.find(x.first); if(it==old.latest.end() || !(it->second==x.second)) deltas[1].latest[x.first]=x.second; }
@@ -289,41 +314,78 @@ int32_t checkpointAppend(Feed* f,Conn* c,Stream* stream,const Counters& counters
     for(const auto& x:out.tokens) { auto it=old.tokens.find(x.first); if(it==old.tokens.end() || !tokenEqual(it->second,x.second)) deltas[3].tokens[x.first]=tokenEntry(x.first,x.second,out.dictionary.at({0,x.first}).text[0]); }
     for(const auto& x:old.tokens) if(!out.tokens.count(x.first)) deltas[3].tokens[x.first]=tokenEntry(x.first,TokCount{},out.dictionary.at({0,x.first}).text[0]);
     for(auto rid:out.tombstones) if(!old.tombstones.count(rid)) deltas[4].tombstones.insert(rid);
+    // This plan's own segments (offsets >= mark) are merged from memory.
+    uint64_t cursor=mark; std::map<uint64_t,SegmentData> made;
     for(uint8_t kind=0;kind<5;kind++) if(deltas[kind].size(kind)) {
-        CheckpointSegment desc; rc=writeSegment(f,stream,kind,0,deltas[kind],{},out.appliedThrough,counters,end,previous,&desc); if(rc!=P4_OK) return rc; out.segments.push_back(desc);
+        CheckpointSegment desc; encodeSegment(f,kind,0,deltas[kind],{},out.appliedThrough,counters,&cursor,plan,&desc);
+        made[desc.offset]=std::move(deltas[kind]); out.segments.push_back(desc);
         for(uint8_t level=0;level<63;level++) {
             std::vector<CheckpointSegment> inputs; for(const auto& d:out.segments) if(d.kind==kind && d.level==level) inputs.push_back(d);
             if(inputs.size()<4) break;
             std::sort(inputs.begin(),inputs.end(),[](const CheckpointSegment& a,const CheckpointSegment& b){return a.offset<b.offset;}); inputs.resize(4);
             SegmentData combined; std::vector<uint64_t> replaces;
-            for(const auto& d:inputs) { SegmentData part; rc=readSegment(f,stream,d,&part); if(rc!=P4_OK) return rc; merge(&combined,part); replaces.push_back(d.offset); }
+            for(const auto& d:inputs) {
+                if(d.offset>=mark) merge(&combined,made.at(d.offset));
+                else { SegmentData part; rc=readSegment(f,stream,d,&part); if(rc!=P4_OK) return rc; merge(&combined,part); }
+                replaces.push_back(d.offset);
+            }
             // LATEST deltas already include zero-rid deletion markers. Applying
             // the tombstone union again would erase a later reuse of ROW_J.
-            rc=writeSegment(f,stream,kind,uint8_t(level+1),combined,replaces,out.appliedThrough,counters,end,previous,&desc); if(rc!=P4_OK) return rc;
+            encodeSegment(f,kind,uint8_t(level+1),combined,replaces,out.appliedThrough,counters,&cursor,plan,&desc);
+            made[desc.offset]=std::move(combined);
             out.segments.erase(std::remove_if(out.segments.begin(),out.segments.end(),[&](const CheckpointSegment& d){return std::find(replaces.begin(),replaces.end(),d.offset)!=replaces.end();}),out.segments.end()); out.segments.push_back(desc);
         }
     }
     std::sort(out.segments.begin(),out.segments.end(),[](const CheckpointSegment& a,const CheckpointSegment& b){return a.offset<b.offset;});
-    rc=feedDagCommitRoot(f,stream,*previous,uint64_t(*end),&out.commitsRoot,err); if(rc!=P4_OK) return rc;
+    plan->previousRoot=old.feedRoot;
+    if(plan->previousRoot.empty() && fresh) { std::lock_guard<std::mutex> lock(f->type->mu); if(f->checkpoint) plan->previousRoot=f->checkpoint->feedRoot; }
+    if(plan->previousRoot.empty()) {
+        std::vector<uint64_t> genesis; uint32_t genesisSize=0;
+        rc=frame(stream,0,&genesis,&genesisSize); if(rc!=P4_OK) return rc;
+        plan->previousRoot=feedDagCheckpointCid(genesis.data(),genesisSize);
+    }
+    return P4_OK;
+}
+
+int32_t checkpointInstall(Feed* f,Stream* stream,CheckpointPlan& plan,int64_t* end,uint64_t* previous,CheckpointState* state) {
+    if(*end<0 || uint64_t(*end)<plan.at || plan.frames.size()!=plan.lengths.size()) return P4_E_INTERNAL;
+    const uint64_t shift=uint64_t(*end)-plan.at;
+    auto place=[&](uint64_t offset) { return offset>=plan.at?offset+shift:offset; };
+    CheckpointState out=std::move(plan.state); const Counters& counters=out.counters;
+    out.current=*previous==plan.previous;
+    std::map<uint64_t,std::array<uint8_t,32>> digests;
+    for(size_t i=0;i<plan.frames.size();i++) {
+        auto* p=reinterpret_cast<uint8_t*>(plan.frames[i].data()); const uint32_t n=plan.lengths[i]; const uint64_t at=uint64_t(*end);
+        auto* table=const_cast<flatbuffers::Table*>(reinterpret_cast<const flatbuffers::Table*>(GetFSG(p)));
+        if(!table->SetField<uint64_t>(FSG::VT_SELF_OFFSET,at,0) || !table->SetField<uint64_t>(FSG::VT_PREVIOUS,*previous,0)) return P4_E_INTERNAL;
+        if(auto* replaces=const_cast<flatbuffers::Vector<uint64_t>*>(GetFSG(p)->REPLACES()))
+            for(flatbuffers::uoffset_t j=0;j<replaces->size();j++) replaces->Mutate(j,place(replaces->Get(j)));
+        ps::sha256(p,n,digests[at].data());
+        const int32_t rc=append(stream,p,n,end,"FSG"); if(rc!=P4_OK) return rc; *previous=at;
+    }
+    for(auto& s:out.segments) if(s.offset>=plan.at) {
+        s.offset=place(s.offset); auto d=digests.find(s.offset); if(d==digests.end()) return P4_E_INTERNAL; s.digest=d->second;
+    }
     flatbuffers::FlatBufferBuilder b; auto type=b.CreateString(f->type->name),provider=b.CreateString(f->provider),source=b.CreateString(f->source);
     int64_t minAt=INT64_MAX,maxAt=0; for(const auto& x:out.instances) { minAt=std::min(minAt,x.second.first); maxAt=std::max(maxAt,x.second.maxat); }
     FCKCounters k(uint64_t(counters.rows),uint64_t(counters.recs),uint64_t(counters.bytes),uint64_t(counters.nnull),uint64_t(counters.copies),uint64_t(counters.cbytes),uint64_t(counters.fbytes),counters.minseq==INT64_MAX?0:uint64_t(counters.minseq),uint64_t(counters.maxseq),counters.mine==INT64_MAX?0:counters.mine,counters.maxe==INT64_MIN?0:counters.maxe,counters.mints==INT64_MAX?0:counters.mints,counters.maxts,minAt==INT64_MAX?0:minAt,maxAt);
-    std::vector<::FCKSegment> segments; std::vector<uint8_t> digests;
-    for(const auto& s:out.segments) { segments.emplace_back(s.offset,s.length,fckSegmentKind(s.kind),s.level,0,s.minSeq,s.maxSeq,s.coversThrough,s.entries); digests.insert(digests.end(),s.digest.begin(),s.digest.end()); out.segmentBytes+=s.length+4; }
-    auto sv=b.CreateVectorOfStructs(segments); auto dv=b.CreateVector(digests);
+    std::vector<::FCKSegment> segments; std::vector<uint8_t> digestBytes;
+    for(const auto& s:out.segments) { segments.emplace_back(s.offset,s.length,fckSegmentKind(s.kind),s.level,0,s.minSeq,s.maxSeq,s.coversThrough,s.entries); digestBytes.insert(digestBytes.end(),s.digest.begin(),s.digest.end()); out.segmentBytes+=s.length+4; }
+    auto sv=b.CreateVectorOfStructs(segments); auto dv=b.CreateVector(digestBytes);
     auto cv=b.CreateVector(reinterpret_cast<const uint8_t*>(out.commitsRoot.data()),out.commitsRoot.size());
-    std::string previousRoot=state->feedRoot;
-    if(previousRoot.empty() && fresh) { std::lock_guard<std::mutex> lock(f->type->mu); if(f->checkpoint) previousRoot=f->checkpoint->feedRoot; }
-    if(previousRoot.empty()) {
-        std::vector<uint64_t> genesis; uint32_t genesisSize=0;
-        rc=frame(stream,0,&genesis,&genesisSize); if(rc!=P4_OK) return rc;
-        previousRoot=feedDagCheckpointCid(genesis.data(),genesisSize);
-    }
-    auto pv=b.CreateVector(reinterpret_cast<const uint8_t*>(previousRoot.data()),previousRoot.size());
-    out.offset=uint64_t(*end); FCKBuilder root(b); root.add_SELF_OFFSET(out.offset); root.add_PREVIOUS(*previous); root.add_FEED_ID(f->fid); root.add_TYPE(type); root.add_PROVIDER(provider); root.add_SOURCE(source); root.add_GENERATION(stream->gen); root.add_COMMITTED_AT(nowSec()); root.add_APPLIED_THROUGH(out.appliedThrough); root.add_TYPE_SEQ_HIGH(out.typeSeqHigh); root.add_COUNTERS(&k); root.add_SEGMENTS(sv); root.add_SEGMENT_DIGESTS(dv); root.add_COMMITS_ROOT_CID(cv); if(!previousRoot.empty()) root.add_PREVIOUS_FEED_ROOT_CID(pv);
+    auto pv=b.CreateVector(reinterpret_cast<const uint8_t*>(plan.previousRoot.data()),plan.previousRoot.size());
+    out.offset=uint64_t(*end); FCKBuilder root(b); root.add_SELF_OFFSET(out.offset); root.add_PREVIOUS(*previous); root.add_FEED_ID(f->fid); root.add_TYPE(type); root.add_PROVIDER(provider); root.add_SOURCE(source); root.add_GENERATION(stream->gen); root.add_COMMITTED_AT(nowSec()); root.add_APPLIED_THROUGH(out.appliedThrough); root.add_TYPE_SEQ_HIGH(out.typeSeqHigh); root.add_COUNTERS(&k); root.add_SEGMENTS(sv); root.add_SEGMENT_DIGESTS(dv); root.add_COMMITS_ROOT_CID(cv); if(!plan.previousRoot.empty()) root.add_PREVIOUS_FEED_ROOT_CID(pv);
     auto x=root.Finish(); FinishFCKBuffer(b,x); out.checkpointBytes+=b.GetSize()+4;
     out.feedRoot=feedDagCheckpointCid(b.GetBufferPointer(),b.GetSize());
-    rc=append(stream,b,end,"FCK"); if(rc!=P4_OK) return rc; *previous=out.offset; out.end=uint64_t(*end); *state=std::move(out); return P4_OK;
+    const int32_t rc=append(stream,b.GetBufferPointer(),b.GetSize(),end,"FCK"); if(rc!=P4_OK) return rc;
+    *previous=out.offset; out.end=uint64_t(*end); *state=std::move(out); return P4_OK;
+}
+
+int32_t checkpointAppend(Feed* f,Conn* c,Stream* stream,const Counters& counters,int64_t* end,uint64_t* previous,CheckpointState* state,bool fresh,std::string* err) {
+    std::string commitsRoot; const CheckpointState empty; CheckpointPlan plan;
+    int32_t rc=feedDagCommitRoot(f,stream,*previous,uint64_t(*end),&commitsRoot,err); if(rc!=P4_OK) return rc;
+    rc=checkpointPrepare(f,c,stream,*previous,uint64_t(*end),counters,fresh?empty:*state,fresh,commitsRoot,&plan,err); if(rc!=P4_OK) return rc;
+    return checkpointInstall(f,stream,plan,end,previous,state);
 }
 
 bool checkpointDue(const Feed* f,bool idle) {

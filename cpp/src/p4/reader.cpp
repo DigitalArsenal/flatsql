@@ -1757,10 +1757,10 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                 if(result==SQLITE_ROW) keep(row); else complete=false;
                 sqlite3_reset(row);
             }
-            if(complete && tailCommit!=ck->offset) {
+            if(complete && (tailCommit!=ck->offset || !ck->current)) {
                 std::vector<uint64_t> tailRows; int32_t streamStatus=P4_OK;
                 auto stream=streamCur(files_[fi].f,&streamStatus);
-                if(!stream || checkpointTailRows(files_[fi].f,stream.get(),ck->end,tailCommit,&tailRows)!=P4_OK) complete=false;
+                if(!stream || checkpointTailRows(files_[fi].f,stream.get(),*ck,tailCommit,&tailRows)!=P4_OK) complete=false;
                 for(uint64_t rid:tailRows) {
                     if(!complete) break;
                     sqlite3_bind_int64(row,1,sqlite3_int64(rid));

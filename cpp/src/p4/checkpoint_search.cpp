@@ -134,7 +134,7 @@ bool candidate(Stream* s,Feed* feed,uint64_t at,uint64_t size,CheckpointState* o
     *out=std::move(state); return true;
 }
 }
-int32_t checkpointTailRows(Feed* feed,Stream* stream,uint64_t checkpointEnd,uint64_t previous,std::vector<uint64_t>* rids,
+int32_t checkpointTailRows(Feed* feed,Stream* stream,const CheckpointState& checkpoint,uint64_t previous,std::vector<uint64_t>* rids,
                           uint64_t* rowCount,int64_t* lastCommitAt) {
     rids->clear();
     if(rowCount) *rowCount=0;
@@ -142,12 +142,18 @@ int32_t checkpointTailRows(Feed* feed,Stream* stream,uint64_t checkpointEnd,uint
     const int64_t extent=streamSize(stream);
     if(extent<0) return P4_E_IO;
     const uint64_t size=uint64_t(extent);
-    if(!checkpointEnd || checkpointEnd>size || previous>=size) return P4_E_CORRUPT;
-    uint64_t at=previous;
-    while(at>=checkpointEnd) {
+    if(!checkpoint.end || checkpoint.end>size || previous>=size || previous<checkpoint.offset) return P4_E_CORRUPT;
+    // Every $FMB that ends past APPLIED_THROUGH: those after the $FCK, and
+    // (prepared off the writer) those between APPLIED_THROUGH and the $FCK.
+    bool seen=false;
+    for(uint64_t at=previous;at!=UINT64_MAX;) {
         Frame f;
         if(!readFrame(stream,at,size,&f) || !commitHeader(&f,feed)) return P4_E_CORRUPT;
-        if(!std::memcmp(f.data()+4,"$FMB",4)) {
+        if(at==checkpoint.offset) {
+            if(f.end!=checkpoint.end || std::memcmp(f.data()+4,"$FCK",4)) return P4_E_CORRUPT;
+            seen=true; if(checkpoint.current) break;
+        } else if(!std::memcmp(f.data()+4,"$FMB",4)) {
+            if(f.end<=checkpoint.appliedThrough) break;
             const auto* batch=GetFMB(f.data());
             if(rowCount && batch->ROWS()) *rowCount+=batch->ROWS()->size();
             if(lastCommitAt) *lastCommitAt=std::max(*lastCommitAt,batch->COMMITTED_AT());
@@ -155,12 +161,10 @@ int32_t checkpointTailRows(Feed* feed,Stream* stream,uint64_t checkpointEnd,uint
                 if(!row->SEQ() || row->SEQ()>uint64_t(INT64_MAX>>16)) return P4_E_CORRUPT;
                 rids->push_back((row->SEQ()<<16)|row->ROW_J());
             }
-        }
+        } else if(at<checkpoint.offset && !std::memcmp(f.data()+4,"$FCK",4)) break;
         at=f.previous;
     }
-    Frame checkpoint;
-    if(!readFrame(stream,at,size,&checkpoint) || checkpoint.end!=checkpointEnd ||
-       std::memcmp(checkpoint.data()+4,"$FCK",4) || !commitHeader(&checkpoint,feed)) return P4_E_CORRUPT;
+    if(!seen) return P4_E_CORRUPT;
     std::sort(rids->begin(),rids->end());
     rids->erase(std::unique(rids->begin(),rids->end()),rids->end());
     return P4_OK;
@@ -173,10 +177,10 @@ int32_t checkpointRestoreCadence(Feed* feed,Stream* stream) {
         checkpoint=feed->checkpoint; previous=feed->lastCommit;
         feed->checkpointRows=0; feed->checkpointAt=0;
     }
-    if(!checkpoint || previous==checkpoint->offset) return P4_OK;
+    if(!checkpoint || (previous==checkpoint->offset && checkpoint->current)) return P4_OK;
     uint64_t rows=0; int64_t committedAt=0;
     std::vector<uint64_t> rids;
-    const int32_t rc=checkpointTailRows(feed,stream,checkpoint->end,previous,&rids,&rows,&committedAt);
+    const int32_t rc=checkpointTailRows(feed,stream,*checkpoint,previous,&rids,&rows,&committedAt);
     if(rc!=P4_OK) return rc;
     const uint64_t now=monoNs();
     const int64_t wall=nowSec();

@@ -232,13 +232,11 @@ int readMeta(Conn* c, FileMeta* m) {
     return r == SQLITE_DONE ? SQLITE_OK : r;
 }
 
-int readInst(Feed* f, Conn* c, std::map<InstId, InstCount>* out) {
-    out->clear();
-    if (!dictEnsure(f, c)) return SQLITE_ERROR;
+int readInstRows(Conn* c, std::vector<std::pair<InstId, InstCount>>* got) {
+    got->clear();
     sqlite3_stmt* s = c->sql("SELECT b, c, n, bytes, minw, maxw, minseq, maxseq, first, updated, maxat, maxts, url FROM inst");
     if (!s) return SQLITE_ERROR;
     int r;
-    std::vector<std::pair<InstId, InstCount>> got;
     while ((r = sqlite3_step(s)) == SQLITE_ROW) {
         InstCount ic;
         const InstId id(uint32_t(sqlite3_column_int64(s, 0)), uint32_t(sqlite3_column_int64(s, 1)));
@@ -254,10 +252,18 @@ int readInst(Feed* f, Conn* c, std::map<InstId, InstCount>* out) {
         ic.maxts = sqlite3_column_int64(s, 11);
         const unsigned char* u = sqlite3_column_text(s, 12);
         if (u) ic.url = reinterpret_cast<const char*>(u);
-        if (ic.n > 0) got.push_back({id, std::move(ic)});
+        if (ic.n > 0) got->push_back({id, std::move(ic)});
     }
     sqlite3_reset(s);
-    if (r != SQLITE_DONE) return r;
+    return r == SQLITE_DONE ? SQLITE_OK : r;
+}
+
+int readInst(Feed* f, Conn* c, std::map<InstId, InstCount>* out) {
+    out->clear();
+    if (!dictEnsure(f, c)) return SQLITE_ERROR;
+    std::vector<std::pair<InstId, InstCount>> got;
+    const int r = readInstRows(c, &got);
+    if (r != SQLITE_OK) return r;
     for (auto& kv : got) {
         BatchDef bd;
         if (!dictBatch(f, c, kv.first.first, &bd)) return SQLITE_CORRUPT;
@@ -581,7 +587,7 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
     FileMeta m; std::map<InstId,InstCount> inst; std::map<uint32_t,TokCount> tokc;
     int rc=st==P4_OK?readMeta(c,&m):SQLITE_ERROR;
     const auto checkpoint=f->checkpoint;
-    if(rc==SQLITE_OK && checkpoint && checkpoint->offset && checkpoint->end==uint64_t(m.mark)) {
+    if(rc==SQLITE_OK && checkpoint && checkpoint->offset && checkpoint->holdsStateAt(uint64_t(m.mark))) {
         // The schema omits rbytes/minw/maxw and the instance URL. Keep only
         // those derived supplements in SQLite; all represented state comes
         // from the verified checkpoint segments.
