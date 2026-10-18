@@ -188,7 +188,8 @@ struct FMBUrl    { SEQ:ulong; ROW_J:uint; URL_ID:uint; }               // a DUP 
 table FMBEntry   { KIND:fmbDictKind; ID:uint; TEXT:[string]; }         // TOKEN [token, peer]; NODE [producer, peer];
                                                                        // BATCH [batch, ppeer, pkey]; others [value]
 table FMBSignature { ROW:uint; BYTES:[ubyte]; }                        // format 4's `x`
-table FMBSealed  { ROW:uint; EPOCH:long; OBJECT_KEY_ID:uint;          // ciphertext cannot be re-extracted, so a sealed
+table FMBSealed  { ROW:uint; EPOCH:long = -9223372036854775808;      // ciphertext cannot be re-extracted, so a sealed
+                   OBJECT_KEY_ID:uint;
                    LEAF_DIGEST:[ubyte]; COLUMNS:[ubyte]; }             // row's epoch/key live here only; LEAF_DIGEST:
                                                                        // ciphertext sha2-256; COLUMNS: format 4's `f`
 table FMBIdentity { ROW:uint; HASH:[ubyte]; }                          // IQC ingest identity (32 B)
@@ -219,7 +220,9 @@ file_identifier "$FMB";
 What the vectors cover:
 - `ROWS` and `GROUPS` hold every column of format 4's row `r`.
 - `DICTIONARY` covers `node`, `batch`, `ckey`, `url` and the type's `tok`.
-  `OBJECT_KEY` entries are written only for sealed rows. Other rows' object
+  `OBJECT_KEY` entries are written only for sealed rows; their one `TEXT` is
+  the key typed as the extractor gives it: `i` + decimal for an integer key,
+  `s` + the text for a string key. Other rows' object
   keys come from their bytes, with ids given in order of first appearance in
   the stream, so a rebuild gives the same ids.
 - **Why the digest stays.** It is the commit's integrity check (§9) and the
@@ -298,7 +301,7 @@ table FSG {
   SELF_OFFSET:ulong;
   PREVIOUS:ulong;
   FEED_ID:uint;
-  KIND:ubyte;                // fckSegmentKind
+  KIND:fckSegmentKind;
   LEVEL:ubyte;
   MIN_SEQ:ulong; MAX_SEQ:ulong;
   COVERS_THROUGH:ulong;
@@ -413,6 +416,17 @@ call, so a single-feed call drops from 2 syncs to 1. A call that also creates a
 feed pays once for the feed: the new file, its genesis `$FCK` and a directory
 sync. A new token has no extra sync, because it lives in the `$FMB`
 dictionary.
+
+**SQLite never syncs on the ack path.** The index files open through a VFS
+shim (`flatsql_p4_cache`) whose `xSync` is a no-op outside WAL checkpoints and
+connection close, so a WAL restart's header sync is skipped too. A power loss
+can therefore drop index commits, but never acknowledged data. Checkpoints keep
+SQLite's own sync order.
+
+**Split rounds.** A round whose feed rows exceed 65,536 writes several `$FMB`s.
+The ack follows the sync of all of them. Recovery may apply a durable prefix of
+an unacknowledged round. Such records were never acknowledged and are kept, as
+any durable but unacknowledged write is.
 
 **Order of persistence.** The index commit is written only after its stream
 sync returned. A persisted index commit therefore never names bytes the stream
