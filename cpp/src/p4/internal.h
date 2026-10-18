@@ -819,6 +819,8 @@ std::shared_ptr<Stream> streamAt(Feed* f, uint32_t gen, int32_t* rc);
 // The record bytes of the frame at off: its size prefix must be len. frame:
 // the whole frame, the size prefix kept.
 int32_t streamRead(Stream* s, int64_t off, int64_t len, std::string* out, bool frame = false);
+// n bytes of the stream at off (several frames at once): P4_E_CORRUPT when it ends first.
+int32_t streamReadRange(Stream* s, int64_t off, size_t n, std::string* out);
 // Appends bytes at off (the caller's end); syncs when sync is set.
 int32_t streamWrite(Stream* s, int64_t off, const uint8_t* p, size_t n);
 int32_t streamSync(Stream* s);

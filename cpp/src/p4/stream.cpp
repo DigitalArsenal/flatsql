@@ -89,6 +89,20 @@ int32_t streamRead(Stream* s, int64_t off, int64_t len, std::string* out, bool f
     return P4_OK;
 }
 
+int32_t streamReadRange(Stream* s, int64_t off, size_t n, std::string* out) {
+    if (off < 0) return P4_E_CORRUPT;
+    out->resize(n);
+    size_t got = 0;
+    while (got < n) {
+        const int32_t r = flatsql_io_read(s->h, &(*out)[got], int32_t(std::min<size_t>(n - got, size_t(1) << 30)),
+                                          double(off) + double(got));
+        if (r < 0) return P4_E_IO;
+        if (r == 0) return P4_E_CORRUPT;  // past the stream's end
+        got += size_t(r);
+    }
+    return P4_OK;
+}
+
 int32_t streamWrite(Stream* s, int64_t off, const uint8_t* p, size_t n) {
     size_t done = 0;
     while (done < n) {
