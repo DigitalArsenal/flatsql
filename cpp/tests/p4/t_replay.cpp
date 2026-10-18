@@ -32,7 +32,11 @@
 // pass is the cold cache, the others warm). Every answer goes into the hash: a build that
 // answers differently hashes differently.
 #include <fcntl.h>
+#if defined(__wasm__)
+#include <wasi/api.h>
+#else
 #include <sys/resource.h>
+#endif
 #if defined(__APPLE__)
 #include <sys/clonefile.h>
 #endif
@@ -131,10 +135,18 @@ uint64_t syncs() {
 struct Clock {
     uint64_t wall0 = 0, sync0 = 0;
     double cpu0 = 0;
+    // The process's CPU seconds; under WASI the host's (the process clock
+    // of the runtime that runs the command), -1 where the host has none.
     static double cpu() {
+#if defined(__wasm__)
+        __wasi_timestamp_t ns = 0;
+        if (__wasi_clock_time_get(__WASI_CLOCKID_PROCESS_CPUTIME_ID, 1000, &ns) != 0) return -1;
+        return double(ns) / 1e9;
+#else
         struct rusage u;
         getrusage(RUSAGE_SELF, &u);
         return double(u.ru_utime.tv_sec + u.ru_stime.tv_sec) + double(u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1e6;
+#endif
     }
     void start() {
         wall0 = flatsql::ps::monoNs();
@@ -142,7 +154,7 @@ struct Clock {
         sync0 = syncs();
     }
     double wallMs() const { return double(flatsql::ps::monoNs() - wall0) / 1e6; }
-    double cpuMs() const { return (cpu() - cpu0) * 1e3; }
+    double cpuMs() const { return cpu0 < 0 ? -1 : (cpu() - cpu0) * 1e3; }
 };
 
 void emit(const std::string& workload, const char* pass, const Clock& c, const Hash& h, int64_t rows, int64_t ops) {

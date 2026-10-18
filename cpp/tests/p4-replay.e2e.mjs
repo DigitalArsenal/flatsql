@@ -15,10 +15,24 @@
 // per workload, each build's median and p95 wall and CPU time, the speedup,
 // the bound (durable syncs x this disk's sync latency, or the bytes at memcpy
 // rate) and stock SQLite 3.53.4 on the same index and frames, and fails when
-// any answer hashes differently on the two builds (or across repetitions) or
+// any answer hashes differently on the two builds (or across repetitions, or
+// between the runtimes) or
 // a workload is slower than 3.7.2 (exact one-sided Mann-Whitney U test,
 // p <= 0.005: at 5 repetitions every run of this build slower than every run
 // of 3.7.2).
+//
+// Two runtimes (P4_REPLAY_RUNTIMES, default "native,aot"): the native test
+// client, and the same client and engine as the wasm32 test command
+// flatsql-p4-test.wasm (built in Docker with the Linux wasi-sdk 30 that builds
+// the shipped flatsql-p4-threads.wasm) run as SDN runs the format-4 engine:
+// sdn-server's flatsqlrt compiles it with the node's threaded AOT
+// configuration and runs it on wasmrt with the node's native host I/O
+// (cpp/tests/p4/aot/replay_aot_test.go, overlaid into that package with go
+// test -overlay; the SDN checkout is not changed). The aot runtime needs
+// Docker, P4_REPLAY_SDN (else $GAUNTLET_STACK_ROOT/repos/main-packages/
+// space-data-network, else the sibling space-data-network checkout) and
+// P4_REPLAY_WASMEDGE (else ~/.sdn-wasmedge-static-macos-patched/prefix, the
+// patched static WasmEdge the node links).
 //
 // Environment: FLATBUFFERS_DIR (else the sibling flatbuffers checkout),
 // P4_REPLAY_DIR (work directory; default the system temp directory),
@@ -28,8 +42,8 @@
 // P4_REPLAY_WORKLOADS (comma list), P4_REPLAY_WXF_BYTES.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statfsSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createGunzip } from 'node:zlib';
@@ -45,6 +59,8 @@ const SEED_DAYS = ['2026-09-16', '2026-09-17', '2026-09-18', '2026-09-19', '2026
 const INGEST_DAY = '2026-09-26';
 const WORKLOADS = (process.env.P4_REPLAY_WORKLOADS || 'gp_ingest,wxf_lead,sync_norad,sync_window,latest,retention,explorer,open')
   .split(',').filter(Boolean);
+const RUNTIMES = (process.env.P4_REPLAY_RUNTIMES || 'native,aot').split(',').filter(Boolean);
+for (const r of RUNTIMES) if (r !== 'native' && r !== 'aot') throw new Error(`P4_REPLAY_RUNTIMES: unknown runtime ${r}`);
 const READS = new Set(['sync_norad', 'sync_window', 'latest', 'explorer']);
 const WARM_PASSES = 3;
 
@@ -64,8 +80,10 @@ function flatbuffers() {
   return dir;
 }
 
-const work = process.env.P4_REPLAY_DIR || join(tmpdir(), `flatsql-p4-replay-${createHash('sha256').update(repo).digest('hex').slice(0, 12)}`);
-mkdirSync(work, { recursive: true });
+const workDir = process.env.P4_REPLAY_DIR || join(tmpdir(), `flatsql-p4-replay-${createHash('sha256').update(repo).digest('hex').slice(0, 12)}`);
+mkdirSync(workDir, { recursive: true });
+// The host I/O confines the aot runtime's store to this root by its real path.
+const work = realpathSync(workDir);
 
 function build(name, src) {
   const dir = join(work, `build-${name}`);
@@ -83,6 +101,45 @@ mkdirSync(baseSrc, { recursive: true });
 execFileSync('sh', ['-c', `git -C "${repo}" archive ${BASE_TAG} cpp | tar -x -C "${baseSrc}"`]);
 for (const f of ['t_replay.cpp', 'wxf_fixture.h']) writeFileSync(join(baseSrc, 'cpp/tests/p4', f), readFileSync(join(cpp, 'tests/p4', f)));
 const arms = { base: build('base', join(baseSrc, 'cpp')), new: build('new', cpp) };
+
+// The aot runtime: each build's wasm test command, and the SDN harness.
+function wasmTestBuild(name, src) {
+  const arch = process.arch === 'arm64' ? 'arm64' : 'x86_64';
+  const tgz = join(process.env.XDG_CACHE_HOME || join(homedir(), '.cache'), 'flatsql', `wasi-sdk-30.0-${arch}-linux.tar.gz`);
+  if (!existsSync(tgz)) fail(`${tgz} missing: scripts/build-wasm.sh --ps --linux fetches and checks it`);
+  const out = join(work, `wasm-${name}`);
+  rmSync(out, { recursive: true, force: true });
+  mkdirSync(out, { recursive: true });
+  const script = [
+    'apt-get update -qq >/dev/null && apt-get install -y -qq cmake ninja-build >/dev/null',
+    'mkdir -p /opt/wasi-sdk && tar -xzf /w/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1',
+    'cmake -S /w/flatsql/cpp -B /tmp/b -G Ninja -DCMAKE_TOOLCHAIN_FILE=/w/flatsql/cpp/cmake/wasi-threads-toolchain.cmake' +
+      ' -DWASI_SDK_PREFIX=/opt/wasi-sdk -DFLATBUFFERS_DIR=/w/flatbuffers -DCMAKE_BUILD_TYPE=Release >/dev/null',
+    'cmake --build /tmp/b --target flatsql_p4_test_wasm -j 8 >/tmp/build.log 2>&1 || { tail -40 /tmp/build.log; exit 1; }',
+    'cp /tmp/b/flatsql-p4-test.wasm /w/out/',
+  ].join('\n');
+  run('docker', ['run', '--rm', '-v', `${src}:/w/flatsql/cpp:ro`, '-v', `${flatbuffers()}:/w/flatbuffers:ro`, '-v', `${tgz}:/w/wasi-sdk.tar.gz:ro`,
+    '-v', `${out}:/w/out`, 'ubuntu:22.04', 'bash', '-euc', script], { stdio: ['ignore', 'inherit', 'inherit'] });
+  return join(out, 'flatsql-p4-test.wasm');
+}
+function aotSetup() {
+  const stack = process.env.GAUNTLET_STACK_ROOT;
+  const sdn = resolve(process.env.P4_REPLAY_SDN || (stack ? join(stack, 'repos/main-packages/space-data-network') : join(repo, '..', 'space-data-network')));
+  const pkg = join(sdn, 'sdn-server/internal/flatsqlrt');
+  if (!existsSync(join(pkg, 'aot.go'))) fail(`no SDN checkout at ${sdn} (set P4_REPLAY_SDN)`);
+  const wasmedge = resolve(process.env.P4_REPLAY_WASMEDGE || join(homedir(), '.sdn-wasmedge-static-macos-patched/prefix'));
+  if (!existsSync(join(wasmedge, 'sdn-runtime-patches.txt'))) fail(`${wasmedge} is not the patched WasmEdge prefix (set P4_REPLAY_WASMEDGE)`);
+  const wasm = { base: wasmTestBuild('base', join(baseSrc, 'cpp')), new: wasmTestBuild('new', cpp) };
+  const overlay = join(work, 'aot-overlay.json');
+  writeFileSync(overlay, JSON.stringify({ Replace: { [join(pkg, 'zz_p4_replay_aot_test.go')]: join(cpp, 'tests/p4/aot/replay_aot_test.go') } }));
+  const bin = join(work, 'p4-replay-aot.test');
+  const env = { ...process.env, WASMEDGE_DIR: wasmedge, GOFLAGS: '-p=6' };
+  for (const k of Object.keys(env)) if (k.startsWith('CGO_') || k === 'WASMEDGE_LIB_DIR') delete env[k];
+  run(join(sdn, 'scripts/go-with-wasmedge.sh'), ['test', '-c', '-overlay', overlay, '-o', bin, './internal/flatsqlrt'],
+    { cwd: join(sdn, 'sdn-server'), env, stdio: ['ignore', 'ignore', 'inherit'] });
+  return { bin, wasm, cache: join(work, 'aot-cache') };
+}
+const aot = RUNTIMES.includes('aot') ? aotSetup() : null;
 
 // The gp_history days as the replay's TSV (NORAD, OBJECT_ID, OBJECT_NAME,
 // EPOCH, CREATION_DATE, MEAN_MOTION, ECCENTRICITY, INCLINATION, TLE).
@@ -125,17 +182,23 @@ if (!existsSync(stamp) || readFileSync(stamp, 'utf8') !== want) {
 
 // One process on a fresh clone of the fixture; its REPLAY lines.
 let cloneN = 0;
-function measure(arm, workload, extra = []) {
+function measure(runtime, arm, workload, extra = []) {
   const clone = join(work, `clone-${process.pid}-${cloneN++}`);
   run('cp', ['-c', '-R', fixture, clone]);
   try {
     const args = ['--test=p4_replay', '--phase=run', `--store=${clone}`, `--workload=${workload}`, `--gp=${seedTsv}`,
       `--gp-day=${dayTsv}`, ...extra];
-    const r = spawnSync(arms[arm], args, { encoding: 'utf8', maxBuffer: 64 << 20 });
+    const r = runtime === 'native'
+      ? spawnSync(arms[arm], args, { encoding: 'utf8', maxBuffer: 64 << 20 })
+      : spawnSync(aot.bin, ['-test.run', '^TestP4ReplayAOT$', '-test.timeout', '2h'], {
+        cwd: work, encoding: 'utf8', maxBuffer: 64 << 20,
+        env: { ...process.env, P4_REPLAY_AOT_WASM: aot.wasm[arm], P4_REPLAY_AOT_CACHE: aot.cache, P4_REPLAY_AOT_ROOT: work,
+          P4_REPLAY_AOT_ARGS: args.join('\x1f') },
+      });
     const lines = (r.stdout || '').split('\n');
     const passes = lines.filter((l) => l.startsWith('REPLAY {')).map((l) => JSON.parse(l.slice(7)));
     const after = lines.filter((l) => l.startsWith('REPLAY_AFTER ')).map((l) => JSON.parse(l.slice(13)));
-    if (r.status !== 0 || !passes.length) fail(`${arm} ${workload}: exit ${r.status ?? r.signal}\n${(r.stdout || '').slice(-2000)}${(r.stderr || '').slice(-2000)}`);
+    if (r.status !== 0 || !passes.length) fail(`${runtime} ${arm} ${workload}: exit ${r.status ?? r.signal}\n${(r.stdout || '').slice(-2000)}${(r.stderr || '').slice(-2000)}`);
     return { passes, after: after[0]?.hash ?? '' };
   } finally {
     rmSync(clone, { recursive: true, force: true });
@@ -160,11 +223,12 @@ const med = (v) => q(v, 0.5);
 // one-sided Mann-Whitney U test: U counts the pairs (3.7.2 run, this build's
 // run) where this build is faster (ties count a half); under the null (the
 // two builds' runs exchangeable) p = P(U <= observed), from the exact
-// distribution of U for these sample sizes. A workload fails at p <= ALPHA. At
-// 5 repetitions only complete separation qualifies (p = 1/252 = 0.004); over
-// this E2E's 20 workload passes the false-alarm rate is at most 8%
-// (Bonferroni), and a real slowdown of a few run-to-run deviations still
-// separates every run.
+// distribution of U for these sample sizes. Each sample is one process (its
+// warm passes count as their median). A workload fails at p <= ALPHA. At 5
+// repetitions only complete separation qualifies (p = 1/252 = 0.004); over
+// this E2E's 12 comparisons per runtime (24 with both) the false-alarm rate is
+// at most 4.8% (9.5%) by Bonferroni, and a real slowdown of a few run-to-run
+// deviations still separates every run.
 const ALPHA = 0.005;
 function slowerP(base, mine) {
   let u = 0;
@@ -188,20 +252,28 @@ function slowerP(base, mine) {
 
 const b0 = bounds();
 console.log(`bounds: ${JSON.stringify(b0)}`);
-const results = {}; // workload -> pass -> arm -> [{wall, cpu, syncs}]
-const hashes = {}; // workload|pass -> Set
+const results = {}; // runtime -> workload -> pass -> arm -> [{wall, cpu, syncs}]
+const hashes = {}; // workload|pass -> Set, over both builds and both runtimes
 let failed = false;
 for (let rep = 0; rep < reps; rep++) {
   for (const workload of WORKLOADS) {
-    const order = rep % 2 ? ['new', 'base'] : ['base', 'new'];
-    for (const arm of order) {
-      const m = measure(arm, workload, READS.has(workload) ? [`--passes=${1 + WARM_PASSES}`] : []);
-      for (const p of m.passes) {
-        const key = `${workload}|${p.pass}`;
-        ((results[workload] ??= {})[p.pass] ??= { base: [], new: [] })[arm].push(p);
-        (hashes[key] ??= new Set()).add(p.hash);
+    for (const runtime of RUNTIMES) {
+      const order = rep % 2 ? ['new', 'base'] : ['base', 'new'];
+      for (const arm of order) {
+        const m = measure(runtime, arm, workload, READS.has(workload) ? [`--passes=${1 + WARM_PASSES}`] : []);
+        // One sample per process and pass kind: a process's warm passes are
+        // not independent of each other, so they count as their median.
+        const kinds = {};
+        for (const p of m.passes) {
+          (kinds[p.pass] ??= []).push(p);
+          (hashes[`${workload}|${p.pass}`] ??= new Set()).add(p.hash);
+        }
+        for (const [kind, ps] of Object.entries(kinds)) {
+          const one = { ...ps[0], wall_ms: med(ps.map((p) => p.wall_ms)), cpu_ms: med(ps.map((p) => p.cpu_ms)) };
+          (((results[runtime] ??= {})[workload] ??= {})[kind] ??= { base: [], new: [] })[arm].push(one);
+        }
+        if (m.after) (hashes[`${workload}|after`] ??= new Set()).add(m.after);
       }
-      if (m.after) (hashes[`${workload}|after`] ??= new Set()).add(m.after);
     }
   }
   console.log(`repetition ${rep + 1}/${reps} done (load ${b0.load})`);
@@ -213,34 +285,33 @@ const memcpy = Math.max(b0.memcpy_GBps, b1.memcpy_GBps);
 
 const rows = [];
 for (const workload of WORKLOADS) {
-  for (const [pass, byArm] of Object.entries(results[workload] || {})) {
-    const key = `${workload}|${pass}`;
-    if (hashes[key].size !== 1) {
-      failed = true;
-      console.error(`FAIL: ${key}: ${hashes[key].size} distinct answer hashes (${[...hashes[key]].join(', ')})`);
-    }
-    const a = byArm.base.map((p) => p.wall_ms), b = byArm.new.map((p) => p.wall_ms);
-    const ac = byArm.base.map((p) => p.cpu_ms), bc = byArm.new.map((p) => p.cpu_ms);
-    const syncs = med(byArm.new.map((p) => p.syncs));
-    const bytes = med(byArm.new.map((p) => p.rows));
-    const bound = syncs > 0 ? syncs * syncMs : 0;
-    rows.push({ workload, pass, base_med: med(a), base_p95: q(a, 0.95), new_med: med(b), new_p95: q(b, 0.95), speedup: med(a) / med(b),
-      base_cpu: med(ac), new_cpu: med(bc), syncs, bound_ms: bound, rows: bytes });
-    const p = slowerP(a, b);
-    if (p <= ALPHA) {
-      failed = true;
-      console.error(`FAIL: ${key}: this build ${med(b).toFixed(1)} ms is slower than ${BASE_TAG} ${med(a).toFixed(1)} ms (Mann-Whitney p = ${p.toFixed(4)})`);
-    }
-  }
-  if (hashes[`${workload}|after`] && hashes[`${workload}|after`].size !== 1) {
+  for (const key of Object.keys(hashes).filter((k) => k.startsWith(`${workload}|`))) {
+    if (hashes[key].size === 1) continue;
     failed = true;
-    console.error(`FAIL: ${workload}: the store after the writes differs between builds`);
+    console.error(key.endsWith('|after')
+      ? `FAIL: ${workload}: the store after the writes differs between builds or runtimes`
+      : `FAIL: ${key}: ${hashes[key].size} distinct answer hashes (${[...hashes[key]].join(', ')})`);
+  }
+  for (const runtime of RUNTIMES) {
+    for (const [pass, byArm] of Object.entries(results[runtime]?.[workload] || {})) {
+      const a = byArm.base.map((p) => p.wall_ms), b = byArm.new.map((p) => p.wall_ms);
+      const ac = byArm.base.map((p) => p.cpu_ms), bc = byArm.new.map((p) => p.cpu_ms);
+      const syncs = med(byArm.new.map((p) => p.syncs));
+      const bound = syncs > 0 ? syncs * syncMs : 0;
+      rows.push({ runtime, workload, pass, base_med: med(a), base_p95: q(a, 0.95), new_med: med(b), new_p95: q(b, 0.95),
+        speedup: med(a) / med(b), base_cpu: med(ac), new_cpu: med(bc), syncs, bound_ms: bound, rows: med(byArm.new.map((p) => p.rows)) });
+      const p = slowerP(a, b);
+      if (p <= ALPHA) {
+        failed = true;
+        console.error(`FAIL: ${runtime} ${workload}|${pass}: this build ${med(b).toFixed(1)} ms is slower than ${BASE_TAG} ${med(a).toFixed(1)} ms (Mann-Whitney p = ${p.toFixed(4)})`);
+      }
+    }
   }
 }
-const f = (x) => (x >= 100 ? x.toFixed(0) : x.toFixed(2));
-console.log(`\nworkload pass | ${BASE_TAG} median/p95 ms | this build median/p95 ms | speedup | cpu ms ${BASE_TAG} -> this | syncs (bound ms at ${syncMs.toFixed(2)} ms/sync) | rows`);
+const f = (x) => (x < 0 ? 'n/a' : x >= 100 ? x.toFixed(0) : x.toFixed(2));
+console.log(`\nruntime workload pass | ${BASE_TAG} median/p95 ms | this build median/p95 ms | speedup | cpu ms ${BASE_TAG} -> this | syncs (bound ms at ${syncMs.toFixed(2)} ms/sync) | rows`);
 for (const r of rows)
-  console.log(`${r.workload} ${r.pass} | ${f(r.base_med)}/${f(r.base_p95)} | ${f(r.new_med)}/${f(r.new_p95)} | ${r.speedup.toFixed(2)}x | ${f(r.base_cpu)} -> ${f(r.new_cpu)} | ${r.syncs} (${f(r.bound_ms)}) | ${r.rows}`);
+  console.log(`${r.runtime} ${r.workload} ${r.pass} | ${f(r.base_med)}/${f(r.base_p95)} | ${f(r.new_med)}/${f(r.new_p95)} | ${r.speedup.toFixed(2)}x | ${f(r.base_cpu)} -> ${f(r.new_cpu)} | ${r.syncs} (${f(r.bound_ms)}) | ${r.rows}`);
 writeFileSync(join(work, 'replay-results.json'), JSON.stringify({ bounds: [b0, b1], memcpy, rows }, null, 1));
-console.log(failed ? 'FAIL: p4 replay' : 'PASS: p4 replay (every answer the same on both builds)');
+console.log(failed ? 'FAIL: p4 replay' : `PASS: p4 replay (every answer the same on both builds, ${RUNTIMES.join(' and ')})`);
 process.exit(failed ? 1 : 0);
