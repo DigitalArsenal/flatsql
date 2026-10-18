@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.7.6
+
+Store format 4's warm reads build no per-row strings and copy no record bytes. Every answer is
+3.7.5's; the storage format is unchanged.
+- A limited SCAN resolves the candidates its limit still needs (3.7.5 resolved 512 per page
+  whatever the limit: 5.1 rows read per row answered by a 100-row explorer page), doubling when
+  rows are rejected; walk chunks likewise.
+- Rows hold views of the scan's copy of the feed dictionary and a slice of the read buffer
+  (the frame in place, extracted without a copy); flat vectors replace the page maps.
+- The p4 replay hashes a read pass's answers after its clock stops (a 4-lane hash).
+- p4 replay gate, 3.7.2 -> this build, warm median, native then WasmEdge AOT (stock SQLite):
+  - Explorer paging: 77.6 -> 9.5 ms, 111 -> 13.8 ms (5.5 ms).
+  - EPOCH-window sync: 126 -> 71 ms, 183 -> 107 ms (105 ms).
+  - Nearest-epoch latest: 102 -> 87 ms, 138 -> 114 ms (110 ms).
+
 ## 3.7.5
 
 The p4 replay E2E fits the gauntlet's budget; the engine and its wasm are 3.7.4's (byte for byte).
