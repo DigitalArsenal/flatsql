@@ -1,5 +1,48 @@
 # Changelog
 
+## 3.11.0
+
+Store format 5, item 5: FlatBuffer index segments answer two read paths
+(`cpp/src/p4/FORMAT.md` §3.3, §6, §7, §12).
+- Checkpoints write the row orders `ROWS_BY_SEQ` and (types with an object
+  key) `ROWS_BY_OBJECT_EPOCH` as `$FSG` segments of sorted `FSGPair`s. The seq
+  walk (explorer paging, the retention SCAN, the whole-lane scan) and the
+  object-key path (`NORAD_CAT_ID =`) now read segments plus the in-memory tail
+  since the newest checkpoint. The `w` range, delivery time, copy ts and CID
+  paths stay on SQLite; latest-per-object stays on the `LATEST` segments.
+- Basis, per path: the replay E2E, gate fixture (1 GB WXF sea feed, 3 seed
+  days of OMM), 5 interleaved repetitions, against 3.10.1's SQLite paths, each
+  build on its own fixture from the same input, native and WasmEdge AOT, equal
+  answer hashes. Ratios SQLite / FSG (medians): explorer cold 0.91x native,
+  0.95x AOT, warm 1.06x / 1.01x (a second run: cold 0.94x / 0.93x, warm 1.10x
+  / 1.00x); sync_norad cold 1.05x / 1.03x, warm 1.00x / 1.02x; retention 1.03x
+  / 1.02x; scan_all 0.99x / 0.99x; every other workload 0.96x to 1.03x. All
+  within the 10% bar, so both paths switch. Load average 3.5 to 7.6 on a
+  28-core Mac Studio.
+- Integrity: each row-order segment is digest-checked (sha256, verifier,
+  header, sorted pairs) once per process; the checked identity is kept, so
+  later loads skip the hash. The check runs on the checkpoint worker; until it
+  is done the SQLite index answers, so no reader and no writer waits for a
+  hash. First load measured: 5.84 MB of OMM row orders in 18.5 ms native.
+  Segments this process wrote are checked by construction.
+- Lookups: the first pair of each 128-pair page stays in memory (fence keys),
+  so a lookup reads one page; the pairs stay on disk.
+- LSM and retention: a row-order merge stays at most 1/8 of the live rows
+  (at least 4,096) and leaves out removed rows' pairs. A segment a quarter
+  dead is rewritten without them, or dropped whole when none stay.
+- A checkpoint written before 3.11.0 has no row orders: the SQLite index
+  answers until the next checkpoint folds every live row.
+- `DROPS` checks only its candidate CIDs against the DAG cache's live entries
+  instead of rebuilding the feed's closure per call: 0.020 ms on the sea feed
+  (51.1 ms in 3.10.1). `REPLAY_DAG_SCALE` now bounds it like `FEED_ROOT` and
+  `RANGES`.
+- The replay gains `scan_all`, the weather node's whole-lane scan (50,000-row
+  hydrated seq pages, a tile writer beside it): about 160,000 records/s
+  native; a concurrent PUT's ack p99 stays 8 to 12 ms during the scan.
+- Cost: `$FSG` bytes on the gate fixture 22.9 MB for 298,986 rows (OMM 17.3%
+  of its stream, WXF sea 0.74%); the checkpoint install step measured 96 ms on
+  one round (73 ms in 3.10.1).
+
 ## 3.10.1
 
 Store format 5 IPFS layout: per-call costs no longer grow with the feed
