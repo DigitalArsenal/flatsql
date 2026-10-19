@@ -16,7 +16,8 @@
  *   fieldIV  = HKDF-SHA256(K, "flatbuffers-iv"    || BE16(4) || BE32(0))
  *   KEY_BYTES = AES-256-CTR(fieldKey, fieldIV) XOR contentKey
  *
- * Only the recipient's wallet can unwrap it again (sdn.wallet.key-unwrap.v1).
+ * Only the recipient's wallet can unwrap it again (sdn.wallet.key-unwrap.v1,
+ * hd-wallet-ui 2.2.1 unwrapKey), after the user approves, for this site only.
  */
 
 const WALLET_RECORD = Symbol.for('sdn.wallet.public-client.v1');
@@ -42,9 +43,12 @@ export function bytesToHex(bytes) {
     return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** The signed-in wallet's encryption key, or null when signed out. */
+/**
+ * The signed-in wallet's encryption key, or null when signed out. The client
+ * reports 'opening' while a wallet request is in flight; the identity stays.
+ */
 export function walletEncryptionKey(snapshot) {
-    if (snapshot?.status !== 'connected' || !snapshot.identity) return null;
+    if (!['connected', 'opening'].includes(snapshot?.status) || !snapshot.identity) return null;
     const key = snapshot.identity.keys?.find((k) => k.purpose === 'contact-encryption' && k.curve === 'x25519');
     if (!key || !HEX32.test(key.publicKeyHex)) return null;
     return Object.freeze({ publicKey: hexToBytes(key.publicKeyHex), publicKeyHex: key.publicKeyHex, path: key.path });
@@ -73,6 +77,28 @@ export function watchWallet(listener) {
         globalThis.addEventListener?.('DOMContentLoaded', attach, { once: true });
         globalThis.addEventListener?.('load', attach, { once: true });
     }
+}
+
+/**
+ * The site's own origin. The wallet binds a site's client to its origin, and
+ * every site on digitalarsenal.github.io shares that one origin, so the page
+ * asks the wallet to unwrap keys only when it is served from its own.
+ */
+export const SITE_ORIGIN = 'https://flatsql.spacedatanetwork.org';
+
+export function walletOpensHere() {
+    return globalThis.location?.origin === SITE_ORIGIN;
+}
+
+/**
+ * Ask the signed-in wallet to unwrap a database content key ({ enc, kmf,
+ * context }); it asks the user first. Resolves to the 32-byte key.
+ */
+export async function unwrapContentKey(envelope) {
+    const record = walletRecord();
+    if (!walletOpensHere() || typeof record?.client?.unwrapKey !== 'function') throw new Error('The wallet does not unwrap keys on this origin');
+    const { contentKey } = await record.client.unwrapKey({ enc: envelope.enc, kmf: envelope.kmf, context: envelope.context });
+    return contentKey;
 }
 
 /** Open the wallet's sign-in. Resolves false when the page has no wallet client. */

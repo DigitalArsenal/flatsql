@@ -484,6 +484,8 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <li>Compaction rewrites the whole tree.</li>
 </ul>
 </li>
+<li><strong>Pulling a change.</strong> Every node of the DAG carries the commit that last rewrote it, and no block below a node is newer than the node. <code>RANGES</code> from a commit therefore walks only the nodes rewritten at or after it: the new units, the rewritten units and their spine. <code>FEED_ROOT</code> computes only the root. Neither walks the feed (<a class="sref" href="#s12">§12</a> has the cost).</li>
+<li><strong>One forward cache.</strong> The derived DAG is built forward only. A commits root asked for an earlier commit point is the one recorded when a build stopped there (the last 4,096 points are kept); the feed is never replayed for it.</li>
 <li><strong>What <code>PREVIOUS_FEED_ROOT_CID</code> gives.</strong> Inside the <code>$FCK</code> it is just bytes: a raw leaf has no links. History is reachable on purpose but never pinned by the current root.</li>
 <li><strong>Announcing.</strong> Only feed roots (and, if the node chooses, segment roots) are announced. Records are fetched by CID over bitswap from root holders.</li>
 </ul>
@@ -505,6 +507,18 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <li>WAL checkpoints (they sync);</li>
 <li><code>$FCK</code> and <code>$FSG</code> preparation (a background thread, <a class="sref" href="#s6">§6</a>) and frames (synced with the next round, or alone when idle);</li>
 <li>merges of staged rows.</li>
+</ul>
+<p><strong>Measured: a checkpoint preparing does not slow the acknowledgment.</strong> PUT acknowledgment latency, p50/p99:</p>
+<div class="table-wrap"><table><thead><tr><th></th><th>p50</th><th>p99</th></tr></thead><tbody>
+<tr><td>No checkpoint preparing</td><td>8.80 ms</td><td>13.95 ms</td></tr>
+<tr><td>A checkpoint preparing</td><td>9.04 ms</td><td>10.44 ms</td></tr>
+</tbody></table></div>
+<p>Installing the prepared checkpoint takes about 73 ms, once, on the round where the appender installs it.</p>
+<p>Basis: FlatSQL 3.10.0&#39;s replay gate (<code>REPLAY_CHECKPOINT_PREPARE</code>, native):</p>
+<ul>
+<li>the gate fixture, a 1 GB WXF sea feed and 3 seed days of OMM (182,508 records);</li>
+<li>32 PUTs timed with no checkpoint preparing, and 32 rounds of 256 PUTs timed while one prepares;</li>
+<li>one run on a 28-core Apple M-series Mac Studio, with a 1-minute load average of 23.7 (peak 30.4) from other work.</li>
 </ul>
 <p><strong>Registration</strong> follows the acknowledgment:</p>
 <ul>
@@ -666,9 +680,10 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <tr><td>Acknowledgment and durability</td><td><a class="sref" href="#s5">§5</a>: one stream sync per touched stream; index commit unsynced (WAL NORMAL)</td><td><strong>M: 4.79 ms per sync</strong> (F_FULLFSYNC; gate: 16 syncs = 76.66 ms). Gate <code>wxf_lead</code> 746 ms with 128 syncs (613 ms) → 64 syncs, about <strong>−307 ms (−41%)</strong>; <code>gp_ingest</code> 476 ms with 16 → 8, about <strong>−38 ms (−8%)</strong> (E from M)</td></tr>
 <tr><td>Crash recovery from the tail</td><td><a class="sref" href="#s9">§9</a>: commit chain + digest-checked <code>$FMB</code>s; tail search within about 64 MiB</td><td>open without the index (E): newest <code>$FCK</code> + segments + tail of at most 64 MiB, <strong>about 1 s</strong>. Rebuilding the 15 GB fixture&#39;s SQLite index from the stream (E): one sequential read of 15.2 GB, about 1 µs/row of re-extraction and a bulk insert of 2.34M rows, <strong>about 15–30 s</strong></td></tr>
 <tr><td>Reads through IPFS or direct</td><td>not a format change</td><td>(E) direct warm <code>pread</code> 5–20 µs/record; through the local filestore +30–100 µs/block (datastore lookup, <code>pread</code>, Kubo&#39;s re-hash); remote = network round trip + that</td></tr>
+<tr><td>The node pulls per acknowledged round, so a pull costs what changed, not the feed</td><td><a class="sref" href="#s4-3">§4.3</a>: <code>RANGES</code> from a commit walks only the nodes rewritten since; <code>FEED_ROOT</code> computes only the root; an earlier commits root comes from the forward cache</td><td>M (the gate&#39;s WXF sea feed, 110,915 blocks, against a 92-block feed of the same lane shape; medians of 7 rounds): <code>FEED_ROOT</code> 0.109 / 0.064 ms; <code>RANGES</code> from the prior commit 0.089 / 0.038 ms (14 blocks); earlier commits root 4 / 3 µs. The whole-closure <code>RANGES</code> on the sea feed costs 68.6 ms</td></tr>
 </tbody></table></div>
 <h3 id="measured-in-the-implementation"><a class="anchor" href="#measured-in-the-implementation" aria-label="Link to this section">#</a>Measured in the implementation</h3>
-<p>Measured as each part of the format was built (FlatSQL 3.8.0 to 3.10.0): the replay gate&#39;s native medians against store format 4 (FlatSQL 3.7.2) as the baseline, and the 15 GB replay fixture.</p>
+<p>Measured as each part of the format was built (FlatSQL 3.8.0 to 3.10.1): the replay gate&#39;s native medians against store format 4 (FlatSQL 3.7.2) as the baseline, and the 15 GB replay fixture.</p>
 <div class="table-wrap"><table><thead><tr><th>Property</th><th>Measured</th></tr></thead><tbody>
 <tr><td>One stream sync per acknowledgment</td><td><code>wxf_lead</code> 799 → 398 ms; <code>gp_ingest</code> 531 → 478 ms</td></tr>
 <tr><td><code>$FMB</code> size</td><td>76 B per row</td></tr>
@@ -680,9 +695,11 @@ next frame at F + 4 + N; the file ends exactly at a frame end.</code></pre></div
 <tr><td>Records over 1 MiB</td><td>root CIDs byte-equal to Kubo&#39;s <code>ipfs add --cid-version=1 --raw-leaves --chunker=size-1048576</code></td></tr>
 <tr><td>CARv2 export</td><td><code>ipfs dag import</code> takes the CAR byte for byte</td></tr>
 <tr><td>A compacted feed with its index deleted</td><td>rebuilds exactly, including urls that only dead rows wrote</td></tr>
+<tr><td>Acknowledgment while a checkpoint prepares</td><td>p50/p99 9.04/10.44 ms, against 8.80/13.95 ms with none; the install step about 73 ms on one round (<a class="sref" href="#s5">§5</a>)</td></tr>
+<tr><td>Pulling one round from a 110,915-block feed</td><td><code>RANGES</code> 0.089 ms and <code>FEED_ROOT</code> 0.109 ms; the whole-closure walk 68.6 ms (<a class="sref" href="#s12">§12</a>)</td></tr>
 </tbody></table></div>
 
-            <p class="source">Source: <a href="https://github.com/DigitalArsenal/flatsql/blob/b70c1ace86/cpp/src/p4/FORMAT.md" target="_blank" rel="noopener"><code>cpp/src/p4/FORMAT.md</code></a> in the FlatSQL repository, commit <code>b70c1ace86</code>. The schemas are the SDS standards FMB, FCK and FSG (SDS 1.256.0).</p>
+            <p class="source">Source: <a href="https://github.com/DigitalArsenal/flatsql/blob/d57ca6c92e/cpp/src/p4/FORMAT.md" target="_blank" rel="noopener"><code>cpp/src/p4/FORMAT.md</code></a> in the FlatSQL repository, commit <code>d57ca6c92e</code>. The schemas are the SDS standards FMB, FCK and FSG (SDS 1.256.0).</p>
         </article>
     </div>
 
