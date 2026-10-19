@@ -4,6 +4,14 @@
 #include "internal.h"
 #include <functional>
 namespace flatsql { namespace p4 {
+// One FSGPair (FORMAT.md §3.3): ROWS_BY_SEQ (KEY_HI = rid) and
+// ROWS_BY_OBJECT_EPOCH (KEY_HI = okey id, 0 none; KEY_LO = epoch XOR 2^63, 0 none).
+struct FsgPairV {
+    uint64_t hi=0,lo=0,rid=0,ref=0;
+    bool operator<(const FsgPairV& x) const { return hi!=x.hi?hi<x.hi:lo!=x.lo?lo<x.lo:rid<x.rid; }
+};
+#define FLATSQL_P4_FSG 1
+constexpr uint8_t kFsgSeq=5,kFsgObjectEpoch=6,kFsgMaxKind=6;
 struct CheckpointLatest {
     uint32_t objectKey=0;
     int64_t epoch=INT64_MIN;
@@ -27,6 +35,10 @@ struct CheckpointState {
     std::map<uint32_t,TokCount> tokens;
     std::set<uint64_t> tombstones;
     std::vector<CheckpointSegment> segments;
+    // Row-order segments' pairs whose rows were removed since this process
+    // saw the segment, by segment offset (in memory only: after a restart
+    // the count starts again; a rewrite drops every dead pair it finds).
+    std::map<uint64_t,uint64_t> deadPairs;
     // No $FMB sits between APPLIED_THROUGH and this $FCK (a checkpoint
     // prepared off the writer is installed after later rounds).
     bool current=true;
@@ -45,6 +57,69 @@ struct CheckpointPlan {
     std::vector<uint32_t> lengths;
     std::string previousRoot;                  // PREVIOUS_FEED_ROOT_CID
 };
+// A ROWS_BY_* segment whose digest this process has checked (once per
+// process: segments are immutable and content-addressed, so a later load of
+// the same segment of the same file skips the hash): where its PAIRS lie and
+// the first pair of each page (the fence keys a lookup searches in memory).
+struct FsgVerified {
+    uint64_t base=0, n=0;
+    std::vector<FsgPairV> fences;
+};
+// The checked identity of desc in stream: verified (the hash, the FlatBuffer
+// verifier, the header, sorted PAIRS) on its first load in this process.
+// fresh is set when this call hashed it.
+int32_t checkpointVerifyPairs(Feed*,Stream*,const CheckpointSegment&,std::shared_ptr<const FsgVerified>*,bool* fresh=nullptr);
+// Whether ck lists a segment of row-order kind.
+bool checkpointHasRowOrders(const CheckpointState& ck,uint8_t kind);
+// Whether desc in stream is checked in this process (no read, no hash).
+bool checkpointPairsVerified(Stream*,const CheckpointSegment&);
+// Lets go of the checked identities of stream's file that ck no longer lists.
+void checkpointPairsRetain(Stream*,const CheckpointState&);
+// Checks the feed's checkpoint's row-order segments on the checkpoint worker
+// (off the readers and the writer); readers use the SQLite index until then.
+void fsgVerifySchedule(Feed*);
+// The process's row-order verification counters (t_replay).
+struct FsgVerifyStats { uint64_t hashed=0, hashedBytes=0, hashNs=0, reused=0; };
+FsgVerifyStats fsgVerifyStats();
+// A sorted run of pairs: a tail in memory, or a segment's PAIRS read from
+// the stream a page (128 pairs) at a time as lookups reach them.
+struct FsgRun {
+    static constexpr size_t kPage=128;
+    static constexpr int kFaults=8;
+    const FsgPairV* p=nullptr; size_t n=0;
+    std::shared_ptr<const void> keep;  // what p points into
+    std::shared_ptr<Stream> stream; uint64_t base=0;
+    std::shared_ptr<const FsgVerified> verified;  // a segment run: its fence keys
+    mutable std::mutex mu;
+    mutable std::vector<std::shared_ptr<const std::vector<FsgPairV>>> pages;
+    mutable bool failed=false;
+    mutable int faults=0;  // reads so far; past kFaults the whole run is read at once
+    const FsgPairV* begin() const { return p; }  // a tail run
+    const FsgPairV* end() const { return p+n; }
+    FsgPairV at(size_t i) const;
+    // Page pg's pairs (null after a read error: failed is set).
+    // A walk reads ahead `ahead` pages in the walk's direction with one read.
+    const FsgPairV* page(size_t pg,size_t* count,int ahead=0) const;
+    size_t lowerBound(const FsgPairV& key) const;  // the first pair not below key
+};
+int32_t checkpointReadPairs(Feed*,const std::shared_ptr<Stream>&,const CheckpointSegment&,FsgRun*);
+// The FlatBuffer row orders of a feed (fsg.cpp): its checkpoint's ROWS_BY_*
+// segments plus the rows the $FMB chain added after APPLIED_THROUGH, as
+// sorted runs. A superset: a removed row's pair may remain (readers check
+// each candidate's row).
+struct FsgView {
+    std::shared_ptr<const CheckpointState> ck;
+    uint64_t previous=0;
+    std::vector<std::shared_ptr<const FsgRun>> runs[2];  // [0] ROWS_BY_SEQ, [1] ROWS_BY_OBJECT_EPOCH
+};
+// The feed's view with kind (kFsgSeq or kFsgObjectEpoch) ready; null when
+// the feed has no checkpoint yet (the caller uses the SQLite index). c is a
+// reader connection inside a read transaction (the tail's keys).
+std::shared_ptr<const FsgView> fsgView(Feed*,Conn* c,uint8_t kind,int64_t vis);
+// The next n distinct seqs after `from` (asc: > from, desc: < from) inside (lo, hi].
+int32_t fsgSeqs(const FsgView&,bool desc,int64_t from,int64_t lo,int64_t hi,size_t n,std::vector<int64_t>* out);
+// The rids an object id (0: rows without one) holds.
+int32_t fsgObject(const FsgView&,uint64_t kk,std::vector<uint64_t>* rids);
 int32_t checkpointFindNewest(Feed*,Stream*,CheckpointState*,bool* found,std::string* err);
 // Reads a candidate checkpoint and every listed segment, including its digest.
 // Tail-search and commit-chain validation belong to the recovery caller.
@@ -53,7 +128,7 @@ int32_t checkpointReadAt(Feed*,Stream*,uint64_t,CheckpointState*,std::string* er
 // (including the $FMBs before the $FCK itself), including moves and retags
 // that preserve a sequence below the checkpoint's sequence high.
 int32_t checkpointTailRows(Feed*,Stream*,const CheckpointState&,uint64_t previous,std::vector<uint64_t>* rids,
-                          uint64_t* rowCount=nullptr,int64_t* lastCommitAt=nullptr);
+                          uint64_t* rowCount=nullptr,int64_t* lastCommitAt=nullptr,uint64_t stop=UINT64_MAX);
 // Restore row/idle cadence from already committed tail metadata after open.
 int32_t checkpointRestoreCadence(Feed*,Stream*);
 // Folds the feed as of mark (previous: its last commit) into a plan, reading

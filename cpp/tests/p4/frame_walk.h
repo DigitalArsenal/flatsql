@@ -2,6 +2,7 @@
 // Reads size prefixes and released SDS tables, never engine recovery code.
 #ifndef FLATSQL_P4_TEST_FRAME_WALK_H
 #define FLATSQL_P4_TEST_FRAME_WALK_H
+#include <tuple>
 #include <array>
 #include <cstring>
 #include <functional>
@@ -75,14 +76,17 @@ inline std::string walkFrames(uint64_t size, const std::function<bool(uint64_t, 
             flatbuffers::Verifier v(p, n);
             if (!VerifyFSGBuffer(v)) return "FSG verifier at " + std::to_string(at);
             const auto* sg = GetFSG(p);
-            if (commitEnd != at || sg->SELF_OFFSET() != at || sg->PREVIOUS() != previous || sg->FEED_ID() != feed || uint8_t(sg->KIND()) > 4)
-                return "invalid segment or item-5 kind";
+            if (commitEnd != at || sg->SELF_OFFSET() != at || sg->PREVIOUS() != previous || sg->FEED_ID() != feed || uint8_t(sg->KIND()) > 6)
+                return "invalid segment or row-order kind";
             if (sg->COVERS_THROUGH() && !metadataEnds.count(sg->COVERS_THROUGH())) return "segment coverage is not FMB end";
             if (sg->REPLACES() && sg->REPLACES()->size()) {
-                if (sg->REPLACES()->size() != 4 || !sg->LEVEL()) return "invalid four-way LSM merge";
+                // A four-way merge one level up, or (row orders) a retention
+                // rewrite of one segment at its own level.
+                const bool rewrite = uint8_t(sg->KIND()) >= 5 && sg->REPLACES()->size() == 1;
+                if (!rewrite && (sg->REPLACES()->size() != 4 || !sg->LEVEL())) return "invalid four-way LSM merge";
                 for (auto input : *sg->REPLACES()) {
                     const auto it = segments.find(input);
-                    if (it == segments.end() || it->second.kind != uint8_t(sg->KIND()) || it->second.level + 1 != sg->LEVEL())
+                    if (it == segments.end() || it->second.kind != uint8_t(sg->KIND()) || it->second.level + (rewrite ? 0 : 1) != sg->LEVEL())
                         return "invalid LSM input";
                 }
                 out->mergedSegments++;
@@ -94,6 +98,16 @@ inline std::string walkFrames(uint64_t size, const std::function<bool(uint64_t, 
                 case 2: entries = sg->INSTANCES() ? sg->INSTANCES()->size() : 0; break;
                 case 3: entries = sg->TOKENS() ? sg->TOKENS()->size() : 0; break;
                 case 4: entries = sg->PAIRS() ? sg->PAIRS()->size() : 0; break;
+                case 5: case 6: {
+                    // ROWS_BY_SEQ / ROWS_BY_OBJECT_EPOCH: sorted by (KEY_HI, KEY_LO, RID).
+                    entries = sg->PAIRS() ? sg->PAIRS()->size() : 0;
+                    for (uint32_t i = 1; i < entries; i++) {
+                        const auto* a = sg->PAIRS()->Get(i - 1); const auto* b = sg->PAIRS()->Get(i);
+                        if (std::make_tuple(a->KEY_HI(), a->KEY_LO(), a->RID()) >= std::make_tuple(b->KEY_HI(), b->KEY_LO(), b->RID()))
+                            return "row-order pairs out of order";
+                    }
+                    break;
+                }
             }
             Segment s{{n, {}}, uint8_t(sg->KIND()), sg->LEVEL(), sg->COVERS_THROUGH(), entries};
             flatsql::ps::sha256(p, n, s.frame.digest.data());

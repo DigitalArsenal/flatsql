@@ -1508,6 +1508,15 @@ void runOne(const std::string& root, const std::string& workload) {
             c.stop();
             ph.flush();
             emit(workload, pass ? "warm" : "cold", c, ph, rows, ops);
+#if defined(FLATSQL_P4_FSG)
+            // The row-order segments this pass verified (the first load in
+            // the process hashes; later loads reuse the checked identity).
+            const auto vs = flatsql::p4::fsgVerifyStats();
+            std::printf("REPLAY_FSG_VERIFY workload=%s pass=%s hashed=%llu hashed_bytes=%llu hash_ms=%.3f reused=%llu\n",
+                        workload.c_str(), pass ? "warm" : "cold", (unsigned long long)vs.hashed,
+                        (unsigned long long)vs.hashedBytes, double(vs.hashNs) / 1e6, (unsigned long long)vs.reused);
+            std::fflush(stdout);
+#endif
         }
     } else if (workload == "gp_ingest" || workload == "wxf_lead" || workload == "retention") {
         Hash wh;

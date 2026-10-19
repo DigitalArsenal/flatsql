@@ -232,12 +232,13 @@ bool ipfsDagMemory() {
 // WXF sea feed and on a small feed of the same lane shape, each round PUTs one
 // tile batch, then times FEED_ROOT, RANGES from the prior commit + 1, and the
 // commits root at the prior (now earlier) commit point. Each must cost the same
-// on both feeds: neither replays nor walks the whole feed. The earlier point's
+// on both feeds, as must the node's DROPS poll from the prior commit + 1:
+// neither replays nor walks the whole feed. The earlier point's
 // root must equal the one a fresh cache computes, and the pruned RANGES must
 // hold every block of the full closure at or after its `from`.
 double ipfsMedian(std::vector<double> v) { std::sort(v.begin(),v.end()); return v.empty()?0:v[v.size()/2]; }
 bool ipfsDagScale() {
-    struct Arm { const char* source; flatsql::p4::Feed* feed=nullptr; std::vector<double> root,ranges,earlier; size_t fullRows=0,tailRows=0; double fullMs=0; uint64_t lastPoint=0; std::string lastRoot; };
+    struct Arm { const char* source; flatsql::p4::Feed* feed=nullptr; std::vector<double> root,ranges,earlier,drops; size_t fullRows=0,tailRows=0; double fullMs=0; uint64_t lastPoint=0; std::string lastRoot; };
     Arm arms[2]; arms[0].source=kBig; arms[1].source="dag-scale-small";
     const auto values=payloadOf(1024);
     for(int t=0;t<8;t++) { const auto r=put(tileBatch(arms[1].source,"scale-seed-"+std::to_string(t),"seed",t,kT0+t,values)); if(r.status!=P4_OK)return ipfsFail("scale seed PUT: "+r.err); }
@@ -258,6 +259,10 @@ bool ipfsDagScale() {
             if(r.status!=P4_OK||r.rows.empty())return ipfsFail("scale tail ranges: "+r.err);
             for(size_t i=0;i<r.rows.size();i++)if(uint64_t(r.i(i,"unit"))<=prior)return ipfsFail("scale tail ranges before from");
             a.tailRows=r.rows.size();
+            // The node's drop poll: the drops since its last commit.
+            auto dw=ipfsRequest(f); dw.u64(80,prior+1);
+            t0=flatsql::ps::monoNs(); const auto d=ipfsCall(P4_OPC_DROPS,dw); a.drops.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
+            if(d.status!=P4_OK)return ipfsFail("scale drops: "+d.err);
             std::string again; t0=flatsql::ps::monoNs(); const int32_t rc=commitRoot(a.feed,prior,&again); a.earlier.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
             if(rc!=P4_OK||again!=priorRoot)return ipfsFail("scale earlier commit root not answered from the cache");
             a.lastPoint=prior; a.lastRoot=priorRoot;
@@ -272,10 +277,10 @@ bool ipfsDagScale() {
         if(commitRoot(a.feed,a.lastPoint,&fresh)!=P4_OK||fresh!=a.lastRoot)return ipfsFail("earlier commit root differs from a fresh cache's");
         if(!ipfsRefreshRoot(&f))return false;
     }
-    const double big[3]={ipfsMedian(arms[0].root),ipfsMedian(arms[0].ranges),ipfsMedian(arms[0].earlier)},small[3]={ipfsMedian(arms[1].root),ipfsMedian(arms[1].ranges),ipfsMedian(arms[1].earlier)};
-    bool flat=true; for(int i=0;i<3;i++) flat=flat&&big[i]<=2*small[i]+1.0;
-    std::printf("REPLAY_DAG_SCALE big_full_ranges_rows=%zu small_full_ranges_rows=%zu big_full_ranges_ms=%.2f small_full_ranges_ms=%.2f feed_root_ms=%.3f/%.3f tail_ranges_ms=%.3f/%.3f tail_rows=%zu/%zu earlier_commit_root_ms=%.4f/%.4f bound=big<=2*small+1ms earlier=cached fresh=equal pruned=complete %s\n",
-        arms[0].fullRows,arms[1].fullRows,arms[0].fullMs,arms[1].fullMs,big[0],small[0],big[1],small[1],arms[0].tailRows,arms[1].tailRows,big[2],small[2],flat?"PASS":"FAIL");
+    const double big[4]={ipfsMedian(arms[0].root),ipfsMedian(arms[0].ranges),ipfsMedian(arms[0].earlier),ipfsMedian(arms[0].drops)},small[4]={ipfsMedian(arms[1].root),ipfsMedian(arms[1].ranges),ipfsMedian(arms[1].earlier),ipfsMedian(arms[1].drops)};
+    bool flat=true; for(int i=0;i<4;i++) flat=flat&&big[i]<=2*small[i]+1.0;
+    std::printf("REPLAY_DAG_SCALE big_full_ranges_rows=%zu small_full_ranges_rows=%zu big_full_ranges_ms=%.2f small_full_ranges_ms=%.2f feed_root_ms=%.3f/%.3f tail_ranges_ms=%.3f/%.3f tail_rows=%zu/%zu earlier_commit_root_ms=%.4f/%.4f drops_ms=%.3f/%.3f bound=big<=2*small+1ms earlier=cached fresh=equal pruned=complete %s\n",
+        arms[0].fullRows,arms[1].fullRows,arms[0].fullMs,arms[1].fullMs,big[0],small[0],big[1],small[1],arms[0].tailRows,arms[1].tailRows,big[2],small[2],big[3],small[3],flat?"PASS":"FAIL");
     return flat?true:ipfsFail("DAG per-call cost grows with the feed");
 }
 bool ipfsProof(const std::string& store,const Probe& probe) {

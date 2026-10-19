@@ -725,6 +725,46 @@ int32_t Scan::candidatesFromPreds(bool* used) {
         c->exec("BEGIN");
         int32_t st = P4_OK;
         const size_t nv = s_.hasCid ? 1 : kp->vals.size();
+        // ROWS_BY_OBJECT_EPOCH: the object's rows in the segments and the
+        // tail (staged or merged), each read by its rid.
+        std::shared_ptr<const FsgView> fsgObj = !s_.hasCid ? fsgView(fr.f, c, kFsgObjectEpoch, vis_) : nullptr;
+        if (fsgObj) {
+            sqlite3_stmt* keyId = c->sql("SELECT id FROM okey WHERE k=?1");
+            sqlite3_stmt* row = c->sql(std::string("SELECT seq, w, cid, ") + ovCol + " FROM r WHERE rid=?1");
+            if (!keyId || !row) st = P4_E_INTERNAL;
+            std::vector<uint64_t> rids;
+            for (size_t vi = 0; vi < nv && st == P4_OK && ents.size() <= kMax; vi++) {
+                bindCell(keyId, 1, kp->vals[vi]);
+                int r = sqlite3_step(keyId);
+                const uint64_t kk = r == SQLITE_ROW ? uint64_t(sqlite3_column_int64(keyId, 0)) : 0;
+                sqlite3_reset(keyId);
+                if (r != SQLITE_ROW && r != SQLITE_DONE) st = statusOfSqlite(r);
+                if (!kk) continue;
+                st = fsgObject(*fsgObj, kk, &rids);
+                for (uint64_t rid : rids) {
+                    const int64_t sq = int64_t(rid >> 16);
+                    if (sq <= lo_ || sq > hi_) continue;
+                    sqlite3_bind_int64(row, 1, sqlite3_int64(rid));
+                    r = sqlite3_step(row);
+                    if (r == SQLITE_ROW && sqlite3_column_bytes(row, 2) == 32) {
+                        E en;
+                        en.seq = sq;
+                        en.fi = int(fi);
+                        en.w = sqlite3_column_int64(row, 1);
+                        en.ov = sqlite3_column_int64(row, 3);
+                        std::memcpy(en.key, sqlite3_column_blob(row, 2), 32);
+                        ents.push_back(en);
+                    }
+                    sqlite3_reset(row);
+                    if (r != SQLITE_ROW && r != SQLITE_DONE) st = statusOfSqlite(r);
+                    if (ents.size() > kMax) break;
+                }
+            }
+            c->exec("COMMIT");
+            e_->rpool.release(c);
+            if (st != P4_OK) return st;
+            continue;
+        }
         for (size_t vi = 0; vi < nv && st == P4_OK && ents.size() <= kMax; vi++) {
             if (s_.hasCid) sqlite3_bind_blob(q, 1, s_.cidKey, 32, SQLITE_STATIC);
             else bindCell(q, 1, kp->vals[vi]);
@@ -931,7 +971,25 @@ int32_t Scan::fetchChunk(Stream& s) {
         return r == SQLITE_DONE ? P4_OK : statusOfSqlite(r);
     };
     c->exec("BEGIN");
-    if (wo_ == kSeqAsc || wo_ == kSeqDesc) {
+    std::shared_ptr<const FsgView> fsgSeq;
+    if ((wo_ == kSeqAsc || wo_ == kSeqDesc) && fr.indexed && !wBound) fsgSeq = fsgView(fr.f, c, kFsgSeq, vis_);
+    if (fsgSeq) {
+        // ROWS_BY_SEQ: the segments' and the tail's seqs (a removed row's
+        // seq finds no row when the page's rows are read).
+        const bool desc = wo_ == kSeqDesc;
+        if (!s.started) s.rKey = desc ? hi_ + 1 : lo_;
+        std::vector<int64_t> seqs;
+        rc = fsgSeqs(*fsgSeq, desc, s.rKey, lo_, hi_, chunk_, &seqs);
+        for (int64_t sq : seqs) {
+            Ent en;
+            en.seq = sq;
+            en.rid = sq << 16;
+            got.push_back(en);
+        }
+        if (!got.empty()) s.rKey = got.back().seq;
+        if (got.size() < chunk_) s.done = true;
+        s.started = true;
+    } else if (wo_ == kSeqAsc || wo_ == kSeqDesc) {
         const bool desc = wo_ == kSeqDesc;
         // The seqs alone (r_s), or the rows' rids (a file before REBUILD 1, or a w range).
         const bool idx = fr.indexed && !wBound;

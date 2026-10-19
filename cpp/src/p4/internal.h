@@ -406,6 +406,9 @@ struct RetiredGeneration {
 };
 struct CheckpointState;
 struct CheckpointPlan;
+struct FsgView;
+struct FsgPairV;
+struct FsgRun;
 struct DagHistory;
 struct Feed {
     Type* type = nullptr;
@@ -450,6 +453,12 @@ struct Feed {
     bool checkpointPreparing = false;
     uint64_t checkpointRetryAt = 0;  // after a failed preparation (monoNs)
     std::shared_ptr<CheckpointState> checkpoint; // immutable checkpoint state, Type::mu
+    // The FlatBuffer row orders (fsg.cpp; fsgMu): the current view, and the
+    // ROWS_BY_* segments read so far, by (generation, offset).
+    std::mutex fsgMu;
+    std::shared_ptr<const FsgView> fsg[2];
+    bool fsgVerifying = false;  // queued on the checkpoint worker
+    std::map<std::pair<uint32_t,uint64_t>,std::shared_ptr<const FsgRun>> fsgSegments;
     uint64_t checkpointOpenNs = 0, rowIndexRebuildNs = 0;
     uint64_t checkpointRows = 0, checkpointAt = 0; // rows since checkpoint; last commit monoNs
     int64_t metadataBytes = 0;  // committed non-record frame bytes
@@ -785,6 +794,7 @@ struct P4Engine {
     std::mutex ckMu;
     std::condition_variable ckCv;
     std::deque<flatsql::p4::Feed*> ckQ;
+    std::deque<flatsql::p4::Feed*> fsgQ;  // feeds whose row-order segments to check (fsgVerifySchedule)
     bool ckStop = false;
 
     flatsql::p4::SlotHeader* slot(uint32_t i) {

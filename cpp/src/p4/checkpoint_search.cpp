@@ -134,8 +134,9 @@ bool candidate(Stream* s,Feed* feed,uint64_t at,uint64_t size,CheckpointState* o
     *out=std::move(state); return true;
 }
 }
+// stop: a commit already read (the walk ends there: the rows after it only).
 int32_t checkpointTailRows(Feed* feed,Stream* stream,const CheckpointState& checkpoint,uint64_t previous,std::vector<uint64_t>* rids,
-                          uint64_t* rowCount,int64_t* lastCommitAt) {
+                          uint64_t* rowCount,int64_t* lastCommitAt,uint64_t stop) {
     rids->clear();
     if(rowCount) *rowCount=0;
     if(lastCommitAt) *lastCommitAt=0;
@@ -147,6 +148,7 @@ int32_t checkpointTailRows(Feed* feed,Stream* stream,const CheckpointState& chec
     // (prepared off the writer) those between APPLIED_THROUGH and the $FCK.
     bool seen=false;
     for(uint64_t at=previous;at!=UINT64_MAX;) {
+        if(at==stop) { seen=true; break; }
         Frame f;
         if(!readFrame(stream,at,size,&f) || !commitHeader(&f,feed)) return P4_E_CORRUPT;
         if(at==checkpoint.offset) {

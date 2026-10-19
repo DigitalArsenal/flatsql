@@ -2,10 +2,16 @@
 #include "dag.h"
 #include "sds_frames.h"
 #include <algorithm>
+#include <map>
+#include <mutex>
+#include <tuple>
 #include <cstdio>
 #include <cerrno>
 
 namespace flatsql { namespace p4 {
+bool checkpointHasRowOrders(const CheckpointState& ck,uint8_t kind) {
+    return std::any_of(ck.segments.begin(),ck.segments.end(),[&](const CheckpointSegment& d){return d.kind==kind;});
+}
 namespace {
 using DictKey=std::pair<uint8_t,uint32_t>;
 struct SegmentData {
@@ -15,7 +21,8 @@ struct SegmentData {
     std::map<InstId,uint32_t> instanceUrls; // INSTANCE_URL_IDS, parallel to instances (0 = none)
     std::map<uint32_t,FmbEntry> tokens;
     std::set<uint64_t> tombstones;
-    uint64_t size(uint8_t k) const { switch(k) { case 0:return dictionary.size(); case 1:return latest.size(); case 2:return instances.size(); case 3:return tokens.size(); default:return tombstones.size(); } }
+    std::vector<FsgPairV> pairs; // ROWS_BY_SEQ / ROWS_BY_OBJECT_EPOCH, sorted by (KEY_HI, KEY_LO, RID)
+    uint64_t size(uint8_t k) const { switch(k) { case 0:return dictionary.size(); case 1:return latest.size(); case 2:return instances.size(); case 3:return tokens.size(); case 4:return tombstones.size(); default:return pairs.size(); } }
 };
 std::string text(sqlite3_stmt* q,int i) {
     auto* p=reinterpret_cast<const char*>(sqlite3_column_text(q,i));
@@ -98,7 +105,7 @@ int32_t readSegment(Feed* f,Stream* stream,const CheckpointSegment& desc,Segment
     flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return P4_E_CORRUPT;
     const auto* s=GetFSG(p);
     if(s->SELF_OFFSET()!=desc.offset || s->FEED_ID()!=f->fid || s->KIND()!=desc.kind || s->LEVEL()!=desc.level ||
-       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || desc.kind>4) return P4_E_CORRUPT;
+       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || desc.kind>kFsgMaxKind) return P4_E_CORRUPT;
     if(s->ENTRIES()) for(const auto* e:*s->ENTRIES()) { auto d=entry(e); if(!d.id) return P4_E_CORRUPT; out->dictionary[{d.kind,d.id}]=std::move(d); }
     if(s->LATEST()) for(const auto* e:*s->LATEST()) {
         if(!e->OBJECT_KEY_ID() || e->RESERVED()) return P4_E_CORRUPT;
@@ -113,7 +120,9 @@ int32_t readSegment(Feed* f,Stream* stream,const CheckpointSegment& desc,Segment
         out->instances[{e->BATCH_ID(),e->CONTENT_KEY_ID()}]=std::move(x);
     }
     if(s->TOKENS()) for(const auto* e:*s->TOKENS()) { auto d=entry(e); if(!d.id || d.text.size()!=6) return P4_E_CORRUPT; out->tokens[d.id]=std::move(d); }
-    if(s->PAIRS()) for(const auto* e:*s->PAIRS()) out->tombstones.insert(e->KEY_HI());
+    if(s->PAIRS()) for(const auto* e:*s->PAIRS()) {
+        if(desc.kind==4) out->tombstones.insert(e->KEY_HI()); else out->pairs.push_back({e->KEY_HI(),e->KEY_LO(),e->RID(),e->ROW_REF()});
+    }
     return out->size(desc.kind)==desc.entries?P4_OK:P4_E_CORRUPT;
 }
 void merge(SegmentData* dst,const SegmentData& src) {
@@ -123,6 +132,7 @@ void merge(SegmentData* dst,const SegmentData& src) {
     for(const auto& x:src.instanceUrls) dst->instanceUrls[x.first]=x.second;
     for(const auto& x:src.tokens) dst->tokens[x.first]=x.second;
     dst->tombstones.insert(src.tombstones.begin(),src.tombstones.end());
+    dst->pairs.insert(dst->pairs.end(),src.pairs.begin(),src.pairs.end());
 }
 // Encodes one segment at the provisional offset *cursor. Defaults are forced
 // so SELF_OFFSET, PREVIOUS and every REPLACES entry exist to be patched.
@@ -138,10 +148,16 @@ void encodeSegment(Feed* f,uint8_t kind,uint8_t level,const SegmentData& data,co
         instances.emplace_back(item.first.first,item.first.second,uint64_t(x.n),uint64_t(x.bytes),x.minw,x.maxw,uint64_t(x.minseq),uint64_t(x.maxseq),x.first,x.updated,x.maxat,x.maxts);
         auto u=data.instanceUrls.find(item.first); urls.push_back(u==data.instanceUrls.end()?0:u->second); }
     for(auto rid:data.tombstones) pairs.emplace_back(rid,0,rid,0);
+    for(const auto& x:data.pairs) pairs.emplace_back(x.hi,x.lo,x.rid,x.ref);
     auto ev=b.CreateVector(entries),tv=b.CreateVector(tokens); auto lv=b.CreateVectorOfStructs(latest);
     auto iv=b.CreateVectorOfStructs(instances); auto uv=b.CreateVector(urls); auto pv=b.CreateVectorOfStructs(pairs); auto rv=b.CreateVector(replaces);
     desc->offset=*cursor; desc->kind=kind; desc->level=level; desc->coversThrough=applied; desc->entries=data.size(kind);
     desc->minSeq=counters.minseq==INT64_MAX?0:uint64_t(counters.minseq); desc->maxSeq=uint64_t(counters.maxseq);
+    if(kind>=kFsgSeq) {
+        // A row-order segment's MIN_SEQ / MAX_SEQ are its own rows' seqs.
+        uint64_t lo=UINT64_MAX,hi=0; for(const auto& x:data.pairs) { lo=std::min(lo,x.rid>>16); hi=std::max(hi,x.rid>>16); }
+        desc->minSeq=lo==UINT64_MAX?0:lo; desc->maxSeq=hi;
+    }
     FSGBuilder root(b); root.add_SELF_OFFSET(desc->offset); root.add_PREVIOUS(0); root.add_FEED_ID(f->fid);
     root.add_KIND(fckSegmentKind(kind)); root.add_LEVEL(level); root.add_MIN_SEQ(desc->minSeq); root.add_MAX_SEQ(desc->maxSeq);
     root.add_COVERS_THROUGH(applied); root.add_REPLACES(rv);
@@ -262,7 +278,142 @@ int32_t snapshot(Feed* f,Conn* c,Stream* stream,uint64_t previous,const Checkpoi
     sql=readTokc(f->type,c,&state->tokens); if(sql!=SQLITE_OK) return statusOfSqlite(sql);
     return latestSnapshot(f,c,stream,previous,old,state);
 }
+// The row orders of the rows the metadata added since old's APPLIED_THROUGH
+// (all rows for a fresh generation) that c's snapshot still holds: their
+// keys from the index rows, their ROW_REFs from the $FMB chain.
+int32_t rowOrders(Feed* f,Conn* c,Stream* stream,uint64_t previous,const CheckpointState& old,std::vector<FsgPairV>* bySeq,std::vector<FsgPairV>* byObject) {
+    CheckpointState scratch; TailChanges tail;
+    // A checkpoint without row orders for its rows (written before they
+    // existed) is folded whole: the new segments cover every live row.
+    const bool whole=old.counters.rows>0 && !checkpointHasRowOrders(old,kFsgSeq);
+    int32_t rc=changes(stream,previous,whole?0:old.appliedThrough,&tail,&scratch,true); if(rc!=P4_OK) return rc;
+    if(tail.rows.empty()) return P4_OK;
+    const bool hasObject=f->type->spec()->hasObject;
+    auto add=[&](uint64_t rid,uint64_t ref,sqlite3_stmt* q,int k) {
+        bySeq->push_back({rid,0,rid,ref});
+        if(!hasObject) return;
+        const uint64_t hi=sqlite3_column_type(q,k)==SQLITE_NULL?0:uint64_t(sqlite3_column_int64(q,k));
+        const uint64_t lo=sqlite3_column_type(q,k+1)==SQLITE_NULL?0:uint64_t(sqlite3_column_int64(q,k+1))^(uint64_t(1)<<63);
+        byObject->push_back({hi,lo,rid,ref});
+    };
+    int sr=SQLITE_DONE;
+    if(tail.rows.size()>8192) {  // most of the file: one walk
+        auto* q=c->sql("SELECT rid,kk,e FROM r"); if(!q) return P4_E_IO;
+        while((sr=sqlite3_step(q))==SQLITE_ROW) { auto it=tail.rows.find(uint64_t(sqlite3_column_int64(q,0))); if(it!=tail.rows.end()) add(it->first,it->second,q,1); }
+        sqlite3_reset(q);
+    } else {
+        auto* q=c->sql("SELECT kk,e FROM r WHERE rid=?1"); if(!q) return P4_E_IO;
+        for(const auto& x:tail.rows) {
+            sqlite3_bind_int64(q,1,sqlite3_int64(x.first)); sr=sqlite3_step(q);
+            if(sr==SQLITE_ROW) add(x.first,x.second,q,0);
+            sqlite3_reset(q); if(sr!=SQLITE_ROW && sr!=SQLITE_DONE) break;
+        }
+        if(sr==SQLITE_ROW) sr=SQLITE_DONE;
+    }
+    if(sr!=SQLITE_DONE) return statusOfSqlite(sr);
+    std::sort(bySeq->begin(),bySeq->end()); std::sort(byObject->begin(),byObject->end());
+    return P4_OK;
+}
+// Drops the pairs whose rows c's snapshot no longer holds: a tombstoned
+// rid whose row is gone (a tombstoned rid that a later row reuses stays).
+int32_t dropDead(Conn* c,const std::set<uint64_t>& tombstones,std::vector<FsgPairV>* pairs) {
+    if(tombstones.empty()) return P4_OK;
+    sqlite3_stmt* q=nullptr; size_t w=0;
+    for(const auto& x:*pairs) {
+        bool keep=true;
+        if(tombstones.count(x.rid)) {
+            if(!q && !(q=c->sql("SELECT 1 FROM r WHERE rid=?1"))) return P4_E_IO;
+            sqlite3_bind_int64(q,1,sqlite3_int64(x.rid)); const int r=sqlite3_step(q); sqlite3_reset(q);
+            if(r!=SQLITE_ROW && r!=SQLITE_DONE) return statusOfSqlite(r);
+            keep=r==SQLITE_ROW;
+        }
+        if(keep) (*pairs)[w++]=x;
+    }
+    pairs->resize(w); return P4_OK;
+}
 } // namespace
+
+namespace {
+struct VerifiedKey {
+    std::string path; uint32_t gen; uint64_t offset; uint32_t length; std::array<uint8_t,32> digest;
+    bool operator<(const VerifiedKey& x) const { return std::tie(path,gen,offset,length,digest)<std::tie(x.path,x.gen,x.offset,x.length,x.digest); }
+};
+std::mutex gVerifiedMu;
+std::map<VerifiedKey,std::shared_ptr<const FsgVerified>> gVerified;
+FsgVerifyStats gVerifyStats;
+
+// The fence keys and PAIRS place of an FSG row-order buffer p (n bytes) at
+// stream offset at; sorted is checked when check is set.
+std::shared_ptr<FsgVerified> pairsLayout(const uint8_t* p,uint64_t at,bool check) {
+    const auto* s=GetFSG(p); if(!s->PAIRS()) return nullptr;
+    static_assert(sizeof(::FSGPair)==sizeof(FsgPairV),"FSGPair");
+    auto ver=std::make_shared<FsgVerified>();
+    ver->n=s->PAIRS()->size();
+    ver->base=at+4+uint64_t(reinterpret_cast<const uint8_t*>(s->PAIRS()->Data())-p);
+    ver->fences.reserve((ver->n+FsgRun::kPage-1)/FsgRun::kPage);
+    FsgPairV prev{};
+    for(uint64_t i=0;i<ver->n;i+=check?1:FsgRun::kPage) {
+        const auto* e=s->PAIRS()->Get(flatbuffers::uoffset_t(i));
+        const FsgPairV x{e->KEY_HI(),e->KEY_LO(),e->RID(),e->ROW_REF()};
+        if(check && i && x<prev) return nullptr;
+        if(i%FsgRun::kPage==0) ver->fences.push_back(x);
+        prev=x;
+    }
+    return ver;
+}
+void remember(const VerifiedKey& key,std::shared_ptr<const FsgVerified> ver,std::shared_ptr<const FsgVerified>* out) {
+    std::lock_guard<std::mutex> g(gVerifiedMu);
+    auto& slot=gVerified[key]; if(!slot) slot=std::move(ver);
+    if(out) *out=slot;
+}
+} // namespace
+
+FsgVerifyStats fsgVerifyStats() { std::lock_guard<std::mutex> g(gVerifiedMu); return gVerifyStats; }
+
+bool checkpointPairsVerified(Stream* stream,const CheckpointSegment& desc) {
+    std::lock_guard<std::mutex> g(gVerifiedMu);
+    return gVerified.count(VerifiedKey{stream->path,stream->gen,desc.offset,desc.length,desc.digest})>0;
+}
+
+void checkpointPairsRetain(Stream* stream,const CheckpointState& ck) {
+    std::lock_guard<std::mutex> g(gVerifiedMu);
+    for(auto it=gVerified.lower_bound(VerifiedKey{stream->path,0,0,0,{}});it!=gVerified.end() && it->first.path==stream->path;) {
+        const bool live=it->first.gen==stream->gen && std::any_of(ck.segments.begin(),ck.segments.end(),[&](const CheckpointSegment& d){return d.offset==it->first.offset;});
+        it=live?std::next(it):gVerified.erase(it);
+    }
+}
+
+int32_t checkpointVerifyPairs(Feed* f,Stream* stream,const CheckpointSegment& desc,std::shared_ptr<const FsgVerified>* out,bool* fresh) {
+    if(fresh) *fresh=false;
+    if(desc.kind<kFsgSeq || desc.kind>kFsgMaxKind) return P4_E_ARG;
+    const VerifiedKey key{stream->path,stream->gen,desc.offset,desc.length,desc.digest};
+    { std::lock_guard<std::mutex> g(gVerifiedMu); auto it=gVerified.find(key); if(it!=gVerified.end()) { gVerifyStats.reused++; *out=it->second; return P4_OK; } }
+    // First load in this process: the whole segment, its digest and
+    // structure, as every other segment kind is checked when it is read.
+    const uint64_t t0=ps::monoNs();
+    std::vector<uint64_t> storage; uint32_t n=0;
+    int32_t rc=frame(stream,desc.offset,&storage,&n); if(rc!=P4_OK || n!=desc.length) return P4_E_CORRUPT;
+    const auto* p=reinterpret_cast<const uint8_t*>(storage.data());
+    std::array<uint8_t,32> digest{}; ps::sha256(p,n,digest.data()); if(digest!=desc.digest) return P4_E_CORRUPT;
+    flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return P4_E_CORRUPT;
+    const auto* s=GetFSG(p);
+    if(s->SELF_OFFSET()!=desc.offset || s->FEED_ID()!=f->fid || s->KIND()!=desc.kind || s->LEVEL()!=desc.level ||
+       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || !s->PAIRS() || s->PAIRS()->size()!=desc.entries) return P4_E_CORRUPT;
+    auto ver=pairsLayout(p,desc.offset,true); if(!ver) return P4_E_CORRUPT;
+    { std::lock_guard<std::mutex> g(gVerifiedMu); gVerifyStats.hashed++; gVerifyStats.hashedBytes+=n; gVerifyStats.hashNs+=ps::monoNs()-t0; }
+    remember(key,std::move(ver),out); if(fresh) *fresh=true;
+    return P4_OK;
+}
+
+int32_t checkpointReadPairs(Feed* f,const std::shared_ptr<Stream>& stream,const CheckpointSegment& desc,FsgRun* out) {
+    std::shared_ptr<const FsgVerified> ver;
+    const int32_t rc=checkpointVerifyPairs(f,stream.get(),desc,&ver); if(rc!=P4_OK) return rc;
+    // The PAIRS vector stays on disk, read a page at a time; the fence keys
+    // are in memory.
+    out->stream=stream; out->base=ver->base; out->n=size_t(ver->n); out->verified=ver;
+    out->pages.assign((out->n+FsgRun::kPage-1)/FsgRun::kPage,nullptr);
+    return P4_OK;
+}
 
 int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState* state,std::string* err) {
     std::vector<uint64_t> storage; uint32_t n=0; int32_t rc=frame(stream,offset,&storage,&n);
@@ -284,12 +435,13 @@ int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState*
     std::set<uint64_t> offsets;
     for(size_t i=0;i<count;i++) { const auto* s=ck->SEGMENTS()->Get(flatbuffers::uoffset_t(i)); CheckpointSegment d;
         d.offset=s->OFFSET(); d.length=s->LENGTH(); d.kind=uint8_t(s->KIND()); d.level=s->LEVEL(); d.minSeq=s->MIN_SEQ(); d.maxSeq=s->MAX_SEQ(); d.coversThrough=s->COVERS_THROUGH(); d.entries=s->ENTRIES();
-        if(s->RESERVED() || d.kind>4 || d.offset>=offset || d.length>offset-d.offset-4 || d.coversThrough>out.appliedThrough || !offsets.insert(d.offset).second) return fail();
+        if(s->RESERVED() || d.kind>kFsgMaxKind || d.offset>=offset || d.length>offset-d.offset-4 || d.coversThrough>out.appliedThrough || !offsets.insert(d.offset).second) return fail();
         std::memcpy(d.digest.data(),ck->SEGMENT_DIGESTS()->data()+i*32,32); out.segmentBytes+=d.length+4; out.segments.push_back(d);
     }
     std::sort(out.segments.begin(),out.segments.end(),[](const CheckpointSegment& a,const CheckpointSegment& b){return a.offset<b.offset;});
     SegmentData data;
-    for(const auto& d:out.segments) { SegmentData part; if(readSegment(f,stream,d,&part)!=P4_OK) return fail(); merge(&data,part); }
+    // Row orders are read (and digest-checked) when a reader first needs them (fsg.cpp).
+    for(const auto& d:out.segments) { if(d.kind>=kFsgSeq) continue; SegmentData part; if(readSegment(f,stream,d,&part)!=P4_OK) return fail(); merge(&data,part); }
     out.dictionary=std::move(data.dictionary); out.latest=std::move(data.latest); out.instances=std::move(data.instances); out.tombstones=std::move(data.tombstones);
     for(auto it=out.latest.begin();it!=out.latest.end();) { if(!it->second.rid) it=out.latest.erase(it); else ++it; }
     for(auto it=out.instances.begin();it!=out.instances.end();) {
@@ -317,7 +469,7 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
     int32_t rc=appliedEnd(stream,previous,&out.appliedThrough); if(rc!=P4_OK) return rc;
     rc=snapshot(f,c,stream,previous,old,counters,&out); if(rc!=P4_OK) { if(err) *err="checkpoint snapshot "+f->path; return rc; }
     out.segments=old.segments; out.checkpointBytes=old.checkpointBytes; out.commitsRoot=commitsRoot;
-    SegmentData deltas[5];
+    SegmentData deltas[kFsgMaxKind+1];
     for(const auto& x:out.dictionary) { auto it=old.dictionary.find(x.first); if(it==old.dictionary.end() || it->second.text!=x.second.text) deltas[0].dictionary[x.first]=x.second; }
     for(const auto& x:out.latest) { auto it=old.latest.find(x.first); if(it==old.latest.end() || !(it->second==x.second)) deltas[1].latest[x.first]=x.second; }
     for(const auto& x:old.latest) if(!out.latest.count(x.first)) deltas[1].latest[x.first]={x.first,INT64_MIN,0,0};
@@ -335,15 +487,39 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
     for(const auto& x:out.tokens) { auto it=old.tokens.find(x.first); if(it==old.tokens.end() || !tokenEqual(it->second,x.second)) deltas[3].tokens[x.first]=tokenEntry(x.first,x.second,out.dictionary.at({0,x.first}).text[0]); }
     for(const auto& x:old.tokens) if(!out.tokens.count(x.first)) deltas[3].tokens[x.first]=tokenEntry(x.first,TokCount{},out.dictionary.at({0,x.first}).text[0]);
     for(auto rid:out.tombstones) if(!old.tombstones.count(rid)) deltas[4].tombstones.insert(rid);
+    rc=rowOrders(f,c,stream,previous,old,&deltas[kFsgSeq].pairs,&deltas[kFsgObjectEpoch].pairs); if(rc!=P4_OK) { if(err) *err="checkpoint row orders "+f->path; return rc; }
     // This plan's own segments (offsets >= mark) are merged from memory.
     uint64_t cursor=mark; std::map<uint64_t,SegmentData> made;
-    for(uint8_t kind=0;kind<5;kind++) if(deltas[kind].size(kind)) {
+    // Retention: each removal counts against the row-order segments whose
+    // seq range holds it. A segment a quarter dead is rewritten without its
+    // dead pairs (one input, same level), or dropped when none stay; so
+    // retention by arrival drops whole segments.
+    for(const auto& d:out.segments) if(d.kind>=kFsgSeq) { auto it=old.deadPairs.find(d.offset); if(it!=old.deadPairs.end()) out.deadPairs[d.offset]=it->second; }
+    for(uint64_t rid:deltas[4].tombstones) for(const auto& d:out.segments)
+        if(d.kind>=kFsgSeq && (rid>>16)>=d.minSeq && (rid>>16)<=d.maxSeq) out.deadPairs[d.offset]++;
+    for(uint8_t kind=kFsgSeq;kind<=kFsgMaxKind;kind++) {
+        std::vector<CheckpointSegment> garbage;
+        for(const auto& d:out.segments) if(d.kind==kind) { auto it=out.deadPairs.find(d.offset); if(it!=out.deadPairs.end() && it->second*4>=d.entries) garbage.push_back(d); }
+        for(const auto& d:garbage) {
+            SegmentData part; rc=readSegment(f,stream,d,&part); if(rc!=P4_OK) return rc;
+            rc=dropDead(c,out.tombstones,&part.pairs); if(rc!=P4_OK) return rc;
+            out.deadPairs.erase(d.offset);
+            out.segments.erase(std::remove_if(out.segments.begin(),out.segments.end(),[&](const CheckpointSegment& x){return x.offset==d.offset;}),out.segments.end());
+            if(part.pairs.empty()) continue;
+            CheckpointSegment desc; encodeSegment(f,kind,d.level,part,{d.offset},out.appliedThrough,counters,&cursor,plan,&desc);
+            made[desc.offset]=std::move(part); out.segments.push_back(desc);
+        }
+    }
+    // A row-order merge's output stays at most 1/8 of the live rows.
+    const uint64_t mergeCap=std::max<uint64_t>(4096,uint64_t(std::max<int64_t>(counters.rows,0))/8);
+    for(uint8_t kind=0;kind<=kFsgMaxKind;kind++) if(deltas[kind].size(kind)) {
         CheckpointSegment desc; encodeSegment(f,kind,0,deltas[kind],{},out.appliedThrough,counters,&cursor,plan,&desc);
         made[desc.offset]=std::move(deltas[kind]); out.segments.push_back(desc);
         for(uint8_t level=0;level<63;level++) {
             std::vector<CheckpointSegment> inputs; for(const auto& d:out.segments) if(d.kind==kind && d.level==level) inputs.push_back(d);
             if(inputs.size()<4) break;
             std::sort(inputs.begin(),inputs.end(),[](const CheckpointSegment& a,const CheckpointSegment& b){return a.offset<b.offset;}); inputs.resize(4);
+            if(kind>=kFsgSeq) { uint64_t n=0; for(const auto& d:inputs) n+=d.entries; if(n>mergeCap) break; }
             SegmentData combined; std::vector<uint64_t> replaces;
             for(const auto& d:inputs) {
                 if(d.offset>=mark) merge(&combined,made.at(d.offset));
@@ -352,6 +528,13 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
             }
             // LATEST deltas already include zero-rid deletion markers. Applying
             // the tombstone union again would erase a later reuse of ROW_J.
+            // Row orders: one sorted run without the pairs of removed rows
+            // (readers check each candidate's row for the rest).
+            if(kind>=kFsgSeq) {
+                rc=dropDead(c,out.tombstones,&combined.pairs); if(rc!=P4_OK) return rc;
+                std::sort(combined.pairs.begin(),combined.pairs.end());
+                for(uint64_t r:replaces) out.deadPairs.erase(r);
+            }
             encodeSegment(f,kind,uint8_t(level+1),combined,replaces,out.appliedThrough,counters,&cursor,plan,&desc);
             made[desc.offset]=std::move(combined);
             out.segments.erase(std::remove_if(out.segments.begin(),out.segments.end(),[&](const CheckpointSegment& d){return std::find(replaces.begin(),replaces.end(),d.offset)!=replaces.end();}),out.segments.end()); out.segments.push_back(desc);
@@ -383,6 +566,10 @@ int32_t checkpointInstall(Feed* f,Stream* stream,CheckpointPlan& plan,int64_t* e
             for(flatbuffers::uoffset_t j=0;j<replaces->size();j++) replaces->Mutate(j,place(replaces->Get(j)));
         ps::sha256(p,n,digests[at].data());
         const int32_t rc=append(stream,p,n,end,"FSG"); if(rc!=P4_OK) return rc; *previous=at;
+        // A row-order segment this process wrote is checked: its digest is
+        // the hash of these bytes.
+        if(GetFSG(p)->KIND()>=kFsgSeq) if(auto ver=pairsLayout(p,at,false))
+            remember(VerifiedKey{stream->path,stream->gen,at,n,digests[at]},std::move(ver),nullptr);
     }
     for(auto& s:out.segments) if(s.offset>=plan.at) {
         s.offset=place(s.offset); auto d=digests.find(s.offset); if(d==digests.end()) return P4_E_INTERNAL; s.digest=d->second;

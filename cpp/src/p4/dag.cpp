@@ -430,8 +430,37 @@ int32_t feedDagSnapshot(Feed* f,DagSnapshot* out,std::string* err,uint64_t from,
     { std::lock_guard<std::mutex> lock(f->dagMu); for(auto it=f->dagHistory->generations.begin();it!=f->dagHistory->generations.end();) { if(!retained.count(it->first)) it=f->dagHistory->generations.erase(it); else ++it; } }
     return P4_OK;
 }
+namespace {
+struct DigestHash { size_t operator()(const Digest& d) const { size_t h; std::memcpy(&h,d.data(),sizeof h); return h; } };
+// Which of the candidate CIDs the generation's closure at its committed
+// point holds, from the cache's live entries (the closure's leaves: the
+// checkpoint, the segments, each linked unit's FMB and live frames, a large
+// frame's root and leaves) by digest, without rebuilding a node.
+void liveOf(const DagState& s,const std::unordered_set<std::string>& candidates,std::unordered_set<std::string>* live) {
+    std::unordered_map<Digest,std::string,DigestHash> raw; std::unordered_set<std::string> nodes;
+    for(const auto& cid:candidates) {
+        if(cid.size()==36 && uint8_t(cid[1])==IpldRaw) { Digest d; std::memcpy(d.data(),cid.data()+4,32); raw.emplace(d,cid); }
+        else nodes.insert(cid);
+    }
+    auto probe=[&](const Digest& d) { if(raw.empty()) return; auto it=raw.find(d); if(it!=raw.end()) live->insert(it->second); };
+    if(s.hasCheckpoint) probe(s.checkpoint.digest);
+    for(const auto& r:s.segments) probe(r.digest);
+    for(const auto& u:s.units) {
+        if(u.node.cid.empty()) continue;
+        probe(u.metadata.digest);
+        for(uint32_t i=u.firstFrame;i<u.firstFrame+u.frameCount;i++) {
+            const Frame& fr=s.frames[i]; if(!fr.refs) continue;
+            if(!fr.large) { probe(fr.digest); continue; }
+            const Large& big=s.large.at(fr.at); if(nodes.count(big.cid)) live->insert(big.cid);
+            for(const auto& leaf:big.leaves) probe(leaf);
+        }
+    }
+}
+}
 int32_t feedDagDrops(Feed* f,uint64_t from,std::vector<DagDrop>* out,std::string* err) {
-    DagSnapshot snapshot; int32_t rc=feedDagSnapshot(f,&snapshot,err); if(rc!=P4_OK) return rc;
+    // The committed point without its closure: a drop is listed unless the
+    // closure still holds its CID, which the cache answers per candidate.
+    DagSnapshot snapshot; int32_t rc=feedDagSnapshot(f,&snapshot,err,0,false); if(rc!=P4_OK) return rc;
     std::vector<uint32_t> retired;
     { std::lock_guard<std::mutex> lock(f->smu); if(f->retired) retired.push_back(f->retired->gen); for(const auto& r:f->olderRetired) retired.push_back(r.stream->gen); }
     for(uint32_t gen:retired) {
@@ -443,27 +472,31 @@ int32_t feedDagDrops(Feed* f,uint64_t from,std::vector<DagDrop>* out,std::string
         rc=build(f,stream.get(),previous,end,&ignored,err,false); if(rc!=P4_OK) return rc;
     }
     std::lock_guard<std::mutex> lock(f->dagMu); std::set<std::tuple<std::string,uint64_t,uint32_t>> seen;
-    std::unordered_set<std::string> live; for(const auto& b:snapshot.blocks) live.insert(b.cid);
+    const auto current=f->dagHistory->generations.find(snapshot.generation);
+    if(current==f->dagHistory->generations.end() || !current->second) return P4_E_INTERNAL;
+    // The candidates first, in their order; then one pass over the cache
+    // for the ones the closure holds.
+    std::vector<DagDrop> candidates;
     for(const auto& generation:f->dagHistory->generations) if(generation.first<=snapshot.generation)
         for(const auto& d:generation.second->drops) if(d.unit>=from &&
-            (d.generation<snapshot.generation || d.unit<=snapshot.through) &&
-            !live.count(d.cid) && seen.emplace(d.cid,d.unit,d.generation).second) out->push_back(d);
+            (d.generation<snapshot.generation || d.unit<=snapshot.through) && seen.emplace(d.cid,d.unit,d.generation).second) candidates.push_back(d);
     // A compaction replaces the old generation's still-live metadata too.
     // Those leaves are not removals within the old stream, so retire them at
     // the new generation's first (compaction-completion) checkpoint.
-    const auto current=f->dagHistory->generations.find(snapshot.generation);
-    const uint64_t replacedAt=current!=f->dagHistory->generations.end() && current->second->firstCheckpoint!=UINT64_MAX?
-        current->second->firstCheckpoint:snapshot.through;
+    const uint64_t replacedAt=current->second->firstCheckpoint!=UINT64_MAX?current->second->firstCheckpoint:snapshot.through;
     if(replacedAt>=from) for(const auto& generation:f->dagHistory->generations) if(generation.first<snapshot.generation) {
         const auto append=[&](const Raw& block) {
-            const std::string cid=rawCid(block.digest);
-            if(!live.count(cid) && seen.emplace(cid,replacedAt,snapshot.generation).second)
-                out->push_back({cid,replacedAt,snapshot.generation});
+            std::string cid=rawCid(block.digest);
+            if(seen.emplace(cid,replacedAt,snapshot.generation).second) candidates.push_back({std::move(cid),replacedAt,snapshot.generation});
         };
         if(generation.second->hasCheckpoint) append(generation.second->checkpoint);
         for(const auto& block:generation.second->segments) append(block);
         for(const auto& unit:generation.second->units) if(unit.linked) append(unit.metadata);
     }
+    if(candidates.empty()) return P4_OK;
+    std::unordered_set<std::string> cids,live; for(const auto& d:candidates) cids.insert(d.cid);
+    liveOf(*current->second,cids,&live);
+    for(auto& d:candidates) if(!live.count(d.cid)) out->push_back(std::move(d));
     return P4_OK;
 }
 void feedDagReset(Feed* f) { std::lock_guard<std::mutex> lock(f->dagMu); f->dagHistory.reset(); }

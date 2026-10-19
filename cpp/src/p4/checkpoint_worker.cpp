@@ -53,13 +53,39 @@ void checkpointSchedule(Feed* f) {
     else { std::lock_guard<std::mutex> g(f->type->mu); f->checkpointPreparing=false; }
 }
 
+void fsgVerifySchedule(Feed* f) {
+    Engine* e=f->type->e;
+    { std::lock_guard<std::mutex> g(f->fsgMu); if(f->fsgVerifying) return; f->fsgVerifying=true; }
+    bool queued;
+    { std::lock_guard<std::mutex> g(e->ckMu); queued=!e->ckStop; if(queued) e->fsgQ.push_back(f); }
+    if(queued) e->ckCv.notify_one();
+    else { std::lock_guard<std::mutex> g(f->fsgMu); f->fsgVerifying=false; }
+}
+
+namespace {
+// The feed's current checkpoint's row-order segments, each hashed once in
+// this process (checkpointVerifyPairs); a failure leaves the readers on the
+// SQLite index and is found again by the next reader's schedule.
+void verifyFeed(Feed* f) {
+    std::shared_ptr<const CheckpointState> ck;
+    { std::lock_guard<std::mutex> g(f->type->mu); ck=f->checkpoint; }
+    int32_t st=P4_OK; auto stream=ck?streamCur(f,&st):nullptr;
+    if(stream && st==P4_OK)
+        for(const auto& d:ck->segments) if(d.kind>=kFsgSeq) { std::shared_ptr<const FsgVerified> v; if(checkpointVerifyPairs(f,stream.get(),d,&v)!=P4_OK) break; }
+    std::lock_guard<std::mutex> g(f->fsgMu); f->fsgVerifying=false;
+}
+}
+
 void checkpointLoop(Engine* e) {
     for(;;) {
-        Feed* f;
+        Feed* f; bool verify=false;
         { std::unique_lock<std::mutex> g(e->ckMu);
-          e->ckCv.wait(g,[&]{ return e->ckStop || !e->ckQ.empty(); });
+          e->ckCv.wait(g,[&]{ return e->ckStop || !e->ckQ.empty() || !e->fsgQ.empty(); });
           if(e->ckStop) break;
-          f=e->ckQ.front(); e->ckQ.pop_front(); }
+          // A checkpoint to prepare goes first.
+          if(e->ckQ.empty()) { f=e->fsgQ.front(); e->fsgQ.pop_front(); verify=true; }
+          else { f=e->ckQ.front(); e->ckQ.pop_front(); } }
+        if(verify) { verifyFeed(f); continue; }
         std::shared_ptr<CheckpointPlan> plan; std::string err;
         const int32_t rc=prepare(f,&plan,&err);
         { std::lock_guard<std::mutex> g(f->type->mu);
@@ -71,10 +97,12 @@ void checkpointLoop(Engine* e) {
 
 void checkpointWorkerStop(Engine* e) {
     std::deque<Feed*> left;
-    { std::lock_guard<std::mutex> g(e->ckMu); e->ckStop=true; left.swap(e->ckQ); }
+    std::deque<Feed*> verifying;
+    { std::lock_guard<std::mutex> g(e->ckMu); e->ckStop=true; left.swap(e->ckQ); verifying.swap(e->fsgQ); }
     e->ckCv.notify_all();
     if(e->ckThread.joinable()) e->ckThread.join();
     for(Feed* f:left) { std::lock_guard<std::mutex> g(f->type->mu); f->checkpointPreparing=false; }
+    for(Feed* f:verifying) { std::lock_guard<std::mutex> g(f->fsgMu); f->fsgVerifying=false; }
 }
 
 int32_t checkpointInstallReady(Feed* f) {

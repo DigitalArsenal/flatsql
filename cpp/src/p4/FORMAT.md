@@ -335,9 +335,11 @@ How the item-5 orders fill `PAIRS`:
 | `ROWS_BY_AT` | at XOR 2^63 | 0 |
 
 - `ROW_REF` reaches every other column of the row in its `$FMB` with one read.
-- `FSG` field layout is **frozen when item 5 lands** (§7). The kinds above
-  `TOMBSTONES` are provisional until then; everything else in §3 is frozen by
-  this review.
+- A row-order segment's `MIN_SEQ` / `MAX_SEQ` are its own rows' seqs (the
+  other kinds carry the feed's).
+- `FSG` field layout is **frozen** (item 5 landed in 3.11.0). `ROWS_BY_SEQ`
+  and `ROWS_BY_OBJECT_EPOCH` are written; `ROWS_BY_CID`, `ROWS_BY_W` and
+  `ROWS_BY_AT` stay reserved (their paths stay on SQLite, §7).
 
 ## 4. IPFS mapping
 
@@ -491,7 +493,9 @@ Basis: FlatSQL 3.10.0's replay gate (`REPLAY_CHECKPOINT_PREPARE`, native):
 **Writing one.**
 1. Fold the rows since `APPLIED_THROUGH` into new level-0 segments, one per
    changed kind: dictionary entries, latest-per-object, instances, tokens,
-   tombstones, and the item-5 row orders where enabled.
+   tombstones, and the row orders `ROWS_BY_SEQ` and (a type with an object
+   key) `ROWS_BY_OBJECT_EPOCH`. A checkpoint whose live rows have no row
+   orders (written before 3.11.0) is folded whole the next time.
 2. Append the segments, then the `$FCK` that lists every live segment.
 
 **Off the PUT path.**
@@ -511,25 +515,72 @@ Basis: FlatSQL 3.10.0's replay gate (`REPLAY_CHECKPOINT_PREPARE`, native):
 - When a kind has 4 segments at a level, they merge into one at the next level
   (newest wins; tombstones drop the rows they name).
 - `REPLACES` names the inputs, which become dead frames.
-- Row-order segments merge only with neighbors in seq order, and a merge's
-  output stays at most 1/8 of the feed's live rows. Retention by arrival
-  therefore drops **whole segments**.
+- Row-order segments merge only with neighbors in seq order (the four oldest
+  of a level), and a merge's output stays at most 1/8 of the feed's live rows
+  (at least 4,096). A merge leaves out the pairs of removed rows.
+- Retention: each removal counts against the row-order segments whose seq
+  range holds it (in memory; the count starts again after a restart). A
+  segment a quarter dead is rewritten without its dead pairs (`REPLACES` one
+  input, same level), or dropped when no pair stays. Retention by arrival
+  therefore drops **whole segments**. A pair is dead when its rid is
+  tombstoned and the snapshot holds no row at that rid (a reused rid stays).
 
 **Open.** Open is the newest `$FCK`, its segments and the tail `$FMB`s after
 `APPLIED_THROUGH`. No SQLite file is needed for counters, dictionary,
 instances, tokens or latest.
 
-## 7. Index choice (item 5)
+## 7. Index choice (item 5, settled in 3.11.0)
 
-- The SQLite index (`<feed>.db`) stays the default. It is a cache rebuilt from
-  the `$FMB` chain (§9).
-- FSG row-order segments replace it **per workload** only if every replay
-  workload on the 15 GB fixture is within about 10% of SQLite (native and AOT).
+- The SQLite index (`<feed>.db`) is a cache rebuilt from the `$FMB` chain (§9).
+- FSG row-order segments replace it **per read path** where the replay
+  workloads on that path are within about 10% of SQLite, native and AOT, with
+  equal answer hashes. Result (3.11.0):
+
+| Read path | Workloads | Answered by |
+|---|---|---|
+| seq walk (`ORDER_SEQ` asc/desc, no w range) | explorer, retention SCAN, scan_all | `ROWS_BY_SEQ` |
+| object key (`NORAD_CAT_ID =` and other object predicates) | sync_norad | `ROWS_BY_OBJECT_EPOCH` |
+| w range, delivery time, copy ts | sync_window, w walks | SQLite (`r_w`, `r_a`, `r_t`) |
+| CID | GET by CID | SQLite (`r_c`) |
+| latest per object | latest | `LATEST` segments (§3.3), unchanged |
+
 - Reads go through the same `p4_reader.h` / virtual-table interface over
-  "segments + tail": the in-memory view of rows after the newest checkpoint
-  plays the part that `Staged` plays today.
-- The `FSG` layout freezes when item 5 lands. Until then only kinds below
-  `ROWS_BY_SEQ` are written.
+  "segments + tail". The tail is the rows the `$FMB` chain added after
+  `APPLIED_THROUGH`, sorted in memory. Each candidate's row is read by rid, so
+  a removed row's pair that has not yet left its segment answers nothing.
+- A segment's pairs stay on disk and are read a page (128 pairs) at a time;
+  the first pair of each page (the fence keys, 0.25 B per pair) stays in
+  memory, so a lookup is one page read.
+- **Integrity.** A row-order segment is digest-checked (sha256, the
+  FlatBuffer verifier, its header, sorted pairs) once per process. Segments are
+  immutable and content-addressed, so the checked identity (file, generation,
+  offset, length, digest) is kept and later loads skip the hash. The check runs
+  on the checkpoint worker, never on a reader or the writer; until it is done
+  the SQLite index answers. A segment this process wrote is checked by
+  construction (its digest is the hash of the bytes it appended).
+- SQLite keeps `r_s` and `r_ke` (the tail's keys and the answer while a
+  segment is unchecked).
+- Measured (gate fixture: 1 GB WXF sea feed, 3 seed days of OMM; 5
+  interleaved repetitions, base = 3.10.1's SQLite paths, each build on its
+  own fixture from the same input; medians, ms; ratio = SQLite / FSG):
+
+| Workload | native cold | native warm | AOT cold | AOT warm |
+|---|---|---|---|---|
+| explorer | 15.81 → 17.41 (0.91x) | 9.49 → 8.98 (1.06x) | 21.16 → 22.27 (0.95x) | 14.11 → 13.91 (1.01x) |
+| sync_norad | 200 → 191 (1.05x) | 6.21 → 6.24 (1.00x) | 200 → 194 (1.03x) | 7.95 → 7.82 (1.02x) |
+| retention | 123 → 120 (1.03x) | | 132 → 129 (1.02x) | |
+| scan_all (114,966 records, 3 pages, a tile writer beside it) | 902 → 912 (0.99x) | | 1202 → 1215 (0.99x) | |
+| sync_window / latest / open / gp_ingest / wxf_lead | 0.96x to 1.03x | | 0.99x to 1.03x | |
+
+  A second run of the read paths gave explorer cold 0.94x native and 0.93x
+  AOT, warm 1.10x and 1.00x. The scan alone runs about 160,000 records/s
+  native on either path; a concurrent PUT's ack p99 stays 8 to 12 ms during
+  the scan (idle p99 17 to 25 ms on this run's load), so the scan does not
+  stall the writer.
+  First load (one-time per segment per process, off the read path): sha256
+  of the gate's OMM row orders, 5.84 MB in 3 segments, 18.5 ms native (316
+  MB/s). Steady state: no hash; one page read per run per lookup, cached.
+  Load average 3.5 to 7.6 on 28 cores.
 
 ## 8. Backups and archives: CARv2
 
@@ -712,13 +763,13 @@ E = estimated; the implementing release measures it.
 | Records over 1 MiB are a DAG of raw-leaf sub-ranges | §4.2: 1 MiB leaves; UnixFS root byte-equal to `ipfs add --raw-leaves --chunker=size-1048576` | about 410 B root node + 32 B per leaf in `FMBLarge`; no fixture record exceeds 1 MiB (M: max 8,720 B) |
 | Backups and archives are IPLD CARv2 (record blocks, index segments, checkpoint root DAG); backups are tables themselves | §8: deterministic CARv2 of the feed root; restore = the same apply path as recovery; a restored CAR is a feed | CAR overhead (E): about 40 B per block section + 40 B index entry: OMM about 1.25x its live stream, WXF about 1.01x. dag-pb links about 44 B per record (in the node's blockstore, not FlatSQL's) |
 | Announce roots, not records; IPFS per feed, off by default; restricted feeds never registered or served | §4.3, §11: FlatSQL computes roots and range tuples for every feed (cheap, and needed for backups); registration, providing and serving are the node's per-feed policy | DHT load: one provider record per feed root per checkpoint, instead of per record |
-| FlatBuffer index segments may replace SQLite per workload within about 10% | §3.3, §6, §7: `FSGPair` sorted vectors, LSM, whole-segment retention, behind the same reader interface | 32 B per row per order (5 orders = 160 B/row) against SQLite's 193 B/row for OMM (M: 120.7 MB / 623,462) and 180 B/row for WXF (M: 309.8 MB / 1,720,179) |
+| FlatBuffer index segments may replace SQLite per workload within about 10% | §3.3, §6, §7: `FSGPair` sorted vectors, LSM, whole-segment retention, behind the same reader interface. 3.11.0: the seq walk and the object-key path answer from `ROWS_BY_SEQ` / `ROWS_BY_OBJECT_EPOCH`; the rest stays on SQLite (§7 table) | 32 B per row per order (2 orders written = 64 B/row). M (gate fixture): `$FSG` bytes 22.9 MB for 298,986 rows across 3 streams (OMM 15.3 MB = 17.3% of its 88.3 MB stream; WXF sea 7.6 MB = 0.74%); checkpoint install step 96 ms on one round (73 ms in 3.10.1) |
 | Room for analytics column segments | `fckSegmentKind` 64–127 and `FSG.COLUMN` reserved; root link `"columns"` reserved; no code (YAGNI) | none |
 | Zero back-compat | format 4 refused (`P4_E_FORMAT`); nodes rebuild by re-sync | one re-sync per node |
 | Ack and durability | §5: one stream sync per touched stream; index commit unsynced (WAL NORMAL) | **M: 4.79 ms per sync** (F_FULLFSYNC, gate: 16 syncs = 76.66 ms). Gate `wxf_lead` 746 ms with 128 syncs (613 ms) → 64 syncs, about **−307 ms (−41%)**; `gp_ingest` 476 ms with 16 → 8, about **−38 ms (−8%)** (E from M) |
 | Crash recovery from the tail | §9: commit chain + digest-checked `$FMB`s; tail search ≤ about 64 MiB | open without the index (E): newest `$FCK` + segments + tail ≤ 64 MiB, **about 1 s**. Rebuilding the 15 GB fixture's SQLite index from the stream (E): one sequential read of 15.2 GB, about 1 µs/row of re-extraction, bulk-insert 2.34M rows, **about 15–30 s**, against format 4's rebuild, which re-hashes 15 GB with FlatSQL's software sha256 and loses seqs and provenance |
 | Read through IPFS vs direct | not a format change | (E) direct warm `pread` 5–20 µs/record; through the local filestore +30–100 µs/block (datastore lookup, `pread`, Kubo's re-hash); remote = network RTT + that. The sdn child measures it |
-| The node pulls per acknowledged round, so a pull costs what changed, not the feed | §4.3: `RANGES` from a commit walks only the nodes rewritten since; `FEED_ROOT` computes only the root; an earlier commits root comes from the forward cache | M (gate WXF sea feed, 110,915 blocks, against a 92-block feed of the same lane shape; medians of 7 rounds): `FEED_ROOT` 0.109 / 0.064 ms; `RANGES` from the prior commit 0.089 / 0.038 ms (14 blocks); earlier commits root 4 / 3 µs. The whole-closure `RANGES` on the sea feed costs 68.6 ms |
+| The node pulls per acknowledged round, so a pull costs what changed, not the feed | §4.3: `RANGES` from a commit walks only the nodes rewritten since; `FEED_ROOT` computes only the root; an earlier commits root comes from the forward cache; `DROPS` checks only its candidate CIDs against the cache's live entries (3.11.0), never rebuilding the closure | M (gate WXF sea feed, 110,915 blocks, against a 92-block feed of the same lane shape; medians of 7 rounds): `FEED_ROOT` 0.109 / 0.064 ms; `RANGES` from the prior commit 0.089 / 0.038 ms (14 blocks); earlier commits root 4 / 3 µs. The whole-closure `RANGES` on the sea feed costs 68.6 ms. 3.11.0: `DROPS` from the prior commit 0.020 / 0.012 ms (51.1 ms on the sea feed in 3.10.1, which rebuilt the whole closure per call) |
 
 What the releases measure (each its own release, `cmd node
 cpp/tests/p4-replay.e2e.mjs`):
