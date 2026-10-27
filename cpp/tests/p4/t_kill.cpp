@@ -287,7 +287,7 @@ P4_SLOW_TEST(t_kill_run) {
 }
 
 namespace {
-bool killCheck(const std::string& root, std::string* why) {
+bool killCheck(const std::string& root, std::string* why, int* compactions = nullptr) {
     EngineOpts o;
     o.flushEntries = 5000;
     if (openEngine(root, o) != P4_OK) {
@@ -314,16 +314,50 @@ bool killCheck(const std::string& root, std::string* why) {
             return false;
         }
         files++;
-        // The feed's stream, as a stock reader walks it (the generation the
-        // index's meta names).
+        // Compaction can replace both the stream and its row offsets while
+        // this checker runs. Read meta and rows in one SQLite transaction,
+        // and hold that generation alive for the independent stock walk.
+        auto* e = fp::currentEngine();
+        auto* t = e->findType("PNM");
+        fp::Feed* feed = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(t->mu);
+            for (auto& candidate : t->feeds)
+                if (candidate && candidate->path == f) feed = candidate.get();
+        }
         sqlite3* db = nullptr;
-        openSide(f, &db);
-        sqlite3_stmt* q;
+        std::shared_ptr<fp::Stream> stream;
+        auto fail = [&](const std::string& error) {
+            *why = error;
+            sqlite3_close(db);
+            stream.reset();
+            closeEngine();
+            return false;
+        };
+        if (!feed) return fail("feed missing: " + f);
+        if (openSide(f, &db) != SQLITE_OK) return fail("open index: " + f);
+        sqlite3_stmt* q = nullptr;
         int64_t gen = 0, mark = 0;
-        sqlite3_prepare_v2(db, "SELECT k, v FROM meta WHERE k IN ('gen', 'mark')", -1, &q, nullptr);
-        while (sqlite3_step(q) == SQLITE_ROW)
-            (std::strcmp(reinterpret_cast<const char*>(sqlite3_column_text(q, 0)), "gen") == 0 ? gen : mark) = sqlite3_column_int64(q, 1);
-        sqlite3_finalize(q);
+        for (int tries = 0; tries < 4; tries++) {
+            if (tries) sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            if (sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK)
+                return fail("begin snapshot: " + f);
+            gen = mark = 0;
+            int rc = sqlite3_prepare_v2(db, "SELECT k, v FROM meta WHERE k IN ('gen', 'mark')", -1, &q, nullptr);
+            if (rc == SQLITE_OK)
+                while ((rc = sqlite3_step(q)) == SQLITE_ROW)
+                    (std::strcmp(reinterpret_cast<const char*>(sqlite3_column_text(q, 0)), "gen") == 0 ? gen : mark) = sqlite3_column_int64(q, 1);
+            sqlite3_finalize(q);
+            if (rc != SQLITE_DONE) return fail("read snapshot metadata: " + f);
+            if (mark == 0) break;
+            int32_t status = P4_OK;
+            stream = fp::streamAt(feed, uint32_t(gen), &status);
+            if (status != P4_OK) return fail("open snapshot stream: " + f);
+            if (stream) break;
+            // The generation retired before we pinned it. Retry from a new
+            // snapshot, as the engine's readers do.
+        }
+        if (mark != 0 && !stream) return fail("snapshot generation retired: " + f);
         const std::string base = f.substr(0, f.size() - 3);
         const std::string sp = gen == 0 ? base + ".fsdata" : base + "." + std::to_string(gen) + ".fsdata";
         std::map<int64_t, int64_t> fr;
@@ -331,12 +365,17 @@ bool killCheck(const std::string& root, std::string* why) {
         std::error_code sec;
         if (walk.empty() && mark != 0 && int64_t(std::filesystem::file_size(sp, sec)) != mark) walk = "size != mark";
         if (!walk.empty()) {
-            *why = "stream " + sp + ": " + walk;
-            sqlite3_close(db);
-            closeEngine();
-            return false;
+            return fail("stream " + sp + ": " + walk);
         }
         frames += int64_t(fr.size());
+        if (compactions && mark != 0) {
+            fp::Internal in;
+            in.what = feed->fid;
+            in.force = true;
+            if (fp::runOnWriter(e, t, fp::kOpCompact, &in) != P4_OK || in.b == 0)
+                return fail("forced compaction: " + f);
+            ++*compactions;
+        }
         sqlite3_prepare_v2(db, "SELECT off, len FROM r", -1, &q, nullptr);
         while (sqlite3_step(q) == SQLITE_ROW) {
             auto it = fr.find(sqlite3_column_int64(q, 0));
@@ -427,6 +466,25 @@ bool killCheck(const std::string& root, std::string* why) {
            above && nodesLeft == 0 && unframed == 0 && unbatched == 0 && badBytes == 0;
 }
 }  // namespace
+
+// Real store lifecycle with compaction forced between the stock stream walk
+// and the row reads. Without a shared snapshot, every live row can appear
+// unframed even though GET and REBUILD both verify the store successfully.
+P4_TEST(t_kill_check_compaction) {
+    const std::string root = scratchDir("check-compaction") + "/store";
+    REQUIRE(openEngine(root) == P4_OK, "open");
+    REQUIRE(registerType(killType()) == P4_OK, "register");
+    uint64_t id = 100000000;
+    for (int c = 0; c < 4; c++) killWorkStep(c, &id);
+    closeEngine();
+    int compactions = 0;
+    std::string why;
+    const bool ok = killCheck(root, &why, &compactions);
+    std::printf("  compactions %d: %s\n", compactions, why.c_str());
+    CHECK(compactions > 0, "compacted during verification");
+    CHECK(ok, why);
+    removeTree(root);
+}
 
 P4_SLOW_TEST(t_kill_check) {
     const std::string root = argStr("store", "");
