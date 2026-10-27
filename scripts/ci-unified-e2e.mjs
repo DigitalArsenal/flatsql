@@ -50,10 +50,19 @@ const root=await fs.mkdtemp(path.join(os.tmpdir(),'flatsql-unified-e2e-'));
 let db;
 try {
   db=await FlatSQL.open({root});
-  await db.registerSchema({name:'GJN',fileIdentifier:'$GJN',bfbs});
+  await db.registerSchema({name:'GJN',fileIdentifier:'$GJN',bfbs,fullText:true});
   await db.close();db=await FlatSQL.open({root});
-  const ingest=rows(await db.ingest('GJN',record,{source:'customer',provider:'external-flatc'}));
+  const ingest=rows(await db.ingest('GJN',record,{source:'customer',provider:'external-flatc',signatures:[new Uint8Array([1,2,3,4])]}));
   assert.equal(ingest.length,1);
+  assert.deepEqual(rows(await db.execute(request('SELECT _signature FROM GJN')))[0][0].BYTES_VALUE,[1,2,3,4]);
+  const searchUntil = Date.now() + 10000;
+  for (;;) {
+    try {
+      const found=rows(await db.execute(request('SELECT _rowid FROM GJN WHERE _search MATCH ?1',{PARAMETERS:[{KIND:'Text',TEXT_VALUE:'"polygon" AND "hole"'}]})));
+      assert.equal(found.length,1);break;
+    } catch(error) { if(![-6,-9].includes(error.status) || Date.now()>searchUntil)throw error; await new Promise(resolve=>setTimeout(resolve,10)); }
+  }
+
   const projected=rows(await db.execute(request('SELECT geo_contains(_data,2,2),geo_contains(_data,5,5),geo_area_geom(_data),geo_envelope(_data) FROM GJN')));
   assert.equal(projected.length,1);
   assert.equal(projected[0][0].INT_VALUE,1); assert.equal(projected[0][1].INT_VALUE,0);
@@ -98,6 +107,11 @@ try {
   db=await FlatSQL.open({root});
   assert.deepEqual(await db.execute(request('SELECT _data FROM GJN'),{records:true}),record);
   assert.equal(rows(await db.execute(request('SELECT COUNT(*) FROM "GJN@customer"')))[0][0].INT_VALUE,1);
+  assert.equal(rows(await db.remove('GJN',record))[0][0].INT_VALUE,1);
+  assert.equal(rows(await db.execute(request('SELECT COUNT(*) FROM GJN')))[0][0].INT_VALUE,0);
+  await db.close();db=await FlatSQL.open({root});
+  assert.equal(rows(await db.execute(request('SELECT COUNT(*) FROM GJN')))[0][0].INT_VALUE,0);
+
   await db.close(); db=null;
   if(packageRoot) {
     const cli=path.join(packageRoot,'bin/flatsql.mjs');

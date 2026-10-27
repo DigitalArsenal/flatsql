@@ -72,7 +72,7 @@ assert.deepEqual(imported.map(i => `${i.module}.${i.name}:${i.kind}`).sort(), [
   'env.memory:memory', 'wasi.thread-spawn:function',
 ].sort());
 assert.deepEqual(WebAssembly.Module.exports(module).map(e => `${e.name}:${e.kind}`).sort(), [
-  ...['activate','alloc','free','init','layout','register_type','set_quota','start','stats','stop','wake','ingest_request'].map(n => `flatsql_${n}:function`),
+  ...['activate','alloc','free','init','layout','register_type','set_quota','start','stats','stop','wake','record_request'].map(n => `flatsql_${n}:function`),
   '_initialize:function', 'wasi_thread_start:function', 'memory:memory',
 ].sort());
 const memory = importedMemory(bytes);

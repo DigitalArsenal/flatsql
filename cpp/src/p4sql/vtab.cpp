@@ -136,11 +136,12 @@ int32_t sourcesOf(LaneState* ls, const std::string& type, std::vector<std::strin
 namespace {
 
 // Hidden columns after the schema columns and format 1's four meta columns.
-enum Meta : int { kSource = 0, kRowid, kOffset, kData, kSeq, kCid, kTs, kEpoch, kProducer, kPeer, kMetaCount };
+enum Meta : int { kSource = 0, kRowid, kOffset, kData, kSeq, kCid, kTs, kEpoch, kProducer, kPeer, kSignature, kSearch, kMetaCount };
 const char* const kMetaDecl[kMetaCount] = {
     "\"_source\" TEXT",          "\"_rowid\" INTEGER",       "\"_offset\" INTEGER",    "\"_data\" BLOB",
     "\"_seq\" INTEGER HIDDEN",   "\"_cid\" TEXT HIDDEN",     "\"_ts\" INTEGER HIDDEN", "\"_epoch\" INTEGER HIDDEN",
     "\"_producer\" TEXT HIDDEN", "\"_peer\" TEXT HIDDEN",
+    "\"_signature\" BLOB HIDDEN", "\"_search\" TEXT HIDDEN",
 };
 
 struct RelVtab : sqlite3_vtab {
@@ -229,11 +230,13 @@ int relBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
     for (int i = 0; i < info->nConstraint; i++) {
         const auto& c = info->aConstraint[i];
         if (!c.usable) continue;
-        const char op = opChar(c.op);
+        const bool search = c.iColumn == vt->meta(kSearch) && c.op == SQLITE_INDEX_CONSTRAINT_MATCH;
+        const char op = search ? '~' : opChar(c.op);
         if (!op) continue;
         char target = 0;
         const int col = c.iColumn;
-        if (col == -1 || col == vt->meta(kRowid) || col == vt->meta(kSeq)) target = 'S';
+        if (search) target = 'F';
+        else if (col == -1 || col == vt->meta(kRowid) || col == vt->meta(kSeq)) target = 'S';
         else if (col == vt->meta(kEpoch)) target = 'E';
         else if (col == vt->meta(kTs)) target = 'T';
         else if (col >= 0 && col == vt->t->col0) target = 'A';
@@ -241,7 +244,7 @@ int relBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         else if (col == vt->meta(kSource) && op == '=') target = 'R';
         if (!target) continue;
         info->aConstraintUsage[i].argvIndex = ++argc;
-        info->aConstraintUsage[i].omit = 0;
+        info->aConstraintUsage[i].omit = search ? 1 : 0;
         plan += target;
         plan += op;
         if (op == '=') rows = target == 'S' ? 1 : target == 'R' ? rows : rows / 100;
@@ -409,6 +412,13 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
         }
         int64_t iv = 0;
         switch (target) {
+            case 'F': {
+                if (sqlite3_value_type(v) != SQLITE_TEXT) return fail(c, FLATSQL_E_ARG, "full-text search requires text");
+                const std::string term(reinterpret_cast<const char*>(sqlite3_value_text(v)), size_t(sqlite3_value_bytes(v)));
+                if (term.empty() || term.find('\0') != std::string::npos) return fail(c, FLATSQL_E_ARG, "empty or invalid full-text search");
+                args.search = args.search.empty() ? term : "(" + args.search + ") AND (" + term + ")";
+                break;
+            }
             case 'S':
                 if (intBound(v, op, &iv, &seq.empty)) applySeq(&seq, op, iv);
                 break;
@@ -536,6 +546,10 @@ int relColumn(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int i) {
             if (r.producer) sqlite3_result_text(ctx, r.producer, -1, SQLITE_TRANSIENT);
             else sqlite3_result_null(ctx);
             break;
+        case kSignature:
+            if (r.sigLen) sqlite3_result_blob(ctx, r.sig, int(r.sigLen), SQLITE_TRANSIENT);
+            else sqlite3_result_null(ctx);
+            break;
         case kPeer:
             if (r.peer) sqlite3_result_text(ctx, r.peer, -1, SQLITE_TRANSIENT);
             else sqlite3_result_null(ctx);
@@ -625,6 +639,7 @@ int32_t RelScan::open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, con
     spec_.hydrate = a.hydrate ? 1 : 0;
     spec_.noTags = a.tags ? 0 : 1;
     spec_.bound = t.bound;
+    if (!a.search.empty()) { strs_.push_back(a.search); spec_.search = strs_.back().c_str(); }
     if (alias_) {
         if (rel.empty) return FLATSQL_OK;   // a source the type holds no feed of (C-39 S1): no rows
         strs_.push_back(rel.source);

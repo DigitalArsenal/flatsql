@@ -122,18 +122,32 @@ export class FlatSQL {
       [6, 4 * 1024 * 1024, 8], [7, 3], [8, 4096], [10, maxRows], [12, fullText ? 1 : 0, 1]]);
     await this.#withBytes(spec, async p => check(await this.#host.call('flatsql_register_type', p, spec.length)));
   }
-  async ingest(type, frames, options = {}) {
+  ingest(type, frames, options = {}) { return this.#records(1, type, frames, options); }
+  remove(type, frames, options = {}) { return this.#records(3, type, frames, options); }
+  async #records(opcode, type, frames, options) {
     this.#assertOpen(); bytes(frames);queryOptions(options);
     if(options.timestamp!==undefined)integer(options.timestamp,'timestamp');
     const tags = options.source ? [[51, control([[1, options.provider ?? 'local'], [2, options.source],
       ...(options.batch ? [[4, options.batch]] : [])])]] : [];
-    const meta = control([[1, type], [50, options.producer ?? 'local'], ...tags, [54, options.timestamp ?? Math.floor(Date.now() / 1000), 8]]);
+    const signatures = [];
+    if (options.signatures !== undefined) {
+      if (opcode !== 1 || !Array.isArray(options.signatures)) throw new TypeError('Signatures require an ingest array');
+      const header = new Uint8Array(4); new DataView(header.buffer).setUint32(0, options.signatures.length, true);
+      const parts = [header];
+      for (const signature of options.signatures) {
+        bytes(signature); integer(signature.length, 'signature size', 0, 65535);
+        const length = new Uint8Array(2); new DataView(length.buffer).setUint16(0, signature.length, true);
+        parts.push(length, signature);
+      }
+      signatures.push([55, join(parts)]);
+    }
+    const meta = control([[1, type], [50, options.producer ?? 'local'], ...tags, ...signatures, [54, options.timestamp ?? Math.floor(Date.now() / 1000), 8]]);
     const request = await this.#withBytes(frames, f => this.#withBytes(meta, async m => {
       const out = await this.#host.call('flatsql_alloc', 8);
       if (!out) throw new FlatSQLError(-2);
       let prepared = 0;
       try {
-        check(await this.#host.call('flatsql_ingest_request', f, frames.length, m, meta.length, out, out + 4));
+        check(await this.#host.call('flatsql_record_request', opcode, f, frames.length, m, meta.length, out, out + 4));
         const view = new DataView((await this.#host.read(out, 8)).buffer);
         prepared = view.getUint32(0, true);
         return await this.#host.read(prepared, view.getUint32(4, true));
@@ -142,7 +156,7 @@ export class FlatSQL {
         await this.#host.call('flatsql_free', out);
       }
     }));
-    return this.#collect(this.#stream(1, request, options), options.maxResultBytes);
+    return this.#collect(this.#stream(opcode, request, options), options.maxResultBytes);
   }
   query(request, options = {}) { bytes(request); return this.#stream(30, request, options); }
   async execute(request, options = {}) { return this.#collect(this.query(request, options), options.maxResultBytes); }

@@ -38,6 +38,8 @@ export interface BinarySchema {
   fullText?: boolean;
 }
 export interface IngestOptions extends QueryOptions {
+  /** One opaque signature per input record, in frame order. */
+  signatures?: Uint8Array[];
   provider?: string;
   source?: string;
   producer?: string;
@@ -49,6 +51,8 @@ export class FlatSQL {
   registerSchema(schema: BinarySchema): Promise<void>;
   /** Frames are [u32 little-endian length][FlatBuffer payload], concatenated. */
   ingest(type: string, frames: Uint8Array, options?: IngestOptions): Promise<Uint8Array>;
+  /** Remove records by their original binary payloads; returns an SDS QRP receipt. */
+  remove(type: string, frames: Uint8Array, options?: QueryOptions): Promise<Uint8Array>;
   /** QRP request in; chunks of a size-prefixed QRP result stream out. */
   query(request: Uint8Array, options?: QueryOptions): AsyncGenerator<Uint8Array>;
   execute(request: Uint8Array, options?: QueryOptions): Promise<Uint8Array>;

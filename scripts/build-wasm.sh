@@ -37,7 +37,7 @@ if [[ "${1:-}" == --linux ]]; then
 elif [[ $# == 0 ]]; then
   : "${WASI_SDK_PATH:?Set WASI_SDK_PATH to wasi-sdk 30.0, or use --linux}"
   [[ "$(head -1 "$WASI_SDK_PATH/VERSION")" == 30.0 ]]
-  cmake -S cpp -B cpp/build-unified-wasm \
+  cmake -S cpp -B cpp/build-unified-wasm -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$root/cpp/cmake/wasi-threads-toolchain.cmake" \
     -DWASI_SDK_PREFIX="$WASI_SDK_PATH" -DCMAKE_BUILD_TYPE=Release
   cmake --build cpp/build-unified-wasm --target flatsql_p4_threads --parallel "${FLATSQL_BUILD_JOBS:-6}"

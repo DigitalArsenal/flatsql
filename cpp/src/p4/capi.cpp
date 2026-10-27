@@ -111,10 +111,11 @@ FLATSQL_EXPORT("flatsql_alloc") void* flatsql_alloc(int32_t n) {
 
 FLATSQL_EXPORT("flatsql_free") void flatsql_free(void* p) { std::free(p); }
 
-FLATSQL_EXPORT("flatsql_ingest_request") int32_t flatsql_ingest_request(
-    const uint8_t* frames, int32_t size, const uint8_t* metadata, int32_t metadataSize, uint8_t** output, uint32_t* outLen) {
+FLATSQL_EXPORT("flatsql_record_request") int32_t flatsql_record_request(
+    int32_t opcode, const uint8_t* frames, int32_t size, const uint8_t* metadata, int32_t metadataSize, uint8_t** output, uint32_t* outLen) {
     using namespace flatsql::p4;
     if (!gEngine) return FLATSQL_E_STOPPED;
+    if (opcode != FLATSQL_OPC_PUT && opcode != FLATSQL_OPC_DELETE) return FLATSQL_E_ARG;
     if (!frames || size < 12 || metadataSize < 0 || (!metadata && metadataSize) || !output || !outLen) return FLATSQL_E_ARG;
     *output = nullptr;
     *outLen = 0;
@@ -129,7 +130,11 @@ FLATSQL_EXPORT("flatsql_ingest_request") int32_t flatsql_ingest_request(
     if (tlvU64(tags, 54, &timestamp, &bad)) at = int64_t(timestamp);
     if (bad) return FLATSQL_E_ARG;
     std::vector<uint8_t> request;
+    const Tlv* signatures = tlvFind(tags, 55);
+    size_t sigAt = 4;
+    if (signatures && (signatures->n < 4 || opcode != FLATSQL_OPC_PUT)) return FLATSQL_E_ARG;
     for (const auto& tag : tags) {
+        if (tag.tag == 55) continue;
         if (tag.tag != 1 && tag.tag != 50 && tag.tag != 51 && tag.tag != 54) return FLATSQL_E_ARG;
         tlvPut(request, tag.tag, tag.v, tag.n);
     }
@@ -141,21 +146,35 @@ FLATSQL_EXPORT("flatsql_ingest_request") int32_t flatsql_ingest_request(
         if (size_t(size) - offset < 4) return FLATSQL_E_ARG;
         const size_t n = ld32(frames + offset);
         if (n < 8 || n > size_t(size) - offset - 4) return FLATSQL_E_ARG;
-        const size_t start = records.size();
-        // flags/reserved, CIDv1 raw SHA-256, timestamp, frame size, frame,
-        // empty signature. The storage engine verifies and commits this batch.
-        if (request.size() + start + n + 64 > gEngine->cfg.writeReqBytes) return FLATSQL_E_BUDGET;
-        records.resize(start + 52 + n + 4 + 2, 0);
-        uint8_t* out = records.data() + start;
-        out[4] = 1; out[5] = 0x55; out[6] = 0x12; out[7] = 0x20;
-        flatsql::ps::sha256(frames + offset + 4, n, out + 8);
-        st64(out + 40, uint64_t(at));
-        st32(out + 48, uint32_t(n + 4));
-        std::memcpy(out + 52, frames + offset, n + 4);
+        uint8_t cid[36] = {1, 0x55, 0x12, 0x20};
+        flatsql::ps::sha256(frames + offset + 4, n, cid + 4);
+        if (opcode == FLATSQL_OPC_DELETE) {
+            records.insert(records.end(), cid, cid + sizeof cid);
+        } else {
+            uint16_t sigLen = 0;
+            const uint8_t* sig = nullptr;
+            if (signatures) {
+                if (sigAt > signatures->n || signatures->n - sigAt < 2) return FLATSQL_E_ARG;
+                sigLen = ld16(signatures->v + sigAt); sigAt += 2;
+                if (sigLen > signatures->n - sigAt) return FLATSQL_E_ARG;
+                sig = signatures->v + sigAt; sigAt += sigLen;
+            }
+            const size_t start = records.size();
+            if (request.size() + start + n + sigLen + 64 > gEngine->cfg.writeReqBytes) return FLATSQL_E_BUDGET;
+            records.resize(start + 52 + n + 4 + 2 + sigLen, 0);
+            uint8_t* out = records.data() + start;
+            std::memcpy(out + 4, cid, sizeof cid);
+            st64(out + 40, uint64_t(at));
+            st32(out + 48, uint32_t(n + 4));
+            std::memcpy(out + 52, frames + offset, n + 4);
+            st16(out + 56 + n, sigLen);
+            if (sigLen) std::memcpy(out + 58 + n, sig, sigLen);
+        }
         offset += n + 4;
     }
+    if (signatures && (sigAt != signatures->n || ld32(signatures->v) != count)) return FLATSQL_E_ARG;
     st32(records.data(), count);
-    tlvPut(request, 53, records.data(), uint32_t(records.size()));
+    tlvPut(request, opcode == FLATSQL_OPC_PUT ? 53 : 40, records.data(), uint32_t(records.size()));
     if (request.size() > gEngine->cfg.writeReqBytes) return FLATSQL_E_BUDGET;
     auto* bytes = static_cast<uint8_t*>(std::malloc(request.size()));
     if (!bytes) return FLATSQL_E_NOMEM;

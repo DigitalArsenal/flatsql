@@ -18,7 +18,10 @@ There are no PS/P4 selectors, old engine aliases, or compatibility modes.
 - `ingest(type, records, metadata)` accepts concatenated frames:
   `[u32 little-endian payload length][FlatBuffer payload]`. The guest validates
   records, computes identities, persists streams and updates indexes. Provider,
-  source, producer, batch and timestamp metadata are optional.
+  source, producer, batch and timestamp metadata are optional. `signatures`
+  supplies one opaque byte array per record, retained in `_signature`.
+- `remove(type, records)` deletes those original binary payloads and returns a
+  QRP receipt. Record hashing and deletion stay inside the engine.
 - `query(request, options)` returns an async stream of byte chunks; `execute`
   collects it within a byte budget. Requests are canonical SDS QRP buffers,
   optionally size-prefixed, with `KIND=Request` and `REPRESENTATION=FlatBuffer`
@@ -33,6 +36,12 @@ There are no PS/P4 selectors, old engine aliases, or compatibility modes.
 - `SELECT _data` with `{records:true}` streams original record frames unchanged.
   IDs, properties, altitude, null geometry and bounding boxes are preserved
   byte for byte. Derived geometry has the separate semantics below.
+- With `registerSchema({..., fullText:true})`, SQL `_search MATCH ?1` uses the
+  engine's FTS5 index over the record's text fields, including nested text.
+  The engine returns `BUSY` while its background index catches up; retry the
+  query, and never treat that condition as zero matches.
+- Hidden metadata columns `_cid`, `_seq`, `_ts`, `_epoch`, `_producer`, `_peer`
+  and `_signature` are available alongside `_source`, `_rowid` and `_data`.
 - Root scalar/string/byte-vector fields are exposed by BFBS reflection.
   Complex/nested fields remain in `_data`. Unsigned integers above the SQLite
   signed 64-bit range produce an error; retrieve `_data` to preserve them.

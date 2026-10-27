@@ -222,6 +222,7 @@ struct ScanPred {
 struct ScanArgs {
     int64_t seqAfter = 0, seqThrough = 0;   // exclusive / inclusive; 0 = none
     std::vector<ScanPred> preds;
+    std::string search;
     bool desc = false;                      // seq descending, else ascending
     bool hydrate = true;
     bool tags = true;                       // _source is read

@@ -147,12 +147,13 @@ FLATSQL_EXPORT("flatsql_stop")          int32_t flatsql_stop(double deadlineMs);
 FLATSQL_EXPORT("flatsql_alloc")         void*   flatsql_alloc(int32_t n);          /* wasm only */
 FLATSQL_EXPORT("flatsql_free")          void    flatsql_free(void* p);             /* wasm only */
 
-/* Prepare an ingest mailbox request from an unchanged stream of size-prefixed
- * records. Metadata is the control TLV (type, producer, source tags, timestamp).
+/* Prepare a PUT or DELETE mailbox request from an unchanged stream of size-prefixed
+ * records. Metadata is the control TLV (type, producer, source tags, timestamp;
+ * tag 55: u32 signature count, then u16 length + bytes per PUT record).
  * CID computation stays in the guest. Returns status and an allocated buffer.
  * Caller frees *output with flatsql_free. */
-FLATSQL_EXPORT("flatsql_ingest_request") int32_t flatsql_ingest_request(
-    const uint8_t* frames, int32_t size, const uint8_t* metadata, int32_t metadataSize, uint8_t** output, uint32_t* outLen);
+FLATSQL_EXPORT("flatsql_record_request") int32_t flatsql_record_request(
+    int32_t opcode, const uint8_t* frames, int32_t size, const uint8_t* metadata, int32_t metadataSize, uint8_t** output, uint32_t* outLen);
 
 #ifdef __cplusplus
 }

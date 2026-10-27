@@ -859,6 +859,9 @@ int32_t Scan::open() {
         // FTS5 (background index; C-4's exception), checked a page at a time.
         // A type without records answers none (below).
         if (!sp_->fullText || (t_->hasFiles.load(std::memory_order_acquire) && !ioExists(t_->pFts))) return FLATSQL_E_UNSUPPORTED;
+        // A search is complete only after its index covers this snapshot.
+        { std::lock_guard<std::mutex> lock(t_->ftsMu);
+          if (t_->ftsThrough < hi_) return FLATSQL_E_BUSY; }
         fts_ = true;
     }
     if (s_.order == 0) s_.order = FLATSQL_ORDER_SEQ_ASC;
