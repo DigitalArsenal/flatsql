@@ -24,7 +24,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     env:
-      FLATSQL_CI_RESULTS: ${{ github.workspace }}/.ci-results
+      FLATSQL_CI_RESULTS: ${{ github.workspace }}/ci-results
       FLATBUFFERS_DIR: ${{ github.workspace }}/../flatbuffers
       FLATSQL_BUILD_JOBS: '4'
     steps:
@@ -51,5 +51,5 @@ jobs:
         if: always()
         with:
           name: e2e-results-${{ matrix.os }}
-          path: ${{ github.workspace }}/.ci-results
+          path: ${{ github.workspace }}/ci-results
           if-no-files-found: warn

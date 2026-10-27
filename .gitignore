@@ -35,4 +35,4 @@ stress/results/
 cpp/build-native/
 cpp/build-gauntlet/
 cpp/build-ci-e2e/
-.ci-results/
+ci-results/
