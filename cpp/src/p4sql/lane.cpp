@@ -1,3 +1,4 @@
+#include "flatsql/query_page.h"
 // FlatSQL store format 4, SQL surface: the lane hooks (CONTRACT.md §3.9).
 //
 // Copy-adapted from format 2's ps/lane.cpp (prepare, bind, step, the RB1 and
@@ -14,18 +15,19 @@
 // nothing left to refuse.
 //
 // Status mapping (all returned, never trapped):
-//   P4_E_ARG        malformed parameters
-//   P4_E_SQL        SQL errors, sandbox refusals, a raw stream with a non-BLOB cell
-//   P4_E_BUDGET     result rows or bytes, VM steps, the sandbox heap cap, or a
+//   FLATSQL_E_ARG        malformed parameters
+//   FLATSQL_E_SQL        SQL errors, sandbox refusals, a raw stream with a non-BLOB cell
+//   FLATSQL_E_BUDGET     result rows or bytes, VM steps, the sandbox heap cap, or a
 //                   reader cap (rows examined, bytes read)
-//   P4_E_CANCELLED  the slot's cancel word
-//   P4_E_NOMEM      SQLite out of memory outside the sandbox cap
+//   FLATSQL_E_CANCELLED  the slot's cancel word
+//   FLATSQL_E_NOMEM      SQLite out of memory outside the sandbox cap
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <memory>
 
 #include "flatsql/ps/result_block.h"
+#include "flatsql/geo_functions.h"
 #include "internal.h"
 
 namespace rb1 = flatsql::ps::rb1;
@@ -85,13 +87,13 @@ int progress(void* p) {
         rc = p4_lane_check(ls->lane);
     }
     if (rc < 0) {
-        s->raise(rc, rc == P4_E_CANCELLED ? "cancelled" : "work budget exhausted");
+        s->raise(rc, rc == FLATSQL_E_CANCELLED ? "cancelled" : "work budget exhausted");
         return 1;
     }
     if (s->sandbox) {
         s->vmSteps += 4096;
         if (s->vmSteps > kSandboxMaxVmSteps) {
-            s->raise(P4_E_BUDGET, "work budget exhausted (VM steps)");
+            s->raise(FLATSQL_E_BUDGET, "work budget exhausted (VM steps)");
             return 1;
         }
     }
@@ -161,7 +163,7 @@ bool missingTable(const char* msg, std::string* name) {
 }
 
 // Out of memory: the sandbox heap cap, or the process.
-int32_t nomemStatus(const Stmt& st) { return st.capTripped() ? P4_E_BUDGET : P4_E_NOMEM; }
+int32_t nomemStatus(const Stmt& st) { return st.capTripped() ? FLATSQL_E_BUDGET : FLATSQL_E_NOMEM; }
 
 const char* kHeapCapMessage = "heap cap: the statement exceeds the sandbox lane heap";
 
@@ -177,7 +179,7 @@ int32_t prepare(LaneState* ls, Stmt& st, const char* sql, size_t n, sqlite3_stmt
         if (rc == SQLITE_OK) {
             if (!s) {
                 *msg = "empty statement";
-                return P4_E_SQL;
+                return FLATSQL_E_SQL;
             }
             if (st.sandbox) {
                 const char* why = nullptr;
@@ -191,22 +193,22 @@ int32_t prepare(LaneState* ls, Stmt& st, const char* sql, size_t n, sqlite3_stmt
                 if (why) {
                     sqlite3_finalize(s);
                     *msg = why;
-                    return P4_E_SQL;
+                    return FLATSQL_E_SQL;
                 }
             }
             *out = s;
-            return P4_OK;
+            return FLATSQL_OK;
         }
         const std::string err = sqlite3_errmsg(ls->db);
         if (s) sqlite3_finalize(s);
         if (rc == SQLITE_NOMEM) {
             const int32_t status = nomemStatus(st);
-            *msg = status == P4_E_BUDGET ? kHeapCapMessage : "out of memory";
+            *msg = status == FLATSQL_E_BUDGET ? kHeapCapMessage : "out of memory";
             return status;
         }
         if (st.sandbox && !auth.violation.empty()) {
             *msg = "sandbox: not-authorized: " + auth.violation;
-            return P4_E_SQL;
+            return FLATSQL_E_SQL;
         }
         std::string table;
         if (missingTable(err.c_str(), &table)) {
@@ -219,10 +221,10 @@ int32_t prepare(LaneState* ls, Stmt& st, const char* sql, size_t n, sqlite3_stmt
             if (made == 1) continue;   // retry with the relation in place
         }
         *msg = err;
-        return P4_E_SQL;
+        return FLATSQL_E_SQL;
     }
     *msg = "too many relations";
-    return P4_E_SQL;
+    return FLATSQL_E_SQL;
 }
 
 // ---- output -----------------------------------------------------------------------
@@ -283,31 +285,31 @@ public:
         if (!raw_) enc_.header(names);
     }
 
-    // P4_OK, or a status with *msg set.
+    // FLATSQL_OK, or a status with *msg set.
     int32_t row(const std::vector<Cell>& cells, std::string* msg) {
         if (maxRows_ && rows_ + 1 > maxRows_) {
             *msg = "row-cap: result exceeds the row limit";
-            return P4_E_BUDGET;
+            return FLATSQL_E_BUDGET;
         }
-        size_t need = raw_ ? 0 : (enc_.blockBytes() == 0 ? 16 : 0);
+        size_t need = raw_ ? 0 : enc_.pendingBytes() + 64;
         for (const Cell& c : cells) {
             if (raw_) {
                 if (c.type != SQLITE_BLOB) {
                     *msg = "not-a-record-stream: raw stream queries must return only BLOB cells";
-                    return P4_E_SQL;
+                    return FLATSQL_E_SQL;
                 }
                 need += 4 + c.n;
             } else if (c.type == SQLITE_INTEGER || c.type == SQLITE_FLOAT) {
-                need += 9;
+                need += 48;
             } else if (c.type == SQLITE_TEXT || c.type == SQLITE_BLOB) {
-                need += 5 + c.n;
+                need += 48 + c.n;
             } else {
-                need += 1;
+                need += 32;
             }
         }
         if (maxBytes_ && emitted_ + buf_.size() + need > maxBytes_) {
             *msg = "byte-cap: result exceeds the byte limit";
-            return P4_E_BUDGET;
+            return FLATSQL_E_BUDGET;
         }
         if (raw_) {
             for (const Cell& c : cells) rb1::rawFrame(c.p, c.n, &buf_);
@@ -327,7 +329,7 @@ public:
         rows_++;
         // Emit whole blocks only: an open block's header is patched when it closes.
         if (buf_.size() >= rb1::kBlockTarget && enc_.blockBytes() == 0) return flush(msg);
-        return P4_OK;
+        return FLATSQL_OK;
     }
 
     // Closes the output: the open block and the rest, and the row count for
@@ -342,7 +344,7 @@ public:
 
 private:
     int32_t flush(std::string* msg) {
-        if (buf_.empty()) return P4_OK;
+        if (buf_.empty()) return FLATSQL_OK;
         int32_t rc;
         {
             EngineCall ec;
@@ -351,7 +353,7 @@ private:
         emitted_ += buf_.size();
         buf_.clear();
         if (rc < 0 && msg->empty())
-            *msg = rc == P4_E_CANCELLED ? "cancelled" : rc == P4_E_BUDGET ? "byte-cap: result exceeds the byte limit" : "emit failed";
+            *msg = rc == FLATSQL_E_CANCELLED ? "cancelled" : rc == FLATSQL_E_BUDGET ? "byte-cap: result exceeds the byte limit" : "emit failed";
         return rc;
     }
 
@@ -359,7 +361,7 @@ private:
     bool raw_;
     uint64_t maxRows_, maxBytes_;
     std::vector<uint8_t> buf_;
-    rb1::Encoder enc_;
+    query::Encoder enc_;
     uint64_t rows_ = 0;
     uint64_t emitted_ = 0;
 };
@@ -368,7 +370,7 @@ int32_t bindParams(sqlite3* db, sqlite3_stmt* s, const std::vector<rb1::Cell>& p
     const int np = sqlite3_bind_parameter_count(s);
     if (np != int(params.size())) {
         *msg = "parameter count mismatch: statement expects " + std::to_string(np);
-        return P4_E_SQL;
+        return FLATSQL_E_SQL;
     }
     for (size_t i = 0; i < params.size(); i++) {
         const rb1::Cell& c = params[i];
@@ -383,10 +385,10 @@ int32_t bindParams(sqlite3* db, sqlite3_stmt* s, const std::vector<rb1::Cell>& p
         }
         if (rc != SQLITE_OK) {
             *msg = sqlite3_errmsg(db);
-            return rc == SQLITE_NOMEM ? P4_E_NOMEM : P4_E_SQL;
+            return rc == SQLITE_NOMEM ? FLATSQL_E_NOMEM : FLATSQL_E_SQL;
         }
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // Runs a prepared statement into `out`. Returns the status.
@@ -406,11 +408,11 @@ int32_t run(LaneState* ls, Stmt& st, sqlite3_stmt* s, Out& out, std::string* msg
             }
             if (rc == SQLITE_NOMEM) {
                 const int32_t status = nomemStatus(st);
-                *msg = status == P4_E_BUDGET ? kHeapCapMessage : "out of memory";
+                *msg = status == FLATSQL_E_BUDGET ? kHeapCapMessage : "out of memory";
                 return status;
             }
             *msg = sqlite3_errmsg(ls->db);
-            return rc == SQLITE_INTERRUPT ? P4_E_CANCELLED : P4_E_SQL;
+            return rc == SQLITE_INTERRUPT ? FLATSQL_E_CANCELLED : FLATSQL_E_SQL;
         }
         if (st.status) {   // raised inside a vtab without failing the step
             *msg = st.message;
@@ -494,9 +496,9 @@ bool match(const char* sql, size_t n, std::string* relation) {
 // Serves the statement when it is the A18 raw stream: true and *status set,
 // or false (the SQL path runs it).
 bool dataStream(LaneState* ls, const P4SqlRequest* req, Out& out, int32_t* status, std::string* msg) {
-    if (!(req->flags & P4_SLOT_RAW) || req->paramsLen > 4 || !req->sql) return false;
+    if (!(req->flags & FLATSQL_SLOT_RAW) || !req->sql) return false;
     std::vector<rb1::Cell> params;
-    if (!rb1::decodeParams(req->params, req->paramsLen, &params) || !params.empty()) return false;
+    if (!flatsql::query::parameters(req->params, req->paramsLen, &params) || !params.empty()) return false;
     std::string name;
     if (!dscan::match(req->sql, req->sqlLen, &name)) return false;
     RelSpec rel;
@@ -507,23 +509,23 @@ bool dataStream(LaneState* ls, const P4SqlRequest* req, Out& out, int32_t* statu
     RelScan scan;
     int32_t rc = scan.open(ls, *t, rel, ScanArgs());
     std::vector<Cell> cells(1);
-    while (rc == P4_OK && !scan.eof()) {
+    while (rc == FLATSQL_OK && !scan.eof()) {
         const P4Row& r = scan.row();
         const uint8_t* p = nullptr;
         size_t n = 0;
         payloadOf(t->fid, r.data, r.dataLen, &p, &n);
         if (n == 0) {   // _data is NULL: not a BLOB cell, as on the SQL path
             *msg = "not-a-record-stream: raw stream queries must return only BLOB cells";
-            rc = P4_E_SQL;
+            rc = FLATSQL_E_SQL;
             break;
         }
         cells[0].type = SQLITE_BLOB;
         cells[0].p = p;
         cells[0].n = n;
         rc = out.row(cells, msg);
-        if (rc == P4_OK) rc = scan.next();
+        if (rc == FLATSQL_OK) rc = scan.next();
     }
-    if (rc < 0 && msg->empty()) *msg = rc == P4_E_CANCELLED ? "cancelled" : "reader cursor failed";
+    if (rc < 0 && msg->empty()) *msg = rc == FLATSQL_E_CANCELLED ? "cancelled" : "reader cursor failed";
     *status = rc;
     return true;
 }
@@ -568,13 +570,13 @@ int32_t surfaceRows(LaneState* ls, Out& out, std::string* msg) {
                 const int32_t w = out.row(cells, msg);
                 if (w < 0) return w;
             }
-            return P4_OK;
+            return FLATSQL_OK;
         };
         rc = relation(t->name, srcs.empty() ? table : view, none);
-        for (size_t i = 0; rc == P4_OK && i < srcs.size(); i++) rc = relation(t->name + "@" + srcs[i], table, srcs[i]);
+        for (size_t i = 0; rc == FLATSQL_OK && i < srcs.size(); i++) rc = relation(t->name + "@" + srcs[i], table, srcs[i]);
         if (rc < 0) return rc;
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 }  // namespace
@@ -595,13 +597,14 @@ extern "C" int32_t p4sql_lane_init(P4Lane* lane) {
                                    nullptr);
     if (rc != SQLITE_OK) {
         if (ls->db) sqlite3_close_v2(ls->db);
-        return rc == SQLITE_NOMEM ? P4_E_NOMEM : P4_E_SQL;
+        return rc == SQLITE_NOMEM ? FLATSQL_E_NOMEM : FLATSQL_E_SQL;
     }
+    flatsql::registerGeoFunctions(ls->db);
     sqlite3_exec(ls->db, "PRAGMA temp_store=MEMORY", nullptr, nullptr, nullptr);
     sqlite3_limit(ls->db, SQLITE_LIMIT_ATTACHED, 0);
     if (registerModule(ls.get()) != SQLITE_OK) {
         sqlite3_close_v2(ls->db);
-        return P4_E_SQL;
+        return FLATSQL_E_SQL;
     }
     sqlite3_progress_handler(ls->db, 4096, progress, ls.get());
     {
@@ -609,20 +612,20 @@ extern "C" int32_t p4sql_lane_init(P4Lane* lane) {
         p4_lane_set_sql_state(lane, ls.get());
     }
     ls.release();
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
     LaneState* ls = stateOf(lane);
-    if (!ls || !req) return P4_E_INTERNAL;
+    if (!ls || !req) return FLATSQL_E_INTERNAL;
     Stmt st;
-    st.sandbox = (req->flags & P4_SLOT_SANDBOX) != 0;
-    Out out(ls, (req->flags & P4_SLOT_RAW) != 0, req->maxResultRows, req->maxResultBytes);
+    st.sandbox = (req->flags & FLATSQL_SLOT_SANDBOX) != 0;
+    Out out(ls, (req->flags & FLATSQL_SLOT_RAW) != 0, req->maxResultRows, req->maxResultBytes);
     std::string msg;
-    int32_t status = P4_OK;
+    int32_t status = FLATSQL_OK;
     if (dataStream(ls, req, out, &status, &msg)) {
         const int32_t emitted = out.finish(&msg);
-        return reply(ls, status != P4_OK ? status : emitted, msg);
+        return reply(ls, status != FLATSQL_OK ? status : emitted, msg);
     }
     {
         SandboxScope scope(ls, &st);
@@ -630,16 +633,16 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
         sqlite3_stmt* s = nullptr;
         std::vector<rb1::Cell> params;
         if (!scope.ok()) {
-            status = P4_E_NOMEM;
+            status = FLATSQL_E_NOMEM;
             msg = "sandbox heap unavailable";
-        } else if (!rb1::decodeParams(req->params, req->paramsLen, &params)) {
-            status = P4_E_ARG;
+        } else if (!flatsql::query::parameters(req->params, req->paramsLen, &params)) {
+            status = FLATSQL_E_ARG;
             msg = "malformed parameters";
         }
         ls->gen++;   // the relations resolve again for this statement (C-43 B3)
-        if (status == P4_OK && req->sql) status = bindSpellings(ls, req->sql, req->sqlLen, &msg);
-        if (status == P4_OK) status = prepare(ls, st, req->sql ? req->sql : "", req->sql ? req->sqlLen : 0, &s, &msg);
-        if (status == P4_OK) status = bindParams(ls->db, s, params, &msg);
+        if (status == FLATSQL_OK && req->sql) status = bindSpellings(ls, req->sql, req->sqlLen, &msg);
+        if (status == FLATSQL_OK) status = prepare(ls, st, req->sql ? req->sql : "", req->sql ? req->sqlLen : 0, &s, &msg);
+        if (status == FLATSQL_OK) status = bindParams(ls->db, s, params, &msg);
         std::vector<std::string> names;
         if (s) {
             const int ncols = sqlite3_column_count(s);
@@ -649,23 +652,23 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
             }
         }
         out.header(names);   // an op that fails before its first row still writes its header
-        if (status == P4_OK) status = run(ls, st, s, out, &msg);
+        if (status == FLATSQL_OK) status = run(ls, st, s, out, &msg);
         if (s) sqlite3_finalize(s);   // releases the reader cursors and the statement's arena memory now
         ls->cur = nullptr;
     }
     const int32_t emitted = out.finish(&msg);
-    return reply(ls, status != P4_OK ? status : emitted, msg);
+    return reply(ls, status != FLATSQL_OK ? status : emitted, msg);
 }
 
 extern "C" int32_t p4sql_surface(P4Lane* lane) {
     LaneState* ls = stateOf(lane);
-    if (!ls) return P4_E_INTERNAL;
+    if (!ls) return FLATSQL_E_INTERNAL;
     Out out(ls, false, 0, 0);
     out.header({"name", "kind", "source", "column", "placeholder", "bound"});
     std::string msg;
     const int32_t status = surfaceRows(ls, out, &msg);
     const int32_t emitted = out.finish(&msg);
-    return reply(ls, status != P4_OK ? status : emitted, msg);
+    return reply(ls, status != FLATSQL_OK ? status : emitted, msg);
 }
 
 extern "C" void p4sql_lane_free(P4Lane* lane) {

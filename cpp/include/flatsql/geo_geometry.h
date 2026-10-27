@@ -14,6 +14,8 @@ namespace geo {
 struct Point {
     double x;  // longitude
     double y;  // latitude
+    double z = 0;
+    bool hasAltitude = false;
     Point() : x(0), y(0) {}
     Point(double x_, double y_) : x(x_), y(y_) {}
     bool operator==(const Point& o) const { return x == o.x && y == o.y; }
@@ -33,7 +35,8 @@ enum class GeomType : uint8_t {
     POLYGON = 3,
     MULTIPOINT = 4,
     MULTILINESTRING = 5,
-    MULTIPOLYGON = 6
+    MULTIPOLYGON = 6,
+    COLLECTION = 7
 };
 
 struct Geometry {
@@ -53,20 +56,11 @@ struct Geometry {
     static Geometry makeMultiPolygon(const std::vector<Geometry>& polygons);
 };
 
-// --- Binary serialization (BLOB) ---
-
-std::vector<uint8_t> geometryToBlob(const Geometry& geom);
-Geometry blobToGeometry(const uint8_t* data, size_t len);
-
-// --- WKT parsing / serialization ---
-
-Geometry parseWKT(const std::string& wkt);
-std::string toWKT(const Geometry& geom);
-
-// --- GeoJSON parsing / serialization ---
-
-Geometry parseGeoJSON(const std::string& json);
-std::string toGeoJSON(const Geometry& geom);
+// SDS GJN FlatBuffers. Input may be a payload or one size-prefixed frame.
+// Geometry-producing operations return a GJN collection with one feature.
+// Stored records (including IDs, properties and altitude) are never rewritten.
+std::vector<uint8_t> geometryToFlatBuffer(const Geometry& geom);
+bool geometryFromFlatBuffer(const uint8_t* data, size_t len, Geometry* result);
 
 // --- Point-in-polygon (ray casting) ---
 

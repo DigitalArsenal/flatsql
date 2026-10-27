@@ -2,203 +2,91 @@ name: Publish to NPM
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Dry run (do not publish)"
-        required: false
-        default: "false"
+        description: Validate the release without publishing
         type: boolean
+        default: true
 
-# Publish `flatsql` to npm only from GitHub Actions via OIDC trusted publishing.
-# Do not attempt local `npm publish` for this package from developer machines.
-# Required for NPM provenance / trusted publishing
+# Releases use npm OIDC trusted publishing, never local credentials.
 permissions:
   contents: write
   id-token: write
 
 jobs:
-  build:
-    name: Build
+  release:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 15
+    env:
+      FLATBUFFERS_DIR: ${{ github.workspace }}/../flatbuffers
+      WASI_SDK_PATH: /opt/wasi-sdk
+      FLATSQL_BUILD_JOBS: '4'
+      FLATSQL_CI_RESULTS: ${{ github.workspace }}/ci-results
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: "24"
-
-      - name: Install dependencies
-        run: npm install --ignore-scripts
-
-      - name: Build TypeScript
-        run: npm run build
-
-      - name: Setup Emscripten
-        uses: mymindstorm/setup-emsdk@v14
-        with:
-          version: "4.0.23"
-          actions-cache-folder: "emsdk-cache"
-
-      - name: Clone FlatBuffers (DigitalArsenal pin)
+          node-version: '24.21.0'
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - name: Install pinned development tools
+        run: npm ci --ignore-scripts --include=dev
+      - name: Verify release version
+        env:
+          RELEASE_REF: ${{ github.ref }}
         run: |
-          git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
-          git -C ../flatbuffers checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
-
-      - name: Build WASM
-        working-directory: cpp
+          node --input-type=module -e "import fs from 'node:fs'; const p=JSON.parse(fs.readFileSync('package.json')); if(process.env.RELEASE_REF.startsWith('refs/tags/') && process.env.RELEASE_REF!=='refs/tags/v'+p.version) throw Error('Release tag/package version mismatch')"
+      - name: Fetch pinned FlatBuffers
         run: |
-          emcmake cmake -B build-wasm -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-wasm --config Release
-
-      - name: Copy WASM to dist
+          git clone --no-checkout https://github.com/DigitalArsenal/flatbuffers.git "$FLATBUFFERS_DIR"
+          git -C "$FLATBUFFERS_DIR" checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
+      - name: Install pinned wasi-sdk 30
         run: |
-          mkdir -p wasm
-          mkdir -p sdm
-          cp cpp/build-wasm/flatsql.js wasm/ || true
-          cp cpp/build-wasm/flatsql.wasm wasm/ || true
-          cp cpp/build-wasm/flatsql-wasi.wasm wasm/ || true
-          cp cpp/build-wasm/flatsql-spatial.wasm sdm/ || true
-
-      # The wasi-threads artifacts (the partition store, A34, and store format
-      # 4): wasi-sdk 30, the same pinned flatbuffers. The published bytes must
-      # be the committed bytes, so a release commit carries the artifacts its
-      # sources build.
-      - name: Install wasi-sdk 30
-        run: |
-          curl -fsSL -o /tmp/wasi-sdk.tar.gz \
-            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
-          echo "0507679dff16814b74516cd969a9b16d2ced1347388024bc7966264648c78bfb  /tmp/wasi-sdk.tar.gz" | sha256sum -c -
+          curl -fsSL -o /tmp/wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
+          echo '0507679dff16814b74516cd969a9b16d2ced1347388024bc7966264648c78bfb  /tmp/wasi-sdk.tar.gz' | sha256sum -c -
           sudo mkdir -p /opt/wasi-sdk
           sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
-          cat /opt/wasi-sdk/VERSION
-
-      - name: Build flatsql-ps-threads.wasm and flatsql-p4-threads.wasm, check imports, write integrity.json
+      - name: Reproduce the committed unified artifact
+        run: |
+          bash scripts/build-wasm.sh
+          git diff --exit-code -- wasm/flatsql.wasm wasm/integrity.json
+      - name: Run short real package and native E2Es
+        run: bash scripts/ci-e2e.sh
+      - name: Cache Chromium headless shell
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: chromium-headless-shell-linux-playwright-1.63.0
+      - name: Install Chromium headless shell
+        run: npx --yes --package playwright@1.63.0 playwright install --with-deps chromium-headless-shell
+      - name: Browser binary and persistence E2E
         env:
-          WASI_SDK_PATH: /opt/wasi-sdk
-          FLATSQL_BUILD_JOBS: '4'
-        run: bash scripts/build-wasm.sh --ps
-
-      - name: The published artifacts are the committed artifacts
+          FLATSQL_BROWSER_RESULTS: ${{ github.workspace }}/ci-results/browser
+        run: npm run test:browser
+      - name: Verify committed browser/runtime assets
+        run: git diff --exit-code -- wasm/runtime docs/assets/unified
+      - name: Publish results
+        if: always()
         run: |
-          sha256sum wasm/flatsql-ps-threads.wasm wasm/flatsql-p4-threads.wasm
-          git diff --exit-code --stat -- wasm/flatsql-ps-threads.wasm wasm/flatsql-p4-threads.wasm
-          node -e "const j=require('./wasm/integrity.json');for(const f of ['flatsql-ps-threads.wasm','flatsql-p4-threads.wasm'])console.log(f,JSON.stringify(j.files[f]))"
-
-      - name: Verify build output
-        run: |
-          echo "Checking build output..."
-          ls -la dist/
-          ls -la wasm/ || true
-          ls -la sdm/ || true
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+          if [ -f "$FLATSQL_CI_RESULTS/summary.md" ]; then cat "$FLATSQL_CI_RESULTS/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: npm-package
-          path: |
-            dist/
-            wasm/
-            sdm/
-            package.json
-            README.md
-            LICENSE
-          retention-days: 1
-
-  test:
-    name: Test Package
-    needs: build
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: npm-package
-          path: ./
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-      - name: Install dependencies
-        run: npm install --ignore-scripts
-
-      - name: Real package end-to-end flows
-        run: bash scripts/ci-e2e.sh --wasm-only
-
-      - name: Check import surfaces and integrity.json
-        run: |
-          npm run check:imports
-          npm run check:integrity
-
-      - name: No sql.js in the package's dependency tree
-        run: |
-          test "$(node -e "const p=require('./package.json');console.log(Object.keys(p.dependencies||{}).length)")" = "0"
-          npm ls sql.js --omit=dev --omit=peer --omit=optional --all > /tmp/npm-ls.txt || true
-          cat /tmp/npm-ls.txt
-          ! grep -q "sql.js@" /tmp/npm-ls.txt
-
-      - name: Verify package
-        run: npm pack --dry-run
-
-  publish:
-    name: Publish to NPM
-    needs: [build, test]
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: npm-package
-          path: ./
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Install dependencies
-        run: npm install --ignore-scripts
-
-      - name: Extract version from tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        id: version
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Publishing version: $VERSION"
-
-      - name: Update package.json version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version --allow-same-version
-
-      - name: Publish to NPM (dry run)
-        if: github.event.inputs.dry_run == 'true'
+          name: release-e2e-results
+          path: ci-results
+      - name: Dry run package
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
         run: npm publish --dry-run
-
-      - name: Publish to NPM with provenance
-        if: github.event.inputs.dry_run != 'true'
+      - name: Publish with npm provenance
+        if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
         run: npm publish --access public --provenance
-
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            wasm/flatsql.wasm
+            wasm/integrity.json

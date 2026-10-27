@@ -1,25 +1,6 @@
-// FlatSQL store format 4, SQL surface: format 1's relation columns and their
-// values (CONTRACT.md §3.9 "Columns", C-9).
-//
-// The column list is what format 1's engine declares for the type (SDN
-// storage/enginecatalog): FlatBuffers vtable slots are positional, so the
-// projection is the LEADING RUN of root fields its engine can represent, in
-// declaration order (scalars, enums as their underlying scalar, strings,
-// byte vectors); a union's discriminator (<NAME>_type) ends the run with a
-// column; a table, struct, union value or other vector ends it without one.
-// When not even the first field is representable, slot 0 becomes a one-byte
-// placeholder column (the >= 1 column invariant).
-//
-// Two standards keep table graphs that format 1 pins as cross-host contracts
-// (SDN storage/engine_records.go engineRecordSchema and engineTBSTableGraph):
-//   OMM  every root field, not the leading run;
-//   OMM, TBS  their enum-typed fields name the enum type unresolved, so
-//        format 1 reads them as NULL (as it reads tables and vectors).
-//
-// Values are read exactly as format 1's generic extractor reads them
-// (database.cpp readGenericColumnValue, sqlite_vtab.cpp setResultFromValue):
-// an absent field is NULL (never its default), a uint32 is narrowed to a
-// signed int, every read is bounds-checked against the record.
+// SQL scalar columns come from the registered binary schema. Complex fields
+// remain available in the complete _data FlatBuffer; they never truncate the
+// remaining scalar columns or create fake placeholder values.
 #include <algorithm>
 #include <cstring>
 
@@ -42,22 +23,6 @@ const char* Column::sqlType() const {
 }
 
 namespace {
-
-struct Pin {
-    const char* type;
-    bool allFields;     // every root field (not the leading run)
-    bool enumsOpaque;   // enum-typed fields read as NULL
-};
-const Pin kPins[] = {
-    {"OMM", true, true},
-    {"TBS", false, true},
-};
-
-const Pin* pinOf(const std::string& type) {
-    for (const Pin& p : kPins)
-        if (type == p.type) return &p;
-    return nullptr;
-}
 
 ColKind scalarKind(reflection::BaseType bt) {
     switch (bt) {
@@ -85,7 +50,7 @@ bool isByteVector(const reflection::Type* t) {
 
 }  // namespace
 
-bool format1Columns(const std::string& type, const uint8_t* bfbs, size_t n, std::vector<Column>* out,
+bool schemaColumns(const std::string& type, const uint8_t* bfbs, size_t n, std::vector<Column>* out,
                     std::string* err) {
     out->clear();
     flatbuffers::Verifier v(bfbs, n);
@@ -102,45 +67,20 @@ bool format1Columns(const std::string& type, const uint8_t* bfbs, size_t n, std:
     std::vector<const reflection::Field*> fields(root->fields()->begin(), root->fields()->end());
     std::sort(fields.begin(), fields.end(),
               [](const reflection::Field* a, const reflection::Field* b) { return a->id() < b->id(); });
-    const Pin* pin = pinOf(type);
     for (const reflection::Field* f : fields) {
-        const reflection::Type* t = f->type();
-        const reflection::BaseType bt = t->base_type();
+        const auto* t = f->type();
+        const auto bt = t->base_type();
         Column c;
         c.name = f->name()->str();
-        c.slot = uint16_t(out->size());   // format 1: field id = position in its table
-        if (pin && pin->allFields) {
-            if (bt == reflection::UType) continue;   // the pinned graph names a union once
-            if (bt >= reflection::Bool && bt <= reflection::Double)
-                c.kind = (pin->enumsOpaque && t->index() >= 0) ? kColNull : scalarKind(bt);
-            else if (bt == reflection::String) c.kind = kColText;
-            else if (isByteVector(t)) c.kind = kColBlob;
-            else c.kind = kColNull;
-            out->push_back(std::move(c));
-            continue;
-        }
-        if (bt == reflection::UType) {   // <NAME>_type: representable, ends the run
-            c.kind = kColU8;
-            out->push_back(std::move(c));
-            break;
-        }
-        if (bt >= reflection::Bool && bt <= reflection::Double) {
-            c.kind = (pin && pin->enumsOpaque && t->index() >= 0) ? kColNull : scalarKind(bt);
-        } else if (bt == reflection::String) {
-            c.kind = kColText;
-        } else if (isByteVector(t)) {
-            c.kind = kColBlob;
-        } else {
-            break;
-        }
-        out->push_back(std::move(c));
-    }
-    if (out->empty()) {
-        Column c;
-        c.name = fields[0]->name()->str();
-        c.slot = 0;
-        c.kind = kColU8;
-        c.placeholder = true;
+        c.slot = f->id();
+        c.defaultInt = f->default_integer();
+        c.defaultReal = f->default_real();
+        c.optional = f->optional();
+        if (bt == reflection::UType) c.kind = kColU8;
+        else if (bt >= reflection::Bool && bt <= reflection::Double) c.kind = scalarKind(bt);
+        else if (bt == reflection::String) c.kind = kColText;
+        else if (isByteVector(t)) c.kind = kColBlob;
+        else continue;
         out->push_back(std::move(c));
     }
     return true;
@@ -224,7 +164,9 @@ void resultColumn(sqlite3_context* ctx, const Column& c, const uint8_t* data, si
     }
     const uint16_t fo = fieldOffset(data, n, vt, vtSize, c.slot);
     if (fo == 0) {
-        sqlite3_result_null(ctx);
+        if (c.optional || c.kind == kColText || c.kind == kColBlob) sqlite3_result_null(ctx);
+        else if (c.kind == kColF32 || c.kind == kColF64) sqlite3_result_double(ctx, c.defaultReal);
+        else sqlite3_result_int64(ctx, c.defaultInt);
         return;
     }
     const size_t at = root + fo;
@@ -253,9 +195,13 @@ void resultColumn(sqlite3_context* ctx, const Column& c, const uint8_t* data, si
         case kColI16: sqlite3_result_int(ctx, rd<int16_t>(p)); break;
         case kColU16: sqlite3_result_int(ctx, rd<uint16_t>(p)); break;
         case kColI32: sqlite3_result_int(ctx, rd<int32_t>(p)); break;
-        case kColU32: sqlite3_result_int(ctx, static_cast<int>(rd<uint32_t>(p))); break;   // as format 1
+        case kColU32: sqlite3_result_int64(ctx, rd<uint32_t>(p)); break;
         case kColI64: sqlite3_result_int64(ctx, rd<int64_t>(p)); break;
-        case kColU64: sqlite3_result_int64(ctx, sqlite3_int64(rd<uint64_t>(p))); break;
+        case kColU64:
+            if (rd<uint64_t>(p) > uint64_t(INT64_MAX))
+                sqlite3_result_error(ctx, "uint64 exceeds SQL int64 range; select _data for the original FlatBuffer", -1);
+            else sqlite3_result_int64(ctx, sqlite3_int64(rd<uint64_t>(p)));
+            break;
         case kColF32: sqlite3_result_double(ctx, double(rd<float>(p))); break;
         case kColF64: sqlite3_result_double(ctx, rd<double>(p)); break;
         default: sqlite3_result_null(ctx); break;

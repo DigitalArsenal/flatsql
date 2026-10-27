@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(FlatSQL VERSION 1.0.0 LANGUAGES C CXX)
+project(FlatSQL VERSION 3.12.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,7 +42,7 @@ ExternalProject_Add(flatsql_host_flatc
     BUILD_BYPRODUCTS "${FLATSQL_HOST_FLATC_DIR}/flatc")
 set(FLATSQL_SDS_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated-sds")
 set(FLATSQL_SDS_HEADERS)
-foreach(SDS_TABLE FMB FCK FSG)
+foreach(SDS_TABLE FMB FCK FSG GJN QRP)
     if(NOT EXISTS "${SDS_SCHEMA_DIR}/${SDS_TABLE}/main.fbs")
         message(FATAL_ERROR "SDS 1.256.0 schema missing: ${SDS_SCHEMA_DIR}/${SDS_TABLE}/main.fbs")
     endif()
@@ -52,7 +52,11 @@ foreach(SDS_TABLE FMB FCK FSG)
         COMMAND "${FLATSQL_HOST_FLATC_DIR}/flatc" --cpp --keep-prefix
             -I "${SDS_SCHEMA_DIR}" -o "${FLATSQL_SDS_GENERATED_DIR}/${SDS_TABLE}"
             "${SDS_SCHEMA_DIR}/${SDS_TABLE}/main.fbs"
-        DEPENDS flatsql_host_flatc "${SDS_SCHEMA_DIR}/FMB/main.fbs"
+        COMMAND ${CMAKE_COMMAND} -DHEADER=${SDS_HEADER} -DTABLE=${SDS_TABLE}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/sds-header-guard.cmake"
+        DEPENDS flatsql_host_flatc "${CMAKE_CURRENT_SOURCE_DIR}/cmake/sds-header-guard.cmake"
+            "${SDS_SCHEMA_DIR}/${SDS_TABLE}/main.fbs"
+            "${SDS_SCHEMA_DIR}/FMB/main.fbs"
             "${SDS_SCHEMA_DIR}/FCK/main.fbs" "${SDS_SCHEMA_DIR}/FSG/main.fbs"
         VERBATIM)
     list(APPEND FLATSQL_SDS_HEADERS "${SDS_HEADER}")
@@ -79,1030 +83,127 @@ if(NOT FLATSQL_SQLITE_SHA256_FOUND STREQUAL FLATSQL_SQLITE_SHA256)
         "(sha256 ${FLATSQL_SQLITE_SHA256_FOUND}, expected ${FLATSQL_SQLITE_SHA256})")
 endif()
 
-# OpenSSL: the FlatBuffers crypto backend of native builds (below)
-find_package(OpenSSL QUIET)
-if(NOT OpenSSL_FOUND AND APPLE)
-    set(OPENSSL_ROOT_DIR "/opt/homebrew/opt/openssl@3")
-    find_package(OpenSSL QUIET)
-endif()
-if(OpenSSL_FOUND)
-    message(STATUS "OpenSSL found: ${OPENSSL_VERSION} - FlatBuffers crypto backend: OpenSSL")
-else()
-    message(STATUS "OpenSSL not found - FlatBuffers crypto backend: fallback")
-endif()
-
-# FlatBuffers encryption source: HKDF-SHA256, AES-256-CTR and HMAC-SHA256 for
-# record encryption (field-encryption format 3) and computeHMAC. Native builds
-# with OpenSSL compile it with the OpenSSL backend (below); the wasm builds and
-# native builds without OpenSSL compile the fallback backend, which derives the
-# same keys from FlatBuffers 8af3053e on. Against an older FlatBuffers the
-# fallback's derivation is not HKDF-SHA256 and record encryption refuses a key
-# (FlatSQLDatabase::recordEncryptionAvailable).
-set(FLATBUFFERS_ENCRYPTION_SOURCES
-    ${FLATBUFFERS_SRC_DIR}/encryption.cpp
-)
-
-# sqlean extensions (vendored, MIT License)
-set(SQLEAN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/sqlean")
-set(SQLEAN_SOURCES
-    ${SQLEAN_DIR}/math/extension.c
-    ${SQLEAN_DIR}/stats/extension.c
-    ${SQLEAN_DIR}/stats/scalar.c
-    ${SQLEAN_DIR}/stats/series.c
-    ${SQLEAN_DIR}/text/extension.c
-    ${SQLEAN_DIR}/text/bstring.c
-    ${SQLEAN_DIR}/text/rstring.c
-    ${SQLEAN_DIR}/text/runes.c
-    ${SQLEAN_DIR}/text/utf8/utf8.c
-    ${SQLEAN_DIR}/text/utf8/rune.c
-    ${SQLEAN_DIR}/text/utf8/case.c
-    ${SQLEAN_DIR}/uuid/extension.c
-    ${SQLEAN_DIR}/fuzzy/extension.c
-    ${SQLEAN_DIR}/fuzzy/common.c
-    ${SQLEAN_DIR}/fuzzy/caver.c
-    ${SQLEAN_DIR}/fuzzy/damlev.c
-    ${SQLEAN_DIR}/fuzzy/editdist.c
-    ${SQLEAN_DIR}/fuzzy/hamming.c
-    ${SQLEAN_DIR}/fuzzy/jarowin.c
-    ${SQLEAN_DIR}/fuzzy/leven.c
-    ${SQLEAN_DIR}/fuzzy/osadist.c
-    ${SQLEAN_DIR}/fuzzy/phonetic.c
-    ${SQLEAN_DIR}/fuzzy/rsoundex.c
-    ${SQLEAN_DIR}/fuzzy/soundex.c
-    ${SQLEAN_DIR}/fuzzy/translit.c
-)
-
-# sqlean files need SQLITE_CORE so SQLITE_EXTENSION_INIT3 becomes a no-op
-set_source_files_properties(${SQLEAN_SOURCES} PROPERTIES
-    COMPILE_DEFINITIONS "SQLITE_CORE"
-)
-
-# Source files (library - no main)
-set(FLATSQL_LIB_SOURCES
-    src/storage.cpp
-    src/sqlite_index.cpp
-    src/schema_parser.cpp
-    src/database.cpp
-    src/record_search.cpp
-    ${FLATBUFFERS_SRC_DIR}/reflection.cpp
-    src/query_cache.cpp
-    src/junction.cpp
-    src/sqlite_vtab.cpp
-    src/sqlite_engine.cpp
-    src/flatsql_state.cpp
-    src/geo_functions.cpp
-    src/geo_geometry.cpp
-    ${FLATBUFFERS_ENCRYPTION_SOURCES}
-    ${SQLEAN_SOURCES}
-)
-
-# FlatSQL's own sqlite3_vfs over the seven-import host I/O contract
-# (include/flatsql/flatsql_io.h). Linked ONLY into targets that are allowed to
-# grow those seven imports: the engine artifacts (browser + both wasi) and every
-# native build. Deliberately NOT linked into flatsql_sdn_node / flatsql_sdm —
-# those are space-data-module-sdk MODULES and must keep the generic hook set;
-# a module that grows private imports is a new host capability, which is an
-# owner decision, not a build detail. Targets without it refuse a disk-backed
-# open outright rather than silently succeeding against RAM.
-set(FLATSQL_VFS_SOURCES src/flatsql_vfs.cpp)
-if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN))
-    # Natively there is no host to import from, so the same seven functions are
-    # supplied over POSIX pread/pwrite. This is what lets CTest exercise the
-    # exact VFS the wasm lanes use.
-    list(APPEND FLATSQL_VFS_SOURCES src/flatsql_io_native.cpp)
-endif()
-
-# Sources for WASM build - C API (no embind, worker-compatible)
-set(FLATSQL_WASM_SOURCES
-    ${FLATSQL_LIB_SOURCES}
-    src/flatsql_capi.cpp
-)
-
-set(FLATSQL_HEADERS
-    include/flatsql/storage.h
-    include/flatsql/sqlite_index.h
-    include/flatsql/schema_parser.h
-    include/flatsql/database.h
-    include/flatsql/query_cache.h
-    include/flatsql/junction.h
-    include/flatsql/types.h
-    include/flatsql/sqlite_vtab.h
-    include/flatsql/sqlite_engine.h
-    include/flatsql/geo_geometry.h
-)
-
-# wasm32-wasip1-threads (wasi-sdk, cmake/wasi-threads-toolchain.cmake): the
-# partition store artifact flatsql-ps-threads.wasm and its test commands
-# (docs/PARTITION-STORE-WASM.md). That toolchain builds only those targets.
+# The unified engine is the only buildable public implementation.
 if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
-    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/flatsql_ps_wasm.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/flatsql_p4_wasm.cmake)
     return()
 endif()
+if(EMSCRIPTEN OR CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    message(FATAL_ERROR "Use wasi-sdk 30: browsers and servers run the same flatsql.wasm")
+endif()
+find_package(Threads REQUIRED)
+enable_testing()
 
-# Emscripten/WASM configuration
-if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten" OR EMSCRIPTEN)
-    message(STATUS "")
-    message(STATUS "*** EMSCRIPTEN/WEBASSEMBLY BUILD ***")
-    message(STATUS "")
-
-    set(FLATSQL_BUILD_WASM ON)
-
-    # WASM-specific compiler flags are applied per target below. The browser
-    # bundle uses Emscripten JS exception helpers, while the standalone reactor
-    # must stay import-clean for WasmEdge/browser direct instantiation.
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
-
-    # Create the WASM library (includes SQLite amalgamation directly)
-    add_executable(flatsql ${FLATSQL_WASM_SOURCES} ${FLATSQL_VFS_SOURCES} ${SQLITE_DIR}/sqlite3.c)
-
-    target_include_directories(flatsql PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-        ${SQLEAN_DIR}
-    )
-    target_compile_options(flatsql PRIVATE -fexceptions)
-
-    # SQLite compile definitions for minimal WASM build
-    target_compile_definitions(flatsql PRIVATE
-        FLATSQL_ENABLE_IO_VFS=1
-        SQLITE_TEMP_STORE=3
-        SQLITE_THREADSAFE=0
-        SQLITE_OMIT_LOAD_EXTENSION=1
-        SQLITE_OMIT_WAL=1
-        SQLITE_OMIT_DEPRECATED=1
-        SQLITE_OMIT_SHARED_CACHE=1
-        SQLITE_DEFAULT_MEMSTATUS=0
-        SQLITE_DQS=0
-        SQLITE_ENABLE_RTREE=1
-        SQLITE_ENABLE_FTS5=1
-    )
-
-    # Emscripten link flags for WASM output
-    # Using C API exports (no embind) for worker compatibility
-    set_target_properties(flatsql PROPERTIES
-        SUFFIX ".js"
-        LINK_FLAGS "\
-            -s WASM=1 \
-            -s EXPORT_ES6=1 \
-            -s MODULARIZE=1 \
-            -s EXPORT_NAME='FlatSQL' \
-            -s EXPORTED_FUNCTIONS='[ \
-                \"_malloc\", \"_free\", \
-                \"_flatsql_create_db\", \"_flatsql_destroy_db\", \
-                \"_flatsql_open_db\", \"_flatsql_is_disk_backed\", \
-                \"_flatsql_open_state\", \"_flatsql_reindex_all\", \"_flatsql_reindex_step\", \
-                \"_flatsql_flush_index\", \"_flatsql_flushed_offset\", \
-                \"_flatsql_stream_path\", \
-                \"_flatsql_register_file_id\", \"_flatsql_enable_demo_extractors\", \
-                \"_flatsql_ingest\", \"_flatsql_ingest_one\", \
-                \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
-                \"_flatsql_ingest_with_source\", \"_flatsql_ingest_one_with_source\", \
-                \"_flatsql_set_arena_limit\", \
-                \"_flatsql_compact_arena\", \"_flatsql_arena_stat\", \
-                \"_flatsql_get_sources_count\", \"_flatsql_get_source_name\", \
-                \"_flatsql_query\", \"_flatsql_query_params\", \"_flatsql_query_many\", \
-                \"_flatsql_build_query_cache_key\", \
-                \"_flatsql_build_response_artifact_cache_key\", \
-                \"_flatsql_register_query_template\", \"_flatsql_query_template\", \
-                \"_flatsql_clear_query_cache\", \"_flatsql_configure_query_cache\", \
-                \"_flatsql_query_cache_hits\", \
-                \"_flatsql_query_cache_misses\", \"_flatsql_query_cache_size\", \
-                \"_flatsql_query_cache_generation\", \"_flatsql_query_cache_max_entries\", \
-                \"_flatsql_query_cache_max_rows\", \
-                \"_flatsql_batch_result_count\", \"_flatsql_select_batch_result\", \"_flatsql_get_error\", \
-                \"_flatsql_result_column_count\", \"_flatsql_result_row_count\", \
-                \"_flatsql_result_column_name\", \"_flatsql_result_cell_type\", \
-                \"_flatsql_result_cell_number\", \"_flatsql_result_cell_string\", \
-                \"_flatsql_result_cell_blob\", \"_flatsql_result_cell_blob_size\", \
-                \"_flatsql_query_sandboxed\", \
-                \"_flatsql_query_raw_flatbuffer_stream\", \"_flatsql_response_artifact_data\", \
-                \"_flatsql_response_artifact_size\", \"_flatsql_response_artifact_row_count\", \
-                \"_flatsql_response_artifact_column_count\", \"_flatsql_response_artifact_cache_hit\", \
-                \"_flatsql_configure_raw_stream_cache\", \"_flatsql_raw_stream_cache_hits\", \
-                \"_flatsql_raw_stream_cache_misses\", \"_flatsql_raw_stream_cache_size\", \
-                \"_flatsql_raw_stream_cache_total_bytes\", \
-                \"_flatsql_export_data\", \"_flatsql_export_size\", \
-                \"_flatsql_load_and_rebuild\", \"_flatsql_reserve_storage\", \"_flatsql_load_from_db\", \
-                \"_flatsql_create_test_user\", \"_flatsql_create_test_post\", \
-                \"_flatsql_create_test_mpe\", \"_flatsql_create_test_telemetry\", \
-                \"_flatsql_create_test_publish_event\", \
-                \"_flatsql_test_buffer_size\", \
-                \"_flatsql_get_stats_count\", \"_flatsql_get_stat_table_name\", \
-                \"_flatsql_get_stat_file_id\", \"_flatsql_get_stat_record_count\", \
-                \"_flatsql_reset_ingest_profile\", \"_flatsql_get_ingest_profile_record_count\", \
-                \"_flatsql_get_ingest_profile_byte_count\", \"_flatsql_get_ingest_profile_decode_nanos\", \
-                \"_flatsql_get_ingest_profile_append_nanos\", \"_flatsql_get_ingest_profile_index_nanos\", \
-                \"_flatsql_mark_deleted\", \"_flatsql_get_deleted_count\", \
-                \"_flatsql_clear_tombstones\", \
-                \"_flatsql_get_flatbuffer_by_id\", \"_flatsql_get_flatbuffer_by_email\", \
-                \"_flatsql_get_flatbuffer_by_index\", \
-                \"_flatsql_get_raw_flatbuffer_size\", \"_flatsql_get_raw_flatbuffer_sequence\", \
-                \"_flatsql_get_storage_buffer\", \"_flatsql_get_storage_size\", \
-                \"_flatsql_set_encryption_key\", \"_flatsql_is_encrypted\", \
-                \"_flatsql_encrypt_buffer\", \"_flatsql_decrypt_buffer\", \
-                \"_flatsql_ingest_one_encrypted\", \
-                \"_flatsql_set_hmac_verification\", \"_flatsql_is_hmac_enabled\", \
-                \"_flatsql_compute_hmac\", \"_flatsql_verify_hmac\" \
-            ]' \
-            -s EXPORTED_RUNTIME_METHODS='[\"ccall\", \"cwrap\", \"UTF8ToString\", \"stringToUTF8\", \"lengthBytesUTF8\", \"HEAPU8\"]' \
-            -s ALLOW_MEMORY_GROWTH=1 \
-            -s INITIAL_MEMORY=16777216 \
-            -s MAXIMUM_MEMORY=4294967296 \
-            -s STACK_SIZE=1048576 \
-            -s NO_EXIT_RUNTIME=1 \
-            -s FILESYSTEM=0 \
-            --js-library ${CMAKE_CURRENT_SOURCE_DIR}/js/flatsql_io_library.js \
-            -s ENVIRONMENT='web,worker,node' \
-            -s SINGLE_FILE=0 \
-            -s ALLOW_TABLE_GROWTH=1 \
-            -s EMULATE_FUNCTION_POINTER_CASTS=1 \
-            -fexceptions \
-            -s DISABLE_EXCEPTION_CATCHING=0 \
-        "
-    )
-
-    # Build a standalone WASI-compatible module for Go runtimes (wazero/wasmtime)
-    add_executable(flatsql_wasi ${FLATSQL_WASM_SOURCES} ${FLATSQL_VFS_SOURCES} ${SQLITE_DIR}/sqlite3.c)
-
-    target_include_directories(flatsql_wasi PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-        ${SQLEAN_DIR}
-    )
-    target_compile_options(flatsql_wasi PRIVATE -fwasm-exceptions -sWASM_LEGACY_EXCEPTIONS=0)
-
-    target_compile_definitions(flatsql_wasi PRIVATE
-        FLATSQL_ENABLE_IO_VFS=1
-        SQLITE_TEMP_STORE=3
-        SQLITE_THREADSAFE=0
-        SQLITE_OMIT_LOAD_EXTENSION=1
-        # SQLITE_OMIT_WAL intentionally NOT set: the VFS implements xShm* on
-        # the heap, so journal_mode=WAL works on this lane.
-        SQLITE_OMIT_DEPRECATED=1
-        SQLITE_OMIT_SHARED_CACHE=1
-        SQLITE_DEFAULT_MEMSTATUS=0
-        SQLITE_DQS=0
-        SQLITE_ENABLE_RTREE=1
-        SQLITE_ENABLE_FTS5=1
-    )
-
-    # Shared WASI link flags (everything except the exception strategy) so the
-    # exceptions and no-exceptions artifacts stay export-identical.
-    set(FLATSQL_WASI_BASE_LINK_FLAGS "\
-            -s WASM=1 \
-            -s STANDALONE_WASM=1 \
-            -s PURE_WASI=1 \
-            --no-entry \
-            -s EXPORTED_FUNCTIONS='[ \
-                \"_malloc\", \"_free\", \
-                \"_flatsql_create_db\", \"_flatsql_destroy_db\", \
-                \"_flatsql_open_db\", \"_flatsql_is_disk_backed\", \
-                \"_flatsql_open_state\", \"_flatsql_reindex_all\", \"_flatsql_reindex_step\", \
-                \"_flatsql_flush_index\", \"_flatsql_flushed_offset\", \
-                \"_flatsql_stream_path\", \
-                \"_flatsql_register_file_id\", \"_flatsql_enable_demo_extractors\", \
-                \"_flatsql_ingest\", \"_flatsql_ingest_one\", \
-                \"_flatsql_register_source\", \"_flatsql_create_unified_views\", \
-                \"_flatsql_ingest_with_source\", \"_flatsql_ingest_one_with_source\", \
-                \"_flatsql_set_arena_limit\", \
-                \"_flatsql_compact_arena\", \"_flatsql_arena_stat\", \
-                \"_flatsql_get_sources_count\", \"_flatsql_get_source_name\", \
-                \"_flatsql_query\", \"_flatsql_query_params\", \"_flatsql_query_many\", \
-                \"_flatsql_build_query_cache_key\", \
-                \"_flatsql_build_response_artifact_cache_key\", \
-                \"_flatsql_register_query_template\", \"_flatsql_query_template\", \
-                \"_flatsql_clear_query_cache\", \"_flatsql_configure_query_cache\", \
-                \"_flatsql_query_cache_hits\", \
-                \"_flatsql_query_cache_misses\", \"_flatsql_query_cache_size\", \
-                \"_flatsql_query_cache_generation\", \"_flatsql_query_cache_max_entries\", \
-                \"_flatsql_query_cache_max_rows\", \
-                \"_flatsql_batch_result_count\", \"_flatsql_select_batch_result\", \"_flatsql_get_error\", \
-                \"_flatsql_result_column_count\", \"_flatsql_result_row_count\", \
-                \"_flatsql_result_column_name\", \"_flatsql_result_cell_type\", \
-                \"_flatsql_result_cell_number\", \"_flatsql_result_cell_string\", \
-                \"_flatsql_result_cell_blob\", \"_flatsql_result_cell_blob_size\", \
-                \"_flatsql_query_sandboxed\", \
-                \"_flatsql_query_raw_flatbuffer_stream\", \"_flatsql_response_artifact_data\", \
-                \"_flatsql_response_artifact_size\", \"_flatsql_response_artifact_row_count\", \
-                \"_flatsql_response_artifact_column_count\", \"_flatsql_response_artifact_cache_hit\", \
-                \"_flatsql_configure_raw_stream_cache\", \"_flatsql_raw_stream_cache_hits\", \
-                \"_flatsql_raw_stream_cache_misses\", \"_flatsql_raw_stream_cache_size\", \
-                \"_flatsql_raw_stream_cache_total_bytes\", \
-                \"_flatsql_export_data\", \"_flatsql_export_size\", \
-                \"_flatsql_load_and_rebuild\", \"_flatsql_reserve_storage\", \"_flatsql_load_from_db\", \
-                \"_flatsql_create_test_user\", \"_flatsql_create_test_post\", \
-                \"_flatsql_create_test_mpe\", \"_flatsql_create_test_telemetry\", \
-                \"_flatsql_create_test_publish_event\", \
-                \"_flatsql_test_buffer_size\", \
-                \"_flatsql_get_stats_count\", \"_flatsql_get_stat_table_name\", \
-                \"_flatsql_get_stat_file_id\", \"_flatsql_get_stat_record_count\", \
-                \"_flatsql_reset_ingest_profile\", \"_flatsql_get_ingest_profile_record_count\", \
-                \"_flatsql_get_ingest_profile_byte_count\", \"_flatsql_get_ingest_profile_decode_nanos\", \
-                \"_flatsql_get_ingest_profile_append_nanos\", \"_flatsql_get_ingest_profile_index_nanos\", \
-                \"_flatsql_mark_deleted\", \"_flatsql_get_deleted_count\", \
-                \"_flatsql_clear_tombstones\", \
-                \"_flatsql_get_flatbuffer_by_id\", \"_flatsql_get_flatbuffer_by_email\", \
-                \"_flatsql_get_flatbuffer_by_index\", \
-                \"_flatsql_get_raw_flatbuffer_size\", \"_flatsql_get_raw_flatbuffer_sequence\", \
-                \"_flatsql_get_storage_buffer\", \"_flatsql_get_storage_size\", \
-                \"_flatsql_set_encryption_key\", \"_flatsql_is_encrypted\", \
-                \"_flatsql_encrypt_buffer\", \"_flatsql_decrypt_buffer\", \
-                \"_flatsql_ingest_one_encrypted\", \
-                \"_flatsql_set_hmac_verification\", \"_flatsql_is_hmac_enabled\", \
-                \"_flatsql_compute_hmac\", \"_flatsql_verify_hmac\" \
-            ]' \
-            -s ALLOW_MEMORY_GROWTH=1 \
-            -s INITIAL_MEMORY=67108864 \
-            -s MAXIMUM_MEMORY=4294967296 \
-            -s STACK_SIZE=1048576 \
-            -s WASMFS=1 \
-            -s ALLOW_TABLE_GROWTH=1 \
-            -s EMULATE_FUNCTION_POINTER_CASTS=1 \
-        ")
-
-    set_target_properties(flatsql_wasi PROPERTIES
-        OUTPUT_NAME "flatsql-wasi"
-        SUFFIX ".wasm"
-        LINK_FLAGS "${FLATSQL_WASI_BASE_LINK_FLAGS} -fwasm-exceptions -s WASM_LEGACY_EXCEPTIONS=0"
-    )
-
-    add_custom_command(TARGET flatsql_wasi POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE_DIR:flatsql_wasi>/flatsql-wasi.wasm
-            ${CMAKE_CURRENT_SOURCE_DIR}/../docs/
-        COMMENT "Copying flatsql-wasi.wasm to docs/"
-    )
-
-    # No-exceptions WASI variant: identical sources/exports, but throws abort
-    # instead of unwinding. Server hosts need this because WasmEdge's AOT
-    # compiler (0.14–0.17) cannot parse wasm-exceptions (exnref) modules and
-    # its interpreter is ~100x too slow for query workloads. Interim artifact
-    # until the engine's error paths are exception-free by construction.
-    add_executable(flatsql_wasi_noeh ${FLATSQL_WASM_SOURCES} ${FLATSQL_VFS_SOURCES} ${SQLITE_DIR}/sqlite3.c)
-
-    target_include_directories(flatsql_wasi_noeh PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-        ${SQLEAN_DIR}
-    )
-    target_compile_options(flatsql_wasi_noeh PRIVATE -fignore-exceptions)
-
-    target_compile_definitions(flatsql_wasi_noeh PRIVATE
-        FLATSQL_ENABLE_IO_VFS=1
-        SQLITE_TEMP_STORE=3
-        SQLITE_THREADSAFE=0
-        SQLITE_OMIT_LOAD_EXTENSION=1
-        # SQLITE_OMIT_WAL intentionally NOT set: the VFS implements xShm* on
-        # the heap, so journal_mode=WAL works on this lane.
-        SQLITE_OMIT_DEPRECATED=1
-        SQLITE_OMIT_SHARED_CACHE=1
-        SQLITE_DEFAULT_MEMSTATUS=0
-        SQLITE_DQS=0
-        SQLITE_ENABLE_RTREE=1
-        SQLITE_ENABLE_FTS5=1
-    )
-
-    set_target_properties(flatsql_wasi_noeh PROPERTIES
-        OUTPUT_NAME "flatsql-wasi-noeh"
-        SUFFIX ".wasm"
-        LINK_FLAGS "${FLATSQL_WASI_BASE_LINK_FLAGS}"
-    )
-
-    add_custom_command(TARGET flatsql_wasi_noeh POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE_DIR:flatsql_wasi_noeh>/flatsql-wasi-noeh.wasm
-            ${CMAKE_CURRENT_SOURCE_DIR}/../wasm/
-        COMMENT "Copying flatsql-wasi-noeh.wasm to wasm/"
-    )
-
-    # Independently packaged SDN FlatSQL node. The generated directory is
-    # produced by wasm/node/build.mjs from the canonical PLG and SDS PIV/FSO/FSB
-    # schemas before CMake configuration.
-    set(
-        FLATSQL_SDN_NODE_GENERATED_DIR
-        "${CMAKE_CURRENT_SOURCE_DIR}/../wasm/node/.build/generated"
-        CACHE PATH
-        "Generated SDN FlatSQL node ABI sources"
-    )
-    if(EXISTS "${FLATSQL_SDN_NODE_GENERATED_DIR}/invoke_support.cpp")
-        add_library(
-            flatsql_sdn_node_capi
-            OBJECT
-            src/flatsql_capi.cpp
-        )
-        target_include_directories(flatsql_sdn_node_capi PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${FLATBUFFERS_INCLUDE_DIR}
-            ${SQLITE_DIR}
-            ${SQLEAN_DIR}
-        )
-        target_compile_options(
-            flatsql_sdn_node_capi
-            PRIVATE
-                -fignore-exceptions
-                -include
-                ${FLATSQL_SDN_NODE_GENERATED_DIR}/private_capi_exports.h
-        )
-        target_compile_definitions(flatsql_sdn_node_capi PRIVATE
-            SQLITE_THREADSAFE=0
-            SQLITE_OMIT_LOAD_EXTENSION=1
-            SQLITE_OMIT_WAL=1
-            SQLITE_OMIT_DEPRECATED=1
-            SQLITE_OMIT_SHARED_CACHE=1
-            SQLITE_DEFAULT_MEMSTATUS=0
-            SQLITE_DQS=0
-            SQLITE_ENABLE_RTREE=1
-        SQLITE_ENABLE_FTS5=1
-        )
-        add_executable(
-            flatsql_sdn_node
-            ${FLATSQL_LIB_SOURCES}
-            $<TARGET_OBJECTS:flatsql_sdn_node_capi>
-            ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
-            ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp
-            ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
-            ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
-            ${FLATBUFFERS_SRC_DIR}/reflection.cpp
-            ${FLATBUFFERS_SRC_DIR}/util.cpp
-            ${FLATBUFFERS_SRC_DIR}/options.cpp
-            src/sdn_node.cpp
-            ${FLATSQL_SDN_NODE_GENERATED_DIR}/invoke_support.cpp
-            ${FLATSQL_SDN_NODE_GENERATED_DIR}/plugin_manifest_exports.c
-            ${SQLITE_DIR}/sqlite3.c
-        )
-
-        target_include_directories(flatsql_sdn_node PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${FLATBUFFERS_INCLUDE_DIR}
-            ${SQLITE_DIR}
-            ${SQLEAN_DIR}
-            ${FLATSQL_SDN_NODE_GENERATED_DIR}
-        )
-        target_compile_options(
-            flatsql_sdn_node
-            PRIVATE
-                -fignore-exceptions
-                -fvisibility=hidden
-        )
-        target_compile_definitions(flatsql_sdn_node PRIVATE
-            SQLITE_THREADSAFE=0
-            SQLITE_OMIT_LOAD_EXTENSION=1
-            SQLITE_OMIT_WAL=1
-            SQLITE_OMIT_DEPRECATED=1
-            SQLITE_OMIT_SHARED_CACHE=1
-            SQLITE_DEFAULT_MEMSTATUS=0
-            SQLITE_DQS=0
-            SQLITE_ENABLE_RTREE=1
-        SQLITE_ENABLE_FTS5=1
-        )
-        set_target_properties(flatsql_sdn_node PROPERTIES
-            OUTPUT_NAME "flatsql-sdn-node"
-            SUFFIX ".wasm"
-            LINK_FLAGS "\
-                -s WASM=1 \
-                -s STANDALONE_WASM=1 \
-                -s PURE_WASI=1 \
-                --no-entry \
-                -s EXPORTED_FUNCTIONS='[\
-                    \"_plugin_alloc\", \"_plugin_free\", \
-                    \"_plugin_invoke_stream\", \
-                    \"_plugin_get_manifest_flatbuffer\", \
-                    \"_plugin_get_manifest_flatbuffer_size\" \
-                ]' \
-                -s EXPORT_KEEPALIVE=0 \
-                -s ALLOW_MEMORY_GROWTH=1 \
-                -s INITIAL_MEMORY=67108864 \
-                -s MAXIMUM_MEMORY=4294967296 \
-                -s STACK_SIZE=1048576 \
-                -s WASMFS=1 \
-                -s ALLOW_TABLE_GROWTH=1 \
-                -s EMULATE_FUNCTION_POINTER_CASTS=1 \
-            "
-        )
-    endif()
-
-    # Space Data Module (SDM) — standalone spatial engine WASM
-    # Compliant with https://github.com/DigitalArsenal/space-data-module-sdk
-    set(SDM_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/../sdm/sdm_entry.cpp
-        src/geo_geometry.cpp
-    )
-
-    add_executable(flatsql_sdm ${SDM_SOURCES})
-
-    target_include_directories(flatsql_sdm PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../sdm
-    )
-
-    set_target_properties(flatsql_sdm PROPERTIES
-        OUTPUT_NAME "flatsql-spatial"
-        SUFFIX ".wasm"
-        LINK_FLAGS "\
-            -s WASM=1 \
-            -s STANDALONE_WASM=1 \
-            --no-entry \
-            -s EXPORTED_FUNCTIONS='[ \
-                \"_malloc\", \"_free\", \
-                \"_plugin_get_manifest\", \"_plugin_get_manifest_size\", \
-                \"_sdm_get_input_buffer\", \"_sdm_set_input_length\", \
-                \"_sdm_get_output_buffer\", \"_sdm_get_output_length\", \
-                \"_compute_distance\", \"_compute_bearing\", \
-                \"_point_in_polygon\", \
-                \"_polygon_intersection\", \"_polygon_union\", \
-                \"_compute_voronoi\", \"_compute_delaunay\", \
-                \"_transform_to_ecef\", \"_transform_from_ecef\", \
-                \"_spatial_query\" \
-            ]' \
-            -s ALLOW_MEMORY_GROWTH=1 \
-            -s INITIAL_MEMORY=4194304 \
-            -s STACK_SIZE=524288 \
-            -s FILESYSTEM=0 \
-            -s ALLOW_TABLE_GROWTH=1 \
-            -fexceptions \
-            -s DISABLE_EXCEPTION_CATCHING=0 \
-        "
-    )
-
-    add_custom_command(TARGET flatsql_sdm POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE_DIR:flatsql_sdm>/flatsql-spatial.wasm
-            ${CMAKE_CURRENT_SOURCE_DIR}/../sdm/
-        COMMENT "Copying flatsql-spatial.wasm to sdm/"
-    )
-
-    message(STATUS "WASM build configured")
-    message(STATUS "Output: flatsql.js + flatsql.wasm + flatsql-wasi.wasm + flatsql-spatial.wasm (SDM)")
-
-    # Post-build: copy WASM files to docs/ for GitHub Pages
-    add_custom_command(TARGET flatsql POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy
-            $<TARGET_FILE_DIR:flatsql>/flatsql.js
-            $<TARGET_FILE_DIR:flatsql>/flatsql.wasm
-            ${CMAKE_CURRENT_SOURCE_DIR}/../docs/
-        COMMENT "Copying WASM files to docs/ for GitHub Pages"
-    )
-
-else()
-    message(STATUS "Native build (for testing and CLI)")
-    find_package(Threads REQUIRED)
-
-    # SQLite static library (from amalgamation)
-    add_library(sqlite3 STATIC ${SQLITE_DIR}/sqlite3.c)
-    target_include_directories(sqlite3 PUBLIC ${SQLITE_DIR})
-    target_compile_definitions(sqlite3 PRIVATE
-        SQLITE_THREADSAFE=1
-        SQLITE_OMIT_LOAD_EXTENSION=1
-        SQLITE_OMIT_DEPRECATED=1
-        SQLITE_DQS=0
-        SQLITE_ENABLE_RTREE=1
-        SQLITE_ENABLE_FTS5=1
-    )
-    # Suppress warnings in SQLite code
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(sqlite3 PRIVATE -w)
-    endif()
-
-    # Native library. The VFS sources ride along so the native lane exercises
-    # the SAME sqlite3_vfs the wasm lanes use (flatsql_io_native.cpp supplies
-    # the seven functions that are imports on wasm).
-    # flatbuffers util.cpp defines ClassicLocale::instance_, which util.h's
-    # inline ClassicLocale::Get references (GNU ld on ubuntu fails without
-    # it); util.cpp in turn uses global_options from options.cpp.
-    add_library(flatsql_lib STATIC ${FLATSQL_LIB_SOURCES} ${FLATSQL_VFS_SOURCES}
-        ${FLATBUFFERS_SRC_DIR}/util.cpp ${FLATBUFFERS_SRC_DIR}/options.cpp)
-    target_compile_definitions(flatsql_lib PUBLIC FLATSQL_ENABLE_IO_VFS=1)
-
-    target_include_directories(flatsql_lib PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-        ${SQLEAN_DIR}
-    )
-    target_link_libraries(flatsql_lib PUBLIC sqlite3 Threads::Threads)
-    if(OpenSSL_FOUND)
-        target_link_libraries(flatsql_lib PUBLIC OpenSSL::Crypto)
-        target_include_directories(flatsql_lib PUBLIC ${OPENSSL_INCLUDE_DIR})
-        # HKDF-SHA256, AES-256-CTR and HMAC-SHA256 from OpenSSL: the backend
-        # FlatBuffers itself builds with (FLATBUFFERS_USE_OPENSSL).
-        set_source_files_properties(${FLATBUFFERS_SRC_DIR}/encryption.cpp
-            PROPERTIES COMPILE_DEFINITIONS FLATBUFFERS_USE_OPENSSL=1)
-    endif()
-
-    # Native CLI executable (with stdin piping support)
-    add_executable(flatsql src/flatsql.cpp)
-    target_link_libraries(flatsql PRIVATE flatsql_lib)
-    target_include_directories(flatsql PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-
-    # Native test executable (basic unit tests)
-    add_executable(flatsql_test test/test_main.cpp)
-    target_link_libraries(flatsql_test PRIVATE flatsql_lib)
-    target_include_directories(flatsql_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-
-    # Integration test (uses real FlatBuffer generated code)
-    add_executable(flatsql_integration_test test/integration_test.cpp)
-    target_link_libraries(flatsql_integration_test PRIVATE flatsql_lib)
-    target_include_directories(flatsql_integration_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/schemas
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-
-    # Socket streaming test (Unix domain socket streaming)
-    add_executable(flatsql_socket_test test/socket_stream_test.cpp)
-    target_link_libraries(flatsql_socket_test PRIVATE flatsql_lib)
-    target_include_directories(flatsql_socket_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/schemas
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-
-    # Benchmark: FlatSQL vs SQLite (using vendored SQLite)
-    message(STATUS "Building benchmark with vendored SQLite")
-    add_executable(flatsql_benchmark test/benchmark.cpp)
-    target_link_libraries(flatsql_benchmark PRIVATE flatsql_lib)
-    target_include_directories(flatsql_benchmark PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/schemas
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-    # Optimize for benchmark
-    target_compile_options(flatsql_benchmark PRIVATE -O3)
-
-    # Comprehensive round-trip test (using vendored SQLite)
-    add_executable(flatsql_roundtrip_test test/roundtrip_test.cpp)
-    target_link_libraries(flatsql_roundtrip_test PRIVATE flatsql_lib)
-    target_include_directories(flatsql_roundtrip_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/schemas
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-
-    # Native cluster validation harness
-    add_executable(flatsql_cluster_validation test/cluster_validation_test.cpp)
-    target_link_libraries(flatsql_cluster_validation PRIVATE flatsql_lib)
-    target_include_directories(flatsql_cluster_validation PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/schemas
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-
-    # Advanced MPE (Minimum Propagatable Element) benchmark - NOT part of CI
-    # Tests large-scale performance with realistic space catalog data
-    # Usage: ./flatsql_mpe_benchmark [record_count]
-    #        Default: 1M records, can test up to 500M+
-    add_executable(flatsql_mpe_benchmark test/mpe_benchmark.cpp)
-    target_link_libraries(flatsql_mpe_benchmark PRIVATE flatsql_lib)
-    target_include_directories(flatsql_mpe_benchmark PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/schemas
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-    # Optimize for benchmark
-    target_compile_options(flatsql_mpe_benchmark PRIVATE -O3)
-
-    # Spatial extensions benchmark
-    add_executable(flatsql_geo_benchmark test/geo_benchmark.cpp)
-    target_link_libraries(flatsql_geo_benchmark PRIVATE flatsql_lib)
-    target_include_directories(flatsql_geo_benchmark PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-    target_compile_options(flatsql_geo_benchmark PRIVATE -O3)
-
-    # Spatial extensions test
-    add_executable(flatsql_geo_test test/test_geo.cpp)
-    target_link_libraries(flatsql_geo_test PRIVATE flatsql_lib)
-    target_include_directories(flatsql_geo_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-
-    # Disk-backed engine persistence (docs/STORAGE-DURABILITY.md)
-    add_executable(flatsql_disk_persistence_test test/disk_persistence_test.cpp)
-    target_link_libraries(flatsql_disk_persistence_test PRIVATE flatsql_lib)
-    target_include_directories(flatsql_disk_persistence_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-
-    # FlatSQL's own VFS, end to end through the seven-import contract
-    add_executable(flatsql_vfs_test test/vfs_test.cpp)
-    target_link_libraries(flatsql_vfs_test PRIVATE flatsql_lib)
-    target_include_directories(flatsql_vfs_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-
-    # Durable state over the stream + persisted index (the native half of the
-    # sdn-js backend matrix)
-    add_executable(flatsql_state_persistence_test test/state_persistence_test.cpp)
-    target_link_libraries(flatsql_state_persistence_test PRIVATE flatsql_lib)
-    target_include_directories(flatsql_state_persistence_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-
-    # ------------------------------------------------------------------
-    # Partition store (format 2): docs/PARTITION-STORE.md
-    # The engine core is host-neutral C++ (no SQLite): it reaches the host
-    # only through the seven flatsql_io_* imports, so the same sources build
-    # the wasm32-wasip1-threads artifact (T4).
-    # ------------------------------------------------------------------
-    set(FLATSQL_PS_SOURCES
-        src/ps/platform.cpp
-        src/ps/io.cpp
-        src/ps/format.cpp
-        src/ps/index_l0.cpp
-        src/ps/index_l1.cpp
-        src/ps/ring.cpp
-        src/typecfg/extract.cpp
-        src/ps/journal.cpp
-        src/ps/registry.cpp
-        src/ps/partition_log.cpp
-        src/ps/merge.cpp
-        src/ps/type_owner.cpp
-        src/ps/writer_pool.cpp
-        src/ps/open.cpp
-        src/ps/capi_ps.cpp
-        src/ps/lane_arena.cpp
-        src/ps/snapshot.cpp
-        src/ps/result_block.cpp
-        src/ps/vtab_partition.cpp
-        src/ps/vtab_fanout.cpp
-        src/ps/vtab_meta.cpp
-        src/ps/admission.cpp
-        src/ps/lane.cpp
-        ${FLATBUFFERS_SRC_DIR}/reflection.cpp
-    )
-    # Reader lanes (T2): SQLite is only the per-lane in-memory SQL layer
-    # (ruling 1): multi-thread mode, no memory statistics, no WAL, temp
-    # storage in memory; allocation goes through the per-lane arenas.
-    add_library(sqlite3_ps STATIC ${SQLITE_DIR}/sqlite3.c)
-    target_include_directories(sqlite3_ps PUBLIC ${SQLITE_DIR})
-    target_compile_definitions(sqlite3_ps PRIVATE
-        SQLITE_THREADSAFE=2
-        SQLITE_DEFAULT_MEMSTATUS=0
-        SQLITE_OMIT_WAL=1
-        SQLITE_TEMP_STORE=3
-        SQLITE_OMIT_LOAD_EXTENSION=1
-        SQLITE_OMIT_DEPRECATED=1
-        SQLITE_OMIT_SHARED_CACHE=1
-        SQLITE_DQS=0
-    )
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(sqlite3_ps PRIVATE -w)
-    endif()
-    add_library(flatsql_ps STATIC ${FLATSQL_PS_SOURCES} src/flatsql_io_native.cpp)
-    target_include_directories(flatsql_ps PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-    )
-    target_link_libraries(flatsql_ps PUBLIC sqlite3_ps Threads::Threads)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(flatsql_ps PRIVATE -Wall -Wextra -Wno-unused-parameter)
-    endif()
-
-    add_executable(flatsql_ps_test
-        test/ps/ps_test_main.cpp
-        test/ps/ps_fixtures.cpp
-        test/ps/format_test.cpp
-        test/ps/writer_pool_test.cpp
-        test/ps/type_owner_test.cpp
-        test/ps/open_test.cpp
-        test/ps/crash_fault_test.cpp
-        test/ps/reader_fixtures.cpp
-        test/ps/lane_test.cpp
-        test/ps/fanout_merge_test.cpp
-        test/ps/int64_exact_test.cpp
-        test/ps/lane_isolation_test.cpp
-        test/ps/snapshot_test.cpp
-        test/ps/arrivals_paging_test.cpp
-        test/ps/reader_concurrency_test.cpp
-        test/ps/parity_test.cpp
-        test/ps/host_crash_test.cpp
-        test/io_fault.cpp
-    )
-    # Test-only: the flatsql schema parser compiles the test schemas at run
-    # time (no files from sibling repositories).
-    add_library(flatsql_ps_testutil STATIC
-        ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
-        ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
-        ${FLATBUFFERS_SRC_DIR}/util.cpp
-        ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
-        ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp
-        ${FLATBUFFERS_SRC_DIR}/options.cpp
-    )
-    target_include_directories(flatsql_ps_testutil PUBLIC ${FLATBUFFERS_INCLUDE_DIR})
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(flatsql_ps_testutil PRIVATE -w)
-    endif()
-    target_link_libraries(flatsql_ps_test PRIVATE flatsql_ps flatsql_ps_testutil)
-    target_include_directories(flatsql_ps_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
-    target_compile_definitions(flatsql_ps_test PRIVATE
-        PS_VECTOR_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/ps/vectors")
-
-    add_executable(flatsql_ps_bench test/ps/bench_main.cpp test/ps/ps_fixtures.cpp test/io_fault.cpp
-        test/ps/reader_fixtures.cpp test/ps/reader_concurrency_test.cpp)
-    target_link_libraries(flatsql_ps_bench PRIVATE flatsql_ps flatsql_ps_testutil)
-    target_include_directories(flatsql_ps_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
-    target_compile_options(flatsql_ps_bench PRIVATE -O2)
-
-    # T3 compaction/quota/split sources register themselves here.
-    include(${CMAKE_CURRENT_SOURCE_DIR}/src/ps/sources-t3.cmake OPTIONAL)
-    # Terabyte harness (slow tests: unit gates, engine, count-scaled and
-    # metadata-only tiers).
-    include(${CMAKE_CURRENT_SOURCE_DIR}/test/ps/tb_sources.cmake)
-
-    # ---- store format 4 ("p4": one SQLite file per partition, producer x record type) ----
-    # SQLite 3.53.4 unmodified: multi-thread mode, WAL, FTS5, no memory
-    # statistics (C-30: the SQL surface's allocator counts and enforces the
-    # hard heap); files only through FlatSQL's own VFS (flatsql_io). The SQL
-    # surface (src/p4sql) is globbed in; without it src/p4/p4sql_weak.cpp
-    # answers ops 30/31 with UNSUPPORTED (and is left out when it is there).
-    add_library(sqlite3_p4 STATIC ${SQLITE_DIR}/sqlite3.c)
-    target_include_directories(sqlite3_p4 PUBLIC ${SQLITE_DIR})
-    target_compile_definitions(sqlite3_p4 PRIVATE
-        SQLITE_THREADSAFE=2
-        SQLITE_DEFAULT_MEMSTATUS=0
-        SQLITE_TEMP_STORE=3
-        SQLITE_OMIT_LOAD_EXTENSION=1
-        SQLITE_OMIT_DEPRECATED=1
-        SQLITE_OMIT_SHARED_CACHE=1
-        SQLITE_DQS=0
-        SQLITE_ENABLE_FTS5=1
-    )
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(sqlite3_p4 PRIVATE -w)
-    endif()
-    file(GLOB FLATSQL_P4_SOURCES CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/p4/*.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/p4sql/*.cpp")
-    list(FILTER FLATSQL_P4_SOURCES EXCLUDE REGEX "/capi_wasm\\.cpp$")
-    file(GLOB FLATSQL_P4SQL_PRESENT "${CMAKE_CURRENT_SOURCE_DIR}/src/p4sql/*.cpp")
-    if(FLATSQL_P4SQL_PRESENT)
-        list(FILTER FLATSQL_P4_SOURCES EXCLUDE REGEX "/p4sql_weak\\.cpp$")
-    endif()
-    # The engine without host I/O: flatsql_p4 adds the native seven imports;
-    # the fault tests supply their own.
-    add_library(flatsql_p4_core OBJECT
-        ${FLATSQL_P4_SOURCES}
-        src/typecfg/extract.cpp
-        src/ps/platform.cpp
-        src/ps/result_block.cpp
-        src/flatsql_vfs.cpp
-        src/record_search.cpp
-        ${FLATBUFFERS_SRC_DIR}/reflection.cpp
-        ${FLATBUFFERS_SRC_DIR}/util.cpp
-        ${FLATBUFFERS_SRC_DIR}/options.cpp
-    )
-    target_include_directories(flatsql_p4_core PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-    flatsql_p4_use_sds(flatsql_p4_core)
-    target_link_libraries(flatsql_p4_core PUBLIC sqlite3_p4 Threads::Threads)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(flatsql_p4_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
-    endif()
-    add_library(flatsql_p4 STATIC $<TARGET_OBJECTS:flatsql_p4_core> src/flatsql_io_native.cpp)
-    target_include_directories(flatsql_p4 PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-    )
-    target_link_libraries(flatsql_p4 PUBLIC sqlite3_p4 Threads::Threads)
-    # Tests: cpp/tests/p4 (and the SQL surface's engine tests in cpp/tests/p4sql;
-    # its fake reader builds only its own fake target).
-    file(GLOB FLATSQL_P4_TEST_SOURCES CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/*.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/p4sql/*.cpp")
-    list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/fake_reader\\.cpp$")
-    list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/p4_fault_io\\.cpp$")
-    list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/tests/p4sql/.*fake.*\\.cpp$")
-    if(FLATSQL_P4_TEST_SOURCES)
-        # The replay counts actual host sync calls, including WAL-header syncs.
-        # Rename only this test object's symbol; production I/O stays unchanged.
-        add_library(flatsql_p4_replay_native_io OBJECT src/flatsql_io_native.cpp)
-        target_include_directories(flatsql_p4_replay_native_io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-        target_compile_definitions(flatsql_p4_replay_native_io PRIVATE flatsql_io_sync=p4ReplayNativeSync)
-        # The engine's objects, not the archive: every object is linked
-        # (the SQL surface's included), as in the wasm artifact.
-        add_executable(flatsql_p4_test ${FLATSQL_P4_TEST_SOURCES}
-            $<TARGET_OBJECTS:flatsql_p4_core>
-            $<TARGET_OBJECTS:flatsql_p4_replay_native_io>
-            ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
-            ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
-            ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
-            ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp)
-        flatsql_p4_use_sds(flatsql_p4_test)
-        target_link_libraries(flatsql_p4_test PRIVATE sqlite3_p4 Threads::Threads)
-        target_include_directories(flatsql_p4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${FLATBUFFERS_INCLUDE_DIR} ${SQLITE_DIR})
-        target_include_directories(flatsql_p4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src/p4)
-        target_compile_definitions(flatsql_p4_test PRIVATE
-            P4_REPLAY_NATIVE_IO=1
-            P4_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
-        add_test(NAME FlatSQLStoreFormat4Test COMMAND flatsql_p4_test)
-        # Power loss: the same engine objects over FaultFs (in-memory files
-        # that keep what a crash leaves), the test main and its loop only.
-        add_executable(flatsql_p4_fault_test
-            tests/p4/p4_test_main.cpp tests/p4/p4_fault_io.cpp test/io_fault.cpp
-            $<TARGET_OBJECTS:flatsql_p4_core>
-            ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
-            ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
-            ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
-            ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp)
-        flatsql_p4_use_sds(flatsql_p4_fault_test)
-        target_link_libraries(flatsql_p4_fault_test PRIVATE sqlite3_p4 Threads::Threads)
-        target_include_directories(flatsql_p4_fault_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${FLATBUFFERS_INCLUDE_DIR} ${SQLITE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/p4 ${CMAKE_CURRENT_SOURCE_DIR}/test)
-        target_compile_definitions(flatsql_p4_fault_test PRIVATE
-            P4_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
-    endif()
-
-    add_executable(flatsql_full_text_search_test tests/full_text_search_test.cpp)
-    target_link_libraries(flatsql_full_text_search_test PRIVATE flatsql_lib)
-
-    enable_testing()
-    add_test(NAME FlatSQLFullTextSearchTest COMMAND flatsql_full_text_search_test)
-    add_executable(flatsql_full_text_reflection_test tests/full_text_reflection_test.cpp)
-    target_link_libraries(flatsql_full_text_reflection_test PRIVATE flatsql_lib)
-    add_test(NAME FlatSQLFullTextReflectionTest COMMAND flatsql_full_text_reflection_test)
-    # Query-path regressions: index use and rows examined, never wall-clock
-    add_executable(flatsql_query_regression_test test/query_regression_test.cpp)
-    target_link_libraries(flatsql_query_regression_test PRIVATE flatsql_lib)
-    add_test(NAME FlatSQLQueryRegressionTest COMMAND flatsql_query_regression_test)
-    # Arena capacity cap: refusals, never a trap in the arena's resize
-    add_executable(flatsql_arena_limit_test test/arena_limit_test.cpp)
-    target_link_libraries(flatsql_arena_limit_test PRIVATE flatsql_lib)
-    add_test(NAME FlatSQLArenaLimitTest COMMAND flatsql_arena_limit_test)
-
-    # Arena compaction: equivalence, steps, crash injection at every host-I/O
-    # call, churn soak. The test supplies the seven flatsql_io_* functions (an
-    # in-memory filesystem with power-loss semantics), so it compiles the
-    # engine sources without flatsql_io_native.cpp instead of linking
-    # flatsql_lib.
-    add_executable(flatsql_arena_compaction_test test/arena_compaction_test.cpp
-        ${FLATSQL_LIB_SOURCES} src/flatsql_vfs.cpp
-        ${FLATBUFFERS_SRC_DIR}/util.cpp ${FLATBUFFERS_SRC_DIR}/options.cpp)
-    target_compile_definitions(flatsql_arena_compaction_test PRIVATE FLATSQL_ENABLE_IO_VFS=1)
-    target_include_directories(flatsql_arena_compaction_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${FLATBUFFERS_INCLUDE_DIR}
-        ${SQLITE_DIR}
-        ${SQLEAN_DIR}
-    )
-    target_link_libraries(flatsql_arena_compaction_test PRIVATE sqlite3 Threads::Threads)
-    if(OpenSSL_FOUND)
-        target_link_libraries(flatsql_arena_compaction_test PRIVATE OpenSSL::Crypto)
-        target_include_directories(flatsql_arena_compaction_test PRIVATE ${OPENSSL_INCLUDE_DIR})
-    endif()
-    add_test(NAME FlatSQLArenaCompactionTest COMMAND flatsql_arena_compaction_test)
-    # Database-key record encryption (field-encryption format 3). The schema
-    # compiler serializes the test's binary schemas. Every backend has record
-    # encryption (OpenSSL, or the fallback from FlatBuffers 8af3053e on).
-    add_executable(flatsql_db_key_encryption_test test/db_key_encryption_test.cpp
+# ---- store format 4 ("p4": one SQLite file per partition, producer x record type) ----
+# SQLite 3.53.4 unmodified: multi-thread mode, WAL, FTS5, no memory
+# statistics (C-30: the SQL surface's allocator counts and enforces the
+# hard heap); files only through FlatSQL's own VFS (flatsql_io). The SQL
+# surface (src/p4sql) is globbed in; without it src/p4/p4sql_weak.cpp
+# answers ops 30/31 with UNSUPPORTED (and is left out when it is there).
+add_library(sqlite3_p4 STATIC ${SQLITE_DIR}/sqlite3.c)
+target_include_directories(sqlite3_p4 PUBLIC ${SQLITE_DIR})
+target_compile_definitions(sqlite3_p4 PRIVATE
+    SQLITE_THREADSAFE=2
+    SQLITE_DEFAULT_MEMSTATUS=0
+    SQLITE_TEMP_STORE=3
+    SQLITE_OMIT_LOAD_EXTENSION=1
+    SQLITE_OMIT_DEPRECATED=1
+    SQLITE_OMIT_SHARED_CACHE=1
+    SQLITE_OMIT_JSON=1
+    SQLITE_DQS=0
+    SQLITE_ENABLE_FTS5=1
+)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(sqlite3_p4 PRIVATE -w)
+endif()
+file(GLOB FLATSQL_P4_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/p4/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/p4sql/*.cpp")
+list(FILTER FLATSQL_P4_SOURCES EXCLUDE REGEX "/capi_wasm\\.cpp$")
+file(GLOB FLATSQL_P4SQL_PRESENT "${CMAKE_CURRENT_SOURCE_DIR}/src/p4sql/*.cpp")
+if(FLATSQL_P4SQL_PRESENT)
+    list(FILTER FLATSQL_P4_SOURCES EXCLUDE REGEX "/p4sql_weak\\.cpp$")
+endif()
+# The engine without host I/O: flatsql_p4 adds the native seven imports;
+# the fault tests supply their own.
+add_library(flatsql_p4_core OBJECT
+    ${FLATSQL_P4_SOURCES}
+    src/geo_functions.cpp
+    src/geo_geometry.cpp
+    src/geo_gjn.cpp
+    src/query_page.cpp
+    src/typecfg/extract.cpp
+    src/ps/platform.cpp
+    src/ps/result_block.cpp
+    src/flatsql_vfs.cpp
+    src/record_search.cpp
+    ${FLATBUFFERS_SRC_DIR}/reflection.cpp
+    ${FLATBUFFERS_SRC_DIR}/util.cpp
+    ${FLATBUFFERS_SRC_DIR}/options.cpp
+)
+target_include_directories(flatsql_p4_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${FLATBUFFERS_INCLUDE_DIR}
+    ${SQLITE_DIR}
+)
+flatsql_p4_use_sds(flatsql_p4_core)
+target_link_libraries(flatsql_p4_core PUBLIC sqlite3_p4 Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(flatsql_p4_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()
+add_library(flatsql STATIC $<TARGET_OBJECTS:flatsql_p4_core> src/flatsql_io_native.cpp)
+target_include_directories(flatsql PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${FLATBUFFERS_INCLUDE_DIR}
+    ${SQLITE_DIR}
+)
+target_link_libraries(flatsql PUBLIC sqlite3_p4 Threads::Threads)
+# Tests: cpp/tests/p4 (and the SQL surface's engine tests in cpp/tests/p4sql;
+# its fake reader builds only its own fake target).
+file(GLOB FLATSQL_P4_TEST_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/p4sql/*.cpp")
+list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/fake_reader\\.cpp$")
+list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/p4_fault_io\\.cpp$")
+list(FILTER FLATSQL_P4_TEST_SOURCES EXCLUDE REGEX "/tests/p4sql/.*fake.*\\.cpp$")
+if(FLATSQL_P4_TEST_SOURCES)
+    # The replay counts actual host sync calls, including WAL-header syncs.
+    # Rename only this test object's symbol; production I/O stays unchanged.
+    add_library(flatsql_p4_replay_native_io OBJECT src/flatsql_io_native.cpp)
+    target_include_directories(flatsql_p4_replay_native_io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(flatsql_p4_replay_native_io PRIVATE flatsql_io_sync=p4ReplayNativeSync)
+    # The engine's objects, not the archive: every object is linked
+    # (the SQL surface's included), as in the wasm artifact.
+    add_executable(flatsql_p4_test ${FLATSQL_P4_TEST_SOURCES}
+        $<TARGET_OBJECTS:flatsql_p4_core>
+        $<TARGET_OBJECTS:flatsql_p4_replay_native_io>
         ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
         ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
         ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
         ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp)
-    target_link_libraries(flatsql_db_key_encryption_test PRIVATE flatsql_lib)
-    target_compile_definitions(flatsql_db_key_encryption_test PRIVATE
-        FLATSQL_EXPECT_RECORD_ENCRYPTION=1)
-    add_test(NAME FlatSQLDbKeyEncryptionTest COMMAND flatsql_db_key_encryption_test)
-    add_test(NAME FlatSQLVfsTest COMMAND flatsql_vfs_test)
-    add_test(NAME FlatSQLStatePersistenceTest COMMAND flatsql_state_persistence_test)
-    add_test(NAME FlatSQLDiskPersistenceTest COMMAND flatsql_disk_persistence_test)
-    add_test(NAME FlatSQLTest COMMAND flatsql_test)
-    add_test(NAME FlatSQLIntegrationTest COMMAND flatsql_integration_test)
-    add_test(NAME FlatSQLSocketTest COMMAND flatsql_socket_test)
-    add_test(NAME FlatSQLRoundTripTest COMMAND flatsql_roundtrip_test)
-    add_test(NAME FlatSQLGeoTest COMMAND flatsql_geo_test)
-    add_test(NAME FlatSQLPartitionStoreTest COMMAND flatsql_ps_test)
+    flatsql_p4_use_sds(flatsql_p4_test)
+    target_link_libraries(flatsql_p4_test PRIVATE sqlite3_p4 Threads::Threads)
+    target_include_directories(flatsql_p4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR} ${SQLITE_DIR})
+    target_include_directories(flatsql_p4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src/p4)
+    target_compile_definitions(flatsql_p4_test PRIVATE
+        FLATSQL_REPLAY_NATIVE_IO=1
+        FLATSQL_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
+    add_test(NAME FlatSQLBinaryQueryReopen COMMAND flatsql_p4_test --test=t_gjn_binary_query_reopen)
+    # Power loss: the same engine objects over FaultFs (in-memory files
+    # that keep what a crash leaves), the test main and its loop only.
+    add_executable(flatsql_p4_fault_test
+        tests/p4/p4_test_main.cpp tests/p4/p4_fault_io.cpp test/io_fault.cpp
+        $<TARGET_OBJECTS:flatsql_p4_core>
+        ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
+        ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
+        ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
+        ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp)
+    flatsql_p4_use_sds(flatsql_p4_fault_test)
+    target_link_libraries(flatsql_p4_fault_test PRIVATE sqlite3_p4 Threads::Threads)
+    target_include_directories(flatsql_p4_fault_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR} ${SQLITE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/p4 ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    target_compile_definitions(flatsql_p4_fault_test PRIVATE
+        FLATSQL_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
 endif()

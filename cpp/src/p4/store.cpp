@@ -37,42 +37,42 @@ bool validTypeName(const std::string& n) {
 
 int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::string* err) {
     std::vector<Tlv> v;
-    if (!tlvParse(p, n, &v)) { *err = "spec: malformed TLV"; return P4_E_ARG; }
+    if (!tlvParse(p, n, &v)) { *err = "spec: malformed TLV"; return FLATSQL_E_ARG; }
     auto s = std::make_shared<Spec>();
     std::string schema;
-    if (!tlvText(v, 1, &schema)) { *err = "spec: no schema name (tag 1)"; return P4_E_ARG; }
+    if (!tlvText(v, 1, &schema)) { *err = "spec: no schema name (tag 1)"; return FLATSQL_E_ARG; }
     s->name = schema.substr(0, schema.find('.'));
-    if (!validTypeName(s->name)) { *err = "spec: bad type name " + s->name; return P4_E_ARG; }
+    if (!validTypeName(s->name)) { *err = "spec: bad type name " + s->name; return FLATSQL_E_ARG; }
     const Tlv* fid = tlvFind(v, 2);
-    if (!fid || fid->n != 4) { *err = "spec: tag 2 (file identifier) must be 4 bytes"; return P4_E_ARG; }
+    if (!fid || fid->n != 4) { *err = "spec: tag 2 (file identifier) must be 4 bytes"; return FLATSQL_E_ARG; }
     if (!std::memcmp(fid->v, "$FMB", 4) || !std::memcmp(fid->v, "$FCK", 4) || !std::memcmp(fid->v, "$FSG", 4)) {
         *err = "spec: FMB, FCK and FSG identifiers are reserved";
-        return P4_E_ARG;
+        return FLATSQL_E_ARG;
     }
     bool bad = false;
     uint32_t u32 = 0;
     uint64_t u64 = 0;
     uint8_t u8 = 0;
     if (tlvU32(v, 8, &u32, &bad)) {
-        if (u32 < 512 || u32 > 65536 || (u32 & (u32 - 1))) { *err = "spec: page size"; return P4_E_ARG; }
+        if (u32 < 512 || u32 > 65536 || (u32 & (u32 - 1))) { *err = "spec: page size"; return FLATSQL_E_ARG; }
         s->pageSize = u32;
     }
     if (tlvU8(v, 9, &u8, &bad)) s->identity = u8 != 0;
     if (tlvU32(v, 10, &u32, &bad) && u32) s->a18Bound = u32;
     if (tlvU8(v, 11, &u8, &bad)) {
-        if (u8 > 2) { *err = "spec: epoch profile"; return P4_E_ARG; }
+        if (u8 > 2) { *err = "spec: epoch profile"; return FLATSQL_E_ARG; }
         s->epochProfile = u8;
     }
     if (tlvU8(v, 12, &u8, &bad)) s->fullText = u8 != 0;
     if (tlvU64(v, 5, &u64, &bad) && u64 == 0) bad = true;
     if (tlvU32(v, 7, &u32, &bad)) {}
-    if (bad) { *err = "spec: a typed tag has the wrong length"; return P4_E_ARG; }
+    if (bad) { *err = "spec: a typed tag has the wrong length"; return FLATSQL_E_ARG; }
     // Only tags 1-7 reach the type config (format 2's TypeConfig::build shape).
     std::vector<uint8_t> tc;
     for (const Tlv& t : v)
         if (t.tag >= 1 && t.tag <= 7) tlvPut(tc, t.tag, t.v, t.n);
     const std::string e = s->tc.parse(tc.data(), tc.size());
-    if (!e.empty()) { *err = "spec: " + e; return P4_E_ARG; }
+    if (!e.empty()) { *err = "spec: " + e; return FLATSQL_E_ARG; }
     s->bytes.assign(p, p + n);
     s->rules = s->tc.rules();
     s->hasEpochRule = s->tc.hasEpochRule();
@@ -93,7 +93,7 @@ int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::s
     }
     s->ek = s->hasEpochRule && s->hasObject;
     *out = std::move(s);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 namespace {
@@ -117,7 +117,7 @@ bool specFromFile(const std::vector<uint8_t>& b, std::vector<uint8_t>* tlv) {
 std::vector<std::string> catalogRead(const std::string& path) {
     std::vector<std::string> names;
     std::vector<uint8_t> b;
-    if (ioReadAll(path, &b) != P4_OK) return names;
+    if (ioReadAll(path, &b) != FLATSQL_OK) return names;
     size_t at = 0;
     while (b.size() - at >= 6) {
         const uint32_t crc = ld32(&b[at]);
@@ -150,15 +150,15 @@ void sqlLog(void*, int code, const char* msg) {
 }
 int32_t globalInit() {
     std::lock_guard<std::mutex> g(gGlobalMu);
-    if (gGlobalDone) return P4_OK;
+    if (gGlobalDone) return FLATSQL_OK;
     // p4sql installs its per-lane allocators before SQLite initializes (§3.9).
     int32_t rc = p4sql_global_init();
-    if (rc != P4_OK) return rc;
+    if (rc != FLATSQL_OK) return rc;
     sqlite3_config(SQLITE_CONFIG_LOG, sqlLog, nullptr);  // refused (ignored) once SQLite is initialized
-    if (sqlite3_initialize() != SQLITE_OK) return P4_E_INTERNAL;
-    if (flatsql::registerFlatSqlIoVfs(false) != SQLITE_OK) return P4_E_INTERNAL;
+    if (sqlite3_initialize() != SQLITE_OK) return FLATSQL_E_INTERNAL;
+    if (flatsql::registerFlatSqlIoVfs(false) != SQLITE_OK) return FLATSQL_E_INTERNAL;
     gGlobalDone = true;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 void randomUuid(uint8_t out[16]) {
@@ -179,13 +179,13 @@ int32_t readMarkers(Engine* e, Markers* m) {
     std::vector<uint8_t> s, g;
     const std::string sp = pathJoin(e->cfg.root, "STORE"), mp = pathJoin(e->cfg.root, "MIGRATED");
     const bool hs = ioExists(sp), hm = ioExists(mp);
-    if (hs && ioReadAll(sp, &s) != P4_OK) return P4_E_IO;
-    if (hm && ioReadAll(mp, &g) != P4_OK) return P4_E_IO;
+    if (hs && ioReadAll(sp, &s) != FLATSQL_OK) return FLATSQL_E_IO;
+    if (hm && ioReadAll(mp, &g) != FLATSQL_OK) return FLATSQL_E_IO;
     *m = Markers();
     decodeMarkers(hs ? s.data() : nullptr, s.size(), hm ? g.data() : nullptr, g.size(), m);
     if (hs && !s.data()) m->storePresent = true;
     if (hm && !g.data()) m->migratedPresent = true;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t writeMarkers(Engine* e, const uint8_t uuid[16], uint64_t floor, uint32_t from, bool migratedToo) {
@@ -193,7 +193,7 @@ int32_t writeMarkers(Engine* e, const uint8_t uuid[16], uint64_t floor, uint32_t
         uint8_t mig[40];
         encodeMigrated(mig, uuid, wallMs());
         const int32_t rc = ioWriteNew(pathJoin(e->cfg.root, "MIGRATED"), mig, sizeof mig);
-        if (rc != P4_OK) return rc;
+        if (rc != FLATSQL_OK) return rc;
     }
     uint8_t st[64];
     encodeStore(st, uuid, wallMs(), floor, from);
@@ -213,7 +213,7 @@ bool markersActivated(const Markers& m) {
 // (the local rows of a seq the feed took in go once the feed holds it).
 int32_t typeFilesOpen(Type* t, std::string* err) {
     int32_t rc = typeIndexOpen(t, err);
-    if (rc != P4_OK) return rc;
+    if (rc != FLATSQL_OK) return rc;
     std::vector<Feed*> feeds;
     {
         std::lock_guard<std::mutex> g(t->mu);
@@ -225,11 +225,11 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
     for (Feed* f : feeds) {
         std::vector<int64_t> mv;
         rc = feedOpen(t, f, &mv, err);
-        if (rc == P4_E_CORRUPT) {
+        if (rc == FLATSQL_E_CORRUPT) {
             rebuild.push_back(f);
             continue;
         }
-        if (rc != P4_OK) return rc;
+        if (rc != FLATSQL_OK) return rc;
         for (int64_t seq : mv) moved.push_back({f, seq});
     }
     {
@@ -239,10 +239,10 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
     for (Feed* f : rebuild) {
         int64_t n = 0;
         rc = rebuildFeed(t->e, t, f, &n, err);
-        if (rc != P4_OK) return rc;
+        if (rc != FLATSQL_OK) return rc;
         std::vector<int64_t> mv;
         rc = feedOpen(t, f, &mv, err);
-        if (rc != P4_OK) return rc;
+        if (rc != FLATSQL_OK) return rc;
         for (int64_t seq : mv) moved.push_back({f, seq});
     }
     if (!moved.empty()) {
@@ -257,7 +257,7 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
             WriteCtx w(t->e, t);
             for (auto& m : moved) {
                 bool held = false;
-                int32_t st = P4_OK;
+                int32_t st = FLATSQL_OK;
                 std::string er;
                 Conn* c = writerPin(t->e, m.first, &st, &er);
                 if (!c) {
@@ -266,7 +266,7 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
                 }
                 st = fileHoldsSeq(c, m.second, &held);
                 writerUnpin(t->e, m.first);
-                if (st != P4_OK) return st;
+                if (st != FLATSQL_OK) return st;
                 if (!held) continue;
                 RecState* r = w.bySeq(local->fid, m.second, &st);
                 if (!r) {
@@ -278,7 +278,7 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
                 finished.push_back(m.second);
             }
             rc = w.commit();
-            if (rc != P4_OK) {
+            if (rc != FLATSQL_OK) {
                 if (err) *err = "finishing moves: " + w.err;
                 return rc;
             }
@@ -290,11 +290,12 @@ int32_t typeFilesOpen(Type* t, std::string* err) {
     std::lock_guard<std::mutex> g(t->mu);
     for (Feed* f : feeds) f->movedDone = true;
     t->visRecompute();
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
-// A registered type. Its T/ files are opened only when they exist: a type
-// that never had a write costs its .spec and nothing else.
+// Persist an empty registry at registration, before publishing TYPES. A host
+// with the seven-import ABI cannot enumerate streams to distinguish an empty
+// type from a lost registry on reopen.
 int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std::string* err, bool fresh = false) {
     t->e = e;
     t->name = sp->name;
@@ -311,14 +312,13 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
         t->nextSeq = int64_t(e->cfg.gseqFloor);
         t->visRecompute();
     }
-    if (!ioExists(t->pIdx)) {
+    if (!fresh && !ioExists(t->pIdx)) {
         std::vector<std::string> streams;
-        if (fresh) return P4_OK;
-        if (!p4ListStreams(t->pDir, &streams)) { *err = "missing type index requires stream directory enumeration"; return P4_E_UNSUPPORTED; }
-        if (streams.empty()) return P4_OK;
+        if (!p4ListStreams(t->pDir, &streams)) { *err = "missing type index requires stream directory enumeration"; return FLATSQL_E_UNSUPPORTED; }
+        if (streams.empty()) return FLATSQL_OK;
     }
     const int32_t rc = typeFilesOpen(t, err);
-    if (rc != P4_OK) {
+    if (rc != FLATSQL_OK) {
         // The caller deletes the type: nothing the open made may outlive it
         // (its feeds sit in the writer LRU, which engineStop walks).
         std::vector<Feed*> fs;
@@ -339,7 +339,7 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
     }
     t->hasFiles.store(true, std::memory_order_release);
     typeFileBytes(t);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // A file name for a feed: its provider and source, URL-escaped outside
@@ -379,17 +379,17 @@ std::string feedFileName(Type* t, const std::string& provider, const std::string
 }  // namespace
 
 int32_t typeFilesEnsure(Type* t, std::string* err) {
-    if (t->hasFiles.load(std::memory_order_acquire)) return P4_OK;
+    if (t->hasFiles.load(std::memory_order_acquire)) return FLATSQL_OK;
     std::lock_guard<std::mutex> g(t->openMu);
-    if (t->hasFiles.load(std::memory_order_acquire)) return P4_OK;
+    if (t->hasFiles.load(std::memory_order_acquire)) return FLATSQL_OK;
     const int32_t rc = typeFilesOpen(t, err);
-    if (rc != P4_OK) {
+    if (rc != FLATSQL_OK) {
         delete t->idx;
         t->idx = nullptr;
         return rc;
     }
     t->hasFiles.store(true, std::memory_order_release);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // ---- registry --------------------------------------------------------------------------
@@ -472,9 +472,9 @@ uint32_t tokFor(Type* t, const std::string& token, const std::string& peer, bool
 // ---- init ----------------------------------------------------------------------------------
 int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* err) {
     int32_t rc = parseConfig(cfgBytes, n, &e->cfg, err);
-    if (rc != P4_OK) return rc;
+    if (rc != FLATSQL_OK) return rc;
     rc = globalInit();
-    if (rc != P4_OK) { *err = "SQLite or the SQL surface failed to initialize"; return rc; }
+    if (rc != FLATSQL_OK) { *err = "SQLite or the SQL surface failed to initialize"; return rc; }
     for (auto& s : e->stat) s.store(0);
     sqlite3_soft_heap_limit64(int64_t(e->cfg.softHeap));
     sqlite3_hard_heap_limit64(int64_t(e->cfg.hardHeap));
@@ -486,15 +486,15 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
 
     Markers& m = e->markers;
     rc = readMarkers(e, &m);
-    if (rc != P4_OK) { *err = "markers: read failed"; return rc; }
-    if (m.storeValid && (m.format != 5 || m.layout > 1)) { *err = "STORE has an unsupported format or layout (requires format 5)"; return P4_E_FORMAT; }
-    if (m.migratedValid && m.migratedFormat != 5) { *err = "MIGRATED has an unsupported format (requires format 5)"; return P4_E_FORMAT; }
+    if (rc != FLATSQL_OK) { *err = "markers: read failed"; return rc; }
+    if (m.storeValid && (m.format != 5 || m.layout > 1)) { *err = "STORE has an unsupported format or layout (requires format 5)"; return FLATSQL_E_FORMAT; }
+    if (m.migratedValid && m.migratedFormat != 5) { *err = "MIGRATED has an unsupported format (requires format 5)"; return FLATSQL_E_FORMAT; }
     const std::string catalog = pathJoin(pathJoin(e->cfg.root, "T"), "TYPES");
     const std::vector<std::string> names = catalogRead(catalog);
     uint64_t floor = e->cfg.gseqFloor;
     switch (e->cfg.createMode) {
         case 0:
-            if (!markersActivated(m)) { *err = "not an activated format-5 store (STORE and MIGRATED)"; return P4_E_FORMAT; }
+            if (!markersActivated(m)) { *err = "not an activated format-5 store (STORE and MIGRATED)"; return FLATSQL_E_FORMAT; }
             floor = m.gseqFloor;
             break;
         case 1:
@@ -504,59 +504,59 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
                 uint8_t uuid[16];
                 randomUuid(uuid);
                 rc = writeMarkers(e, uuid, floor, 0, true);
-                if (rc != P4_OK) { *err = "markers: write failed"; return rc; }
+                if (rc != FLATSQL_OK) { *err = "markers: write failed"; return rc; }
                 readMarkers(e, &m);
             } else if (m.storePresent && !m.storeValid && m.migratedValid && names.empty()) {
                 // A torn STORE next to a valid MIGRATED: activation in progress.
                 rc = writeMarkers(e, m.migratedUuid, floor, 0, false);
-                if (rc != P4_OK) { *err = "markers: write failed"; return rc; }
+                if (rc != FLATSQL_OK) { *err = "markers: write failed"; return rc; }
                 readMarkers(e, &m);
             } else {
                 *err = "markers: neither an activated store nor an empty directory";
-                return P4_E_FORMAT;
+                return FLATSQL_E_FORMAT;
             }
             break;
         case 2:
             // A valid STORE is an activated store. A torn STORE next to a
             // valid MIGRATED is an activation in progress (C-22): reopened
-            // here, rewritten by flatsql_p4_activate.
-            if (m.storeValid) { *err = "a migration target has no valid STORE yet"; return P4_E_FORMAT; }
-            if (m.storePresent && !m.migratedValid) { *err = "a torn STORE without a valid MIGRATED"; return P4_E_FORMAT; }
+            // here, rewritten by flatsql_activate.
+            if (m.storeValid) { *err = "a migration target has no valid STORE yet"; return FLATSQL_E_FORMAT; }
+            if (m.storePresent && !m.migratedValid) { *err = "a torn STORE without a valid MIGRATED"; return FLATSQL_E_FORMAT; }
             e->ftsHold.store(true);
             break;
     }
     e->cfg.gseqFloor = floor;
     rc = mailboxInit(e, err);
-    if (rc != P4_OK) return rc;
+    if (rc != FLATSQL_OK) return rc;
     // Types: the catalog, then each type's spec; the type index and the feeds
     // tail of the types that have them.
     for (const std::string& name : names) {
         std::vector<uint8_t> fb, tlv;
         const std::string sp = pathJoin(pathJoin(e->cfg.root, "T"), name + ".spec");
-        if (ioReadAll(sp, &fb) != P4_OK || !specFromFile(fb, &tlv)) continue;  // re-registered by the host
+        if (ioReadAll(sp, &fb) != FLATSQL_OK || !specFromFile(fb, &tlv)) continue;  // re-registered by the host
         std::shared_ptr<Spec> spec;
         std::string e2;
-        if (buildSpec(tlv.data(), tlv.size(), &spec, &e2) != P4_OK || spec->name != name) continue;
+        if (buildSpec(tlv.data(), tlv.size(), &spec, &e2) != FLATSQL_OK || spec->name != name) continue;
         auto t = std::make_unique<Type>();
         rc = openType(e, t.get(), spec, &e2);
-        if (rc != P4_OK) { *err = name + ": " + e2; return rc; }
+        if (rc != FLATSQL_OK) { *err = name + ": " + e2; return rc; }
         e->typeByName[name] = t.get();
         e->types.push_back(std::move(t));
     }
     e->markers = m;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* err) {
     std::shared_ptr<Spec> spec;
     int32_t rc = buildSpec(p, n, &spec, err);
-    if (rc != P4_OK) return rc;
+    if (rc != FLATSQL_OK) return rc;
     std::lock_guard<std::mutex> g(e->typesMu);
     auto it = e->typeByName.find(spec->name);
     if (it != e->typeByName.end()) {
         Type* t = it->second;
         std::shared_ptr<const Spec> cur = t->spec();
-        if (cur->bytes == spec->bytes) return P4_OK;
+        if (cur->bytes == spec->bytes) return FLATSQL_OK;
         bool hasData;
         {
             std::lock_guard<std::mutex> tg(t->mu);
@@ -564,47 +564,47 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
         }
         if (hasData && cur->epochRule != spec->epochRule) {
             *err = "the epoch rule of a type with data cannot change (C-5)";
-            return P4_E_FORMAT;
+            return FLATSQL_E_FORMAT;
         }
         // Rows keep the object key (r.k, r_ke) and sealed records their
         // COL values from the rules they were written under.
         if (hasData && cur->keyRules != spec->keyRules) {
             *err = "the object and col rules of a type with data cannot change (C-5)";
-            return P4_E_FORMAT;
+            return FLATSQL_E_FORMAT;
         }
         const std::vector<uint8_t> fb = specFileBytes(spec->bytes);
         rc = ioWriteNew(t->pSpec, fb.data(), fb.size());
-        if (rc != P4_OK) { *err = "spec write failed"; return rc; }
+        if (rc != FLATSQL_OK) { *err = "spec write failed"; return rc; }
         std::lock_guard<std::mutex> tg(t->mu);
         t->spec_ = spec;
-        return P4_OK;
+        return FLATSQL_OK;
     }
     const std::string tdir = pathJoin(e->cfg.root, "T");
     const std::vector<uint8_t> fb = specFileBytes(spec->bytes);
     rc = ioWriteNew(pathJoin(tdir, spec->name + ".spec"), fb.data(), fb.size());
-    if (rc != P4_OK) { *err = "spec write failed"; return rc; }
-    rc = catalogAppend(pathJoin(tdir, "TYPES"), spec->name);
-    if (rc != P4_OK) { *err = "type catalog write failed"; return rc; }
+    if (rc != FLATSQL_OK) { *err = "spec write failed"; return rc; }
     auto t = std::make_unique<Type>();
     rc = openType(e, t.get(), spec, err, true);
-    if (rc != P4_OK) return rc;
+    if (rc != FLATSQL_OK) return rc;
+    rc = catalogAppend(pathJoin(tdir, "TYPES"), spec->name);
+    if (rc != FLATSQL_OK) { *err = "type catalog write failed"; return rc; }
     e->typeByName[spec->name] = t.get();
     e->types.push_back(std::move(t));
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // ---- activation (§2.3 step 1) -------------------------------------------------------------
 int32_t engineActivate(Engine* e, std::string* err) {
     if (e->cfg.createMode != 2) {
         *err = "activate: not a migration target (create mode 2)";
-        return P4_E_FORMAT;
+        return FLATSQL_E_FORMAT;
     }
     Markers m;
-    if (readMarkers(e, &m) != P4_OK) {
+    if (readMarkers(e, &m) != FLATSQL_OK) {
         *err = "activate: markers unreadable";
-        return P4_E_IO;
+        return FLATSQL_E_IO;
     }
-    if (markersActivated(m)) return P4_OK;  // idempotent
+    if (markersActivated(m)) return FLATSQL_OK;  // idempotent
     std::vector<Type*> types;
     {
         std::lock_guard<std::mutex> g(e->typesMu);
@@ -627,7 +627,7 @@ int32_t engineActivate(Engine* e, std::string* err) {
             const int orc = openConn(path, OpenKind::Maint, 1024, 0, &c, &oerr);
             if (orc != SQLITE_OK) {
                 *err = "activate: open " + path + ": " + oerr + " (" + std::to_string(orc) + ")";
-                return P4_E_IO;
+                return FLATSQL_E_IO;
             }
             // The maintenance thread may be checkpointing the same file (a
             // second checkpointer gets SQLITE_BUSY at once, without the busy
@@ -653,7 +653,7 @@ int32_t engineActivate(Engine* e, std::string* err) {
         randomUuid(uuid);
     const bool rewriteMigrated = !(m.migratedValid && m.storePresent && !m.storeValid);
     const int32_t rc = writeMarkers(e, uuid, e->cfg.gseqFloor, 1, rewriteMigrated);
-    if (rc == P4_OK) e->ftsHold.store(false);  // full text builds from seq 0 (§11 step 5)
+    if (rc == FLATSQL_OK) e->ftsHold.store(false);  // full text builds from seq 0 (§11 step 5)
     else *err = "activate: markers write failed";
     return rc;
 }

@@ -1,7 +1,7 @@
 {
   "name": "flatsql",
-  "version": "3.11.1",
-  "description": "SQL queries over raw FlatBuffer storage: the SQLite-backed wasm engine, the multithreaded partition store (flatsql-ps-threads.wasm) and store format 4, a FlatBuffer stream per source feed with its index in SQLite (flatsql-p4-threads.wasm)",
+  "version": "3.12.0",
+  "description": "One SQL engine for binary FlatBuffer streams: SDS QRP queries and results, SDS GJN geometry, persistent indexed storage, and one WASI threads artifact across hosts.",
   "type": "module",
   "main": "wasm/index.js",
   "types": "wasm/index.d.ts",
@@ -10,124 +10,36 @@
       "types": "./wasm/index.d.ts",
       "import": "./wasm/index.js"
     },
-    "./wasm": {
-      "types": "./wasm/index.d.ts",
-      "import": "./wasm/index.js"
-    },
-    "./ps": {
-      "types": "./wasm/ps.d.ts",
-      "import": "./wasm/ps.js"
-    },
-    "./ps-threads.wasm": "./wasm/flatsql-ps-threads.wasm",
-    "./p4-threads.wasm": "./wasm/flatsql-p4-threads.wasm",
-    "./ps/node-host": {
-      "types": "./wasm/ps-node-host.d.mts",
-      "import": "./wasm/ps-node-host.mjs"
-    },
-    "./ps/fault": {
-      "types": "./wasm/ps-node-fault.d.mts",
-      "import": "./wasm/ps-node-fault.mjs"
-    },
-    "./integrity.json": "./wasm/integrity.json",
-    "./wasi": {
-      "types": "./wasm/wasi.d.ts",
-      "import": "./wasm/wasi.js"
-    },
-    "./io": {
-      "types": "./wasm/flatsql-io.d.ts",
-      "import": "./wasm/flatsql-io.js"
-    },
-    "./artifacts": {
-      "types": "./dist/artifacts/index.d.ts",
-      "import": "./dist/artifacts/index.js"
-    },
-    "./response": {
-      "types": "./dist/response/index.d.ts",
-      "import": "./dist/response/index.js"
-    },
-    "./standalone/wasmedge": {
-      "types": "./dist/standalone/index.d.ts",
-      "import": "./dist/standalone/index.js"
-    },
-    "./btree": {
-      "types": "./dist/btree/index.d.ts",
-      "import": "./dist/btree/index.js"
-    },
-    "./storage": {
-      "types": "./dist/storage/index.d.ts",
-      "import": "./dist/storage/index.js"
-    },
-    "./schema": {
-      "types": "./dist/schema/index.d.ts",
-      "import": "./dist/schema/index.js"
-    },
-    "./cluster": {
-      "types": "./dist/cluster/index.d.ts",
-      "import": "./dist/cluster/index.js"
-    },
-    "./wasi.wasm": "./wasm/flatsql-wasi.wasm",
-    "./sdm": {
-      "types": "./sdm/index.d.ts",
-      "import": "./sdm/index.js"
-    },
-    "./sdm.wasm": "./sdm/flatsql-spatial.wasm"
+    "./flatsql.wasm": "./wasm/flatsql.wasm",
+    "./integrity.json": "./wasm/integrity.json"
   },
   "files": [
-    "dist",
-    "wasm/*.js",
-    "wasm/*.wasm",
-    "wasm/*.json",
-    "wasm/*.d.ts",
-    "wasm/native/*.cpp",
-    "sdm/*.js",
-    "sdm/*.wasm",
-    "sdm/*.d.ts",
-    "sdm/*.json",
-    "scripts/stress-docker.sh",
-    "stress/docker/*",
-    "stress/sds/*.mjs",
-    "docs/response-artifacts.md",
-    "docs/agents/*.md",
+    "wasm/index.js",
+    "wasm/index.d.ts",
+    "wasm/flatsql.wasm",
+    "wasm/integrity.json",
+    "wasm/runtime/*.mjs",
+    "wasm/runtime/*.txt",
+    "bin/flatsql.mjs",
+    "cpp/include/flatsql/flatsql.h",
+    "docs/API-3.12.md",
     "README.md",
     "LICENSE",
-    "wasm/ps-node-host.mjs",
-    "wasm/ps-node-guest.mjs",
-    "wasm/ps-node-imports.mjs",
-    "wasm/ps-node-fault.mjs",
-    "wasm/*.d.mts",
-    "docs/PARTITION-STORE-WASM.md",
-    "docs/PARTITION-STORE.md"
+    "cpp/include/flatsql/flatsql_io.h"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/build-runtime.mjs && node scripts/build-demo.mjs",
     "build:wasm": "bash scripts/build-wasm.sh",
-    "build:wasm:ps": "bash scripts/build-wasm.sh --ps",
-    "build:wasm:ps-tests": "bash scripts/build-wasm.sh --ps-tests",
-    "test": "node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js",
-    "test:wasm": "node wasm/test-bulk-ingest.mjs",
-    "test:ps-wasm": "node scripts/ps-wasm-suite.mjs --crash-trials 1000",
-    "dev": "tsc --watch",
+    "test": "node scripts/ci-unified-e2e.mjs",
+    "test:e2e": "bash scripts/ci-e2e.sh",
+    "test:browser": "node scripts/ci-browser-e2e.mjs",
     "serve": "vite docs --port 8081",
-    "check:nav": "node scripts/check-sdn-stack-nav.mjs flatsql docs/index.html docs/assets/sdn-chrome/sdn-chrome.css",
-    "check:dist": "node scripts/check-dist-tracked.mjs",
-    "bench": "node bench/flatsql-perf.mjs",
-    "bench:perf": "node bench/flatsql-perf.mjs",
-    "bench:perf:profile": "node bench/flatsql-perf.mjs --profile",
-    "prepublishOnly": "npm run check:dist && bash scripts/ci-e2e.sh --wasm-only",
-    "emsdk:install": "bash scripts/install-emsdk.sh",
-    "emsdk:env": "echo 'Run: source packages/emsdk/emsdk_env.sh'",
-    "test:wasi": "node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasi.test.ts test/standalone-wasm-imports.test.ts",
-    "test:wasmedge": "node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js --runTestsByPath test/wasmedge-standalone.test.ts test/wasmedge-runner.test.ts",
-    "test:cluster": "bash scripts/cluster-validation.sh",
-    "test:cluster:smoke": "bash scripts/cluster-validation.sh --duration=5 --stretch-duration=5 --readers=4 --stretch-readers=6",
-    "stress:sds:smoke": "bash scripts/stress-docker.sh smoke",
-    "stress:sds:docker-smoke": "bash scripts/stress-docker.sh docker-smoke",
-    "stress:sds:docker-fleet": "bash scripts/stress-docker.sh docker-fleet",
-    "stress:sds:full-config": "bash scripts/stress-docker.sh full-config",
-    "stress:sds:full": "bash scripts/stress-docker.sh full",
     "check:imports": "node scripts/check-wasm-imports.mjs",
-    "test:io": "node wasm/test-io-persistence.mjs",
-    "check:integrity": "node scripts/write-integrity.mjs --check"
+    "check:integrity": "node scripts/write-integrity.mjs --check",
+    "check:package": "node scripts/check-package.mjs",
+    "check:types": "tsc --noEmit --skipLibCheck --target ES2022 --module NodeNext --moduleResolution NodeNext wasm/index.d.ts",
+    "check:nav": "node scripts/check-sdn-stack-nav.mjs flatsql docs/index.html docs/assets/sdn-chrome/sdn-chrome.css",
+    "prepublishOnly": "bash scripts/ci-e2e.sh --wasm-only"
   },
   "repository": {
     "type": "git",
@@ -158,29 +70,22 @@
   ],
   "author": "Edgesource Corporation <tj@edgesource.com>",
   "license": "PolyForm-Noncommercial-1.0.0",
-  "peerDependencies": {
-    "space-data-module-sdk": ">=0.8.24 <0.9.0"
-  },
-  "peerDependenciesMeta": {
-    "space-data-module-sdk": {
-      "optional": true
-    }
-  },
   "devDependencies": {
-    "@types/jest": "^29.5.0",
     "@types/node": "^20.0.0",
     "flatc-wasm": "^26.1.32",
-    "jest": "^29.7.0",
     "space-data-module-sdk": "0.8.24",
     "spacedatastandards.org": "1.256.0",
-    "ts-jest": "^29.1.0",
     "typescript": "^5.3.0",
-    "vite": "^5.0.0"
+    "vite": "^5.0.0",
+    "esbuild": "0.21.5"
   },
   "engines": {
     "node": ">=24.0.0"
   },
   "publishConfig": {
     "access": "public"
+  },
+  "bin": {
+    "flatsql": "bin/flatsql.mjs"
   }
 }

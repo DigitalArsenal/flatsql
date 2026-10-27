@@ -1,3 +1,4 @@
+#include "QRP/main_generated.h"
 // The SQL surface over the real engine (CONTRACT.md §3.5 ops 30/31, §3.9):
 // records PUT through the mailbox, then op 30 (SQL) and op 31 (SURFACE)
 // answered by p4sql on the engine's lanes, cursors from the engine's reader.
@@ -29,20 +30,35 @@ Batch ommBatch(int from, int n, const std::string& source, const std::string& ba
 }
 
 std::vector<uint8_t> sqlReq(const std::string& sql, const std::vector<Cell>& params = {}) {
-    TlvW w;
-    w.text(70, sql);
-    if (!params.empty()) {
-        std::vector<uint8_t> pb;
-        flatsql::ps::rb1::encodeParams(params, &pb);
-        w.raw(71, pb.data(), pb.size());
+    flatbuffers::FlatBufferBuilder builder;
+    std::vector<flatbuffers::Offset<QRPValue>> values;
+    for (const auto& c : params) {
+        flatbuffers::Offset<QRPValue> v;
+        switch (c.type) {
+            case flatsql::ps::rb1::kInt: v = CreateQRPValue(builder, qrpValueKind_Int, false, c.i); break;
+            case flatsql::ps::rb1::kReal: v = CreateQRPValue(builder, qrpValueKind_Float, false, 0, c.d); break;
+            case flatsql::ps::rb1::kText: v = CreateQRPValue(builder, qrpValueKind_Text, false, 0, 0, builder.CreateString(c.s)); break;
+            case flatsql::ps::rb1::kBlob: v = CreateQRPValue(builder, qrpValueKind_Bytes, false, 0, 0, 0,
+                builder.CreateVector(reinterpret_cast<const uint8_t*>(c.s.data()), c.s.size())); break;
+            default: v = CreateQRPValue(builder); break;
+        }
+        values.push_back(v);
     }
-    return w.b;
+    auto text = builder.CreateString(sql);
+    auto bindings = builder.CreateVector(values);
+    QRPBuilder q(builder);
+    q.add_SQL(text);
+    q.add_PARAMETERS(bindings);
+    q.add_REPRESENTATION(qrpRepresentation_FlatBuffer);
+    FinishSizePrefixedQRPBuffer(builder, q.Finish());
+    std::vector<uint8_t> bytes(builder.GetBufferPointer(), builder.GetBufferPointer() + builder.GetSize());
+    return bytes;
 }
 
 Result sql(const std::string& q, uint32_t flags = 0, const std::vector<Cell>& params = {}) {
     CallOpts o;
     o.flags = flags;
-    return call(P4_OPC_SQL, sqlReq(q, params), o);
+    return call(FLATSQL_OPC_SQL, sqlReq(q, params), o);
 }
 
 Cell intCell(int64_t v) {
@@ -55,37 +71,37 @@ Cell intCell(int64_t v) {
 }  // namespace
 
 // Statuses, never traps: result caps, the sandbox, malformed parameters.
-P4_TEST(t_sql_caps_and_sandbox) {
+FLATSQL_TEST(t_sql_caps_and_sandbox) {
     const std::string root = scratchDir("t_sql_caps");
-    REQUIRE(openEngine(root) == P4_OK, "open");
-    REQUIRE(registerType(ommType()) == P4_OK, "register");
-    REQUIRE(put(ommBatch(1, 20, kSrc, "b1")).status == P4_OK, "put");
+    REQUIRE(openEngine(root) == FLATSQL_OK, "open");
+    REQUIRE(registerType(ommType()) == FLATSQL_OK, "register");
+    REQUIRE(put(ommBatch(1, 20, kSrc, "b1")).status == FLATSQL_OK, "put");
     CallOpts o;
     o.maxResultRows = 5;
-    Result r = call(P4_OPC_SQL, sqlReq("SELECT _seq FROM OMM"), o);
-    CHECK_EQ(r.status, P4_E_BUDGET, r.err);
-    r = sql("PRAGMA table_info(OMM)", P4_SLOT_SANDBOX);
-    CHECK_EQ(r.status, P4_E_SQL, r.err);
-    r = sql("SELECT 1; SELECT 2", P4_SLOT_SANDBOX);
-    CHECK_EQ(r.status, P4_E_SQL, r.err);
-    r = sql("SELECT length(randomblob(100000000))", P4_SLOT_SANDBOX);   // past the lane heap cap
-    CHECK_EQ(r.status, P4_E_BUDGET, r.err);
+    Result r = call(FLATSQL_OPC_SQL, sqlReq("SELECT _seq FROM OMM"), o);
+    CHECK_EQ(r.status, FLATSQL_E_BUDGET, r.err);
+    r = sql("PRAGMA table_info(OMM)", FLATSQL_SLOT_SANDBOX);
+    CHECK_EQ(r.status, FLATSQL_E_SQL, r.err);
+    r = sql("SELECT 1; SELECT 2", FLATSQL_SLOT_SANDBOX);
+    CHECK_EQ(r.status, FLATSQL_E_SQL, r.err);
+    r = sql("SELECT length(randomblob(100000000))", FLATSQL_SLOT_SANDBOX);   // past the lane heap cap
+    CHECK_EQ(r.status, FLATSQL_E_BUDGET, r.err);
     r = sql("SELECT ?1 + ?2", 0, {intCell(1)});
-    CHECK_EQ(r.status, P4_E_SQL, r.err);
+    CHECK_EQ(r.status, FLATSQL_E_SQL, r.err);
     r = sql("SELECT COUNT(*) FROM OMM");   // the lane serves on
-    CHECK(r.status == P4_OK && r.rows.size() == 1 && r.rows[0][0].i == 20, r.err);
+    CHECK(r.status == FLATSQL_OK && r.rows.size() == 1 && r.rows[0][0].i == 20, r.err);
     closeEngine();
     removeTree(root);
 }
 
 // SURFACE: the relation per type and per source, format 1's columns.
-P4_TEST(t_sql_surface) {
+FLATSQL_TEST(t_sql_surface) {
     const std::string root = scratchDir("t_sql_surface");
-    REQUIRE(openEngine(root) == P4_OK, "open");
-    REQUIRE(registerType(ommType()) == P4_OK, "register");
-    REQUIRE(put(ommBatch(1, 3, kSrc, "b1")).status == P4_OK, "put");
-    const Result r = call(P4_OPC_SURFACE, {});
-    CHECK_EQ(r.status, P4_OK, r.err);
+    REQUIRE(openEngine(root) == FLATSQL_OK, "open");
+    REQUIRE(registerType(ommType()) == FLATSQL_OK, "register");
+    REQUIRE(put(ommBatch(1, 3, kSrc, "b1")).status == FLATSQL_OK, "put");
+    const Result r = call(FLATSQL_OPC_SURFACE, {});
+    CHECK_EQ(r.status, FLATSQL_OK, r.err);
     size_t base = 0, alias = 0;
     for (size_t i = 0; i < r.rows.size(); i++) {
         if (r.s(i, "name") == "OMM") {

@@ -63,11 +63,11 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
         tlvU8(v, 61, &apply, &bad);
     }
     if (bad || provider.empty() || source.empty()) {
-        out.end(P4_E_ARG, "SUPERSEDE needs provider and source");
+        out.end(FLATSQL_E_ARG, "SUPERSEDE needs provider and source");
         return;
     }
     int64_t tags = 0, records = 0;
-    int32_t status = P4_OK;
+    int32_t status = FLATSQL_OK;
     std::string err;
     Feed* f = nullptr;
     bool created = false, indexed = true;
@@ -77,14 +77,14 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
         created = f && f->created && !f->quarantined;
         indexed = f && f->indexed;
         if (f && f->quarantined) {
-            status = P4_E_CORRUPT;
+            status = FLATSQL_E_CORRUPT;
             err = "feed file quarantined: " + f->path;
         }
     }
     std::vector<uint32_t> drop;  // the batch ids whose batch is not kept
     std::string in;
-    if (created && status == P4_OK) {
-        int32_t st = P4_OK;
+    if (created && status == FLATSQL_OK) {
+        int32_t st = FLATSQL_OK;
         std::string er;
         Conn* c = writerPin(e, f, &st, &er);
         if (!c) {
@@ -92,7 +92,7 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
             err = "open " + er;
         } else {
             if (!dictEnsure(f, c)) {
-                status = P4_E_IO;
+                status = FLATSQL_E_IO;
                 err = "dictionary of " + f->path;
             } else {
                 // reload: a newer snapshot may hold batches the cache lacks
@@ -104,7 +104,7 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
         }
         for (uint32_t id : drop) in += (in.empty() ? "" : ",") + std::to_string(id);
     }
-    if (!drop.empty() && status == P4_OK && !apply) {
+    if (!drop.empty() && status == FLATSQL_OK && !apply) {
         // Count only: the dropped instances' records, and the records that
         // would be left with no row in the file.
         {
@@ -113,7 +113,7 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
                 if (std::find(drop.begin(), drop.end(), kv.first.first) != drop.end()) tags += kv.second.n;
         }
         WriteCtx w(e, t);
-        int32_t st = P4_OK;
+        int32_t st = FLATSQL_OK;
         std::string er;
         Conn* c = writerPin(e, f, &st, &er);
         std::vector<int64_t> seqs;
@@ -130,7 +130,7 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
             writerUnpin(e, f);
             if (r != SQLITE_DONE) status = statusOfSqlite(r);
         }
-        for (size_t i = 0; i < seqs.size() && status == P4_OK; i++) {
+        for (size_t i = 0; i < seqs.size() && status == FLATSQL_OK; i++) {
             RecState* r = w.bySeq(f->fid, seqs[i], &st);
             if (!r) {
                 status = st;
@@ -141,9 +141,9 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
             if (!keeps) records++;
         }
     }
-    while (!drop.empty() && status == P4_OK && apply) {
+    while (!drop.empty() && status == FLATSQL_OK && apply) {
         // A chunk: up to 32,768 dropped rows, their records whole in this file.
-        int32_t st = P4_OK;
+        int32_t st = FLATSQL_OK;
         std::string er;
         Conn* c = writerPin(e, f, &st, &er);
         if (!c) {
@@ -193,9 +193,9 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
                 }
             if (!anyLive(rs)) chunkRecs++;
         }
-        if (status != P4_OK) break;
+        if (status != FLATSQL_OK) break;
         status = w.commit();
-        if (status != P4_OK) {
+        if (status != FLATSQL_OK) {
             err = "supersede commit failed: " + w.err;
             break;
         }
@@ -205,7 +205,7 @@ void supersedeOp(Engine* e, Type* t, WriteTask* task) {
         e->bump(kStSupersedeRecords, uint64_t(chunkRecs));
         if (got < 32768) break;
     }
-    if (status == P4_OK) {
+    if (status == FLATSQL_OK) {
         out.enc.beginRow();
         out.enc.i64(tags);
         out.enc.i64(records);
@@ -229,11 +229,11 @@ void deleteOp(Engine* e, Type* t, WriteTask* task) {
     const Tlv* cids = nullptr;
     if (h->reqLen <= e->reqBytes[0] && tlvParse(e->slotReq(task->slot), h->reqLen, &v)) cids = tlvFind(v, 40);
     if (!cids || cids->n < 4 || (cids->n - 4) != size_t(ld32(cids->v)) * kCidBin) {
-        out.end(P4_E_ARG, "DELETE needs CIDs (tag 40)");
+        out.end(FLATSQL_E_ARG, "DELETE needs CIDs (tag 40)");
         return;
     }
     int64_t deleted = 0;
-    int32_t status = P4_OK;
+    int32_t status = FLATSQL_OK;
     std::string err;
     if (t->hasFiles.load(std::memory_order_acquire)) {
         std::vector<uint32_t> fids;
@@ -242,7 +242,7 @@ void deleteOp(Engine* e, Type* t, WriteTask* task) {
             for (auto& f : t->feeds) {
                 if (!f->created || f->k.recs <= 0) continue;
                 if (f->quarantined) {
-                    status = P4_E_CORRUPT;
+                    status = FLATSQL_E_CORRUPT;
                     err = "feed file quarantined: " + f->path;
                 }
                 fids.push_back(f->fid);
@@ -250,7 +250,7 @@ void deleteOp(Engine* e, Type* t, WriteTask* task) {
         }
         WriteCtx w(e, t);
         const uint32_t n = ld32(cids->v);
-        for (uint32_t i = 0; i < n && status == P4_OK; i++) {
+        for (uint32_t i = 0; i < n && status == FLATSQL_OK; i++) {
             const uint8_t* c36 = cids->v + 4 + size_t(i) * kCidBin;
             if (!cidBinValid(c36)) continue;
             uint8_t key[32];
@@ -269,13 +269,13 @@ void deleteOp(Engine* e, Type* t, WriteTask* task) {
             }
             deleted += int64_t(toks.size());
         }
-        if (status == P4_OK) {
+        if (status == FLATSQL_OK) {
             status = w.commit();
-            if (status != P4_OK) err = "delete commit failed: " + w.err;
+            if (status != FLATSQL_OK) err = "delete commit failed: " + w.err;
         }
-        if (status == P4_OK) e->bump(kStDeletes, uint64_t(deleted));
+        if (status == FLATSQL_OK) e->bump(kStDeletes, uint64_t(deleted));
     }
-    if (status == P4_OK) {
+    if (status == FLATSQL_OK) {
         out.enc.beginRow();
         out.enc.i64(deleted);
         out.enc.endRow();
@@ -286,11 +286,11 @@ void deleteOp(Engine* e, Type* t, WriteTask* task) {
 
 // ---- QUOTA -------------------------------------------------------------------------------------------
 void quotaWork(Engine* e, Type* t, Internal* in) {
-    for (size_t at = 0; at < in->seqs.size() && in->status == P4_OK; at += 32768) {
+    for (size_t at = 0; at < in->seqs.size() && in->status == FLATSQL_OK; at += 32768) {
         WriteCtx w(e, t);
         int64_t recs = 0, bytes = 0;
         for (size_t i = at; i < in->seqs.size() && i < at + 32768; i++) {
-            int32_t st = P4_OK;
+            int32_t st = FLATSQL_OK;
             RecState* r = w.bySeq(in->seqs[i].first, in->seqs[i].second, &st);
             if (!r) {
                 in->status = st;
@@ -303,9 +303,9 @@ void quotaWork(Engine* e, Type* t, Internal* in) {
             w.dropAll(r);
             for (RowR& x : r->rows) if (x.del) x.removeReason = 3;  // SDS QUOTA
         }
-        if (in->status != P4_OK) break;
+        if (in->status != FLATSQL_OK) break;
         const int32_t rc = w.commit();
-        if (rc != P4_OK) {
+        if (rc != FLATSQL_OK) {
             in->status = rc;
             in->err = "quota commit failed: " + w.err;
             break;
@@ -319,7 +319,7 @@ void quotaWork(Engine* e, Type* t, Internal* in) {
 namespace {
 void why(const char* what, const std::string& where, int64_t a, int64_t b) {
 #if !defined(__wasm__)
-    static const bool on = std::getenv("P4_VERIFY_DEBUG") != nullptr;
+    static const bool on = std::getenv("FLATSQL_VERIFY_DEBUG") != nullptr;
     if (on) std::fprintf(stderr, "verify: %s %s (%lld vs %lld)\n", what, where.c_str(), (long long)a, (long long)b);
 #else
     (void)what; (void)where; (void)a; (void)b;
@@ -354,9 +354,9 @@ struct FileCount {
 };
 int32_t countFile(Type* t, Feed* f, Conn* c, Stream* stream, int64_t mark, FileCount* fc) {
     std::shared_ptr<const Spec> sp = t->spec();
-    if (!dictEnsure(f, c)) return P4_E_IO;
+    if (!dictEnsure(f, c)) return FLATSQL_E_IO;
     sqlite3_stmt* q = c->sql("SELECT rid, seq, n, b, c, at, cid, e, k, ts, len, off FROM r ORDER BY rid");
-    if (!q) return P4_E_INTERNAL;
+    if (!q) return FLATSQL_E_INTERNAL;
     struct RowC {
         uint32_t tok, b, cc;
         int64_t len, ts, off;
@@ -366,7 +366,7 @@ int32_t countFile(Type* t, Feed* f, Conn* c, Stream* stream, int64_t mark, FileC
     int64_t seq = 0, ev = 0;
     bool hasE = false;
     std::vector<RowC> rows;
-    int32_t st = P4_OK;
+    int32_t st = FLATSQL_OK;
     auto frameOk = [&](int64_t off, int64_t len) {
         if (off < 0 || off + 4 + len > mark || !stream) return false;
         uint8_t p[4];
@@ -463,7 +463,7 @@ int32_t countFile(Type* t, Feed* f, Conn* c, Stream* stream, int64_t mark, FileC
         if (sqlite3_column_bytes(q, 6) == 32) x.key.assign(static_cast<const char*>(sqlite3_column_blob(q, 6)), 32);
         NodeDef nd;
         if (!dictNode(f, c, n, &nd)) {
-            st = P4_E_CORRUPT;
+            st = FLATSQL_E_CORRUPT;
             break;
         }
         {
@@ -473,9 +473,9 @@ int32_t countFile(Type* t, Feed* f, Conn* c, Stream* stream, int64_t mark, FileC
         rows.push_back(std::move(x));
     }
     sqlite3_reset(q);
-    if (st == P4_OK && r != SQLITE_DONE && r != SQLITE_ROW) st = statusOfSqlite(r);
-    if (st == P4_OK) flush();
-    if (st != P4_OK) return st;
+    if (st == FLATSQL_OK && r != SQLITE_DONE && r != SQLITE_ROW) st = statusOfSqlite(r);
+    if (st == FLATSQL_OK) flush();
+    if (st != FLATSQL_OK) return st;
     // The instances' strings from the dictionary.
     for (auto& kv : fc->inst) {
         BatchDef bd;
@@ -491,7 +491,7 @@ int32_t countFile(Type* t, Feed* f, Conn* c, Stream* stream, int64_t mark, FileC
         fc->k = Counters();
         fc->k.maxseq = keep;
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 bool sameCounts(const Counters& a, const Counters& b) {
@@ -523,12 +523,12 @@ int32_t recountFeed(Feed* f, Conn* c, Stream* stream, int64_t mark, Counters* co
                     std::map<InstId, InstCount>* instances, std::map<uint32_t, TokCount>* tokens) {
     FileCount fc;
     const int32_t rc = countFile(f->type, f, c, stream, mark, &fc);
-    if (rc != P4_OK) return rc;
-    if (fc.framesBad || fc.u2bad) return P4_E_CORRUPT;
+    if (rc != FLATSQL_OK) return rc;
+    if (fc.framesBad || fc.u2bad) return FLATSQL_E_CORRUPT;
     *counts = fc.k;
     *instances = std::move(fc.inst);
     *tokens = std::move(fc.tokc);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 void rebuildWork(Engine* e, Type* t, Internal* in) {
@@ -549,7 +549,7 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             }
             in->a++;
             if (indexed) continue;
-            int32_t st = P4_OK;
+            int32_t st = FLATSQL_OK;
             std::string er;
             Conn* c = writerPin(e, f, &st, &er);
             if (!c) {
@@ -559,7 +559,7 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             }
             st = fileCreateIndexes(t, c, f->local);
             writerUnpin(e, f);
-            if (st != P4_OK) {
+            if (st != FLATSQL_OK) {
                 in->status = st;
                 in->err = "indexes of " + f->path;
                 return;
@@ -570,7 +570,7 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
         // Every index complete: the staged rows merged.
         std::string er;
         const int32_t st = mergeAll(e, t, &er);
-        if (st != P4_OK) {
+        if (st != FLATSQL_OK) {
             in->status = st;
             in->err = er;
             return;
@@ -585,7 +585,7 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             //    every row's frame in the stream), against its meta and the
             //    engine's. This runs on the type's writer: the stream's end and
             //    generation are the committed ones.
-            int32_t st = P4_OK;
+            int32_t st = FLATSQL_OK;
             std::shared_ptr<Stream> stream;
             int64_t mark;
             {
@@ -602,7 +602,7 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             }
             Conn* c = nullptr;
             if (openConn(f->path, OpenKind::Maint, 4096, 0, &c, nullptr) != SQLITE_OK) {
-                in->status = P4_E_IO;
+                in->status = FLATSQL_E_IO;
                 in->err = "open " + f->path;
                 return;
             }
@@ -614,16 +614,16 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
                 std::lock_guard<std::mutex> g(t->mu);
                 indexedNow = f->indexed;
             }
-            const int64_t stagedBad = st == P4_OK && indexedNow ? stagedMismatches(f, c) : 0;
+            const int64_t stagedBad = st == FLATSQL_OK && indexedNow ? stagedMismatches(f, c) : 0;
             FileMeta stored;
             std::map<InstId, InstCount> storedInst;
             std::map<uint32_t, TokCount> storedTokc;
-            if (st == P4_OK && (readMeta(c, &stored) != SQLITE_OK || readInst(f, c, &storedInst) != SQLITE_OK ||
+            if (st == FLATSQL_OK && (readMeta(c, &stored) != SQLITE_OK || readInst(f, c, &storedInst) != SQLITE_OK ||
                                 readTokc(t, c, &storedTokc) != SQLITE_OK))
-                st = P4_E_IO;
+                st = FLATSQL_E_IO;
             c->exec("COMMIT");
             delete c;
-            if (st != P4_OK) {
+            if (st != FLATSQL_OK) {
                 in->status = st;
                 in->err = "count " + f->path;
                 return;
@@ -671,7 +671,7 @@ void rebuildWork(Engine* e, Type* t, Internal* in) {
             if (fix && (fileBad || memBad)) {
                 // The file's counters rewritten from its rows (its writer),
                 // keeping the times and bounds the rows cannot give back.
-                int32_t ps = P4_OK;
+                int32_t ps = FLATSQL_OK;
                 std::string er;
                 Conn* w = writerPin(e, f, &ps, &er);
                 if (!w) {
@@ -764,11 +764,11 @@ bool compactEligible(const Feed* f) { return f && f->created && !f->quarantined;
 // use this point after the first rewritten bytes, before they are committed.
 void compactWriteEvent(const Feed* f, bool beginning) {
 #ifndef __wasm__
-    if (!std::getenv("P4_STATE_DEBUG")) return;
+    if (!std::getenv("FLATSQL_STATE_DEBUG")) return;
     std::fprintf(stderr, "state-write-%s compaction %s\n", beginning ? "begin" : "end", f->path.c_str());
     std::fflush(stderr);
     if (beginning) {
-        const char* pause = std::getenv("P4_STATE_PAUSE_MS");
+        const char* pause = std::getenv("FLATSQL_STATE_PAUSE_MS");
         if (pause) ps::sleepNs(uint64_t(std::max(0, std::min(60000, std::atoi(pause)))) * 1000000);
     }
 #else
@@ -802,18 +802,18 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         bool blocked=f->retired && !streamGenerationReleased(f,f->retired->gen);
         for(const auto& old:f->olderRetired) blocked=blocked || !streamGenerationReleased(f,old.stream->gen);
         if(blocked) {
-            in->status=P4_E_BUSY;
+            in->status=FLATSQL_E_BUSY;
             in->err="compaction awaits IPFS generation release";
             return;
         }
     }
     in->a = f->end;  // the writer's own work, its indexer idle: the end is the mark
-    int32_t st = P4_OK;
+    int32_t st = FLATSQL_OK;
     std::string er;
     // Staged views contain stream offsets. Drain them before changing the
     // generation so every future view uses the remapped SQLite rows.
     st = mergeAll(e, t, &er);
-    if (st != P4_OK) {
+    if (st != FLATSQL_OK) {
         in->status = st;
         in->err = er;
         return;
@@ -872,7 +872,7 @@ void compactWork(Engine* e, Type* t, Internal* in) {
                                           FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC |
                                               FLATSQL_IO_CREATE_PARENTS);
         if (h < 0) {
-            st = h == FLATSQL_IO_ERR_NOSPACE ? P4_E_NOSPACE : P4_E_IO;
+            st = h == FLATSQL_IO_ERR_NOSPACE ? FLATSQL_E_NOSPACE : FLATSQL_E_IO;
         } else {
             next = std::make_shared<Stream>();
             next->path = path;
@@ -887,18 +887,18 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     for (const auto& row : rows) frameRows[row.second].push_back(row.first);
     int64_t at = 0;
     uint64_t previous = 0;
-    if (st == P4_OK) st = streamGenesis(f, next.get(), &at);
-    int r = st == P4_OK ? c->exec("BEGIN IMMEDIATE") : SQLITE_ERROR;
+    if (st == FLATSQL_OK) st = streamGenesis(f, next.get(), &at);
+    int r = st == FLATSQL_OK ? c->exec("BEGIN IMMEDIATE") : SQLITE_ERROR;
     sqlite3_stmt* q = r == SQLITE_OK ? c->get(S_R_OFF) : nullptr;
     if (r == SQLITE_OK && !q) r = SQLITE_ERROR;
-    if (st == P4_OK && r != SQLITE_OK) st = statusOfSqlite(r);
+    if (st == FLATSQL_OK && r != SQLITE_OK) st = statusOfSqlite(r);
     std::vector<int64_t> chunkRows;
     std::string buf;
     bool firstChunk = true, writeEvent = false;
     auto flushBytes = [&]() {
-        if (st != P4_OK || buf.empty()) return;
+        if (st != FLATSQL_OK || buf.empty()) return;
         st = streamWrite(next.get(), at, reinterpret_cast<const uint8_t*>(buf.data()), buf.size());
-        if (st == P4_OK) {
+        if (st == FLATSQL_OK) {
             at += int64_t(buf.size());
             if (!writeEvent) { compactWriteEvent(f, true); writeEvent = true; }
         }
@@ -906,20 +906,20 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     };
     auto flushCommit = [&]() {
         flushBytes();
-        if (st == P4_OK)
+        if (st == FLATSQL_OK)
             st = appendConsolidated(f, c, next.get(), &at, &previous, &er, &chunkRows, firstChunk);
         chunkRows.clear();
         firstChunk = false;
     };
     for (const auto& frame : live) {
-        if (st != P4_OK) break;
+        if (st != FLATSQL_OK) break;
         const auto& ids = frameRows[frame.first];
-        if (ids.size() > 65536) { st = P4_E_CORRUPT; break; }
+        if (ids.size() > 65536) { st = FLATSQL_E_CORRUPT; break; }
         if (chunkRows.size() + ids.size() > 65536) flushCommit();
-        if (st != P4_OK) break;
+        if (st != FLATSQL_OK) break;
         std::string bytes;
         st = streamRead(old.get(), frame.first, frame.second, &bytes);
-        if (st != P4_OK) break;
+        if (st != FLATSQL_OK) break;
         const int64_t newOffset = at + int64_t(buf.size());
         uint8_t prefix[4];
         st32(prefix, uint32_t(bytes.size()));
@@ -935,7 +935,7 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         }
         if (buf.size() >= (4u << 20)) flushBytes();
     }
-    if (st == P4_OK && (!chunkRows.empty() || firstChunk)) flushCommit();
+    if (st == FLATSQL_OK && (!chunkRows.empty() || firstChunk)) flushCommit();
     Counters k;
     uint64_t retiredThrough=0;
     {
@@ -944,11 +944,11 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         retiredThrough=f->lastCommit;
     }
     CheckpointState state;
-    if (st == P4_OK && !writeEvent) { compactWriteEvent(f, true); writeEvent = true; }
-    if (st == P4_OK) st = checkpointAppend(f, c, next.get(), k, &at, &previous, &state, true, &er);
-    if (st == P4_OK) st = streamSync(next.get());
-    r = st == P4_OK ? SQLITE_OK : SQLITE_ERROR;
-    if (st != P4_OK) {
+    if (st == FLATSQL_OK && !writeEvent) { compactWriteEvent(f, true); writeEvent = true; }
+    if (st == FLATSQL_OK) st = checkpointAppend(f, c, next.get(), k, &at, &previous, &state, true, &er);
+    if (st == FLATSQL_OK) st = streamSync(next.get());
+    r = st == FLATSQL_OK ? SQLITE_OK : SQLITE_ERROR;
+    if (st != FLATSQL_OK) {
         c->exec("ROLLBACK");
         writerUnpin(e, f);
         if (next) next->drop.store(true);

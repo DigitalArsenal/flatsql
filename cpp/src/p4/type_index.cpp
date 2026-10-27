@@ -36,13 +36,13 @@ int32_t typeIndexOpen(Type* t, std::string* err) {
     sqlite3_wal_hook(c->db, walHook, t->e);  // its WAL is checkpointed by the maintenance thread
     t->idx = c;
     const int32_t discovered = streamDiscover(t, c, err);
-    if (discovered != P4_OK && (discovered != P4_E_UNSUPPORTED || damagedIndex)) return discovered;
+    if (discovered != FLATSQL_OK && (discovered != FLATSQL_E_UNSUPPORTED || damagedIndex)) return discovered;
     std::lock_guard<std::mutex> g(t->mu);
     // Every registry read either completes or fails the open (M9): a statement
     // that cannot run must not read as an empty registry.
     auto broken = [&](const char* what) {
         if (err) *err = std::string("type index: ") + what + ": " + sqlite3_errmsg(c->db);
-        return P4_E_IO;
+        return FLATSQL_E_IO;
     };
     int sr;
     sqlite3_stmt* s = c->sql("SELECT id, token, peer FROM tok ORDER BY id");
@@ -73,7 +73,7 @@ int32_t typeIndexOpen(Type* t, std::string* err) {
     }
     sqlite3_reset(s);
     if (sr != SQLITE_DONE) return broken("read feeds");
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int indexPutFeed(Conn* idx, const Feed& f, uint32_t gen) {

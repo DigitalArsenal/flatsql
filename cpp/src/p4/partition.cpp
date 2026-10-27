@@ -102,12 +102,12 @@ std::string indexDdl(Type* t, bool local) {
 int32_t fileHasSchema(Conn* c, bool* has) {
     *has = false;
     sqlite3_stmt* s = c->sql("SELECT 1 FROM sqlite_master WHERE type='table' AND name='r'");
-    if (!s) return P4_E_IO;
+    if (!s) return FLATSQL_E_IO;
     const int r = sqlite3_step(s);
     sqlite3_reset(s);
     if (r != SQLITE_ROW && r != SQLITE_DONE) return statusOfSqlite(r);
     *has = r == SQLITE_ROW;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 }  // namespace
 
@@ -116,7 +116,7 @@ int32_t fileCreateIndexes(Type* t, Conn* c, bool local) {
     int rc = c->exec(ddl.c_str());
     if (rc == SQLITE_OK) rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) c->exec("ROLLBACK");
-    return rc == SQLITE_OK ? P4_OK : statusOfSqlite(rc);
+    return rc == SQLITE_OK ? FLATSQL_OK : statusOfSqlite(rc);
 }
 
 // A feed file's tables, meta rows and (indexes) its indexes, in ONE
@@ -148,14 +148,14 @@ int32_t fileSchema(Type* t, Conn* c, Feed* f, bool indexes) {
     if (ok) ok = c->exec(indexes ? indexDdl(t, f->local).c_str() : "INSERT OR IGNORE INTO meta(k, v) VALUES('ix', 0)") == SQLITE_OK;
     if (!ok) {
         c->exec("ROLLBACK");
-        return P4_E_IO;
+        return FLATSQL_E_IO;
     }
     rc = c->exec("COMMIT");
     if (rc != SQLITE_OK) {
         c->exec("ROLLBACK");
         return statusOfSqlite(rc);
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int writeMeta(Conn* c, const Counters& k, int64_t now, int64_t mark, uint32_t gen) {
@@ -344,28 +344,28 @@ int32_t seqOfCid(Conn* c, bool indexed, const Staged* st, const uint8_t key[32],
         st->ofCid(key, &v);
         if (!v.empty()) {
             *seq = v[0]->seq();
-            return P4_OK;
+            return FLATSQL_OK;
         }
     }
     sqlite3_stmt* q = c->get(indexed ? S_R_CID : S_R_CIDSCAN);
-    if (!q) return P4_E_INTERNAL;
+    if (!q) return FLATSQL_E_INTERNAL;
     sqlite3_bind_blob(q, 1, key, 32, SQLITE_STATIC);
     const int r = sqlite3_step(q);
     if (r == SQLITE_ROW) *seq = sqlite3_column_int64(q, 0);
     sqlite3_reset(q);
-    return r == SQLITE_ROW || r == SQLITE_DONE ? P4_OK : statusOfSqlite(r);
+    return r == SQLITE_ROW || r == SQLITE_DONE ? FLATSQL_OK : statusOfSqlite(r);
 }
 
 int32_t fileHoldsSeq(Conn* c, int64_t seq, bool* held) {
     *held = false;
     sqlite3_stmt* q = c->get(S_R_MAXRID);
-    if (!q) return P4_E_INTERNAL;
+    if (!q) return FLATSQL_E_INTERNAL;
     sqlite3_bind_int64(q, 1, seq << 16);
     sqlite3_bind_int64(q, 2, (seq << 16) | 0xffff);
     const int r = sqlite3_step(q);
     if (r == SQLITE_ROW) *held = sqlite3_column_type(q, 0) != SQLITE_NULL;
     sqlite3_reset(q);
-    return r == SQLITE_ROW || r == SQLITE_DONE ? P4_OK : statusOfSqlite(r);
+    return r == SQLITE_ROW || r == SQLITE_DONE ? FLATSQL_OK : statusOfSqlite(r);
 }
 
 // ---- the dictionary -------------------------------------------------------------------------------
@@ -489,9 +489,9 @@ Conn* writerPin(Engine* e, Feed* f, int32_t* rc, std::string* err) {
     // creation and its schema's commit (it exists, so the open and the
     // journal's replay count it created, but it holds nothing yet).
     bool has = false;
-    int32_t s = created ? fileHasSchema(c, &has) : P4_OK;
-    if (s == P4_OK && !has) s = fileSchema(t, c, f, indexed);
-    if (s != P4_OK) {
+    int32_t s = created ? fileHasSchema(c, &has) : FLATSQL_OK;
+    if (s == FLATSQL_OK && !has) s = fileSchema(t, c, f, indexed);
+    if (s != FLATSQL_OK) {
         delete c;
         *rc = s;
         if (err) *err = "schema " + f->path;
@@ -573,19 +573,19 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
     Engine* e=t->e; moved->clear();
     if(!ioExists(f->path)) {
         f->created=false;
-        for(uint32_t gen:{f->regGen+1,f->regGen}) if(streamGenerationComplete(f,gen)) { f->gen=gen; return P4_E_CORRUPT; }
-        return P4_OK;
+        for(uint32_t gen:{f->regGen+1,f->regGen}) if(streamGenerationComplete(f,gen)) { f->gen=gen; return FLATSQL_E_CORRUPT; }
+        return FLATSQL_OK;
     }
     f->created=true;
-    int32_t st=P4_OK; Conn* c=writerPin(e,f,&st,err); if(!c) return st;
+    int32_t st=FLATSQL_OK; Conn* c=writerPin(e,f,&st,err); if(!c) return st;
     auto* format=c->sql("SELECT v FROM meta WHERE k='format'");
     int qr=format?sqlite3_step(format):SQLITE_ERROR;
     const int formatValue=qr==SQLITE_ROW?sqlite3_column_int(format,0):0;
     if(format) sqlite3_reset(format);
-    if(formatValue!=5) { writerUnpin(e,f); return formatValue==4?P4_E_FORMAT:P4_E_CORRUPT; }
+    if(formatValue!=5) { writerUnpin(e,f); return formatValue==4?FLATSQL_E_FORMAT:FLATSQL_E_CORRUPT; }
     st=recoverFeed(t,f,c,moved,err);
     FileMeta m; std::map<InstId,InstCount> inst; std::map<uint32_t,TokCount> tokc;
-    int rc=st==P4_OK?readMeta(c,&m):SQLITE_ERROR;
+    int rc=st==FLATSQL_OK?readMeta(c,&m):SQLITE_ERROR;
     const auto checkpoint=f->checkpoint;
     if(rc==SQLITE_OK && checkpoint && checkpoint->offset && checkpoint->holdsStateAt(uint64_t(m.mark))) {
         // All represented state comes from the verified checkpoint segments
@@ -611,9 +611,9 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
         if(rc==SQLITE_OK) rc=readInst(f,c,&inst);
         if(rc==SQLITE_OK) rc=readTokc(t,c,&tokc);
     }
-    if(st==P4_OK && rc==SQLITE_OK && m.indexed && !f->quarantined) st=stagedLoad(e,f,c,err);
+    if(st==FLATSQL_OK && rc==SQLITE_OK && m.indexed && !f->quarantined) st=stagedLoad(e,f,c,err);
     writerUnpin(e,f);
-    if(st!=P4_OK) return st;
+    if(st!=FLATSQL_OK) return st;
     if(rc!=SQLITE_OK) return statusOfSqlite(rc);
     if(f->regGen!=m.gen) {
         rc=indexPutFeed(t->idx,*f,m.gen); if(rc!=SQLITE_OK) return statusOfSqlite(rc);
@@ -659,7 +659,7 @@ int32_t feedOpen(Type* t, Feed* f, std::vector<int64_t>* moved, std::string* err
     f->movedRows=!moved->empty(); f->movedDone=moved->empty();
     if(f->quarantined) stagedPublish(e,f,nullptr,false);
     t->nextSeq=std::max(t->nextSeq,m.k.maxseq+1);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // The supersede identity of a stored record (unsealed bytes only).
@@ -727,7 +727,7 @@ struct Call {
     int64_t at = 0;
     bool ownTs = false;  // tag 55: a COPY stores this write's ts (format 1's StoreRoutedByProducer, C-39 E6)
     std::vector<size_t> recs;  // group indexes
-    int32_t status = P4_OK;
+    int32_t status = FLATSQL_OK;
     std::string err;
 };
 
@@ -809,7 +809,7 @@ bool Group::parseCall(Call& c) {
     const uint8_t* req = e->slotReq(c.slot);
     std::vector<Tlv> v;
     if (h->reqLen > e->reqBytes[0] || !tlvParse(req, h->reqLen, &v)) {
-        c.status = P4_E_ARG;
+        c.status = FLATSQL_E_ARG;
         c.err = "malformed request";
         return false;
     }
@@ -825,7 +825,7 @@ bool Group::parseCall(Call& c) {
     tlvU8(v, 55, &ownTs, &bad);
     c.ownTs = ownTs != 0;
     if (bad) {
-        c.status = P4_E_ARG;
+        c.status = FLATSQL_E_ARG;
         c.err = "a typed tag has the wrong length";
         return false;
     }
@@ -834,7 +834,7 @@ bool Group::parseCall(Call& c) {
         std::vector<Tlv> tv;
         TagIn tag;
         if (!tlvParse(t.v, t.n, &tv)) {
-            c.status = P4_E_ARG;
+            c.status = FLATSQL_E_ARG;
             c.err = "malformed tag";
             return false;
         }
@@ -846,7 +846,7 @@ bool Group::parseCall(Call& c) {
     }
     const Tlv* recs = tlvFind(v, 53);
     if (!recs || recs->n < 4) {
-        c.status = P4_E_ARG;
+        c.status = FLATSQL_E_ARG;
         c.err = "no records (tag 53)";
         return false;
     }
@@ -913,7 +913,7 @@ bool Group::parseCall(Call& c) {
             }
         }
         if (c.mode == 0 && (r.flags & (kFSeq | kFTags))) {
-            c.status = P4_E_ARG;
+            c.status = FLATSQL_E_ARG;
             c.err = "SEQ and TAGS are migrate-mode only";
             return false;
         }
@@ -924,7 +924,7 @@ bool Group::parseCall(Call& c) {
     if (p != end) goto malformed;
     return true;
 malformed:
-    c.status = P4_E_ARG;
+    c.status = FLATSQL_E_ARG;
     c.err = "malformed record entries";
     c.recs.clear();
     return false;
@@ -932,10 +932,10 @@ malformed:
 
 void Group::prepare(Rec& r, const Call& c) {
     const ps::TypeConfig& tc = sp_->tc;
-    if (!cidBinValid(r.cid36)) { r.reject = P4_REJ_CID_FORM; return; }
-    if (r.frameLen < 4 || ld32(r.frame) != r.frameLen - 4) { r.reject = P4_REJ_FRAME_SIZE; return; }
+    if (!cidBinValid(r.cid36)) { r.reject = FLATSQL_REJ_CID_FORM; return; }
+    if (r.frameLen < 4 || ld32(r.frame) != r.frameLen - 4) { r.reject = FLATSQL_REJ_FRAME_SIZE; return; }
     if (r.frameLen > tc.maxFrame() || uint64_t(r.frameLen) + r.sealedLen > uint64_t(e_->reqBytes[0]) - (64u << 10)) {
-        r.reject = P4_REJ_TOO_LARGE;
+        r.reject = FLATSQL_REJ_TOO_LARGE;
         return;
     }
     const int32_t fc = tc.checkFrame(r.frame, r.frameLen);
@@ -943,20 +943,20 @@ void Group::prepare(Rec& r, const Call& c) {
     {
         uint8_t dg[32];
         ps::sha256(r.frame + 4, r.frameLen - 4, dg);
-        if (std::memcmp(dg, r.cid36 + 4, 32) != 0) { r.reject = P4_REJ_CID; return; }
+        if (std::memcmp(dg, r.cid36 + 4, 32) != 0) { r.reject = FLATSQL_REJ_CID; return; }
     }
-    if (r.sealed && !ps::sealedEnvelopeValid(r.sealed, r.sealedLen)) { r.reject = P4_REJ_SEALED; return; }
+    if (r.sealed && !ps::sealedEnvelopeValid(r.sealed, r.sealedLen)) { r.reject = FLATSQL_REJ_SEALED; return; }
     if (!r.peer.empty() && ps::producerToken(reinterpret_cast<const uint8_t*>(r.peer.data()), r.peer.size()) != c.token) {
-        r.reject = P4_REJ_TAG;
+        r.reject = FLATSQL_REJ_TAG;
         return;
     }
     if (c.mode == 1) {
-        if (r.seqIn <= 0 || r.seqIn > (int64_t(1) << 46)) { r.reject = P4_REJ_SEQ; return; }
+        if (r.seqIn <= 0 || r.seqIn > (int64_t(1) << 46)) { r.reject = FLATSQL_REJ_SEQ; return; }
         for (auto& ti : r.tagsIn)
-            if (ti.first >= c.tags.size() || !c.tags[ti.first].valid) { r.reject = P4_REJ_TAG; return; }
+            if (ti.first >= c.tags.size() || !c.tags[ti.first].valid) { r.reject = FLATSQL_REJ_TAG; return; }
     } else {
         for (const TagIn& ti : c.tags)
-            if (!ti.valid) { r.reject = P4_REJ_TAG; return; }
+            if (!ti.valid) { r.reject = FLATSQL_REJ_TAG; return; }
     }
     cidKeyFromDigest(r.cid36 + 4, r.key);
     ps::Extracted x;
@@ -991,7 +991,7 @@ void Group::prepare(Rec& r, const Call& c) {
 
 void Group::fail(int32_t status, const std::string& err) {
     for (auto& c : calls_)
-        if (c.status == P4_OK) {
+        if (c.status == FLATSQL_OK) {
             c.status = status;
             c.err = err;
         }
@@ -1017,7 +1017,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
         usable = f && f->created && f->indexed && !f->quarantined;
         if (f) staged = f->staged;  // pinned before the read below
     }
-    if (rs->k.type == 0) return P4_OK;
+    if (rs->k.type == 0) return FLATSQL_OK;
     // The records of the previous unit (still being applied) with the object
     // key: their state is the seed's.
     {
@@ -1031,15 +1031,15 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
             if (!any) continue;
             RowR tmp = *any;
             const int32_t lrc = w.loadD(scope, tmp);
-            if (lrc != P4_OK) return lrc;
+            if (lrc != FLATSQL_OK) return lrc;
             if (identityOf(sp_->tc, reinterpret_cast<const uint8_t*>(tmp.d.data()), tmp.d.size()) != r.supIdentity) continue;
             other->restamp = true;
             w.dropAll(other, 2);
             e_->bump(kStCatSuperseded);
         }
     }
-    if (!usable) return P4_OK;
-    int32_t st = P4_OK;
+    if (!usable) return FLATSQL_OK;
+    int32_t st = FLATSQL_OK;
     std::string er;
     Conn* c = planAcquire(e_, f, &st, &er);
     if (!c) return st;
@@ -1064,7 +1064,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
         });
         cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
     }
-    int32_t frc = P4_OK;
+    int32_t frc = FLATSQL_OK;
     if (rc == SQLITE_DONE) {
         // Each candidate's bytes: its frame in the feed's stream.
         std::shared_ptr<Stream> stream = cand.empty() ? nullptr : streamCur(f, &frc);
@@ -1072,7 +1072,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
         int64_t last = 0;
         std::string bytes;
         for (auto& x : cand) {
-            if (frc != P4_OK) break;
+            if (frc != FLATSQL_OK) break;
             if (x.second == last) continue;  // one row per record decides
             sqlite3_bind_int64(dq, 1, x.first);
             const int r2 = sqlite3_step(dq);
@@ -1089,16 +1089,16 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
             last = x.second;
             if (off < 0) continue;
             frc = streamRead(stream.get(), off, len, &bytes);
-            if (frc != P4_OK) break;
+            if (frc != FLATSQL_OK) break;
             if (identityOf(sp_->tc, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()) == r.supIdentity)
                 seqs.push_back(x.second);
         }
     }
     planRelease(e_, c);
     if (rc != SQLITE_DONE) return statusOfSqlite(rc);
-    if (frc != P4_OK) return frc;
+    if (frc != FLATSQL_OK) return frc;
     for (int64_t s : seqs) {
-        int32_t lrc = P4_OK;
+        int32_t lrc = FLATSQL_OK;
         RecState* other = w.bySeq(scope, s, &lrc);
         if (!other) return lrc;
         if (other == rs || !liveRows(other)) continue;  // a record the seed already holds gone
@@ -1106,7 +1106,7 @@ int32_t Group::supersedeOnIngest(WriteCtx& w, Rec& r, RecState* rs, uint32_t sco
         w.dropAll(other, 2);
         e_->bump(kStCatSuperseded);
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // The holder of an ingest identity in a feed file (seq 0 when none).
@@ -1114,7 +1114,7 @@ int32_t Group::identSeq(uint32_t fid, const uint8_t h[32], int64_t* seq) {
     *seq = 0;
     if (RecState* held = w_->seededIdent(fid, h)) {
         *seq = held->seq;  // the previous unit registered it
-        return P4_OK;
+        return FLATSQL_OK;
     }
     Feed* f;
     bool created;
@@ -1125,10 +1125,10 @@ int32_t Group::identSeq(uint32_t fid, const uint8_t h[32], int64_t* seq) {
         created = f && f->created;
         if (f) staged = f->staged;  // pinned before the read below
     }
-    if (!created) return P4_OK;
+    if (!created) return FLATSQL_OK;
     // A staged identity is the latest (the merge replaces ident's row with it).
-    if (staged && (*seq = staged->identSeq(h)) != 0) return P4_OK;
-    int32_t st = P4_OK;
+    if (staged && (*seq = staged->identSeq(h)) != 0) return FLATSQL_OK;
+    int32_t st = FLATSQL_OK;
     std::string er;
     Conn* c = planAcquire(e_, f, &st, &er);
     if (!c) return st;
@@ -1141,7 +1141,7 @@ int32_t Group::identSeq(uint32_t fid, const uint8_t h[32], int64_t* seq) {
         sqlite3_reset(q);
     }
     planRelease(e_, c);
-    return r == SQLITE_ROW || r == SQLITE_DONE ? P4_OK : statusOfSqlite(r);
+    return r == SQLITE_ROW || r == SQLITE_DONE ? FLATSQL_OK : statusOfSqlite(r);
 }
 
 // The copy a record delivers: this write's producer token, peer and
@@ -1165,7 +1165,7 @@ void Group::respond() {
     for (Call& c : calls_) {
         SlotOut out(e_, c.slot);
         out.enc.header({"i", "action", "seq", "reject"});
-        if (c.status != P4_OK) {
+        if (c.status != FLATSQL_OK) {
             out.end(c.status, c.err);
             continue;
         }
@@ -1173,13 +1173,13 @@ void Group::respond() {
         uint64_t nNew = 0, nCopy = 0, nRetag = 0, nDup = 0, nIdent = 0, nRej = 0;
         for (size_t gi : c.recs) {
             Rec& r = recs_[gi];
-            const int action = r.reject ? P4_ACT_REJECTED : r.action;
+            const int action = r.reject ? FLATSQL_ACT_REJECTED : r.action;
             switch (action) {
-                case P4_ACT_NEW: case P4_ACT_MIGRATED: nNew++; break;
-                case P4_ACT_COPY: nCopy++; break;
-                case P4_ACT_RETAG: nRetag++; break;
-                case P4_ACT_DUP: nDup++; break;
-                case P4_ACT_IDENT_DUP: nIdent++; break;
+                case FLATSQL_ACT_NEW: case FLATSQL_ACT_MIGRATED: nNew++; break;
+                case FLATSQL_ACT_COPY: nCopy++; break;
+                case FLATSQL_ACT_RETAG: nRetag++; break;
+                case FLATSQL_ACT_DUP: nDup++; break;
+                case FLATSQL_ACT_IDENT_DUP: nIdent++; break;
                 default: nRej++; break;
             }
             out.enc.beginRow();
@@ -1199,7 +1199,7 @@ void Group::respond() {
         e_->bump(kStDups, nDup);
         e_->bump(kStIdentDups, nIdent);
         e_->bump(kStRejects, nRej);
-        out.end(P4_OK, std::string());
+        out.end(FLATSQL_OK, std::string());
     }
 }
 
@@ -1244,13 +1244,13 @@ int32_t Group::ingest(WriteCtx& w, Call& c, Rec& r) {
     std::vector<RecState*> held_;
     RecState* localRs = nullptr;
     int32_t rc = holders(w, r, c.tags.empty(), &held_, &localRs);
-    if (rc != P4_OK) return rc;
+    if (rc != FLATSQL_OK) return rc;
     if (targets.empty()) {
         for (RecState* h : held_) targets.push_back(Target{h->fid, {}});
         if (targets.empty()) targets.push_back(Target{localFid_, {}});
         else if (localRs) {
             rc = absorbLocal(w, localRs, held_[0]);  // local rows beside a feed's (never left by a write)
-            if (rc != P4_OK) return rc;
+            if (rc != FLATSQL_OK) return rc;
             localRs = nullptr;
         }
     }
@@ -1268,7 +1268,7 @@ int32_t Group::ingest(WriteCtx& w, Call& c, Rec& r) {
         } else {
             int64_t hseq = 0;
             rc = identSeq(scope, r.ident, &hseq);
-            if (rc != P4_OK) return rc;
+            if (rc != FLATSQL_OK) return rc;
             if (hseq) {
                 RecState* hr = w.bySeq(scope, hseq, &rc);
                 if (!hr) return rc;
@@ -1354,7 +1354,7 @@ int32_t Group::ingest(WriteCtx& w, Call& c, Rec& r) {
         w.deliver(rs, copy, tg.insts, &out);
         if (absorb) {
             rc = absorbLocal(w, localRs, rs);
-            if (rc != P4_OK) return rc;
+            if (rc != FLATSQL_OK) return rc;
             if (copyKnown) out.copyNew = false;
         }
         byCid_[std::string(reinterpret_cast<const char*>(r.key), 32)].push_back(rs);
@@ -1378,15 +1378,15 @@ int32_t Group::ingest(WriteCtx& w, Call& c, Rec& r) {
         // CAT supersede-on-ingest (C-20: ingest mode only), in the scope feed.
         if (r.hasSup && tg.fid == scope && scope && (isNew || out.copyNew) && !(held && rs == held)) {
             rc = supersedeOnIngest(w, r, rs, scope);
-            if (rc != P4_OK) return rc;
+            if (rc != FLATSQL_OK) return rc;
         }
     }
-    if (held) r.action = P4_ACT_IDENT_DUP;
-    else if (anyNew) r.action = P4_ACT_NEW;
-    else if (anyCopy) r.action = P4_ACT_COPY;
-    else if (anyInst) r.action = P4_ACT_RETAG;
-    else r.action = P4_ACT_DUP;
-    return P4_OK;
+    if (held) r.action = FLATSQL_ACT_IDENT_DUP;
+    else if (anyNew) r.action = FLATSQL_ACT_NEW;
+    else if (anyCopy) r.action = FLATSQL_ACT_COPY;
+    else if (anyInst) r.action = FLATSQL_ACT_RETAG;
+    else r.action = FLATSQL_ACT_DUP;
+    return FLATSQL_OK;
 }
 
 // The records of r's CID in local and, with feedsToo (an untagged write), in
@@ -1414,7 +1414,7 @@ int32_t Group::holders(WriteCtx& w, const Rec& r, bool feedsToo, std::vector<Rec
         if (isLocal) *local = rs;
         else feeds->push_back(rs);
     };
-    int32_t rc = P4_OK;
+    int32_t rc = FLATSQL_OK;
     for (const F& f : files) {
         RecState* rs = w.byKey(f.fid, r.key, &rc);
         if (!rs) return rc;
@@ -1432,7 +1432,7 @@ int32_t Group::holders(WriteCtx& w, const Rec& r, bool feedsToo, std::vector<Rec
             if (isLocal || feedsToo) take(rs, isLocal);
         }
     std::sort(feeds->begin(), feeds->end(), [](const RecState* a, const RecState* b) { return a->fid < b->fid; });
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // A record's local rows move into a feed file: each local copy joins the
@@ -1464,7 +1464,7 @@ int32_t Group::absorbLocal(WriteCtx& w, RecState* local, RecState* into) {
         w.deliver(into, m, {}, &out);
     }
     w.dropAll(local, 5);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // Migrate mode (C-38 (3)): format 1's rowid is the record's seq in every feed
@@ -1477,8 +1477,8 @@ int32_t Group::migrate(WriteCtx& w, Call& c, Rec& r) {
     const std::string key(reinterpret_cast<const char*>(r.key), 32);
     auto sk = seqKey_.find(seq);
     if (sk != seqKey_.end() && sk->second != key) {
-        r.reject = P4_REJ_SEQ;
-        return P4_OK;
+        r.reject = FLATSQL_REJ_SEQ;
+        return FLATSQL_OK;
     }
     // Every feed file holding the seq (this write's records, else the files
     // whose seq range covers it).
@@ -1492,7 +1492,7 @@ int32_t Group::migrate(WriteCtx& w, Call& c, Rec& r) {
         std::lock_guard<std::mutex> g(t_->mu);
         for (auto& f : t_->feeds) feeds.push_back(FInfo{f->fid, f->local, f->created, f->k.minseq, f->k.maxseq});
     }
-    int32_t rc = P4_OK;
+    int32_t rc = FLATSQL_OK;
     std::vector<RecState*> holders;
     RecState* localHolder = nullptr;
     for (const FInfo& fi : feeds) {
@@ -1503,8 +1503,8 @@ int32_t Group::migrate(WriteCtx& w, Call& c, Rec& r) {
         }
         if (!rs || !(rs->existed || freshSet_.count(rs)) || !liveRows(rs)) continue;
         if (std::memcmp(rs->key, r.key, 32) != 0) {
-            r.reject = P4_REJ_SEQ;  // the seq is held by another CID
-            return P4_OK;
+            r.reject = FLATSQL_REJ_SEQ;  // the seq is held by another CID
+            return FLATSQL_OK;
         }
         if (fi.local) localHolder = rs;
         else holders.push_back(rs);
@@ -1592,8 +1592,8 @@ int32_t Group::migrate(WriteCtx& w, Call& c, Rec& r) {
             w.idents.push_back(in);
         }
     }
-    r.action = isNewRecord ? P4_ACT_MIGRATED : copyNew ? P4_ACT_COPY : P4_ACT_MIGRATED;
-    return P4_OK;
+    r.action = isNewRecord ? FLATSQL_ACT_MIGRATED : copyNew ? FLATSQL_ACT_COPY : FLATSQL_ACT_MIGRATED;
+    return FLATSQL_OK;
 }
 
 void Group::plan(std::vector<WriteTask*>& tasks, const std::vector<const PutUnit*>& prevs) {
@@ -1609,17 +1609,17 @@ void Group::plan(std::vector<WriteTask*>& tasks, const std::vector<const PutUnit
         c.token = ps::producerToken(reinterpret_cast<const uint8_t*>(c.peer.data()), c.peer.size());
     }
     for (Call& c : calls_) {
-        if (c.status != P4_OK) continue;
+        if (c.status != FLATSQL_OK) continue;
         for (size_t gi : c.recs) prepare(recs_[gi], c);
     }
     bool any = false;
-    for (Call& c : calls_) any = any || (c.status == P4_OK && !c.recs.empty());
+    for (Call& c : calls_) any = any || (c.status == FLATSQL_OK && !c.recs.empty());
     if (!any) return;  // answered in order by finish()
     // The type's T/ files exist from its first write.
     {
         std::string err;
         const int32_t frc = typeFilesEnsure(t_, &err);
-        if (frc != P4_OK) {
+        if (frc != FLATSQL_OK) {
             fail(frc, "type files: " + err);
             return;
         }
@@ -1629,22 +1629,22 @@ void Group::plan(std::vector<WriteTask*>& tasks, const std::vector<const PutUnit
         // The feeds of every call's tags, local when a call may need it
         // (an untagged ingest, any migration), and each call's token (copy).
         for (Call& c : calls_) {
-            if (c.status != P4_OK) continue;
+            if (c.status != FLATSQL_OK) continue;
             c.tok = tokFor(t_, c.token, c.peer, true);
             for (TagIn& tag : c.tags) {
                 if (!tag.valid) continue;
                 Feed* f = feedFor(t_, tag.f6[0], tag.f6[1], true);
                 tag.fid = f->fid;
                 if (f->quarantined) {
-                    c.status = P4_E_CORRUPT;
+                    c.status = FLATSQL_E_CORRUPT;
                     c.err = "feed file quarantined: " + f->path;
                 }
             }
-            if (c.status == P4_OK && (c.tags.empty() || c.mode == 1)) {
+            if (c.status == FLATSQL_OK && (c.tags.empty() || c.mode == 1)) {
                 Feed* local = feedFor(t_, "", "", true);
                 localFid_ = local->fid;
                 if (local->quarantined) {
-                    c.status = P4_E_CORRUPT;
+                    c.status = FLATSQL_E_CORRUPT;
                     c.err = "feed file quarantined: " + local->path;
                 }
             }
@@ -1666,18 +1666,18 @@ void Group::plan(std::vector<WriteTask*>& tasks, const std::vector<const PutUnit
     }
     w.migrate = false;
     for (Call& c : calls_)
-        if (c.status == P4_OK) w.migrate = c.mode == 1;  // a group never mixes modes
-    int32_t rc = P4_OK;
+        if (c.status == FLATSQL_OK) w.migrate = c.mode == 1;  // a group never mixes modes
+    int32_t rc = FLATSQL_OK;
     for (Call& c : calls_) {
-        if (c.status != P4_OK || rc != P4_OK) continue;
+        if (c.status != FLATSQL_OK || rc != FLATSQL_OK) continue;
         for (size_t gi : c.recs) {
-            if (rc != P4_OK) break;
+            if (rc != FLATSQL_OK) break;
             Rec& r = recs_[gi];
             if (r.reject) continue;
             rc = c.mode == 1 ? migrate(w, c, r) : ingest(w, c, r);
         }
     }
-    if (rc != P4_OK) {
+    if (rc != FLATSQL_OK) {
         fail(rc, "write planning failed: " + w.err);
         return;
     }
@@ -1704,7 +1704,7 @@ void Group::plan(std::vector<WriteTask*>& tasks, const std::vector<const PutUnit
         }
     }
     rc = w.prepare();
-    if (rc != P4_OK) {
+    if (rc != FLATSQL_OK) {
         fail(rc, "commit failed: " + w.err);
         return;
     }
@@ -1725,7 +1725,7 @@ void Group::release() {
 
 void Group::finish(int32_t rc, const std::string& why) {
     release();
-    if (rc != P4_OK) fail(rc, "commit failed: " + why);
+    if (rc != FLATSQL_OK) fail(rc, "commit failed: " + why);
     respond();
 }
 

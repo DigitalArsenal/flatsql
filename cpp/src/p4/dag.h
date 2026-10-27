@@ -27,7 +27,7 @@ int32_t feedDagCommitRoot(Feed*,Stream*,uint64_t previous,uint64_t end,std::stri
 // The same with Feed::dagMu already held. The cache only moves forward: an
 // earlier commit point is answered from the commits roots it recorded at the
 // points it was built to, never by replaying the generation; a point it never
-// stopped at is P4_E_BUSY (callers ask at a committed mark read under dagMu).
+// stopped at is FLATSQL_E_BUSY (callers ask at a committed mark read under dagMu).
 int32_t feedDagCommitRootHeld(Feed*,Stream*,uint64_t previous,uint64_t end,std::string*,std::string* err);
 std::string feedDagCheckpointCid(const void* bytes,size_t length);
 int32_t feedDagDrops(Feed*,uint64_t from,std::vector<DagDrop>*,std::string* err);

@@ -14,11 +14,11 @@ struct Frame {
 bool readFrame(Stream* s,uint64_t at,uint64_t size,Frame* f) {
     if(at>size || size-at<12) return false;
     std::string prefix;
-    if(streamReadRange(s,int64_t(at),4,&prefix)!=P4_OK) return false;
+    if(streamReadRange(s,int64_t(at),4,&prefix)!=FLATSQL_OK) return false;
     uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data()));
     if(n<8 || n>(128u<<20) || n>size-at-4) return false;
     std::string bytes;
-    if(streamRead(s,int64_t(at),n,&bytes)!=P4_OK) return false;
+    if(streamRead(s,int64_t(at),n,&bytes)!=FLATSQL_OK) return false;
     f->at=at; f->end=at+4+n; f->length=n; f->aligned.resize((size_t(n)+7)/8);
     std::memcpy(f->aligned.data(),bytes.data(),n); return true;
 }
@@ -69,7 +69,7 @@ bool anchored(Stream* s,Feed* feed,Frame current,uint64_t size) {
             while(pos<current.at) {
                 if(current.at-pos<12) return false;
                 std::string prefix;
-                if(streamReadRange(s,int64_t(pos),12,&prefix)!=P4_OK) return false;
+                if(streamReadRange(s,int64_t(pos),12,&prefix)!=FLATSQL_OK) return false;
                 const uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data()));
                 if(n<8 || n>(128u<<20) || uint64_t(n)>current.at-pos-4 ||
                    !std::memcmp(prefix.data()+8,"$FCK",4) || !std::memcmp(prefix.data()+8,"$FMB",4) ||
@@ -112,7 +112,7 @@ bool candidate(Stream* s,Feed* feed,uint64_t at,uint64_t size,CheckpointState* o
     }
     if(!anchored(s,feed,frame,size)) return false;
     CheckpointState state;
-    if(checkpointReadAt(feed,s,at,&state,err)!=P4_OK) return false;
+    if(checkpointReadAt(feed,s,at,&state,err)!=FLATSQL_OK) return false;
     // Every complete tail commit must link back to the candidate. A partial
     // frame is a torn tail; a complete invalid commit requires the fallback.
     uint64_t pos=frame.end,prev=at;
@@ -141,18 +141,18 @@ int32_t checkpointTailRows(Feed* feed,Stream* stream,const CheckpointState& chec
     if(rowCount) *rowCount=0;
     if(lastCommitAt) *lastCommitAt=0;
     const int64_t extent=streamSize(stream);
-    if(extent<0) return P4_E_IO;
+    if(extent<0) return FLATSQL_E_IO;
     const uint64_t size=uint64_t(extent);
-    if(!checkpoint.end || checkpoint.end>size || previous>=size || previous<checkpoint.offset) return P4_E_CORRUPT;
+    if(!checkpoint.end || checkpoint.end>size || previous>=size || previous<checkpoint.offset) return FLATSQL_E_CORRUPT;
     // Every $FMB that ends past APPLIED_THROUGH: those after the $FCK, and
     // (prepared off the writer) those between APPLIED_THROUGH and the $FCK.
     bool seen=false;
     for(uint64_t at=previous;at!=UINT64_MAX;) {
         if(at==stop) { seen=true; break; }
         Frame f;
-        if(!readFrame(stream,at,size,&f) || !commitHeader(&f,feed)) return P4_E_CORRUPT;
+        if(!readFrame(stream,at,size,&f) || !commitHeader(&f,feed)) return FLATSQL_E_CORRUPT;
         if(at==checkpoint.offset) {
-            if(f.end!=checkpoint.end || std::memcmp(f.data()+4,"$FCK",4)) return P4_E_CORRUPT;
+            if(f.end!=checkpoint.end || std::memcmp(f.data()+4,"$FCK",4)) return FLATSQL_E_CORRUPT;
             seen=true; if(checkpoint.current) break;
         } else if(!std::memcmp(f.data()+4,"$FMB",4)) {
             if(f.end<=checkpoint.appliedThrough) break;
@@ -160,16 +160,16 @@ int32_t checkpointTailRows(Feed* feed,Stream* stream,const CheckpointState& chec
             if(rowCount && batch->ROWS()) *rowCount+=batch->ROWS()->size();
             if(lastCommitAt) *lastCommitAt=std::max(*lastCommitAt,batch->COMMITTED_AT());
             if(batch->ROWS()) for(const auto* row:*batch->ROWS()) {
-                if(!row->SEQ() || row->SEQ()>uint64_t(INT64_MAX>>16)) return P4_E_CORRUPT;
+                if(!row->SEQ() || row->SEQ()>uint64_t(INT64_MAX>>16)) return FLATSQL_E_CORRUPT;
                 rids->push_back((row->SEQ()<<16)|row->ROW_J());
             }
         } else if(at<checkpoint.offset && !std::memcmp(f.data()+4,"$FCK",4)) break;
         at=f.previous;
     }
-    if(!seen) return P4_E_CORRUPT;
+    if(!seen) return FLATSQL_E_CORRUPT;
     std::sort(rids->begin(),rids->end());
     rids->erase(std::unique(rids->begin(),rids->end()),rids->end());
-    return P4_OK;
+    return FLATSQL_OK;
 }
 int32_t checkpointRestoreCadence(Feed* feed,Stream* stream) {
     std::shared_ptr<const CheckpointState> checkpoint;
@@ -179,11 +179,11 @@ int32_t checkpointRestoreCadence(Feed* feed,Stream* stream) {
         checkpoint=feed->checkpoint; previous=feed->lastCommit;
         feed->checkpointRows=0; feed->checkpointAt=0;
     }
-    if(!checkpoint || (previous==checkpoint->offset && checkpoint->current)) return P4_OK;
+    if(!checkpoint || (previous==checkpoint->offset && checkpoint->current)) return FLATSQL_OK;
     uint64_t rows=0; int64_t committedAt=0;
     std::vector<uint64_t> rids;
     const int32_t rc=checkpointTailRows(feed,stream,*checkpoint,previous,&rids,&rows,&committedAt);
-    if(rc!=P4_OK) return rc;
+    if(rc!=FLATSQL_OK) return rc;
     const uint64_t now=monoNs();
     const int64_t wall=nowSec();
     const uint64_t seconds=committedAt>0 && committedAt<wall?uint64_t(wall-committedAt):0;
@@ -193,25 +193,25 @@ int32_t checkpointRestoreCadence(Feed* feed,Stream* stream) {
     // Reserve zero for "no commits" and keep a wall-clock age from wrapping
     // the monotonic clock after a reboot or wall-clock adjustment.
     if(committedAt) feed->checkpointAt=now>age?now-age:1;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 int32_t checkpointFindNewest(Feed* feed,Stream* stream,CheckpointState* out,bool* found,std::string* err) {
     *found=false;
-    const int64_t signedSize=streamSize(stream); if(signedSize<0) return P4_E_IO;
+    const int64_t signedSize=streamSize(stream); if(signedSize<0) return FLATSQL_E_IO;
     const uint64_t size=uint64_t(signedSize),chunk=uint64_t(1)<<20;
     bool doubt=false;
     for(uint64_t end=size;end>0;) {
         const uint64_t begin=end>chunk?end-chunk:0;
         // Three overlapping bytes include identifiers crossing chunk edges.
         std::string bytes;
-        if(streamReadRange(stream,int64_t(begin),int64_t(std::min(size,end+3)-begin),&bytes)!=P4_OK) { doubt=true; break; }
+        if(streamReadRange(stream,int64_t(begin),int64_t(std::min(size,end+3)-begin),&bytes)!=FLATSQL_OK) { doubt=true; break; }
         size_t at=bytes.size();
         while(at>=4) {
             const size_t p=bytes.rfind("$FCK",at-4);
             if(p==std::string::npos) break;
             if(begin+p>=8 && begin+p<end) {
                 CheckpointState state;
-                if(candidate(stream,feed,begin+p-8,size,&state,err)) { *out=std::move(state); *found=true; return P4_OK; }
+                if(candidate(stream,feed,begin+p-8,size,&state,err)) { *out=std::move(state); *found=true; return FLATSQL_OK; }
                 doubt=true;
             }
             if(p<4) break;
@@ -230,7 +230,7 @@ int32_t checkpointFindNewest(Feed* feed,Stream* stream,CheckpointState* out,bool
         if(ck||mb||sg) {
             if(!commitHeader(&f,feed) || f.previous!=previous) break;
             if(mb && !verifyFmbCommit(GetFMB(f.data()),pos,previous,feed->fid,pending)) break;
-            if(ck) { CheckpointState state; if(checkpointReadAt(feed,stream,pos,&state,err)==P4_OK) { *out=std::move(state); *found=true; } }
+            if(ck) { CheckpointState state; if(checkpointReadAt(feed,stream,pos,&state,err)==FLATSQL_OK) { *out=std::move(state); *found=true; } }
             previous=pos; pending.clear();
         } else {
             FmbFrameProof proof; proof.size=f.length;
@@ -238,6 +238,6 @@ int32_t checkpointFindNewest(Feed* feed,Stream* stream,CheckpointState* out,bool
         }
         pos=f.end;
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 } }

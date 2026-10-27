@@ -220,11 +220,11 @@ void dayText(int64_t sec, char out[11]) {
 // ---- config -------------------------------------------------------------------------
 int32_t parseConfig(const uint8_t* p, size_t n, Config* c, std::string* err) {
     std::vector<Tlv> v;
-    if (!tlvParse(p, n, &v)) { *err = "config: malformed TLV"; return P4_E_ARG; }
+    if (!tlvParse(p, n, &v)) { *err = "config: malformed TLV"; return FLATSQL_E_ARG; }
     bool bad = false;
     if (!tlvText(v, 1, &c->root) || c->root.empty() || c->root[0] != '/') {
         *err = "config: tag 1 (root) must be an absolute path";
-        return P4_E_ARG;
+        return FLATSQL_E_ARG;
     }
     while (c->root.size() > 1 && c->root.back() == '/') c->root.pop_back();
     uint32_t u32;
@@ -268,25 +268,25 @@ int32_t parseConfig(const uint8_t* p, size_t n, Config* c, std::string* err) {
     setU64(48, &c->sandboxHeap);
     setU64(49, &c->sandboxRows);
     setU64(50, &c->sandboxBytes);
-    if (bad) { *err = "config: a typed tag has the wrong length"; return P4_E_ARG; }
-    if (c->createMode > 2) { *err = "config: create mode must be 0, 1 or 2"; return P4_E_ARG; }
+    if (bad) { *err = "config: a typed tag has the wrong length"; return FLATSQL_E_ARG; }
+    if (c->createMode > 2) { *err = "config: create mode must be 0, 1 or 2"; return FLATSQL_E_ARG; }
     if (c->writers == 0) {
         const uint32_t w = c->cores > 1 ? c->cores - 1 : 1;
         c->writers = w > 8 ? 8 : w;
     }
     auto pow2 = [](uint32_t x) { return x && !(x & (x - 1)); };
-    if (!pow2(c->ringBytes) || c->ringBytes < 4096) { *err = "config: ring bytes must be a power of two >= 4096"; return P4_E_ARG; }
-    if (c->writeReqBytes < (128u << 10)) { *err = "config: write request bytes below 128 KiB"; return P4_E_ARG; }
+    if (!pow2(c->ringBytes) || c->ringBytes < 4096) { *err = "config: ring bytes must be a power of two >= 4096"; return FLATSQL_E_ARG; }
+    if (c->writeReqBytes < (128u << 10)) { *err = "config: write request bytes below 128 KiB"; return FLATSQL_E_ARG; }
     const uint32_t nThreads = c->writers + c->interactive + c->bulk + c->sandbox + 1;
     if (nThreads > 64 || c->interactive == 0 || c->bulk == 0 || c->sandbox == 0) {
         *err = "config: at most 64 service threads, and at least one lane per read class";
-        return P4_E_ARG;
+        return FLATSQL_E_ARG;
     }
-    if (c->writeSlots == 0 || c->readSlots == 0) { *err = "config: no slots"; return P4_E_ARG; }
+    if (c->writeSlots == 0 || c->readSlots == 0) { *err = "config: no slots"; return FLATSQL_E_ARG; }
     if (c->seqBlock < 1024) c->seqBlock = 1024;
     if (c->raStreams > 8) c->raStreams = 8;
     if (c->hardHeap < c->softHeap) c->hardHeap = c->softHeap;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // ---- markers ----------------------------------------------------------------------------
@@ -343,17 +343,17 @@ bool ioExists(const std::string& path) {
 int32_t ioReadAll(const std::string& path, std::vector<uint8_t>* out) {
     out->clear();
     const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_READ);
-    if (h < 0) return P4_E_IO;
+    if (h < 0) return FLATSQL_E_IO;
     const double sz = flatsql_io_size(h);
-    int32_t rc = P4_OK;
+    int32_t rc = FLATSQL_OK;
     if (sz < 0 || sz > double(1u << 30)) {
-        rc = P4_E_IO;
+        rc = FLATSQL_E_IO;
     } else {
         out->resize(size_t(sz));
         size_t got = 0;
         while (got < out->size()) {
             const int32_t n = flatsql_io_read(h, out->data() + got, int32_t(out->size() - got), double(got));
-            if (n <= 0) { rc = P4_E_IO; break; }
+            if (n <= 0) { rc = FLATSQL_E_IO; break; }
             got += size_t(n);
         }
     }
@@ -366,10 +366,10 @@ int32_t writeAt(int32_t h, const uint8_t* p, size_t n, double off) {
     size_t done = 0;
     while (done < n) {
         const int32_t w = flatsql_io_write(h, p + done, int32_t(n - done), off + double(done));
-        if (w <= 0) return w == FLATSQL_IO_ERR_NOSPACE ? P4_E_NOSPACE : P4_E_IO;
+        if (w <= 0) return w == FLATSQL_IO_ERR_NOSPACE ? FLATSQL_E_NOSPACE : FLATSQL_E_IO;
         done += size_t(w);
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 }  // namespace
 
@@ -377,9 +377,9 @@ int32_t ioWriteNew(const std::string& path, const uint8_t* p, size_t n) {
     const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()),
                                       FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE | FLATSQL_IO_TRUNC |
                                           FLATSQL_IO_CREATE_PARENTS);
-    if (h < 0) return h == FLATSQL_IO_ERR_NOSPACE ? P4_E_NOSPACE : P4_E_IO;
+    if (h < 0) return h == FLATSQL_IO_ERR_NOSPACE ? FLATSQL_E_NOSPACE : FLATSQL_E_IO;
     int32_t rc = writeAt(h, p, n, 0);
-    if (rc == P4_OK && flatsql_io_sync(h) < 0) rc = P4_E_IO;
+    if (rc == FLATSQL_OK && flatsql_io_sync(h) < 0) rc = FLATSQL_E_IO;
     flatsql_io_close(h);
     return rc;
 }
@@ -387,17 +387,17 @@ int32_t ioWriteNew(const std::string& path, const uint8_t* p, size_t n) {
 int32_t ioAppend(const std::string& path, const uint8_t* p, size_t n) {
     const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()),
                                       FLATSQL_IO_READ | FLATSQL_IO_WRITE | FLATSQL_IO_CREATE | FLATSQL_IO_CREATE_PARENTS);
-    if (h < 0) return h == FLATSQL_IO_ERR_NOSPACE ? P4_E_NOSPACE : P4_E_IO;
+    if (h < 0) return h == FLATSQL_IO_ERR_NOSPACE ? FLATSQL_E_NOSPACE : FLATSQL_E_IO;
     const double sz = flatsql_io_size(h);
-    int32_t rc = sz < 0 ? P4_E_IO : writeAt(h, p, n, sz);
-    if (rc == P4_OK && flatsql_io_sync(h) < 0) rc = P4_E_IO;
+    int32_t rc = sz < 0 ? FLATSQL_E_IO : writeAt(h, p, n, sz);
+    if (rc == FLATSQL_OK && flatsql_io_sync(h) < 0) rc = FLATSQL_E_IO;
     flatsql_io_close(h);
     return rc;
 }
 
 int32_t ioUnlink(const std::string& path) {
     const int32_t rc = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_UNLINK);
-    return rc >= 0 || rc == FLATSQL_IO_ERR_NOENT ? P4_OK : P4_E_IO;
+    return rc >= 0 || rc == FLATSQL_IO_ERR_NOENT ? FLATSQL_OK : FLATSQL_E_IO;
 }
 
 int64_t ioSize(const std::string& path) {
@@ -561,18 +561,18 @@ int32_t statusOfSqlite(int rc) {
     switch (rc & 0xff) {
         case SQLITE_OK:
         case SQLITE_ROW:
-        case SQLITE_DONE: return P4_OK;
-        case SQLITE_NOMEM: return P4_E_NOMEM;
-        case SQLITE_FULL: return P4_E_NOSPACE;
+        case SQLITE_DONE: return FLATSQL_OK;
+        case SQLITE_NOMEM: return FLATSQL_E_NOMEM;
+        case SQLITE_FULL: return FLATSQL_E_NOSPACE;
         case SQLITE_CORRUPT:
-        case SQLITE_NOTADB: return P4_E_CORRUPT;
+        case SQLITE_NOTADB: return FLATSQL_E_CORRUPT;
         case SQLITE_BUSY:
-        case SQLITE_LOCKED: return P4_E_IO;  // never a miss (M9)
-        case SQLITE_INTERRUPT: return P4_E_CANCELLED;
+        case SQLITE_LOCKED: return FLATSQL_E_IO;  // never a miss (M9)
+        case SQLITE_INTERRUPT: return FLATSQL_E_CANCELLED;
         case SQLITE_CANTOPEN:
         case SQLITE_IOERR:
-        case SQLITE_PERM: return P4_E_IO;
-        default: return P4_E_INTERNAL;
+        case SQLITE_PERM: return FLATSQL_E_IO;
+        default: return FLATSQL_E_INTERNAL;
     }
 }
 

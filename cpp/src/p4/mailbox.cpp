@@ -1,10 +1,11 @@
+#include "flatsql/query_page.h"
 // Store format 4: the mailbox (CONTRACT §3.4) and the service threads.
 //
 // Slots live in two pools (write: a large request area; read: a small one).
 // The host claims a FREE slot, writes the request TLV, stores QUEUED, pushes
 // the slot index on its class's Vyukov MPMC queue and rings a thread's
 // doorbell. Writer threads route write slots to the owner of the partition
-// (its backlog, bounded by a record credit: full = P4_E_BUSY, nothing done);
+// (its backlog, bounded by a record credit: full = FLATSQL_E_BUSY, nothing done);
 // lanes run read ops and SQL; the maintenance thread runs QUOTA_GC, REBUILD,
 // flushes, checkpoints, closes and unlinks. Output streams through the slot's
 // ring; a full ring makes the producer wait on its own doorbell (1 ms) without
@@ -83,7 +84,7 @@ int32_t mailboxInit(Engine* e, std::string* err) {
     e->reqBytes[1] = c.readReqBytes;
     e->ringBytes[0] = e->ringBytes[1] = c.ringBytes;
     for (int p = 0; p < 2; p++)
-        e->slotStride[p] = uint32_t(align64(size_t(FLATSQL_P4_SLOT_HEADER) + e->reqBytes[p] + e->ringBytes[p]));
+        e->slotStride[p] = uint32_t(align64(size_t(FLATSQL_SLOT_HEADER) + e->reqBytes[p] + e->ringBytes[p]));
     // classes: 1 write, 2 interactive, 3 bulk, 4 sandbox, 5 maintenance
     const uint32_t per[6] = {0, c.writers, c.interactive, c.bulk, c.sandbox, 1};
     uint32_t at = 0;
@@ -105,12 +106,12 @@ int32_t mailboxInit(Engine* e, std::string* err) {
     bytes += size_t(e->nSlots[0]) * e->slotStride[0] + size_t(e->nSlots[1]) * e->slotStride[1];
     if (bytes > e->cfg.engineBytes) {
         *err = "mailbox: the slots need more than the engine bytes (tag 20)";
-        return P4_E_ARG;
+        return FLATSQL_E_ARG;
     }
     uint8_t* raw = static_cast<uint8_t*>(std::calloc(1, bytes + 64));
     if (!raw) {
         *err = "mailbox: out of memory";
-        return P4_E_NOMEM;
+        return FLATSQL_E_NOMEM;
     }
     e->mem = raw;
     e->memBytes = bytes + 64;
@@ -143,7 +144,7 @@ int32_t mailboxInit(Engine* e, std::string* err) {
     e->slotBase[1] = e->slotBase[0] + size_t(e->nSlots[0]) * e->slotStride[0];
     for (uint32_t i = 0; i < e->nSlots[0] + e->nSlots[1]; i++) {
         SlotHeader* h = new (e->slot(i)) SlotHeader();
-        h->state.store(P4_SLOT_FREE);
+        h->state.store(FLATSQL_SLOT_FREE);
         h->cancel.store(0);
         h->outSeq.store(0);
         h->spaceSeq.store(0);
@@ -151,15 +152,15 @@ int32_t mailboxInit(Engine* e, std::string* err) {
         h->ringTail.store(0);
     }
     for (uint32_t w = 0; w < c.writers; w++) e->writers.push_back(std::make_unique<WriterState>());
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
-void mailboxLayout(Engine* e, FlatsqlP4Layout* out) {
+void mailboxLayout(Engine* e, FlatSQLLayout* out) {
     std::memset(out, 0, sizeof *out);
     auto addr = [](const void* p) { return uint32_t(uintptr_t(p)); };
-    out->version = FLATSQL_P4_LAYOUT_VERSION;
-    out->size = sizeof(FlatsqlP4Layout);
-    out->headerSize = FLATSQL_P4_SLOT_HEADER;
+    out->version = FLATSQL_LAYOUT_VERSION;
+    out->size = sizeof(FlatSQLLayout);
+    out->headerSize = FLATSQL_SLOT_HEADER;
     out->stopWord = addr(e->stopWord);
     for (int p = 0; p < 2; p++) {
         out->nSlots[p] = e->nSlots[p];
@@ -205,14 +206,14 @@ int32_t ringWrite(Engine* e, uint32_t slot, uint32_t thread, const uint8_t* p, s
     uint8_t* ring = e->slotRing(slot);
     const uint64_t cap = e->ringBytes[e->poolOf(slot)];
     while (n > 0) {
-        if (honourCancel && h->cancel.load(std::memory_order_acquire)) return P4_E_CANCELLED;
+        if (honourCancel && h->cancel.load(std::memory_order_acquire)) return FLATSQL_E_CANCELLED;
         const uint64_t head = h->ringHead.load(std::memory_order_acquire);
         const uint64_t tail = h->ringTail.load(std::memory_order_relaxed);
         const uint64_t space = cap - (tail - head);
         if (space == 0) {
             if (e->stopWord->load(std::memory_order_acquire) && e->stopping.load()) {
                 // The host stopped reading: give up rather than hang the stop.
-                return P4_E_STOPPED;
+                return FLATSQL_E_STOPPED;
             }
             Bell& b = e->bells[thread < e->nThreads ? thread : 0];
             const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
@@ -231,7 +232,7 @@ int32_t ringWrite(Engine* e, uint32_t slot, uint32_t thread, const uint8_t* p, s
         p += k;
         n -= k;
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 }  // namespace
 
@@ -240,12 +241,12 @@ int32_t emitBytes(P4Lane* L, const uint8_t* p, size_t n) {
     // The result-bytes cap: the first chunk (it carries the RB1 header) always
     // goes, so a capped stream stays header, blocks, RB1E.
     if (L->maxResultBytes && L->outBytes > 0 && L->outBytes + n > L->maxResultBytes) {
-        L->trip = P4_E_BUDGET;
-        return P4_E_BUDGET;
+        L->trip = FLATSQL_E_BUDGET;
+        return FLATSQL_E_BUDGET;
     }
     L->outBytes += n;
     const int32_t rc = ringWrite(L->e, L->slot, L->thread, p, n, true);
-    if (rc != P4_OK) L->trip = rc;
+    if (rc != FLATSQL_OK) L->trip = rc;
     return rc;
 }
 
@@ -259,7 +260,7 @@ int32_t flushOut(P4Lane* L) {
 // The op's last bytes (the RB1E, and the header of an op that never ran):
 // written whatever tripped, cancel and caps included.
 int32_t flushFinal(P4Lane* L) {
-    if (L->out.empty()) return P4_OK;
+    if (L->out.empty()) return FLATSQL_OK;
     L->outBytes += L->out.size();
     const int32_t rc = ringWrite(L->e, L->slot, L->thread, L->out.data(), L->out.size(), false);
     L->out.clear();
@@ -275,7 +276,7 @@ void slotDone(Engine* e, uint32_t slot, int32_t status, const std::string& err, 
     h->errLen = uint32_t(n);
     h->rowsOut = rows;
     h->endNs = monoNs();
-    h->state.store(P4_SLOT_DONE, std::memory_order_release);
+    h->state.store(FLATSQL_SLOT_DONE, std::memory_order_release);
     h->outSeq.fetch_add(1, std::memory_order_release);
     ps::wakeU32(&h->outSeq, -1);
 }
@@ -289,15 +290,15 @@ void slotDoneLane(P4Lane* L, int32_t status, const std::string& err) {
 
 void respondEmpty(P4Lane* L, const std::vector<std::string>& cols, int32_t status, const std::string& err) {
     L->out.clear();
-    ps::rb1::Encoder enc(&L->out);
+    query::Encoder enc(&L->out);
     enc.header(cols);
-    enc.end(status, 0, L->rowsExamined, L->bytesRead);
+    enc.end(status, 0, L->rowsExamined, L->bytesRead, err);
     flushFinal(L);
     slotDoneLane(L, status, err);
 }
 
 int32_t SlotOut::flush() {
-    if (buf.empty()) return P4_OK;
+    if (buf.empty()) return FLATSQL_OK;
     const int32_t rc = ringWrite(e, slot, tThread, buf.data(), buf.size(), false);
     buf.clear();
     return rc;
@@ -328,11 +329,11 @@ const std::vector<std::string>& colsOfWrite(uint32_t op) {
     static const std::vector<std::string> reb = {"type", "entries", "mismatches"};
     static const std::vector<std::string> none = {};
     switch (op) {
-        case P4_OPC_PUT: return put;
-        case P4_OPC_SUPERSEDE: return sup;
-        case P4_OPC_DELETE: return del;
-        case P4_OPC_QUOTA_GC: return quota;
-        case P4_OPC_REBUILD: return reb;
+        case FLATSQL_OPC_PUT: return put;
+        case FLATSQL_OPC_SUPERSEDE: return sup;
+        case FLATSQL_OPC_DELETE: return del;
+        case FLATSQL_OPC_QUOTA_GC: return quota;
+        case FLATSQL_OPC_REBUILD: return reb;
         default: return none;
     }
 }
@@ -357,27 +358,27 @@ namespace {
 
 void routeWrite(Engine* e, uint32_t wi, uint32_t slot) {
     SlotHeader* h = e->slot(slot);
-    uint32_t expect = P4_SLOT_QUEUED;
+    uint32_t expect = FLATSQL_SLOT_QUEUED;
     if (h->cancel.load(std::memory_order_acquire)) {
-        if (h->state.compare_exchange_strong(expect, P4_SLOT_RUNNING)) {
+        if (h->state.compare_exchange_strong(expect, FLATSQL_SLOT_RUNNING)) {
             h->thread = tThread;
-            doneStatus(e, slot, colsOfWrite(h->op), P4_E_CANCELLED, "cancelled");
+            doneStatus(e, slot, colsOfWrite(h->op), FLATSQL_E_CANCELLED, "cancelled");
         }
         return;
     }
-    if (!h->state.compare_exchange_strong(expect, P4_SLOT_RUNNING)) return;
+    if (!h->state.compare_exchange_strong(expect, FLATSQL_SLOT_RUNNING)) return;
     h->startNs = monoNs();
     h->thread = tThread;
     const uint32_t op = h->op;
-    if (e->poolOf(slot) != 0 || h->cls != P4_CLASS_WRITE) {
-        doneStatus(e, slot, colsOfWrite(op), P4_E_ARG, "write ops use the write pool and class 1");
+    if (e->poolOf(slot) != 0 || h->cls != FLATSQL_CLASS_WRITE) {
+        doneStatus(e, slot, colsOfWrite(op), FLATSQL_E_ARG, "write ops use the write pool and class 1");
         return;
     }
     if (e->stopping.load()) {
-        doneStatus(e, slot, colsOfWrite(op), P4_E_STOPPED, "stopping");
+        doneStatus(e, slot, colsOfWrite(op), FLATSQL_E_STOPPED, "stopping");
         return;
     }
-    if (op == P4_OPC_QUOTA_GC || op == P4_OPC_REBUILD) {
+    if (op == FLATSQL_OPC_QUOTA_GC || op == FLATSQL_OPC_REBUILD) {
         {
             std::lock_guard<std::mutex> g(e->maintMu);
             MaintTask mt;
@@ -390,28 +391,28 @@ void routeWrite(Engine* e, uint32_t wi, uint32_t slot) {
     }
     std::vector<Tlv> v;
     if (h->reqLen > e->reqBytes[0] || !tlvParse(e->slotReq(slot), h->reqLen, &v)) {
-        doneStatus(e, slot, colsOfWrite(op), P4_E_ARG, "malformed request");
+        doneStatus(e, slot, colsOfWrite(op), FLATSQL_E_ARG, "malformed request");
         return;
     }
     std::string typeName;
     tlvText(v, 1, &typeName);
     Type* t = e->findType(typeName);
-    if (op != P4_OPC_PUT && op != P4_OPC_SUPERSEDE && op != P4_OPC_DELETE) {
-        doneStatus(e, slot, colsOfWrite(op), P4_E_ARG, "not a write op");
+    if (op != FLATSQL_OPC_PUT && op != FLATSQL_OPC_SUPERSEDE && op != FLATSQL_OPC_DELETE) {
+        doneStatus(e, slot, colsOfWrite(op), FLATSQL_E_ARG, "not a write op");
         return;
     }
     if (!t) {
-        doneStatus(e, slot, colsOfWrite(op), P4_E_NOTYPE, "type not registered: " + typeName);
+        doneStatus(e, slot, colsOfWrite(op), FLATSQL_E_NOTYPE, "type not registered: " + typeName);
         return;
     }
     uint64_t records = 0;
     uint8_t mode = 0;
-    if (op == P4_OPC_PUT) {
+    if (op == FLATSQL_OPC_PUT) {
         bool bad = false;
         tlvU8(v, 52, &mode, &bad);
         const Tlv* recs = tlvFind(v, 53);
         if (bad || !recs || recs->n < 4) {
-            doneStatus(e, slot, colsOfWrite(op), P4_E_ARG, "PUT needs records (tag 53)");
+            doneStatus(e, slot, colsOfWrite(op), FLATSQL_E_ARG, "PUT needs records (tag 53)");
             return;
         }
         bool over;
@@ -420,7 +421,7 @@ void routeWrite(Engine* e, uint32_t wi, uint32_t slot) {
             over = t->overQuota;
         }
         if (over) {
-            doneStatus(e, slot, colsOfWrite(op), P4_E_NOSPACE, "over quota");
+            doneStatus(e, slot, colsOfWrite(op), FLATSQL_E_NOSPACE, "over quota");
             return;
         }
         records = ld32(recs->v);
@@ -437,13 +438,13 @@ void routeWrite(Engine* e, uint32_t wi, uint32_t slot) {
         if (why) {
             e->bump(kStBusy);
             e->kickMaintenance();
-            doneStatus(e, slot, colsOfWrite(op), P4_E_BUSY, why);
+            doneStatus(e, slot, colsOfWrite(op), FLATSQL_E_BUSY, why);
             return;
         }
     }
     WriteTask* wt = new (std::nothrow) WriteTask();
     if (!wt) {
-        doneStatus(e, slot, colsOfWrite(op), P4_E_NOMEM, "out of memory");
+        doneStatus(e, slot, colsOfWrite(op), FLATSQL_E_NOMEM, "out of memory");
         return;
     }
     wt->slot = slot;
@@ -469,13 +470,13 @@ bool takeGroup(Engine* e, uint32_t wi, Type** tp, std::vector<WriteTask*>* out) 
         WriteTask* first = t->backlog.front();
         do {
             WriteTask* wt = t->backlog.front();
-            if (!out->empty() && (wt->op != P4_OPC_PUT || first->op != P4_OPC_PUT || wt->mode != first->mode)) break;
+            if (!out->empty() && (wt->op != FLATSQL_OPC_PUT || first->op != FLATSQL_OPC_PUT || wt->mode != first->mode)) break;
             if (!out->empty() && recs + wt->records > e->cfg.groupRecords) break;
             t->backlog.pop_front();
             t->backlogRecords -= wt->records;
             recs += wt->records;
             out->push_back(wt);
-        } while (!t->backlog.empty() && first->op == P4_OPC_PUT);
+        } while (!t->backlog.empty() && first->op == FLATSQL_OPC_PUT);
         if (!t->backlog.empty()) {
             t->ready = true;
             ws.ready.push_back(t);
@@ -507,7 +508,7 @@ void collect(WriterState& ws, bool block) {
             std::unique_lock<std::mutex> g(ws.imu);
             ws.dcv.wait(g, [&] { return p->done.load(std::memory_order_acquire); });
         }
-        if (p->status != P4_OK) {
+        if (p->status != FLATSQL_OK) {
             ws.failing = true;
             return;
         }
@@ -525,10 +526,10 @@ void recover(WriterState& ws) {
         ws.dcv.wait(g, [&] { return u->done.load(std::memory_order_acquire); });
     }
     for (auto& u : ws.pending)
-        if (u->status != P4_OK) u->resetStreams();
+        if (u->status != FLATSQL_OK) u->resetStreams();
     ws.pending.clear();
     std::lock_guard<std::mutex> g(ws.imu);
-    ws.poison = P4_OK;
+    ws.poison = FLATSQL_OK;
     ws.failing = false;
 }
 
@@ -616,7 +617,7 @@ void indexerLoop(Engine* e, uint32_t wi) {
         }
         int32_t rc = poison;
         std::string why = "an earlier write on this writer failed before this one could commit: nothing stored";
-        if (rc == P4_OK) {
+        if (rc == FLATSQL_OK) {
             std::vector<WriteCtx*> ctxs;
             for (PutUnit* u : round)
                 if (WriteCtx* w = u->applyCtx()) ctxs.push_back(w);
@@ -628,11 +629,11 @@ void indexerLoop(Engine* e, uint32_t wi) {
         }
         {
             std::lock_guard<std::mutex> g(ws.imu);
-            if (rc != P4_OK && ws.poison == P4_OK) ws.poison = rc;
+            if (rc != FLATSQL_OK && ws.poison == FLATSQL_OK) ws.poison = rc;
             for (PutUnit* u : round) u->done.store(true, std::memory_order_release);
         }
         ws.dcv.notify_all();
-        if (rc == P4_OK) mergeStep(e, wi);
+        if (rc == FLATSQL_OK) mergeStep(e, wi);
     }
 }
 
@@ -657,7 +658,7 @@ void writerLoop(Engine* e, uint32_t wi) {
             const int op = tasks[0]->op;
             for (WriteTask* wt : tasks)
                 if (!wt->internal) e->slot(wt->slot)->thread = tThread;
-            if (op == P4_OPC_PUT && !tasks[0]->internal) {
+            if (op == FLATSQL_OPC_PUT && !tasks[0]->internal) {
                 runPut(e, wi, t, tasks);
             } else {
                 // Everything else reads and writes the index files itself:
@@ -665,12 +666,12 @@ void writerLoop(Engine* e, uint32_t wi) {
                 drain(ws);
                 if (tasks[0]->internal) {
                     Internal* in = tasks[0]->internal;
-                    if (op == P4_OPC_QUOTA_GC) quotaWork(e, t, in);
+                    if (op == FLATSQL_OPC_QUOTA_GC) quotaWork(e, t, in);
                     else if (op == kOpCompact) compactWork(e, t, in);
                     else if (op == kOpCarExport || op == kOpCarRestore) carWork(t, op, in);
                     else rebuildWork(e, t, in);
                     in->done.store(true, std::memory_order_release);
-                } else if (op == P4_OPC_SUPERSEDE) {
+                } else if (op == FLATSQL_OPC_SUPERSEDE) {
                     supersedeOp(e, t, tasks[0]);
                 } else {
                     deleteOp(e, t, tasks[0]);
@@ -727,79 +728,95 @@ void runSlot(P4Lane* L, uint32_t slot) {
     L->trip = 0;
     L->err.clear();
     L->out.clear();
-    uint32_t expect = P4_SLOT_QUEUED;
+    uint32_t expect = FLATSQL_SLOT_QUEUED;
     if (h->cancel.load(std::memory_order_acquire)) {
-        if (h->state.compare_exchange_strong(expect, P4_SLOT_RUNNING)) {
+        if (h->state.compare_exchange_strong(expect, FLATSQL_SLOT_RUNNING)) {
             h->thread = L->thread;
-            respondEmpty(L, {}, P4_E_CANCELLED, "cancelled");
+            respondEmpty(L, {}, FLATSQL_E_CANCELLED, "cancelled");
         }
         return;
     }
-    if (!h->state.compare_exchange_strong(expect, P4_SLOT_RUNNING)) return;
+    if (!h->state.compare_exchange_strong(expect, FLATSQL_SLOT_RUNNING)) return;
     h->startNs = monoNs();
     h->thread = L->thread;
-    const bool sandbox = L->cls == P4_CLASS_SANDBOX || (h->flags & P4_SLOT_SANDBOX);
+    const bool sandbox = L->cls == FLATSQL_CLASS_SANDBOX || (h->flags & FLATSQL_SLOT_SANDBOX);
     L->maxRows = h->maxRowsExamined ? h->maxRowsExamined : (sandbox ? e->cfg.sandboxRows : 0);
     L->maxBytes = h->maxBytesRead ? h->maxBytesRead : (sandbox ? e->cfg.sandboxBytes : 0);
+    L->deadlineNs = 0;
     L->maxResultRows = h->maxResultRows;
     L->maxResultBytes = h->maxResultBytes;
     L->heapCap = e->cfg.sandboxHeap;
     if (e->poolOf(slot) != 1 || h->cls != L->cls || h->reqLen > e->reqBytes[1]) {
-        respondEmpty(L, {}, P4_E_ARG, "read ops use the read pool and the lane's class");
+        respondEmpty(L, {}, FLATSQL_E_ARG, "read ops use the read pool and the lane's class");
         return;
     }
     if (e->stopping.load()) {
-        respondEmpty(L, {}, P4_E_STOPPED, "stopping");
+        respondEmpty(L, {}, FLATSQL_E_STOPPED, "stopping");
         return;
     }
     const uint32_t op = h->op;
     int32_t status;
-    if (op >= P4_OPC_GET && op <= P4_OPC_RELEASE) {
+    if (op >= FLATSQL_OPC_GET && op <= FLATSQL_OPC_RELEASE) {
         status = runRead(L, op);
         (void)status;
         return;  // runRead finishes the slot
     }
-    if (op == P4_OPC_SQL || op == P4_OPC_SURFACE) {
+    if (op == FLATSQL_OPC_SQL || op == FLATSQL_OPC_SURFACE) {
         e->bump(kStSqlStatements);
-        if (op == P4_OPC_SQL) {
-            std::vector<Tlv> v;
-            if (!tlvParse(L->req, L->reqLen, &v)) {
-                respondEmpty(L, {}, P4_E_ARG, "malformed request");
+        if (op == FLATSQL_OPC_SQL) {
+            const uint8_t* data = L->req;
+            size_t size = L->reqLen;
+            if (size >= 12 && flatbuffers::ReadScalar<uint32_t>(data) == size - 4 &&
+                !std::memcmp(data + 8, "$QRP", 4)) { data += 4; size -= 4; }
+            flatbuffers::Verifier verifier(data, size, 64, 1000000, false);
+            if (size < 8 || !VerifyQRPBuffer(verifier)) {
+                respondEmpty(L, {}, FLATSQL_E_ARG, "SQL requires an SDS QRP request");
                 return;
             }
-            const Tlv* sql = tlvFind(v, 70);
-            const Tlv* params = tlvFind(v, 71);
+            const auto* q = GetQRP(data);
+            if (q->KIND() != qrpKind_Request || q->REPRESENTATION() < qrpRepresentation_Default ||
+                q->REPRESENTATION() > qrpRepresentation_FlatBuffer || !q->SQL() || q->SQL()->size() == 0 ||
+                q->SEARCH() || q->FILTERS() || q->SORT_FIELD() || q->PROVIDER_ID() || q->SOURCE_NAME() ||
+                q->BATCH_ID() || q->PRODUCER_PEER_ID() || q->ORIGIN_ID() || q->FROM_EPOCH_MS() ||
+                q->TO_EPOCH_MS() || q->PAGE() || q->CURSOR() || q->TIME_PROFILE() != qrpTimeProfile_Unspecified) {
+                respondEmpty(L, {}, FLATSQL_E_ARG, "Use SQL and typed PARAMETERS; unsupported QRP selection or representation");
+                return;
+            }
+            auto limit = [](uint64_t a, uint64_t b) { return a && b ? std::min(a, b) : a ? a : b; };
+            L->maxResultRows = limit(L->maxResultRows, limit(q->MAX_ROWS(), q->LIMIT()));
+            L->maxResultBytes = limit(L->maxResultBytes, q->MAX_BYTES());
+            if (q->MAX_ELAPSED_MS()) L->deadlineNs = monoNs() + uint64_t(q->MAX_ELAPSED_MS()) * 1000000;
             P4SqlRequest req{};
-            req.sql = sql ? reinterpret_cast<const char*>(sql->v) : "";
-            req.sqlLen = sql ? sql->n : 0;
-            req.params = params ? params->v : nullptr;
-            req.paramsLen = params ? params->n : 0;
-            req.flags = h->flags & (P4_SLOT_RAW | P4_SLOT_SANDBOX);
-            req.maxResultRows = h->maxResultRows;
-            req.maxResultBytes = h->maxResultBytes;
+            req.sql = q->SQL()->c_str();
+            req.sqlLen = q->SQL()->size();
+            req.params = data;
+            req.paramsLen = uint32_t(size);
+            req.flags = h->flags & (FLATSQL_SLOT_RAW | FLATSQL_SLOT_SANDBOX);
+            req.maxResultRows = L->maxResultRows;
+            req.maxResultBytes = L->maxResultBytes;
             status = p4sql_exec(L, &req);
         } else {
             status = p4sql_surface(L);
         }
-        if (status == P4_E_UNSUPPORTED && L->outBytes == 0 && L->out.empty()) {
+        if (status == FLATSQL_E_UNSUPPORTED && L->outBytes == 0 && L->out.empty()) {
             respondEmpty(L, {}, status, L->err.empty() ? "the SQL surface is not in this build" : L->err);
             return;
         }
-        if (status == P4_E_BUDGET) e->bump(kStSqlBudgetTrips);
+        if (status == FLATSQL_E_BUDGET) e->bump(kStSqlBudgetTrips);
         // C-28: in RB1 mode the engine ends the stream, tripped or not, with
         // the returned status, the slot's counters and C-29's rows (a stream
         // that never started gets an empty header first). RAW is unchanged.
-        if (!(h->flags & P4_SLOT_RAW)) {
+        if (!(h->flags & FLATSQL_SLOT_RAW)) {
             const bool started = L->outBytes > 0 || !L->out.empty();
-            ps::rb1::Encoder enc(&L->out);
+            query::Encoder enc(&L->out);
             if (!started) enc.header({});
-            enc.end(status, L->rowsOut, L->rowsExamined, L->bytesRead);
+            enc.end(status, L->rowsOut, L->rowsExamined, L->bytesRead, L->err);
         }
         flushFinal(L);
-        slotDoneLane(L, status, !L->err.empty() ? L->err : status == P4_OK ? std::string() : std::string("SQL op failed"));
+        slotDoneLane(L, status, !L->err.empty() ? L->err : status == FLATSQL_OK ? std::string() : std::string("SQL op failed"));
         return;
     }
-    respondEmpty(L, {}, P4_E_ARG, "unknown op");
+    respondEmpty(L, {}, FLATSQL_E_ARG, "unknown op");
 }
 
 void laneLoop(Engine* e, uint32_t ti, uint32_t cls) {
@@ -831,7 +848,7 @@ void laneLoop(Engine* e, uint32_t ti, uint32_t cls) {
 }  // namespace
 
 int32_t startThreads(Engine* e) {
-    if (e->started) return P4_E_ARG;
+    if (e->started) return FLATSQL_E_ARG;
     // Each writer's indexer first (a writer hands it units from its start).
     for (uint32_t w = 0; w < e->writers.size(); w++) {
         e->writers[w]->istop = false;
@@ -839,8 +856,8 @@ int32_t startThreads(Engine* e) {
     }
     for (uint32_t i = 0; i < e->nThreads; i++) {
         const uint32_t cls = e->threadClass[i];
-        if (cls == P4_CLASS_WRITE) e->threads.emplace_back(writerLoop, e, i - e->firstOfClass[1]);
-        else if (cls == P4_CLASS_MAINTENANCE) e->threads.emplace_back(maintenanceLoop, e, i);
+        if (cls == FLATSQL_CLASS_WRITE) e->threads.emplace_back(writerLoop, e, i - e->firstOfClass[1]);
+        else if (cls == FLATSQL_CLASS_MAINTENANCE) e->threads.emplace_back(maintenanceLoop, e, i);
         else e->threads.emplace_back(laneLoop, e, i, cls);
     }
     e->slowThread = std::thread(slowLoop, e);
@@ -869,7 +886,7 @@ int32_t engineStop(Engine* e, double deadlineMs) {
             bool all = true;
             for (uint32_t i = 0; i < e->nThreads; i++) all = all && e->bells[i].state.load() == 2;
             if (all) break;
-            if (deadlineMs > 0 && monoNs() >= until) return P4_E_BUSY;
+            if (deadlineMs > 0 && monoNs() >= until) return FLATSQL_E_BUSY;
             for (uint32_t i = 0; i < e->nThreads; i++) e->wake(i);
             ps::sleepNs(1000000);
         }
@@ -883,8 +900,8 @@ int32_t engineStop(Engine* e, double deadlineMs) {
         uint32_t slot;
         while (e->queues[k].pop(&slot)) {
             SlotHeader* h = e->slot(slot);
-            uint32_t expect = P4_SLOT_QUEUED;
-            if (h->state.compare_exchange_strong(expect, P4_SLOT_RUNNING)) slotDone(e, slot, P4_E_STOPPED, "stopping", 0);
+            uint32_t expect = FLATSQL_SLOT_QUEUED;
+            if (h->state.compare_exchange_strong(expect, FLATSQL_SLOT_RUNNING)) slotDone(e, slot, FLATSQL_E_STOPPED, "stopping", 0);
         }
     }
     std::vector<Type*> types;
@@ -892,12 +909,12 @@ int32_t engineStop(Engine* e, double deadlineMs) {
         std::lock_guard<std::mutex> g(e->typesMu);
         for (auto& t : e->types) types.push_back(t.get());
     }
-    int32_t checkpointStatus = P4_OK;
+    int32_t checkpointStatus = FLATSQL_OK;
     for (Type* t : types) {
         if (!t->hasFiles.load(std::memory_order_acquire)) continue; // stop is idempotent, including after a crash
         std::vector<Feed*> feeds;
         { std::lock_guard<std::mutex> g(t->mu); for (auto& f : t->feeds) if (f->created && !f->quarantined) feeds.push_back(f.get()); }
-        for (Feed* f : feeds) { std::string err; const int32_t rc = checkpointFeed(f, true, &err); if (checkpointStatus == P4_OK && rc != P4_OK) checkpointStatus = rc; }
+        for (Feed* f : feeds) { std::string err; const int32_t rc = checkpointFeed(f, true, &err); if (checkpointStatus == FLATSQL_OK && rc != FLATSQL_OK) checkpointStatus = rc; }
         { std::lock_guard<std::mutex> g(t->mu); for (auto& f : t->feeds) f->checkpointPlan.reset(); }  // unused plans pin their streams
     }
     // Close every writer connection with a TRUNCATE checkpoint.

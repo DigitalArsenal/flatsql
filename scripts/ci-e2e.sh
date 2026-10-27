@@ -26,11 +26,11 @@ run() {
   return "$status"
 }
 
-run typescript-build npm run build
+run package-build npm run build
+run public-types npm run check:types
+run packaged-binary-cli-persistence-and-geo npm run check:package
 run artifact-imports npm run check:imports
 run artifact-integrity npm run check:integrity
-run binary-query-and-geo node scripts/ci-package-e2e.mjs
-run binary-persistence node wasm/test-io-persistence.mjs
 
 if [[ "$mode" != --wasm-only ]]; then
   : "${FLATBUFFERS_DIR:?Set FLATBUFFERS_DIR to the pinned FlatBuffers checkout}"
@@ -38,7 +38,7 @@ if [[ "$mode" != --wasm-only ]]; then
   build="${FLATSQL_CI_BUILD_DIR:-cpp/build-ci-e2e}"
   run native-configure cmake -S cpp -B "$build" -DCMAKE_BUILD_TYPE=Release "-DFLATBUFFERS_DIR=$FLATBUFFERS_DIR"
   run native-build cmake --build "$build" --target flatsql_p4_test --parallel "${FLATSQL_BUILD_JOBS:-4}"
-  for flow in t_sql_surface t_kill_check_compaction; do
+  for flow in t_gjn_binary_query_reopen t_sql_surface t_kill_check_compaction; do
     run "$flow" "$build/flatsql_p4_test" "--test=$flow"
     # The test harness permits an unmatched filter; an empty run is not evidence.
     grep -q '^1 tests, 0 failures$' "$results/$flow.log"

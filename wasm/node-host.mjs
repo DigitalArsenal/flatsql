@@ -1,0 +1,457 @@
+// Generic Node WASI threads host. Query, geometry, indexing and record hashing
+// run in the guest. Only the required SDK filesystem adapter is bundled.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
+
+import { createNodeSyncFsIoTable } from "space-data-module-sdk/host/flatsql-io/node";
+
+import {
+  CONTROL_EXITED,
+  CONTROL_EXIT_CODE,
+  CONTROL_FAULT,
+  CONTROL_FAULT_TID,
+  CONTROL_HEADER,
+  CONTROL_SLOT,
+  CONTROL_STARTED,
+  CONTROL_TIDS,
+  POOL_CREATED,
+  POOL_DECLINED,
+  POOL_MAX_RUNNING,
+  POOL_RUNNING,
+  POOL_SPAWNED,
+  POOL_WANT,
+  createControlBlock,
+  createThreadPool,
+  createWasiFdTable,
+} from "./node-imports.mjs";
+
+const GUEST_URL = new URL("./node-guest.mjs", import.meta.url);
+
+/** The shared memory limits a module imports (env.memory), in pages. */
+export function importedMemoryLimits(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let at = 8;
+  const leb = () => {
+    let result = 0;
+    let shift = 0;
+    for (;;) {
+      const b = u8[at++];
+      result += (b & 0x7f) * 2 ** shift;
+      shift += 7;
+      if (!(b & 0x80)) return result;
+    }
+  };
+  const name = () => {
+    const n = leb();
+    const s = Buffer.from(u8.subarray(at, at + n)).toString("utf8");
+    at += n;
+    return s;
+  };
+  while (at < u8.length) {
+    const id = u8[at++];
+    const size = leb();
+    const end = at + size;
+    if (id === 2) {
+      const count = leb();
+      for (let i = 0; i < count; i += 1) {
+        const mod = name();
+        const field = name();
+        const kind = u8[at++];
+        if (kind === 0) leb();
+        else if (kind === 1) {
+          at += 1;
+          const flags = leb();
+          leb();
+          if (flags & 1) leb();
+        } else if (kind === 2) {
+          const flags = leb();
+          const initial = leb();
+          const maximum = flags & 1 ? leb() : undefined;
+          return { module: mod, name: field, initial, maximum, shared: (flags & 2) !== 0 };
+        } else if (kind === 3) {
+          at += 2;
+        } else {
+          throw new Error(`unknown import kind ${kind}`);
+        }
+      }
+      return null;
+    }
+    at = end;
+  }
+  return null;
+}
+
+// The guest's file system: `root` (a host directory) is the guest's "/" for
+// WASI and the flatsql_io root; `mounts` preopen further host directories at
+// guest paths. With no root a private temporary directory is created and
+// removed afterwards.
+function prepareRoot(options) {
+  if (options.root) {
+    fs.mkdirSync(options.root, { recursive: true });
+    return { root: path.resolve(options.root), cleanup: () => {} };
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "flatsql-node-"));
+  return {
+    root,
+    cleanup: () => {
+      if (!options.keepRoot) fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+function hostConfig(options, root) {
+  fs.mkdirSync(path.join(root, "tmp"), { recursive: true });
+  const preopens = [{ guest: "/", host: root }, ...(options.mounts ?? [])];
+  let deterministic = null;
+  if (options.deterministic) {
+    const randomState = new SharedArrayBuffer(8);
+    new BigUint64Array(randomState)[0] = BigInt(options.deterministic.randomSeed ?? 0x9e3779b97f4a7c15n) | 1n;
+    deterministic = { randomSeed: String(options.deterministic.randomSeed ?? 0), randomState };
+  }
+  return {
+    args: options.args ?? [],
+    env: { TMPDIR: "/tmp", ...(options.env ?? {}) },
+    fdTable: createWasiFdTable({ preopens }),
+    control: createControlBlock(),
+    pool: createThreadPool(options.maxThreads ?? 512),
+    spawnWaitMs: options.spawnWaitMs ?? 60000,
+    ioRoot: root,
+    ioTable: createNodeSyncFsIoTable({ maxHandles: options.maxHandles ?? 16384 }),
+    instanceId: options.instanceId ?? 0,
+    fault: options.fault?.buffer ?? null,
+    stdoutFd: options.stdoutFd,
+    stderrFd: options.stderrFd,
+    deterministic,
+  };
+}
+
+async function loadModule(source) {
+  if (source instanceof WebAssembly.Module) return { module: source, bytes: null };
+  const bytes = typeof source === "string" ? fs.readFileSync(source) : new Uint8Array(source);
+  return { module: await WebAssembly.compile(bytes), bytes };
+}
+
+function createMemory(bytes, options) {
+  const limits = importedMemoryLimits(bytes);
+  if (!limits || limits.module !== "env" || limits.name !== "memory" || !limits.shared) {
+    throw new Error("the module must import a shared env.memory");
+  }
+  const initial = Math.max(limits.initial, options.initialPages ?? 0);
+  const maximum = Math.min(limits.maximum ?? 65536, options.maximumPages ?? 65536);
+  const memory = new WebAssembly.Memory({ initial, maximum, shared: true });
+  MAXIMUM_BYTES.set(memory, maximum * 65536);
+  return memory;
+}
+
+// The byte size each memory may grow to (createMemory).
+const MAXIMUM_BYTES = new WeakMap();
+
+// V8 bounds-checks memory.fill/copy and atomics against each thread's cached
+// view of a shared memory's size, and another thread's memory.grow updates
+// that view only at this thread's next stack check. A guest thread that
+// fills a block carved from memory another thread has just grown traps
+// ("memory access out of bounds"). So the heap grows to the memory's maximum
+// before any guest thread starts, and never grows after (a partial pre-grow
+// only moves the failure). The heap stops 16 MiB short of 4 GiB: a segment
+// ending at 2^32 would wrap the guest allocator's pointer arithmetic.
+// WasmEdge (the SDN host) keeps one shared size and is not affected.
+function heapLimitBytes(memory, options) {
+  const max = MAXIMUM_BYTES.get(memory) ?? memory.buffer.byteLength;
+  const cap = options.heapBytes ?? Infinity;
+  return Math.min(max, 2 ** 32 - 16 * 2 ** 20, memory.buffer.byteLength + cap);
+}
+
+/**
+ * One guest process: its memory, its file system, its thread pool, and the
+ * workers that run it. The supervisor starts pool workers when a spawn asks
+ * for one and watches for a guest fault or exit.
+ */
+class Supervisor {
+  constructor(module, memory, cfg, options) {
+    this.module = module;
+    this.memory = memory;
+    this.cfg = cfg;
+    this.control = new Int32Array(cfg.control);
+    this.pool = new Int32Array(cfg.pool);
+    this.cap = this.pool[0];
+    this.workers = new Set();
+    this.listeners = new Set();
+    this.stopped = false;
+    this.poolErrors = [];
+    // Memory size when the first guest thread was seen running (tick): any
+    // growth after it is the precondition of the V8 stale-view trap above.
+    this.memoryAtFirstThread = 0;
+    const warm = Math.min(options.warmThreads ?? 16, this.cap);
+    for (let i = 0; i < warm; i += 1) this.startPoolWorker();
+    this.timer = setInterval(() => this.tick(), 2);
+  }
+
+  startPoolWorker() {
+    const slot = Atomics.add(this.pool, POOL_CREATED, 1);
+    if (slot >= this.cap) {
+      Atomics.sub(this.pool, POOL_CREATED, 1);
+      return;
+    }
+    const worker = new Worker(GUEST_URL, {
+      execArgv: process.execArgv.filter(arg => !arg.startsWith("--input-type")),
+      workerData: { mode: "pool", slot, wasmModule: this.module, memory: this.memory, cfg: this.cfg },
+    });
+    worker.on("error", (error) => this.poolErrors.push(String(error?.stack ?? error)));
+    worker.once("exit", () => this.workers.delete(worker));
+    this.workers.add(worker);
+  }
+
+  tick() {
+    if (this.stopped) return;
+    const want = Atomics.exchange(this.pool, POOL_WANT, 0);
+    for (let i = 0; i < want; i += 1) this.startPoolWorker();
+    if (!this.memoryAtFirstThread && Atomics.load(this.pool, POOL_SPAWNED) > 0) {
+      this.memoryAtFirstThread = this.memory.buffer.byteLength;
+    }
+    for (const listener of this.listeners) listener();
+  }
+
+  startGuest(mode) {
+    const worker = new Worker(GUEST_URL, {
+      execArgv: process.execArgv.filter(arg => !arg.startsWith("--input-type")),
+      workerData: { mode, wasmModule: this.module, memory: this.memory, cfg: this.cfg },
+    });
+    this.workers.add(worker);
+    worker.once("exit", () => this.workers.delete(worker));
+    return worker;
+  }
+
+  exited() {
+    return Atomics.load(this.control, CONTROL_EXITED) !== 0;
+  }
+
+  faulted() {
+    return Atomics.load(this.control, CONTROL_FAULT) !== 0;
+  }
+
+  report() {
+    const c = this.control;
+    const slots = Math.min(Atomics.load(c, CONTROL_SLOT), CONTROL_TIDS);
+    const tids = new Set();
+    for (let i = 0; i < slots; i += 1) tids.add(Atomics.load(c, CONTROL_HEADER + i));
+    return {
+      guestThreadsSpawned: Atomics.load(this.pool, POOL_SPAWNED),
+      // Pool threads running at once, plus the guest's own thread.
+      maxConcurrentGuestThreads: Atomics.load(this.pool, POOL_MAX_RUNNING) + 1,
+      runningGuestThreads: Atomics.load(this.pool, POOL_RUNNING),
+      spawnsDeclined: Atomics.load(this.pool, POOL_DECLINED),
+      workerThreads: Atomics.load(c, CONTROL_STARTED),
+      distinctWorkerThreadIds: tids.size,
+      memoryBytes: this.memory.buffer.byteLength,
+      // Bytes the memory grew after the first guest thread ran (sampled every
+      // 2 ms). Under V8 that growth can trap a thread (heapLimitBytes).
+      memoryGrownWhileThreadsRan: this.memoryAtFirstThread
+        ? Math.max(0, this.memory.buffer.byteLength - this.memoryAtFirstThread)
+        : 0,
+    };
+  }
+
+  async stop() {
+    this.stopped = true;
+    clearInterval(this.timer);
+    await Promise.all([...this.workers].map((w) => w.terminate().catch(() => {})));
+    this.workers.clear();
+  }
+}
+
+/**
+ * Run a wasi-threads command (the ps test commands) to completion.
+ *
+ * @param {string|Uint8Array} wasm path or bytes
+ * @param {object} [options]
+ * @param {string[]} [options.args] argv after argv[0]
+ * @param {Record<string,string>} [options.env] (TMPDIR defaults to "/tmp")
+ * @param {string} [options.root] host directory the guest sees as "/" (WASI
+ *   and flatsql_io); default a private temporary directory, removed after
+ * @param {boolean} [options.keepRoot] keep that temporary directory
+ * @param {Array<{guest:string,host:string}>} [options.mounts] more preopens
+ * @param {number} [options.maxThreads] pool cap (default 512)
+ * @param {number} [options.warmThreads] workers started up front (default 16)
+ * @param {number} [options.timeoutMs] stop the guest after this long
+ * @param {number} [options.killAfterMs] kill the guest after this long (a
+ *   crash, not a failure: the result has killed: true)
+ * @param {() => void} [options.beforeKill] runs just before a kill (the fault
+ *   overlay freezes here)
+ * @param {object} [options.fault] a fault overlay (createFaultOverlay)
+ * @param {number} [options.stdoutFd] guest stdout goes to this fd (default 1)
+ * @param {{ randomSeed?: bigint }} [options.deterministic] seeded random_get
+ * @returns {Promise<{ exitCode: number, killed: boolean, timedOut: boolean,
+ *   fault: boolean, error: string|null, elapsedMs: number, threads: object }>}
+ */
+export async function runCommand(wasm, options = {}) {
+  const { module, bytes } = await loadModule(wasm);
+  const memory = createMemory(bytes ?? options.bytes, options);
+  const argv0 = typeof wasm === "string" ? path.basename(wasm) : "command.wasm";
+  const fsRoot = prepareRoot(options);
+  const cfg = hostConfig({ ...options, args: [argv0, ...(options.args ?? [])] }, fsRoot.root);
+  const started = performance.now();
+  const sup = new Supervisor(module, memory, cfg, options);
+  const guest = sup.startGuest("command");
+  const result = await new Promise((resolve) => {
+    let settled = false;
+    const timers = [];
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      for (const t of timers) clearTimeout(t);
+      sup.listeners.clear();
+      resolve(value);
+    };
+    const base = { exitCode: 0, killed: false, timedOut: false, fault: false, error: null };
+    guest.on("message", (msg) => {
+      if (msg.t === "done") settle({ ...base, exitCode: msg.code, error: msg.error, fault: msg.error !== null });
+    });
+    guest.on("error", (error) => settle({ ...base, exitCode: 134, error: String(error?.stack ?? error), fault: true }));
+    guest.on("exit", (code) => settle({ ...base, exitCode: code || 134, error: `guest worker exited (${code})`, fault: true }));
+    // A pool thread that exits the process or traps: the guest's own thread
+    // may be blocked in a join forever, so decide from here.
+    sup.listeners.add(() => {
+      if (sup.faulted()) {
+        settle({
+          ...base,
+          exitCode: 134,
+          error: `guest thread ${Atomics.load(sup.control, CONTROL_FAULT_TID)} trapped`,
+          fault: true,
+        });
+      } else if (sup.exited()) {
+        timers.push(setTimeout(() => settle({ ...base, exitCode: Atomics.load(sup.control, CONTROL_EXIT_CODE) }), 100));
+      }
+    });
+    if (options.timeoutMs) {
+      timers.push(setTimeout(() => settle({ ...base, exitCode: 124, timedOut: true, error: `timed out after ${options.timeoutMs} ms` }), options.timeoutMs));
+    }
+    if (options.killAfterMs !== undefined) {
+      timers.push(setTimeout(() => {
+        options.beforeKill?.();
+        settle({ ...base, exitCode: 137, killed: true });
+      }, options.killAfterMs));
+    }
+  });
+  const threads = sup.report();
+  await sup.stop();
+  fsRoot.cleanup();
+  return { ...result, elapsedMs: performance.now() - started, threads, root: fsRoot.root, poolErrors: sup.poolErrors };
+}
+
+/**
+ * Instantiate flatsql.wasm as one instance with
+ * an exec thread of its own. Returns an RPC handle for the C ABI:
+ * `call(fn, ...args)`, `write(bytes) -> ptr`, `read(ptr, len)`, `threads()`,
+ * `close()`.
+ */
+export async function createNodeInstance(wasm, options = {}) {
+  const { module, bytes } = await loadModule(wasm);
+  const memory = createMemory(bytes ?? options.bytes, options);
+  const fsRoot = prepareRoot(options);
+  const cfg = hostConfig(options, fsRoot.root);
+  const sup = new Supervisor(module, memory, cfg, options);
+  const worker = sup.startGuest("reactor");
+  const pending = new Map();
+  let nextId = 1;
+  let failure = null;
+  const fail = (error) => {
+    failure = error;
+    for (const p of pending.values()) p.reject(error);
+    pending.clear();
+  };
+  sup.listeners.add(() => {
+    if (!failure && sup.faulted()) fail(new Error(`guest thread ${Atomics.load(sup.control, CONTROL_FAULT_TID)} trapped`));
+  });
+  await new Promise((resolve, reject) => {
+    const timer=setTimeout(()=>reject(new Error('FlatSQL guest startup timed out')),30000);
+    const ready=()=>{clearTimeout(timer);resolve();};
+    const broken=error=>{clearTimeout(timer);fail(error);reject(error);};
+    worker.once('exit',code=>broken(new Error(`FlatSQL guest exited (${code})`)));
+    worker.on("message", (msg) => {
+      if (msg.t === "ready") ready();
+      else if (msg.t === "reply") {
+        const p = pending.get(msg.id);
+        pending.delete(msg.id);
+        if (!p) return;
+        if (msg.error) p.reject(new Error(msg.error));
+        else p.resolve(msg.value);
+      }
+    });
+    worker.on("error", (error) => {
+      broken(error);
+    });
+  }).catch(async error=>{await sup.stop();fsRoot.cleanup();throw error;});
+  // Before any guest thread: the heap to the memory's maximum (heapLimitBytes).
+  if (options.growHeap !== false) {
+    await new Promise((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, { resolve, reject });
+      worker.postMessage({ op: "growHeap", limitBytes: heapLimitBytes(memory, options), id });
+    });
+  }
+  const rpc = (msg) => {
+    if (failure) return Promise.reject(failure);
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      worker.postMessage({ ...msg, id });
+    });
+  };
+  return {
+    memory,
+    root: fsRoot.root,
+    call: (fn, ...args) => rpc({ op: "call", fn, args }),
+    write: (data) => rpc({ op: "write", bytes: data instanceof Uint8Array ? data : new Uint8Array(data) }),
+    read: (ptr, len) => rpc({ op: "read", ptr, len }),
+    threads: () => sup.report(),
+    faulted: () => !!failure || sup.faulted(),
+    async close() {
+      await sup.stop();
+      fsRoot.cleanup();
+    },
+  };
+}
+
+// ---- CLI ---------------------------------------------------------------------
+const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedDirectly) {
+  const [wasmPath, ...args] = process.argv.slice(2);
+  if (!wasmPath) {
+    process.stderr.write("usage: node wasm/node-host.mjs <command.wasm> [args...]\n");
+    process.exit(2);
+  }
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) if (k.startsWith("FLATSQL_PS_") || k.startsWith("PS_")) env[k] = v;
+  const timeoutMs = Number(process.env.FLATSQL_PS_TIMEOUT_MS ?? 0) || undefined;
+  // The checkout is visible at its own path (the test commands read their
+  // vectors from the build tree); everything else lives in a private root.
+  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const r = await runCommand(wasmPath, {
+    args,
+    env,
+    timeoutMs,
+    root: process.env.FLATSQL_PS_ROOT || undefined,
+    keepRoot: process.env.FLATSQL_PS_KEEP_ROOT === "1",
+    mounts: [{ guest: repo, host: repo }],
+  });
+  const t = r.threads;
+  if (process.env.FLATSQL_PS_REPORT) {
+    fs.writeFileSync(process.env.FLATSQL_PS_REPORT, `${JSON.stringify({ ...r, root: undefined })}\n`);
+  }
+  process.stderr.write(
+    `node-host: exit ${r.exitCode}${r.error ? ` (${r.error})` : ""}; guest threads spawned ${t.guestThreadsSpawned}, ` +
+      `max concurrent ${t.maxConcurrentGuestThreads} on ${t.distinctWorkerThreadIds} distinct worker threads` +
+      `${t.spawnsDeclined ? `, ${t.spawnsDeclined} spawns declined` : ""}; memory ${(t.memoryBytes / 2 ** 20).toFixed(0)} MiB; ` +
+      `${(r.elapsedMs / 1000).toFixed(1)} s\n`,
+  );
+  if (t.memoryGrownWhileThreadsRan) {
+    process.stderr.write(
+      `node-host: WARNING memory grew ${(t.memoryGrownWhileThreadsRan / 2 ** 20).toFixed(0)} MiB while guest ` +
+        `threads ran (V8 can trap a thread on memory another thread grew; grow the heap before threads start)\n`,
+    );
+  }
+  process.exit(r.exitCode);
+}

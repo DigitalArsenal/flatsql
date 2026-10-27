@@ -29,14 +29,14 @@ std::string text(sqlite3_stmt* q,int i) {
     return p?std::string(p,size_t(sqlite3_column_bytes(q,i))):std::string();
 }
 int32_t frame(Stream* stream,uint64_t at,std::vector<uint64_t>* storage,uint32_t* length) {
-    if(at>uint64_t(INT64_MAX)) return P4_E_CORRUPT;
+    if(at>uint64_t(INT64_MAX)) return FLATSQL_E_CORRUPT;
     std::string prefix; int32_t rc=streamReadRange(stream,int64_t(at),4,&prefix);
-    if(rc!=P4_OK || prefix.size()!=4) return P4_E_CORRUPT;
+    if(rc!=FLATSQL_OK || prefix.size()!=4) return FLATSQL_E_CORRUPT;
     const uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data()));
-    if(n<8 || n>(128u<<20)) return P4_E_CORRUPT;
+    if(n<8 || n>(128u<<20)) return FLATSQL_E_CORRUPT;
     std::string data; rc=streamRead(stream,int64_t(at),n,&data);
-    if(rc!=P4_OK || data.size()!=n) return P4_E_CORRUPT;
-    storage->resize((n+7)/8); std::memcpy(storage->data(),data.data(),n); *length=n; return P4_OK;
+    if(rc!=FLATSQL_OK || data.size()!=n) return FLATSQL_E_CORRUPT;
+    storage->resize((n+7)/8); std::memcpy(storage->data(),data.data(),n); *length=n; return FLATSQL_OK;
 }
 // Recovery may end at a complete FSG whose following FCK was torn. Coverage
 // still names the last folded FMB end, never the segment's end.
@@ -44,34 +44,34 @@ int32_t appliedEnd(Stream* stream,uint64_t previous,uint64_t* end) {
     uint64_t at=previous;
     while(at!=UINT64_MAX) {
         std::vector<uint64_t> storage; uint32_t n=0;
-        const int32_t rc=frame(stream,at,&storage,&n); if(rc!=P4_OK) return rc;
+        const int32_t rc=frame(stream,at,&storage,&n); if(rc!=FLATSQL_OK) return rc;
         const auto* p=reinterpret_cast<const uint8_t*>(storage.data()); flatbuffers::Verifier v(p,n);
-        if(flatbuffers::BufferHasIdentifier(p,"$FMB")) { if(!VerifyFMBBuffer(v)) return P4_E_CORRUPT; *end=at+4+n; return P4_OK; }
-        if(flatbuffers::BufferHasIdentifier(p,"$FCK")) { if(!VerifyFCKBuffer(v)) return P4_E_CORRUPT; *end=GetFCK(p)->APPLIED_THROUGH(); return P4_OK; }
-        if(!VerifyFSGBuffer(v)) return P4_E_CORRUPT;
-        const uint64_t next=GetFSG(p)->PREVIOUS(); if(next>=at) return P4_E_CORRUPT; at=next;
+        if(flatbuffers::BufferHasIdentifier(p,"$FMB")) { if(!VerifyFMBBuffer(v)) return FLATSQL_E_CORRUPT; *end=at+4+n; return FLATSQL_OK; }
+        if(flatbuffers::BufferHasIdentifier(p,"$FCK")) { if(!VerifyFCKBuffer(v)) return FLATSQL_E_CORRUPT; *end=GetFCK(p)->APPLIED_THROUGH(); return FLATSQL_OK; }
+        if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT;
+        const uint64_t next=GetFSG(p)->PREVIOUS(); if(next>=at) return FLATSQL_E_CORRUPT; at=next;
     }
-    *end=0; return P4_OK;
+    *end=0; return FLATSQL_OK;
 }
 int32_t append(Stream* stream,const uint8_t* data,size_t size,int64_t* end,const char* kind) {
     std::vector<uint8_t> bytes(size+4); st32(bytes.data(),uint32_t(size));
     std::memcpy(bytes.data()+4,data,size);
 #ifndef __wasm__
-    if(const char* pause=std::getenv("P4_STATE_PAUSE_MS")) {
+    if(const char* pause=std::getenv("FLATSQL_STATE_PAUSE_MS")) {
         const size_t half=bytes.size()/2; int32_t rc=streamWrite(stream,*end,bytes.data(),half);
-        if(rc!=P4_OK) return rc;
-        if(std::getenv("P4_STATE_DEBUG")) { std::fprintf(stderr,"state-write-begin %s offset=%lld bytes=%zu\n",kind,(long long)*end,bytes.size()); std::fflush(stderr); }
+        if(rc!=FLATSQL_OK) return rc;
+        if(std::getenv("FLATSQL_STATE_DEBUG")) { std::fprintf(stderr,"state-write-begin %s offset=%lld bytes=%zu\n",kind,(long long)*end,bytes.size()); std::fflush(stderr); }
         ps::sleepNs(uint64_t(std::max(0,std::atoi(pause)))*1000000ull);
         rc=streamWrite(stream,*end+int64_t(half),bytes.data()+half,bytes.size()-half);
-        if(rc!=P4_OK) return rc;
+        if(rc!=FLATSQL_OK) return rc;
     } else
 #endif
-    { const int32_t rc=streamWrite(stream,*end,bytes.data(),bytes.size()); if(rc!=P4_OK) return rc; }
+    { const int32_t rc=streamWrite(stream,*end,bytes.data(),bytes.size()); if(rc!=FLATSQL_OK) return rc; }
     *end+=int64_t(bytes.size());
 #ifndef __wasm__
-    if(std::getenv("P4_STATE_DEBUG")) { std::fprintf(stderr,"state-write-end %s\n",kind); std::fflush(stderr); }
+    if(std::getenv("FLATSQL_STATE_DEBUG")) { std::fprintf(stderr,"state-write-end %s\n",kind); std::fflush(stderr); }
 #endif
-    return P4_OK;
+    return FLATSQL_OK;
 }
 FmbEntry entry(const ::FMBEntry* d) {
     FmbEntry out; out.kind=uint8_t(d->KIND()); out.id=d->ID();
@@ -99,31 +99,31 @@ bool tokenEqual(const TokCount& a,const TokCount& b) {
 }
 int32_t readSegment(Feed* f,Stream* stream,const CheckpointSegment& desc,SegmentData* out) {
     std::vector<uint64_t> storage; uint32_t n=0;
-    int32_t rc=frame(stream,desc.offset,&storage,&n); if(rc!=P4_OK || n!=desc.length) return P4_E_CORRUPT;
+    int32_t rc=frame(stream,desc.offset,&storage,&n); if(rc!=FLATSQL_OK || n!=desc.length) return FLATSQL_E_CORRUPT;
     const auto* p=reinterpret_cast<const uint8_t*>(storage.data());
-    std::array<uint8_t,32> digest{}; ps::sha256(p,n,digest.data()); if(digest!=desc.digest) return P4_E_CORRUPT;
-    flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return P4_E_CORRUPT;
+    std::array<uint8_t,32> digest{}; ps::sha256(p,n,digest.data()); if(digest!=desc.digest) return FLATSQL_E_CORRUPT;
+    flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT;
     const auto* s=GetFSG(p);
     if(s->SELF_OFFSET()!=desc.offset || s->FEED_ID()!=f->fid || s->KIND()!=desc.kind || s->LEVEL()!=desc.level ||
-       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || desc.kind>kFsgMaxKind) return P4_E_CORRUPT;
-    if(s->ENTRIES()) for(const auto* e:*s->ENTRIES()) { auto d=entry(e); if(!d.id) return P4_E_CORRUPT; out->dictionary[{d.kind,d.id}]=std::move(d); }
+       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || desc.kind>kFsgMaxKind) return FLATSQL_E_CORRUPT;
+    if(s->ENTRIES()) for(const auto* e:*s->ENTRIES()) { auto d=entry(e); if(!d.id) return FLATSQL_E_CORRUPT; out->dictionary[{d.kind,d.id}]=std::move(d); }
     if(s->LATEST()) for(const auto* e:*s->LATEST()) {
-        if(!e->OBJECT_KEY_ID() || e->RESERVED()) return P4_E_CORRUPT;
+        if(!e->OBJECT_KEY_ID() || e->RESERVED()) return FLATSQL_E_CORRUPT;
         out->latest[e->OBJECT_KEY_ID()]={e->OBJECT_KEY_ID(),e->EPOCH(),e->RID(),e->ROW_REF()};
     }
     const auto* urls=s->INSTANCE_URL_IDS();
-    if(urls && (!s->INSTANCES() || urls->size()!=s->INSTANCES()->size())) return P4_E_CORRUPT;
+    if(urls && (!s->INSTANCES() || urls->size()!=s->INSTANCES()->size())) return FLATSQL_E_CORRUPT;
     if(s->INSTANCES()) for(flatbuffers::uoffset_t i=0;i<s->INSTANCES()->size();i++) { const auto* e=s->INSTANCES()->Get(i);
         out->instanceUrls[{e->BATCH_ID(),e->CONTENT_KEY_ID()}]=urls?urls->Get(i):0;
         InstCount x; x.n=int64_t(e->RECORDS()); x.bytes=int64_t(e->BYTES()); x.minw=e->MIN_W(); x.maxw=e->MAX_W();
         x.minseq=int64_t(e->MIN_SEQ()); x.maxseq=int64_t(e->MAX_SEQ()); x.first=e->FIRST(); x.updated=e->UPDATED(); x.maxat=e->MAX_AT(); x.maxts=e->MAX_TS();
         out->instances[{e->BATCH_ID(),e->CONTENT_KEY_ID()}]=std::move(x);
     }
-    if(s->TOKENS()) for(const auto* e:*s->TOKENS()) { auto d=entry(e); if(!d.id || d.text.size()!=6) return P4_E_CORRUPT; out->tokens[d.id]=std::move(d); }
+    if(s->TOKENS()) for(const auto* e:*s->TOKENS()) { auto d=entry(e); if(!d.id || d.text.size()!=6) return FLATSQL_E_CORRUPT; out->tokens[d.id]=std::move(d); }
     if(s->PAIRS()) for(const auto* e:*s->PAIRS()) {
         if(desc.kind==4) out->tombstones.insert(e->KEY_HI()); else out->pairs.push_back({e->KEY_HI(),e->KEY_LO(),e->RID(),e->ROW_REF()});
     }
-    return out->size(desc.kind)==desc.entries?P4_OK:P4_E_CORRUPT;
+    return out->size(desc.kind)==desc.entries?FLATSQL_OK:FLATSQL_E_CORRUPT;
 }
 void merge(SegmentData* dst,const SegmentData& src) {
     for(const auto& x:src.dictionary) dst->dictionary[x.first]=x.second;
@@ -170,7 +170,7 @@ void encodeSegment(Feed* f,uint8_t kind,uint8_t level,const SegmentData& data,co
 bool onlySegments(Stream* stream,uint64_t from,uint64_t to) {
     while(from<to) {
         if(to-from<12) return false;
-        std::string prefix; if(streamReadRange(stream,int64_t(from),12,&prefix)!=P4_OK || prefix.size()!=12) return false;
+        std::string prefix; if(streamReadRange(stream,int64_t(from),12,&prefix)!=FLATSQL_OK || prefix.size()!=12) return false;
         const uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data()));
         if(n<8 || uint64_t(n)>to-from-4 || std::memcmp(prefix.data()+8,"$FSG",4)) return false;
         from+=4+uint64_t(n);
@@ -184,11 +184,11 @@ int32_t changes(Stream* stream,uint64_t previous,uint64_t after,TailChanges* cha
     for(const auto& item:state->latest) if(!item.second.rowRef) wanted[item.second.rid]=item.first;
     uint64_t at=previous;
     while(at!=UINT64_MAX) {
-        std::vector<uint64_t> storage; uint32_t n=0; int32_t rc=frame(stream,at,&storage,&n); if(rc!=P4_OK) return rc;
+        std::vector<uint64_t> storage; uint32_t n=0; int32_t rc=frame(stream,at,&storage,&n); if(rc!=FLATSQL_OK) return rc;
         const auto* p=reinterpret_cast<const uint8_t*>(storage.data()); flatbuffers::Verifier v(p,n); uint64_t prev;
         const bool tail=at+4+n>after;
         if(flatbuffers::BufferHasIdentifier(p,"$FMB")) {
-            if(!VerifyFMBBuffer(v)) return P4_E_CORRUPT; const auto* m=GetFMB(p); prev=m->PREVIOUS();
+            if(!VerifyFMBBuffer(v)) return FLATSQL_E_CORRUPT; const auto* m=GetFMB(p); prev=m->PREVIOUS();
             if(tail && m->REMOVALS()) for(const auto* r:*m->REMOVALS()) {
                 if(r->ROW_J()==UINT32_MAX) changes->removedSeqs.insert(r->SEQ()); else changes->removed.insert((r->SEQ()<<16)|r->ROW_J());
             }
@@ -198,39 +198,39 @@ int32_t changes(Stream* stream,uint64_t previous,uint64_t after,TailChanges* cha
                 if(tail && allRefs) changes->rows.emplace(rid,(at<<16)|uint64_t(i));
                 if(changes->removedSeqs.count(r->SEQ())) changes->removed.insert(rid);
             }
-        } else if(flatbuffers::BufferHasIdentifier(p,"$FSG")) { if(!VerifyFSGBuffer(v)) return P4_E_CORRUPT; prev=GetFSG(p)->PREVIOUS(); }
-        else if(flatbuffers::BufferHasIdentifier(p,"$FCK")) { if(!VerifyFCKBuffer(v)) return P4_E_CORRUPT; prev=GetFCK(p)->PREVIOUS(); }
-        else return P4_E_CORRUPT;
+        } else if(flatbuffers::BufferHasIdentifier(p,"$FSG")) { if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT; prev=GetFSG(p)->PREVIOUS(); }
+        else if(flatbuffers::BufferHasIdentifier(p,"$FCK")) { if(!VerifyFCKBuffer(v)) return FLATSQL_E_CORRUPT; prev=GetFCK(p)->PREVIOUS(); }
+        else return FLATSQL_E_CORRUPT;
         if(at==0 || (!tail && wanted.empty() && changes->removedSeqs.empty())) break;
-        if(prev>=at) return P4_E_CORRUPT; at=prev;
+        if(prev>=at) return FLATSQL_E_CORRUPT; at=prev;
     }
     state->tombstones.insert(changes->removed.begin(),changes->removed.end());
-    return wanted.empty()?P4_OK:P4_E_CORRUPT;
+    return wanted.empty()?FLATSQL_OK:FLATSQL_E_CORRUPT;
 }
 int32_t latestSnapshot(Feed* f,Conn* c,Stream* stream,uint64_t previous,const CheckpointState& old,CheckpointState* state) {
     const bool hasObject=f->type->spec()->hasObject;
     if(!old.appliedThrough) {
         if(hasObject) {
-            auto* q=c->sql("SELECT kk,e,rid FROM r WHERE kk IS NOT NULL AND e IS NOT NULL ORDER BY kk,e DESC,cid,rid"); if(!q) return P4_E_IO; int rc;
+            auto* q=c->sql("SELECT kk,e,rid FROM r WHERE kk IS NOT NULL AND e IS NOT NULL ORDER BY kk,e DESC,cid,rid"); if(!q) return FLATSQL_E_IO; int rc;
             while((rc=sqlite3_step(q))==SQLITE_ROW) { uint32_t key=uint32_t(sqlite3_column_int64(q,0)); if(!state->latest.count(key)) state->latest[key]={key,sqlite3_column_int64(q,1),uint64_t(sqlite3_column_int64(q,2)),0}; }
             sqlite3_reset(q); if(rc!=SQLITE_DONE) return statusOfSqlite(rc);
         }
         TailChanges tail; return changes(stream,previous,0,&tail,state,false);
     }
     state->latest=old.latest; TailChanges tail;
-    int32_t rc=changes(stream,previous,old.appliedThrough,&tail,state,hasObject); if(rc!=P4_OK || !hasObject) return rc;
+    int32_t rc=changes(stream,previous,old.appliedThrough,&tail,state,hasObject); if(rc!=FLATSQL_OK || !hasObject) return rc;
     std::set<uint32_t> refresh;
     for(const auto& item:state->latest) if(tail.removed.count(item.second.rid) || tail.removedSeqs.count(item.second.rid>>16)) refresh.insert(item.first);
     // Only a removed winner needs a new object seek. Ordinary checkpoints read
     // precisely the tail's rows by their integer primary keys.
     auto* best=c->sql("SELECT e,rid FROM r WHERE kk=?1 AND e IS NOT NULL ORDER BY e DESC,cid,rid LIMIT 1");
-    if(!best) return P4_E_IO;
+    if(!best) return FLATSQL_E_IO;
     for(uint32_t key:refresh) { sqlite3_bind_int64(best,1,key); const int sr=sqlite3_step(best);
         if(sr==SQLITE_ROW) state->latest[key]={key,sqlite3_column_int64(best,0),uint64_t(sqlite3_column_int64(best,1)),0};
         else if(sr==SQLITE_DONE) state->latest.erase(key); else { sqlite3_reset(best); return statusOfSqlite(sr); } sqlite3_reset(best);
     }
     auto* q=c->sql("SELECT kk,e,rid,cid FROM r WHERE rid=?1 AND kk IS NOT NULL AND e IS NOT NULL");
-    auto* cid=c->sql("SELECT cid FROM r WHERE rid=?1"); if(!q || !cid) return P4_E_IO;
+    auto* cid=c->sql("SELECT cid FROM r WHERE rid=?1"); if(!q || !cid) return FLATSQL_E_IO;
     for(const auto& item:tail.rows) {
         sqlite3_bind_int64(q,1,sqlite3_int64(item.first)); const int sr=sqlite3_step(q);
         if(sr==SQLITE_ROW) {
@@ -247,7 +247,7 @@ int32_t latestSnapshot(Feed* f,Conn* c,Stream* stream,uint64_t previous,const Ch
         sqlite3_reset(q);
     }
     if(!refresh.empty()) { TailChanges refs; return changes(stream,previous,old.appliedThrough,&refs,state,false); }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 int32_t snapshot(Feed* f,Conn* c,Stream* stream,uint64_t previous,const CheckpointState& old,const Counters& counters,CheckpointState* state) {
     state->counters=counters;
@@ -257,7 +257,7 @@ int32_t snapshot(Feed* f,Conn* c,Stream* stream,uint64_t previous,const Checkpoi
     }
     const char* dict[]={"SELECT id,producer,peer FROM node ORDER BY id","SELECT id,batch,ppeer,pkey FROM batch ORDER BY id","SELECT id,ckey FROM ckey ORDER BY id","SELECT id,url FROM url ORDER BY id","SELECT id,k FROM okey ORDER BY id"};
     for(uint8_t kind=1;kind<=5;kind++) {
-        auto* q=c->sql(dict[kind-1]); if(!q) return P4_E_IO; int rc;
+        auto* q=c->sql(dict[kind-1]); if(!q) return FLATSQL_E_IO; int rc;
         while((rc=sqlite3_step(q))==SQLITE_ROW) {
             FmbEntry d; d.kind=kind; d.id=uint32_t(sqlite3_column_int64(q,0));
             for(int i=1;i<sqlite3_column_count(q);i++) d.text.push_back(text(q,i));
@@ -270,7 +270,7 @@ int32_t snapshot(Feed* f,Conn* c,Stream* stream,uint64_t previous,const Checkpoi
     // dictionary cache belongs to its writer.
     std::vector<std::pair<InstId,InstCount>> rows; int sql=readInstRows(c,&rows); if(sql!=SQLITE_OK) return statusOfSqlite(sql);
     for(auto& row:rows) {
-        auto b=state->dictionary.find({2,row.first.first}); if(b==state->dictionary.end() || b->second.text.size()!=3) return P4_E_CORRUPT;
+        auto b=state->dictionary.find({2,row.first.first}); if(b==state->dictionary.end() || b->second.text.size()!=3) return FLATSQL_E_CORRUPT;
         row.second.batch=b->second.text[0]; row.second.ppeer=b->second.text[1]; row.second.pkey=b->second.text[2];
         auto k=state->dictionary.find({3,row.first.second}); if(k!=state->dictionary.end() && k->second.text.size()==1) row.second.ckey=k->second.text[0];
         state->instances[row.first]=std::move(row.second);
@@ -286,8 +286,8 @@ int32_t rowOrders(Feed* f,Conn* c,Stream* stream,uint64_t previous,const Checkpo
     // A checkpoint without row orders for its rows (written before they
     // existed) is folded whole: the new segments cover every live row.
     const bool whole=old.counters.rows>0 && !checkpointHasRowOrders(old,kFsgSeq);
-    int32_t rc=changes(stream,previous,whole?0:old.appliedThrough,&tail,&scratch,true); if(rc!=P4_OK) return rc;
-    if(tail.rows.empty()) return P4_OK;
+    int32_t rc=changes(stream,previous,whole?0:old.appliedThrough,&tail,&scratch,true); if(rc!=FLATSQL_OK) return rc;
+    if(tail.rows.empty()) return FLATSQL_OK;
     const bool hasObject=f->type->spec()->hasObject;
     auto add=[&](uint64_t rid,uint64_t ref,sqlite3_stmt* q,int k) {
         bySeq->push_back({rid,0,rid,ref});
@@ -298,11 +298,11 @@ int32_t rowOrders(Feed* f,Conn* c,Stream* stream,uint64_t previous,const Checkpo
     };
     int sr=SQLITE_DONE;
     if(tail.rows.size()>8192) {  // most of the file: one walk
-        auto* q=c->sql("SELECT rid,kk,e FROM r"); if(!q) return P4_E_IO;
+        auto* q=c->sql("SELECT rid,kk,e FROM r"); if(!q) return FLATSQL_E_IO;
         while((sr=sqlite3_step(q))==SQLITE_ROW) { auto it=tail.rows.find(uint64_t(sqlite3_column_int64(q,0))); if(it!=tail.rows.end()) add(it->first,it->second,q,1); }
         sqlite3_reset(q);
     } else {
-        auto* q=c->sql("SELECT kk,e FROM r WHERE rid=?1"); if(!q) return P4_E_IO;
+        auto* q=c->sql("SELECT kk,e FROM r WHERE rid=?1"); if(!q) return FLATSQL_E_IO;
         for(const auto& x:tail.rows) {
             sqlite3_bind_int64(q,1,sqlite3_int64(x.first)); sr=sqlite3_step(q);
             if(sr==SQLITE_ROW) add(x.first,x.second,q,0);
@@ -312,24 +312,24 @@ int32_t rowOrders(Feed* f,Conn* c,Stream* stream,uint64_t previous,const Checkpo
     }
     if(sr!=SQLITE_DONE) return statusOfSqlite(sr);
     std::sort(bySeq->begin(),bySeq->end()); std::sort(byObject->begin(),byObject->end());
-    return P4_OK;
+    return FLATSQL_OK;
 }
 // Drops the pairs whose rows c's snapshot no longer holds: a tombstoned
 // rid whose row is gone (a tombstoned rid that a later row reuses stays).
 int32_t dropDead(Conn* c,const std::set<uint64_t>& tombstones,std::vector<FsgPairV>* pairs) {
-    if(tombstones.empty()) return P4_OK;
+    if(tombstones.empty()) return FLATSQL_OK;
     sqlite3_stmt* q=nullptr; size_t w=0;
     for(const auto& x:*pairs) {
         bool keep=true;
         if(tombstones.count(x.rid)) {
-            if(!q && !(q=c->sql("SELECT 1 FROM r WHERE rid=?1"))) return P4_E_IO;
+            if(!q && !(q=c->sql("SELECT 1 FROM r WHERE rid=?1"))) return FLATSQL_E_IO;
             sqlite3_bind_int64(q,1,sqlite3_int64(x.rid)); const int r=sqlite3_step(q); sqlite3_reset(q);
             if(r!=SQLITE_ROW && r!=SQLITE_DONE) return statusOfSqlite(r);
             keep=r==SQLITE_ROW;
         }
         if(keep) (*pairs)[w++]=x;
     }
-    pairs->resize(w); return P4_OK;
+    pairs->resize(w); return FLATSQL_OK;
 }
 } // namespace
 
@@ -385,40 +385,40 @@ void checkpointPairsRetain(Stream* stream,const CheckpointState& ck) {
 
 int32_t checkpointVerifyPairs(Feed* f,Stream* stream,const CheckpointSegment& desc,std::shared_ptr<const FsgVerified>* out,bool* fresh) {
     if(fresh) *fresh=false;
-    if(desc.kind<kFsgSeq || desc.kind>kFsgMaxKind) return P4_E_ARG;
+    if(desc.kind<kFsgSeq || desc.kind>kFsgMaxKind) return FLATSQL_E_ARG;
     const VerifiedKey key{stream->path,stream->gen,desc.offset,desc.length,desc.digest};
-    { std::lock_guard<std::mutex> g(gVerifiedMu); auto it=gVerified.find(key); if(it!=gVerified.end()) { gVerifyStats.reused++; *out=it->second; return P4_OK; } }
+    { std::lock_guard<std::mutex> g(gVerifiedMu); auto it=gVerified.find(key); if(it!=gVerified.end()) { gVerifyStats.reused++; *out=it->second; return FLATSQL_OK; } }
     // First load in this process: the whole segment, its digest and
     // structure, as every other segment kind is checked when it is read.
     const uint64_t t0=ps::monoNs();
     std::vector<uint64_t> storage; uint32_t n=0;
-    int32_t rc=frame(stream,desc.offset,&storage,&n); if(rc!=P4_OK || n!=desc.length) return P4_E_CORRUPT;
+    int32_t rc=frame(stream,desc.offset,&storage,&n); if(rc!=FLATSQL_OK || n!=desc.length) return FLATSQL_E_CORRUPT;
     const auto* p=reinterpret_cast<const uint8_t*>(storage.data());
-    std::array<uint8_t,32> digest{}; ps::sha256(p,n,digest.data()); if(digest!=desc.digest) return P4_E_CORRUPT;
-    flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return P4_E_CORRUPT;
+    std::array<uint8_t,32> digest{}; ps::sha256(p,n,digest.data()); if(digest!=desc.digest) return FLATSQL_E_CORRUPT;
+    flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT;
     const auto* s=GetFSG(p);
     if(s->SELF_OFFSET()!=desc.offset || s->FEED_ID()!=f->fid || s->KIND()!=desc.kind || s->LEVEL()!=desc.level ||
-       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || !s->PAIRS() || s->PAIRS()->size()!=desc.entries) return P4_E_CORRUPT;
-    auto ver=pairsLayout(p,desc.offset,true); if(!ver) return P4_E_CORRUPT;
+       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || !s->PAIRS() || s->PAIRS()->size()!=desc.entries) return FLATSQL_E_CORRUPT;
+    auto ver=pairsLayout(p,desc.offset,true); if(!ver) return FLATSQL_E_CORRUPT;
     { std::lock_guard<std::mutex> g(gVerifiedMu); gVerifyStats.hashed++; gVerifyStats.hashedBytes+=n; gVerifyStats.hashNs+=ps::monoNs()-t0; }
     remember(key,std::move(ver),out); if(fresh) *fresh=true;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t checkpointReadPairs(Feed* f,const std::shared_ptr<Stream>& stream,const CheckpointSegment& desc,FsgRun* out) {
     std::shared_ptr<const FsgVerified> ver;
-    const int32_t rc=checkpointVerifyPairs(f,stream.get(),desc,&ver); if(rc!=P4_OK) return rc;
+    const int32_t rc=checkpointVerifyPairs(f,stream.get(),desc,&ver); if(rc!=FLATSQL_OK) return rc;
     // The PAIRS vector stays on disk, read a page at a time; the fence keys
     // are in memory.
     out->stream=stream; out->base=ver->base; out->n=size_t(ver->n); out->verified=ver;
     out->pages.assign((out->n+FsgRun::kPage-1)/FsgRun::kPage,nullptr);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState* state,std::string* err) {
     std::vector<uint64_t> storage; uint32_t n=0; int32_t rc=frame(stream,offset,&storage,&n);
-    auto fail=[&]() { if(err) *err="invalid checkpoint or segment in "+stream->path+" at "+std::to_string(offset); return P4_E_CORRUPT; };
-    if(rc!=P4_OK) return fail(); const auto* p=reinterpret_cast<const uint8_t*>(storage.data()); flatbuffers::Verifier v(p,n);
+    auto fail=[&]() { if(err) *err="invalid checkpoint or segment in "+stream->path+" at "+std::to_string(offset); return FLATSQL_E_CORRUPT; };
+    if(rc!=FLATSQL_OK) return fail(); const auto* p=reinterpret_cast<const uint8_t*>(storage.data()); flatbuffers::Verifier v(p,n);
     if(!VerifyFCKBuffer(v)) return fail(); const auto* ck=GetFCK(p);
     if(ck->SELF_OFFSET()!=offset || ck->FEED_ID()!=f->fid || ck->GENERATION()!=stream->gen || !ck->COUNTERS() || ck->APPLIED_THROUGH()>offset) return fail();
     CheckpointState out; out.offset=offset; out.end=offset+4+n; out.appliedThrough=ck->APPLIED_THROUGH(); out.typeSeqHigh=ck->TYPE_SEQ_HIGH(); out.checkpointBytes=n+4;
@@ -441,7 +441,7 @@ int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState*
     std::sort(out.segments.begin(),out.segments.end(),[](const CheckpointSegment& a,const CheckpointSegment& b){return a.offset<b.offset;});
     SegmentData data;
     // Row orders are read (and digest-checked) when a reader first needs them (fsg.cpp).
-    for(const auto& d:out.segments) { if(d.kind>=kFsgSeq) continue; SegmentData part; if(readSegment(f,stream,d,&part)!=P4_OK) return fail(); merge(&data,part); }
+    for(const auto& d:out.segments) { if(d.kind>=kFsgSeq) continue; SegmentData part; if(readSegment(f,stream,d,&part)!=FLATSQL_OK) return fail(); merge(&data,part); }
     out.dictionary=std::move(data.dictionary); out.latest=std::move(data.latest); out.instances=std::move(data.instances); out.tombstones=std::move(data.tombstones);
     for(auto it=out.latest.begin();it!=out.latest.end();) { if(!it->second.rid) it=out.latest.erase(it); else ++it; }
     for(auto it=out.instances.begin();it!=out.instances.end();) {
@@ -458,7 +458,7 @@ int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState*
     out.current=onlySegments(stream,out.appliedThrough,offset);
     out.feedRoot=feedDagCheckpointCid(p,n);
     if(ck->COMMITS_ROOT_CID()) out.commitsRoot.assign(reinterpret_cast<const char*>(ck->COMMITS_ROOT_CID()->data()),ck->COMMITS_ROOT_CID()->size());
-    *state=std::move(out); return P4_OK;
+    *state=std::move(out); return FLATSQL_OK;
 }
 
 int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint64_t mark,const Counters& counters,const CheckpointState& old,
@@ -466,8 +466,8 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
     plan->at=mark; plan->previous=previous; plan->frames.clear(); plan->lengths.clear();
     CheckpointState& out=plan->state; out=CheckpointState();
     out.tombstones=old.tombstones;
-    int32_t rc=appliedEnd(stream,previous,&out.appliedThrough); if(rc!=P4_OK) return rc;
-    rc=snapshot(f,c,stream,previous,old,counters,&out); if(rc!=P4_OK) { if(err) *err="checkpoint snapshot "+f->path; return rc; }
+    int32_t rc=appliedEnd(stream,previous,&out.appliedThrough); if(rc!=FLATSQL_OK) return rc;
+    rc=snapshot(f,c,stream,previous,old,counters,&out); if(rc!=FLATSQL_OK) { if(err) *err="checkpoint snapshot "+f->path; return rc; }
     out.segments=old.segments; out.checkpointBytes=old.checkpointBytes; out.commitsRoot=commitsRoot;
     SegmentData deltas[kFsgMaxKind+1];
     for(const auto& x:out.dictionary) { auto it=old.dictionary.find(x.first); if(it==old.dictionary.end() || it->second.text!=x.second.text) deltas[0].dictionary[x.first]=x.second; }
@@ -480,14 +480,14 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
         for(const auto& x:out.dictionary) if(x.first.first==4 && x.second.text.size()==1) urlIds.emplace(x.second.text[0],x.first.second);
         for(const auto& x:deltas[2].instances) {
             uint32_t id=0;
-            if(!x.second.url.empty()) { auto u=urlIds.find(x.second.url); if(u==urlIds.end()) { if(err) *err="checkpoint instance url outside the url dictionary "+f->path; return P4_E_CORRUPT; } id=u->second; }
+            if(!x.second.url.empty()) { auto u=urlIds.find(x.second.url); if(u==urlIds.end()) { if(err) *err="checkpoint instance url outside the url dictionary "+f->path; return FLATSQL_E_CORRUPT; } id=u->second; }
             deltas[2].instanceUrls[x.first]=id;
         }
     }
     for(const auto& x:out.tokens) { auto it=old.tokens.find(x.first); if(it==old.tokens.end() || !tokenEqual(it->second,x.second)) deltas[3].tokens[x.first]=tokenEntry(x.first,x.second,out.dictionary.at({0,x.first}).text[0]); }
     for(const auto& x:old.tokens) if(!out.tokens.count(x.first)) deltas[3].tokens[x.first]=tokenEntry(x.first,TokCount{},out.dictionary.at({0,x.first}).text[0]);
     for(auto rid:out.tombstones) if(!old.tombstones.count(rid)) deltas[4].tombstones.insert(rid);
-    rc=rowOrders(f,c,stream,previous,old,&deltas[kFsgSeq].pairs,&deltas[kFsgObjectEpoch].pairs); if(rc!=P4_OK) { if(err) *err="checkpoint row orders "+f->path; return rc; }
+    rc=rowOrders(f,c,stream,previous,old,&deltas[kFsgSeq].pairs,&deltas[kFsgObjectEpoch].pairs); if(rc!=FLATSQL_OK) { if(err) *err="checkpoint row orders "+f->path; return rc; }
     // This plan's own segments (offsets >= mark) are merged from memory.
     uint64_t cursor=mark; std::map<uint64_t,SegmentData> made;
     // Retention: each removal counts against the row-order segments whose
@@ -501,8 +501,8 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
         std::vector<CheckpointSegment> garbage;
         for(const auto& d:out.segments) if(d.kind==kind) { auto it=out.deadPairs.find(d.offset); if(it!=out.deadPairs.end() && it->second*4>=d.entries) garbage.push_back(d); }
         for(const auto& d:garbage) {
-            SegmentData part; rc=readSegment(f,stream,d,&part); if(rc!=P4_OK) return rc;
-            rc=dropDead(c,out.tombstones,&part.pairs); if(rc!=P4_OK) return rc;
+            SegmentData part; rc=readSegment(f,stream,d,&part); if(rc!=FLATSQL_OK) return rc;
+            rc=dropDead(c,out.tombstones,&part.pairs); if(rc!=FLATSQL_OK) return rc;
             out.deadPairs.erase(d.offset);
             out.segments.erase(std::remove_if(out.segments.begin(),out.segments.end(),[&](const CheckpointSegment& x){return x.offset==d.offset;}),out.segments.end());
             if(part.pairs.empty()) continue;
@@ -523,7 +523,7 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
             SegmentData combined; std::vector<uint64_t> replaces;
             for(const auto& d:inputs) {
                 if(d.offset>=mark) merge(&combined,made.at(d.offset));
-                else { SegmentData part; rc=readSegment(f,stream,d,&part); if(rc!=P4_OK) return rc; merge(&combined,part); }
+                else { SegmentData part; rc=readSegment(f,stream,d,&part); if(rc!=FLATSQL_OK) return rc; merge(&combined,part); }
                 replaces.push_back(d.offset);
             }
             // LATEST deltas already include zero-rid deletion markers. Applying
@@ -531,7 +531,7 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
             // Row orders: one sorted run without the pairs of removed rows
             // (readers check each candidate's row for the rest).
             if(kind>=kFsgSeq) {
-                rc=dropDead(c,out.tombstones,&combined.pairs); if(rc!=P4_OK) return rc;
+                rc=dropDead(c,out.tombstones,&combined.pairs); if(rc!=FLATSQL_OK) return rc;
                 std::sort(combined.pairs.begin(),combined.pairs.end());
                 for(uint64_t r:replaces) out.deadPairs.erase(r);
             }
@@ -545,14 +545,14 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
     if(plan->previousRoot.empty() && fresh) { std::lock_guard<std::mutex> lock(f->type->mu); if(f->checkpoint) plan->previousRoot=f->checkpoint->feedRoot; }
     if(plan->previousRoot.empty()) {
         std::vector<uint64_t> genesis; uint32_t genesisSize=0;
-        rc=frame(stream,0,&genesis,&genesisSize); if(rc!=P4_OK) return rc;
+        rc=frame(stream,0,&genesis,&genesisSize); if(rc!=FLATSQL_OK) return rc;
         plan->previousRoot=feedDagCheckpointCid(genesis.data(),genesisSize);
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t checkpointInstall(Feed* f,Stream* stream,CheckpointPlan& plan,int64_t* end,uint64_t* previous,CheckpointState* state) {
-    if(*end<0 || uint64_t(*end)<plan.at || plan.frames.size()!=plan.lengths.size()) return P4_E_INTERNAL;
+    if(*end<0 || uint64_t(*end)<plan.at || plan.frames.size()!=plan.lengths.size()) return FLATSQL_E_INTERNAL;
     const uint64_t shift=uint64_t(*end)-plan.at;
     auto place=[&](uint64_t offset) { return offset>=plan.at?offset+shift:offset; };
     CheckpointState out=std::move(plan.state); const Counters& counters=out.counters;
@@ -561,18 +561,18 @@ int32_t checkpointInstall(Feed* f,Stream* stream,CheckpointPlan& plan,int64_t* e
     for(size_t i=0;i<plan.frames.size();i++) {
         auto* p=reinterpret_cast<uint8_t*>(plan.frames[i].data()); const uint32_t n=plan.lengths[i]; const uint64_t at=uint64_t(*end);
         auto* table=const_cast<flatbuffers::Table*>(reinterpret_cast<const flatbuffers::Table*>(GetFSG(p)));
-        if(!table->SetField<uint64_t>(FSG::VT_SELF_OFFSET,at,0) || !table->SetField<uint64_t>(FSG::VT_PREVIOUS,*previous,0)) return P4_E_INTERNAL;
+        if(!table->SetField<uint64_t>(FSG::VT_SELF_OFFSET,at,0) || !table->SetField<uint64_t>(FSG::VT_PREVIOUS,*previous,0)) return FLATSQL_E_INTERNAL;
         if(auto* replaces=const_cast<flatbuffers::Vector<uint64_t>*>(GetFSG(p)->REPLACES()))
             for(flatbuffers::uoffset_t j=0;j<replaces->size();j++) replaces->Mutate(j,place(replaces->Get(j)));
         ps::sha256(p,n,digests[at].data());
-        const int32_t rc=append(stream,p,n,end,"FSG"); if(rc!=P4_OK) return rc; *previous=at;
+        const int32_t rc=append(stream,p,n,end,"FSG"); if(rc!=FLATSQL_OK) return rc; *previous=at;
         // A row-order segment this process wrote is checked: its digest is
         // the hash of these bytes.
         if(GetFSG(p)->KIND()>=kFsgSeq) if(auto ver=pairsLayout(p,at,false))
             remember(VerifiedKey{stream->path,stream->gen,at,n,digests[at]},std::move(ver),nullptr);
     }
     for(auto& s:out.segments) if(s.offset>=plan.at) {
-        s.offset=place(s.offset); auto d=digests.find(s.offset); if(d==digests.end()) return P4_E_INTERNAL; s.digest=d->second;
+        s.offset=place(s.offset); auto d=digests.find(s.offset); if(d==digests.end()) return FLATSQL_E_INTERNAL; s.digest=d->second;
     }
     flatbuffers::FlatBufferBuilder b; auto type=b.CreateString(f->type->name),provider=b.CreateString(f->provider),source=b.CreateString(f->source);
     int64_t minAt=INT64_MAX,maxAt=0; for(const auto& x:out.instances) { minAt=std::min(minAt,x.second.first); maxAt=std::max(maxAt,x.second.maxat); }
@@ -586,14 +586,14 @@ int32_t checkpointInstall(Feed* f,Stream* stream,CheckpointPlan& plan,int64_t* e
     if(counters.rows) { root.add_RECORD_BYTES(uint64_t(counters.rbytes)); root.add_MIN_W(counters.minw); root.add_MAX_W(counters.maxw); }
     auto x=root.Finish(); FinishFCKBuffer(b,x); out.checkpointBytes+=b.GetSize()+4;
     out.feedRoot=feedDagCheckpointCid(b.GetBufferPointer(),b.GetSize());
-    const int32_t rc=append(stream,b.GetBufferPointer(),b.GetSize(),end,"FCK"); if(rc!=P4_OK) return rc;
-    *previous=out.offset; out.end=uint64_t(*end); *state=std::move(out); return P4_OK;
+    const int32_t rc=append(stream,b.GetBufferPointer(),b.GetSize(),end,"FCK"); if(rc!=FLATSQL_OK) return rc;
+    *previous=out.offset; out.end=uint64_t(*end); *state=std::move(out); return FLATSQL_OK;
 }
 
 int32_t checkpointAppend(Feed* f,Conn* c,Stream* stream,const Counters& counters,int64_t* end,uint64_t* previous,CheckpointState* state,bool fresh,std::string* err) {
     std::string commitsRoot; const CheckpointState empty; CheckpointPlan plan;
-    int32_t rc=feedDagCommitRoot(f,stream,*previous,uint64_t(*end),&commitsRoot,err); if(rc!=P4_OK) return rc;
-    rc=checkpointPrepare(f,c,stream,*previous,uint64_t(*end),counters,fresh?empty:*state,fresh,commitsRoot,&plan,err); if(rc!=P4_OK) return rc;
+    int32_t rc=feedDagCommitRoot(f,stream,*previous,uint64_t(*end),&commitsRoot,err); if(rc!=FLATSQL_OK) return rc;
+    rc=checkpointPrepare(f,c,stream,*previous,uint64_t(*end),counters,fresh?empty:*state,fresh,commitsRoot,&plan,err); if(rc!=FLATSQL_OK) return rc;
     return checkpointInstall(f,stream,plan,end,previous,state);
 }
 
@@ -610,18 +610,18 @@ bool checkpointDue(const Feed* f,bool idle) {
 int32_t checkpointFeed(Feed* f,bool force,std::string* err) {
     Engine* e=f->type->e; Counters counters; CheckpointState state; int64_t end,start; uint64_t previous; bool pending=false;
     { std::lock_guard<std::mutex> g(f->type->mu);
-        if(!f->created || f->quarantined || !f->mark || (!force && !checkpointDue(f,true))) return P4_OK;
-        if(f->checkpoint && uint64_t(f->mark)==f->checkpoint->end && !f->pendingCheckpoint && !f->checkpoint->commitsRoot.empty()) return P4_OK;
+        if(!f->created || f->quarantined || !f->mark || (!force && !checkpointDue(f,true))) return FLATSQL_OK;
+        if(f->checkpoint && uint64_t(f->mark)==f->checkpoint->end && !f->pendingCheckpoint && !f->checkpoint->commitsRoot.empty()) return FLATSQL_OK;
         pending=bool(f->pendingCheckpoint);
         if(pending) state=*f->pendingCheckpoint; else if(f->checkpoint) state=*f->checkpoint;
         counters=f->k; start=f->mark; end=pending?int64_t(state.end):start; previous=pending?state.offset:f->lastCommit;
     }
-    int32_t rc=P4_OK; Conn* c=writerPin(e,f,&rc,err); if(!c) return rc;
+    int32_t rc=FLATSQL_OK; Conn* c=writerPin(e,f,&rc,err); if(!c) return rc;
     std::shared_ptr<Stream> stream=streamCur(f,&rc);
-    if(rc==P4_OK && f->end!=end) { writerUnpin(e,f); return P4_E_BUSY; }
-    if(rc==P4_OK && !pending) rc=checkpointAppend(f,c,stream.get(),counters,&end,&previous,&state,false,err);
-    if(rc==P4_OK) rc=streamSync(stream.get());
-    if(rc==P4_OK) {
+    if(rc==FLATSQL_OK && f->end!=end) { writerUnpin(e,f); return FLATSQL_E_BUSY; }
+    if(rc==FLATSQL_OK && !pending) rc=checkpointAppend(f,c,stream.get(),counters,&end,&previous,&state,false,err);
+    if(rc==FLATSQL_OK) rc=streamSync(stream.get());
+    if(rc==FLATSQL_OK) {
         int sql=c->exec("BEGIN IMMEDIATE");
         if(sql==SQLITE_OK) sql=writeMeta(c,counters,nowSec(),end,f->gen);
         if(sql==SQLITE_OK) {
@@ -631,7 +631,7 @@ int32_t checkpointFeed(Feed* f,bool force,std::string* err) {
         if(sql==SQLITE_OK) sql=writeStreamCache(c,f,end,previous,f->metadataBytes+end-start,state.typeSeqHigh,f->streamTokens,f->streamObjects,f->streamMoves);
         if(sql==SQLITE_OK) sql=c->exec("COMMIT"); if(sql!=SQLITE_OK) { c->exec("ROLLBACK"); rc=statusOfSqlite(sql); }
     }
-    if(rc==P4_OK) { std::lock_guard<std::mutex> g(f->type->mu); f->checkpoint=std::make_shared<CheckpointState>(std::move(state)); f->pendingCheckpoint.reset(); f->checkpointRows=0; f->end=f->mark=f->streamBytes=end; f->lastCommit=previous; f->metadataBytes+=end-start; }
+    if(rc==FLATSQL_OK) { std::lock_guard<std::mutex> g(f->type->mu); f->checkpoint=std::make_shared<CheckpointState>(std::move(state)); f->pendingCheckpoint.reset(); f->checkpointRows=0; f->end=f->mark=f->streamBytes=end; f->lastCommit=previous; f->metadataBytes+=end-start; }
     else if(stream) { streamTruncate(stream.get(),start,false); std::lock_guard<std::mutex> g(f->type->mu); f->pendingCheckpoint.reset(); f->end=start; }
     writerUnpin(e,f); return rc;
 }

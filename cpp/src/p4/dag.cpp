@@ -62,19 +62,19 @@ private:
 };
 struct Meta { uint64_t offset=0,previous=0; uint32_t kind=0; std::string bytes; };
 int32_t readMeta(Stream* stream,uint64_t at,uint64_t end,Meta* m) {
-    if(at>end || end-at<12) return P4_E_CORRUPT;
-    std::string prefix; int32_t rc=streamReadRange(stream,int64_t(at),4,&prefix); if(rc!=P4_OK) return rc;
-    const uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data())); if(n<8 || uint64_t(n)>end-at-4) return P4_E_CORRUPT;
-    rc=streamReadRange(stream,int64_t(at+4),n,&m->bytes); if(rc!=P4_OK) return rc;
+    if(at>end || end-at<12) return FLATSQL_E_CORRUPT;
+    std::string prefix; int32_t rc=streamReadRange(stream,int64_t(at),4,&prefix); if(rc!=FLATSQL_OK) return rc;
+    const uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data())); if(n<8 || uint64_t(n)>end-at-4) return FLATSQL_E_CORRUPT;
+    rc=streamReadRange(stream,int64_t(at+4),n,&m->bytes); if(rc!=FLATSQL_OK) return rc;
     std::vector<uint64_t> aligned((n+7)/8); std::memcpy(aligned.data(),m->bytes.data(),n);
     const auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier v(p,n);
     m->offset=at;
-    if(!std::memcmp(p+4,"$FMB",4) && VerifyFMBBuffer(v)) { const auto* x=GetFMB(p); m->previous=x->PREVIOUS(); m->kind=P4_RANGE_FMB; if(x->SELF_OFFSET()!=at) return P4_E_CORRUPT; }
-    else if(!std::memcmp(p+4,"$FCK",4) && VerifyFCKBuffer(v)) { const auto* x=GetFCK(p); m->previous=x->PREVIOUS(); m->kind=P4_RANGE_FCK; if(x->SELF_OFFSET()!=at) return P4_E_CORRUPT; }
-    else if(!std::memcmp(p+4,"$FSG",4) && VerifyFSGBuffer(v)) { const auto* x=GetFSG(p); m->previous=x->PREVIOUS(); m->kind=P4_RANGE_FSG; if(x->SELF_OFFSET()!=at) return P4_E_CORRUPT; }
-    else return P4_E_CORRUPT;
-    if(at && m->previous>=at) return P4_E_CORRUPT;
-    return P4_OK;
+    if(!std::memcmp(p+4,"$FMB",4) && VerifyFMBBuffer(v)) { const auto* x=GetFMB(p); m->previous=x->PREVIOUS(); m->kind=FLATSQL_RANGE_FMB; if(x->SELF_OFFSET()!=at) return FLATSQL_E_CORRUPT; }
+    else if(!std::memcmp(p+4,"$FCK",4) && VerifyFCKBuffer(v)) { const auto* x=GetFCK(p); m->previous=x->PREVIOUS(); m->kind=FLATSQL_RANGE_FCK; if(x->SELF_OFFSET()!=at) return FLATSQL_E_CORRUPT; }
+    else if(!std::memcmp(p+4,"$FSG",4) && VerifyFSGBuffer(v)) { const auto* x=GetFSG(p); m->previous=x->PREVIOUS(); m->kind=FLATSQL_RANGE_FSG; if(x->SELF_OFFSET()!=at) return FLATSQL_E_CORRUPT; }
+    else return FLATSQL_E_CORRUPT;
+    if(at && m->previous>=at) return FLATSQL_E_CORRUPT;
+    return FLATSQL_OK;
 }
 std::string rawCid(const Digest& d) { return ipldCidDigest(IpldRaw,d.data()); }
 Digest digestOf(const uint8_t* p) { Digest d; std::memcpy(d.data(),p,32); return d; }
@@ -145,34 +145,34 @@ int32_t apply(DagState& s,const Meta& m) {
     std::vector<uint64_t> aligned((m.bytes.size()+7)/8); std::memcpy(aligned.data(),m.bytes.data(),m.bytes.size());
     const auto* p=reinterpret_cast<const uint8_t*>(aligned.data());
     Raw self; self.at=m.offset; self.length=uint32_t(m.bytes.size()); ps::sha256(p,m.bytes.size(),self.digest.data());
-    if(m.kind==P4_RANGE_FCK) {
+    if(m.kind==FLATSQL_RANGE_FCK) {
         if(m.offset && s.firstCheckpoint==UINT64_MAX) s.firstCheckpoint=m.offset;
         if(s.hasCheckpoint && s.checkpoint.digest!=self.digest) s.drops.push_back({rawCid(s.checkpoint.digest),m.offset,s.gen});
         const auto oldSegments=std::move(s.segments);
         s.checkpoint=self; s.hasCheckpoint=true; s.segments.clear(); const auto* ck=GetFCK(p);
         if(ck->SEGMENTS()) {
-            if(!ck->SEGMENT_DIGESTS() || ck->SEGMENT_DIGESTS()->size()!=ck->SEGMENTS()->size()*32) return P4_E_CORRUPT;
+            if(!ck->SEGMENT_DIGESTS() || ck->SEGMENT_DIGESTS()->size()!=ck->SEGMENTS()->size()*32) return FLATSQL_E_CORRUPT;
             for(size_t i=0;i<ck->SEGMENTS()->size();i++) { const auto* x=ck->SEGMENTS()->Get(flatbuffers::uoffset_t(i)); s.segments.push_back({x->OFFSET(),x->LENGTH(),digestOf(ck->SEGMENT_DIGESTS()->data()+i*32)}); }
         }
         std::set<Digest> liveSegments; for(const auto& r:s.segments) liveSegments.insert(r.digest);
         for(const auto& r:oldSegments) if(!liveSegments.count(r.digest)) s.drops.push_back({rawCid(r.digest),m.offset,s.gen});
-    } else if(m.kind==P4_RANGE_FMB) {
+    } else if(m.kind==FLATSQL_RANGE_FMB) {
         const auto* mb=GetFMB(p); const size_t rows=mb->ROWS()?mb->ROWS()->size():0;
         std::vector<const ::FMBSealed*> sealed; std::vector<const ::FMBLarge*> larges;
-        if(!fmbByRow(mb->SEALED(),rows,&sealed) || !fmbByRow(mb->LARGE(),rows,&larges)) return P4_E_CORRUPT;
+        if(!fmbByRow(mb->SEALED(),rows,&sealed) || !fmbByRow(mb->LARGE(),rows,&larges)) return FLATSQL_E_CORRUPT;
         const uint32_t index=uint32_t(s.units.size()); s.units.emplace_back(); Unit& u=s.units.back();
         u.metadata=self; u.changedAt=m.offset; u.firstFrame=uint32_t(s.frames.size());
         // The round's new frames, in stream order after every earlier frame.
         size_t dig=0; std::vector<std::pair<Frame,Large>> added;
         for(size_t i=0;i<rows;i++) {
             const auto* r=mb->ROWS()->Get(flatbuffers::uoffset_t(i)); if(!(r->FLAGS()&FmbNewFrame)) continue;
-            if(!mb->DIGESTS() || dig+32>mb->DIGESTS()->size()) return P4_E_CORRUPT;
+            if(!mb->DIGESTS() || dig+32>mb->DIGESTS()->size()) return FLATSQL_E_CORRUPT;
             Frame f; f.at=r->OFFSET(); f.length=r->LENGTH(); f.owner=index; f.digest=digestOf(mb->DIGESTS()->data()+dig); dig+=32;
-            if(r->FLAGS()&FmbSealed) { const auto* x=fmbRow(sealed,i); if(!x || !x->LEAF_DIGEST() || x->LEAF_DIGEST()->size()!=32) return P4_E_CORRUPT; f.digest=digestOf(x->LEAF_DIGEST()->data()); }
+            if(r->FLAGS()&FmbSealed) { const auto* x=fmbRow(sealed,i); if(!x || !x->LEAF_DIGEST() || x->LEAF_DIGEST()->size()!=32) return FLATSQL_E_CORRUPT; f.digest=digestOf(x->LEAF_DIGEST()->data()); }
             Large big;
             if(r->FLAGS()&FmbLarge) {
                 const auto* x=fmbRow(larges,i); const size_t leaves=(uint64_t(r->LENGTH())+IpldChunkSize-1)/IpldChunkSize;
-                if(!x || !x->ROOT_CID() || x->ROOT_CID()->size()!=36 || !x->ROOT_NODE() || !x->LEAF_DIGESTS() || x->LEAF_DIGESTS()->size()!=leaves*32) return P4_E_CORRUPT;
+                if(!x || !x->ROOT_CID() || x->ROOT_CID()->size()!=36 || !x->ROOT_NODE() || !x->LEAF_DIGESTS() || x->LEAF_DIGESTS()->size()!=leaves*32) return FLATSQL_E_CORRUPT;
                 f.large=true; big.cid.assign(reinterpret_cast<const char*>(x->ROOT_CID()->data()),36);
                 big.node.assign(reinterpret_cast<const char*>(x->ROOT_NODE()->data()),x->ROOT_NODE()->size());
                 for(size_t j=0;j<leaves;j++) big.leaves.push_back(digestOf(x->LEAF_DIGESTS()->data()+j*32));
@@ -181,7 +181,7 @@ int32_t apply(DagState& s,const Meta& m) {
         }
         std::sort(added.begin(),added.end(),[](const auto& a,const auto& b){ return a.first.at<b.first.at; });
         for(auto& item:added) {
-            if(!s.frames.empty() && item.first.at<=s.frames.back().at) return P4_E_CORRUPT;
+            if(!s.frames.empty() && item.first.at<=s.frames.back().at) return FLATSQL_E_CORRUPT;
             if(item.first.large) s.large[item.first.at]=std::move(item.second);
             s.frames.push_back(item.first);
         }
@@ -189,7 +189,7 @@ int32_t apply(DagState& s,const Meta& m) {
         for(size_t i=0;i<rows;i++) {
             const auto* r=mb->ROWS()->Get(flatbuffers::uoffset_t(i)); const uint64_t rid=(r->SEQ()<<16)|r->ROW_J();
             if(const auto* old=s.live.find(rid)) eraseRow(s,*old,m.offset,nullptr);
-            const uint32_t fi=frameAt(s,r->OFFSET()); if(fi==UINT32_MAX) return P4_E_CORRUPT;
+            const uint32_t fi=frameAt(s,r->OFFSET()); if(fi==UINT32_MAX) return FLATSQL_E_CORRUPT;
             Frame& frame=s.frames[fi];
             if(!frame.refs) { s.units[frame.owner].changedAt=m.offset; ++s.units[frame.owner].liveFrames; }
             ++frame.refs; ++s.units[index].live; s.live.put(rid,fi,index); s.dirty.insert(frame.owner);
@@ -202,7 +202,7 @@ int32_t apply(DagState& s,const Meta& m) {
         }
         s.dirty.insert(index);
     }
-    s.end=m.offset+4+m.bytes.size(); s.last=m.offset; return P4_OK;
+    s.end=m.offset+4+m.bytes.size(); s.last=m.offset; return FLATSQL_OK;
 }
 void updateTree(DagState& s,uint64_t through) {
     // Removal units and URL updates are live while a unit they affect is live.
@@ -248,16 +248,16 @@ public:
     Closure(const DagState& s,uint64_t end,std::vector<DagBlock>* out,uint64_t from=0):s_(s),end_(end),from_(from),out_(out) {}
     bool root(const std::vector<IpldLink>& links,const std::string& dir,uint64_t unit) {
         if(!node(ipldDagPb(links,&dir),unit,nullptr)) return false;
-        if(!raw(s_.checkpoint,P4_RANGE_FCK) || !tree(s_.tree.size()-1,0)) return false;
+        if(!raw(s_.checkpoint,FLATSQL_RANGE_FCK) || !tree(s_.tree.size()-1,0)) return false;
         const std::string segments=ipldDagPb(segmentLinks(s_)); bool fresh=false;
         if(!node(segments,unit,&fresh)) return false;
-        if(fresh) for(const auto& r:s_.segments) if(!raw(r,P4_RANGE_FSG)) return false;
+        if(fresh) for(const auto& r:s_.segments) if(!raw(r,FLATSQL_RANGE_FSG)) return false;
         return true;
     }
 private:
     bool first(const std::string& cid) { return seen_.insert(cid).second; }
     bool node(const std::string& bytes,uint64_t unit,bool* fresh,const std::string* expect=nullptr) {
-        DagBlock b; b.kind=P4_RANGE_LINK; b.unit=unit; b.cid=ipldCid(IpldDagPb,bytes.data(),bytes.size());
+        DagBlock b; b.kind=FLATSQL_RANGE_LINK; b.unit=unit; b.cid=ipldCid(IpldDagPb,bytes.data(),bytes.size());
         if(expect && b.cid!=*expect) return false;
         const bool isNew=first(b.cid); if(fresh) *fresh=isNew;
         if(isNew && unit>=from_) { b.bytes=bytes; b.length=bytes.size(); out_->push_back(std::move(b)); }
@@ -287,15 +287,15 @@ private:
         if(!fresh) return true;
         for(uint32_t i=u.firstFrame;i<u.firstFrame+u.frameCount;i++) {
             const Frame& f=s_.frames[i]; if(!f.refs) continue;
-            if(!f.large) { if(!raw({f.at,f.length,f.digest},P4_RANGE_RECORD,u.metadata.at)) return false; continue; }
+            if(!f.large) { if(!raw({f.at,f.length,f.digest},FLATSQL_RANGE_RECORD,u.metadata.at)) return false; continue; }
             const Large& big=s_.large.at(f.at); if(!first(big.cid)) continue;
-            if(u.metadata.at>=from_) { DagBlock root; root.cid=big.cid; root.bytes=big.node; root.length=big.node.size(); root.unit=u.metadata.at; root.kind=P4_RANGE_LARGE_ROOT; out_->push_back(std::move(root)); }
+            if(u.metadata.at>=from_) { DagBlock root; root.cid=big.cid; root.bytes=big.node; root.length=big.node.size(); root.unit=u.metadata.at; root.kind=FLATSQL_RANGE_LARGE_ROOT; out_->push_back(std::move(root)); }
             for(size_t j=0;j<big.leaves.size();j++) {
                 const uint64_t at=f.at+j*IpldChunkSize;
-                if(!raw({at,uint32_t(std::min<uint64_t>(IpldChunkSize,f.length-j*IpldChunkSize)),big.leaves[j]},P4_RANGE_LARGE_LEAF,u.metadata.at)) return false;
+                if(!raw({at,uint32_t(std::min<uint64_t>(IpldChunkSize,f.length-j*IpldChunkSize)),big.leaves[j]},FLATSQL_RANGE_LARGE_LEAF,u.metadata.at)) return false;
             }
         }
-        return raw(u.metadata,P4_RANGE_FMB);
+        return raw(u.metadata,FLATSQL_RANGE_FMB);
     }
     const DagState& s_; uint64_t end_,from_; std::vector<DagBlock>* out_; std::unordered_set<std::string> seen_;
 };
@@ -306,9 +306,9 @@ int32_t build(Feed* feed,Stream* stream,uint64_t previous,uint64_t end,DagSnapsh
         // The cache never goes back. An earlier point's commits root is one
         // it recorded when a build stopped there; nothing replays the feed.
         const auto it=ptr->commitRoots.find(previous);
-        if(closure || it==ptr->commitRoots.end()) { if(err) *err="DAG cache is past commit point "+std::to_string(previous); return P4_E_BUSY; }
+        if(closure || it==ptr->commitRoots.end()) { if(err) *err="DAG cache is past commit point "+std::to_string(previous); return FLATSQL_E_BUSY; }
         DagSnapshot result; result.through=previous; result.generation=stream->gen; result.commitsRoot=it->second;
-        *out=std::move(result); return P4_OK;
+        *out=std::move(result); return FLATSQL_OK;
     }
     if(!ptr) {
         ptr=std::make_shared<DagState>(); ptr->gen=stream->gen;
@@ -317,12 +317,12 @@ int32_t build(Feed* feed,Stream* stream,uint64_t previous,uint64_t end,DagSnapsh
     }
     DagState& s=*ptr; std::vector<Meta> tail; uint64_t at=previous;
     while(at!=UINT64_MAX && (s.last==UINT64_MAX || at>s.last)) {
-        Meta m; const int32_t rc=readMeta(stream,at,end,&m); if(rc!=P4_OK) { if(err) *err="invalid acknowledged DAG chain: "+stream->path; return rc; }
+        Meta m; const int32_t rc=readMeta(stream,at,end,&m); if(rc!=FLATSQL_OK) { if(err) *err="invalid acknowledged DAG chain: "+stream->path; return rc; }
         at=m.previous; tail.push_back(std::move(m));
     }
-    if(s.last!=UINT64_MAX && at!=s.last) return P4_E_CORRUPT;
-    for(auto it=tail.rbegin();it!=tail.rend();++it) { const int32_t rc=apply(s,*it); if(rc!=P4_OK) return rc; }
-    if(!s.hasCheckpoint) return P4_E_CORRUPT;
+    if(s.last!=UINT64_MAX && at!=s.last) return FLATSQL_E_CORRUPT;
+    for(auto it=tail.rbegin();it!=tail.rend();++it) { const int32_t rc=apply(s,*it); if(rc!=FLATSQL_OK) return rc; }
+    if(!s.hasCheckpoint) return FLATSQL_E_CORRUPT;
     updateTree(s,previous);
     DagSnapshot result; result.through=previous; result.generation=stream->gen;
     const Link& commits=s.tree.back().front(); const Link segments=linkOf(segmentLinks(s),previous);
@@ -331,14 +331,14 @@ int32_t build(Feed* feed,Stream* stream,uint64_t previous,uint64_t end,DagSnapsh
     const std::vector<IpldLink> rootLinks={{rawCid(s.checkpoint.digest),"checkpoint",0},{commits.cid,"commits",0},{segments.cid,"segments",0}};
     const std::string rootBytes=ipldDagPb(rootLinks,&dir);
     result.root=ipldCid(IpldDagPb,rootBytes.data(),rootBytes.size()); result.commitsRoot=commits.cid;
-    if(closure && !Closure(s,end,&result.blocks,from).root(rootLinks,dir,previous)) return P4_E_CORRUPT;
-    *out=std::move(result); return P4_OK;
+    if(closure && !Closure(s,end,&result.blocks,from).root(rootLinks,dir,previous)) return FLATSQL_E_CORRUPT;
+    *out=std::move(result); return FLATSQL_OK;
 }
 // Read the three cache values in one SQLite snapshot, then pin that stream
 // before releasing the snapshot. Compaction can prepare and swap another
 // generation concurrently, but cannot mix its offsets with this one.
 int32_t committedStream(Feed* f,std::shared_ptr<Stream>* stream,uint64_t* previous,uint64_t* end,std::string* err) {
-    { std::lock_guard<std::mutex> lock(f->type->mu); if(f->quarantined) return P4_E_CORRUPT; }
+    { std::lock_guard<std::mutex> lock(f->type->mu); if(f->quarantined) return FLATSQL_E_CORRUPT; }
     int sql=SQLITE_OK; Conn* c=f->type->e->rpool.acquire(f->path,OpenKind::Reader,&sql,err);
     if(!c) return statusOfSqlite(sql);
     sql=c->exec("BEGIN"); uint32_t gen=0; unsigned seen=0;
@@ -357,30 +357,30 @@ int32_t committedStream(Feed* f,std::shared_ptr<Stream>* stream,uint64_t* previo
             sqlite3_reset(q); if(sql==SQLITE_DONE) sql=seen==7?SQLITE_OK:SQLITE_CORRUPT;
         }
     }
-    int32_t rc=sql==SQLITE_OK?P4_OK:statusOfSqlite(sql);
-    if(rc==P4_OK) { *stream=streamAt(f,gen,&rc); if(!*stream && rc==P4_OK) rc=P4_E_BUSY; }
+    int32_t rc=sql==SQLITE_OK?FLATSQL_OK:statusOfSqlite(sql);
+    if(rc==FLATSQL_OK) { *stream=streamAt(f,gen,&rc); if(!*stream && rc==FLATSQL_OK) rc=FLATSQL_E_BUSY; }
     c->exec("ROLLBACK"); f->type->e->rpool.release(c);
-    if(rc==P4_OK && (*previous>=*end || *end<12)) return P4_E_CORRUPT;
+    if(rc==FLATSQL_OK && (*previous>=*end || *end<12)) return FLATSQL_E_CORRUPT;
     return rc;
 }
 // Retired streams are immutable, and can be rediscovered after a restart.
 // Skip record payloads; only size prefixes and metadata headers are read.
 int32_t retiredBounds(Stream* stream,uint64_t* previous,uint64_t* end,uint64_t* firstCheckpoint=nullptr,uint64_t limit=0) {
-    const int64_t length=limit?int64_t(limit):streamSize(stream); if(length<12) return P4_E_CORRUPT;
+    const int64_t length=limit?int64_t(limit):streamSize(stream); if(length<12) return FLATSQL_E_CORRUPT;
     *previous=UINT64_MAX; *end=0; if(firstCheckpoint) *firstCheckpoint=UINT64_MAX;
     uint64_t at=0;
     while(at<uint64_t(length)) {
-        if(uint64_t(length)-at<12) return P4_E_CORRUPT;
-        std::string prefix; const int32_t rc=streamReadRange(stream,int64_t(at),12,&prefix); if(rc!=P4_OK) return rc;
+        if(uint64_t(length)-at<12) return FLATSQL_E_CORRUPT;
+        std::string prefix; const int32_t rc=streamReadRange(stream,int64_t(at),12,&prefix); if(rc!=FLATSQL_OK) return rc;
         const uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data()));
-        if(n<8 || uint64_t(n)>uint64_t(length)-at-4) return P4_E_CORRUPT;
+        if(n<8 || uint64_t(n)>uint64_t(length)-at-4) return FLATSQL_E_CORRUPT;
         if(!std::memcmp(prefix.data()+8,"$FMB",4) || !std::memcmp(prefix.data()+8,"$FSG",4) || !std::memcmp(prefix.data()+8,"$FCK",4)) {
             *previous=at; *end=at+4+n;
             if(firstCheckpoint && at && *firstCheckpoint==UINT64_MAX && !std::memcmp(prefix.data()+8,"$FCK",4)) *firstCheckpoint=at;
         }
         at+=4+n;
     }
-    return *previous==UINT64_MAX?P4_E_CORRUPT:P4_OK;
+    return *previous==UINT64_MAX?FLATSQL_E_CORRUPT:FLATSQL_OK;
 }
 }
 int32_t feedDagAt(Feed* f,Stream* stream,uint64_t previous,uint64_t end,DagSnapshot* out,std::string* err) {
@@ -388,7 +388,7 @@ int32_t feedDagAt(Feed* f,Stream* stream,uint64_t previous,uint64_t end,DagSnaps
 }
 int32_t feedDagCommitRootHeld(Feed* f,Stream* stream,uint64_t previous,uint64_t end,std::string* cid,std::string* err) {
     DagSnapshot result;
-    const int32_t rc=build(f,stream,previous,end,&result,err,false); if(rc==P4_OK) *cid=std::move(result.commitsRoot); return rc;
+    const int32_t rc=build(f,stream,previous,end,&result,err,false); if(rc==FLATSQL_OK) *cid=std::move(result.commitsRoot); return rc;
 }
 int32_t feedDagCommitRoot(Feed* f,Stream* stream,uint64_t previous,uint64_t end,std::string* cid,std::string* err) {
     std::lock_guard<std::mutex> lock(f->dagMu); return feedDagCommitRootHeld(f,stream,previous,end,cid,err);
@@ -418,8 +418,8 @@ int32_t feedDagSnapshot(Feed* f,DagSnapshot* out,std::string* err,uint64_t from,
         // builder's is: the cache only moves forward, never resets for a
         // point another builder already passed (smu holders never take dagMu).
         std::lock_guard<std::mutex> lock(f->dagMu);
-        rc=committedStream(f,&stream,&previous,&end,err); if(rc!=P4_OK) return rc;
-        rc=build(f,stream.get(),previous,end,out,err,closure,from); if(rc!=P4_OK) return rc;
+        rc=committedStream(f,&stream,&previous,&end,err); if(rc!=FLATSQL_OK) return rc;
+        rc=build(f,stream.get(),previous,end,out,err,closure,from); if(rc!=FLATSQL_OK) return rc;
     }
     out->stream=std::move(stream);
     // Released generations whose files have left the retained set no longer
@@ -428,7 +428,7 @@ int32_t feedDagSnapshot(Feed* f,DagSnapshot* out,std::string* err,uint64_t from,
     { std::lock_guard<std::mutex> lock(f->smu); retained.insert(f->gen); if(f->retired) retained.insert(f->retired->gen); for(const auto& old:f->olderRetired) retained.insert(old.stream->gen); }
     retained.insert(out->generation);
     { std::lock_guard<std::mutex> lock(f->dagMu); for(auto it=f->dagHistory->generations.begin();it!=f->dagHistory->generations.end();) { if(!retained.count(it->first)) it=f->dagHistory->generations.erase(it); else ++it; } }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 namespace {
 struct DigestHash { size_t operator()(const Digest& d) const { size_t h; std::memcpy(&h,d.data(),sizeof h); return h; } };
@@ -460,20 +460,20 @@ void liveOf(const DagState& s,const std::unordered_set<std::string>& candidates,
 int32_t feedDagDrops(Feed* f,uint64_t from,std::vector<DagDrop>* out,std::string* err) {
     // The committed point without its closure: a drop is listed unless the
     // closure still holds its CID, which the cache answers per candidate.
-    DagSnapshot snapshot; int32_t rc=feedDagSnapshot(f,&snapshot,err,0,false); if(rc!=P4_OK) return rc;
+    DagSnapshot snapshot; int32_t rc=feedDagSnapshot(f,&snapshot,err,0,false); if(rc!=FLATSQL_OK) return rc;
     std::vector<uint32_t> retired;
     { std::lock_guard<std::mutex> lock(f->smu); if(f->retired) retired.push_back(f->retired->gen); for(const auto& r:f->olderRetired) retired.push_back(r.stream->gen); }
     for(uint32_t gen:retired) {
-        auto stream=streamAt(f,gen,&rc); if(!stream) { if(rc!=P4_OK) return rc; continue; }
-        const int64_t length=streamSize(stream.get()); if(length<0) return P4_E_IO;
+        auto stream=streamAt(f,gen,&rc); if(!stream) { if(rc!=FLATSQL_OK) return rc; continue; }
+        const int64_t length=streamSize(stream.get()); if(length<0) return FLATSQL_E_IO;
         { std::lock_guard<std::mutex> lock(f->dagMu); const auto cached=f->dagHistory->generations.find(gen); if(cached!=f->dagHistory->generations.end() && cached->second && cached->second->end==uint64_t(length)) continue; }
-        uint64_t previous,end; rc=retiredBounds(stream.get(),&previous,&end); if(rc!=P4_OK) return rc;
+        uint64_t previous,end; rc=retiredBounds(stream.get(),&previous,&end); if(rc!=FLATSQL_OK) return rc;
         std::lock_guard<std::mutex> lock(f->dagMu); DagSnapshot ignored;
-        rc=build(f,stream.get(),previous,end,&ignored,err,false); if(rc!=P4_OK) return rc;
+        rc=build(f,stream.get(),previous,end,&ignored,err,false); if(rc!=FLATSQL_OK) return rc;
     }
     std::lock_guard<std::mutex> lock(f->dagMu); std::set<std::tuple<std::string,uint64_t,uint32_t>> seen;
     const auto current=f->dagHistory->generations.find(snapshot.generation);
-    if(current==f->dagHistory->generations.end() || !current->second) return P4_E_INTERNAL;
+    if(current==f->dagHistory->generations.end() || !current->second) return FLATSQL_E_INTERNAL;
     // The candidates first, in their order; then one pass over the cache
     // for the ones the closure holds.
     std::vector<DagDrop> candidates;
@@ -493,30 +493,30 @@ int32_t feedDagDrops(Feed* f,uint64_t from,std::vector<DagDrop>* out,std::string
         for(const auto& block:generation.second->segments) append(block);
         for(const auto& unit:generation.second->units) if(unit.linked) append(unit.metadata);
     }
-    if(candidates.empty()) return P4_OK;
+    if(candidates.empty()) return FLATSQL_OK;
     std::unordered_set<std::string> cids,live; for(const auto& d:candidates) cids.insert(d.cid);
     liveOf(*current->second,cids,&live);
     for(auto& d:candidates) if(!live.count(d.cid)) out->push_back(std::move(d));
-    return P4_OK;
+    return FLATSQL_OK;
 }
 void feedDagReset(Feed* f) { std::lock_guard<std::mutex> lock(f->dagMu); f->dagHistory.reset(); }
-int32_t feedExposure(Feed* f,bool on) { f->ipfsExposed.store(on); f->type->e->kickMaintenance(); return P4_OK; }
+int32_t feedExposure(Feed* f,bool on) { f->ipfsExposed.store(on); f->type->e->kickMaintenance(); return FLATSQL_OK; }
 int32_t feedRelease(Feed* f,uint32_t generation,uint64_t through) {
     uint32_t current;
     { std::lock_guard<std::mutex> lock(f->smu); current=f->gen; }
-    if(generation>current) return P4_E_ARG;
+    if(generation>current) return FLATSQL_E_ARG;
     std::vector<uint32_t> retire;
     if(generation==current) {
         // A current-generation acknowledgement covers all earlier ranges
         // only after that generation's compaction checkpoint was published.
         // Offset comparisons never cross generation boundaries.
         uint64_t previous=0,end=0; std::shared_ptr<Stream> stream;
-        int32_t rc=committedStream(f,&stream,&previous,&end,nullptr); if(rc!=P4_OK) return rc;
-        if(stream->gen!=generation || through>previous) return P4_E_ARG;
+        int32_t rc=committedStream(f,&stream,&previous,&end,nullptr); if(rc!=FLATSQL_OK) return rc;
+        if(stream->gen!=generation || through>previous) return FLATSQL_E_ARG;
         if(generation) {
             uint64_t last,boundary,firstCheckpoint;
-            rc=retiredBounds(stream.get(),&last,&boundary,&firstCheckpoint,end); if(rc!=P4_OK) return rc;
-            if(through<firstCheckpoint) return P4_OK;
+            rc=retiredBounds(stream.get(),&last,&boundary,&firstCheckpoint,end); if(rc!=FLATSQL_OK) return rc;
+            if(through<firstCheckpoint) return FLATSQL_OK;
         }
         std::lock_guard<std::mutex> lock(f->smu);
         if(f->retired && f->retired->gen<generation) retire.push_back(f->retired->gen);
@@ -529,13 +529,13 @@ int32_t feedRelease(Feed* f,uint32_t generation,uint64_t through) {
         uint64_t need=UINT64_MAX;
         { std::lock_guard<std::mutex> lock(f->smu); const auto it=f->releaseRequired.find(old); if(it!=f->releaseRequired.end()) need=it->second; }
         if(need==UINT64_MAX) {
-            int32_t rc=P4_OK; auto stream=streamAt(f,old,&rc); if(!stream) { if(rc!=P4_OK) return rc; continue; }
-            uint64_t end; rc=retiredBounds(stream.get(),&need,&end); if(rc!=P4_OK) return rc;
+            int32_t rc=FLATSQL_OK; auto stream=streamAt(f,old,&rc); if(!stream) { if(rc!=FLATSQL_OK) return rc; continue; }
+            uint64_t end; rc=retiredBounds(stream.get(),&need,&end); if(rc!=FLATSQL_OK) return rc;
         }
         std::lock_guard<std::mutex> lock(f->smu);
         f->releaseRequired[old]=need; f->releasedThrough[old]=need;
     }
-    f->type->e->kickMaintenance(); return P4_OK;
+    f->type->e->kickMaintenance(); return FLATSQL_OK;
 }
 uint64_t feedBlockedGenerations(Feed* f) {
     std::lock_guard<std::mutex> lock(f->smu); uint64_t n=0;

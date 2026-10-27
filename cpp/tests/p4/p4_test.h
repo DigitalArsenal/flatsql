@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "flatsql/p4/flatsql_p4.h"
+#include "flatsql/flatsql.h"
 #include "flatsql/ps/result_block.h"
 
 namespace reflection {
@@ -42,11 +42,11 @@ std::string argStr(const char* name, const std::string& def);
 void report(const char* key, double value, const char* unit);  // a measured number, with the load average
 double loadAvg();
 
-#define P4_TEST(name) \
+#define FLATSQL_TEST(name) \
     static void name(); \
     static ::p4t::Reg reg_##name(#name, name); \
     static void name()
-#define P4_SLOW_TEST(name) \
+#define FLATSQL_SLOW_TEST(name) \
     static void name(); \
     static ::p4t::Reg reg_##name(#name, name, true); \
     static void name()

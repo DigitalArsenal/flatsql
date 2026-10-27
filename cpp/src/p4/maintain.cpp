@@ -169,7 +169,7 @@ int walHook(void* arg, sqlite3* db, const char* zDb, int nPages) {
 // ---- work on a type's writer -----------------------------------------------------------------------
 int32_t runOnWriter(Engine* e, Type* t, int op, Internal* in) {
     WriteTask* wt = new (std::nothrow) WriteTask();
-    if (!wt) return P4_E_NOMEM;
+    if (!wt) return FLATSQL_E_NOMEM;
     wt->op = op;
     wt->type = t;
     wt->internal = in;
@@ -288,7 +288,7 @@ public:
             started_ = true;
             for (size_t i = 0; i < ss_.size(); i++) {
                 const int32_t rc = fill(ss_[i]);
-                if (rc != P4_OK) return rc;
+                if (rc != FLATSQL_OK) return rc;
                 if (!ss_[i].buf.empty()) heap_.push(Head{ss_[i].buf.front(), ss_[i].fid, i});
             }
         }
@@ -299,7 +299,7 @@ public:
         s.buf.pop_front();
         if (s.buf.empty() && !s.done) {
             const int32_t rc = fill(s);
-            if (rc != P4_OK) return rc;
+            if (rc != FLATSQL_OK) return rc;
         }
         if (!s.buf.empty()) heap_.push(Head{s.buf.front(), s.fid, h.i});
         *seq = h.seq;
@@ -322,13 +322,13 @@ private:
         bool operator<(const Head& o) const { return seq != o.seq ? seq > o.seq : fid > o.fid; }  // a min-heap
     };
     int32_t fill(S& s) {
-        if (s.done) return P4_OK;
+        if (s.done) return FLATSQL_OK;
         int orc = 0;
         Conn* c = e_->rpool.acquire(s.path, OpenKind::Reader, &orc, nullptr);
         if (!c) return statusOfSqlite(orc);
         sqlite3_stmt* q = c->sql(s.indexed ? "SELECT seq FROM r INDEXED BY r_s WHERE seq>?1 AND seq<=?2 ORDER BY seq LIMIT ?3"
                                            : "SELECT seq FROM r WHERE rid>=((?1+1)<<16) AND rid<=((?2<<16)|65535) ORDER BY rid LIMIT ?3");
-        int32_t st = q ? P4_OK : P4_E_INTERNAL;
+        int32_t st = q ? FLATSQL_OK : FLATSQL_E_INTERNAL;
         size_t got = 0;
         if (q) {
             sqlite3_bind_int64(q, 1, s.last);
@@ -345,8 +345,8 @@ private:
             if (r != SQLITE_DONE) st = statusOfSqlite(r);
         }
         e_->rpool.release(c);
-        if (st == P4_OK && got < chunk_) s.done = true;
-        if (st == P4_OK && s.buf.empty() && !s.done) return fill(s);  // a chunk of one record's rows
+        if (st == FLATSQL_OK && got < chunk_) s.done = true;
+        if (st == FLATSQL_OK && s.buf.empty() && !s.done) return fill(s);  // a chunk of one record's rows
         return st;
     }
     Engine* e_;
@@ -392,7 +392,7 @@ int32_t oldestOf(Engine* e, Type* t, size_t want, std::vector<std::pair<uint32_t
         }
         if (*ts == INT64_MAX) *ts = INT64_MIN;  // unknown: oldest
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 }  // namespace
 
@@ -409,7 +409,7 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFr
     // The file sizes first: a store whose files fit needs no page counts.
     if (uint64_t(storeBytes(e, false)) <= maxBytes) {
         setOver(false);
-        return P4_OK;
+        return FLATSQL_OK;
     }
     const int64_t before = storeBytes(e, true);
     int64_t used = before;
@@ -432,7 +432,7 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFr
             std::vector<std::pair<uint32_t, int64_t>> seqs;
             int64_t ts = 0;
             const int32_t rc = oldestOf(e, t, want, &seqs, &ts);
-            if (rc != P4_OK) return rc;
+            if (rc != FLATSQL_OK) return rc;
             if (!seqs.empty() && (!victim || ts < oldestTs)) {
                 oldestTs = ts;
                 victim = t;
@@ -441,14 +441,14 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFr
         }
         if (!victim) {
             // Nothing left to delete: under the configured quota, writes
-            // refuse (P4_E_NOSPACE) while reads continue.
+            // refuse (FLATSQL_E_NOSPACE) while reads continue.
             setOver(true);
-            return P4_OK;
+            return FLATSQL_OK;
         }
         Internal in;
         in.seqs = std::move(victimSeqs);
-        const int32_t rc = runOnWriter(e, victim, P4_OPC_QUOTA_GC, &in);
-        if (rc != P4_OK) return rc;
+        const int32_t rc = runOnWriter(e, victim, FLATSQL_OPC_QUOTA_GC, &in);
+        if (rc != FLATSQL_OK) return rc;
         *records += in.a;
         if (in.a == 0) break;
         ftsCatchUp(e, victim, false);  // the evicted records' full-text rows go before the next measure
@@ -456,7 +456,7 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFr
     }
     *bytesFreed = std::max<int64_t>(0, before - used);
     setOver(uint64_t(used) > maxBytes);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // ---- REBUILD ------------------------------------------------------------------------------------------
@@ -474,8 +474,8 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
         if (what & (1 | 2 | 8)) {
             Internal in;
             in.what = what & (1 | 2 | 8);
-            const int32_t rc = runOnWriter(e, t, P4_OPC_REBUILD, &in);
-            if (rc != P4_OK) return rc;
+            const int32_t rc = runOnWriter(e, t, FLATSQL_OPC_REBUILD, &in);
+            if (rc != FLATSQL_OK) return rc;
             entries = in.a;
             mismatches = in.b;
             if (firstBad && firstBad->empty() && !in.firstBad.empty()) *firstBad = in.firstBad;
@@ -491,22 +491,22 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
         rows->push_back({entries, mismatches});
         rowTypes->push_back(t);
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 }  // namespace
 
 // ---- FTS (background; never on the ingest path) -------------------------------------------------------
 int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
     std::shared_ptr<const Spec> sp = t->spec();
-    if (!sp->fullText || !t->hasFiles.load(std::memory_order_acquire)) return P4_OK;  // no data: no .fts yet
+    if (!sp->fullText || !t->hasFiles.load(std::memory_order_acquire)) return FLATSQL_OK;  // no data: no .fts yet
     std::lock_guard<std::mutex> g(t->ftsMu);
     if (!t->fts) {
         Conn* c = nullptr;
-        if (openConn(t->pFts, OpenKind::Index, 4096, 4096, &c, nullptr) != SQLITE_OK) return P4_E_IO;
+        if (openConn(t->pFts, OpenKind::Index, 4096, 4096, &c, nullptr) != SQLITE_OK) return FLATSQL_E_IO;
         if (c->exec("CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(t, content='', contentless_delete=1);"
                     "CREATE TABLE IF NOT EXISTS ftsmeta(k TEXT PRIMARY KEY, v) WITHOUT ROWID;") != SQLITE_OK) {
             delete c;
-            return P4_E_IO;
+            return FLATSQL_E_IO;
         }
         sqlite3_stmt* s = c->sql("SELECT v FROM ftsmeta WHERE k='through'");
         if (s && sqlite3_step(s) == SQLITE_ROW) t->ftsThrough = sqlite3_column_int64(s, 0);
@@ -541,7 +541,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
                     }
                     const int32_t st = fileHoldsSeq(c, seq, &held);
                     e->rpool.release(c);
-                    if (st != P4_OK) ok = false;
+                    if (st != FLATSQL_OK) ok = false;
                     if (held || !ok) break;
                 }
             if (!ok) break;
@@ -565,20 +565,20 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
     const int64_t vis = t->vis.load(std::memory_order_acquire);
     if (t->ftsThrough >= vis) {
         t->ftsState = 2;
-        return P4_OK;
+        return FLATSQL_OK;
     }
     t->ftsState = 1;
-    if (e->ftsHold.load()) return P4_OK;
+    if (e->ftsHold.load()) return FLATSQL_OK;
     const std::string fid(reinterpret_cast<const char*>(sp->tc.fid()), 4);
     // Pages of the feed files merged by seq, each seq read once from the
     // first feed file holding it, a file at a time.
     int64_t through = t->ftsThrough;
     const int64_t limit = all ? INT64_MAX : 20000;
     int64_t done = 0;
-    int32_t status = P4_OK;
+    int32_t status = FLATSQL_OK;
     SeqMerge merge(e, t, through, vis, 1024);
     bool end = false;
-    while (status == P4_OK && done < limit && !end) {
+    while (status == FLATSQL_OK && done < limit && !end) {
         std::vector<std::pair<int64_t, uint32_t>> page;  // (seq, fid)
         while (page.size() < 4096) {
             int64_t seq = 0;
@@ -595,7 +595,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             if (!page.empty() && page.back().first == seq) continue;  // a migrated seq held by several feeds
             page.push_back({seq, ffid});
         }
-        if (status != P4_OK) break;
+        if (status != FLATSQL_OK) break;
         if (page.empty()) {
             through = vis;
             break;
@@ -620,25 +620,25 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             // The bytes come from the stream generation this read transaction
             // sees (a compaction may have replaced it since: then a new one).
             std::shared_ptr<Stream> stream;
-            for (int tries = 0; tries < 4 && !stream && status == P4_OK; tries++) {
+            for (int tries = 0; tries < 4 && !stream && status == FLATSQL_OK; tries++) {
                 if (tries) c->exec("COMMIT");
                 c->exec("BEGIN");
                 uint32_t gen = 0;
                 int32_t st = snapGen(c, &gen);
-                if (st == P4_OK) stream = streamAt(f, gen, &st);
-                if (st != P4_OK) status = st;
+                if (st == FLATSQL_OK) stream = streamAt(f, gen, &st);
+                if (st != FLATSQL_OK) status = st;
             }
-            if (!stream && status == P4_OK) status = P4_E_BUSY;
+            if (!stream && status == FLATSQL_OK) status = FLATSQL_E_BUSY;
             std::string bytes;
             for (int64_t seq : kv.second) {
-                if (!s || status != P4_OK) break;
+                if (!s || status != FLATSQL_OK) break;
                 sqlite3_bind_int64(s, 1, seq << 16);
                 sqlite3_bind_int64(s, 2, (seq << 16) | 0xffff);
                 // The frame with its size prefix, as format 1 hands it: a record
                 // whose 8-byte fields align to a prefix the producer cut off
                 // verifies from that origin, any other from its own (C-46 (3)).
                 if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 2) == SQLITE_NULL &&
-                    streamRead(stream.get(), sqlite3_column_int64(s, 0), sqlite3_column_int64(s, 1), &bytes, true) == P4_OK) {
+                    streamRead(stream.get(), sqlite3_column_int64(s, 0), sqlite3_column_int64(s, 1), &bytes, true) == FLATSQL_OK) {
                     std::string text, err;
                     if (reflectedRecordSearchText(sp->tc.bfbs().data(), sp->tc.bfbs().size(), fid,
                                                   reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), text, &err)) {
@@ -654,9 +654,9 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             }
             c->exec("COMMIT");
             e->rpool.release(c);
-            if (status != P4_OK) break;
+            if (status != FLATSQL_OK) break;
         }
-        if (status != P4_OK) {
+        if (status != FLATSQL_OK) {
             t->fts->exec("ROLLBACK");
             break;
         }
@@ -669,7 +669,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         t->ftsThrough = through;
         done += int64_t(page.size());
     }
-    if (status == P4_OK && through >= vis) {
+    if (status == FLATSQL_OK && through >= vis) {
         sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
         sqlite3_bind_int64(m, 1, vis);
         sqlite3_step(m);
@@ -687,18 +687,18 @@ void runMaintSlot(Engine* e, uint32_t slot) {
     SlotOut out(e, slot);
     std::vector<Tlv> v;
     const bool parsed = h->reqLen <= e->reqBytes[0] && tlvParse(e->slotReq(slot), h->reqLen, &v);
-    if (h->op == P4_OPC_QUOTA_GC) {
+    if (h->op == FLATSQL_OPC_QUOTA_GC) {
         out.enc.header({"files_dropped", "records_dropped", "bytes_freed"});
         uint64_t maxBytes = 0;
         bool bad = !parsed;
         if (parsed && !tlvU64(v, 62, &maxBytes, &bad)) maxBytes = e->quota.load();
         if (bad) {
-            out.end(P4_E_ARG, "QUOTA_GC: tag 62 is a u64");
+            out.end(FLATSQL_E_ARG, "QUOTA_GC: tag 62 is a u64");
             return;
         }
         int64_t records = 0, bytes = 0;
-        const int32_t rc = maxBytes ? quotaGc(e, maxBytes, &records, &bytes, false) : P4_OK;
-        if (rc == P4_OK) {
+        const int32_t rc = maxBytes ? quotaGc(e, maxBytes, &records, &bytes, false) : FLATSQL_OK;
+        if (rc == FLATSQL_OK) {
             out.enc.beginRow();
             out.enc.i64(0);  // files_dropped: a partition keeps its file (C-32)
             out.enc.i64(records);
@@ -706,7 +706,7 @@ void runMaintSlot(Engine* e, uint32_t slot) {
             out.enc.endRow();
             out.rows = 1;
         }
-        out.end(rc, rc == P4_OK ? "" : "QUOTA_GC failed");
+        out.end(rc, rc == FLATSQL_OK ? "" : "QUOTA_GC failed");
         return;
     }
     out.enc.header({"type", "entries", "mismatches"});
@@ -718,14 +718,14 @@ void runMaintSlot(Engine* e, uint32_t slot) {
         tlvU32(v, 63, &what, &bad);
     }
     if (bad || what == 0 || (what & ~15u)) {
-        out.end(P4_E_ARG, "REBUILD needs what (tag 63)");
+        out.end(FLATSQL_E_ARG, "REBUILD needs what (tag 63)");
         return;
     }
     Type* only = nullptr;
     if (!type.empty()) {
         only = e->findType(type);
         if (!only) {
-            out.end(P4_E_NOTYPE, "type not registered: " + type);
+            out.end(FLATSQL_E_NOTYPE, "type not registered: " + type);
             return;
         }
     }
@@ -733,7 +733,7 @@ void runMaintSlot(Engine* e, uint32_t slot) {
     std::vector<Type*> rt;
     std::string damaged;
     const int32_t rc = rebuildOp(e, only, what, &rows, &rt, &damaged);
-    if (rc == P4_OK) {
+    if (rc == FLATSQL_OK) {
         for (size_t i = 0; i < rows.size(); i++) {
             out.enc.beginRow();
             out.enc.text(rt[i]->name.data(), rt[i]->name.size());
@@ -743,7 +743,7 @@ void runMaintSlot(Engine* e, uint32_t slot) {
             out.rows++;
         }
     }
-    out.end(rc, rc != P4_OK         ? std::string("REBUILD failed")
+    out.end(rc, rc != FLATSQL_OK         ? std::string("REBUILD failed")
                 : damaged.empty() ? std::string()
                                   : "integrity_check failed: " + damaged);
 }
@@ -878,7 +878,7 @@ void slowLoop(Engine* e) {
             for (uint32_t s : refused) {
                 SlotOut out(e, s);
                 out.enc.header({});
-                out.end(P4_E_STOPPED, "stopping");
+                out.end(FLATSQL_E_STOPPED, "stopping");
             }
             return;
         }

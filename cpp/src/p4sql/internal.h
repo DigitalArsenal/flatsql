@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-#include "flatsql/p4/flatsql_p4.h"
+#include "flatsql/flatsql.h"
 #include "flatsql/p4sql/p4sql.h"
 
 namespace flatsql {
@@ -124,15 +124,16 @@ struct Column {
     std::string name;
     uint16_t slot = 0;          // vtable slot = the field's id (positional)
     ColKind kind = kColNull;
-    bool placeholder = false;   // the >= 1 column fallback: a one-byte read of slot 0
+    bool placeholder = false;   // always false; surface describes real columns
+    int64_t defaultInt = 0;
+    double defaultReal = 0;
+    bool optional = false;
     const char* sqlType() const;
 };
 
-// Format 1's declared columns of a type (SDN engineDeclaredColumns): the
-// leading run of representable root fields in declaration order, a union's
-// discriminator ending the run, slot 0 as a one-byte placeholder when none is
-// representable; OMM and TBS keep their pinned table graphs (columns.cpp).
-bool format1Columns(const std::string& type, const uint8_t* bfbs, size_t n, std::vector<Column>* out,
+// All representable scalar fields, addressed by reflection field ID.
+// Tables and non-byte vectors stay in _data; no schema-specific exceptions.
+bool schemaColumns(const std::string& type, const uint8_t* bfbs, size_t n, std::vector<Column>* out,
                     std::string* err);
 // Format 1's value of column `c` in a record payload (no size prefix).
 void resultColumn(sqlite3_context* ctx, const Column& c, const uint8_t* data, size_t n);
@@ -237,11 +238,11 @@ public:
     ~RelScan() { close(); }
     RelScan(const RelScan&) = delete;
     RelScan& operator=(const RelScan&) = delete;
-    // Positions on the first row. P4_OK or a status.
+    // Positions on the first row. FLATSQL_OK or a status.
     int32_t open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, const ScanArgs& a);
     // A plan that reads no column: n rows without reading them (COUNT(*)).
     void openCounted(int64_t n);
-    int32_t next();   // P4_OK or a status
+    int32_t next();   // FLATSQL_OK or a status
     bool eof() const { return eof_; }
     const P4Row& row() const { return row_; }
     // The row's _source: the relation's "<TYPE>@<source>"; for <TYPE>,
@@ -271,7 +272,7 @@ private:
 // 1 found, 0 not a relation, < 0 status. Creates nothing.
 int32_t resolveRelation(LaneState* ls, const std::string& name, RelSpec* out, std::string* err);
 // Points the lane's relations at the spellings statement `sql` uses (C-43 B3).
-// P4_OK, or P4_E_SQL with *msg when two spellings of one relation name read
+// FLATSQL_OK, or FLATSQL_E_SQL with *msg when two spellings of one relation name read
 // different things (SQLite's catalog cannot hold both), or a status.
 int32_t bindSpellings(LaneState* ls, const char* sql, size_t n, std::string* msg);
 int registerModule(LaneState* ls);

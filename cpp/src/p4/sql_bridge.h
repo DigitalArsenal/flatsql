@@ -5,7 +5,7 @@
 #ifndef FLATSQL_P4_SQL_BRIDGE_H
 #define FLATSQL_P4_SQL_BRIDGE_H
 
-#include "flatsql/p4/flatsql_p4.h"
+#include "flatsql/flatsql.h"
 #include "flatsql/p4/p4_reader.h"
 
 #if __has_include("flatsql/p4sql/p4sql.h")
@@ -17,7 +17,7 @@ extern "C" {
 typedef struct P4SqlRequest {
     const char* sql; uint32_t sqlLen;
     const uint8_t* params; uint32_t paramsLen;   /* RB1 params: u32 n, then n cells */
-    uint32_t flags;                              /* P4_SLOT_RAW | P4_SLOT_SANDBOX */
+    uint32_t flags;                              /* FLATSQL_SLOT_RAW | FLATSQL_SLOT_SANDBOX */
     uint64_t maxResultRows, maxResultBytes;      /* 0 = none */
 } P4SqlRequest;
 int32_t p4sql_global_init(void);

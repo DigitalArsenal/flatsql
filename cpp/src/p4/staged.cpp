@@ -335,7 +335,7 @@ namespace {
 int32_t readStaged(Conn* c, std::vector<StRow>* out, std::vector<std::pair<IdentKey, int64_t>>* ids) {
     std::vector<StRow>& rows = *out;
     sqlite3_stmt* q = c->sql("SELECT rid, cid, e, k, ts, at FROM r INDEXED BY r_m WHERE m=0");
-    if (!q) return P4_E_FORMAT;
+    if (!q) return FLATSQL_E_FORMAT;
     int r;
     while ((r = sqlite3_step(q)) == SQLITE_ROW) {
         if (sqlite3_column_bytes(q, 1) != 32) continue;
@@ -353,7 +353,7 @@ int32_t readStaged(Conn* c, std::vector<StRow>* out, std::vector<std::pair<Ident
     sqlite3_reset(q);
     if (r != SQLITE_DONE) return statusOfSqlite(r);
     q = c->sql("SELECT h, seq FROM idst ORDER BY rowid");
-    if (!q) return P4_E_FORMAT;
+    if (!q) return FLATSQL_E_FORMAT;
     while ((r = sqlite3_step(q)) == SQLITE_ROW) {
         if (sqlite3_column_bytes(q, 0) != 32) continue;
         IdentKey h;
@@ -361,7 +361,7 @@ int32_t readStaged(Conn* c, std::vector<StRow>* out, std::vector<std::pair<Ident
         ids->push_back({h, sqlite3_column_int64(q, 1)});
     }
     sqlite3_reset(q);
-    return r == SQLITE_DONE ? P4_OK : statusOfSqlite(r);
+    return r == SQLITE_DONE ? FLATSQL_OK : statusOfSqlite(r);
 }
 }  // namespace
 
@@ -369,19 +369,19 @@ int32_t stagedLoad(Engine* e, Feed* f, Conn* c, std::string* err) {
     std::vector<StRow> rows;
     std::vector<std::pair<IdentKey, int64_t>> ids;
     const int32_t st = readStaged(c, &rows, &ids);
-    if (st == P4_E_FORMAT && err) *err = f->path + ": a feed index without staged rows (format 4 from an older engine)";
-    if (st != P4_OK) return st;
+    if (st == FLATSQL_E_FORMAT && err) *err = f->path + ": a feed index without staged rows (format 4 from an older engine)";
+    if (st != FLATSQL_OK) return st;
     rows.shrink_to_fit();  // the view's memory is its rows
     Type* t = f->type;
     std::lock_guard<std::mutex> g(t->mu);
     stagedPublish(e, f, Staged::make(nullptr, std::move(rows), {}, ids, true), true);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int64_t stagedMismatches(Feed* f, Conn* c) {
     std::vector<StRow> rows;
     std::vector<std::pair<IdentKey, int64_t>> ids;
-    if (readStaged(c, &rows, &ids) != P4_OK) return 1;
+    if (readStaged(c, &rows, &ids) != FLATSQL_OK) return 1;
     std::shared_ptr<const Staged> disk = Staged::make(nullptr, std::move(rows), {}, ids, true), mem;
     {
         std::lock_guard<std::mutex> g(f->type->mu);
@@ -415,11 +415,11 @@ namespace {
 // 10 s or 30 s). The views' cap bounds the memory whatever the window.
 constexpr uint64_t kMergeIdleNs = 30000000000ull;
 
-// Native test builds: P4_MERGE_DEBUG=1 logs each merge's start and end on
+// Native test builds: FLATSQL_MERGE_DEBUG=1 logs each merge's start and end on
 // stderr (the kill-during-merge test times its kills by them).
 void mergeLog(const char* what, const Feed* f, size_t rows, int rc) {
 #if !defined(__wasm__)
-    if (!std::getenv("P4_MERGE_DEBUG")) return;
+    if (!std::getenv("FLATSQL_MERGE_DEBUG")) return;
     std::fprintf(stderr, "%s %s rows %zu rc %d\n", what, f->path.c_str(), rows, rc);
     std::fflush(stderr);
 #else
@@ -432,10 +432,10 @@ int32_t mergeFeed(Engine* e, Type* t, Feed* f, std::string* err) {
     std::shared_ptr<const Staged> v;
     {
         std::lock_guard<std::mutex> g(t->mu);
-        if (!f->created || f->quarantined) return P4_OK;
+        if (!f->created || f->quarantined) return FLATSQL_OK;
         v = f->staged;
     }
-    if (!v) return P4_OK;
+    if (!v) return FLATSQL_OK;
     // CID order: the CID index's pages are then filled one after the other
     // (the largest random-keyed index; a page that left the cache is not
     // touched again by this transaction).
@@ -447,7 +447,7 @@ int32_t mergeFeed(Engine* e, Type* t, Feed* f, std::string* err) {
     });
     const size_t cap = size_t(std::max<uint32_t>(e->cfg.flushEntries, 1024)) * 2;
     if (rows.size() > cap) rows.resize(cap);
-    int32_t st = P4_OK;
+    int32_t st = FLATSQL_OK;
     std::string er;
     Conn* c = writerPin(e, f, &st, &er);
     if (!c) {
@@ -497,7 +497,7 @@ int32_t mergeFeed(Engine* e, Type* t, Feed* f, std::string* err) {
         f->freeBytes = freeBytes;
     }
     stagedPublish(e, f, Staged::make(f->staged.get(), {}, merged, {}, ids), false);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t mergeAll(Engine* e, Type* t, std::string* err) {
@@ -516,9 +516,9 @@ int32_t mergeAll(Engine* e, Type* t, std::string* err) {
             }
             if (!before) break;
             const int32_t rc = mergeFeed(e, t, f, err);
-            if (rc != P4_OK) return rc;
+            if (rc != FLATSQL_OK) return rc;
         }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // A feed is due when it holds flushEntries staged rows, or when it has had
@@ -571,7 +571,7 @@ void mergeStep(Engine* e, uint32_t writer) {
         if (run) {
             std::string err;
             const int32_t mrc = mergeFeed(e, pick->type, pick, &err);
-            if (mrc != P4_OK) {
+            if (mrc != FLATSQL_OK) {
                 // Nothing changed: the rows stay staged and are merged later.
                 std::lock_guard<std::mutex> g(pick->type->mu);
                 pick->mergeAfter = monoNs() + 2000000000ull;

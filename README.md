@@ -1,822 +1,88 @@
 # FlatSQL
 
-[![CI](https://github.com/DigitalArsenal/flatsql/actions/workflows/ci.yml/badge.svg)](https://github.com/DigitalArsenal/flatsql/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/flatsql.svg)](https://www.npmjs.com/package/flatsql)
-[![License](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0/)
+[![CI](https://github.com/DigitalArsenal/flatsql/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DigitalArsenal/flatsql/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/flatsql)](https://www.npmjs.com/package/flatsql)
 
-**SQL queries over raw FlatBuffer storage** — A streaming query engine that keeps data in native FlatBuffer format while providing SQL access via SQLite virtual tables.
+SQL over persistent FlatBuffer records. FlatBuffers in, FlatBuffers out.
 
-## Live Demo
+FlatSQL 3.12 provides one API and one `wasm32-wasip1-threads` engine for Node,
+browsers, and WASI hosts. The optimized store, SQL lanes, and geospatial
+functions share that engine. There are no separate PS/P4 entry points.
 
-Try FlatSQL in your browser: **[https://digitalarsenal.github.io/flatsql/](https://digitalarsenal.github.io/flatsql/)**
-
-## Installation
-
-```bash
+```sh
 npm install flatsql
 ```
 
-### 3.0: the partition store
-
-`flatsql` 3.x ships the multithreaded partition store as one
-`wasm32-wasip1-threads` artifact, `flatsql/ps-threads.wasm`: one writer per
-(producer, SDS type) partition on a pinned pool of writer threads, durable
-acks, and reader lanes that read committed snapshots and never wait on writers.
-Hosts instantiate it over a shared memory and provide WASI preview1,
-`wasi.thread-spawn` and the seven `flatsql_io_*` imports; its sha256 is in
-`flatsql/integrity.json`.
-
-```javascript
-import { loadFlatSQLPsThreads, getFlatSQLPsThreadsURL } from 'flatsql';
-import { createPsNodeInstance } from 'flatsql/ps/node-host'; // Node; needs space-data-module-sdk >= 0.8.24
-
-const bytes = await loadFlatSQLPsThreads(); // checked against integrity.json
-const writer = await createPsNodeInstance(bytes, { root: './store-root' });
-```
-
-See [docs/PARTITION-STORE-WASM.md](docs/PARTITION-STORE-WASM.md) (artifact,
-Node host, acceptance) and [docs/PARTITION-STORE.md](docs/PARTITION-STORE.md)
-(the engine). 3.0.0 removed the TypeScript engine (`FlatSQLDatabase` from
-`src/`, `DirectAccessor`, `FlatcAccessor`), the `node:sqlite` artifact builder,
-`flatsql/standalone`, `flatsql/artifacts/standalone` and the `sql.js` and
-`flatbuffers` dependencies; the package root is the wasm bindings.
-
-## Quick Start
-
-```javascript
-import { initFlatSQL } from 'flatsql/wasm';
-
-// Initialize
-const flatsql = await initFlatSQL();
-
-// Create database with schema
-const db = flatsql.createDatabase(`
-  table User {
-    id: int (id);
-    name: string;
-    email: string (key);
-    age: int;
-  }
-`, 'myapp');
-
-// Register file identifier for routing
-db.registerFileId('USER', 'User');
-
-// Ingest FlatBuffer data (streaming)
-db.ingest(flatbufferStream);
-
-// Query with SQL
-const result = db.query('SELECT * FROM User WHERE age > 25');
-console.log(result.columns, result.rows);
-```
-
-## What is FlatSQL?
-
-FlatSQL bridges two technologies:
-
-- **[FlatBuffers](https://github.com/digitalarsenal/flatbuffers)** — Google's efficient cross-platform serialization library. Data is stored in binary format with zero-copy access (no parsing/unpacking needed).
-- **SQLite** — The most widely deployed SQL database engine, used here only for SQL parsing and query execution.
-
-The key insight: instead of converting FlatBuffers to SQLite rows (expensive), FlatSQL uses [SQLite virtual tables](https://sqlite.org/vtab.html) to query FlatBuffer data directly. Your data stays in portable FlatBuffer format, readable by any FlatBuffer tooling, while you get SQL query capabilities.
-
-## Why FlatSQL?
-
-Traditional approach:
-```
-FlatBuffer → Deserialize → SQLite rows → Query → Serialize → FlatBuffer
-```
-
-FlatSQL approach:
-```
-FlatBuffer → Query (via virtual table) → FlatBuffer
-```
-
-**Benefits:**
-- **Zero conversion overhead** — Data stays in FlatBuffer format
-- **Streaming ingestion** — Indexes built during data arrival, not after
-- **Portable output** — Exported data is standard FlatBuffers, readable by any tooling
-- **Multi-source federation** — Query across multiple FlatBuffer sources with automatic source tagging
-
-## Runtime Choices & Performance Gates
-
-### Complete-record full-text search
-
-`flatsql_record_text(table, record, binary_schema)` extracts search text using a
-canonical FlatBuffers binary schema (`.bfbs`). This includes fields after vectors,
-nested tables and unions, even when the SQL table exposes only an initial set of
-columns. Records remain in their original binary format. The two-argument form
-continues to extract the registered SQL columns.
-
-Generate binary schemas from the same published IDL version used to produce the
-records, using `flatc -b --schema --bfbs-builtins`. The schema and record must match
-the registered table's file identifier. FlatSQL validates both inputs and indexes
-public scalar values, strings and nested content. It excludes encrypted fields,
-internal fields beginning with `_`, and opaque byte vectors.
-
-Extraction rejects unsupported layouts and reports bounds failures instead of
-returning partial text. Limits are 1 MiB per binary schema, 16 MiB per record and
-output, 100,000 visited values/objects and 64 nesting levels. Schema metadata with
-64-bit offsets or unknown advanced features is rejected. Consumers must include
-the binary schema and engine versions in their derived-index fingerprint so
-upgrades rebuild previously incomplete indexes. See the
-[FlatBuffers reflection documentation](https://flatbuffers.dev/languages/cpp/).
-
-### SDN flow runtime contract
-
-Within an SDN module flow, FlatSQL always runs as a signed, pluggable WASM node.
-The exact same artifact bytes and hash run under the browser/JavaScript harness
-and WasmEdge. The pure TypeScript implementation is a library fallback and
-must not substitute for the FlatSQL node in an isomorphic flow.
-
-FlatSQL remains independently instantiated and addressable by its signed
-manifest and artifact hash. A flow bundle may carry those bytes, but a compiler
-must not statically fold FlatSQL into the consuming application module.
-
-The FlatSQL node owns SQL, tables, rows, indexes, compaction, snapshots, and
-reload semantics. Hosts provide only generic opaque byte persistence,
-shared-arena bounds checking, clocks/wakeups, network byte streams, and module
-lifecycle. They must not expose a FlatSQL service, `storage_engine_link`, or
-schema-aware row/query API.
-
-Every FlatSQL module input and output port supports both canonical SDS
-FlatBuffer and aligned-binary representations for the same schema identity.
-`PIV`/`TAB.WIRE_FORMAT` selects per frame. Aligned frames are transient
-shared-memory views; durable, network, and fallback records remain canonical
-size-prefixed FlatBuffers.
-
-- The SQLite-backed WASM path is `initFlatSQL` → `FlatSQL` → `createDatabase` (the package root and `flatsql/wasm`).
-- Standalone deployments use the C++ WASI reactor at `flatsql/wasi.wasm`; Node/WasmEdge hosts use a resident runner from `flatsql/standalone/wasmedge`. The partition store is `flatsql/ps-threads.wasm` (Node host: `flatsql/ps/node-host`).
-- Artifact-builder cache behavior belongs to C++: query templates, result-cache keys, invalidation generation, hit/miss counters, SQL execution, and raw FlatBuffer lookup all live in the WASM database instance. JavaScript only marshals bytes and fills host capability gaps.
-- Use `db.ingestBuffers([...])` on the WASM path when your input is already a set of raw FlatBuffers. It feeds the native bulk-stream ingest path instead of looping through `ingestOne(...)`.
-- Run `npm run bench` (alias `npm run bench:perf`) for the WASM ingest benchmark (medians and records/s). Use `npm run bench:perf:profile` to print the ingest phase breakdown (`pack`, `decode`, `append`, `index`, `verify`); profiling is diagnostic and slower by design.
-- Run `npm run test:cluster` for the native cluster validation workload, or `npm run test:cluster:smoke` for the short preflight run. See [docs/performance.md](docs/performance.md).
-
-## SDS Stress Harness
-
-The Space Data Standards stress harness exercises every discoverable `main.fbs` under `../spacedatastandards.org/schema`, records bandwidth and storage-fill metrics, and keeps canonical schemas database-neutral. Results are written under `stress/results/<run-id>/`.
-
-```bash
-# Local smoke path, no Docker required.
-npm run stress:sds:smoke -- --run-id sds-smoke
-
-# Existing single-controller Docker smoke path.
-npm run stress:sds:docker-smoke -- --run-id sds-docker-smoke
-
-# Container-per-node fleet path for small probes, e.g. 10 isolated nodes.
-npm run stress:sds:docker-fleet -- --run-id sds-10-node --nodes 10 --storage-gb 1 --records-per-node 100000
-
-# Generate and validate the 100-node / 1 GB-per-node production compose file without running it.
-npm run stress:sds:full-config -- --run-id sds-full
-docker compose -f stress/results/sds-full/docker-compose.full.yml config
-
-# Run the full production gate. Requires Docker and enough local storage.
-CONFIRM_FULL_STRESS=1 npm run stress:sds:full -- --run-id sds-full
-```
-
-The production gate only passes when the aggregate report shows container isolation, Docker transport, at least 100 nodes, no metric errors, measured native/standalone/WasmEdge events, complete SDS schema-sweep coverage, at least 95% storage fill against the 1 GB/node target on every node, and bulk-ingest throughput at or above 75 fps on every node.
-
-Full mode defaults to 20,000 records per node, or 2 million records across the 100-node fleet. In full mode the generated PublishEventRecord payload size scales from the configured storage budget so the run targets the requested per-node storage fill without requiring hundreds of millions of tiny records.
-
-## Agent Runtime Notes
-
-Use these entrypoints when wiring agents or deployments:
-
-| Import | Runtime | Use for |
-|--------|---------|---------|
-| `flatsql`, `flatsql/wasm` | Emscripten JS wrapper + C++ WASM | Browser/Node SQLite-backed engine |
-| `flatsql/ps-threads.wasm`, `flatsql/ps` | The partition store artifact and its locator | Multithreaded partition store hosts |
-| `flatsql/ps/node-host` | Node wasi-threads host (thread pool, WASI, flatsql_io, fault overlay) | Tests and Node processes |
-| `flatsql/response` | Response artifact bytes | ETags, chunks, and raw byte artifacts keyed by native runtime cache keys |
-| `flatsql/standalone/wasmedge` | Native WasmEdge runner builder/client | Persistent standalone runtime in Node |
-
-For repeated FILE_ID-style traffic, register a cacheable query template once and call `queryTemplate(...)` with positional params. Identical query IDs and params hit the C++ result cache; ingest, load, template changes, and explicit `clearQueryCache()` invalidate stale entries by generation.
-
-```javascript
-import { initFlatSQL } from 'flatsql';
-
-const builder = (await initFlatSQL()).createDatabase(schema, 'users');
-await builder.registerFileId('USER', 'User');
-await builder.enableDemoExtractors();
-await builder.ingestBuffers(buffers);
-await builder.configureQueryCache({ maxEntries: 4096, maxRows: 5000 });
-await builder.registerQueryTemplate('userByEmail', 'SELECT id FROM User WHERE email = ?', true);
-
-await builder.queryTemplate('userByEmail', ['alice@example.com']); // miss
-await builder.queryTemplate('userByEmail', ['alice@example.com']); // hit
-console.log(await builder.getQueryCacheStats());
-```
-
-The native cache holds up to 1024 results within a 64 MiB budget, evicting the least recently used result to stay under it; a result bigger than the whole budget is not cached. `maxRows` caps any single result (default 1,000,000 rows). Tune `maxEntries` and `maxRows` for production FILE_ID traffic instead of recompiling the C++ core.
-
-For WasmEdge, build the small host runner and open a database through its process runtime. The runner keeps one WASI module instance resident so cache state survives across requests.
-
-```javascript
-import { buildFlatSQLWasmEdgeRunner, createFlatSQLWasmEdgeProcessRuntime } from 'flatsql/standalone/wasmedge';
-
-const runner = await buildFlatSQLWasmEdgeRunner({
-  outputPath: './build/flatsql-wasmedge-runner',
-});
-
-const runtime = createFlatSQLWasmEdgeProcessRuntime({ runnerPath: runner.outputPath });
-const builder = await runtime.createDatabase(schema, 'users');
-```
-
-WasmEdge must support WebAssembly exception handling for this artifact. The test runner uses `wasmedge --enable-exception-handling --reactor wasm/flatsql-wasi.wasm _initialize` for the smoke check and the native C API runner enables the same proposal programmatically. Some Node 24 builds require `node --experimental-wasm-exnref` when directly instantiating the standalone WASI artifact.
-
-For high-volume repeated FILE_ID responses, build the cache key through the C++ runtime, wrap query results as response artifacts, and let edge/browser/WasmEdge host caches serve the immutable bytes by ETag or content hash. FlatSQL creates deterministic native cache keys and chunk metadata; deployment code owns CDN placement, routing, authorization, and global invalidation.
-
-```javascript
-import { createQueryResponseArtifact } from 'flatsql/response';
-
-const sql = 'SELECT _data FROM PublishEventRecord WHERE FILE_ID = ?';
-const cacheKey = await builder.buildResponseArtifactCacheKey('PublishEventRecord', '1', sql, {
-  format: 'raw-flatbuffer-stream',
-  publishEventKey: 'publish-1',
-  projection: ['_data'],
-  params: ['publish-1'],
-});
-const result = await builder.query(sql, ['publish-1']);
-const artifact = createQueryResponseArtifact(result, {
-  schemaName: 'PublishEventRecord',
-  schemaVersion: 1,
-  sql,
-  params: ['publish-1'],
-  format: 'raw-flatbuffer-stream',
-  publishEventKey: 'publish-1',
-  projection: ['_data'],
-  cacheKey,
-});
-
-console.log(artifact.metadata.cacheKey, artifact.metadata.etag);
-```
-
-See `docs/response-artifacts.md` and `docs/agents/response-artifacts.md` for production and agent guidance.
-
-
-## Source Code
-
-| Repository | Description |
-|------------|-------------|
-| [digitalarsenal/flatsql](https://github.com/digitalarsenal/flatsql) | This project — FlatSQL query engine |
-| [digitalarsenal/flatbuffers](https://github.com/digitalarsenal/flatbuffers) | Fork of Google FlatBuffers with WASM support |
-| [flatc-wasm](https://digitalarsenal.github.io/flatbuffers/) | FlatBuffer compiler running in WebAssembly |
-
-## Usage
-
-### WASM (Browser/Node.js)
-
-The C++ engine compiles to WebAssembly for cross-platform deployment:
-
-```javascript
-import { initFlatSQL } from 'flatsql/wasm';
-
-const flatsql = await initFlatSQL();
-
-// Create database with schema
-const db = flatsql.createDatabase(`
-  table User {
-    id: int (id);
-    name: string;
-    email: string (key);
-    age: int;
-  }
-`, 'myapp');
-
-// Register file identifier routing
-db.registerFileId('USER', 'User');
-
-// Enable demo field extractors (for testing)
-db.enableDemoExtractors();
-
-// Ingest FlatBuffer stream
-// Format: [4-byte size LE][FlatBuffer][4-byte size LE][FlatBuffer]...
-db.ingest(streamData);
-
-// Or ingest pre-built FlatBuffers directly through the bulk path.
-db.ingestBuffers([
-  flatsql.createTestUser(1, 'Alice', 'alice@example.com', 30),
-  flatsql.createTestUser(2, 'Bob', 'bob@example.com', 25),
-]);
-
-// Query with SQL
-const result = db.query('SELECT id, name, email FROM User WHERE age > 25');
-console.log(result.columns); // ['id', 'name', 'email']
-console.log(result.rows);    // [[1, 'Alice', 'alice@example.com'], ...]
-
-// Export database
-const exported = db.exportData();
-
-// Cleanup
-db.destroy();
-```
-
-### TypeScript engine (removed)
-
-The pure TypeScript engine (`FlatSQLDatabase` with `DirectAccessor` /
-`FlatcAccessor`) was removed in 3.0.0; `flatsql` 2.x still carries it. The
-BTree, stacked store and schema parser remain as `flatsql/btree`,
-`flatsql/storage` and `flatsql/schema`.
-
-### Cluster Runtime Detection
-
-Use the runtime guard helpers before attempting browser cluster mode:
-
-```typescript
-import { detectClusterEnvironment, isClusterModeSupported } from 'flatsql/cluster';
-
-const env = detectClusterEnvironment();
-if (!isClusterModeSupported(env)) {
-  throw new Error('Cluster mode unsupported on this runtime');
+```js
+import { FlatSQL } from 'flatsql';
+
+const db = await FlatSQL.open({ root: './customer-data' });
+await db.registerSchema({ name: 'GJN', fileIdentifier: '$GJN', bfbs });
+await db.ingest('GJN', sizePrefixedRecords);
+for await (const chunk of db.query(qrpRequest)) {
+  consumeBinaryResults(chunk);
 }
+await db.close();
 ```
 
-### Native C++ (Embedded)
+`bfbs` is a binary reflection schema. Records are concatenated size-prefixed
+FlatBuffers. `qrpRequest` is an SDS QRP FlatBuffer containing SQL and typed
+parameters. Results are a stream of size-prefixed SDS QRP pages. Request
+`{ records: true }` with `SELECT _data` to return the original record frames.
+Stream chunks can split frames; consume the four-byte lengths when framing.
 
-For performance-critical applications, link the C++ library directly:
+Use the canonical [SDS GJN schema](https://github.com/DigitalArsenal/spacedatastandards.org)
+for geometry. For example, a QRP request containing
+`SELECT _data FROM GJN WHERE geo_contains(_data, 40.75, -73.98)` filters binary
+records. Geometry projections such as `geo_envelope(_data)` return GJN bytes
+inside QRP values. Scalar distance and radius queries remain available.
 
-```cpp
-#include <flatsql/database.h>
+Text conversion belongs in a separate program such as
+[flatc-wasm](https://digitalarsenal.github.io/flatc-wasm/). The engine has no
+JSON, GeoJSON, WKT, or schema-text conversion and no SQLite JSON extension.
+It has no runtime npm dependencies. Generated SDS bindings can construct and
+read the binary requests/results in your application.
 
-auto db = flatsql::FlatSQLDatabase::fromSchema(schema, "mydb");
+## Binary CLI
 
-// Register file ID routing
-db.registerFileId("USER", "User");
-
-// Set field extractor
-db.setFieldExtractor("User", extractUserField);
-
-// Ingest streaming data
-size_t recordsIngested = 0;
-db.ingest(data, length, &recordsIngested);
-
-// Query
-auto result = db.query("SELECT * FROM User WHERE id = 5");
-for (size_t i = 0; i < result.rowCount(); i++) {
-    std::cout << result.getString(i, "name") << std::endl;
-}
+```sh
+# Feed the binary output of your converter through stdin.
+flatsql ingest --root ./store --schema GJN.bfbs --type GJN --id '$GJN' < records.fb > receipts.fb
+flatsql query --root ./store --request query.qrp > results.qrp
+flatsql query --root ./store --records < records-query.qrp > records.fb
 ```
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     FlatSQLDatabase                          │
-├─────────────────────────────────────────────────────────────┤
-│   SchemaParser        │      SQLiteEngine                    │
-│   (FlatBuffers IDL)   │      (Virtual Tables)                │
-├─────────────────────────────────────────────────────────────┤
-│                    TableStore (per table)                    │
-│  ┌────────────────────────────────────────────────────────┐ │
-│  │  SQLite Indexes            Field Extractors             │ │
-│  │  (id, email, timestamp)    (getField callbacks)         │ │
-│  └────────────────────────────────────────────────────────┘ │
-├─────────────────────────────────────────────────────────────┤
-│              StackedFlatBufferStore (append-only)            │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ [Header][FB₁][FB₂][FB₃]...                           │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Schema Joins & References
-
-- JSON schemas that reference other definitions now produce explicit ``From_Target_join`` tables with `{FromRowId, TargetRowId}` columns.
-- This keeps referenced schemas in the same normalized storage layer so queries can `JOIN` the virtual tables instead of embedding opaque JSON blobs.
-
-### Stream Format
-
-FlatSQL ingests size-prefixed FlatBuffer streams:
-
-```
-[4-byte size LE][FlatBuffer with file_id][4-byte size LE][FlatBuffer]...
-```
-
-The 4-byte file identifier in each FlatBuffer determines which table receives the record.
-
-## Spatial Extensions
-
-FlatSQL includes a full spatial computation engine with SpatiaLite-compatible functions, polygon boolean operations, Voronoi/Delaunay tessellation, and coordinate transforms.
-
-### Spatial SQL Functions
-
-| Category | Functions |
-|----------|-----------|
-| **Point ops** | `geo_distance`, `geo_bearing`, `geo_destination`, `geo_midpoint`, `geo_area_bbox`, `geo_within_radius`, `geo_bbox_contains` |
-| **Geohash** | `geo_geohash_encode`, `geo_geohash_decode_lat`, `geo_geohash_decode_lon` |
-| **Geometry I/O** | `geo_from_text` (WKT→blob), `geo_as_text` (blob→WKT), `geo_from_geojson`, `geo_as_geojson` |
-| **Predicates** | `geo_contains` (point-in-polygon, ray casting with hole support) |
-| **Boolean ops** | `geo_intersection`, `geo_union`, `geo_difference`, `geo_sym_difference`, `geo_buffer` |
-| **Analysis** | `geo_area_geom`, `geo_centroid`, `geo_length_geom`, `geo_envelope`, `geo_convex_hull` |
-| **Voronoi/Delaunay** | `geo_voronoi`, `geo_delaunay` |
-| **Coord transforms** | `geo_to_ecef` (WGS84→ECEF), `geo_from_ecef` (ECEF→WGS84) |
-
-### Examples
-
-```sql
--- Distance between NYC and DC (~328 km)
-SELECT geo_distance(40.7128, -74.0060, 38.9072, -77.0369);
-
--- Bearing from NYC to LA
-SELECT geo_bearing(40.7128, -74.0060, 34.0522, -118.2437);
-
--- Geohash encode/decode
-SELECT geo_geohash_encode(42.6, -5.6, 5);  -- 'ezs42'
-
--- Point-in-polygon
-SELECT geo_contains('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))', 5, 5);  -- 1
-
--- Polygon intersection (accepts WKT or blob)
-SELECT geo_as_text(geo_intersection(
-  'POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))',
-  'POLYGON((5 5, 15 5, 15 15, 5 15, 5 5))'
-));
-
--- WGS84 to ECEF coordinate transform
-SELECT geo_to_ecef(48.8566, 2.3522, 35);  -- '4200952.xxx,172458.xxx,4780111.xxx'
-
--- Voronoi diagram
-SELECT geo_as_text(geo_voronoi(
-  'MULTIPOINT((0 0), (10 0), (10 10), (0 10))',
-  'POLYGON((-5 -5, 15 -5, 15 15, -5 15, -5 -5))'
-));
-```
-
-### R-Tree Spatial Indexing
-
-FlatSQL automatically creates R-Tree shadow tables for spatial columns during ingest. Spatial columns are detected by:
-- **Convention**: columns named `latitude`/`lat` + `longitude`/`lon`/`lng`
-- **Schema attribute**: fields marked with `(spatial)` in FlatBuffers IDL
-
-```sql
--- R-Tree pre-filter + precise radius check (72x faster than full scan)
-SELECT p.* FROM points p
-INNER JOIN _rtree_points r ON p.rowid = r.id
-WHERE r.minLat >= 36.2 AND r.maxLat <= 45.2
-  AND r.minLon >= -80 AND r.maxLon <= -68
-  AND geo_within_radius(40.7, -74.0, p.lat, p.lon, 500) = 1;
-```
-
-### Spatial Performance
-
-| Operation | Throughput | Latency |
-|-----------|-----------|---------|
-| Point operations (distance, bearing) | 733K–1.07M ops/sec | ~1 µs |
-| Geohash encode/decode | 631K–746K ops/sec | ~1.4 µs |
-| Point-in-polygon | 127K–255K ops/sec | ~4 µs |
-| Polygon intersection | 81K ops/sec | ~12 µs |
-| Voronoi (4 sites) | 34K ops/sec | ~29 µs |
-| Coordinate transforms | 556K–609K ops/sec | ~1.7 µs |
-| R-Tree bbox query (10K records) | 77K ops/sec | ~13 µs |
-| R-Tree vs full scan speedup | **58–72x** | |
-
-### Space Data Module (SDM)
-
-FlatSQL Spatial is also available as a standalone WASM module compliant with the [Space Data Module SDK](https://github.com/DigitalArsenal/space-data-module-sdk):
-
-```javascript
-import { initSpatialSDM } from 'flatsql/sdm';
-
-const sdm = await initSpatialSDM();
-
-// Read the embedded manifest
-console.log(sdm.getManifest().pluginId);
-// → 'com.digitalarsenal.flatsql.spatial'
-
-// Compute distance
-const km = sdm.computeDistance(40.7128, -74.006, 38.9072, -77.0369);
-
-// Point-in-polygon
-const inside = sdm.pointInPolygon('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))', 5, 5);
-
-// Coordinate transform
-const ecef = sdm.toECEF(48.8566, 2.3522, 35);
-const back = sdm.fromECEF(ecef.x, ecef.y, ecef.z);
-```
-
-## SQL Support
-
-The WASM engines (`initFlatSQL()`, the partition store's reader lanes) embed
-SQLite. (The pure-JS engine and its SQL subset were removed in 3.0.0.)
-
-### Fail-closed guarantee
-
-The engines reject what they cannot execute: a caller that asks for a subset
-gets that subset or an error, never the whole table with no indication that
-the filter was dropped.
-
-### Supported
-
-- `SELECT` with column selection
-- `WHERE` with `=`, `!=`/`<>`, `<`, `>`, `<=`, `>=`, `BETWEEN`, `IN`, `LIKE`,
-  `IS NULL`, and `AND` / `OR` / `NOT` / parentheses
-- `LIKE` with `%` and `_` wildcards, ASCII case-insensitive (the SQLite default)
-- `ORDER BY` (ASC/DESC, multiple terms)
-- `LIMIT` and `OFFSET`
-- `COUNT(*)` aggregate (WASM engine)
-- Index-accelerated queries on `(id)` and `(key)` columns, including as one
-  conjunct of a larger `AND` predicate
-
-### Not Supported
-
-- `JOIN` (query one table at a time)
-- `GROUP BY`, `HAVING`, most aggregates
-- `INSERT`, `UPDATE`, `DELETE` (use API methods instead)
-- Subqueries, CTEs, window functions
-
-## Performance
-
-FlatSQL outperforms traditional SQLite on query operations:
-
-| Operation | FlatSQL | SQLite | Speedup |
-|-----------|---------|--------|---------|
-| Point query (by id) | 3.50 ms | 3.93 ms | 1.1x |
-| Point query (by key) | 5.23 ms | 6.94 ms | 1.3x |
-| Direct index lookup | 1.56 ms | 3.93 ms | 2.5x |
-| Full scan | 0.84 ms | 1.25 ms | 1.5x |
-| Direct iteration | 0.05 ms | 1.25 ms | 25x |
-
-*Benchmarks: 10,000 records, 10,000 query iterations, Apple M3 Ultra*
-
-## Performance Trade-offs
-
-FlatSQL uses SQLite's virtual table (VTable) API to expose FlatBuffer data as queryable tables. This architecture enables SQL queries over raw binary data, but comes with fundamental trade-offs that affect performance characteristics.
-
-### Access Paths
-
-FlatSQL provides three access paths with different performance profiles:
-
-| Access Path | Latency | Throughput | Use Case |
-|-------------|---------|------------|----------|
-| **Zero-Copy API** | 1.7 µs | 580K ops/sec | Direct index lookup, returns raw FlatBuffer pointer |
-| **VTable SQL** | 12.9 µs | 78K ops/sec | Full SQL queries via SQLite |
-| **Pure SQLite** | 2.5 µs | 400K ops/sec | Baseline comparison |
-
-### Why VTable Queries Are Slower Than Pure SQLite
-
-SQLite's VTable API has fundamental limitations that prevent FlatSQL from matching pure SQLite query performance:
-
-1. **Per-Column Extraction** — The `xColumn()` callback is invoked once per column per row. There is no batch API to extract multiple fields at once, meaning each field access has function call overhead.
-
-2. **Mandatory Value Conversion** — All values must be converted to SQLite's internal format via `sqlite3_result_*()` functions. Even though FlatBuffers already store data in an efficient binary format, we must convert strings to SQLite strings, integers to SQLite integers, etc.
-
-3. **Row-by-Row Processing** — The `xNext()` callback advances one row at a time with no vectorized or batch iteration. This prevents SIMD optimizations or processing multiple records per call.
-
-4. **No Direct Memory Access** — SQLite cannot read FlatBuffer memory directly; all data must flow through the VTable callback interface, adding overhead for every field access.
-
-### When to Use Each Access Path
-
-**Use the Zero-Copy API when:**
-- You need maximum throughput for point lookups
-- You're building hot paths that query by indexed keys
-- You can work directly with FlatBuffer data structures
-
-```cpp
-// Zero-copy: returns pointer to raw FlatBuffer (1.7 µs)
-const uint8_t* data = db.findRawByIndex("User", "email", email, &len);
-auto user = GetUser(data);  // Direct FlatBuffer access
-```
-
-**Use VTable SQL when:**
-- You need complex queries (filtering, sorting, aggregation)
-- Query flexibility is more important than raw speed
-- You're doing ad-hoc exploration of the data
-
-```cpp
-// VTable SQL: full query capability (12.9 µs)
-auto result = db.query("SELECT * FROM User WHERE age > 25 ORDER BY name");
-```
-
-### Architecture: SQLite-Backed Indexes
-
-FlatSQL uses SQLite's highly optimized B-tree for indexing (not a custom implementation). This provides:
-
-- **Battle-tested performance** — SQLite's B-tree is used by billions of devices
-- **Consistent behavior** — Same indexing code path as pure SQLite
-- **Fast path optimization** — Type-specific lookups bypass `std::variant` overhead
-
-The index stores `(key, sequence) → (offset, length)` mappings, allowing O(log n) lookups that return pointers directly into the FlatBuffer storage.
-
-### Trade-off Summary
-
-| Aspect | FlatSQL | Pure SQLite |
-|--------|---------|-------------|
-| Point lookup (indexed) | **1.4x faster** (zero-copy API) | Baseline |
-| SQL queries | 5-7x slower (VTable overhead) | Baseline |
-| Storage format | FlatBuffers (portable, zero-copy) | SQLite pages |
-| Data conversion | None (zero-copy) or on-demand | Always required |
-| Streaming ingest | Append-only, real-time indexing | Row-by-row inserts |
-
-**Bottom line:** FlatSQL excels when you need streaming ingestion of FlatBuffer data with SQL query capability. Use the zero-copy API for performance-critical lookups; use SQL for complex queries where flexibility matters more than speed.
-
-## Building from Source
-
-### Prerequisites
-
-- Node.js 24+
-- CMake 3.20+ (for WASM builds)
-- Emscripten (for WASM builds)
-
-### TypeScript Build
-
-```bash
-npm install
+CLI ingest batches are bounded to 4 MiB, including each record's size prefix.
+The JavaScript request capacity is configurable. Errors go to stderr and produce
+a nonzero exit status; stdout contains binary results only.
+
+## Runtime requirements
+
+Node 24 or later uses the bundled generic thread/filesystem adapter. With an
+explicit `root`, data survives `close()` and later opens. Without one, Node uses
+a temporary store. Browsers use OPFS and require cross-origin isolation
+(`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` or `credentialless`). Serve the
+package's runtime workers and WASM file as static assets. The
+[interactive demo](https://digitalarsenal.github.io/flatsql/) shows this setup.
+
+The same artifact imports WASI preview 1, shared memory, `wasi.thread-spawn`, and
+seven filesystem operations. Native builds expose the same `flatsql_*` ABI.
+See [the complete API and geometry contract](docs/API-3.12.md),
+[the native build](cpp/README.md), and [CI evidence](docs/CI.md).
+
+## Development
+
+```sh
+npm ci --ignore-scripts
 npm run build
-npm test
+npm run test:e2e # set FLATBUFFERS_DIR to the pinned checkout for native checks
+npm run test:browser # installed Chromium headless shell required
 ```
 
-### WASM Build
+CI runs short end-to-end flows against the packed npm artifact and native
+engine. It does not run unit suites. Release CI reproduces the committed WASM
+bytes with wasi-sdk 30 before npm trusted publishing.
 
-```bash
-# Clone DA-FlatBuffers (required dependency)
-git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
-
-# Build browser, standalone WASI, and SDM artifacts
-npm run build:wasm
-
-# Verify standalone and package surfaces
-npm run test:wasi
-npm run test:wasmedge
-npm test -- --runInBand --runTestsByPath test/package-exports.test.ts
-```
-
-Output: `wasm/flatsql.js`, `wasm/flatsql.wasm`, `wasm/flatsql-wasi.wasm`, `sdm/flatsql-spatial.wasm`, and docs copies for GitHub Pages.
-
-The partition store artifact `wasm/flatsql-ps-threads.wasm` needs wasi-sdk 30 (`WASI_SDK_PATH`) and builds with `npm run build:wasm:ps` (`npm run build:wasm:ps-tests` adds the wasm test commands); see docs/PARTITION-STORE-WASM.md.
-
-### Run Demo Locally
-
-```bash
-npm run serve
-# Open http://localhost:8081
-```
-
-## API Reference
-
-### initFlatSQL()
-
-```typescript
-import { initFlatSQL } from 'flatsql/wasm';
-
-const flatsql = await initFlatSQL();
-```
-
-### createDatabase(schema, name)
-
-```typescript
-const db = flatsql.createDatabase(schemaString, 'dbname');
-```
-
-### db.registerFileId(fileId, tableName)
-
-```typescript
-db.registerFileId('USER', 'User');  // Route "USER" FlatBuffers to User table
-```
-
-### db.ingest(data, source?)
-
-```typescript
-const bytesConsumed = db.ingest(uint8ArrayStream);
-// Or with source tagging (requires registerSource first):
-const bytesConsumed = db.ingest(uint8ArrayStream, 'satellite-1');
-```
-
-### db.query(sql)
-
-```typescript
-const result = db.query('SELECT * FROM User WHERE age > 25');
-// result.columns: string[]
-// result.rows: any[][]
-```
-
-### db.exportData()
-
-```typescript
-const data = db.exportData();  // Returns Uint8Array
-```
-
-### db.registerSource(sourceName)
-
-```typescript
-db.registerSource('satellite-1');  // Creates User@satellite-1, Post@satellite-1, etc.
-```
-
-### db.createUnifiedViews()
-
-```typescript
-db.createUnifiedViews();  // Creates unified views with _source column
-```
-
-### db.listSources()
-
-```typescript
-const sources = db.listSources();  // ['satellite-1', 'satellite-2', ...]
-```
-
-## Multi-Source Queries
-
-FlatSQL supports federating multiple data sources with the same schema. Each source gets its own set of tables, and you can query them individually or across all sources.
-
-### Use Case
-
-Imagine you have multiple satellites streaming telemetry data with the same schema:
-
-```javascript
-// Register sources
-db.registerSource('satellite-1');
-db.registerSource('satellite-2');
-db.registerSource('ground-station');
-
-// Register file IDs and extractors (must be done after registerSource)
-db.registerFileId('TELE', 'Telemetry');
-db.enableDemoExtractors();
-
-// Create unified views (call once after all sources registered)
-db.createUnifiedViews();
-
-// Ingest from different sources
-db.ingest(satellite1Stream, 'satellite-1');
-db.ingest(satellite2Stream, 'satellite-2');
-db.ingest(groundStream, 'ground-station');
-
-// Query a specific source
-db.query('SELECT * FROM "Telemetry@satellite-1" WHERE signal > 50');
-
-// Query across all sources (unified view)
-db.query('SELECT * FROM Telemetry WHERE timestamp > 1000');
-```
-
-### Table Naming Convention
-
-- **Source-specific tables**: `TableName@sourceName` (e.g., `User@siteA`, `Telemetry@satellite-1`)
-- **Unified views**: `TableName` (e.g., `User`, `Telemetry`) - combines all source tables with a `_source` column
-
-### The _source Column
-
-Unified views include a `_source` column that identifies which source each row came from:
-
-```sql
--- See source for each record
-SELECT _source, id, name FROM User LIMIT 10;
-
--- Count records by source
-SELECT _source, COUNT(*) as count FROM User GROUP BY _source;
-
--- Filter by source in unified view
-SELECT * FROM User WHERE _source = 'satellite-1';
-```
-
-## Database-key encryption
-
-Fields marked `(encrypted)` in the schema are stored encrypted under the database key and decrypted when SQL reads them. The format is FlatBuffers field-encryption format 3: each record gets its own key, derived from the database key and the record's index, and each encrypted value gets its own IV, its position in the record. No two records and no two values share a key stream.
-
-The record index is the record's sequence, its `rowid`. Records are numbered 1, 2, 3, ... in stream order, so the stream carries the index: an exported stream loaded into an empty database (`loadAndRebuild`) gives every record the index it was encrypted with. Load an encrypted stream into an empty database only.
-
-```javascript
-db.registerFileId('SECR', 'Secret');
-db.setEncryptionKey(key);                         // 32 bytes
-const seq = db.ingestOneEncrypted(record, bfbs);  // encrypted as record `seq`
-db.query('SELECT code FROM Secret');              // plaintext
-```
-
-- `bfbs` is the table's binary schema with builtin attributes (`flatc -b --schema --bfbs-builtins`). It must mark the same fields `(encrypted)` as the database schema, or the call is refused.
-- `ingestOneEncrypted(record, bfbs, source?)` assigns the sequence and encrypts under it in one step. `encryptBuffer(record, bfbs, recordIndex)` and `decryptBuffer(record, bfbs, recordIndex)` take the index explicitly.
-- `(encrypted)` columns are never indexed. A predicate on one scans and decrypts.
-- A database that already holds records in tables with `(encrypted)` columns needs their format declared: `setEncryptionKey(key, { format: 3 })`. Nothing in the stream marks the format.
-
-**Crypto backend.** Format 3 derives keys with HKDF-SHA256 and encrypts with AES-256-CTR, and `computeHMAC`/`verifyHMAC` are HMAC-SHA256 under the database key. All three come from the FlatBuffers crypto backend. Native builds use OpenSSL when CMake finds it. The wasm builds (`flatsql.wasm`, `flatsql-wasi.wasm`, `flatsql-wasi-noeh.wasm`) and native builds without OpenSSL compile the FlatBuffers fallback backend, which implements them from FlatBuffers 8af3053e on and derives the same keys as OpenSSL: the same key and record give the same stored bytes in every build. Built against an older FlatBuffers, the fallback's key derivation is not HKDF-SHA256 (it had 256 outputs, so records would share key streams); such a build refuses a key for a database with `(encrypted)` columns, with an error that names HKDF-SHA256. `FlatSQLDatabase::recordEncryptionAvailable()` checks the backend against an HKDF-SHA256 known answer.
-
-**Format 2 (flatsql 3.2.0 and earlier).** Those versions encrypted every record under the same field keys, those of record 0, derived by the fallback backend. This version refuses format 2: `setEncryptionKey(key, { format: 2 })` throws, and a database that holds records must declare format 3. To migrate, use flatsql 3.2.0 and the old key to read each record of `exportData()` back as plaintext with `decryptBuffer(record, bfbs)`. Then ingest the plaintext records into a new database with `ingestOneEncrypted`.
-
-## License
-
-[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) — source-available, free for any noncommercial purpose. Commercial use requires a separate license from Edgesource Corporation See [LICENSE](LICENSE).
-
-## Contributing
-
-Contributions welcome. Please open an issue first to discuss significant changes.
-
-## Contact
-
-For questions, licensing inquiries, or commercial support: [tj@edgesource.com](mailto:tj@edgesource.com)
-
----
-
-Built on [DA-FlatBuffers](https://digitalarsenal.github.io/flatbuffers/) and [SQLite](https://sqlite.org/).
-
-### Full-text indexing of record archives
-
-The bundled SQLite engine includes FTS5 on native, browser and WASI targets.
-`SELECT flatsql_record_text('CAT', ?)` extracts searchable scalar/text fields
-from a bound FlatBuffer blob using the registered table schema. Both raw and
-size-prefixed records are accepted; the file identifier must match the table.
-Encrypted columns, opaque byte vectors and internal columns are excluded.
-Scalar defaults retain their declared type. Enums use their declared integer
-width when their definition is present; unresolved named types and non-byte
-vectors stay opaque instead of being treated as strings.
-Unknown schemas and malformed supported fields return SQL errors.
-
-A host can persist that text in an FTS5 table keyed by its durable record ID,
-including records outside the engine's active record window. Index lifecycle,
-source permissions, coverage and cursor identity remain the host's responsibility.
-The function covers the fields declared in the registered schema; it does not
-recursively decode nested tables or invent a text representation for binary data.
+Licensed under [PolyForm Noncommercial 1.0.0](LICENSE). Commercial licensing:
+[tj@edgesource.com](mailto:tj@edgesource.com).

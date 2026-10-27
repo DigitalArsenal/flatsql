@@ -195,11 +195,11 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked,
     EngineOpts o;
     o.flushEntries = 2000;
     const int32_t orc = openEngine(root, o);
-    if (orc != P4_OK) {
+    if (orc != FLATSQL_OK) {
         ck.fail("reopen failed: " + std::to_string(orc) + " " + fp::lastError());
         return ck;
     }
-    if (registerType(faultType()) != P4_OK) ck.fail("register failed");
+    if (registerType(faultType()) != FLATSQL_OK) ck.fail("register failed");
     // every acknowledged record is there
     std::vector<std::vector<uint8_t>> want;
     for (const std::string& c : acked) want.emplace_back(c.begin(), c.end());
@@ -207,7 +207,7 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked,
     for (size_t i = 0; i < want.size(); i += 512) {
         std::vector<std::vector<uint8_t>> part(want.begin() + long(i), want.begin() + long(std::min(want.size(), i + 512)));
         Result g = get("PNM", part, false);
-        if (g.status != P4_OK) ck.fail("GET failed: " + g.err);
+        if (g.status != FLATSQL_OK) ck.fail("GET failed: " + g.err);
         found += g.rows.size();
     }
     if (found != want.size()) ck.fail("acknowledged records lost: " + std::to_string(want.size() - found));
@@ -221,8 +221,8 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked,
         fp::st32(cl.data(), uint32_t(end - i));
         for (size_t k = i; k < end; k++) cl.insert(cl.end(), inst[k].first.begin(), inst[k].first.end());
         tw.raw(40, cl.data(), cl.size());
-        Result tg = call(P4_OPC_TAGS, tw.b);
-        if (tg.status != P4_OK) {
+        Result tg = call(FLATSQL_OPC_TAGS, tw.b);
+        if (tg.status != FLATSQL_OK) {
             ck.fail("TAGS failed: " + tg.err);
             break;
         }
@@ -239,9 +239,9 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked,
     int64_t after = 0;
     for (;;) {
         TlvW sc;
-        sc.text(1, "PNM").u8(5, P4_ORDER_SEQ_ASC).i64(6, after).u64(3, 5000);
-        Result r = call(P4_OPC_SCAN, sc.b);
-        if (r.status != P4_OK) {
+        sc.text(1, "PNM").u8(5, FLATSQL_ORDER_SEQ_ASC).i64(6, after).u64(3, 5000);
+        Result r = call(FLATSQL_OPC_SCAN, sc.b);
+        if (r.status != FLATSQL_OK) {
             ck.fail("SCAN failed: " + r.err);
             break;
         }
@@ -255,14 +255,14 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked,
     }
     TlvW s1;
     s1.u8(45, 1).text(1, "PNM");
-    Result s = call(P4_OPC_SUMMARY, s1.b);
+    Result s = call(FLATSQL_OPC_SUMMARY, s1.b);
     const int64_t count = s.rows.size() == 1 ? s.i(0, "records") : (scanned == 0 ? 0 : -1);
     if (count != scanned) ck.fail("count " + std::to_string(count) + " vs scanned " + std::to_string(scanned));
     if (int64_t(seqs.size()) != scanned) ck.fail("scanned " + std::to_string(scanned) + " records, " + std::to_string(seqs.size()) + " seqs");
     TlvW rb;
     rb.u32(63, 8);
-    Result v = call(P4_OPC_REBUILD, rb.b);
-    if (v.status != P4_OK || v.rows.size() != 1) ck.fail("REBUILD 8 failed: " + std::to_string(v.status) + " " + v.err);
+    Result v = call(FLATSQL_OPC_REBUILD, rb.b);
+    if (v.status != FLATSQL_OK || v.rows.size() != 1) ck.fail("REBUILD 8 failed: " + std::to_string(v.status) + " " + v.err);
     else if (v.i(0, "mismatches") != 0) ck.fail("mismatches " + std::to_string(v.i(0, "mismatches")) + " " + v.err);
     closeEngine();
     if (flatsql::flatSqlIoVfsStats().nodes != 0) ck.fail("VFS nodes left open");
@@ -271,7 +271,7 @@ Check checkStore(const std::string& root, const std::vector<std::string>& acked,
 
 }  // namespace
 
-P4_SLOW_TEST(t_power_loss) {
+FLATSQL_SLOW_TEST(t_power_loss) {
     FaultFs& fs = faultFs();
     const int rounds = int(argInt("rounds", 200));
     // A fresh store every 50 rounds keeps each round's check (a full scan and
@@ -292,7 +292,7 @@ P4_SLOW_TEST(t_power_loss) {
         EngineOpts o;
         o.writers = 3;
         o.flushEntries = 2000;
-        if (openEngine(root, o) != P4_OK || registerType(faultType()) != P4_OK) {
+        if (openEngine(root, o) != FLATSQL_OK || registerType(faultType()) != FLATSQL_OK) {
             std::printf("  round %d: open failed before the workload\n", round);
             fail++;
             break;
@@ -334,7 +334,7 @@ P4_SLOW_TEST(t_power_loss) {
                         b.recs.push_back(std::move(in));
                     }
                     Result res = put(b);
-                    if (res.status != P4_OK) continue;
+                    if (res.status != FLATSQL_OK) continue;
                     std::lock_guard<std::mutex> g(mu);
                     for (auto& in : b.recs) {
                         newAcks.insert(cidKeyOf(in.frame));

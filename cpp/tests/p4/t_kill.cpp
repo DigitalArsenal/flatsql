@@ -169,7 +169,7 @@ std::string strayEntries(const std::string& root, const std::string& type) {
 Result summary1(const std::string& type) {
     TlvW w;
     w.u8(45, 1).text(1, type);
-    return call(P4_OPC_SUMMARY, w.b);
+    return call(FLATSQL_OPC_SUMMARY, w.b);
 }
 
 }  // namespace
@@ -223,12 +223,12 @@ void killWorkStep(int c, uint64_t* id) {
     if (c % 4 == 3) {
         std::vector<uint32_t> slots;
         for (int k = 0; k < 4; k++) {
-            slots.push_back(submit(P4_OPC_PUT, encodePut(killBatch("producer1", "f" + std::to_string(*id), *id, 64, 3))));
+            slots.push_back(submit(FLATSQL_OPC_PUT, encodePut(killBatch("producer1", "f" + std::to_string(*id), *id, 64, 3))));
             *id += 64;
         }
         for (uint32_t sl : slots) {
             Result r = wait(sl);
-            if (r.status != P4_OK) {
+            if (r.status != FLATSQL_OK) {
                 std::fprintf(stderr, "  put failed: %d %s\n", r.status, r.err.c_str());
                 std::_Exit(1);
             }
@@ -246,42 +246,42 @@ void killWorkStep(int c, uint64_t* id) {
             for (int pi = 0; pi < 3; pi++) {
                 Batch part = killBatch("producer" + std::to_string(pi), "b" + std::to_string(c / 7), 0, 0, pi);
                 part.recs.assign(b.recs.begin() + at, b.recs.begin() + at + 50);
-                slots.push_back(submit(P4_OPC_PUT, encodePut(part)));
+                slots.push_back(submit(FLATSQL_OPC_PUT, encodePut(part)));
             }
         for (uint32_t sl : slots) {
             Result x = wait(sl);
-            if (r.status == P4_OK && x.status != P4_OK) r = x;
+            if (r.status == FLATSQL_OK && x.status != FLATSQL_OK) r = x;
         }
     } else {
         r = put(b);
     }
-    if (r.status != P4_OK) {
+    if (r.status != FLATSQL_OK) {
         std::fprintf(stderr, "  put failed: %d %s\n", r.status, r.err.c_str());
         std::_Exit(1);
     }
     if (c % 13 == 12) {
         TlvW s;
         s.text(1, "PNM").text(11, "prov").text(12, "src").text(60, "b" + std::to_string(c / 7)).u8(61, 1);
-        call(P4_OPC_SUPERSEDE, s.b);
+        call(FLATSQL_OPC_SUPERSEDE, s.b);
     }
     if (c % 11 == 10) {
         TlvW q;
         q.u64(62, 4ull << 20);
-        call(P4_OPC_QUOTA_GC, q.b);
+        call(FLATSQL_OPC_QUOTA_GC, q.b);
     }
 }
 }  // namespace
 
 // t_kill_run ingests until killed (killWorkStep; a small flush threshold so
 // flushes and journal cleanup happen often); t_kill_check reopens and checks.
-P4_SLOW_TEST(t_kill_run) {
+FLATSQL_SLOW_TEST(t_kill_run) {
     const std::string root = argStr("store", "");
     REQUIRE(!root.empty(), "--store");
     EngineOpts o;
     o.flushEntries = 5000;
     o.writers = 3;
-    REQUIRE(openEngine(root, o) == P4_OK, "open");
-    REQUIRE(registerType(killType()) == P4_OK, "register");
+    REQUIRE(openEngine(root, o) == FLATSQL_OK, "open");
+    REQUIRE(registerType(killType()) == FLATSQL_OK, "register");
     uint64_t id = uint64_t(argInt("base", 1)) * 100000000ull;
     for (int c = 0;; c++) killWorkStep(c, &id);
 }
@@ -290,11 +290,11 @@ namespace {
 bool killCheck(const std::string& root, std::string* why, int* compactions = nullptr) {
     EngineOpts o;
     o.flushEntries = 5000;
-    if (openEngine(root, o) != P4_OK) {
+    if (openEngine(root, o) != FLATSQL_OK) {
         *why = "reopen failed";
         return false;
     }
-    if (registerType(killType()) != P4_OK) {
+    if (registerType(killType()) != FLATSQL_OK) {
         *why = "register failed";
         closeEngine();
         return false;
@@ -350,9 +350,9 @@ bool killCheck(const std::string& root, std::string* why, int* compactions = nul
             sqlite3_finalize(q);
             if (rc != SQLITE_DONE) return fail("read snapshot metadata: " + f);
             if (mark == 0) break;
-            int32_t status = P4_OK;
+            int32_t status = FLATSQL_OK;
             stream = fp::streamAt(feed, uint32_t(gen), &status);
-            if (status != P4_OK) return fail("open snapshot stream: " + f);
+            if (status != FLATSQL_OK) return fail("open snapshot stream: " + f);
             if (stream) break;
             // The generation retired before we pinned it. Retry from a new
             // snapshot, as the engine's readers do.
@@ -372,7 +372,7 @@ bool killCheck(const std::string& root, std::string* why, int* compactions = nul
             fp::Internal in;
             in.what = feed->fid;
             in.force = true;
-            if (fp::runOnWriter(e, t, fp::kOpCompact, &in) != P4_OK || in.b == 0)
+            if (fp::runOnWriter(e, t, fp::kOpCompact, &in) != FLATSQL_OK || in.b == 0)
                 return fail("forced compaction: " + f);
             ++*compactions;
         }
@@ -438,14 +438,14 @@ bool killCheck(const std::string& root, std::string* why, int* compactions = nul
     const int64_t count = s.rows.size() == 1 ? s.i(0, "records") : (distinct.empty() ? 0 : -1);
     TlvW rb;
     rb.u32(63, 8);
-    Result v = call(P4_OPC_REBUILD, rb.b);
+    Result v = call(FLATSQL_OPC_REBUILD, rb.b);
     const int64_t mism = v.rows.size() == 1 ? v.i(0, "mismatches") : -1;
     if (mism < 0) std::fprintf(stderr, "  check: REBUILD 8 failed: %d %s\n", v.status, v.err.c_str());
     static uint64_t nextFresh = 9000000000ull;
     nextFresh += 1000;
     Result fresh = put(killBatch("producer0", "after", nextFresh + flatsql::ps::monoNs() % 1000000000ull * 1000, 100));
-    bool above = fresh.status == P4_OK && fresh.rows.size() == 100;
-    if (fresh.status != P4_OK) std::fprintf(stderr, "  check: fresh PUT failed: %d %s\n", fresh.status, fresh.err.c_str());
+    bool above = fresh.status == FLATSQL_OK && fresh.rows.size() == 100;
+    if (fresh.status != FLATSQL_OK) std::fprintf(stderr, "  check: fresh PUT failed: %d %s\n", fresh.status, fresh.err.c_str());
     for (size_t i = 0; i < fresh.rows.size(); i++) above = above && fresh.i(i, "seq") > maxSeq;
     closeEngine();
     // A closed engine leaves no file open: no VFS node (a forked child would
@@ -470,10 +470,10 @@ bool killCheck(const std::string& root, std::string* why, int* compactions = nul
 // Real store lifecycle with compaction forced between the stock stream walk
 // and the row reads. Without a shared snapshot, every live row can appear
 // unframed even though GET and REBUILD both verify the store successfully.
-P4_TEST(t_kill_check_compaction) {
+FLATSQL_TEST(t_kill_check_compaction) {
     const std::string root = scratchDir("check-compaction") + "/store";
-    REQUIRE(openEngine(root) == P4_OK, "open");
-    REQUIRE(registerType(killType()) == P4_OK, "register");
+    REQUIRE(openEngine(root) == FLATSQL_OK, "open");
+    REQUIRE(registerType(killType()) == FLATSQL_OK, "register");
     uint64_t id = 100000000;
     for (int c = 0; c < 4; c++) killWorkStep(c, &id);
     closeEngine();
@@ -486,7 +486,7 @@ P4_TEST(t_kill_check_compaction) {
     removeTree(root);
 }
 
-P4_SLOW_TEST(t_kill_check) {
+FLATSQL_SLOW_TEST(t_kill_check) {
     const std::string root = argStr("store", "");
     REQUIRE(!root.empty(), "--store");
     std::string why;
@@ -504,15 +504,15 @@ bool killStateWrite(const std::string& root,int round,const std::string& kind) {
     if(pid==0) {
         close(pe[0]); dup2(pe[1],2); close(pe[1]);
         EngineOpts o; o.flushEntries=5000; o.writers=3;
-        if(openEngine(root,o)!=P4_OK || registerType(killType())!=P4_OK) _exit(2);
+        if(openEngine(root,o)!=FLATSQL_OK || registerType(killType())!=FLATSQL_OK) _exit(2);
         uint64_t id=uint64_t(round)*100000000ull;
         for(int c=0;c<3;c++) killWorkStep(c,&id);
-        setenv("P4_STATE_DEBUG","1",1); setenv("P4_STATE_PAUSE_MS","100",1);
+        setenv("FLATSQL_STATE_DEBUG","1",1); setenv("FLATSQL_STATE_PAUSE_MS","100",1);
         if(kind=="compaction") {
             auto* e=fp::currentEngine();
             for(const auto& t:e->types) for(const auto& f:t->feeds) if(f) {
                 fp::Internal in; in.what=f->fid; in.force=true;
-                if(fp::runOnWriter(e,t.get(),fp::kOpCompact,&in)!=P4_OK) _exit(3);
+                if(fp::runOnWriter(e,t.get(),fp::kOpCompact,&in)!=FLATSQL_OK) _exit(3);
             }
         } else closeEngine(600000);
         _exit(4);
@@ -533,7 +533,7 @@ bool killStateWrite(const std::string& root,int round,const std::string& kind) {
     return landed && WIFSIGNALED(st) && WTERMSIG(st)==SIGKILL;
 }
 // The native loop: kill -9 an ingesting engine at a random point, check, repeat.
-P4_SLOW_TEST(t_kill) {
+FLATSQL_SLOW_TEST(t_kill) {
     const int rounds = int(argInt("rounds", 1000));
     const std::string root = scratchDir("kill") + "/fsql4";
     std::mt19937 rng(uint32_t(argInt("seed", 1)));
@@ -549,7 +549,7 @@ P4_SLOW_TEST(t_kill) {
             EngineOpts o;
             o.flushEntries = 5000;
             o.writers = 3;
-            if (openEngine(root, o) != P4_OK || registerType(killType()) != P4_OK) {
+            if (openEngine(root, o) != FLATSQL_OK || registerType(killType()) != FLATSQL_OK) {
                 std::fprintf(stderr, "  child: open failed\n");
                 _exit(2);
             }
@@ -595,7 +595,7 @@ struct Acked {
 };
 bool ackedCheck(const std::string& root, const std::vector<Acked>& acked, std::string* why) {
     EngineOpts o;
-    if (openEngine(root, o) != P4_OK || registerType(killType()) != P4_OK) {
+    if (openEngine(root, o) != FLATSQL_OK || registerType(killType()) != FLATSQL_OK) {
         *why = "reopen failed";
         closeEngine();
         return false;
@@ -620,7 +620,7 @@ bool ackedCheck(const std::string& root, const std::vector<Acked>& acked, std::s
         fp::st32(cl.data(), uint32_t(cids.size()));
         for (auto& c : cids) cl.insert(cl.end(), c.begin(), c.end());
         tw.raw(40, cl.data(), cl.size());
-        Result tg = call(P4_OPC_TAGS, tw.b);
+        Result tg = call(FLATSQL_OPC_TAGS, tw.b);
         std::set<std::string> tagged;
         const std::string src = a.feed == 0 ? "src" : kOddSource;
         for (size_t k = 0; k < tg.rows.size(); k++)
@@ -638,10 +638,10 @@ bool ackedCheck(const std::string& root, const std::vector<Acked>& acked, std::s
 
 // The kill -9 loop timed into merges: the child ingests with a small index
 // flush threshold (a merge per 2,000 staged rows of a feed) and logs each
-// merge's start and end (P4_MERGE_DEBUG) and each acknowledged call; the
+// merge's start and end (FLATSQL_MERGE_DEBUG) and each acknowledged call; the
 // parent kills it 0-4 ms after the k-th merge start, then checks the store
 // (t_kill's checks) and every acknowledged call.
-P4_SLOW_TEST(t_kill_merge) {
+FLATSQL_SLOW_TEST(t_kill_merge) {
     const int rounds = int(argInt("rounds", 100));
     const std::string root = scratchDir("killmerge") + "/fsql4";
     std::mt19937 rng(uint32_t(argInt("seed", 1)));
@@ -657,7 +657,7 @@ P4_SLOW_TEST(t_kill_merge) {
         }
         const pid_t pid = fork();
         if (pid == 0) {
-            setenv("P4_MERGE_DEBUG", "1", 1);
+            setenv("FLATSQL_MERGE_DEBUG", "1", 1);
             dup2(po[1], 1);
             dup2(pe[1], 2);
             close(po[0]);
@@ -665,7 +665,7 @@ P4_SLOW_TEST(t_kill_merge) {
             EngineOpts o;
             o.flushEntries = 2000;
             o.writers = 2;
-            if (openEngine(root, o) != P4_OK || registerType(killType()) != P4_OK) _exit(2);
+            if (openEngine(root, o) != FLATSQL_OK || registerType(killType()) != FLATSQL_OK) _exit(2);
             uint64_t id = uint64_t(round) * 100000000ull;
             for (int c = 0;; c++) {
                 const int feed = c % 3;
@@ -676,7 +676,7 @@ P4_SLOW_TEST(t_kill_merge) {
                 const uint64_t from = c % 5 == 4 ? id - 1600 : id;
                 Batch b = killBatch("producer" + std::to_string(c % 2), batch, from, 400, feed);
                 Result r = put(b);
-                if (r.status != P4_OK) _exit(1);
+                if (r.status != FLATSQL_OK) _exit(1);
                 std::printf("ACK %d %llu %d %d %s\n", c, (unsigned long long)from, 400, feed, batch.c_str());
                 std::fflush(stdout);
                 if (c % 5 != 4) id += 400;

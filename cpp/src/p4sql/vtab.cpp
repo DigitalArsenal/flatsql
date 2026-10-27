@@ -103,11 +103,11 @@ int32_t loadTypes(LaneState* ls, std::string* err) {
         std::memcpy(t.fid, ti.fid, 4);
         t.bound = ti.a18Bound;
         std::string e;
-        if (!format1Columns(t.name, ti.bfbs, ti.bfbsLen, &t.cols, &e)) continue;   // not queryable
+        if (!schemaColumns(t.name, ti.bfbs, ti.bfbsLen, &t.cols, &e)) continue;   // not queryable
         mapCols(&t, rulesOf(ti));
         ls->types.emplace(key, std::move(t));
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 const TypeEntry* typeByName(LaneState* ls, const std::string& name) {
@@ -127,7 +127,7 @@ int32_t sourcesOf(LaneState* ls, const std::string& type, std::vector<std::strin
         if (srcs[i]) out->emplace_back(srcs[i]);
     std::sort(out->begin(), out->end());
     out->erase(std::unique(out->begin(), out->end()), out->end());
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -334,11 +334,11 @@ void applySeq(Bounds* b, char op, int64_t v) {
 
 uint8_t predOp(char op) {
     switch (op) {
-        case '=': return P4_OP_EQ;
-        case '>': return P4_OP_GT;
-        case ')': return P4_OP_GE;
-        case '<': return P4_OP_LT;
-        case '(': return P4_OP_LE;
+        case '=': return FLATSQL_OP_EQ;
+        case '>': return FLATSQL_OP_GT;
+        case ')': return FLATSQL_OP_GE;
+        case '<': return FLATSQL_OP_LT;
+        case '(': return FLATSQL_OP_LE;
         default: return 0;
     }
 }
@@ -376,7 +376,7 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
     if (found < 0) return fail(c, found, err.empty() ? "sources unavailable" : err);
     if (found == 0) {
         auto it = vt->ls->relations.find(vt->key);
-        return fail(c, P4_E_SQL, "no such table: " + (it == vt->ls->relations.end() ? vt->key : it->second.spelling));
+        return fail(c, FLATSQL_E_SQL, "no such table: " + (it == vt->ls->relations.end() ? vt->key : it->second.spelling));
     }
     ScanArgs args;
     args.desc = (idxNum & kPlanDesc) != 0;
@@ -389,7 +389,7 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
             EngineCall ec;
             n = p4_type_rows(vt->ls->lane, vt->t->name.c_str());
         }
-        if (n < 0) return fail(c, P4_E_NOTYPE, "type not registered");
+        if (n < 0) return fail(c, FLATSQL_E_NOTYPE, "type not registered");
         if (vt->t->bound && uint64_t(n) > vt->t->bound) n = int64_t(vt->t->bound);  // A18: the newest N
         c->scan.openCounted(n);
         return SQLITE_OK;
@@ -416,7 +416,7 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
             case 'T':
                 if (intBound(v, op, &iv, &seq.empty)) {
                     ScanPred p;
-                    p.field = target == 'E' ? P4_F_EPOCH : P4_F_TS;
+                    p.field = target == 'E' ? FLATSQL_F_EPOCH : FLATSQL_F_TS;
                     p.op = predOp(op);
                     p.i = iv;
                     args.preds.push_back(p);
@@ -439,8 +439,8 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
                     const int n = sqlite3_value_bytes(v);
                     if (n > 0 && !spaceAt(s, n)) {
                         ScanPred p;
-                        p.field = P4_F_COL1;
-                        p.op = P4_OP_EQ;
+                        p.field = FLATSQL_F_COL1;
+                        p.op = FLATSQL_OP_EQ;
                         p.isText = true;
                         p.text.assign(reinterpret_cast<const char*>(s), size_t(n));
                         args.preds.push_back(p);
@@ -458,16 +458,16 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
     }
     auto col0 = [&](uint8_t op, int64_t v) {
         ScanPred p;
-        p.field = P4_F_COL0;
+        p.field = FLATSQL_F_COL0;
         p.op = op;
         p.i = v;
         args.preds.push_back(p);
     };
     if (col0HasEq) {
-        if (col0Eq >= 1) col0(P4_OP_EQ, col0Eq);
+        if (col0Eq >= 1) col0(FLATSQL_OP_EQ, col0Eq);
     } else if (col0Lo >= 1) {
-        col0(P4_OP_GE, col0Lo);
-        if (col0Hi != INT64_MAX) col0(P4_OP_LE, col0Hi);
+        col0(FLATSQL_OP_GE, col0Lo);
+        if (col0Hi != INT64_MAX) col0(FLATSQL_OP_LE, col0Hi);
     }
     if (seq.after < 0) seq.after = 0;
     if (seq.through < 1 || seq.after >= seq.through) seq.empty = true;
@@ -621,12 +621,12 @@ int32_t RelScan::open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, con
     spec_.seqThrough = a.seqThrough;
     spec_.preds = preds_.empty() ? nullptr : preds_.data();
     spec_.nPreds = uint32_t(preds_.size());
-    spec_.order = a.desc ? P4_ORDER_SEQ_DESC : P4_ORDER_SEQ_ASC;
+    spec_.order = a.desc ? FLATSQL_ORDER_SEQ_DESC : FLATSQL_ORDER_SEQ_ASC;
     spec_.hydrate = a.hydrate ? 1 : 0;
     spec_.noTags = a.tags ? 0 : 1;
     spec_.bound = t.bound;
     if (alias_) {
-        if (rel.empty) return P4_OK;   // a source the type holds no feed of (C-39 S1): no rows
+        if (rel.empty) return FLATSQL_OK;   // a source the type holds no feed of (C-39 S1): no rows
         strs_.push_back(rel.source);
         spec_.lane.source = strs_.back().c_str();
         spec_.part = rel.part;   // 3 for "<TYPE>@local": the local file too (C-43 B2)
@@ -649,15 +649,15 @@ int32_t RelScan::next() {
     if (counted_ >= 0) {
         row_.seq = --counted_;
         if (counted_ <= 0) eof_ = true;
-        return P4_OK;
+        return FLATSQL_OK;
     }
     if (!c_) {
         eof_ = true;
-        return P4_OK;
+        return FLATSQL_OK;
     }
     EngineCall ec;
     const int32_t rc = p4_cursor_next(c_, &row_);
-    if (rc > 0) return P4_OK;
+    if (rc > 0) return FLATSQL_OK;
     p4_cursor_close(c_);
     c_ = nullptr;
     eof_ = true;
@@ -791,7 +791,7 @@ int32_t ensureRelation(LaneState* ls, const std::string& name, std::string* err)
         ls->relations.erase(key);
         if (err) *err = msg ? msg : sqlite3_errstr(rc);
         sqlite3_free(msg);
-        return rc == SQLITE_NOMEM ? P4_E_NOMEM : P4_E_SQL;
+        return rc == SQLITE_NOMEM ? FLATSQL_E_NOMEM : FLATSQL_E_SQL;
     }
     return 1;
 }
@@ -871,14 +871,14 @@ int32_t bindSpellings(LaneState* ls, const char* sql, size_t n, std::string* msg
                 if (fi != f0 || (f0 == 1 && !first.same(other))) {
                     *msg = "relation names \"" + v[0] + "\" and \"" + v[i] +
                            "\" differ only by case and read different sources; one statement can name only one of them";
-                    return P4_E_SQL;
+                    return FLATSQL_E_SQL;
                 }
             }
         }
         auto it = ls->relations.find(kv.first);
         if (it != ls->relations.end()) it->second.spelling = v[0];
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 }  // namespace p4sql

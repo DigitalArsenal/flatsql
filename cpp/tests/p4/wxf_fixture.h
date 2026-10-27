@@ -116,8 +116,8 @@ inline bool migrateLane(const std::string& source, int64_t tiles, int64_t* seq, 
     auto flush = [&]() {
         if (b.recs.empty()) return true;
         Result r = put(b);
-        bool ok = r.status == P4_OK && r.rows.size() == b.recs.size();
-        for (size_t i = 0; ok && i < r.rows.size(); i++) ok = r.i(i, "action") != P4_ACT_REJECTED;
+        bool ok = r.status == FLATSQL_OK && r.rows.size() == b.recs.size();
+        for (size_t i = 0; ok && i < r.rows.size(); i++) ok = r.i(i, "action") != FLATSQL_ACT_REJECTED;
         if (!ok) std::fprintf(stderr, "  migrate %s: PUT %d %s\n", source.c_str(), r.status, r.err.c_str());
         b.recs.clear();
         b.tags.clear();
@@ -155,10 +155,10 @@ inline std::vector<uint8_t> retentionScan(const std::string& source, int64_t bef
     cells[0].i = before;
     std::vector<uint8_t> enc;
     flatsql::ps::rb1::encodeParams(cells, &enc);
-    std::vector<uint8_t> pred = {uint8_t(P4_F_TS), uint8_t(P4_OP_LT), 1, 0};
+    std::vector<uint8_t> pred = {uint8_t(FLATSQL_F_TS), uint8_t(FLATSQL_OP_LT), 1, 0};
     pred.insert(pred.end(), enc.begin() + 4, enc.end());
     TlvW sc;
-    sc.text(1, "WXF").u64(3, 501).u8(5, P4_ORDER_SEQ_ASC);
+    sc.text(1, "WXF").u64(3, 501).u8(5, FLATSQL_ORDER_SEQ_ASC);
     if (after) sc.i64(6, after);
     sc.i64(7, through).text(11, kProvider).text(12, source).raw(17, pred.data(), pred.size());
     return sc.b;

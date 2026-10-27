@@ -151,9 +151,9 @@ bool recordBytes(const Archive& archive,const Record& record,std::string* out) {
     return std::memcmp(digest,record.bytesDigest.data(),32)==0;
 }
 int32_t appendFrame(Stream* stream,const std::string& bytes,int64_t* end) {
-    if(bytes.size()>UINT32_MAX) return P4_E_CORRUPT;
+    if(bytes.size()>UINT32_MAX) return FLATSQL_E_CORRUPT;
     std::string data; le32(data,uint32_t(bytes.size())); data+=bytes;
-    int32_t rc=streamWrite(stream,*end,reinterpret_cast<const uint8_t*>(data.data()),data.size()); if(rc==P4_OK) *end+=int64_t(data.size()); return rc;
+    int32_t rc=streamWrite(stream,*end,reinterpret_cast<const uint8_t*>(data.data()),data.size()); if(rc==FLATSQL_OK) *end+=int64_t(data.size()); return rc;
 }
 flatbuffers::Offset<::FMBEntry> encodeEntry(flatbuffers::FlatBufferBuilder& b,const ::FMBEntry* e) {
     std::vector<flatbuffers::Offset<flatbuffers::String>> text; if(e->TEXT()) for(const auto* s:*e->TEXT()) text.push_back(b.CreateString(s->str()));
@@ -162,10 +162,10 @@ flatbuffers::Offset<::FMBEntry> encodeEntry(flatbuffers::FlatBufferBuilder& b,co
 int32_t appendSegments(Feed* f,Stream* stream,const std::vector<std::string>& segmentBytes,const FCK* ck,
                        const std::map<uint64_t,uint64_t>& refs,const std::string& previousRoot,uint64_t applied,int64_t* end,uint64_t* previous) {
     std::map<uint64_t,std::string> source;
-    for(const auto& bytes:segmentBytes) { Aligned a(bytes); flatbuffers::Verifier v(a.data(),a.size); if(!VerifyFSGBuffer(v)) return P4_E_CORRUPT; source.emplace(GetFSG(a.data())->SELF_OFFSET(),bytes); }
+    for(const auto& bytes:segmentBytes) { Aligned a(bytes); flatbuffers::Verifier v(a.data(),a.size); if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT; source.emplace(GetFSG(a.data())->SELF_OFFSET(),bytes); }
     std::vector<::FCKSegment> desc; std::vector<uint8_t> digests;
     if(ck->SEGMENTS()) for(const auto* old:*ck->SEGMENTS()) {
-        auto i=source.find(old->OFFSET()); if(i==source.end()) return P4_E_CORRUPT;
+        auto i=source.find(old->OFFSET()); if(i==source.end()) return FLATSQL_E_CORRUPT;
         Aligned a(i->second); const auto* s=GetFSG(a.data()); flatbuffers::FlatBufferBuilder b;
         std::vector<flatbuffers::Offset<::FMBEntry>> entries,tokens;
         if(s->ENTRIES()) for(const auto* d:*s->ENTRIES()) entries.push_back(encodeEntry(b,d));
@@ -180,56 +180,56 @@ int32_t appendSegments(Feed* f,Stream* stream,const std::vector<std::string>& se
         uint64_t at=uint64_t(*end); FSGBuilder builder(b); builder.add_SELF_OFFSET(at); builder.add_PREVIOUS(*previous); builder.add_FEED_ID(f->fid); builder.add_KIND(s->KIND()); builder.add_LEVEL(s->LEVEL()); builder.add_MIN_SEQ(s->MIN_SEQ()); builder.add_MAX_SEQ(s->MAX_SEQ()); builder.add_COVERS_THROUGH(applied); builder.add_ENTRIES(ev); builder.add_TOKENS(tv); builder.add_LATEST(lv); builder.add_INSTANCES(iv); builder.add_PAIRS(pv); if(urls.o) builder.add_INSTANCE_URL_IDS(urls); if(column.o) builder.add_COLUMN(column); auto root=builder.Finish(); FinishFSGBuffer(b,root);
         uint8_t digest[32]; ps::sha256(b.GetBufferPointer(),b.GetSize(),digest); digests.insert(digests.end(),digest,digest+32);
         desc.emplace_back(at,uint32_t(b.GetSize()),old->KIND(),old->LEVEL(),0,old->MIN_SEQ(),old->MAX_SEQ(),applied,old->ENTRIES());
-        int32_t rc=appendFrame(stream,std::string(reinterpret_cast<const char*>(b.GetBufferPointer()),b.GetSize()),end); if(rc!=P4_OK) return rc; *previous=at;
+        int32_t rc=appendFrame(stream,std::string(reinterpret_cast<const char*>(b.GetBufferPointer()),b.GetSize()),end); if(rc!=FLATSQL_OK) return rc; *previous=at;
     }
-    std::string commitsRoot; int32_t dagRc=feedDagCommitRoot(f,stream,*previous,uint64_t(*end),&commitsRoot,nullptr); if(dagRc!=P4_OK) return dagRc;
+    std::string commitsRoot; int32_t dagRc=feedDagCommitRoot(f,stream,*previous,uint64_t(*end),&commitsRoot,nullptr); if(dagRc!=FLATSQL_OK) return dagRc;
     flatbuffers::FlatBufferBuilder b; auto type=b.CreateString(f->type->name),provider=b.CreateString(f->provider),sourceName=b.CreateString(f->source);
     auto dv=b.CreateVectorOfStructs(desc); auto hv=b.CreateVector(digests); auto cr=b.CreateVector(reinterpret_cast<const uint8_t*>(commitsRoot.data()),commitsRoot.size()); auto pr=b.CreateVector(reinterpret_cast<const uint8_t*>(previousRoot.data()),previousRoot.size()); uint64_t at=uint64_t(*end);
     FCKBuilder builder(b); builder.add_SELF_OFFSET(at); builder.add_PREVIOUS(*previous); builder.add_FEED_ID(f->fid); builder.add_TYPE(type); builder.add_PROVIDER(provider); builder.add_SOURCE(sourceName); builder.add_GENERATION(f->gen); builder.add_COMMITTED_AT(ck->COMMITTED_AT()); builder.add_APPLIED_THROUGH(applied); builder.add_TYPE_SEQ_HIGH(ck->TYPE_SEQ_HIGH()); builder.add_COUNTERS(ck->COUNTERS()); builder.add_SEGMENTS(dv); builder.add_SEGMENT_DIGESTS(hv); builder.add_COMMITS_ROOT_CID(cr); builder.add_PREVIOUS_FEED_ROOT_CID(pr); builder.add_RECORD_BYTES(ck->RECORD_BYTES()); builder.add_MIN_W(ck->MIN_W()); builder.add_MAX_W(ck->MAX_W()); auto root=builder.Finish(); FinishFCKBuffer(b,root);
-    int32_t rc=appendFrame(stream,std::string(reinterpret_cast<const char*>(b.GetBufferPointer()),b.GetSize()),end); if(rc==P4_OK) *previous=at; return rc;
+    int32_t rc=appendFrame(stream,std::string(reinterpret_cast<const char*>(b.GetBufferPointer()),b.GetSize()),end); if(rc==FLATSQL_OK) *previous=at; return rc;
 }
 } // namespace
 
 static int32_t carExportOnWriter(Feed* feed,const std::string& path,CarStats* stats,std::string* err) {
     const uint64_t start=monoNs(); if(stats) *stats=CarStats{};
-    int32_t rc=checkpointFeed(feed,true,err); if(rc!=P4_OK) return rc;
-    DagSnapshot dag; rc=feedDagSnapshot(feed,&dag,err); if(rc!=P4_OK) return rc;
-    if(dag.root.size()!=36 || dag.blocks.empty()) return P4_E_CORRUPT;
-    File out; out.h=flatsql_io_open(path.data(),int32_t(path.size()),FLATSQL_IO_WRITE|FLATSQL_IO_CREATE|FLATSQL_IO_TRUNC|FLATSQL_IO_CREATE_PARENTS); if(out.h<0) return P4_E_IO;
-    std::string prefix(reinterpret_cast<const char*>(pragmaBytes),11); prefix.append(40,0); if(!out.write(0,prefix)) return P4_E_IO;
-    std::string header=cborHeader(dag.root),framed; varint(framed,header.size()); framed+=header; uint64_t at=51; if(!out.write(at,framed)) return P4_E_IO; at+=framed.size();
+    int32_t rc=checkpointFeed(feed,true,err); if(rc!=FLATSQL_OK) return rc;
+    DagSnapshot dag; rc=feedDagSnapshot(feed,&dag,err); if(rc!=FLATSQL_OK) return rc;
+    if(dag.root.size()!=36 || dag.blocks.empty()) return FLATSQL_E_CORRUPT;
+    File out; out.h=flatsql_io_open(path.data(),int32_t(path.size()),FLATSQL_IO_WRITE|FLATSQL_IO_CREATE|FLATSQL_IO_TRUNC|FLATSQL_IO_CREATE_PARENTS); if(out.h<0) return FLATSQL_E_IO;
+    std::string prefix(reinterpret_cast<const char*>(pragmaBytes),11); prefix.append(40,0); if(!out.write(0,prefix)) return FLATSQL_E_IO;
+    std::string header=cborHeader(dag.root),framed; varint(framed,header.size()); framed+=header; uint64_t at=51; if(!out.write(at,framed)) return FLATSQL_E_IO; at+=framed.size();
     File source; source.h=dag.stream->h; source.owned=false; source.size=uint64_t(streamSize(dag.stream.get()));
     std::vector<std::pair<std::string,uint64_t>> index; uint64_t live=uint64_t(feed->k.fbytes);
     for(const auto& block:dag.blocks) {
-        if(block.cid.size()!=36) return P4_E_CORRUPT; std::string bytes=block.bytes;
-        if(bytes.empty() && block.length) { if(!source.read(block.offset,size_t(block.length),&bytes)) return P4_E_IO; }
-        if(block.kind==P4_RANGE_FMB || block.kind==P4_RANGE_FCK || block.kind==P4_RANGE_FSG) live+=block.length+4;
+        if(block.cid.size()!=36) return FLATSQL_E_CORRUPT; std::string bytes=block.bytes;
+        if(bytes.empty() && block.length) { if(!source.read(block.offset,size_t(block.length),&bytes)) return FLATSQL_E_IO; }
+        if(block.kind==FLATSQL_RANGE_FMB || block.kind==FLATSQL_RANGE_FCK || block.kind==FLATSQL_RANGE_FSG) live+=block.length+4;
         std::string section; varint(section,block.cid.size()+bytes.size()); section+=block.cid;
-        index.emplace_back(block.cid,at-51); if(!out.write(at,section)) return P4_E_IO; at+=section.size(); if(!out.write(at,bytes)) return P4_E_IO; at+=bytes.size();
+        index.emplace_back(block.cid,at-51); if(!out.write(at,section)) return FLATSQL_E_IO; at+=section.size(); if(!out.write(at,bytes)) return FLATSQL_E_IO; at+=bytes.size();
     }
-    uint64_t indexAt=at; std::string idx=indexBytes(index); if(!out.write(at,idx)) return P4_E_IO; at+=idx.size();
+    uint64_t indexAt=at; std::string idx=indexBytes(index); if(!out.write(at,idx)) return FLATSQL_E_IO; at+=idx.size();
     std::string header2(16,0); le64(header2,51); le64(header2,indexAt-51); le64(header2,indexAt);
-    if(!out.write(11,header2) || !out.flush() || flatsql_io_sync(out.h)<0) return P4_E_IO;
+    if(!out.write(11,header2) || !out.flush() || flatsql_io_sync(out.h)<0) return FLATSQL_E_IO;
     if(stats) { stats->bytes=at; stats->blocks=dag.blocks.size(); stats->liveStreamBytes=live; stats->wallNs=monoNs()-start; }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 static int32_t carRestoreOnWriter(Type* type,const std::string& path,Feed** restored,CarStats* stats,std::string* err) {
     const uint64_t start=monoNs(); if(restored) *restored=nullptr; if(stats) *stats=CarStats{};
-    Archive archive; if(!parse(&archive,path,err)) return P4_E_CORRUPT;
+    Archive archive; if(!parse(&archive,path,err)) return FLATSQL_E_CORRUPT;
     std::string root; std::vector<IpldLink> links;
-    if(!archive.block(archive.root,&root) || !ipldLinks(root,&links)) return P4_E_CORRUPT;
-    std::string checkpoint; for(const auto& link:links) if(link.name=="checkpoint" && !archive.block(link.cid,&checkpoint)) return P4_E_CORRUPT;
-    if(checkpoint.empty()) return P4_E_CORRUPT;
-    Aligned ckBytes(checkpoint); flatbuffers::Verifier verifier(ckBytes.data(),ckBytes.size); if(!VerifyFCKBuffer(verifier)) return P4_E_CORRUPT; const auto* ck=GetFCK(ckBytes.data());
-    if(!ck->FEED_ID() || ck->FEED_ID()>1000000 || !ck->TYPE() || ck->TYPE()->str()!=type->name || !ck->PROVIDER() || !ck->SOURCE() || !ck->COUNTERS()) return P4_E_CORRUPT;
+    if(!archive.block(archive.root,&root) || !ipldLinks(root,&links)) return FLATSQL_E_CORRUPT;
+    std::string checkpoint; for(const auto& link:links) if(link.name=="checkpoint" && !archive.block(link.cid,&checkpoint)) return FLATSQL_E_CORRUPT;
+    if(checkpoint.empty()) return FLATSQL_E_CORRUPT;
+    Aligned ckBytes(checkpoint); flatbuffers::Verifier verifier(ckBytes.data(),ckBytes.size); if(!VerifyFCKBuffer(verifier)) return FLATSQL_E_CORRUPT; const auto* ck=GetFCK(ckBytes.data());
+    if(!ck->FEED_ID() || ck->FEED_ID()>1000000 || !ck->TYPE() || ck->TYPE()->str()!=type->name || !ck->PROVIDER() || !ck->SOURCE() || !ck->COUNTERS()) return FLATSQL_E_CORRUPT;
     std::vector<Batch> batches; std::vector<std::string> segments; std::map<uint64_t,Record> records;
     for(const auto& cid:archive.order) {
         const auto& location=archive.blocks.at(cid); if(uint8_t(cid[1])!=0x55 || location.length<8) continue;
-        std::string identifier; if(!archive.file.read(location.offset+4,4,&identifier)) return P4_E_IO;
+        std::string identifier; if(!archive.file.read(location.offset+4,4,&identifier)) return FLATSQL_E_IO;
         if(identifier!="$FMB" && identifier!="$FSG") continue;
-        std::string bytes; if(!archive.block(cid,&bytes)) return P4_E_IO;
-        if(identifier=="$FMB") { Batch batch; if(!decodeBatch(bytes,&batch,&records)) return P4_E_CORRUPT; batches.push_back(std::move(batch)); } else segments.push_back(std::move(bytes));
+        std::string bytes; if(!archive.block(cid,&bytes)) return FLATSQL_E_IO;
+        if(identifier=="$FMB") { Batch batch; if(!decodeBatch(bytes,&batch,&records)) return FLATSQL_E_CORRUPT; batches.push_back(std::move(batch)); } else segments.push_back(std::move(bytes));
     }
     // Determine the surviving addition for each RID before replay. A unit's
     // FMB can describe dead rows whose blocks intentionally aren't in the CAR.
@@ -258,14 +258,14 @@ static int32_t carRestoreOnWriter(Type* type,const std::string& path,Feed** rest
     }
     for(const auto& entry:seqIdentities) if(entry.second.size()>seqRows[entry.first]) {
         if(err) *err="CAR identity count exceeds surviving row capacity";
-        return P4_E_UNSUPPORTED;
+        return FLATSQL_E_UNSUPPORTED;
     }
-    int32_t rc=typeFilesEnsure(type,err); if(rc!=P4_OK) return rc; Feed* feed;
-    { std::lock_guard<std::mutex> lock(type->mu); feed=feedRestoreFresh(type,ck->FEED_ID(),ck->PROVIDER()->str(),ck->SOURCE()->str(),err); if(!feed) return P4_E_ARG; }
+    int32_t rc=typeFilesEnsure(type,err); if(rc!=FLATSQL_OK) return rc; Feed* feed;
+    { std::lock_guard<std::mutex> lock(type->mu); feed=feedRestoreFresh(type,ck->FEED_ID(),ck->PROVIDER()->str(),ck->SOURCE()->str(),err); if(!feed) return FLATSQL_E_ARG; }
     Conn* conn=writerPin(type->e,feed,&rc,err); if(!conn) return rc;
     auto fail=[&](int32_t status) { writerUnpin(type->e,feed); if(err && err->empty()) *err="CAR restore replay failed"; return status; };
     auto stream=streamCur(feed,&rc); if(!stream) return fail(rc); int64_t end=feed->end; uint64_t previous=0;
-    DagSnapshot genesis; rc=feedDagAt(feed,stream.get(),0,uint64_t(end),&genesis,err); if(rc!=P4_OK) return fail(rc);
+    DagSnapshot genesis; rc=feedDagAt(feed,stream.get(),0,uint64_t(end),&genesis,err); if(rc!=FLATSQL_OK) return fail(rc);
     File recordOutput; recordOutput.h=stream->h; recordOutput.owned=false; recordOutput.size=uint64_t(end);
     std::map<uint64_t,uint64_t> offsets,refs; uint64_t liveBytes=0;
     for(size_t i=0;i<batches.size();i++) {
@@ -278,15 +278,15 @@ static int32_t carRestoreOnWriter(Type* type,const std::string& path,Feed** rest
         // Frame order is the unit's physical stream order. FMB rows retain
         // their plan order and may point backward to any shared frame.
         for(uint64_t oldOffset:fresh) {
-            auto record=records.find(oldOffset); if(record==records.end()) return fail(P4_E_CORRUPT);
-            std::string bytes; if(!recordBytes(archive,record->second,&bytes)) return fail(P4_E_CORRUPT);
+            auto record=records.find(oldOffset); if(record==records.end()) return fail(FLATSQL_E_CORRUPT);
+            std::string bytes; if(!recordBytes(archive,record->second,&bytes)) return fail(FLATSQL_E_CORRUPT);
             offsets.emplace(oldOffset,uint64_t(end)); std::string framed; le32(framed,uint32_t(bytes.size())); framed+=bytes;
-            if(!recordOutput.write(uint64_t(end),framed)) return fail(P4_E_IO); end+=int64_t(framed.size()); liveBytes+=framed.size();
+            if(!recordOutput.write(uint64_t(end),framed)) return fail(FLATSQL_E_IO); end+=int64_t(framed.size()); liveBytes+=framed.size();
         }
         for(size_t j=0;j<source.commit.rows.size();j++) {
             FmbRow row=source.commit.rows[j]; uint64_t rid=(row.seq<<16)|row.rowJ; auto alive=live.find(rid);
             if(alive==live.end() || alive->second!=std::make_pair(i,j)) continue;
-            auto record=records.find(row.offset); if(record==records.end()) return fail(P4_E_CORRUPT);
+            auto record=records.find(row.offset); if(record==records.end()) return fail(FLATSQL_E_CORRUPT);
             uint64_t oldOffset=row.offset; row.offset=offsets.at(oldOffset);
             if(fresh.count(oldOffset) && emitted.insert(oldOffset).second) { row.flags|=FmbNewFrame; row.digest=record->second.digest; }
             else row.flags&=~uint32_t(FmbNewFrame);
@@ -296,33 +296,33 @@ static int32_t carRestoreOnWriter(Type* type,const std::string& path,Feed** rest
         }
         uint64_t commitAt=uint64_t(end); size_t newRow=0;
         for(size_t j=0;j<source.commit.rows.size();j++) { const auto& row=source.commit.rows[j]; auto alive=live.find((row.seq<<16)|row.rowJ); if(alive!=live.end() && alive->second==std::make_pair(i,j)) refs[(source.oldOffset<<16)|j]=(commitAt<<16)|newRow++; }
-        if(!recordOutput.flush()) return fail(P4_E_IO);
-        rc=streamAppendCommit(feed,stream.get(),m,&end,&previous); if(rc!=P4_OK) return fail(rc);
+        if(!recordOutput.flush()) return fail(FLATSQL_E_IO);
+        rc=streamAppendCommit(feed,stream.get(),m,&end,&previous); if(rc!=FLATSQL_OK) return fail(rc);
     }
-    const uint64_t applied=uint64_t(end); rc=appendSegments(feed,stream.get(),segments,ck,refs,genesis.root,applied,&end,&previous); if(rc!=P4_OK) return fail(rc);
-    rc=streamSync(stream.get()); if(rc!=P4_OK) return fail(rc);
-    std::vector<int64_t> moved; rc=recoverFeed(type,feed,conn,&moved,err); if(rc!=P4_OK) return fail(rc);
+    const uint64_t applied=uint64_t(end); rc=appendSegments(feed,stream.get(),segments,ck,refs,genesis.root,applied,&end,&previous); if(rc!=FLATSQL_OK) return fail(rc);
+    rc=streamSync(stream.get()); if(rc!=FLATSQL_OK) return fail(rc);
+    std::vector<int64_t> moved; rc=recoverFeed(type,feed,conn,&moved,err); if(rc!=FLATSQL_OK) return fail(rc);
     rc=indexPutFeed(type->idx,*feed,feed->gen); if(rc!=SQLITE_OK) return fail(statusOfSqlite(rc)); feed->registered=true;
-    writerUnpin(type->e,feed); rc=feedOpen(type,feed,&moved,err); if(rc!=P4_OK) return rc;
+    writerUnpin(type->e,feed); rc=feedOpen(type,feed,&moved,err); if(rc!=FLATSQL_OK) return rc;
     { std::lock_guard<std::mutex> lock(type->mu); type->vis.store(std::max(type->vis.load(),type->nextSeq-1)); }
     if(restored) *restored=feed;
     if(stats) { stats->bytes=archive.file.size; stats->blocks=archive.blocks.size(); stats->liveStreamBytes=liveBytes; stats->wallNs=monoNs()-start; }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 void carWork(Type* type,int op,Internal* in) {
     if(op==kOpCarExport) {
         Feed* feed=nullptr; { std::lock_guard<std::mutex> lock(type->mu); feed=type->feedById(in->what); }
-        in->status=feed?carExportOnWriter(feed,in->archivePath,in->archiveStats,&in->err):P4_E_ARG;
+        in->status=feed?carExportOnWriter(feed,in->archivePath,in->archiveStats,&in->err):FLATSQL_E_ARG;
     } else in->status=carRestoreOnWriter(type,in->archivePath,in->restoredFeed,in->archiveStats,&in->err);
 }
 int32_t carExportFeed(Feed* feed,const std::string& path,CarStats* stats,std::string* err) {
-    if(!feed) return P4_E_ARG;
+    if(!feed) return FLATSQL_E_ARG;
     if(!feed->type->e->started) return carExportOnWriter(feed,path,stats,err);
     Internal in; in.what=feed->fid; in.archivePath=path; in.archiveStats=stats;
     int32_t rc=runOnWriter(feed->type->e,feed->type,kOpCarExport,&in); if(err) *err=in.err; return rc;
 }
 int32_t carRestoreFeed(Type* type,const std::string& path,Feed** restored,CarStats* stats,std::string* err) {
-    if(!type) return P4_E_ARG;
+    if(!type) return FLATSQL_E_ARG;
     if(!type->e->started) return carRestoreOnWriter(type,path,restored,stats,err);
     Internal in; in.archivePath=path; in.archiveStats=stats; in.restoredFeed=restored;
     int32_t rc=runOnWriter(type->e,type,kOpCarRestore,&in); if(err) *err=in.err; return rc;

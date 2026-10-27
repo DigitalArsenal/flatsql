@@ -70,9 +70,9 @@ bool ipfsDfs(const IpfsFeed& f,const std::string& cid,std::set<std::string>* see
     return true;
 }
 bool ipfsRanges(const std::string& store,IpfsFeed* f,double* rangeUs=nullptr) {
-    auto w=ipfsRequest(*f);const auto t=flatsql::ps::monoNs();const Result r=ipfsCall(P4_OPC_RANGES,w);
+    auto w=ipfsRequest(*f);const auto t=flatsql::ps::monoNs();const Result r=ipfsCall(FLATSQL_OPC_RANGES,w);
     if(rangeUs)*rangeUs=double(flatsql::ps::monoNs()-t)/1e3/std::max<size_t>(1,r.rows.size());
-    if(r.status!=P4_OK)return ipfsFail("range op: "+r.err);
+    if(r.status!=FLATSQL_OK)return ipfsFail("range op: "+r.err);
     f->blocks.clear();f->linkBytes=f->streamBytes=f->records=0;
     std::map<std::string,int> handles;
     bool ok=true;
@@ -130,7 +130,7 @@ bool ipfsRanges(const std::string& store,IpfsFeed* f,double* rangeUs=nullptr) {
     return true;
 }
 bool ipfsRefreshRoot(IpfsFeed* f) {
-    const auto r=ipfsCall(P4_OPC_FEED_ROOT,ipfsRequest(*f));if(r.status!=P4_OK||r.rows.size()!=1)return ipfsFail("feed root op: "+r.err);
+    const auto r=ipfsCall(FLATSQL_OPC_FEED_ROOT,ipfsRequest(*f));if(r.status!=FLATSQL_OK||r.rows.size()!=1)return ipfsFail("feed root op: "+r.err);
     f->root=r.s(0,"cid");f->unit=uint64_t(r.i(0,"unit"));f->generation=uint32_t(r.i(0,"generation"));return true;
 }
 uint64_t ipfsLE(const uint8_t* p,size_t n) {uint64_t v=0;for(size_t i=0;i<n;i++)v|=uint64_t(p[i])<<(i*8);return v;}
@@ -175,15 +175,15 @@ flatsql::p4::Feed* ipfsEngineFeed(const IpfsFeed& f) {
 }
 bool ipfsFeeds(std::vector<IpfsFeed>* feeds) {
     feeds->clear();
-    for(const char* type:{"OMM","WXF","IQC"}) {TlvW w;w.text(1,type);const auto r=ipfsCall(P4_OPC_FEED_ROOT,w);
-        if(r.status!=P4_OK)return ipfsFail("type roots: "+r.err);
+    for(const char* type:{"OMM","WXF","IQC"}) {TlvW w;w.text(1,type);const auto r=ipfsCall(FLATSQL_OPC_FEED_ROOT,w);
+        if(r.status!=FLATSQL_OK)return ipfsFail("type roots: "+r.err);
         for(size_t i=0;i<r.rows.size();i++) {IpfsFeed f;f.type=type;f.provider=r.s(i,"provider");f.source=r.s(i,"source");f.root=r.s(i,"cid");f.unit=uint64_t(r.i(i,"unit"));f.generation=uint32_t(r.i(i,"generation"));feeds->push_back(std::move(f));}
     }return !feeds->empty();
 }
 // One RANGES answer (one snapshot): record CIDs, exposed CIDs, and every
 // CID with its unit, and the snapshot's generation.
 bool ipfsRangeRecordSet(const IpfsFeed& f,std::set<std::string>* out,std::set<std::string>* exposed=nullptr,std::map<std::string,uint64_t>* all=nullptr,uint32_t* generation=nullptr) {
-    const auto r=ipfsCall(P4_OPC_RANGES,ipfsRequest(f));if(r.status!=P4_OK)return ipfsFail("retention ranges: "+r.err);
+    const auto r=ipfsCall(FLATSQL_OPC_RANGES,ipfsRequest(f));if(r.status!=FLATSQL_OK)return ipfsFail("retention ranges: "+r.err);
     if(generation)*generation=r.rows.empty()?UINT32_MAX:uint32_t(r.i(0,"generation"));
     for(size_t i=0;i<r.rows.size();i++) {if(r.i(i,"kind")<=3)out->insert(r.s(i,"cid"));if(exposed&&r.i(i,"kind")!=7)exposed->insert(r.s(i,"cid"));if(all)all->emplace(r.s(i,"cid"),uint64_t(r.i(i,"unit")));
         if(generation&&uint32_t(r.i(i,"generation"))!=*generation)return ipfsFail("one RANGES answer spans generations");}
@@ -193,11 +193,11 @@ bool ipfsIdentityFixture(int64_t* seq) {
     Batch b;b.type="IQC";b.peer="identity-first";b.at=kT0;b.tags.push_back({"ipfs-e2e","identity","https://example.invalid/identity","first","","",""});
     In rec;rec.ts=kT0;rec.frame=iqcFrame("identity-copy","2026-10-18T00:00:00",128,42);rec.sig.assign(64,0x53);rec.hasIdent=true;
     for(size_t i=0;i<32;i++)rec.ident[i]=uint8_t(0xa0+i);b.recs.push_back(rec);
-    const auto first=put(b);if(first.status!=P4_OK||first.rows.size()!=1||first.i(0,"reject"))return ipfsFail("identity original PUT");*seq=first.i(0,"seq");
+    const auto first=put(b);if(first.status!=FLATSQL_OK||first.rows.size()!=1||first.i(0,"reject"))return ipfsFail("identity original PUT");*seq=first.i(0,"seq");
     b.peer="identity-copy";b.tags[0].batch="survivor";b.tags[0].url="https://example.invalid/identity-copy";b.recs[0].hasIdent=false;b.recs[0].sig.assign(64,0x43);b.at++;b.recs[0].ts++;
-    const auto copy=put(b);if(copy.status!=P4_OK||copy.rows.size()!=1||copy.i(0,"reject")||copy.i(0,"seq")!=*seq)return ipfsFail("identity shared copy PUT");
+    const auto copy=put(b);if(copy.status!=FLATSQL_OK||copy.rows.size()!=1||copy.i(0,"reject")||copy.i(0,"seq")!=*seq)return ipfsFail("identity shared copy PUT");
     TlvW remove;remove.text(1,"IQC").text(11,"ipfs-e2e").text(12,"identity").text(60,"survivor").u8(61,1);
-    if(ipfsCall(P4_OPC_SUPERSEDE,remove).status!=P4_OK)return ipfsFail("identity original-only removal");return true;
+    if(ipfsCall(FLATSQL_OPC_SUPERSEDE,remove).status!=FLATSQL_OK)return ipfsFail("identity original-only removal");return true;
 }
 bool ipfsIdentityHash(int64_t seq,std::string* out) {
     IpfsFeed f;f.type="IQC";f.provider="ipfs-e2e";f.source="identity";auto* feed=ipfsEngineFeed(f);if(!feed)return ipfsFail("identity feed missing");
@@ -206,7 +206,7 @@ bool ipfsIdentityHash(int64_t seq,std::string* out) {
     if(ok)while(sqlite3_step(q)==SQLITE_ROW) {const auto* p=static_cast<const uint8_t*>(sqlite3_column_blob(q,0));if(sqlite3_column_bytes(q,0)!=32||sqlite3_column_int64(q,1)!=seq) {ok=false;break;}for(size_t i=0;i<32;i++)if(p[i]!=uint8_t(0xa0+i))ok=false;hash.bytes(p,32);hash.i64(seq);count++;}
     sqlite3_finalize(q);q=nullptr;if(ok)ok=sqlite3_prepare_v2(db,"SELECT count(*) FROM r",-1,&q,nullptr)==SQLITE_OK&&sqlite3_step(q)==SQLITE_ROW&&sqlite3_column_int64(q,0)==2;
     sqlite3_finalize(q);sqlite3_close(db);if(!ok||count!=1)return ipfsFail("identity did not survive original-row removal / CAR restore");
-    TlvW scan;scan.text(1,"IQC").u8(2,1).u64(3,10).u8(5,P4_ORDER_SEQ_ASC);hash.result(ipfsCall(P4_OPC_SCAN,scan));*out=hash.hex();return true;
+    TlvW scan;scan.text(1,"IQC").u8(2,1).u64(3,10).u8(5,FLATSQL_ORDER_SEQ_ASC);hash.result(ipfsCall(FLATSQL_OPC_SCAN,scan));*out=hash.hex();return true;
 }
 // Bytes the allocator holds for the process (live allocations only).
 uint64_t ipfsHeapInUse() {
@@ -223,7 +223,7 @@ bool ipfsDagMemory() {
     auto* feed=ipfsEngineFeed(sea);if(!feed)return ipfsFail("sea feed missing");
     flatsql::p4::feedDagReset(feed);
     const uint64_t before=ipfsHeapInUse();
-    { flatsql::p4::DagSnapshot snapshot;std::string err;if(flatsql::p4::feedDagSnapshot(feed,&snapshot,&err)!=P4_OK)return ipfsFail("sea DAG: "+err); }
+    { flatsql::p4::DagSnapshot snapshot;std::string err;if(flatsql::p4::feedDagSnapshot(feed,&snapshot,&err)!=FLATSQL_OK)return ipfsFail("sea DAG: "+err); }
     const uint64_t after=ipfsHeapInUse();int64_t rows=0;{std::lock_guard<std::mutex> g(feed->type->mu);rows=feed->k.rows;}
     std::printf("REPLAY_IPFS_DAG_MEMORY type=WXF source=gfs-0p25-sea rows=%lld resident_bytes=%lld bytes_per_row=%.1f\n",(long long)rows,(long long)(after-before),double(int64_t(after-before))/double(std::max<int64_t>(1,rows)));
     return true;
@@ -241,40 +241,40 @@ bool ipfsDagScale() {
     struct Arm { const char* source; flatsql::p4::Feed* feed=nullptr; std::vector<double> root,ranges,earlier,drops; size_t fullRows=0,tailRows=0; double fullMs=0; uint64_t lastPoint=0; std::string lastRoot; };
     Arm arms[2]; arms[0].source=kBig; arms[1].source="dag-scale-small";
     const auto values=payloadOf(1024);
-    for(int t=0;t<8;t++) { const auto r=put(tileBatch(arms[1].source,"scale-seed-"+std::to_string(t),"seed",t,kT0+t,values)); if(r.status!=P4_OK)return ipfsFail("scale seed PUT: "+r.err); }
+    for(int t=0;t<8;t++) { const auto r=put(tileBatch(arms[1].source,"scale-seed-"+std::to_string(t),"seed",t,kT0+t,values)); if(r.status!=FLATSQL_OK)return ipfsFail("scale seed PUT: "+r.err); }
     auto commitRoot=[](flatsql::p4::Feed* feed,uint64_t point,std::string* cid) {
-        int32_t rc=P4_OK; auto stream=flatsql::p4::streamCur(feed,&rc); if(!stream) return rc==P4_OK?int32_t(P4_E_BUSY):rc;
+        int32_t rc=FLATSQL_OK; auto stream=flatsql::p4::streamCur(feed,&rc); if(!stream) return rc==FLATSQL_OK?int32_t(FLATSQL_E_BUSY):rc;
         std::string err; return flatsql::p4::feedDagCommitRoot(feed,stream.get(),point,uint64_t(flatsql::p4::streamSize(stream.get())),cid,&err);
     };
     for(auto& a:arms) {
         IpfsFeed f; f.type="WXF"; f.provider=kProvider; f.source=a.source; a.feed=ipfsEngineFeed(f); if(!a.feed||!ipfsRefreshRoot(&f))return ipfsFail("scale feed");
-        { const uint64_t t0=flatsql::ps::monoNs(); const auto full=ipfsCall(P4_OPC_RANGES,ipfsRequest(f)); if(full.status!=P4_OK)return ipfsFail("scale full ranges"); a.fullMs=double(flatsql::ps::monoNs()-t0)/1e6; a.fullRows=full.rows.size(); }
+        { const uint64_t t0=flatsql::ps::monoNs(); const auto full=ipfsCall(FLATSQL_OPC_RANGES,ipfsRequest(f)); if(full.status!=FLATSQL_OK)return ipfsFail("scale full ranges"); a.fullMs=double(flatsql::ps::monoNs()-t0)/1e6; a.fullRows=full.rows.size(); }
         for(int round=0;round<7;round++) {
-            const uint64_t prior=f.unit; std::string priorRoot; if(commitRoot(a.feed,prior,&priorRoot)!=P4_OK)return ipfsFail("scale commit root at the cache point");
-            const auto w=put(tileBatch(a.source,"scale-"+std::to_string(round),"scale",1000000+round,kT0+100000+round,values)); if(w.status!=P4_OK)return ipfsFail("scale PUT: "+w.err);
+            const uint64_t prior=f.unit; std::string priorRoot; if(commitRoot(a.feed,prior,&priorRoot)!=FLATSQL_OK)return ipfsFail("scale commit root at the cache point");
+            const auto w=put(tileBatch(a.source,"scale-"+std::to_string(round),"scale",1000000+round,kT0+100000+round,values)); if(w.status!=FLATSQL_OK)return ipfsFail("scale PUT: "+w.err);
             uint64_t t0=flatsql::ps::monoNs(); if(!ipfsRefreshRoot(&f))return false; a.root.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
             if(f.unit<=prior)return ipfsFail("scale PUT not committed at ack");
             auto tail=ipfsRequest(f); tail.u64(80,prior+1);
-            t0=flatsql::ps::monoNs(); const auto r=ipfsCall(P4_OPC_RANGES,tail); a.ranges.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
-            if(r.status!=P4_OK||r.rows.empty())return ipfsFail("scale tail ranges: "+r.err);
+            t0=flatsql::ps::monoNs(); const auto r=ipfsCall(FLATSQL_OPC_RANGES,tail); a.ranges.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
+            if(r.status!=FLATSQL_OK||r.rows.empty())return ipfsFail("scale tail ranges: "+r.err);
             for(size_t i=0;i<r.rows.size();i++)if(uint64_t(r.i(i,"unit"))<=prior)return ipfsFail("scale tail ranges before from");
             a.tailRows=r.rows.size();
             // The node's drop poll: the drops since its last commit.
             auto dw=ipfsRequest(f); dw.u64(80,prior+1);
-            t0=flatsql::ps::monoNs(); const auto d=ipfsCall(P4_OPC_DROPS,dw); a.drops.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
-            if(d.status!=P4_OK)return ipfsFail("scale drops: "+d.err);
+            t0=flatsql::ps::monoNs(); const auto d=ipfsCall(FLATSQL_OPC_DROPS,dw); a.drops.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
+            if(d.status!=FLATSQL_OK)return ipfsFail("scale drops: "+d.err);
             std::string again; t0=flatsql::ps::monoNs(); const int32_t rc=commitRoot(a.feed,prior,&again); a.earlier.push_back(double(flatsql::ps::monoNs()-t0)/1e6);
-            if(rc!=P4_OK||again!=priorRoot)return ipfsFail("scale earlier commit root not answered from the cache");
+            if(rc!=FLATSQL_OK||again!=priorRoot)return ipfsFail("scale earlier commit root not answered from the cache");
             a.lastPoint=prior; a.lastRoot=priorRoot;
             if(round==6) {
                 std::set<std::pair<std::string,uint64_t>> pruned; for(size_t i=0;i<r.rows.size();i++) pruned.insert({r.s(i,"cid"),uint64_t(r.i(i,"unit"))});
-                const auto full=ipfsCall(P4_OPC_RANGES,ipfsRequest(f)); if(full.status!=P4_OK)return ipfsFail("scale full ranges after");
+                const auto full=ipfsCall(FLATSQL_OPC_RANGES,ipfsRequest(f)); if(full.status!=FLATSQL_OK)return ipfsFail("scale full ranges after");
                 for(size_t i=0;i<full.rows.size();i++)if(uint64_t(full.i(i,"unit"))>prior&&!pruned.count({full.s(i,"cid"),uint64_t(full.i(i,"unit"))}))return ipfsFail("pruned ranges omit a block of the full closure");
             }
         }
         // A fresh cache computes the same commits root at that earlier point.
         flatsql::p4::feedDagReset(a.feed); std::string fresh;
-        if(commitRoot(a.feed,a.lastPoint,&fresh)!=P4_OK||fresh!=a.lastRoot)return ipfsFail("earlier commit root differs from a fresh cache's");
+        if(commitRoot(a.feed,a.lastPoint,&fresh)!=FLATSQL_OK||fresh!=a.lastRoot)return ipfsFail("earlier commit root differs from a fresh cache's");
         if(!ipfsRefreshRoot(&f))return false;
     }
     const double big[4]={ipfsMedian(arms[0].root),ipfsMedian(arms[0].ranges),ipfsMedian(arms[0].earlier),ipfsMedian(arms[0].drops)},small[4]={ipfsMedian(arms[1].root),ipfsMedian(arms[1].ranges),ipfsMedian(arms[1].earlier),ipfsMedian(arms[1].drops)};
@@ -285,7 +285,7 @@ bool ipfsDagScale() {
 }
 bool ipfsProof(const std::string& store,const Probe& probe) {
     const uint64_t phaseStart=flatsql::ps::monoNs();
-    if(openNode(store,1)!=P4_OK||!registerAll()||registerType(iqcType())!=P4_OK)return false;
+    if(openNode(store,1)!=FLATSQL_OK||!registerAll()||registerType(iqcType())!=FLATSQL_OK)return false;
     if(!ipfsDagMemory())return false;
     int64_t identitySeq=0;if(!ipfsIdentityFixture(&identitySeq))return false;
     std::setvbuf(stdout,nullptr,_IOLBF,0);
@@ -304,13 +304,13 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
         std::ofstream out(kubo+"/large-"+std::to_string(rec.frame.size()-4)+".bin",std::ios::binary);
         out.write(reinterpret_cast<const char*>(rec.frame.data()+4),std::streamsize(rec.frame.size()-4));if(!out)return ipfsFail("kubo input write");
     }
-    const auto wrote=put(large);if(wrote.status!=P4_OK||wrote.rows.size()!=2)return ipfsFail("large fixture PUT: "+wrote.err);
+    const auto wrote=put(large);if(wrote.status!=FLATSQL_OK||wrote.rows.size()!=2)return ipfsFail("large fixture PUT: "+wrote.err);
     for(size_t i=0;i<wrote.rows.size();i++)if(wrote.i(i,"reject"))return ipfsFail("large fixture reject "+std::to_string(wrote.i(i,"reject")));
     IpfsFeed lf;lf.type="WXF";lf.provider="ipfs-e2e";lf.source="large";
     if(!ipfsRefreshRoot(&lf)||!ipfsRanges(store,&lf))return false;
     for(const auto& cid:largeRoots)if(!lf.blocks.count(cid)||lf.blocks.at(cid).kind!=3)return ipfsFail("large record root does not match independent encoding");
     std::printf("REPLAY_IPFS_LARGE bytes=3145728,1572864 root_3m=%s root_1_5m=%s chunks=3,2 roots=matching PASS\n",flatsql::p4::ipldBase32(largeRoots[0]).c_str(),flatsql::p4::ipldBase32(largeRoots[1]).c_str());
-    auto expose=ipfsRequest(lf);expose.u8(81,1);if(ipfsCall(P4_OPC_EXPOSURE,expose).status!=P4_OK)return ipfsFail("exposure on");
+    auto expose=ipfsRequest(lf);expose.u8(81,1);if(ipfsCall(FLATSQL_OPC_EXPOSURE,expose).status!=FLATSQL_OK)return ipfsFail("exposure on");
     // Take the exact block sets before retention. This includes large roots
     // and every chunk, so a whole-range CID accidentally exposed is caught.
     std::vector<IpfsFeed> before;if(!ipfsFeeds(&before))return false;
@@ -319,13 +319,13 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
     Hash retained;int64_t retentionRows=0,retentionOps=0;wRetention(probe,&retained,&retentionRows,&retentionOps);
     uint8_t largeKey[36];cidOf(large.recs[0].frame,largeKey);TlvW dw;dw.text(1,"WXF");
     const auto list=cidList({std::vector<uint8_t>(largeKey,largeKey+36)},0,1);dw.raw(40,list.data(),list.size());
-    if(ipfsCall(P4_OPC_DELETE,dw).status!=P4_OK)return ipfsFail("large retention DELETE");
+    if(ipfsCall(FLATSQL_OPC_DELETE,dw).status!=FLATSQL_OK)return ipfsFail("large retention DELETE");
     std::vector<IpfsFeed> after;if(!ipfsFeeds(&after))return false;
     std::set<std::string> live,liveExposed;
     for(auto& f:after)if(f.type=="WXF"&&!ipfsRangeRecordSet(f,&live,&liveExposed))return false;
     std::set<std::string> removed;std::set_difference(prior.begin(),prior.end(),live.begin(),live.end(),std::inserter(removed,removed.end()));
-    TlvW dropsRequest;dropsRequest.text(1,"WXF");const auto drops=ipfsCall(P4_OPC_DROPS,dropsRequest);std::set<std::string> dropped,allDrops;
-    if(drops.status!=P4_OK)return ipfsFail("drop list: "+drops.err);
+    TlvW dropsRequest;dropsRequest.text(1,"WXF");const auto drops=ipfsCall(FLATSQL_OPC_DROPS,dropsRequest);std::set<std::string> dropped,allDrops;
+    if(drops.status!=FLATSQL_OK)return ipfsFail("drop list: "+drops.err);
     for(size_t i=0;i<drops.rows.size();i++) {if(drops.i(i,"unit")<=0)return ipfsFail("drop missing commit unit");const auto cid=drops.s(i,"cid");allDrops.insert(cid);if(prior.count(cid))dropped.insert(cid);}
     if(removed.empty()||removed!=dropped)return ipfsFail("drop list differs from removed record blocks: expected "+std::to_string(removed.size())+" got "+std::to_string(dropped.size()));
     // Incremental pulls: within one generation, every block new since the
@@ -352,14 +352,14 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
     if(!ipfsRefreshRoot(&lf))return false;auto* oldFeed=ipfsEngineFeed(lf);if(!oldFeed)return false;
     // Retention may already have compacted this small test feed. Acknowledge
     // that publication before the controlled compaction below.
-    auto priorRelease=ipfsRequest(lf);priorRelease.u64(80,lf.unit).u32(82,lf.generation);if(ipfsCall(P4_OPC_RELEASE,priorRelease).status!=P4_OK)return ipfsFail("release earlier automatic compaction");
+    auto priorRelease=ipfsRequest(lf);priorRelease.u64(80,lf.unit).u32(82,lf.generation);if(ipfsCall(FLATSQL_OPC_RELEASE,priorRelease).status!=FLATSQL_OK)return ipfsFail("release earlier automatic compaction");
     if(!ipfsRefreshRoot(&lf))return false;
     const std::string oldPath=oldFeed->stream->path;const uint32_t oldGeneration=oldFeed->gen;const uint64_t oldUnit=lf.unit;
     flatsql::p4::Internal compact;compact.what=oldFeed->fid;compact.force=true;
-    if(flatsql::p4::runOnWriter(flatsql::p4::currentEngine(),oldFeed->type,flatsql::p4::kOpCompact,&compact)!=P4_OK)return ipfsFail("IPFS compact: "+compact.err);
+    if(flatsql::p4::runOnWriter(flatsql::p4::currentEngine(),oldFeed->type,flatsql::p4::kOpCompact,&compact)!=FLATSQL_OK)return ipfsFail("IPFS compact: "+compact.err);
     const uint64_t compactAt=flatsql::ps::monoNs();
     flatsql::p4::Internal blocked;blocked.what=oldFeed->fid;blocked.force=true;
-    if(flatsql::p4::runOnWriter(flatsql::p4::currentEngine(),oldFeed->type,flatsql::p4::kOpCompact,&blocked)!=P4_E_BUSY)return ipfsFail("compaction accepted an unreleased prior generation");
+    if(flatsql::p4::runOnWriter(flatsql::p4::currentEngine(),oldFeed->type,flatsql::p4::kOpCompact,&blocked)!=FLATSQL_E_BUSY)return ipfsFail("compaction accepted an unreleased prior generation");
     if(!std::filesystem::exists(oldPath)||oldFeed->gen<=oldGeneration)return ipfsFail("compaction removed unreleased generation");
     std::vector<IpfsFeed> feeds;if(!ipfsFeeds(&feeds))return false;
     const std::string carDir=std::filesystem::path(store).parent_path().string()+"/cars";std::filesystem::create_directories(carDir);
@@ -370,7 +370,7 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
         auto* feed=ipfsEngineFeed(f);if(!feed)return ipfsFail("export feed lookup");
         const std::string path=carDir+"/"+std::to_string(feedN++)+".car",again=path+".again";
         flatsql::p4::CarStats first,second;std::string err;
-        if(flatsql::p4::carExportFeed(feed,path,&first,&err)!=P4_OK||flatsql::p4::carExportFeed(feed,again,&second,&err)!=P4_OK)return ipfsFail("CAR export: "+err);
+        if(flatsql::p4::carExportFeed(feed,path,&first,&err)!=FLATSQL_OK||flatsql::p4::carExportFeed(feed,again,&second,&err)!=FLATSQL_OK)return ipfsFail("CAR export: "+err);
         exportNs+=first.wallNs;
         if(!ipfsFileEqual(path,again))return ipfsFail("CAR deterministic bytes");std::filesystem::remove(again);
         double rangeUs=0;if(!ipfsRefreshRoot(&f)||!ipfsRanges(store,&f,&rangeUs))return false;
@@ -379,12 +379,12 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
         cars.push_back({f.type,path});sourceFeedIds[path]=feed->fid;
         std::printf("REPLAY_IPFS_CAR_FILE type=%s source=%s root=%s blocks=%llu path=%s\n",f.type.c_str(),f.source.c_str(),flatsql::p4::ipldBase32(f.root).c_str(),(unsigned long long)blocks,path.c_str());
         std::printf("REPLAY_IPFS_RANGE type=%s source=%s tuples=%zu us_per_tuple=%.3f hashes=matching closure=exact PASS\n",f.type.c_str(),f.source.c_str(),f.blocks.size(),rangeUs);
-        auto partial=ipfsRequest(f);partial.u64(80,f.unit);const auto tail=ipfsCall(P4_OPC_RANGES,partial);if(tail.status!=P4_OK)return ipfsFail("range from commit");
+        auto partial=ipfsRequest(f);partial.u64(80,f.unit);const auto tail=ipfsCall(FLATSQL_OPC_RANGES,partial);if(tail.status!=FLATSQL_OK)return ipfsFail("range from commit");
         for(size_t i=0;i<tail.rows.size();i++)if(uint64_t(tail.i(i,"unit"))<f.unit)return ipfsFail("range inclusive commit bound");
     }
     uint8_t liveLargeKey[36];cidOf(large.recs[1].frame,liveLargeKey);
     const std::vector<std::vector<uint8_t>> largeGetKeys{std::vector<uint8_t>(liveLargeKey,liveLargeKey+36)};
-    auto want=allReadHashes(probe);Hash largeAnswer;const auto signedLarge=get("WXF",largeGetKeys);if(signedLarge.status!=P4_OK||signedLarge.rows.size()!=1||signedLarge.s(0,"sig")!=std::string(reinterpret_cast<const char*>(large.recs[1].sig.data()),large.recs[1].sig.size()))return ipfsFail("large record signature GET");largeAnswer.result(signedLarge);want["large_get"]=largeAnswer.hex();if(!ipfsIdentityHash(identitySeq,&want["identity_survivor"]))return false;
+    auto want=allReadHashes(probe);Hash largeAnswer;const auto signedLarge=get("WXF",largeGetKeys);if(signedLarge.status!=FLATSQL_OK||signedLarge.rows.size()!=1||signedLarge.s(0,"sig")!=std::string(reinterpret_cast<const char*>(large.recs[1].sig.data()),large.recs[1].sig.size()))return ipfsFail("large record signature GET");largeAnswer.result(signedLarge);want["large_get"]=largeAnswer.hex();if(!ipfsIdentityHash(identitySeq,&want["identity_survivor"]))return false;
     // Leave exposure enabled for the full reader window. A generation must
     // still exist after both time and work have passed, until release arrives.
     const uint64_t deadline=compactAt+uint64_t(30500)*1000000;
@@ -393,20 +393,20 @@ bool ipfsProof(const std::string& store,const Probe& probe) {
     while(flatsql::ps::monoNs()<deadline)std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if(!std::filesystem::exists(oldPath))return ipfsFail("unreleased generation deleted after reader window");
     auto release=ipfsRequest(lf);release.u64(80,oldUnit).u32(82,oldGeneration);
-    if(ipfsCall(P4_OPC_RELEASE,release).status!=P4_OK)return ipfsFail("release through commit");
+    if(ipfsCall(FLATSQL_OPC_RELEASE,release).status!=FLATSQL_OK)return ipfsFail("release through commit");
     const uint64_t releasedAt=flatsql::ps::monoNs();while(std::filesystem::exists(oldPath)&&flatsql::ps::monoNs()-releasedAt<uint64_t(5)*1000000000)std::this_thread::sleep_for(std::chrono::milliseconds(20));
     if(std::filesystem::exists(oldPath))return ipfsFail("released generation not unlinked");
     std::printf("REPLAY_IPFS_RELEASE generation=%u held_before_release=1 compaction_while_unreleased=busy window_ms=%.1f unlinked_after_release=1 PASS\n",oldGeneration,double(flatsql::ps::monoNs()-compactAt)/1e6);
     closeEngine(600000);
     const std::string restored=std::filesystem::path(store).parent_path().string()+"/restored/fsql4";
-    if(openNode(restored,1)!=P4_OK||!registerAll()||registerType(iqcType())!=P4_OK)return ipfsFail("restore store open");uint64_t restoreNs=0;
+    if(openNode(restored,1)!=FLATSQL_OK||!registerAll()||registerType(iqcType())!=FLATSQL_OK)return ipfsFail("restore store open");uint64_t restoreNs=0;
     std::reverse(cars.begin(),cars.end());
     for(const auto& car:cars) {flatsql::p4::CarStats stats;std::string err;flatsql::p4::Feed* feed=nullptr;
-        if(flatsql::p4::carRestoreFeed(flatsql::p4::currentEngine()->findType(car.first),car.second,&feed,&stats,&err)!=P4_OK)return ipfsFail("CAR restore: "+err);if(!feed||feed->fid!=sourceFeedIds.at(car.second))return ipfsFail("CAR restore changed FEED_ID");restoreNs+=stats.wallNs;
+        if(flatsql::p4::carRestoreFeed(flatsql::p4::currentEngine()->findType(car.first),car.second,&feed,&stats,&err)!=FLATSQL_OK)return ipfsFail("CAR restore: "+err);if(!feed||feed->fid!=sourceFeedIds.at(car.second))return ipfsFail("CAR restore changed FEED_ID");restoreNs+=stats.wallNs;
     }
     auto got=allReadHashes(probe);Hash restoredLarge;restoredLarge.result(get("WXF",largeGetKeys));got["large_get"]=restoredLarge.hex();if(!ipfsIdentityHash(identitySeq,&got["identity_survivor"]))return false;if(want!=got) {for(const auto& h:want)if(got.find(h.first)==got.end()||got.at(h.first)!=h.second)std::fprintf(stderr,"IPFS restore hash %s: want %s got %s\n",h.first.c_str(),h.second.c_str(),got.count(h.first)?got.at(h.first).c_str():"missing");return false;}
     closeEngine(600000);
-    if(openNode(restored,1)!=P4_OK||!registerAll()||registerType(iqcType())!=P4_OK)return false;auto reopened=allReadHashes(probe);Hash reopenedLarge;reopenedLarge.result(get("WXF",largeGetKeys));reopened["large_get"]=reopenedLarge.hex();if(!ipfsIdentityHash(identitySeq,&reopened["identity_survivor"]))return false;closeEngine(600000);if(reopened!=want)return ipfsFail("restored CAR reopen answers");
+    if(openNode(restored,1)!=FLATSQL_OK||!registerAll()||registerType(iqcType())!=FLATSQL_OK)return false;auto reopened=allReadHashes(probe);Hash reopenedLarge;reopenedLarge.result(get("WXF",largeGetKeys));reopened["large_get"]=reopenedLarge.hex();if(!ipfsIdentityHash(identitySeq,&reopened["identity_survivor"]))return false;closeEngine(600000);if(reopened!=want)return ipfsFail("restored CAR reopen answers");
     for(const auto& h:got)std::printf("REPLAY_IPFS_RESTORE workload=%s hash=%s source=equal reopened=equal PASS\n",h.first.c_str(),h.second.c_str());
     for(const auto& item:metrics) {const auto& m=item.second;std::printf("REPLAY_IPFS_METRIC type=%s records=%llu dag_link_bytes_per_record=%.3f car_bytes=%llu live_stream_bytes=%llu car_stream_ratio=%.6f range_us_per_tuple=%.3f\n",item.first.c_str(),(unsigned long long)m.records,double(m.links)/std::max<uint64_t>(1,m.records),(unsigned long long)m.car,(unsigned long long)m.stream,double(m.car)/std::max<uint64_t>(1,m.stream),m.rangeUs/std::max<uint64_t>(1,m.tuples));}
     std::printf("REPLAY_IPFS_CAR feeds=%zu blocks=%llu deterministic=1 header=valid sections=valid index=valid feed_ids=preserved restore_order=reversed export_ms=%.3f restore_ms=%.3f PASS\n",cars.size(),(unsigned long long)carBlocks,double(exportNs)/1e6,double(restoreNs)/1e6);

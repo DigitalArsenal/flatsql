@@ -1,0 +1,13 @@
+{
+  "algorithm": "sha384",
+  "hash": "HkzWZkYi6pKQx4eBpFpKKCuU89Omodu9+slm1pbwMcitwPnqBMyQ2JvLQgKLvJfA",
+  "sri": "sha384-HkzWZkYi6pKQx4eBpFpKKCuU89Omodu9+slm1pbwMcitwPnqBMyQ2JvLQgKLvJfA",
+  "size": 3713350,
+  "files": {
+    "flatsql.wasm": {
+      "sha256": "2c9aaac2f04677ad972076d0e6fcc656b3d66462072a0b7404ddcd44d0bf8c19",
+      "sri": "sha384-HkzWZkYi6pKQx4eBpFpKKCuU89Omodu9+slm1pbwMcitwPnqBMyQ2JvLQgKLvJfA",
+      "size": 3713350
+    }
+  }
+}

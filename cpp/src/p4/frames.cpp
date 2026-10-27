@@ -16,7 +16,7 @@ int32_t appendBuffer(Stream* s, flatbuffers::FlatBufferBuilder& b, int64_t* end)
     st32(frame.data(), uint32_t(b.GetSize()));
     std::memcpy(frame.data()+4,b.GetBufferPointer(),b.GetSize());
     const int32_t rc=streamWrite(s,*end,frame.data(),frame.size());
-    if(rc==P4_OK) *end+=int64_t(frame.size());
+    if(rc==FLATSQL_OK) *end+=int64_t(frame.size());
     return rc;
 }
 }
@@ -83,7 +83,7 @@ bool verifyFmbCommit(const FMB* m,uint64_t at,uint64_t previous,uint32_t fid,
 }
 
 int32_t streamGenesis(Feed* f, Stream* s, int64_t* end) {
-    if(*end != 0) return P4_E_CORRUPT;
+    if(*end != 0) return FLATSQL_E_CORRUPT;
     flatbuffers::FlatBufferBuilder b;
     auto type=b.CreateString(f->type->name), provider=b.CreateString(f->provider), source=b.CreateString(f->source);
     const std::string emptyNode=ipldDagPb({}), emptyCid=ipldCid(IpldDagPb,emptyNode.data(),emptyNode.size());
@@ -119,8 +119,8 @@ int32_t streamAppendCommit(Feed* f, Stream* stream, const FmbCommit& m, int64_t*
                 auto found=largeFrames.find(r.offset);
                 if(found==largeFrames.end()) {
                     std::string record; const int32_t rc=streamRead(stream,int64_t(r.offset),r.length,&record);
-                    if(rc!=P4_OK) return rc;
-                    IpldLarge dag; if(!ipldLarge(record.data(),record.size(),&dag)) return P4_E_CORRUPT;
+                    if(rc!=FLATSQL_OK) return rc;
+                    IpldLarge dag; if(!ipldLarge(record.data(),record.size(),&dag)) return FLATSQL_E_CORRUPT;
                     found=largeFrames.emplace(r.offset,std::move(dag)).first;
                 }
                 const auto& dag=found->second;
@@ -160,10 +160,10 @@ int32_t streamAppendCommit(Feed* f, Stream* stream, const FmbCommit& m, int64_t*
         auto x=root.Finish(); FinishFMBBuffer(b,x);
         const uint64_t offset=uint64_t(*end);
         int32_t rc=appendBuffer(stream,b,end);
-        if(rc!=P4_OK) return rc;
+        if(rc!=FLATSQL_OK) return rc;
         *previous=offset; at+=count;
     } while(at<m.rows.size());
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 } }
@@ -188,7 +188,7 @@ int32_t appendConsolidated(Feed* f,Conn* c,Stream* stream,int64_t* end,uint64_t*
         }
         const char* sql[]={"SELECT id,producer,peer FROM node ORDER BY id","SELECT id,batch,ppeer,pkey FROM batch ORDER BY id","SELECT id,ckey FROM ckey ORDER BY id","SELECT id,url FROM url ORDER BY id"};
         for(uint8_t k=1;k<=4;k++) {
-            auto* q=c->sql(sql[k-1]); if(!q) return P4_E_IO; int rc;
+            auto* q=c->sql(sql[k-1]); if(!q) return FLATSQL_E_IO; int rc;
             while((rc=sqlite3_step(q))==SQLITE_ROW) {
                 FmbEntry d; d.kind=k; d.id=uint32_t(sqlite3_column_int64(q,0));
                 for(int j=1;j<sqlite3_column_count(q);j++) d.text.push_back(colText(q,j));
@@ -204,7 +204,7 @@ int32_t appendConsolidated(Feed* f,Conn* c,Stream* stream,int64_t* end,uint64_t*
         int rc=c->exec("CREATE TEMP TABLE IF NOT EXISTS compact_rid(rid INTEGER PRIMARY KEY) WITHOUT ROWID; DELETE FROM compact_rid");
         if(rc!=SQLITE_OK) return statusOfSqlite(rc);
         auto* insert=c->sql("INSERT OR IGNORE INTO temp.compact_rid(rid) VALUES(?1)");
-        if(!insert) return P4_E_IO;
+        if(!insert) return FLATSQL_E_IO;
         for(int64_t rid:*rids) {
             sqlite3_bind_int64(insert,1,rid); rc=sqlite3_step(insert); sqlite3_reset(insert);
             if(rc!=SQLITE_DONE) return statusOfSqlite(rc);
@@ -216,14 +216,14 @@ int32_t appendConsolidated(Feed* f,Conn* c,Stream* stream,int64_t* end,uint64_t*
         "SELECT r.rid,r.seq,r.n,r.b,r.c,r.u,r.at,r.cid,r.e,r.k,r.ts,r.f,r.x,r.off,r.len,r.kk "
         "FROM temp.compact_rid AS chosen CROSS JOIN r ON r.rid=chosen.rid ORDER BY chosen.rid":
         "SELECT rid,seq,n,b,c,u,at,cid,e,k,ts,f,x,off,len,kk FROM r ORDER BY rid");
-    if(!q) return P4_E_IO; int rc;
+    if(!q) return FLATSQL_E_IO; int rc;
     while((rc=sqlite3_step(q))==SQLITE_ROW) {
         const int64_t rid=sqlite3_column_int64(q,0);
         FmbRow row; row.seq=uint64_t(sqlite3_column_int64(q,1)); row.rowJ=uint16_t(rid&65535);
         row.offset=uint64_t(sqlite3_column_int64(q,13)); row.length=uint32_t(sqlite3_column_int64(q,14));
         row.sourceTs=sqlite3_column_int64(q,10); row.flags=FmbCompacted;
         if(frames.insert(row.offset).second) row.flags|=FmbNewFrame;
-        if(sqlite3_column_bytes(q,7)!=32) { sqlite3_reset(q); return P4_E_CORRUPT; }
+        if(sqlite3_column_bytes(q,7)!=32) { sqlite3_reset(q); return FLATSQL_E_CORRUPT; }
         cidDigestFromKey(static_cast<const uint8_t*>(sqlite3_column_blob(q,7)),row.digest.data());
         row.signature=colBlob(q,12);
         row.group=uint32_t(m.groups.size());
@@ -236,19 +236,19 @@ int32_t appendConsolidated(Feed* f,Conn* c,Stream* stream,int64_t* end,uint64_t*
                 KVal key; key.from(q,9); m.dictionary.push_back({5,row.objectKey,{std::string(key.type==1?"i":"s")+key.text()}});
             }
             std::string bytes;
-            if(streamRead(stream,int64_t(row.offset),row.length,&bytes)!=P4_OK) { sqlite3_reset(q); return P4_E_IO; }
+            if(streamRead(stream,int64_t(row.offset),row.length,&bytes)!=FLATSQL_OK) { sqlite3_reset(q); return FLATSQL_E_IO; }
             ps::sha256(reinterpret_cast<const uint8_t*>(bytes.data()),bytes.size(),row.leafDigest.data());
         }
         auto* iq=c->sql("SELECT h FROM ident WHERE seq=?1 UNION ALL SELECT h FROM idst WHERE seq=?1 LIMIT 1");
-        if(!iq) { sqlite3_reset(q); return P4_E_IO; }
+        if(!iq) { sqlite3_reset(q); return FLATSQL_E_IO; }
         sqlite3_bind_int64(iq,1,sqlite3_int64(row.seq));
         if(sqlite3_step(iq)==SQLITE_ROW) row.identity=colBlob(iq,0);
         sqlite3_reset(iq);
         m.rows.push_back(std::move(row));
     }
     sqlite3_reset(q); if(rc!=SQLITE_DONE) return statusOfSqlite(rc);
-    if(rids && c->exec("DELETE FROM temp.compact_rid")!=SQLITE_OK) return P4_E_IO;
-    if(m.rows.size()>65536) { if(err) *err="compaction chunk exceeds 65536 rows"; return P4_E_INTERNAL; }
+    if(rids && c->exec("DELETE FROM temp.compact_rid")!=SQLITE_OK) return FLATSQL_E_IO;
+    if(m.rows.size()>65536) { if(err) *err="compaction chunk exceeds 65536 rows"; return FLATSQL_E_INTERNAL; }
     return streamAppendCommit(f,stream,m,end,previous);
 }
 
@@ -277,12 +277,12 @@ bool completedGeneration(Stream* stream,uint32_t fid,uint32_t gen) {
     bool complete=false;
     std::map<uint64_t,FmbFrameProof> pending;
     while(at+12<=size) {
-        std::string prefix; if(streamReadRange(stream,at,12,&prefix)!=P4_OK) break;
+        std::string prefix; if(streamReadRange(stream,at,12,&prefix)!=FLATSQL_OK) break;
         uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data()));
         if(n<8 || n>(128u<<20) || int64_t(n)>size-at-4) break;
         const bool fmb=!std::memcmp(prefix.data()+8,"$FMB",4), fck=!std::memcmp(prefix.data()+8,"$FCK",4), fsg=!std::memcmp(prefix.data()+8,"$FSG",4);
         if(fmb || fck || fsg) {
-            std::string data; if(streamRead(stream,at,n,&data)!=P4_OK) break;
+            std::string data; if(streamRead(stream,at,n,&data)!=FLATSQL_OK) break;
             std::vector<uint64_t> aligned((n+7)/8); std::memcpy(aligned.data(),data.data(),n);
             auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier verifier(p,n);
             if(fmb) {
@@ -299,13 +299,13 @@ bool completedGeneration(Stream* stream,uint32_t fid,uint32_t gen) {
                 if(c->SELF_OFFSET()!=uint64_t(at) || c->PREVIOUS()!=previous || c->FEED_ID()!=fid || c->GENERATION()!=gen) break;
                 if(at && c->APPLIED_THROUGH()<=uint64_t(at) && c->COUNTERS()) {
                     Feed feed; feed.fid=fid; CheckpointState state; stream->gen=gen;
-                    if(checkpointReadAt(&feed,stream,uint64_t(at),&state,nullptr)!=P4_OK) break;
+                    if(checkpointReadAt(&feed,stream,uint64_t(at),&state,nullptr)!=FLATSQL_OK) break;
                     complete=true;
                 }
             }
             previous=uint64_t(at); pending.clear();
         } else {
-            std::string data; if(streamRead(stream,at,n,&data)!=P4_OK) break;
+            std::string data; if(streamRead(stream,at,n,&data)!=FLATSQL_OK) break;
             FmbFrameProof proof; proof.size=n;
             ps::sha256(reinterpret_cast<const uint8_t*>(data.data()),data.size(),proof.digest.data());
             pending.emplace(uint64_t(at),proof);
@@ -325,11 +325,11 @@ int32_t streamDiscover(Type* t,Conn* idx,std::string* err) {
     std::vector<std::string> names;
     if(!p4ListStreams(t->pDir,&names)) {
         if(err) *err="stream discovery requires directory enumeration: "+t->pDir;
-        return P4_E_UNSUPPORTED;
+        return FLATSQL_E_UNSUPPORTED;
     }
     std::set<uint32_t> registered;
     auto* registry=idx->sql("SELECT fid,provider,source,name,gen FROM feed ORDER BY fid");
-    if(!registry) return P4_E_IO;
+    if(!registry) return FLATSQL_E_IO;
     int rr;
     while((rr=sqlite3_step(registry))==SQLITE_ROW) {
         Feed* f=feedRestore(t,uint32_t(sqlite3_column_int64(registry,0)),colText(registry,1),colText(registry,2),colText(registry,3));
@@ -342,9 +342,9 @@ int32_t streamDiscover(Type* t,Conn* idx,std::string* err) {
         if(stream.h<0) continue;
         const int64_t size=streamSize(&stream); if(size<12) continue;
         std::string prefix;
-        if(streamReadRange(&stream,0,12,&prefix)!=P4_OK || std::memcmp(prefix.data()+8,"$FCK",4)) continue;
+        if(streamReadRange(&stream,0,12,&prefix)!=FLATSQL_OK || std::memcmp(prefix.data()+8,"$FCK",4)) continue;
         uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data())); if(n<8 || n>(1u<<20) || int64_t(n)+4>size) continue;
-        std::string bytes; if(streamRead(&stream,0,n,&bytes)!=P4_OK) continue;
+        std::string bytes; if(streamRead(&stream,0,n,&bytes)!=FLATSQL_OK) continue;
         std::vector<uint64_t> aligned((n+7)/8); std::memcpy(aligned.data(),bytes.data(),n);
         const auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier v(p,n);
         if(!VerifyFCKBuffer(v)) continue;
@@ -370,6 +370,6 @@ int32_t streamDiscover(Type* t,Conn* idx,std::string* err) {
     }
     // Each feed recovery restores TOKEN entries while following its committed
     // metadata chain. Record frames need no scan during a normal cache open.
-    return P4_OK;
+    return FLATSQL_OK;
 }
 } }

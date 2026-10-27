@@ -18,8 +18,8 @@ int readCommit(Conn* c,uint64_t* previous) {
 }
 int32_t prepare(Feed* f,std::shared_ptr<CheckpointPlan>* out,std::string* err) {
     Engine* e=f->type->e; auto plan=std::make_shared<CheckpointPlan>();
-    { std::lock_guard<std::mutex> g(f->type->mu); if(!f->created || f->quarantined) return P4_E_BUSY; plan->base=f->checkpoint; }
-    int32_t rc=P4_OK; plan->stream=streamCur(f,&rc); if(!plan->stream) return rc;
+    { std::lock_guard<std::mutex> g(f->type->mu); if(!f->created || f->quarantined) return FLATSQL_E_BUSY; plan->base=f->checkpoint; }
+    int32_t rc=FLATSQL_OK; plan->stream=streamCur(f,&rc); if(!plan->stream) return rc;
     int sql=SQLITE_OK; Conn* c=e->rpool.acquire(f->path,OpenKind::Reader,&sql,err); if(!c) return statusOfSqlite(sql);
     FileMeta meta; uint64_t previous=0; std::string commitsRoot;
     {
@@ -28,16 +28,16 @@ int32_t prepare(Feed* f,std::shared_ptr<CheckpointPlan>* out,std::string* err) {
         sql=c->exec("BEGIN");
         if(sql==SQLITE_OK) sql=readMeta(c,&meta);
         if(sql==SQLITE_OK) sql=readCommit(c,&previous);
-        rc=sql==SQLITE_OK?P4_OK:statusOfSqlite(sql);
-        if(rc==P4_OK && (meta.gen!=plan->stream->gen || meta.mark<12 ||
-           (plan->base && uint64_t(meta.mark)<=plan->base->end))) rc=P4_E_BUSY;  // compacted, or nothing new
-        if(rc==P4_OK) rc=feedDagCommitRootHeld(f,plan->stream.get(),previous,uint64_t(meta.mark),&commitsRoot,err);
+        rc=sql==SQLITE_OK?FLATSQL_OK:statusOfSqlite(sql);
+        if(rc==FLATSQL_OK && (meta.gen!=plan->stream->gen || meta.mark<12 ||
+           (plan->base && uint64_t(meta.mark)<=plan->base->end))) rc=FLATSQL_E_BUSY;  // compacted, or nothing new
+        if(rc==FLATSQL_OK) rc=feedDagCommitRootHeld(f,plan->stream.get(),previous,uint64_t(meta.mark),&commitsRoot,err);
     }
-    if(rc==P4_OK && checkpointPreparedHook) checkpointPreparedHook(f);
-    if(rc==P4_OK) rc=checkpointPrepare(f,c,plan->stream.get(),previous,uint64_t(meta.mark),meta.k,
+    if(rc==FLATSQL_OK && checkpointPreparedHook) checkpointPreparedHook(f);
+    if(rc==FLATSQL_OK) rc=checkpointPrepare(f,c,plan->stream.get(),previous,uint64_t(meta.mark),meta.k,
                                        plan->base?*plan->base:CheckpointState(),false,commitsRoot,plan.get(),err);
     c->exec("ROLLBACK"); e->rpool.release(c);
-    if(rc==P4_OK) *out=std::move(plan);
+    if(rc==FLATSQL_OK) *out=std::move(plan);
     return rc;
 }
 } // namespace
@@ -69,9 +69,9 @@ namespace {
 void verifyFeed(Feed* f) {
     std::shared_ptr<const CheckpointState> ck;
     { std::lock_guard<std::mutex> g(f->type->mu); ck=f->checkpoint; }
-    int32_t st=P4_OK; auto stream=ck?streamCur(f,&st):nullptr;
-    if(stream && st==P4_OK)
-        for(const auto& d:ck->segments) if(d.kind>=kFsgSeq) { std::shared_ptr<const FsgVerified> v; if(checkpointVerifyPairs(f,stream.get(),d,&v)!=P4_OK) break; }
+    int32_t st=FLATSQL_OK; auto stream=ck?streamCur(f,&st):nullptr;
+    if(stream && st==FLATSQL_OK)
+        for(const auto& d:ck->segments) if(d.kind>=kFsgSeq) { std::shared_ptr<const FsgVerified> v; if(checkpointVerifyPairs(f,stream.get(),d,&v)!=FLATSQL_OK) break; }
     std::lock_guard<std::mutex> g(f->fsgMu); f->fsgVerifying=false;
 }
 }
@@ -90,8 +90,8 @@ void checkpointLoop(Engine* e) {
         const int32_t rc=prepare(f,&plan,&err);
         { std::lock_guard<std::mutex> g(f->type->mu);
           f->checkpointPreparing=false;
-          if(rc==P4_OK) f->checkpointPlan=std::move(plan); else f->checkpointRetryAt=monoNs()+1000000000ull; }
-        if(rc==P4_OK) e->wake(e->firstOfClass[1]+f->type->owner);
+          if(rc==FLATSQL_OK) f->checkpointPlan=std::move(plan); else f->checkpointRetryAt=monoNs()+1000000000ull; }
+        if(rc==FLATSQL_OK) e->wake(e->firstOfClass[1]+f->type->owner);
     }
 }
 
@@ -108,17 +108,17 @@ void checkpointWorkerStop(Engine* e) {
 int32_t checkpointInstallReady(Feed* f) {
     std::shared_ptr<CheckpointPlan> plan; int64_t end; uint64_t previous;
     { std::lock_guard<std::mutex> g(f->type->mu);
-      if(!f->checkpointPlan) return P4_OK;
+      if(!f->checkpointPlan) return FLATSQL_OK;
       plan=std::move(f->checkpointPlan);
-      if(f->quarantined || f->pendingCheckpoint || f->checkpoint!=plan->base || f->end!=f->mark) return P4_OK;  // stale: dropped
+      if(f->quarantined || f->pendingCheckpoint || f->checkpoint!=plan->base || f->end!=f->mark) return FLATSQL_OK;  // stale: dropped
       end=f->end; previous=f->lastCommit; }
-    int32_t rc=P4_OK; std::shared_ptr<Stream> stream=streamCur(f,&rc); if(!stream) return rc;
-    if(stream!=plan->stream || uint64_t(end)<plan->at) return P4_OK;
+    int32_t rc=FLATSQL_OK; std::shared_ptr<Stream> stream=streamCur(f,&rc); if(!stream) return rc;
+    if(stream!=plan->stream || uint64_t(end)<plan->at) return FLATSQL_OK;
     CheckpointState state; const int64_t start=end;
     rc=checkpointInstall(f,stream.get(),*plan,&end,&previous,&state);
-    if(rc!=P4_OK) { streamTruncate(stream.get(),start,false); return rc; }
+    if(rc!=FLATSQL_OK) { streamTruncate(stream.get(),start,false); return rc; }
     std::lock_guard<std::mutex> g(f->type->mu);
     f->pendingCheckpoint=std::make_shared<CheckpointState>(std::move(state)); f->end=end;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 } }

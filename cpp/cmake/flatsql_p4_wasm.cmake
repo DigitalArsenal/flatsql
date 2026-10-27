@@ -1,21 +1,5 @@
-# Store format 5 for wasm32-wasip1-threads (src/p4/FORMAT.md).
-# Included by CMakeLists.txt when the WASI toolchain is active
-# (cmake/wasi-threads-toolchain.cmake), next to flatsql_ps_wasm.cmake:
-#
-#   flatsql_p4_threads    flatsql-p4-threads.wasm: the engine artifact, a
-#                         reactor whose imports are WASI preview1 (clocks,
-#                         random, proc_exit; no file descriptor is opened),
-#                         wasi.thread-spawn, the shared env.memory and the seven
-#                         env.flatsql_io_* (scripts/check-wasm-imports.mjs).
-#                         Exports flatsql_p4_*, _initialize, wasi_thread_start.
-#   flatsql_p4_test_wasm  flatsql-p4-test.wasm: the cpp/tests/p4 suite (and the
-#                         SQL surface's engine tests) as a wasi-threads command
-#                         (the Node host runs it: wasm/ps-node-host.mjs).
-#
-# Sources are globbed: src/p4 (the engine), src/p4sql (the SQL surface; without
-# it src/p4/p4sql_weak.cpp answers SQL with P4_E_UNSUPPORTED, and it is left
-# out when the surface is there), tests/p4 and tests/p4sql.
-
+# Private build targets for the unified WASI threads engine and its native-fixture
+# command. Every host runs the same flatsql.wasm and flatsql_* ABI.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "WASI")
     message(FATAL_ERROR "flatsql_p4_wasm.cmake needs the WASI toolchain")
 endif()
@@ -51,6 +35,7 @@ target_compile_definitions(sqlite3_p4_wasm PRIVATE
     SQLITE_OMIT_LOAD_EXTENSION=1
     SQLITE_OMIT_DEPRECATED=1
     SQLITE_OMIT_SHARED_CACHE=1
+    SQLITE_OMIT_JSON=1
     SQLITE_DQS=0
     SQLITE_ENABLE_FTS5=1
 )
@@ -67,6 +52,10 @@ endif()
 set(FLATSQL_P4_WASM_ENTRY "${CMAKE_CURRENT_SOURCE_DIR}/src/p4/capi_wasm.cpp")
 add_library(flatsql_p4_wasm OBJECT
     ${FLATSQL_P4_WASM_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/geo_functions.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/geo_geometry.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/geo_gjn.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/query_page.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/typecfg/extract.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ps/platform.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ps/result_block.cpp
@@ -84,7 +73,7 @@ target_link_libraries(flatsql_p4_wasm PUBLIC sqlite3_p4_wasm)
 
 # Shared memory imported as env.memory, shared, at most 32768 pages (2 GiB).
 # The initial size is the smallest memory a host may pass; a host grows the
-# heap before flatsql_p4_start with flatsql_p4_alloc/free.
+# heap before flatsql_start with flatsql_alloc/free.
 set(FLATSQL_P4_THREADS_LINK
     -pthread
     -Wl,--strip-debug
@@ -101,7 +90,7 @@ target_compile_options(flatsql_p4_threads PRIVATE ${FLATSQL_P4_WASM_FLAGS})
 target_link_libraries(flatsql_p4_threads PRIVATE flatsql_p4_wasm)
 target_link_options(flatsql_p4_threads PRIVATE ${FLATSQL_P4_THREADS_LINK} -mexec-model=reactor)
 set_target_properties(flatsql_p4_threads PROPERTIES
-    OUTPUT_NAME "flatsql-p4-threads"
+    OUTPUT_NAME "flatsql"
     SUFFIX ".wasm"
 )
 
@@ -131,7 +120,7 @@ if(FLATSQL_P4_WASM_TEST_SOURCES)
     )
     target_compile_options(flatsql_p4_test_wasm PRIVATE ${FLATSQL_P4_WASM_FLAGS})
     target_compile_definitions(flatsql_p4_test_wasm PRIVATE
-        P4_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
+        FLATSQL_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
     target_link_libraries(flatsql_p4_test_wasm PRIVATE flatsql_p4_wasm flatsql_p4_wasm_testutil)
     target_link_options(flatsql_p4_test_wasm PRIVATE
         -pthread

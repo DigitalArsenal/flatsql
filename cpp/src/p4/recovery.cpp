@@ -142,7 +142,7 @@ int applyCommit(Replay& r,Stream* stream,const FMB* m,const std::map<uint64_t,Fr
             std::string data; const std::string* bytes=nullptr;
             auto it=pending.find(row->OFFSET());
             if(it!=pending.end()) bytes=&it->second.bytes;
-            else { if(streamRead(stream,int64_t(row->OFFSET()),row->LENGTH(),&data)!=P4_OK) return SQLITE_CORRUPT; bytes=&data; }
+            else { if(streamRead(stream,int64_t(row->OFFSET()),row->LENGTH(),&data)!=FLATSQL_OK) return SQLITE_CORRUPT; bytes=&data; }
             std::vector<uint8_t> frame(bytes->size()+4); st32(frame.data(),uint32_t(bytes->size())); std::memcpy(frame.data()+4,bytes->data(),bytes->size());
             if(r.spec->tc.checkFrame(frame.data(),uint32_t(frame.size()))) return SQLITE_CORRUPT;
             ps::Extracted x; uint8_t scratch[2048]; r.spec->tc.extract(frame.data(),frame.size(),&x,scratch,sizeof scratch);
@@ -244,7 +244,7 @@ int writeFold(Replay& r,Stream* stream,int64_t mark,uint64_t previous) {
     Counters counts;
     std::map<InstId,InstCount> exactInst; std::map<uint32_t,TokCount> exactTok;
     int32_t st=recountFeed(r.f,r.c,stream,mark,&counts,&exactInst,&exactTok);
-    if(st!=P4_OK) return SQLITE_CORRUPT;
+    if(st!=FLATSQL_OK) return SQLITE_CORRUPT;
     counts.maxseq=std::max(counts.maxseq,int64_t(r.feedHigh));
     if(counts.rows) { counts.mints=std::min(counts.mints,r.history.mints); counts.maxts=std::max(counts.maxts,r.history.maxts); }
     for(auto& p:exactInst) {
@@ -293,17 +293,17 @@ int writeFold(Replay& r,Stream* stream,int64_t mark,uint64_t previous) {
 }
 bool loadAligned(Stream* stream,uint64_t at,std::vector<uint64_t>* aligned,uint32_t* size) {
     std::string prefix;
-    if(streamReadRange(stream,int64_t(at),4,&prefix)!=P4_OK) return false;
+    if(streamReadRange(stream,int64_t(at),4,&prefix)!=FLATSQL_OK) return false;
     *size=ld32(reinterpret_cast<const uint8_t*>(prefix.data()));
     if(*size<8 || *size>(128u<<20)) return false;
     std::string bytes;
-    if(streamRead(stream,int64_t(at),*size,&bytes)!=P4_OK) return false;
+    if(streamRead(stream,int64_t(at),*size,&bytes)!=FLATSQL_OK) return false;
     aligned->resize((*size+7)/8); std::memcpy(aligned->data(),bytes.data(),*size); return true;
 }
 void collectMoves(Stream* stream,uint64_t previous,Feed* f,std::set<int64_t>* moved) {
     f->metadataBytes=0; f->streamHigh=0; f->streamTokens.clear(); f->streamObjects.clear();
     std::string prefix;
-    if(streamReadRange(stream,0,4,&prefix)==P4_OK) f->metadataBytes=int64_t(ld32(reinterpret_cast<const uint8_t*>(prefix.data())))+4;
+    if(streamReadRange(stream,0,4,&prefix)==FLATSQL_OK) f->metadataBytes=int64_t(ld32(reinterpret_cast<const uint8_t*>(prefix.data())))+4;
     while(previous) {
         std::vector<uint64_t> aligned; uint32_t size;
         if(!loadAligned(stream,previous,&aligned,&size)) return;
@@ -349,12 +349,12 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
     FileMeta meta; int rc=readMeta(c,&meta);
     if(rc!=SQLITE_OK) return statusOfSqlite(rc);
     f->gen=meta.gen; f->mark=meta.mark;
-    int32_t st=P4_OK; auto stream=streamCur(f,&st); if(!stream) return st;
-    const int64_t size=streamSize(stream.get()); if(size<0) return P4_E_IO;
+    int32_t st=FLATSQL_OK; auto stream=streamCur(f,&st); if(!stream) return st;
+    const int64_t size=streamSize(stream.get()); if(size<0) return FLATSQL_E_IO;
     if(size<meta.mark) {
         f->quarantined=true;
         if(err) *err="stream shorter than committed mark: "+stream->path;
-        return P4_OK;
+        return FLATSQL_OK;
     }
     uint64_t previous=0;
     auto* q=c->sql("SELECT v FROM meta WHERE k='commit'");
@@ -373,7 +373,7 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
             uint64_t prior=UINT64_MAX;
             if(!std::memcmp(p+4,"$FCK",4)) {
                 if(!VerifyFCKBuffer(v) || GetFCK(p)->SELF_OFFSET()!=point || GetFCK(p)->FEED_ID()!=f->fid) break;
-                if(checkpointReadAt(f,stream.get(),point,checkpoint.get(),err)==P4_OK) haveCheckpoint=true;
+                if(checkpointReadAt(f,stream.get(),point,checkpoint.get(),err)==FLATSQL_OK) haveCheckpoint=true;
                 break;
             } else if(!std::memcmp(p+4,"$FSG",4)) {
                 if(!VerifyFSGBuffer(v) || GetFSG(p)->SELF_OFFSET()!=point || GetFSG(p)->FEED_ID()!=f->fid) break;
@@ -387,7 +387,7 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
     }
     if(!haveCheckpoint) {
         st=checkpointFindNewest(f,stream.get(),checkpoint.get(),&haveCheckpoint,err);
-        if(st!=P4_OK) return st;
+        if(st!=FLATSQL_OK) return st;
     }
     f->checkpointOpenNs+=monoNs()-openStart;
     if(haveCheckpoint) f->checkpoint=checkpoint;
@@ -400,14 +400,14 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
     else { collectMoves(stream.get(),previous,f,&replay.moved); replay.high=std::max(replay.high,f->streamHigh); }
     if(cached && size==meta.mark) {
         f->lastCommit=previous; f->end=meta.mark; f->streamBytes=meta.mark;
-        st=checkpointRestoreCadence(f,stream.get()); if(st!=P4_OK) return st;
+        st=checkpointRestoreCadence(f,stream.get()); if(st!=FLATSQL_OK) return st;
         { std::lock_guard<std::mutex> lock(t->mu); t->nextSeq=std::max(t->nextSeq,int64_t(replay.high)+1); }
         moved->assign(replay.moved.begin(),replay.moved.end());
-        return P4_OK;
+        return FLATSQL_OK;
     }
     if(haveCheckpoint && checkpoint->holdsStateAt(uint64_t(meta.mark))) checkpointHistory(replay,*checkpoint);
-    else if(readInst(f,c,&replay.inst)!=SQLITE_OK || readTokc(t,c,&replay.tokc)!=SQLITE_OK) return P4_E_CORRUPT;
-    auto* nodes=c->sql("SELECT id,producer FROM node"); if(!nodes) return P4_E_IO;
+    else if(readInst(f,c,&replay.inst)!=SQLITE_OK || readTokc(t,c,&replay.tokc)!=SQLITE_OK) return FLATSQL_E_CORRUPT;
+    auto* nodes=c->sql("SELECT id,producer FROM node"); if(!nodes) return FLATSQL_E_IO;
     while(sqlite3_step(nodes)==SQLITE_ROW) {
         const char* token=reinterpret_cast<const char*>(sqlite3_column_text(nodes,1));
         auto it=t->tokByToken.find(token?token:""); if(it!=t->tokByToken.end()) replay.nodes[uint32_t(sqlite3_column_int64(nodes,0))]=it->second;
@@ -428,14 +428,14 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
         checkpointHistory(replay,*checkpoint);
     while(at+12<=size) {
         std::string prefix;
-        if(streamReadRange(stream.get(),at,12,&prefix)!=P4_OK) break;
+        if(streamReadRange(stream.get(),at,12,&prefix)!=FLATSQL_OK) break;
         const auto* p=reinterpret_cast<const uint8_t*>(prefix.data());
         const uint32_t n=ld32(p);
         if(n<8 || n>(128u<<20) || int64_t(n)>size-at-4) break;
         const bool batch=std::memcmp(p+8,"$FMB",4)==0, isCheckpoint=std::memcmp(p+8,"$FCK",4)==0, segment=std::memcmp(p+8,"$FSG",4)==0;
         if(!batch && !isCheckpoint && !segment) {
             Frame frame; frame.size=n;
-            if(streamRead(stream.get(),at,n,&frame.bytes)!=P4_OK) break;
+            if(streamRead(stream.get(),at,n,&frame.bytes)!=FLATSQL_OK) break;
             pending.emplace(uint64_t(at),std::move(frame)); at+=int64_t(n)+4; continue;
         }
         std::vector<uint64_t> aligned;
@@ -483,7 +483,7 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
             replay.high=std::max(replay.high,ck->TYPE_SEQ_HIGH());
             if(at && (!haveCheckpoint || uint64_t(at)>checkpoint->offset)) {
                 auto newer=std::make_shared<CheckpointState>();
-                if(checkpointReadAt(f,stream.get(),uint64_t(at),newer.get(),err)!=P4_OK) break;
+                if(checkpointReadAt(f,stream.get(),uint64_t(at),newer.get(),err)!=FLATSQL_OK) break;
                 checkpoint=newer; f->checkpoint=newer; haveCheckpoint=true;
                 // The walk already applied any $FMB between its APPLIED_THROUGH
                 // and here: only a checkpoint with none replaces the walk's history.
@@ -509,7 +509,7 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
             checkpointHistory(replay,*checkpoint); restoredHistory=true;
         }
     }
-    if(lastEnd<size) { st=streamTruncate(stream.get(),lastEnd,true); if(st!=P4_OK) return fail(st); }
+    if(lastEnd<size) { st=streamTruncate(stream.get(),lastEnd,true); if(st!=FLATSQL_OK) return fail(st); }
     if(changed) {
         rc=writeFold(replay,stream.get(),lastEnd,previous); if(rc!=SQLITE_OK) return fail(statusOfSqlite(rc));
     }
@@ -519,10 +519,10 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
     rc=c->exec("COMMIT"); if(rc!=SQLITE_OK) return fail(statusOfSqlite(rc));
     f->streamMoves=replay.moved;
     f->lastCommit=previous; f->end=lastEnd; f->mark=lastEnd; f->streamBytes=lastEnd;
-    st=checkpointRestoreCadence(f,stream.get()); if(st!=P4_OK) return st;
+    st=checkpointRestoreCadence(f,stream.get()); if(st!=FLATSQL_OK) return st;
     { std::lock_guard<std::mutex> lock(t->mu); t->nextSeq=std::max(t->nextSeq,int64_t(replay.high)+1); }
     moved->assign(replay.moved.begin(),replay.moved.end());
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t replayRebuildFeed(Engine* e,Type* t,Feed* f,int64_t* indexed,std::string* err) {
@@ -530,16 +530,16 @@ int32_t replayRebuildFeed(Engine* e,Type* t,Feed* f,int64_t* indexed,std::string
     for(const char* suffix:{"","-wal","-shm","-journal"}) ioUnlink(f->path+suffix);
     { std::lock_guard<std::mutex> lock(t->mu); f->created=false; f->indexed=false; f->quarantined=false; f->k=Counters(); f->inst.clear(); f->tokc.clear(); }
     { std::lock_guard<std::mutex> lock(f->dictMu); f->dict=Dict(); }
-    int32_t st=P4_OK; Conn* c=writerPin(e,f,&st,err); if(!c) return st;
+    int32_t st=FLATSQL_OK; Conn* c=writerPin(e,f,&st,err); if(!c) return st;
     std::vector<int64_t> moved;
     const uint64_t rebuildStart=monoNs(),priorCheckpointNs=f->checkpointOpenNs;
     st=recoverFeed(t,f,c,&moved,err);
-    if(st==P4_OK) st=fileCreateIndexes(t,c,f->local);
+    if(st==FLATSQL_OK) st=fileCreateIndexes(t,c,f->local);
     f->rowIndexRebuildNs+=monoNs()-rebuildStart-(f->checkpointOpenNs-priorCheckpointNs);
     writerUnpin(e,f);
-    if(st!=P4_OK) return st;
+    if(st!=FLATSQL_OK) return st;
     st=feedOpen(t,f,&moved,err);
-    if(st==P4_OK) { *indexed=f->k.recs; e->bump(kStRebuilds); }
+    if(st==FLATSQL_OK) { *indexed=f->k.recs; e->bump(kStRebuilds); }
     return st;
 }
 

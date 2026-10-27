@@ -112,17 +112,17 @@ void retentionPages(const std::string& source, int pages, int64_t before, Arm* a
                     const std::atomic<int>* writing = nullptr) {
     TlvW hw;
     hw.text(1, "WXF");
-    Result h = call(P4_OPC_HEAD, hw.b);
-    REQUIRE(h.status == P4_OK && h.rows.size() == 1, "HEAD: " + h.err);
+    Result h = call(FLATSQL_OPC_HEAD, hw.b);
+    REQUIRE(h.status == FLATSQL_OK && h.rows.size() == 1, "HEAD: " + h.err);
     const int64_t through = h.i(0, "through");
     int64_t after = 0;
     for (int p = 0; p < pages && (!writing || p == 0 || writing->load() > 0); p++) {
         CallOpts bulk;
-        bulk.cls = P4_CLASS_BULK;
+        bulk.cls = FLATSQL_CLASS_BULK;
         const uint64_t t0 = flatsql::ps::monoNs();
-        Result s = call(P4_OPC_SCAN, retentionScan(source, before, through, after), bulk);
+        Result s = call(FLATSQL_OPC_SCAN, retentionScan(source, before, through, after), bulk);
         const uint64_t t1 = flatsql::ps::monoNs();
-        REQUIRE(s.status == P4_OK, "SCAN page: " + s.err);
+        REQUIRE(s.status == FLATSQL_OK, "SCAN page: " + s.err);
         if (s.rows.empty()) break;
         const size_t n = std::min<size_t>(s.rows.size(), 500);
         std::vector<std::vector<uint8_t>> cids;
@@ -135,9 +135,9 @@ void retentionPages(const std::string& source, int pages, int64_t before, Arm* a
         dw.text(1, "WXF");
         const std::vector<uint8_t> cl = cidList(cids, 0, cids.size());
         dw.raw(40, cl.data(), cl.size());
-        Result d = call(P4_OPC_DELETE, dw.b);
+        Result d = call(FLATSQL_OPC_DELETE, dw.b);
         const uint64_t t2 = flatsql::ps::monoNs();
-        REQUIRE(d.status == P4_OK && d.rows.size() == 1, "DELETE page: " + d.err);
+        REQUIRE(d.status == FLATSQL_OK && d.rows.size() == 1, "DELETE page: " + d.err);
         CHECK_EQ(d.i(0, "deleted"), int64_t(n), "a page deletes its CIDs (one copy each)");
         a->scan.push_back(secs(t0, t1));
         a->del.push_back(secs(t1, t2));
@@ -154,8 +154,8 @@ void lead(const std::string& source, const std::string& name, int64_t tiles, int
         const uint64_t t0 = flatsql::ps::monoNs();
         Result r = tilePut(source, name + "-tile-" + std::to_string(tile), name, tile, ts, values, &a->wrote);
         a->put.push_back(secs(t0, flatsql::ps::monoNs()));
-        REQUIRE(r.status == P4_OK && r.rows.size() == 9, "tile PUT: " + r.err);
-        for (size_t i = 0; i < r.rows.size(); i++) CHECK_EQ(r.i(i, "action"), int64_t(P4_ACT_NEW), "a lead record is new");
+        REQUIRE(r.status == FLATSQL_OK && r.rows.size() == 9, "tile PUT: " + r.err);
+        for (size_t i = 0; i < r.rows.size(); i++) CHECK_EQ(r.i(i, "action"), int64_t(FLATSQL_ACT_NEW), "a lead record is new");
         a->putRecs += 9;
     }
 }
@@ -165,10 +165,10 @@ void lead(const std::string& source, const std::string& name, int64_t tiles, int
 std::vector<std::string> instances(int64_t* n) {
     TlvW w;
     w.u8(45, 3).text(1, "WXF");
-    Result r = call(P4_OPC_SUMMARY, w.b);
+    Result r = call(FLATSQL_OPC_SUMMARY, w.b);
     std::vector<std::string> out;
     *n = 0;
-    if (r.status != P4_OK) return out;
+    if (r.status != FLATSQL_OK) return out;
     for (size_t i = 0; i < r.rows.size(); i++) {
         std::string s;
         for (const char* c : {"provider", "source", "batch", "content_key_id", "producer_peer", "producer_pubkey", "source_url"})
@@ -184,8 +184,8 @@ std::vector<std::string> instances(int64_t* n) {
 int64_t records() {
     TlvW w;
     w.u8(45, 1).text(1, "WXF");
-    Result r = call(P4_OPC_SUMMARY, w.b);
-    return r.status == P4_OK && r.rows.size() == 1 ? r.i(0, "records") : -1;
+    Result r = call(FLATSQL_OPC_SUMMARY, w.b);
+    return r.status == FLATSQL_OK && r.rows.size() == 1 ? r.i(0, "records") : -1;
 }
 
 void reportArm(const std::string& lane, const Arm& a) {
@@ -205,7 +205,7 @@ void reportArm(const std::string& lane, const Arm& a) {
 
 }  // namespace
 
-P4_SLOW_TEST(p4_record_scaling) {
+FLATSQL_SLOW_TEST(p4_record_scaling) {
     const int64_t want = std::strtoll(argStr("bytes", "15000000000").c_str(), nullptr, 10);  // long is 32 bits on wasm32
     const size_t payload = size_t(argInt("payload", 8616));
     const int64_t smallTiles = argInt("small-tiles", 200);
@@ -224,8 +224,8 @@ P4_SLOW_TEST(p4_record_scaling) {
         EngineOpts m = o;
         m.createMode = 2;
         m.gseqFloor = uint64_t((bigTiles + smallTiles) * 9) + 1 + (1u << 20);
-        REQUIRE(openEngine(root, m) == P4_OK, "open the fixture");
-        REQUIRE(registerType(wxfType()) == P4_OK, "register WXF");
+        REQUIRE(openEngine(root, m) == FLATSQL_OK, "open the fixture");
+        REQUIRE(registerType(wxfType()) == FLATSQL_OK, "register WXF");
         const uint64_t t0 = flatsql::ps::monoNs();
         int64_t seq = 1, bytes = 0;
         REQUIRE(migrateLane(kBig, bigTiles, &seq, values, 1024, &bytes), "the large feed");
@@ -237,13 +237,13 @@ P4_SLOW_TEST(p4_record_scaling) {
         r1.u32(63, 1);
         CallOpts slow;
         slow.timeoutMs = 3600000;
-        CHECK_EQ(call(P4_OPC_REBUILD, r1.b, slow).status, P4_OK, "REBUILD 1");
-        CHECK_EQ(flatsql_p4_activate(), P4_OK, "activate");
+        CHECK_EQ(call(FLATSQL_OPC_REBUILD, r1.b, slow).status, FLATSQL_OK, "REBUILD 1");
+        CHECK_EQ(flatsql_activate(), FLATSQL_OK, "activate");
         closeEngine(600000);
         p4t::report("scaling.fixture.seconds", secs(t0, flatsql::ps::monoNs()), "s");
         if (argInt("build-only", 0)) return;
     }
-    REQUIRE(openEngine(root, o) == P4_OK, "open");
+    REQUIRE(openEngine(root, o) == FLATSQL_OK, "open");
     const int64_t before0 = records();
     REQUIRE(before0 > 0, "the fixture's records");
     p4t::report("scaling.large.tiles", double(bigTiles), "batches");
@@ -311,13 +311,13 @@ P4_SLOW_TEST(p4_record_scaling) {
         std::vector<std::vector<uint8_t>> cids;
         for (size_t i = at; i < at + n; i++) cids.push_back(wrote[i].cid);
         Result g = get("WXF", cids, true);
-        REQUIRE(g.status == P4_OK, "GET leads: " + g.err);
+        REQUIRE(g.status == FLATSQL_OK, "GET leads: " + g.err);
         TlvW tw;
         tw.text(1, "WXF");
         const std::vector<uint8_t> cl = cidList(cids, 0, cids.size());
         tw.raw(40, cl.data(), cl.size());
-        Result tg = call(P4_OPC_TAGS, tw.b);
-        REQUIRE(tg.status == P4_OK, "TAGS leads: " + tg.err);
+        Result tg = call(FLATSQL_OPC_TAGS, tw.b);
+        REQUIRE(tg.status == FLATSQL_OK, "TAGS leads: " + tg.err);
         std::map<std::string, size_t> row, tag;
         for (size_t i = 0; i < g.rows.size(); i++) row[g.s(i, "cid")] = i;
         for (size_t i = 0; i < tg.rows.size(); i++) tag[tg.s(i, "cid")] = i;
@@ -355,7 +355,7 @@ P4_SLOW_TEST(p4_record_scaling) {
         const size_t n = std::min<size_t>(500, gone.size() - at);
         std::vector<std::vector<uint8_t>> cids(gone.begin() + long(at), gone.begin() + long(at + n));
         Result g = get("WXF", cids, false);
-        REQUIRE(g.status == P4_OK, "GET deleted: " + g.err);
+        REQUIRE(g.status == FLATSQL_OK, "GET deleted: " + g.err);
         still += int64_t(g.rows.size());
     }
     CHECK_EQ(still, int64_t(0), "every deleted record is gone");
@@ -368,7 +368,7 @@ P4_SLOW_TEST(p4_record_scaling) {
 
     // After a reopen: the instances the files hold are the ones the engine
     // kept, and REBUILD 8 recounts every file from its rows.
-    REQUIRE(openEngine(root, o) == P4_OK, "reopen");
+    REQUIRE(openEngine(root, o) == FLATSQL_OK, "reopen");
     int64_t instN2 = 0;
     const std::vector<std::string> inst2 = instances(&instN2);
     CHECK(inst == inst2, "the instance summary after a reopen");
@@ -378,9 +378,9 @@ P4_SLOW_TEST(p4_record_scaling) {
     CallOpts slow;
     slow.timeoutMs = 3600000;
     const uint64_t tv = flatsql::ps::monoNs();
-    Result rb = call(P4_OPC_REBUILD, v8.b, slow);
+    Result rb = call(FLATSQL_OPC_REBUILD, v8.b, slow);
     p4t::report("scaling.verify.seconds", secs(tv, flatsql::ps::monoNs()), "s");
-    REQUIRE(rb.status == P4_OK, "REBUILD 8: " + rb.err);
+    REQUIRE(rb.status == FLATSQL_OK, "REBUILD 8: " + rb.err);
     for (size_t i = 0; i < rb.rows.size(); i++) CHECK_EQ(rb.i(i, "mismatches"), int64_t(0), "REBUILD 8 " + rb.s(i, "type"));
     closeEngine(600000);
     for (const std::string& s : serialInst) canon += s + "\n";

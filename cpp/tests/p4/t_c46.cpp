@@ -26,10 +26,10 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// cpp/tests/p4 (P4_SCHEMA_DIR names cpp/tests/p4/schemas): the checkout is
+// cpp/tests/p4 (FLATSQL_SCHEMA_DIR names cpp/tests/p4/schemas): the checkout is
 // visible at its own path natively and under the wasm host.
 std::string testsDir() {
-    const std::string d = P4_SCHEMA_DIR;
+    const std::string d = FLATSQL_SCHEMA_DIR;
     return d.substr(0, d.rfind('/'));
 }
 
@@ -53,7 +53,7 @@ namespace {
 std::string ftsState(const std::string& type, int64_t* through = nullptr) {
     TlvW w;
     w.u8(45, 5).text(1, type);
-    const Result r = call(P4_OPC_SUMMARY, w.b);
+    const Result r = call(FLATSQL_OPC_SUMMARY, w.b);
     for (size_t i = 0; i < r.rows.size(); i++)
         if (r.s(i, "type") == type) {
             if (through) *through = r.i(i, "through");
@@ -73,14 +73,14 @@ bool ftsCaughtUp(const std::string& type, int64_t seq) {
 Result search(const std::string& type, const std::string& text) {
     TlvW w;
     w.text(1, type).text(18, text).u64(3, 1000);
-    return call(P4_OPC_SCAN, w.b);
+    return call(FLATSQL_OPC_SCAN, w.b);
 }
 Result epochCall(int profile, int64_t at, int64_t maxDelta, bool count, uint64_t limit = 1000) {
     TlvW w;
     w.text(1, "MPE").u8(30, uint8_t(profile)).i64(31, at).i64(32, maxDelta);
     if (count) w.u8(33, 1);
     else w.u64(3, limit);
-    return call(P4_OPC_EPOCH, w.b);
+    return call(FLATSQL_OPC_EPOCH, w.b);
 }
 // A page's (key, epoch) pairs in answer order.
 std::vector<std::pair<std::string, int64_t>> keyEpochs(const Result& r) {
@@ -94,12 +94,12 @@ std::vector<std::pair<std::string, int64_t>> keyEpochs(const Result& r) {
 // C-46 (3): full text indexes a record whose 8-byte fields align to a size
 // prefix the producer cut off (a size-prefixed build plus [4:], as SDN's sds
 // builders send) as format 1 does, and a start-aligned one as before.
-P4_TEST(t_fts_prefix_aligned) {
+FLATSQL_TEST(t_fts_prefix_aligned) {
     const std::string root = scratchDir("t_fts_prefix_aligned");
-    REQUIRE(openEngine(root) == P4_OK, "open");
+    REQUIRE(openEngine(root) == FLATSQL_OK, "open");
     TestType mpe = mpeType();
     mpe.fullText = true;
-    REQUIRE(registerType(mpe) == P4_OK, "register");
+    REQUIRE(registerType(mpe) == FLATSQL_OK, "register");
     Batch b;
     b.type = "MPE";
     b.peer = "12D3KooWExample";
@@ -119,7 +119,7 @@ P4_TEST(t_fts_prefix_aligned) {
         b.recs.push_back(std::move(r));
     }
     const Result pr = put(b);
-    REQUIRE(pr.status == P4_OK, "put");
+    REQUIRE(pr.status == FLATSQL_OK, "put");
     int64_t last = 0;
     for (size_t i = 0; i < pr.rows.size(); i++) last = std::max(last, pr.i(i, "seq"));
     REQUIRE(last >= 8, "the records' seqs");
@@ -133,13 +133,13 @@ P4_TEST(t_fts_prefix_aligned) {
 
 // C-46 (2): full text on a type with no records answers like format 1: no
 // rows (its index has nothing to build), not "building".
-P4_TEST(t_fts_empty_type) {
+FLATSQL_TEST(t_fts_empty_type) {
     const std::string root = scratchDir("t_fts_empty_type");
-    REQUIRE(openEngine(root) == P4_OK, "open");
-    REQUIRE(registerType(catType()) == P4_OK, "register");
+    REQUIRE(openEngine(root) == FLATSQL_OK, "open");
+    REQUIRE(registerType(catType()) == FLATSQL_OK, "register");
     CHECK(ftsState("CAT") == "ready", ftsState("CAT"));
     const Result r = search("CAT", "lorem");
-    CHECK(r.status == P4_OK && r.rows.empty(), std::to_string(r.status) + " " + r.err);
+    CHECK(r.status == FLATSQL_OK && r.rows.empty(), std::to_string(r.status) + " " + r.err);
     closeEngine();
     removeTree(root);
 }
@@ -149,10 +149,10 @@ P4_TEST(t_fts_empty_type) {
 // arm64 indexes it; NaN and 0 stay absent. The EPOCH points rank the clamped
 // epochs by their exact distance (no overflow at INT64_MIN), staged and
 // merged alike.
-P4_TEST(t_epoch_clamped) {
+FLATSQL_TEST(t_epoch_clamped) {
     const std::string root = scratchDir("t_epoch_clamped");
-    REQUIRE(openEngine(root) == P4_OK, "open");
-    REQUIRE(registerType(mpeType()) == P4_OK, "register");
+    REQUIRE(openEngine(root) == FLATSQL_OK, "open");
+    REQUIRE(registerType(mpeType()) == FLATSQL_OK, "register");
     const double inf = std::numeric_limits<double>::infinity();
     const std::vector<std::pair<std::string, double>> in = {
         {"E-A", 1789000000.0}, {"E-A", 1e19},   {"E-B", -1e19},    {"E-C", inf},          {"E-D", -inf},
@@ -167,13 +167,13 @@ P4_TEST(t_epoch_clamped) {
         r.ts = 1790000000 + int64_t(i);
         b.recs.push_back(std::move(r));
     }
-    REQUIRE(put(b).status == P4_OK, "put");
+    REQUIRE(put(b).status == FLATSQL_OK, "put");
     const int64_t mx = INT64_MAX, mn = INT64_MIN;
     for (int pass = 0; pass < 2; pass++) {   // the rows staged, then merged (REBUILD 1)
         const std::string P = pass ? "merged " : "staged ";
         TlvW sc;
         sc.text(1, "MPE").u64(3, 100);
-        const Result all = call(P4_OPC_SCAN, sc.b);
+        const Result all = call(FLATSQL_OPC_SCAN, sc.b);
         REQUIRE(all.rows.size() == in.size(), P + "scan " + all.err);
         std::map<std::string, std::vector<int64_t>> byKey;
         int nulls = 0;
@@ -211,11 +211,11 @@ P4_TEST(t_epoch_clamped) {
               P + "as_of");
         TlvW s1;
         s1.u8(45, 1).text(1, "MPE");
-        const Result sum = call(P4_OPC_SUMMARY, s1.b);
+        const Result sum = call(FLATSQL_OPC_SUMMARY, s1.b);
         CHECK(sum.rows.size() == 1 && sum.i(0, "min_epoch") == mn && sum.i(0, "max_epoch") == mx, P + "summary epoch range");
         TlvW rb;
         rb.text(1, "MPE").u32(63, 1);
-        if (!pass) REQUIRE(call(P4_OPC_REBUILD, rb.b).status == P4_OK, "REBUILD 1");
+        if (!pass) REQUIRE(call(FLATSQL_OPC_REBUILD, rb.b).status == FLATSQL_OK, "REBUILD 1");
     }
     closeEngine();
     removeTree(root);
@@ -226,10 +226,10 @@ P4_TEST(t_epoch_clamped) {
 // pass. Every page answers (no error, no stall), in entity order within its
 // limit; once the deletes end, the page is the first rows of the answer with
 // no limit, and the count is its size.
-P4_TEST(t_epoch_page_under_deletes) {
+FLATSQL_TEST(t_epoch_page_under_deletes) {
     const std::string root = scratchDir("t_epoch_page_deletes");
-    REQUIRE(openEngine(root) == P4_OK, "open");
-    REQUIRE(registerType(mpeType()) == P4_OK, "register");
+    REQUIRE(openEngine(root) == FLATSQL_OK, "open");
+    REQUIRE(registerType(mpeType()) == FLATSQL_OK, "register");
     const int64_t at = 1789000000;
     Batch b;
     b.type = "MPE";
@@ -249,11 +249,11 @@ P4_TEST(t_epoch_page_under_deletes) {
             cids[size_t(k)].push_back(std::vector<uint8_t>(c, c + 36));
             b.recs.push_back(std::move(r));
         }
-    REQUIRE(put(b).status == P4_OK, "put");
+    REQUIRE(put(b).status == FLATSQL_OK, "put");
     auto page = [&](uint64_t limit) {
         TlvW w;
         w.text(1, "MPE").u8(30, 2).i64(31, at).u64(3, limit).u8(2, 1);
-        return call(P4_OPC_EPOCH, w.b);
+        return call(FLATSQL_OPC_EPOCH, w.b);
     };
     // The deleter takes, one call each, the nearest record of the page's
     // entities (ENT-00..ENT-03), their first four records in rank order.
@@ -267,14 +267,14 @@ P4_TEST(t_epoch_page_under_deletes) {
                 std::vector<uint8_t> cl = {1, 0, 0, 0};  // one CID
                 cl.insert(cl.end(), cids[size_t(k)][size_t(j)].begin(), cids[size_t(k)][size_t(j)].end());
                 d.raw(40, cl.data(), cl.size());
-                if (call(P4_OPC_DELETE, d.b).status != P4_OK) deleteErrors++;
+                if (call(FLATSQL_OPC_DELETE, d.b).status != FLATSQL_OK) deleteErrors++;
             }
         done = true;
     });
     int pages = 0, bad = 0;
     while (!done.load() || pages < 20) {
         const Result r = page(3);
-        bool ok = r.status == P4_OK && r.rows.size() == 3;
+        bool ok = r.status == FLATSQL_OK && r.rows.size() == 3;
         for (size_t i = 1; ok && i < r.rows.size(); i++) ok = r.s(i - 1, "key") < r.s(i, "key");
         if (!ok) bad++;
         pages++;
@@ -283,7 +283,7 @@ P4_TEST(t_epoch_page_under_deletes) {
     CHECK_EQ(deleteErrors, 0, "deletes");
     CHECK_EQ(bad, 0, std::to_string(pages) + " pages under deletes");
     const Result full = page(250000), three = page(3);
-    REQUIRE(full.status == P4_OK && full.rows.size() == 40 && three.status == P4_OK && three.rows.size() == 3, full.err + three.err);
+    REQUIRE(full.status == FLATSQL_OK && full.rows.size() == 40 && three.status == FLATSQL_OK && three.rows.size() == 3, full.err + three.err);
     for (size_t i = 0; i < 3; i++)
         CHECK(three.s(i, "key") == full.s(i, "key") && three.i(i, "epoch") == full.i(i, "epoch") && three.s(i, "cid") == full.s(i, "cid"),
               "row " + std::to_string(i));
@@ -292,8 +292,8 @@ P4_TEST(t_epoch_page_under_deletes) {
     CHECK(three.s(1, "key") == "ENT-01" && three.i(1, "epoch") == at + 300, "ENT-01 keeps its last record");
     TlvW c;
     c.text(1, "MPE").u8(30, 2).i64(31, at).u8(33, 1);
-    const Result n = call(P4_OPC_EPOCH, c.b);
-    CHECK(n.status == P4_OK && n.rows.size() == 1 && n.rows[0][0].i == 40, "count");
+    const Result n = call(FLATSQL_OPC_EPOCH, c.b);
+    CHECK(n.status == FLATSQL_OK && n.rows.size() == 1 && n.rows[0][0].i == 40, "count");
     closeEngine();
     removeTree(root);
 }
@@ -301,7 +301,7 @@ P4_TEST(t_epoch_page_under_deletes) {
 // C-46 (6): a format-4 store is refused by the format-5 engine with a format
 // error and never crashes. The fixture is a store 74b2f0d wrote (feed index
 // r_c on the CID, r_ke on (k, e), no staged rows): one feed and local, OMM.
-P4_TEST(t_earlier_layout_refused) {
+FLATSQL_TEST(t_earlier_layout_refused) {
     const std::string dir = scratchDir("t_earlier_layout");
     std::error_code ec;
     fs::copy(testsDir() + "/fixtures/store-74b2f0d", dir, fs::copy_options::recursive, ec);
@@ -311,7 +311,7 @@ P4_TEST(t_earlier_layout_refused) {
     for (uint8_t mode : {uint8_t(0), uint8_t(1)}) {
         EngineOpts o;
         o.createMode = mode;
-        CHECK_EQ(openEngine(dir + "/fsql4", o), P4_E_FORMAT, "create mode " + std::to_string(mode));
+        CHECK_EQ(openEngine(dir + "/fsql4", o), FLATSQL_E_FORMAT, "create mode " + std::to_string(mode));
         CHECK(flatsql::p4::lastError().find("requires format 5") != std::string::npos, flatsql::p4::lastError());
     }
     // Refused as it was: every file of the store has its bytes.
@@ -322,8 +322,8 @@ P4_TEST(t_earlier_layout_refused) {
     }
     // The engine starts again in this process: a fresh store opens and serves.
     const std::string fresh = scratchDir("t_earlier_layout_fresh");
-    REQUIRE(openEngine(fresh) == P4_OK, "a fresh store opens");
-    REQUIRE(registerType(ommType()) == P4_OK, "register");
+    REQUIRE(openEngine(fresh) == FLATSQL_OK, "a fresh store opens");
+    REQUIRE(registerType(ommType()) == FLATSQL_OK, "register");
     Batch b;
     b.type = "OMM";
     b.peer = "12D3KooWExample";
@@ -331,11 +331,11 @@ P4_TEST(t_earlier_layout_refused) {
     r.frame = ommFrame(25544, "1998-067A", isoTime(1789000000));
     r.ts = 1790000000;
     b.recs.push_back(r);
-    CHECK_EQ(put(b).status, P4_OK, "put");
+    CHECK_EQ(put(b).status, FLATSQL_OK, "put");
     uint8_t cid[36];
     cidOf(r.frame, cid);
     const Result g = get("OMM", {std::vector<uint8_t>(cid, cid + 36)});
-    CHECK(g.status == P4_OK && g.rows.size() == 1, g.err);
+    CHECK(g.status == FLATSQL_OK && g.rows.size() == 1, g.err);
     closeEngine();
     removeTree(dir);
     removeTree(fresh);

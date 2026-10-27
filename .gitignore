@@ -36,3 +36,6 @@ cpp/build-native/
 cpp/build-gauntlet/
 cpp/build-ci-e2e/
 ci-results/
+
+cpp/build-unified/
+cpp/build-unified-wasm/

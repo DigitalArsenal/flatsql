@@ -25,7 +25,7 @@ function digest(bytes, algorithm, encoding) {
 }
 
 const files = {};
-for (const name of readdirSync(WASM).filter((f) => f.endsWith('.wasm')).sort()) {
+for (const name of ['flatsql.wasm']) {
   const bytes = readFileSync(join(WASM, name));
   const sha384 = digest(bytes, 'sha384', 'base64');
   files[name] = {

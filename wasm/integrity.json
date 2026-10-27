@@ -1,33 +1,13 @@
 {
   "algorithm": "sha384",
-  "hash": "lo5Z9SZ5dLzJokhZpE5G9thCtbsEToamsnqkcquS7lz5EwR+jtVx8MeGKFbQe3iB",
-  "sri": "sha384-lo5Z9SZ5dLzJokhZpE5G9thCtbsEToamsnqkcquS7lz5EwR+jtVx8MeGKFbQe3iB",
-  "size": 2332160,
+  "hash": "HkzWZkYi6pKQx4eBpFpKKCuU89Omodu9+slm1pbwMcitwPnqBMyQ2JvLQgKLvJfA",
+  "sri": "sha384-HkzWZkYi6pKQx4eBpFpKKCuU89Omodu9+slm1pbwMcitwPnqBMyQ2JvLQgKLvJfA",
+  "size": 3713350,
   "files": {
-    "flatsql-p4-threads.wasm": {
-      "sha256": "56b242de531a657714141583f0ed378335049cc6a94c28930e0f85a2d7297477",
-      "sri": "sha384-5n15mndPLu4Nl68m5LiZVLnopDGeJaIhO9PFaf94IaUL1xxP11ylXueXffRM88MX",
-      "size": 3615814
-    },
-    "flatsql-ps-threads.wasm": {
-      "sha256": "aa1ed58de773347c478215a763328f2aca9bca795c0944a85247e53b2433736a",
-      "sri": "sha384-ZTcxIdR1ya/icHbvLaKv9rOjJcsXQ0NXXN3BQOuIwk86iF73DqqQM8vz9PtNmpqq",
-      "size": 2680218
-    },
-    "flatsql-wasi-noeh.wasm": {
-      "sha256": "48dbf9473b5a4a506b0b42e5a1a66a6d5d2ff8173d6dbfef0cd59dfe4b24af86",
-      "sri": "sha384-ohr1g+djwFDAMymrT5Q/ojNp27OKhe7manAdOBPVE7Bc4wwLmy06+TvNxKWxiYg+",
-      "size": 2241020
-    },
-    "flatsql-wasi.wasm": {
-      "sha256": "d0bc62d6d73f0af2a521d45345f8f066742f9f24df7b39fe5d332d18fecfc54c",
-      "sri": "sha384-Gh5r7/pAFDJOyoqVLKCxZ2h9Ov9o9ijfGLBCkjxDpsVTijhRa9KdbWMPJm9lNHjF",
-      "size": 2335758
-    },
     "flatsql.wasm": {
-      "sha256": "891325ef63b3af716ac57cab8b0f5562a19a1f847acddba6ab720e64bdd72cda",
-      "sri": "sha384-lo5Z9SZ5dLzJokhZpE5G9thCtbsEToamsnqkcquS7lz5EwR+jtVx8MeGKFbQe3iB",
-      "size": 2332160
+      "sha256": "2c9aaac2f04677ad972076d0e6fcc656b3d66462072a0b7404ddcd44d0bf8c19",
+      "sri": "sha384-HkzWZkYi6pKQx4eBpFpKKCuU89Omodu9+slm1pbwMcitwPnqBMyQ2JvLQgKLvJfA",
+      "size": 3713350
     }
   }
 }

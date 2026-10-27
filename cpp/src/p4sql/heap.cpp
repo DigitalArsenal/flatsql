@@ -10,7 +10,7 @@
 // A lane binds its arena for the statements it runs SANDBOXED (untrusted
 // SQL): the arena is a fixed region the size of the sandbox heap cap, carved
 // by a TLSF allocator that takes no lock, so a runaway statement fails with
-// SQLITE_NOMEM inside its own region (reported as P4_E_BUDGET) and never
+// SQLITE_NOMEM inside its own region (reported as FLATSQL_E_BUDGET) and never
 // contends with, or takes memory from, the writers. Measured on this
 // machine before the arena: a capped statement churning its heap through the
 // shared allocator cut a writer thread's SQLite ingest rate by 67-78%. Trusted
@@ -467,10 +467,10 @@ void arenaUnregister(LaneArena* a) {
 
 int32_t heapInstall() {
     const int rc = sqlite3_config(SQLITE_CONFIG_MALLOC, &kMethods);
-    return rc == SQLITE_OK ? P4_OK : P4_E_INTERNAL;
+    return rc == SQLITE_OK ? FLATSQL_OK : FLATSQL_E_INTERNAL;
 }
 
-// The engine sets the limit in flatsql_p4_init after the allocator is
+// The engine sets the limit in flatsql_init after the allocator is
 // installed, so a lane reads it at its start (never inside an allocation:
 // sqlite3_hard_heap_limit64 takes SQLite's mem0 mutex).
 void heapLimitRefresh() {

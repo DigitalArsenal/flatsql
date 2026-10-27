@@ -70,12 +70,12 @@ int32_t WriteCtx::loadRows(RecState* r) {
         created = f && f->created;
         quarantined = f && f->quarantined;
     }
-    if (!f || !created || !r->seq) return P4_OK;
+    if (!f || !created || !r->seq) return FLATSQL_OK;
     if (quarantined) {
         err = "feed file quarantined: " + f->path;
-        return P4_E_CORRUPT;
+        return FLATSQL_E_CORRUPT;
     }
-    int32_t st = P4_OK;
+    int32_t st = FLATSQL_OK;
     std::string er;
     Conn* c = planAcquire(e, f, &st, &er);
     if (!c) {
@@ -85,12 +85,12 @@ int32_t WriteCtx::loadRows(RecState* r) {
     if (!dictEnsure(f, c)) {
         planRelease(e, c);
         err = "dictionary of " + f->path;
-        return P4_E_IO;
+        return FLATSQL_E_IO;
     }
     sqlite3_stmt* q = c->get(S_R_SEQ);
     if (!q) {
         planRelease(e, c);
-        return P4_E_INTERNAL;
+        return FLATSQL_E_INTERNAL;
     }
     const int64_t base = r->seq << 16;
     sqlite3_bind_int64(q, 1, base);
@@ -164,16 +164,16 @@ int32_t WriteCtx::loadRows(RecState* r) {
     planRelease(e, c);
     if (rc != SQLITE_DONE) {
         err = "rows of seq " + std::to_string(r->seq) + " in " + f->path + ": " + std::to_string(rc);
-        if ((rc & 0xff) == SQLITE_CORRUPT) return P4_E_CORRUPT;
+        if ((rc & 0xff) == SQLITE_CORRUPT) return FLATSQL_E_CORRUPT;
         return statusOfSqlite(rc);
     }
     r->existed = !got.empty();
     r->rows = std::move(got);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 RecState* WriteCtx::byKey(uint32_t fid, const uint8_t key[32], int32_t* rc) {
-    *rc = P4_OK;
+    *rc = FLATSQL_OK;
     const auto k = std::make_pair(fid, std::string(reinterpret_cast<const char*>(key), 32));
     auto it = byKey_.find(k);
     if (it != byKey_.end()) return it->second;
@@ -205,7 +205,7 @@ RecState* WriteCtx::byKey(uint32_t fid, const uint8_t key[32], int32_t* rc) {
         }
         *rc = seqOfCid(c, indexed, st.get(), key, &seq);
         planRelease(e, c);
-        if (*rc != P4_OK) {
+        if (*rc != FLATSQL_OK) {
             err = "CID lookup in " + f->path;
             return nullptr;
         }
@@ -215,7 +215,7 @@ RecState* WriteCtx::byKey(uint32_t fid, const uint8_t key[32], int32_t* rc) {
         if (!r) {
             r = make(fid, seq, key);
             *rc = loadRows(r);
-            if (*rc != P4_OK) return nullptr;
+            if (*rc != FLATSQL_OK) return nullptr;
             bySeq_[{fid, seq}] = r;
         }
         byKey_[k] = r;
@@ -227,12 +227,12 @@ RecState* WriteCtx::byKey(uint32_t fid, const uint8_t key[32], int32_t* rc) {
 }
 
 RecState* WriteCtx::bySeq(uint32_t fid, int64_t seq, int32_t* rc, const uint8_t* keyIfNew) {
-    *rc = P4_OK;
+    *rc = FLATSQL_OK;
     RecState* r = known(fid, seq);
     if (!r) {
         r = make(fid, seq, nullptr);
         *rc = loadRows(r);
-        if (*rc != P4_OK) return nullptr;
+        if (*rc != FLATSQL_OK) return nullptr;
         bySeq_[{fid, seq}] = r;
         if (r->existed) byKey_[{fid, std::string(reinterpret_cast<const char*>(r->key), 32)}] = r;
     }
@@ -249,14 +249,14 @@ RecState* WriteCtx::bySeq(uint32_t fid, int64_t seq, int32_t* rc, const uint8_t*
 }
 
 int32_t WriteCtx::loadD(uint32_t fid, RowR& x) {
-    if (x.hasD) return P4_OK;
+    if (x.hasD) return FLATSQL_OK;
     Feed* f;
     {
         std::lock_guard<std::mutex> g(t->mu);
         f = t->feedById(fid);
     }
-    if (!f) return P4_E_INTERNAL;
-    int32_t st = P4_OK;
+    if (!f) return FLATSQL_E_INTERNAL;
+    int32_t st = FLATSQL_OK;
     int64_t off = x.off, len = x.len;
     if (off < 0) {
         // The row's frame from the index (a row this write did not load).
@@ -280,7 +280,7 @@ int32_t WriteCtx::loadD(uint32_t fid, RowR& x) {
         planRelease(e, c);
         if (r != SQLITE_ROW) {
             err = "frame of row " + std::to_string(x.rid) + " in " + f->path;
-            return r == SQLITE_DONE ? P4_E_CORRUPT : statusOfSqlite(r);
+            return r == SQLITE_DONE ? FLATSQL_E_CORRUPT : statusOfSqlite(r);
         }
     }
     std::shared_ptr<Stream> stream = streamCur(f, &st);
@@ -289,12 +289,12 @@ int32_t WriteCtx::loadD(uint32_t fid, RowR& x) {
         return st;
     }
     st = streamRead(stream.get(), off, len, &x.d);
-    if (st != P4_OK) {
+    if (st != FLATSQL_OK) {
         err = "frame at " + std::to_string(off) + " in " + stream->path;
         return st;
     }
     x.hasD = true;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // ---- changes ------------------------------------------------------------------------------------
@@ -494,9 +494,9 @@ int32_t WriteCtx::registryWrite() {
             if (d && !d->registered) toks.push_back({id, *d});
         }
     }
-    if (feeds.empty() && toks.empty()) return P4_OK;
+    if (feeds.empty() && toks.empty()) return FLATSQL_OK;
     Conn* x = t->idx;
-    if (!x) return P4_E_INTERNAL;
+    if (!x) return FLATSQL_E_INTERNAL;
     int rc = x->exec("BEGIN IMMEDIATE");
     for (Feed* f : feeds)
         if (rc == SQLITE_OK) rc = indexPutFeed(x, *f, f->gen);
@@ -515,7 +515,7 @@ int32_t WriteCtx::registryWrite() {
     }
     for (auto& d : toks)
         if (TokDef* td = t->tokById(d.first)) td->registered = true;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // Every new live row's frame in the file's stream: a frame already there
@@ -572,7 +572,7 @@ int32_t WriteCtx::frames(Feed* f, const std::vector<RecState*>& recs, std::strin
                             break;
                         }
                 const int32_t st = loadD(x.srcFid, src);
-                if (st != P4_OK) return st;
+                if (st != FLATSQL_OK) return st;
                 x.d.swap(src.d);
                 x.hasD = true;
             }
@@ -585,11 +585,11 @@ int32_t WriteCtx::frames(Feed* f, const std::vector<RecState*>& recs, std::strin
                     same = true;  // one CID, verified over both: the same bytes
                 } else {
                     if (!k.have) {
-                        int32_t st = P4_OK;
+                        int32_t st = FLATSQL_OK;
                         if (!stream) stream = streamCur(f, &st);
                         if (!stream) return st;
                         st = streamRead(stream.get(), k.off, k.len, &k.read);
-                        if (st != P4_OK) {
+                        if (st != FLATSQL_OK) {
                             err = "frame at " + std::to_string(k.off) + " in " + stream->path;
                             return st;
                         }
@@ -613,7 +613,7 @@ int32_t WriteCtx::frames(Feed* f, const std::vector<RecState*>& recs, std::strin
             framed.push_back(Fr{x.off, x.len, x.sealed, int(i), std::string(), true});
         }
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 namespace {
@@ -811,7 +811,7 @@ int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
         std::lock_guard<std::mutex> g(t->mu);
         if (!f->created) f->indexed = false;
     }
-    int32_t status = P4_OK;
+    int32_t status = FLATSQL_OK;
     std::string er;
     x.c = writerPin(e, f, &status, &er);
     if (!x.c) {
@@ -822,7 +822,7 @@ int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
         writerUnpin(e, f);
         x.c = nullptr;
         err = "dictionary of " + f->path;
-        return P4_E_IO;
+        return FLATSQL_E_IO;
     }
     {
         std::lock_guard<std::mutex> g(f->dictMu);
@@ -844,7 +844,7 @@ int32_t WriteCtx::fileBegin(FileTxn& x, Feed* f) {
     x.tokcBefore = x.tokc;
     x.rc = x.c->exec("BEGIN IMMEDIATE");
     x.open = true;
-    return x.rc == SQLITE_OK ? P4_OK : statusOfSqlite(x.rc);
+    return x.rc == SQLITE_OK ? FLATSQL_OK : statusOfSqlite(x.rc);
 }
 
 // This write's rows of the feed file x.f, in x's transaction (after the
@@ -863,7 +863,7 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
         for (const RowR& y : r->rows) adds = adds || (!y.loaded && !y.del);
         if (adds && !r->keyed) {
             err = "a new row of seq " + std::to_string(r->seq) + " has no CID: " + f->path;
-            return P4_E_INTERNAL;
+            return FLATSQL_E_INTERNAL;
         }
     }
     // The indexer alone owns stream appends. Planning keeps bytes for rows
@@ -873,7 +873,7 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
         for (RowR& y : r->rows) {
             if (!y.loaded || y.off >= 0) continue;
             sqlite3_stmt* q = c->get(S_R_FRAME);
-            if (!q) return P4_E_INTERNAL;
+            if (!q) return FLATSQL_E_INTERNAL;
             sqlite3_bind_int64(q, 1, y.rid);
             const int rc = sqlite3_step(q);
             if (rc == SQLITE_ROW) {
@@ -881,9 +881,9 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
                 y.len = sqlite3_column_int64(q, 1);
             }
             sqlite3_reset(q);
-            if (rc != SQLITE_ROW) return rc == SQLITE_DONE ? P4_E_CORRUPT : statusOfSqlite(rc);
+            if (rc != SQLITE_ROW) return rc == SQLITE_DONE ? FLATSQL_E_CORRUPT : statusOfSqlite(rc);
         }
-    int32_t frameStatus = P4_OK;
+    int32_t frameStatus = FLATSQL_OK;
     std::shared_ptr<Stream> stream = streamCur(f, &frameStatus);
     if (!stream) return frameStatus;
     const int64_t oldEnd = f->end;
@@ -892,9 +892,9 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
     x.previous = f->pendingCheckpoint ? f->pendingCheckpoint->offset : f->lastCommit;
     std::string framed;
     frameStatus = frames(f, recs, &framed, oldEnd);
-    if (frameStatus == P4_OK && !framed.empty())
+    if (frameStatus == FLATSQL_OK && !framed.empty())
         frameStatus = streamWrite(stream.get(), oldEnd, reinterpret_cast<const uint8_t*>(framed.data()), framed.size());
-    if (frameStatus != P4_OK) return frameStatus;
+    if (frameStatus != FLATSQL_OK) return frameStatus;
     f->end = oldEnd + int64_t(framed.size());
     newEnd_[f->fid] = f->end;
     x.newEnd = f->end;
@@ -1228,12 +1228,12 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
                 row.epoch = r->hasE ? r->e : INT64_MIN;
                 if (r->k.type) {
                     sqlite3_stmt* q = c->sql("SELECT id FROM okey WHERE k=?1");
-                    if (!q) return P4_E_INTERNAL;
+                    if (!q) return FLATSQL_E_INTERNAL;
                     r->k.bind(q, 1);
                     const int qr = sqlite3_step(q);
                     if (qr == SQLITE_ROW) row.objectKey = uint32_t(sqlite3_column_int64(q, 0));
                     sqlite3_reset(q);
-                    if (qr != SQLITE_ROW) return P4_E_CORRUPT;
+                    if (qr != SQLITE_ROW) return FLATSQL_E_CORRUPT;
                     if (x.objectKeys.insert(row.objectKey).second) {
                         std::lock_guard<std::mutex> g(t->mu);
                         if (!f->streamObjects.count(row.objectKey)) {
@@ -1244,7 +1244,7 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
                 }
                 if (!y.hasD) {
                     const int32_t st = streamRead(stream.get(), y.off, y.len, &y.d);
-                    if (st != P4_OK) return st;
+                    if (st != FLATSQL_OK) return st;
                     y.hasD = true;
                 }
                 ps::sha256(reinterpret_cast<const uint8_t*>(y.d.data()), y.d.size(), row.leafDigest.data());
@@ -1260,7 +1260,7 @@ int32_t WriteCtx::fileApply(FileTxn& x) {
             }
         }
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 namespace {
@@ -1275,7 +1275,7 @@ int32_t appendChunkedMetadata(FileTxn& x, Stream* stream) {
         if (row.offset < uint64_t(x.recordStart) || frames.count(row.offset)) continue;
         std::string bytes;
         const int32_t st = streamRead(stream, int64_t(row.offset), row.length, &bytes, true);
-        if (st != P4_OK) return st;
+        if (st != FLATSQL_OK) return st;
         frames.emplace(row.offset, std::move(bytes));
     }
     x.newEnd = x.recordStart;
@@ -1288,7 +1288,7 @@ int32_t appendChunkedMetadata(FileTxn& x, Stream* stream) {
         removals.removals = metadata.removals;
         const int64_t before = x.newEnd;
         const int32_t st = streamAppendCommit(x.f, stream, removals, &x.newEnd, &x.previous);
-        if (st != P4_OK) return st;
+        if (st != FLATSQL_OK) return st;
         x.metadataBytes += x.newEnd - before;
         dictionaryWritten = true;
     }
@@ -1313,7 +1313,7 @@ int32_t appendChunkedMetadata(FileTxn& x, Stream* stream) {
                     oi = offsets.emplace(oldOffset, uint64_t(x.newEnd)).first;
                     const std::string& bytes = frames.at(oldOffset);
                     const int32_t st = streamWrite(stream, x.newEnd, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
-                    if (st != P4_OK) return st;
+                    if (st != FLATSQL_OK) return st;
                     x.newEnd += int64_t(bytes.size());
                     row.flags |= FmbNewFrame;
                 }
@@ -1327,7 +1327,7 @@ int32_t appendChunkedMetadata(FileTxn& x, Stream* stream) {
             row.group = gi->second;
             // Rids stay fixed, including in pending units' immutable plans.
             sqlite3_stmt* q = x.c->sql("UPDATE r SET off=?1 WHERE rid=?2");
-            if (!q) return P4_E_INTERNAL;
+            if (!q) return FLATSQL_E_INTERNAL;
             sqlite3_bind_int64(q, 1, int64_t(row.offset));
             sqlite3_bind_int64(q, 2, int64_t(row.seq << 16) | row.rowJ);
             const int rc = sqlite3_step(q);
@@ -1338,14 +1338,14 @@ int32_t appendChunkedMetadata(FileTxn& x, Stream* stream) {
         if (at + count == metadata.rows.size()) part.urls = metadata.urls;
         const int64_t before = x.newEnd;
         const int32_t st = streamAppendCommit(x.f, stream, part, &x.newEnd, &x.previous);
-        if (st != P4_OK) return st;
+        if (st != FLATSQL_OK) return st;
         x.metadataBytes += x.newEnd - before;
     }
     return streamTruncate(stream, x.newEnd, false);
 }
 
 int32_t appendMetadata(FileTxn& x, std::string* err) {
-    if (x.metadataAppended) return P4_OK;
+    if (x.metadataAppended) return FLATSQL_OK;
     for (size_t i = 0; i < x.dict.add.node.size(); ++i) {
         const NodeDef& d = x.dict.add.node[i];
         x.metadata.dictionary.push_back(FmbEntry{1, x.dict.node0 + uint32_t(i + 1), {d.producer, d.peer}});
@@ -1354,7 +1354,7 @@ int32_t appendMetadata(FileTxn& x, std::string* err) {
         const BatchDef& d = x.dict.add.batch[i];
         x.metadata.dictionary.push_back(FmbEntry{2, x.dict.batch0 + uint32_t(i + 1), {d.batch, d.ppeer, d.pkey}});
     }
-    int32_t st = P4_OK;
+    int32_t st = FLATSQL_OK;
     std::shared_ptr<Stream> stream = streamCur(x.f, &st);
     if (stream) {
         if (x.metadata.rows.size() > 65536 || (!x.metadata.removals.empty() && !x.metadata.rows.empty()))
@@ -1362,31 +1362,31 @@ int32_t appendMetadata(FileTxn& x, std::string* err) {
         else {
             const int64_t before = x.newEnd;
             st = streamAppendCommit(x.f, stream.get(), x.metadata, &x.newEnd, &x.previous);
-            if (st == P4_OK) x.metadataBytes += x.newEnd - before;
+            if (st == FLATSQL_OK) x.metadataBytes += x.newEnd - before;
         }
     }
-    if (st != P4_OK) {
+    if (st != FLATSQL_OK) {
         *err = "metadata append " + streamPath(x.f, x.f->gen);
         return st;
     }
     x.f->end = x.newEnd;
     x.metadataAppended = true;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t syncTransaction(Engine* e, FileTxn& x, std::string* err) {
-    if (x.streamSynced) return P4_OK;
+    if (x.streamSynced) return FLATSQL_OK;
     int32_t st = appendMetadata(x, err);
-    if (st != P4_OK) return st;
+    if (st != FLATSQL_OK) return st;
     std::shared_ptr<Stream> stream = streamCur(x.f, &st);
     if (stream) st = streamSync(stream.get());
-    if (st != P4_OK) {
+    if (st != FLATSQL_OK) {
         *err = "stream sync " + streamPath(x.f, x.f->gen);
         return st;
     }
     e->bump(kStJournalSyncs);
     x.streamSynced = true;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 }  // namespace
 
@@ -1402,7 +1402,7 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
     };
     if (rc == SQLITE_OK) {
         const int32_t st = syncTransaction(e, x, err);
-        if (st != P4_OK) {
+        if (st != FLATSQL_OK) {
             c->exec("ROLLBACK");
             writerUnpin(e, f);
             x.open = false;
@@ -1582,7 +1582,7 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
     x.inst.publish(f);
     f->tokc = std::move(x.tokc);
     f->created = true;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // A commit round: every feed file the writes touch in ONE transaction each
@@ -1593,10 +1593,10 @@ int32_t fileCommit(Engine* e, Type* t, FileTxn& x, std::string* err) {
 int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* err) {
     std::map<Feed*, FileTxn> txns;
     std::vector<Feed*> feeds, locals;
-    int32_t first = P4_OK;
+    int32_t first = FLATSQL_OK;
     const int64_t roundNow = nowSec();
     for (WriteCtx* w : units) {
-        if (first != P4_OK) break;
+        if (first != FLATSQL_OK) break;
         // FMB carries one clock for the complete round. Use it for every
         // instance update and removal restamp in the derived index too.
         w->now = roundNow;
@@ -1612,13 +1612,13 @@ int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* 
             if (!x.open && !x.f) {
                 (f->local ? locals : feeds).push_back(f);
                 first = w->fileBegin(x, f);
-                if (first != P4_OK) {
+                if (first != FLATSQL_OK) {
                     *err = w->err;
                     break;
                 }
             }
             first = w->fileApply(x);
-            if (first != P4_OK) {
+            if (first != FLATSQL_OK) {
                 *err = w->err;
                 break;
             }
@@ -1628,7 +1628,7 @@ int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* 
     // Different streams sync concurrently. A move's destination streams
     // are durable before the local removal is even appended.
     auto syncFeeds = [&](const std::vector<Feed*>& fs) {
-        if (first != P4_OK) return;
+        if (first != FLATSQL_OK) return;
         if (fs.size() == 1) {
             first = syncTransaction(e, txns[fs.front()], err);
             return;
@@ -1642,7 +1642,7 @@ int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* 
             }));
         for (auto& wait : waits) {
             auto result = wait.get();
-            if (first == P4_OK && result.first != P4_OK) {
+            if (first == FLATSQL_OK && result.first != FLATSQL_OK) {
                 first = result.first;
                 *err = std::move(result.second);
             }
@@ -1653,7 +1653,7 @@ int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* 
     feeds.insert(feeds.end(), locals.begin(), locals.end());
     for (Feed* f : feeds) {
         FileTxn& x = txns[f];
-        if (first != P4_OK) {
+        if (first != FLATSQL_OK) {
             if (x.open) {
                 x.c->exec("ROLLBACK");
                 writerUnpin(e, f);
@@ -1662,7 +1662,7 @@ int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* 
             continue;
         }
         first = fileCommit(e, f->type, x, err);
-        if (first == P4_OK) committed.insert(f);
+        if (first == FLATSQL_OK) committed.insert(f);
     }
     return first;
 }
@@ -1685,7 +1685,7 @@ int32_t WriteCtx::prepare() {
         }
     if (!any_) {
         snapshot();
-        return P4_OK;
+        return FLATSQL_OK;
     }
     // Feed files, then local files.
     std::set<uint32_t> fids;
@@ -1736,7 +1736,7 @@ int32_t WriteCtx::prepare() {
     newEnd_.clear();
     if (const int32_t rc = registryWrite()) return rc;
     snapshot();
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // The state this write leaves its records in, for the next unit of the type
@@ -1847,7 +1847,7 @@ void WriteCtx::resetStreams() {
             mark = f ? f->mark : 0;
         }
         if (!f) continue;
-        int32_t st = P4_OK;
+        int32_t st = FLATSQL_OK;
         std::shared_ptr<Stream> stream = streamCur(f, &st);
         if (stream && streamSize(stream.get()) > mark) streamTruncate(stream.get(), mark, false);
         { std::lock_guard<std::mutex> g(t->mu); f->pendingCheckpoint.reset(); f->end = mark; }
@@ -1856,10 +1856,10 @@ void WriteCtx::resetStreams() {
 
 // ---- apply (the indexer, or the writer for its own synchronous work) -------------------------------------
 int32_t WriteCtx::apply() {
-    if (!any_) return P4_OK;
+    if (!any_) return FLATSQL_OK;
     std::string e2;
     const int32_t rc = applyRound(e, {this}, &e2);
-    if (rc != P4_OK && err.empty()) err = e2;
+    if (rc != FLATSQL_OK && err.empty()) err = e2;
     return rc;
 }
 
@@ -1867,8 +1867,8 @@ int32_t WriteCtx::apply() {
 // the writer prepares and applies it itself, its indexer idle.
 int32_t WriteCtx::commit() {
     int32_t rc = prepare();
-    if (rc == P4_OK) rc = apply();
-    if (rc != P4_OK) resetStreams();
+    if (rc == FLATSQL_OK) rc = apply();
+    if (rc != FLATSQL_OK) resetStreams();
     return rc;
 }
 

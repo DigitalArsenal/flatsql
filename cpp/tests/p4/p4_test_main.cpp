@@ -1,3 +1,4 @@
+#include "flatsql/query_page.h"
 // Store format 4 tests: the framework, fixtures and the in-process client.
 #include <flatbuffers/flatbuffers.h>
 #include <flatbuffers/idl.h>
@@ -439,28 +440,28 @@ int32_t openEngine(const std::string& root, const EngineOpts& o, bool start) {
     if (o.softHeap) w.u64(26, o.softHeap);
     if (o.hardHeap) w.u64(27, o.hardHeap);
     w.b.insert(w.b.end(), o.extra.begin(), o.extra.end());
-    int32_t rc = flatsql_p4_init(w.b.data(), int32_t(w.b.size()));
-    if (rc != P4_OK) {
+    int32_t rc = flatsql_init(w.b.data(), int32_t(w.b.size()));
+    if (rc != FLATSQL_OK) {
         std::fprintf(stderr, "    init: %d %s\n", rc, flatsql::p4::lastError().c_str());
         return rc;
     }
     if (start) {
-        rc = flatsql_p4_start();
+        rc = flatsql_start();
         if (rc < 0) return rc;
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
-int32_t closeEngine(double deadlineMs) { return flatsql_p4_stop(deadlineMs); }
+int32_t closeEngine(double deadlineMs) { return flatsql_stop(deadlineMs); }
 int32_t registerType(const TestType& t) {
     const auto s = t.spec();
-    const int32_t rc = flatsql_p4_register_type(s.data(), int32_t(s.size()));
-    if (rc != P4_OK) std::fprintf(stderr, "    register %s: %d %s\n", t.name.c_str(), rc, flatsql::p4::lastError().c_str());
+    const int32_t rc = flatsql_register_type(s.data(), int32_t(s.size()));
+    if (rc != FLATSQL_OK) std::fprintf(stderr, "    register %s: %d %s\n", t.name.c_str(), rc, flatsql::p4::lastError().c_str());
     return rc;
 }
 
 std::vector<uint64_t> stats() {
     uint8_t buf[8 * 64];
-    const int32_t n = flatsql_p4_stats(buf, sizeof buf);
+    const int32_t n = flatsql_stats(buf, sizeof buf);
     std::vector<uint64_t> v;
     for (int32_t i = 0; i + 8 <= n; i += 8) v.push_back(flatsql::p4::ld64(buf + i));
     return v;
@@ -469,18 +470,18 @@ std::vector<uint64_t> stats() {
 // ---- the client ------------------------------------------------------------------------------------
 uint32_t submit(uint32_t op, const std::vector<uint8_t>& req, const CallOpts& o) {
     Engine* e = flatsql::p4::currentEngine();
-    const uint32_t cls = o.cls ? o.cls : (op < 10 ? P4_CLASS_WRITE : P4_CLASS_INTERACTIVE);
-    const uint32_t pool = cls == P4_CLASS_WRITE ? 0 : 1;
+    const uint32_t cls = o.cls ? o.cls : (op < 10 ? FLATSQL_CLASS_WRITE : FLATSQL_CLASS_INTERACTIVE);
+    const uint32_t pool = cls == FLATSQL_CLASS_WRITE ? 0 : 1;
     const uint32_t first = pool == 0 ? 0 : e->nSlots[0];
     const uint32_t n = e->nSlots[pool];
     for (;;) {
         for (uint32_t k = 0; k < n; k++) {
             const uint32_t i = first + k;
             SlotHeader* h = e->slot(i);
-            uint32_t expect = P4_SLOT_FREE;
-            if (!h->state.compare_exchange_strong(expect, P4_SLOT_CLAIMED)) continue;
+            uint32_t expect = FLATSQL_SLOT_FREE;
+            if (!h->state.compare_exchange_strong(expect, FLATSQL_SLOT_CLAIMED)) continue;
             if (req.size() > e->reqBytes[pool]) {
-                h->state.store(P4_SLOT_FREE);
+                h->state.store(FLATSQL_SLOT_FREE);
                 return UINT32_MAX;
             }
             std::memcpy(e->slotReq(i), req.data(), req.size());
@@ -500,7 +501,7 @@ uint32_t submit(uint32_t op, const std::vector<uint8_t>& req, const CallOpts& o)
             h->errLen = 0;
             h->rowsOut = h->rowsExamined = h->bytesRead = 0;
             h->submitNs = flatsql::ps::monoNs();
-            h->state.store(P4_SLOT_QUEUED, std::memory_order_release);
+            h->state.store(FLATSQL_SLOT_QUEUED, std::memory_order_release);
             if (o.cancelAfterSubmit) h->cancel.store(1);
             while (!e->queues[cls - 1].push(i)) flatsql::ps::sleepNs(100000);
             // wake an idle thread of the class, else the first
@@ -510,9 +511,9 @@ uint32_t submit(uint32_t op, const std::vector<uint8_t>& req, const CallOpts& o)
                     pick = e->firstOfClass[cls] + t;
                     break;
                 }
-            flatsql_p4_wake(reinterpret_cast<uint32_t*>(&e->bells[pick].doorbell), 0);
+            flatsql_wake(reinterpret_cast<uint32_t*>(&e->bells[pick].doorbell), 0);
             e->bells[pick].doorbell.fetch_add(1);
-            flatsql_p4_wake(reinterpret_cast<uint32_t*>(&e->bells[pick].doorbell), 1);
+            flatsql_wake(reinterpret_cast<uint32_t*>(&e->bells[pick].doorbell), 1);
             return i;
         }
         flatsql::ps::sleepNs(200000);
@@ -525,7 +526,7 @@ Result wait(uint32_t slot, uint64_t timeoutMs) {
     SlotHeader* h = e->slot(slot);
     const uint8_t* ring = e->slotRing(slot);
     const uint64_t cap = e->ringBytes[e->poolOf(slot)];
-    flatsql::ps::rb1::Decoder dec;
+    flatsql::query::Decoder dec;
     std::vector<uint8_t> buf(64 << 10);
     const uint64_t until = flatsql::ps::monoNs() + timeoutMs * 1000000ull;
     for (;;) {
@@ -544,7 +545,7 @@ Result wait(uint32_t slot, uint64_t timeoutMs) {
             const uint32_t th = h->thread;
             if (th < e->nThreads) {
                 e->bells[th].doorbell.fetch_add(1);
-                flatsql_p4_wake(reinterpret_cast<uint32_t*>(&e->bells[th].doorbell), 1);
+                flatsql_wake(reinterpret_cast<uint32_t*>(&e->bells[th].doorbell), 1);
             }
             if (!dec.feed(buf.data(), k)) {
                 res.status = -999;
@@ -552,7 +553,7 @@ Result wait(uint32_t slot, uint64_t timeoutMs) {
             }
             continue;
         }
-        if (state == P4_SLOT_DONE) break;
+        if (state == FLATSQL_SLOT_DONE) break;
         if (flatsql::ps::monoNs() >= until) {
             res.status = -998;
             res.err = "timeout";
@@ -574,7 +575,7 @@ Result wait(uint32_t slot, uint64_t timeoutMs) {
         res.status = -996;
         res.err = "no RB1E (" + res.err + ")";
     }
-    h->state.store(P4_SLOT_FREE, std::memory_order_release);
+    h->state.store(FLATSQL_SLOT_FREE, std::memory_order_release);
     return res;
 }
 
@@ -591,8 +592,8 @@ Result call(uint32_t op, const std::vector<uint8_t>& req, const CallOpts& o) {
 
 Result put(const Batch& b) {
     for (int attempt = 0;; attempt++) {
-        Result r = call(P4_OPC_PUT, encodePut(b));
-        if (r.status != P4_E_BUSY || attempt > 2000) return r;
+        Result r = call(FLATSQL_OPC_PUT, encodePut(b));
+        if (r.status != FLATSQL_E_BUSY || attempt > 2000) return r;
         flatsql::ps::sleepNs(1000000);
     }
 }
@@ -605,7 +606,7 @@ Result get(const std::string& type, const std::vector<std::vector<uint8_t>>& cid
     for (auto& x : cids) c.insert(c.end(), x.begin(), x.end());
     w.raw(40, c.data(), c.size());
     if (every) w.u8(41, 1);
-    return call(P4_OPC_GET, w.b);
+    return call(FLATSQL_OPC_GET, w.b);
 }
 
 int Result::col(const std::string& name) const {
@@ -641,9 +642,9 @@ int main(int argc, char** argv) {
     // connection at start, and the memory.fill in openDatabase
     // (sqlite3SchemaGet, sqlite3FindFunction) landed in memory a writer had
     // just grown past the old 1,536 MiB pre-grow. The same fix as the ps test
-    // main (668f0e6); WasmEdge (SDN) is immune. P4_WASM_HEAP_MB caps it.
+    // main (668f0e6); WasmEdge (SDN) is immune. FLATSQL_WASM_HEAP_MB caps it.
     {
-        const char* mb = std::getenv("P4_WASM_HEAP_MB");
+        const char* mb = std::getenv("FLATSQL_WASM_HEAP_MB");
         const size_t cap = mb ? size_t(std::atol(mb)) << 20 : SIZE_MAX;
         const uint64_t limit = (uint64_t(1) << 32) - (uint64_t(16) << 20);
         void* volatile held[64];  // volatile: the allocations are not elided

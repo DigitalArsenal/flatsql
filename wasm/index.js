@@ -1,1291 +1,274 @@
-// FlatSQL JavaScript API - Uses C exports (worker-compatible)
-// This wrapper uses cwrap/ccall instead of embind to avoid worker issues
-
-import FlatSQLModule from './flatsql.js';
-
-let Module = null;
-let api = null;
-const textEncoder = new TextEncoder();
-
-const PARAM_NULL = 0;
-const PARAM_BOOL = 1;
-const PARAM_INT64 = 2;
-const PARAM_FLOAT64 = 3;
-const PARAM_STRING = 4;
-const PARAM_BYTES = 5;
-
-// Security: Track if integrity was verified
-let integrityVerified = false;
-
-function toBase64(bytes) {
-    if (typeof Buffer !== 'undefined') {
-        return Buffer.from(bytes).toString('base64');
-    }
-    let binary = '';
-    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-    }
-    return btoa(binary);
+// One engine, one data API: binary schemas and records in, SDS QRP/records out.
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const pause = () => new Promise(resolve => setTimeout(resolve, 1));
+const bytes = value => {
+  if (!(value instanceof Uint8Array)) throw new TypeError('Expected Uint8Array FlatBuffer bytes');
+  return value;
+};
+function integer(value, name, minimum=0, maximum=Number.MAX_SAFE_INTEGER) {
+  if(!Number.isSafeInteger(value) || value<minimum || value>maximum)
+    throw new RangeError(`${name} must be an integer from ${minimum} to ${maximum}`);
+  return value;
 }
-
-function normalizeHashResult(value) {
-    if (typeof value === 'string') {
-        return value;
-    }
-    if (value instanceof Uint8Array) {
-        return toBase64(value);
-    }
-    if (ArrayBuffer.isView(value)) {
-        return toBase64(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
-    }
-    if (value instanceof ArrayBuffer) {
-        return toBase64(new Uint8Array(value));
-    }
-    throw new Error('SHA-384 provider must return a base64 string or binary digest');
+function queryOptions(options) {
+  for(const key of ['timeoutMs','maxRows','maxRowsExamined','maxBytesRead','maxResultBytes'])
+    if(options[key]!==undefined)integer(options[key],key);
+  if(options.sandbox && options.bulk)throw new TypeError('Choose either sandbox or bulk');
+  return options;
 }
-
-function hasNodeProcess() {
-    return typeof process !== 'undefined' &&
-        process.versions !== undefined &&
-        typeof process.versions.node === 'string';
+function join(parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
 }
-
-/**
- * Compute SHA-384 hash of data and return as base64.
- * Browser WebCrypto is intentionally not used; browser callers that require
- * integrity verification must pass computeSHA384 backed by WASM/native crypto.
- * @param {ArrayBuffer} data
- * @param {(data: ArrayBuffer) => Promise<string|Uint8Array|ArrayBuffer>|string|Uint8Array|ArrayBuffer} [provider]
- * @returns {Promise<string>}
- */
-async function computeSHA384(data, provider) {
-    if (typeof provider === 'function') {
-        return normalizeHashResult(await provider(data));
+// Private engine control encoding; no record fields are decoded by the host.
+function control(entries) {
+  return join(entries.map(([tag, value, width]) => {
+    let data;
+    if (typeof value === 'string') data = encoder.encode(value);
+    else if (value instanceof Uint8Array) data = value;
+    else {
+      data = new Uint8Array(width ?? 4);
+      const view = new DataView(data.buffer);
+      if (data.length === 8) view.setBigUint64(0, BigInt(value), true);
+      else if (data.length === 1) view.setUint8(0, value);
+      else view.setUint32(0, value, true);
     }
-    if (hasNodeProcess()) {
-        const cryptoModule = await import('node:crypto');
-        const hash = cryptoModule.createHash('sha384');
-        hash.update(Buffer.from(data));
-        return hash.digest('base64');
-    }
-    throw new Error(
-        'WASM integrity verification requires a computeSHA384 option backed by WASM/native crypto; browser WebCrypto is intentionally not used.'
-    );
+    const h = new Uint8Array(6);
+    const v = new DataView(h.buffer);
+    v.setUint16(0, tag, true); v.setUint32(2, data.length, true);
+    return join([h, data]);
+  }));
 }
-
-/**
- * Verify WASM binary integrity
- * @param {ArrayBuffer} wasmBinary - The WASM binary data
- * @param {string} expectedHash - Expected SHA-384 hash (base64)
- * @returns {Promise<boolean>}
- */
-async function verifyWASMIntegrity(wasmBinary, expectedHash, options = {}) {
-    const computedHash = await computeSHA384(wasmBinary, options.computeSHA384);
-    return computedHash === expectedHash;
+export class FlatSQLError extends Error {
+  constructor(status, message) { super(message || `FlatSQL status ${status}`); this.name = 'FlatSQLError'; this.status = status; }
 }
-
-/**
- * Load integrity.json if available
- * @param {string} [basePath] - Base path for integrity.json
- * @returns {Promise<{hash: string, sri: string, size: number} | null>}
- */
-async function loadIntegrityFile(basePath = '') {
-    try {
-        if (typeof fetch !== 'undefined') {
-            // Browser or Node.js with fetch
-            const url = basePath ? `${basePath}/integrity.json` : new URL('./integrity.json', import.meta.url).href;
-            const response = await fetch(url);
-            if (response.ok) {
-                return await response.json();
-            }
-        } else {
-            // Node.js fallback
-            const fs = await import('fs');
-            const path = await import('path');
-            const url = await import('url');
-            const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-            const integrityPath = path.join(__dirname, 'integrity.json');
-            if (fs.existsSync(integrityPath)) {
-                return JSON.parse(fs.readFileSync(integrityPath, 'utf8'));
-            }
-        }
-    } catch (e) {
-        // Integrity file not available - this is OK in development
-    }
-    return null;
+function check(status) { if (status < 0) throw new FlatSQLError(status); return status; }
+async function load(url, integrity) {
+  if (url.protocol === 'file:') {
+    const { readFile } = await import('node:fs/promises');
+    return new Uint8Array(await readFile(url));
+  }
+  const response = await fetch(url, integrity ? { integrity } : undefined);
+  if (!response.ok) throw new Error(`FlatSQL artifact: HTTP ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
 }
-
-/**
- * @typedef {Object} InitOptions
- * @property {string} [integrity] - Expected SHA-384 hash for WASM verification (base64)
- * @property {string} [wasmPath] - Custom path to WASM files directory
- * @property {boolean} [skipIntegrityCheck] - Skip integrity verification (not recommended for production)
- * @property {boolean} [requireIntegrity] - Fail if integrity cannot be verified (default: false)
- * @property {function} [moduleFactory] - Custom Emscripten module factory
- */
-
-/**
- * Initialize the FlatSQL WASM module with optional integrity verification
- * @param {function|InitOptions} [moduleFactoryOrOptions] - Module factory or initialization options
- * @returns {Promise<FlatSQL>}
- *
- * @example
- * // Basic usage (auto-loads integrity.json if available)
- * const flatsql = await initFlatSQL();
- *
- * @example
- * // With explicit integrity hash
- * const flatsql = await initFlatSQL({
- *   integrity: 'base64-hash-here',
- *   requireIntegrity: true
- * });
- *
- * @example
- * // Skip integrity check (development only)
- * const flatsql = await initFlatSQL({ skipIntegrityCheck: true });
- */
-let ioBackend = null;
-
-/** The I/O backend this runtime was initialised with (null when ephemeral). */
-export function getFlatSqlIoBackend() {
-    return ioBackend;
-}
-
-export async function initFlatSQL(moduleFactoryOrOptions) {
-    let moduleFactory = FlatSQLModule;
-    let options = {};
-
-    // Parse arguments - support both legacy and new API
-    if (moduleFactoryOrOptions) {
-        if (typeof moduleFactoryOrOptions === 'function') {
-            // Legacy: moduleFactory passed directly
-            moduleFactory = moduleFactoryOrOptions;
-        } else if (typeof moduleFactoryOrOptions === 'object') {
-            // New: options object
-            options = moduleFactoryOrOptions;
-            if (options.moduleFactory) {
-                moduleFactory = options.moduleFactory;
-            }
-        }
-    }
-
-    // Determine expected integrity hash
-    let expectedIntegrity = options.integrity || null;
-
-    // Load integrity file if no explicit integrity provided
-    if (!expectedIntegrity && !options.skipIntegrityCheck) {
-        const integrityData = await loadIntegrityFile(options.wasmPath);
-        if (integrityData) {
-            expectedIntegrity = integrityData.hash;
-        }
-    }
-
-    // Check if integrity is required but not available
-    if (options.requireIntegrity && !expectedIntegrity) {
-        throw new Error(
-            'WASM integrity verification required but no integrity hash available. ' +
-            'Ensure integrity.json exists or pass integrity option.'
-        );
-    }
-
-    // Create module configuration
-    const moduleConfig = {};
-
-    // The seven-import host I/O contract (cpp/include/flatsql/flatsql_io.h).
-    // cpp/js/flatsql_io_library.js reads this off the Module and translates
-    // pointers into typed arrays; everything else about storage lives in the
-    // backend. With no backend, disk-backed opens fail closed with an error
-    // value — they never quietly succeed against RAM.
-    ioBackend = options.io ?? null;
-    if (ioBackend) {
-        moduleConfig.flatsqlIO = ioBackend;
-    }
-
-    // If we have an expected hash, use custom WASM instantiation with verification
-    if (expectedIntegrity && !options.skipIntegrityCheck) {
-        moduleConfig.instantiateWasm = async (imports, successCallback) => {
-            try {
-                // Determine WASM path
-                let wasmUrl;
-                if (options.wasmPath) {
-                    wasmUrl = `${options.wasmPath}/flatsql.wasm`;
-                } else {
-                    wasmUrl = new URL('./flatsql.wasm', import.meta.url).href;
-                }
-
-                // Fetch WASM binary
-                let wasmBinary;
-                if (typeof fetch !== 'undefined') {
-                    const response = await fetch(wasmUrl);
-                    if (!response.ok) {
-                        throw new Error(`Failed to fetch WASM: ${response.status}`);
-                    }
-                    wasmBinary = await response.arrayBuffer();
-                } else {
-                    // Node.js fallback
-                    const fs = await import('fs');
-                    const path = await import('path');
-                    const url = await import('url');
-                    const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-                    const wasmPath = path.join(__dirname, 'flatsql.wasm');
-                    wasmBinary = fs.readFileSync(wasmPath).buffer;
-                }
-
-                // Verify integrity
-                const isValid = await verifyWASMIntegrity(wasmBinary, expectedIntegrity, options);
-                if (!isValid) {
-                    throw new Error(
-                        'WASM integrity check failed: hash mismatch. ' +
-                        'The WASM binary may have been tampered with or corrupted.'
-                    );
-                }
-
-                // Mark as verified
-                integrityVerified = true;
-
-                // Instantiate verified WASM
-                const result = await WebAssembly.instantiate(wasmBinary, imports);
-                successCallback(result.instance);
-                return result.instance.exports;
-            } catch (error) {
-                throw new Error(`WASM integrity verification failed: ${error.message}`);
-            }
-        };
-    }
-
-    // Initialize module
-    Module = await moduleFactory(moduleConfig);
-
-    // Wrap C functions using cwrap
-    api = {
-        // Database lifecycle
-        createDb: Module.cwrap('flatsql_create_db', 'number', ['string', 'string']),
-        openDb: Module.cwrap('flatsql_open_db', 'number', ['string', 'string', 'string', 'number']),
-        isDiskBacked: Module.cwrap('flatsql_is_disk_backed', 'number', ['number']),
-        openState: Module.cwrap('flatsql_open_state', 'number', ['number']),
-        reindexAll: Module.cwrap('flatsql_reindex_all', 'number', ['number']),
-        reindexStep: Module.cwrap('flatsql_reindex_step', 'number', ['number', 'number']),
-        flushIndex: Module.cwrap('flatsql_flush_index', 'number', ['number']),
-        flushedOffset: Module.cwrap('flatsql_flushed_offset', 'number', ['number']),
-        streamPath: Module.cwrap('flatsql_stream_path', 'string', ['number']),
-        destroyDb: Module.cwrap('flatsql_destroy_db', null, ['number']),
-        registerFileId: Module.cwrap('flatsql_register_file_id', null, ['number', 'string', 'string']),
-        enableDemoExtractors: Module.cwrap('flatsql_enable_demo_extractors', null, ['number']),
-
-        // Data ingestion
-        ingest: Module.cwrap('flatsql_ingest', 'number', ['number', 'number', 'number']),
-        ingestOne: Module.cwrap('flatsql_ingest_one', 'number', ['number', 'number', 'number']),
-
-        // Source-aware ingestion
-        registerSource: Module.cwrap('flatsql_register_source', null, ['number', 'string']),
-        createUnifiedViews: Module.cwrap('flatsql_create_unified_views', null, ['number']),
-        ingestWithSource: Module.cwrap('flatsql_ingest_with_source', 'number', ['number', 'number', 'number', 'string']),
-        ingestOneWithSource: Module.cwrap('flatsql_ingest_one_with_source', 'number', ['number', 'number', 'number', 'string']),
-        getSourcesCount: Module.cwrap('flatsql_get_sources_count', 'number', ['number']),
-        getSourceName: Module.cwrap('flatsql_get_source_name', 'string', ['number']),
-
-        // Query execution
-        query: Module.cwrap('flatsql_query', 'number', ['number', 'string']),
-        queryParams: Module.cwrap('flatsql_query_params', 'number', ['number', 'string', 'number', 'number', 'number']),
-        queryMany: Module.cwrap('flatsql_query_many', 'number', ['number', 'number', 'number', 'number']),
-        buildQueryCacheKey: Module.cwrap('flatsql_build_query_cache_key', 'string', ['string', 'string', 'string', 'number', 'number', 'number']),
-        buildResponseArtifactCacheKey: Module.cwrap('flatsql_build_response_artifact_cache_key', 'string', ['string', 'string', 'string', 'string', 'string', 'string', 'number', 'number', 'number']),
-        registerQueryTemplate: Module.cwrap('flatsql_register_query_template', 'number', ['number', 'string', 'string', 'number']),
-        queryTemplate: Module.cwrap('flatsql_query_template', 'number', ['number', 'string', 'number', 'number', 'number']),
-        clearQueryCache: Module.cwrap('flatsql_clear_query_cache', null, ['number']),
-        configureQueryCache: Module.cwrap('flatsql_configure_query_cache', 'number', ['number', 'number', 'number']),
-        queryCacheHits: Module.cwrap('flatsql_query_cache_hits', 'number', ['number']),
-        queryCacheMisses: Module.cwrap('flatsql_query_cache_misses', 'number', ['number']),
-        queryCacheSize: Module.cwrap('flatsql_query_cache_size', 'number', ['number']),
-        queryCacheGeneration: Module.cwrap('flatsql_query_cache_generation', 'number', ['number']),
-        queryCacheMaxEntries: Module.cwrap('flatsql_query_cache_max_entries', 'number', ['number']),
-        queryCacheMaxRows: Module.cwrap('flatsql_query_cache_max_rows', 'number', ['number']),
-        batchResultCount: Module.cwrap('flatsql_batch_result_count', 'number', []),
-        selectBatchResult: Module.cwrap('flatsql_select_batch_result', 'number', ['number']),
-        getError: Module.cwrap('flatsql_get_error', 'string', []),
-
-        // Result access
-        resultColumnCount: Module.cwrap('flatsql_result_column_count', 'number', []),
-        resultRowCount: Module.cwrap('flatsql_result_row_count', 'number', []),
-        resultColumnName: Module.cwrap('flatsql_result_column_name', 'string', ['number']),
-        resultCellType: Module.cwrap('flatsql_result_cell_type', 'number', ['number', 'number']),
-        resultCellNumber: Module.cwrap('flatsql_result_cell_number', 'number', ['number', 'number']),
-        resultCellString: Module.cwrap('flatsql_result_cell_string', 'string', ['number', 'number']),
-        resultCellBlob: Module.cwrap('flatsql_result_cell_blob', 'number', ['number', 'number']),
-        resultCellBlobSize: Module.cwrap('flatsql_result_cell_blob_size', 'number', ['number', 'number']),
-        queryRawFlatBufferStream: Module.cwrap('flatsql_query_raw_flatbuffer_stream', 'number', ['number', 'string', 'number', 'number', 'number']),
-        querySandboxed: Module.cwrap('flatsql_query_sandboxed', 'number', ['number', 'string', 'number', 'number', 'number', 'number', 'number', 'number', 'number']),
-        responseArtifactData: Module.cwrap('flatsql_response_artifact_data', 'number', []),
-        responseArtifactSize: Module.cwrap('flatsql_response_artifact_size', 'number', []),
-        responseArtifactRowCount: Module.cwrap('flatsql_response_artifact_row_count', 'number', []),
-        responseArtifactColumnCount: Module.cwrap('flatsql_response_artifact_column_count', 'number', []),
-        responseArtifactCacheHit: Module.cwrap('flatsql_response_artifact_cache_hit', 'number', []),
-        configureRawStreamCache: Module.cwrap('flatsql_configure_raw_stream_cache', 'number', ['number', 'number', 'number']),
-        rawStreamCacheHits: Module.cwrap('flatsql_raw_stream_cache_hits', 'number', ['number']),
-        rawStreamCacheMisses: Module.cwrap('flatsql_raw_stream_cache_misses', 'number', ['number']),
-        rawStreamCacheSize: Module.cwrap('flatsql_raw_stream_cache_size', 'number', ['number']),
-        rawStreamCacheTotalBytes: Module.cwrap('flatsql_raw_stream_cache_total_bytes', 'number', ['number']),
-
-        // Export/Import
-        exportData: Module.cwrap('flatsql_export_data', 'number', ['number']),
-        exportSize: Module.cwrap('flatsql_export_size', 'number', []),
-        loadAndRebuild: Module.cwrap('flatsql_load_and_rebuild', null, ['number', 'number', 'number']),
-        reserveStorage: Module.cwrap('flatsql_reserve_storage', null, ['number', 'number']),
-        loadFromDb: Module.cwrap('flatsql_load_from_db', null, ['number', 'number']),
-
-        // Test helpers
-        createTestUser: Module.cwrap('flatsql_create_test_user', 'number', ['number', 'string', 'string', 'number']),
-        createTestPost: Module.cwrap('flatsql_create_test_post', 'number', ['number', 'number', 'string']),
-        createTestMPE: Module.cwrap('flatsql_create_test_mpe', 'number', ['string', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'number', 'number']),
-        createTestTelemetry: Module.cwrap('flatsql_create_test_telemetry', 'number', ['number', 'string', 'string', 'string', 'number', 'number', 'number']),
-        createTestPublishEvent: Module.cwrap('flatsql_create_test_publish_event', 'number', ['string', 'string', 'number', 'number']),
-        testBufferSize: Module.cwrap('flatsql_test_buffer_size', 'number', []),
-
-        // Stats
-        getStatsCount: Module.cwrap('flatsql_get_stats_count', 'number', ['number']),
-        getStatTableName: Module.cwrap('flatsql_get_stat_table_name', 'string', ['number']),
-        getStatFileId: Module.cwrap('flatsql_get_stat_file_id', 'string', ['number']),
-        getStatRecordCount: Module.cwrap('flatsql_get_stat_record_count', 'number', ['number']),
-        resetIngestProfile: Module.cwrap('flatsql_reset_ingest_profile', null, ['number']),
-        getIngestProfileRecordCount: Module.cwrap('flatsql_get_ingest_profile_record_count', 'number', ['number']),
-        getIngestProfileByteCount: Module.cwrap('flatsql_get_ingest_profile_byte_count', 'number', ['number']),
-        getIngestProfileDecodeNanos: Module.cwrap('flatsql_get_ingest_profile_decode_nanos', 'number', ['number']),
-        getIngestProfileAppendNanos: Module.cwrap('flatsql_get_ingest_profile_append_nanos', 'number', ['number']),
-        getIngestProfileIndexNanos: Module.cwrap('flatsql_get_ingest_profile_index_nanos', 'number', ['number']),
-
-        // Delete support
-        markDeleted: Module.cwrap('flatsql_mark_deleted', null, ['number', 'string', 'number']),
-        getDeletedCount: Module.cwrap('flatsql_get_deleted_count', 'number', ['number', 'string']),
-        clearTombstones: Module.cwrap('flatsql_clear_tombstones', null, ['number', 'string']),
-
-        // Raw FlatBuffer access
-        getFlatBufferById: Module.cwrap('flatsql_get_flatbuffer_by_id', 'number', ['number', 'string', 'number']),
-        getFlatBufferByEmail: Module.cwrap('flatsql_get_flatbuffer_by_email', 'number', ['number', 'string', 'string']),
-        getFlatBufferByIndex: Module.cwrap('flatsql_get_flatbuffer_by_index', 'number', ['number', 'string', 'string', 'number', 'number', 'number']),
-        getRawFlatBufferSize: Module.cwrap('flatsql_get_raw_flatbuffer_size', 'number', []),
-        getRawFlatBufferSequence: Module.cwrap('flatsql_get_raw_flatbuffer_sequence', 'number', []),
-        getStorageBuffer: Module.cwrap('flatsql_get_storage_buffer', 'number', ['number']),
-        getStorageSize: Module.cwrap('flatsql_get_storage_size', 'number', ['number']),
-
-        // Encryption (field-encryption format 3; the record index is the sequence)
-        setEncryptionKey: Module.cwrap('flatsql_set_encryption_key', 'number', ['number', 'number', 'number', 'number']),
-        isEncrypted: Module.cwrap('flatsql_is_encrypted', 'number', ['number']),
-        encryptBuffer: Module.cwrap('flatsql_encrypt_buffer', 'number', ['number', 'number', 'number', 'number', 'number', 'number']),
-        decryptBuffer: Module.cwrap('flatsql_decrypt_buffer', 'number', ['number', 'number', 'number', 'number', 'number', 'number']),
-        ingestOneEncrypted: Module.cwrap('flatsql_ingest_one_encrypted', 'number', ['number', 'number', 'number', 'number', 'number', 'string']),
-
-        // HMAC Authentication
-        setHMACVerification: Module.cwrap('flatsql_set_hmac_verification', 'number', ['number', 'number']),
-        isHMACEnabled: Module.cwrap('flatsql_is_hmac_enabled', 'number', ['number']),
-        computeHMAC: Module.cwrap('flatsql_compute_hmac', 'number', ['number', 'number', 'number', 'number']),
-        verifyHMAC: Module.cwrap('flatsql_verify_hmac', 'number', ['number', 'number', 'number', 'number']),
-    };
-
-    return new FlatSQL();
-}
-
-/**
- * Check if WASM was loaded with integrity verification
- * @returns {boolean}
- */
-export function wasIntegrityVerified() {
-    return integrityVerified;
-}
-
-function wasmPointerToByteOffset(ptr) {
-    const numeric = Number(ptr);
-    if (!Number.isFinite(numeric)) {
-        throw new TypeError(`Invalid WASM pointer: ${ptr}`);
-    }
-    return numeric >>> 0;
-}
-
-export const __testWasmPointerToByteOffset = wasmPointerToByteOffset;
-
-function heapBytes(ptr, size) {
-    return new Uint8Array(Module.HEAPU8.buffer, wasmPointerToByteOffset(ptr), size);
-}
-
-function copyHeapBytes(ptr, size) {
-    return heapBytes(ptr, size).slice();
-}
-
-// BLOB cells are plain number arrays (the result contract). An indexed copy
-// into a preallocated array builds the same array ~14x faster than
-// Array.from(typedArray), which dominated 90k-row blob results (~430 ms).
-function blobToArray(bytes) {
-    const out = new Array(bytes.length);
-    for (let index = 0; index < bytes.length; index++) {
-        out[index] = bytes[index];
-    }
-    return out;
-}
-
-function setHeapBytes(data, ptr) {
-    Module.HEAPU8.set(data, wasmPointerToByteOffset(ptr));
-}
-
-// A record index is the record's sequence (rowid): 1 to 4294967295.
-function requireRecordIndex(method, recordIndex) {
-    if (!Number.isInteger(recordIndex) || recordIndex < 1 || recordIndex > 0xFFFFFFFF) {
-        throw new TypeError(
-            `${method}: recordIndex must be the record's sequence, an integer from 1 to 4294967295 ` +
-            '(field-encryption format 2, without a record index, is not supported)');
-    }
-}
-
-function withHeapBytes(data, callback) {
-    const ptr = Module._malloc(data.length);
-    try {
-        setHeapBytes(data, ptr);
-        return callback(ptr);
-    } finally {
-        Module._free(ptr);
-    }
-}
-
-function encodeQueryParams(params) {
-    const parts = [];
-    let total = 0;
-
-    for (const value of params) {
-        let tag;
-        let payload;
-
-        if (value === null) {
-            tag = PARAM_NULL;
-            payload = new Uint8Array(0);
-        } else if (typeof value === 'boolean') {
-            tag = PARAM_BOOL;
-            payload = Uint8Array.of(value ? 1 : 0);
-        } else if (typeof value === 'number' && Number.isInteger(value)) {
-            if (!Number.isSafeInteger(value)) {
-                throw new TypeError('Integer query parameters must be safe integers');
-            }
-            tag = PARAM_INT64;
-            payload = new Uint8Array(8);
-            new DataView(payload.buffer, payload.byteOffset, payload.byteLength).setBigInt64(0, BigInt(value), true);
-        } else if (typeof value === 'number') {
-            tag = PARAM_FLOAT64;
-            payload = new Uint8Array(8);
-            new DataView(payload.buffer, payload.byteOffset, payload.byteLength).setFloat64(0, value, true);
-        } else if (typeof value === 'string') {
-            tag = PARAM_STRING;
-            payload = textEncoder.encode(value);
-        } else if (value instanceof Uint8Array) {
-            tag = PARAM_BYTES;
-            payload = value;
-        } else {
-            throw new TypeError(`Unsupported query parameter type: ${typeof value}`);
-        }
-
-        const header = new Uint8Array(5);
-        const view = new DataView(header.buffer);
-        view.setUint8(0, tag);
-        view.setUint32(1, payload.length, true);
-
-        parts.push(header, payload);
-        total += header.length + payload.length;
-    }
-
-    const encoded = new Uint8Array(total);
-    let offset = 0;
-    for (const part of parts) {
-        encoded.set(part, offset);
-        offset += part.length;
-    }
-
-    return encoded;
-}
-
-function encodeQueryRequests(queries) {
-    const parts = [];
-    let total = 0;
-
-    for (const query of queries) {
-        const sqlBytes = textEncoder.encode(query.sql);
-        const paramList = query.params ?? [];
-        const paramBytes = encodeQueryParams(paramList);
-        const header = new Uint8Array(12);
-        const view = new DataView(header.buffer);
-        view.setUint32(0, sqlBytes.length, true);
-        view.setUint32(4, paramList.length, true);
-        view.setUint32(8, paramBytes.length, true);
-
-        parts.push(header, sqlBytes, paramBytes);
-        total += header.length + sqlBytes.length + paramBytes.length;
-    }
-
-    const encoded = new Uint8Array(total);
-    let offset = 0;
-    for (const part of parts) {
-        encoded.set(part, offset);
-        offset += part.length;
-    }
-
-    return encoded;
-}
-
-function readCellValue(row, col) {
-    const type = api.resultCellType(row, col);
-    switch (type) {
-        case 0:
-            return null;
-        case 1:
-            return api.resultCellNumber(row, col) !== 0;
-        case 2:
-        case 3:
-        case 4:
-            return api.resultCellNumber(row, col);
-        case 5:
-            return api.resultCellString(row, col);
-        case 6: {
-            const blobPtr = api.resultCellBlob(row, col);
-            const blobSize = api.resultCellBlobSize(row, col);
-            return blobPtr && blobSize > 0
-                ? blobToArray(heapBytes(blobPtr, blobSize))
-                : [];
-        }
-        default:
-            return null;
-    }
-}
-
-function readQueryResult() {
-    const colCount = api.resultColumnCount();
-    const rowCount = api.resultRowCount();
-
-    const columns = [];
-    for (let i = 0; i < colCount; i++) {
-        columns.push(api.resultColumnName(i));
-    }
-
-    const rows = [];
-    for (let r = 0; r < rowCount; r++) {
-        const row = [];
-        for (let c = 0; c < colCount; c++) {
-            row.push(readCellValue(r, c));
-        }
-        rows.push(row);
-    }
-
-    return { columns, rows };
-}
-
-function buildSizePrefixedStream(buffers) {
-    let total = 0;
-    for (const buffer of buffers) {
-        total += 4 + buffer.length;
-    }
-
-    const stream = new Uint8Array(total);
-    let offset = 0;
-    for (const buffer of buffers) {
-        new DataView(stream.buffer, offset, 4).setUint32(0, buffer.length, true);
-        offset += 4;
-        stream.set(buffer, offset);
-        offset += buffer.length;
-    }
-    return stream;
-}
-
-// High-level FlatSQL API class
 export class FlatSQL {
-    createDatabase(schema, dbName = 'default') {
-        const handle = api.createDb(schema, dbName);
-        return new FlatSQLDatabase(handle);
+  #host; #layout; #memory; #u8; #i32; #u64; #view; #closed = false; #active = new Set();
+  static async open(options = {}) {
+    integer(options.maximumPages??8192,'maximumPages',8192,32768);
+    integer(options.requestBytes??8*1024*1024,'requestBytes',1024,16*1024*1024);
+    integer(options.writers??1,'writers',1,8);integer(options.readers??1,'readers',1,16);
+    if(options.backend && !['opfs','memory'].includes(options.backend))throw new TypeError('Unknown browser storage backend');
+    const url = new URL(options.wasmUrl ?? './flatsql.wasm', import.meta.url);
+    let artifact;
+    if (options.wasmBytes) {
+      if (!options.verify) throw new TypeError('Supplied WASM bytes require an artifact verification callback');
+      artifact = bytes(options.wasmBytes);
+    } else {
+      const manifest = JSON.parse(decoder.decode(await load(new URL('./integrity.json', url))));
+      const expected = manifest.files?.['flatsql.wasm'];
+      if (!expected?.sri || !expected?.sha256) throw new Error('Missing FlatSQL artifact integrity');
+      artifact = await load(url, expected.sri);
+      if (artifact.length !== expected.size) throw new Error('FlatSQL artifact size mismatch');
+      if (globalThis.process?.versions?.node) {
+        const { createHash } = await import('node:crypto');
+        if (createHash('sha256').update(artifact).digest('hex') !== expected.sha256) throw new Error('FlatSQL artifact digest mismatch');
+      }
     }
-
-    /**
-     * Disk-backed open through the I/O backend passed to initFlatSQL.
-     *
-     * `path` is a name in the BACKEND's namespace — a real path under a WASI
-     * preopen on the server, a key prefix in a browser store. The module never
-     * learns which, which is what makes one artifact work in both.
-     *
-     * journalMode: 0 DELETE, 1 WAL (not available on wasm — no xShmMap in
-     * either lane), 2 TRUNCATE (the wasm default, crash-safe under the single
-     * writer the one-daemon-per-box law guarantees), 3 MEMORY.
-     *
-     * Async backends must be hydrated BEFORE this call and flushed after
-     * flushIndex(); see wasm/flatsql-io.js.
-     */
-    openDatabase(schema, dbName = 'default', path = '', journalMode = 2) {
-        const handle = api.openDb(schema, dbName, path ?? '', journalMode);
-        if (!handle) {
-            throw new Error(
-                `Failed to open FlatSQL database at "${path}": ${api.getError() || 'unknown error'}`
-            );
+    if (options.verify) await options.verify(artifact);
+    const hostOptions = { ...options, maximumPages: options.maximumPages ?? 8192 };
+    const host = globalThis.process?.versions?.node
+      ? await (await import('./runtime/node-host.mjs')).createNodeInstance(artifact, hostOptions)
+      : await (await import('./runtime/browser-host.mjs')).createBrowserInstance(artifact, hostOptions);
+    const db = new FlatSQL();
+    db.#host = host;
+    db.#memory = host.memory;
+    db.#u8 = new Uint8Array(host.memory.buffer);
+    db.#i32 = new Int32Array(host.memory.buffer);
+    db.#u64 = new BigUint64Array(host.memory.buffer);
+    db.#view = new DataView(host.memory.buffer);
+    try {
+      const requestBytes = options.requestBytes ?? 8 * 1024 * 1024;
+      const cfg = control([[1, options.path ?? '/store'], [2, 1, 1], [3, options.writers ?? 1],
+        [4, options.readers ?? 1], [5, 1], [6, 1], [7, 2], [8, 4], [9, requestBytes], [10, requestBytes],
+        [11, 256 * 1024], [20, 384 * 1024 * 1024, 8], [21, 8], [23, 16], [25, 16 * 1024 * 1024, 8],
+        [26, 128 * 1024 * 1024, 8], [27, 192 * 1024 * 1024, 8], [48, 32 * 1024 * 1024, 8]]);
+      await db.#withBytes(cfg, async p => check(await host.call('flatsql_init', p, cfg.length)));
+      const p = await host.call('flatsql_alloc', 640);
+      if (!p) throw new FlatSQLError(-2);
+      try {
+        if (check(await host.call('flatsql_layout', p)) !== 640) throw new Error('Invalid FlatSQL mailbox layout');
+        db.#layout = new DataView((await host.read(p, 640)).buffer);
+        if (db.#layout.getUint32(0, true) !== 1 || db.#layout.getUint32(8, true) !== 448) throw new Error('Invalid FlatSQL mailbox layout');
+      } finally { await host.call('flatsql_free', p); }
+      check(await host.call('flatsql_start'));
+      return db;
+    } catch (error) { await host.close(); throw error; }
+  }
+  async #withBytes(data, fn) {
+    const p = await this.#host.write(data);
+    try { return await fn(p); } finally { await this.#host.call('flatsql_free', p); }
+  }
+  #assertOpen() { if (this.#closed || this.#host.faulted()) throw new FlatSQLError(-11, 'FlatSQL is closed or its guest failed'); }
+  async registerSchema({ name, fileIdentifier, bfbs, indexRules = '', maxRecordBytes = 16 * 1024 * 1024, maxRows = 400000, fullText = false }) {
+    this.#assertOpen(); bytes(bfbs);
+    integer(maxRecordBytes,'maxRecordBytes',8,128*1024*1024);integer(maxRows,'maxRows',1,0xffffffff);
+    if(typeof fileIdentifier!=='string')throw new TypeError('A four-byte file identifier is required');
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name) || encoder.encode(fileIdentifier).length !== 4) throw new TypeError('Schema name and four-byte file identifier are required');
+    const spec = control([[1, name], [2, fileIdentifier], [3, bfbs], [4, indexRules], [5, maxRecordBytes, 8],
+      [6, 4 * 1024 * 1024, 8], [7, 3], [8, 4096], [10, maxRows], [12, fullText ? 1 : 0, 1]]);
+    await this.#withBytes(spec, async p => check(await this.#host.call('flatsql_register_type', p, spec.length)));
+  }
+  async ingest(type, frames, options = {}) {
+    this.#assertOpen(); bytes(frames);queryOptions(options);
+    if(options.timestamp!==undefined)integer(options.timestamp,'timestamp');
+    const tags = options.source ? [[51, control([[1, options.provider ?? 'local'], [2, options.source],
+      ...(options.batch ? [[4, options.batch]] : [])])]] : [];
+    const meta = control([[1, type], [50, options.producer ?? 'local'], ...tags, [54, options.timestamp ?? Math.floor(Date.now() / 1000), 8]]);
+    const request = await this.#withBytes(frames, f => this.#withBytes(meta, async m => {
+      const out = await this.#host.call('flatsql_alloc', 8);
+      if (!out) throw new FlatSQLError(-2);
+      let prepared = 0;
+      try {
+        check(await this.#host.call('flatsql_ingest_request', f, frames.length, m, meta.length, out, out + 4));
+        const view = new DataView((await this.#host.read(out, 8)).buffer);
+        prepared = view.getUint32(0, true);
+        return await this.#host.read(prepared, view.getUint32(4, true));
+      } finally {
+        if (prepared) await this.#host.call('flatsql_free', prepared);
+        await this.#host.call('flatsql_free', out);
+      }
+    }));
+    return this.#collect(this.#stream(1, request, options), options.maxResultBytes);
+  }
+  query(request, options = {}) { bytes(request); return this.#stream(30, request, options); }
+  async execute(request, options = {}) { return this.#collect(this.query(request, options), options.maxResultBytes); }
+  async surface(options = {}) { return this.#collect(this.#stream(31, new Uint8Array(), options), options.maxResultBytes); }
+  async setQuota(bytes) { integer(bytes,'quota'); this.#assertOpen(); check(await this.#host.call('flatsql_set_quota', bytes)); }
+  async #collect(stream, maxBytes = 16 * 1024 * 1024) {
+    const parts = []; let size = 0;
+    for await (const part of stream) {
+      size += part.length;
+      if (size > maxBytes + 65536) throw new FlatSQLError(-8, 'Collected result exceeds the byte budget');
+      parts.push(part);
+    }
+    return join(parts);
+  }
+  #get(offset) { return this.#layout.getUint32(offset, true); }
+  #wake(cls) {
+    for (let i = 0; i < this.#get(120); ++i) if (this.#get(128 + i * 4) === cls) {
+      const bell = this.#get(384 + i * 4) >>> 2;
+      Atomics.add(this.#i32, bell, 1); Atomics.notify(this.#i32, bell);
+    }
+  }
+  #enqueue(cls, slot) {
+    const i = cls - 1, enq = this.#get(88 + i * 4) >>> 3;
+    const mask = BigInt(this.#get(72 + i * 4));
+    let pos = Atomics.load(this.#u64, enq);
+    for (;;) {
+      const cell = this.#get(56 + i * 4) + Number(pos & mask) * 16;
+      const seq = Atomics.load(this.#u64, cell >>> 3);
+      if (seq < pos) return false;
+      if (seq === pos && Atomics.compareExchange(this.#u64, enq, pos, pos + 1n) === pos) {
+        this.#view.setUint32(cell + 8, slot, true);
+        Atomics.store(this.#u64, cell >>> 3, pos + 1n);
+        return true;
+      }
+      pos = Atomics.load(this.#u64, enq);
+    }
+  }
+  #stream(op, request, options) {
+    queryOptions(options);
+    const handle = {};
+    handle.iterator = this.#run(op, request, options, handle);
+    return handle.iterator;
+  }
+  async *#run(op, request, options, handle) {
+    this.#assertOpen();
+    const cls = op < 10 ? 1 : options.sandbox ? 4 : options.bulk ? 3 : 2;
+    const pool = cls === 1 ? 0 : 1, first = pool ? this.#get(16) : 0;
+    const count = this.#get(16 + pool * 4), base = this.#get(24 + pool * 4), stride = this.#get(32 + pool * 4);
+    const capacity = this.#get(40 + pool * 4), ringSize = this.#get(48 + pool * 4);
+    if (request.length > capacity) throw new FlatSQLError(-8, 'Request exceeds the configured mailbox capacity');
+    let address = 0, slot = 0, queued = false, finished = false;
+    const started = performance.now(), timeout = options.timeoutMs ?? 30000;
+    const expired = () => options.signal?.aborted || (timeout > 0 && performance.now() - started >= timeout);
+    for (;;) {
+      this.#assertOpen();
+      if (expired()) throw new FlatSQLError(-7, 'Request cancelled before submission');
+      for (let i = 0; i < count; ++i) {
+        const a = base + i * stride;
+        if (Atomics.compareExchange(this.#i32, a >>> 2, 0, 1) === 0) { address = a; slot = first + i; break; }
+      }
+      if (address) break;
+      await pause();
+    }
+    const h = address, ring = h + 448 + capacity, state = h >>> 2;
+    let done;
+    const completion = new Promise(resolve => { done = resolve; });
+    const active = { cancel: () => { Atomics.store(this.#i32, (h + 4) >>> 2, 1); this.#wake(cls); }, completion, finish: () => handle.iterator.return() };
+    this.#active.add(active);
+    const read = () => {
+      const head = Atomics.load(this.#u64, (h + 72) >>> 3), tail = Atomics.load(this.#u64, (h + 80) >>> 3);
+      if (head === tail) return null;
+      const n = Number(tail - head), at = Number(head & BigInt(ringSize - 1));
+      if (n < 0 || n > ringSize) throw new Error('Invalid FlatSQL ring counters');
+      const take = Math.min(n, 65536), a = Math.min(take, ringSize - at), out = new Uint8Array(take);
+      out.set(this.#u8.subarray(ring + at, ring + at + a));
+      if (a < take) out.set(this.#u8.subarray(ring, ring + take - a), a);
+      Atomics.store(this.#u64, (h + 72) >>> 3, head + BigInt(take));
+      Atomics.add(this.#i32, (h + 12) >>> 2, 1); this.#wake(cls);
+      return out;
+    };
+    try {
+      this.#u8.fill(0, h + 4, h + 448);
+      this.#u8.set(request, h + 448);
+      this.#view.setUint32(h + 16, op, true); this.#view.setUint32(h + 20, cls, true);
+      this.#view.setUint32(h + 24, (options.records ? 1 : 0) | (options.sandbox ? 2 : 0), true);
+      this.#view.setUint32(h + 28, request.length, true);
+      for (const [off, value] of [[40, options.maxRowsExamined ?? 0], [48, options.maxBytesRead ?? 0],
+        [56, options.maxRows ?? 0], [64, options.maxResultBytes ?? 16 * 1024 * 1024]])
+        this.#view.setBigUint64(h + off, BigInt(value), true);
+      Atomics.store(this.#i32, state, 2);
+      while (!this.#enqueue(cls, slot)) {
+        if (expired()) throw new FlatSQLError(-7, 'Request cancelled before enqueue');
+        await pause();
+      }
+      queued = true; this.#wake(cls);
+      for (;;) {
+        if (expired()) active.cancel();
+        if (this.#host.faulted()) throw new FlatSQLError(-14, 'FlatSQL guest failed');
+        const part = read();
+        if (part) { yield part; continue; }
+        if (Atomics.load(this.#i32, state) === 5) {
+          finished = true;
+          const status = this.#view.getInt32(h + 88, true);
+          if (status < 0) throw new FlatSQLError(status, decoder.decode(this.#u8.subarray(h + 144, h + 144 + Math.min(256, this.#view.getUint32(h + 92, true)))));
+          break;
         }
-        return new FlatSQLDatabase(handle);
+        await pause();
+      }
+    } finally {
+      if (queued && !finished && !this.#host.faulted()) {
+        active.cancel();
+        // A consumer that breaks early must release ring space until the lane
+        // acknowledges cancellation before this slot can be reused.
+        while (Atomics.load(this.#i32, state) !== 5 && !this.#host.faulted()) { read(); await pause(); }
+      }
+      if (!this.#host.faulted()) Atomics.store(this.#i32, state, 0);
+      this.#active.delete(active); done();
     }
-
-    // Create test FlatBuffers
-    createTestUser(id, name, email, age) {
-        const ptr = api.createTestUser(id, name, email, age);
-        const size = api.testBufferSize();
-        return copyHeapBytes(ptr, size);
-    }
-
-    createTestPost(id, userId, title) {
-        const ptr = api.createTestPost(id, userId, title);
-        const size = api.testBufferSize();
-        return copyHeapBytes(ptr, size);
-    }
-
-    createTestPublishEvent(fileId, recordId, eventIndex, payloadSize) {
-        const ptr = api.createTestPublishEvent(fileId, recordId, eventIndex, payloadSize);
-        const size = api.testBufferSize();
-        return copyHeapBytes(ptr, size);
-    }
-
-    createTestMPE(entityId, epoch, meanMotion, eccentricity, inclination,
-                  raOfAscNode, argOfPericenter, meanAnomaly, bstar, meanElementTheory = 0) {
-        const ptr = api.createTestMPE(
-            entityId,
-            epoch,
-            meanMotion,
-            eccentricity,
-            inclination,
-            raOfAscNode,
-            argOfPericenter,
-            meanAnomaly,
-            bstar,
-            meanElementTheory
-        );
-        const size = api.testBufferSize();
-        return copyHeapBytes(ptr, size);
-    }
-
-    createTestTelemetry(packetId, spacecraft, subsystem, mode, temperatureC, signalDb, timestampS) {
-        const ptr = api.createTestTelemetry(packetId, spacecraft, subsystem, mode, temperatureC, signalDb, timestampS);
-        const size = api.testBufferSize();
-        return copyHeapBytes(ptr, size);
-    }
-
-    /**
-     * Check if WASM was loaded with integrity verification
-     * @returns {boolean}
-     */
-    wasIntegrityVerified() {
-        return integrityVerified;
-    }
-
-    buildQueryCacheKey(dataset, artifactVersion, queryId, params = []) {
-        const encodedParams = encodeQueryParams(params);
-        const key = encodedParams.length === 0
-            ? api.buildQueryCacheKey(dataset, artifactVersion, queryId, 0, 0, 0)
-            : withHeapBytes(
-                encodedParams,
-                (ptr) => api.buildQueryCacheKey(dataset, artifactVersion, queryId, ptr, encodedParams.length, params.length)
-            );
-        if (!key) {
-            throw new Error(api.getError());
-        }
-        return key;
-    }
-
-    buildResponseArtifactCacheKey(schemaName, schemaVersion, sql, options = {}) {
-        const format = options.format ?? 'json';
-        const publishEventKey = options.publishEventKey ?? '';
-        const projectionList = (options.projection ?? []).join('\n');
-        const params = options.params ?? [];
-        const encodedParams = encodeQueryParams(params);
-        const key = encodedParams.length === 0
-            ? api.buildResponseArtifactCacheKey(
-                schemaName,
-                schemaVersion,
-                sql,
-                format,
-                publishEventKey,
-                projectionList,
-                0,
-                0,
-                0
-            )
-            : withHeapBytes(
-                encodedParams,
-                (ptr) => api.buildResponseArtifactCacheKey(
-                    schemaName,
-                    schemaVersion,
-                    sql,
-                    format,
-                    publishEventKey,
-                    projectionList,
-                    ptr,
-                    encodedParams.length,
-                    params.length
-                )
-            );
-        if (!key) {
-            throw new Error(api.getError());
-        }
-        return key;
-    }
+  }
+  async close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const operation of this.#active) operation.cancel();
+    await Promise.allSettled([...this.#active].map(operation => operation.finish()));
+    await Promise.all([...this.#active].map(operation => operation.completion));
+    try { if (!this.#host.faulted()) check(await this.#host.call('flatsql_stop', 5000)); }
+    finally { await this.#host.close(); }
+  }
 }
-
-// Database wrapper class
-export class FlatSQLDatabase {
-    constructor(handle) {
-        this._handle = handle;
-    }
-
-    // ---- Durable state (docs/STORAGE-DURABILITY.md §3.3) ------------------
-    // Codes are VALUES, never throws:
-    //   >=0 record count / OK   -1 absent   -2 format or schema mismatch
-    //   -3 corrupt              -4 torn pair (stream shorter than the mark)
-    //   -5 no filesystem
-    // Every negative is recoverable with reindexAll(); none means data loss.
-
-    isDiskBacked() {
-        return api.isDiskBacked(this._handle) === 1;
-    }
-
-    /** Boot: verify persisted state, replay only the stream tail. */
-    openState() {
-        return api.openState(this._handle);
-    }
-
-    /** Full re-derivation from the stream. Always available. */
-    reindexAll() {
-        return api.reindexAll(this._handle);
-    }
-
-    reindexStep(maxRecords = 4096) {
-        if (!Number.isSafeInteger(maxRecords) || maxRecords <= 0 || maxRecords > 0x7fffffff) {
-            throw new RangeError('maxRecords must be a positive 32-bit integer');
-        }
-        return api.reindexStep(this._handle, maxRecords);
-    }
-
-    /** Append new stream bytes, sync, then commit the index + high-water mark. */
-    flushIndex() {
-        return api.flushIndex(this._handle);
-    }
-
-    /** High-water mark a host may resume its own journal from. */
-    flushedOffset() {
-        return api.flushedOffset(this._handle);
-    }
-
-    /** Path of the SDS FlatBuffer stream backing this handle. */
-    streamPath() {
-        return api.streamPath(this._handle);
-    }
-
-    destroy() {
-        if (this._handle) {
-            api.destroyDb(this._handle);
-            this._handle = null;
-        }
-    }
-
-    registerFileId(fileId, tableName) {
-        api.registerFileId(this._handle, fileId, tableName);
-    }
-
-    enableDemoExtractors() {
-        api.enableDemoExtractors(this._handle);
-    }
-
-    // Ingest data from Uint8Array (routes to base tables or source tables)
-    ingest(data, source = null) {
-        const result = withHeapBytes(data, (ptr) => {
-            if (source) {
-                return api.ingestWithSource(this._handle, ptr, data.length, source);
-            }
-            return api.ingest(this._handle, ptr, data.length);
-        });
-        if (result < 0) throw new Error(api.getError());
-        return result;
-    }
-
-    // Ingest many FlatBuffers via the native bulk stream path.
-    ingestBuffers(buffers, source = null) {
-        return this.ingest(buildSizePrefixedStream(buffers), source);
-    }
-
-    ingestOne(data, source = null) {
-        const result = withHeapBytes(data, (ptr) => {
-            if (source) {
-                return api.ingestOneWithSource(this._handle, ptr, data.length, source);
-            }
-            return api.ingestOne(this._handle, ptr, data.length);
-        });
-        if (result < 0) throw new Error(api.getError());
-        return result;
-    }
-
-    // Register a named data source for source-aware ingestion
-    // Creates source-specific tables: User@siteA, Post@siteA, etc.
-    registerSource(sourceName) {
-        api.registerSource(this._handle, sourceName);
-    }
-
-    // Create unified views for cross-source queries
-    // Must be called after registering all sources and file IDs
-    createUnifiedViews() {
-        api.createUnifiedViews(this._handle);
-    }
-
-    // List registered sources
-    listSources() {
-        const count = api.getSourcesCount(this._handle);
-        const sources = [];
-        for (let i = 0; i < count; i++) {
-            sources.push(api.getSourceName(i));
-        }
-        return sources;
-    }
-
-    query(sql, params = undefined) {
-        const success = params === undefined
-            ? api.query(this._handle, sql)
-            : (() => {
-                const encodedParams = encodeQueryParams(params);
-                if (encodedParams.length === 0) {
-                    return api.queryParams(this._handle, sql, 0, 0, 0);
-                }
-                return withHeapBytes(
-                    encodedParams,
-                    (ptr) => api.queryParams(this._handle, sql, ptr, encodedParams.length, params.length)
-                );
-            })();
-        if (!success) {
-            throw new Error(api.getError());
-        }
-        return readQueryResult();
-    }
-
-    registerQueryTemplate(queryId, sql, cacheable = true) {
-        const success = api.registerQueryTemplate(this._handle, queryId, sql, cacheable ? 1 : 0);
-        if (!success) {
-            throw new Error(api.getError());
-        }
-    }
-
-    queryTemplate(queryId, params = []) {
-        const encodedParams = encodeQueryParams(params);
-        const success = encodedParams.length === 0
-            ? api.queryTemplate(this._handle, queryId, 0, 0, 0)
-            : withHeapBytes(
-                encodedParams,
-                (ptr) => api.queryTemplate(this._handle, queryId, ptr, encodedParams.length, params.length)
-            );
-        if (!success) {
-            throw new Error(api.getError());
-        }
-        return readQueryResult();
-    }
-
-    clearQueryCache() {
-        api.clearQueryCache(this._handle);
-    }
-
-    configureQueryCache({ maxEntries, maxRows }) {
-        if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
-            throw new TypeError(`maxEntries must be a positive safe integer, received: ${maxEntries}`);
-        }
-        if (!Number.isSafeInteger(maxRows) || maxRows <= 0) {
-            throw new TypeError(`maxRows must be a positive safe integer, received: ${maxRows}`);
-        }
-        const success = api.configureQueryCache(this._handle, maxEntries, maxRows);
-        if (!success) {
-            throw new Error(api.getError());
-        }
-    }
-
-    getQueryCacheStats() {
-        return {
-            hits: api.queryCacheHits(this._handle),
-            misses: api.queryCacheMisses(this._handle),
-            size: api.queryCacheSize(this._handle),
-            generation: api.queryCacheGeneration(this._handle),
-            maxEntries: api.queryCacheMaxEntries(this._handle),
-            maxRows: api.queryCacheMaxRows(this._handle)
-        };
-    }
-
-    queryMany(queries) {
-        if (queries.length === 0) {
-            return [];
-        }
-
-        const encodedRequests = encodeQueryRequests(queries);
-        const success = withHeapBytes(
-            encodedRequests,
-            (ptr) => api.queryMany(this._handle, ptr, encodedRequests.length, queries.length)
-        );
-        if (!success) {
-            throw new Error(api.getError());
-        }
-
-        const resultCount = api.batchResultCount();
-        const results = [];
-        for (let index = 0; index < resultCount; index++) {
-            if (!api.selectBatchResult(index)) {
-                throw new Error(`Failed to select batch result ${index}`);
-            }
-            results.push(readQueryResult());
-        }
-        return results;
-    }
-
-    queryRawFlatBufferStream(sql, params = []) {
-        const encodedParams = encodeQueryParams(params);
-        const success = encodedParams.length === 0
-            ? api.queryRawFlatBufferStream(this._handle, sql, 0, 0, 0)
-            : withHeapBytes(
-                encodedParams,
-                (ptr) => api.queryRawFlatBufferStream(this._handle, sql, ptr, encodedParams.length, params.length)
-            );
-        if (!success) {
-            throw new Error(api.getError());
-        }
-
-        const ptr = api.responseArtifactData();
-        const size = api.responseArtifactSize();
-        return ptr && size > 0 ? copyHeapBytes(ptr, size) : new Uint8Array();
-    }
-
-    // Sandboxed public query (gateway loop G.5): one read-only SELECT under
-    // the engine authorizer (record tables / shadow tables / unified views
-    // only), single-statement, statement timeout, row/byte caps. options:
-    // { mode: "stream" | "json", maxRows, maxBytes, timeoutMs }. Returns
-    // { payload: Uint8Array, rows, columns } — payload is the aligned frame
-    // stream (mode "stream") or UTF-8 bare-array JSON bytes (mode "json").
-    // Sandbox rejections throw with the engine's "sandbox: <code>: ..." text.
-    querySandboxed(sql, params = [], options = {}) {
-        const encodedParams = encodeQueryParams(params);
-        const mode = options.mode === 'json' ? 1 : 0;
-        const maxRows = options.maxRows > 0 ? options.maxRows : 0;
-        const maxBytes = options.maxBytes > 0 ? options.maxBytes : 0;
-        const timeoutMs = options.timeoutMs > 0 ? options.timeoutMs : 0;
-        const success = encodedParams.length === 0
-            ? api.querySandboxed(this._handle, sql, 0, 0, 0, mode, maxRows, maxBytes, timeoutMs)
-            : withHeapBytes(
-                encodedParams,
-                (ptr) => api.querySandboxed(this._handle, sql, ptr, encodedParams.length, params.length, mode, maxRows, maxBytes, timeoutMs)
-            );
-        if (!success) {
-            throw new Error(api.getError());
-        }
-
-        const ptr = api.responseArtifactData();
-        const size = api.responseArtifactSize();
-        return {
-            payload: ptr && size > 0 ? copyHeapBytes(ptr, size) : new Uint8Array(),
-            rows: api.responseArtifactRowCount(),
-            columns: api.responseArtifactColumnCount(),
-        };
-    }
-
-    // True when the last queryRawFlatBufferStream call was served from the
-    // engine's response-artifact cache (no SQL re-execution).
-    lastRawStreamCacheHit() {
-        return api.responseArtifactCacheHit() !== 0;
-    }
-
-    configureRawStreamCache(maxEntries, maxTotalBytes) {
-        if (!api.configureRawStreamCache(this._handle, maxEntries, maxTotalBytes)) {
-            throw new Error(api.getError());
-        }
-    }
-
-    getRawStreamCacheStats() {
-        return {
-            hits: api.rawStreamCacheHits(this._handle),
-            misses: api.rawStreamCacheMisses(this._handle),
-            entries: api.rawStreamCacheSize(this._handle),
-            totalBytes: api.rawStreamCacheTotalBytes(this._handle)
-        };
-    }
-
-    exportData() {
-        const ptr = api.exportData(this._handle);
-        const error = api.getError();
-        if (error) throw new Error(error);
-        const size = api.exportSize();
-        return copyHeapBytes(ptr, size);
-    }
-
-    loadAndRebuild(data) {
-        const ptr = Module._malloc(data.length);
-        setHeapBytes(data, ptr);
-        api.loadAndRebuild(this._handle, ptr, data.length);
-        Module._free(ptr);
-    }
-
-    reserveStorageBytes(bytes) {
-        api.reserveStorage(this._handle, bytes);
-    }
-
-    loadAndRebuildFrom(sourceDb) {
-        if (!sourceDb?._handle) {
-            throw new TypeError('loadAndRebuildFrom requires a FlatSQL WASM database.');
-        }
-        api.loadFromDb(this._handle, sourceDb._handle);
-    }
-
-    getStats() {
-        const count = api.getStatsCount(this._handle);
-        const stats = [];
-        for (let i = 0; i < count; i++) {
-            stats.push({
-                tableName: api.getStatTableName(i),
-                fileId: api.getStatFileId(i),
-                recordCount: api.getStatRecordCount(i)
-            });
-        }
-        return stats;
-    }
-
-    resetIngestProfile() {
-        api.resetIngestProfile(this._handle);
-    }
-
-    getIngestProfile() {
-        return {
-            recordCount: api.getIngestProfileRecordCount(this._handle),
-            byteCount: api.getIngestProfileByteCount(this._handle),
-            decodeNanos: api.getIngestProfileDecodeNanos(this._handle),
-            appendNanos: api.getIngestProfileAppendNanos(this._handle),
-            indexNanos: api.getIngestProfileIndexNanos(this._handle),
-        };
-    }
-
-    markDeleted(tableName, sequence) {
-        api.markDeleted(this._handle, tableName, sequence);
-    }
-
-    getDeletedCount(tableName) {
-        return api.getDeletedCount(this._handle, tableName);
-    }
-
-    clearTombstones(tableName) {
-        api.clearTombstones(this._handle, tableName);
-    }
-
-    getFlatBufferById(tableName, id) {
-        const ptr = api.getFlatBufferById(this._handle, tableName, id);
-        if (!ptr) {
-            return null;
-        }
-        return {
-            ptr,
-            size: api.getRawFlatBufferSize(),
-            sequence: api.getRawFlatBufferSequence()
-        };
-    }
-
-    getFlatBufferByEmail(tableName, email) {
-        const ptr = api.getFlatBufferByEmail(this._handle, tableName, email);
-        if (!ptr) {
-            return null;
-        }
-        return {
-            ptr,
-            size: api.getRawFlatBufferSize(),
-            sequence: api.getRawFlatBufferSequence()
-        };
-    }
-
-    getFlatBufferByIndex(tableName, columnName, value) {
-        const encodedParams = encodeQueryParams([value]);
-        const ptr = withHeapBytes(
-            encodedParams,
-            (paramPtr) => api.getFlatBufferByIndex(
-                this._handle,
-                tableName,
-                columnName,
-                paramPtr,
-                encodedParams.length,
-                1
-            )
-        );
-        if (!ptr) {
-            const error = api.getError();
-            if (error) {
-                throw new Error(error);
-            }
-            return null;
-        }
-        return {
-            ptr,
-            size: api.getRawFlatBufferSize(),
-            sequence: api.getRawFlatBufferSequence()
-        };
-    }
-
-    getFlatBufferDataById(tableName, id) {
-        const record = this.getFlatBufferById(tableName, id);
-        if (!record) {
-            return null;
-        }
-        return copyHeapBytes(record.ptr, record.size);
-    }
-
-    getFlatBufferDataByIndex(tableName, columnName, value) {
-        const record = this.getFlatBufferByIndex(tableName, columnName, value);
-        if (!record) {
-            return null;
-        }
-        return copyHeapBytes(record.ptr, record.size);
-    }
-
-    getStorageInfo() {
-        return {
-            ptr: api.getStorageBuffer(this._handle),
-            size: api.getStorageSize(this._handle)
-        };
-    }
-
-    // ==================== Encryption API ====================
-    //
-    // The (encrypted) fields of a record are encrypted under FlatBuffers field
-    // encryption format 3: each record under its own key, with its sequence
-    // (rowid) as the record index, so no two records share a key stream.
-
-    /**
-     * Set the database key. SQL decrypts the (encrypted) columns with it.
-     * @param {Uint8Array} key - 32-byte AES-256 key
-     * @param {{format?: number}} [options] - format: the field-encryption format
-     *   of the records the database already holds in tables with (encrypted)
-     *   columns. Required (3) when it holds any. Format 2 (records encrypted by
-     *   flatsql 3.2.0 or earlier) is refused: see README "Database-key encryption".
-     */
-    setEncryptionKey(key, options = {}) {
-        const format = options && options.format !== undefined ? options.format : 0;
-        if (!Number.isInteger(format) || format < 0 || format > 255) {
-            throw new TypeError('setEncryptionKey: options.format must be 3');
-        }
-        const result = withHeapBytes(key, (ptr) =>
-            api.setEncryptionKey(this._handle, ptr, key.length, format));
-        if (!result) throw new Error(api.getError());
-    }
-
-    /**
-     * Check if encryption is enabled.
-     * @returns {boolean}
-     */
-    isEncrypted() {
-        return api.isEncrypted(this._handle) !== 0;
-    }
-
-    /**
-     * Encrypt the (encrypted) fields of a FlatBuffer as the record with index
-     * `recordIndex`: the sequence it has, or gets, in this database. To write
-     * encrypted records use ingestOneEncrypted, which assigns and uses the
-     * sequence together.
-     * @param {Uint8Array} buffer - FlatBuffer data (no size prefix)
-     * @param {Uint8Array} schema - Binary schema (.bfbs) with builtin attributes (flatc --bfbs-builtins)
-     * @param {number} recordIndex - The record's sequence (1 to 4294967295)
-     * @returns {Uint8Array} Encrypted buffer (copy)
-     */
-    encryptBuffer(buffer, schema, recordIndex) {
-        requireRecordIndex('encryptBuffer', recordIndex);
-        return this._cipherBuffer(api.encryptBuffer, buffer, schema, recordIndex);
-    }
-
-    /**
-     * Decrypt the (encrypted) fields of a stored FlatBuffer.
-     * @param {Uint8Array} buffer - Encrypted FlatBuffer data (no size prefix)
-     * @param {Uint8Array} schema - Binary schema (.bfbs) with builtin attributes (flatc --bfbs-builtins)
-     * @param {number} recordIndex - The record's sequence (1 to 4294967295)
-     * @returns {Uint8Array} Decrypted buffer (copy)
-     */
-    decryptBuffer(buffer, schema, recordIndex) {
-        requireRecordIndex('decryptBuffer', recordIndex);
-        return this._cipherBuffer(api.decryptBuffer, buffer, schema, recordIndex);
-    }
-
-    _cipherBuffer(cipher, buffer, schema, recordIndex) {
-        const bufPtr = Module._malloc(buffer.length);
-        const schemaPtr = Module._malloc(schema.length);
-        try {
-            setHeapBytes(buffer, bufPtr);
-            setHeapBytes(schema, schemaPtr);
-            const result = cipher(this._handle, bufPtr, buffer.length, schemaPtr, schema.length, recordIndex);
-            if (!result) throw new Error(api.getError());
-            return copyHeapBytes(bufPtr, buffer.length);
-        } finally {
-            Module._free(bufPtr);
-            Module._free(schemaPtr);
-        }
-    }
-
-    /**
-     * Encrypt a plaintext FlatBuffer under the sequence it gets and ingest it.
-     * @param {Uint8Array} data - FlatBuffer data (no size prefix)
-     * @param {Uint8Array} schema - Binary schema (.bfbs) with builtin attributes (flatc --bfbs-builtins)
-     * @param {string|null} [source] - Source name, as for ingestOne
-     * @returns {number} The record's sequence
-     */
-    ingestOneEncrypted(data, schema, source = null) {
-        const result = withHeapBytes(data, (dataPtr) =>
-            withHeapBytes(schema, (schemaPtr) =>
-                api.ingestOneEncrypted(this._handle, dataPtr, data.length, schemaPtr, schema.length, source)));
-        if (result < 0) throw new Error(api.getError());
-        return result;
-    }
-
-    // ==================== HMAC Authentication API ====================
-
-    /**
-     * Enable or disable HMAC verification on ingest.
-     * Requires an encryption key to be set first.
-     * @param {boolean} enabled
-     */
-    setHMACVerification(enabled) {
-        const result = api.setHMACVerification(this._handle, enabled ? 1 : 0);
-        if (!result) throw new Error(api.getError());
-    }
-
-    /**
-     * Check if HMAC verification is enabled.
-     * @returns {boolean}
-     */
-    isHMACEnabled() {
-        return api.isHMACEnabled(this._handle) !== 0;
-    }
-
-    /**
-     * Compute HMAC-SHA256 for a FlatBuffer.
-     * @param {Uint8Array} buffer - FlatBuffer data
-     * @returns {Uint8Array} 32-byte HMAC
-     */
-    computeHMAC(buffer) {
-        const bufPtr = Module._malloc(buffer.length);
-        setHeapBytes(buffer, bufPtr);
-        const macPtr = Module._malloc(32);
-        const result = api.computeHMAC(this._handle, bufPtr, buffer.length, macPtr);
-        const mac = copyHeapBytes(macPtr, 32);
-        Module._free(bufPtr);
-        Module._free(macPtr);
-        if (!result) throw new Error('HMAC computation failed - is encryption key set?');
-        return mac;
-    }
-
-    /**
-     * Verify HMAC-SHA256 for a FlatBuffer.
-     * @param {Uint8Array} buffer - FlatBuffer data
-     * @param {Uint8Array} mac - 32-byte HMAC to verify
-     * @returns {boolean} true if valid
-     */
-    verifyHMAC(buffer, mac) {
-        const bufPtr = Module._malloc(buffer.length);
-        setHeapBytes(buffer, bufPtr);
-        const macPtr = Module._malloc(32);
-        setHeapBytes(mac, macPtr);
-        const result = api.verifyHMAC(this._handle, bufPtr, buffer.length, macPtr);
-        Module._free(bufPtr);
-        Module._free(macPtr);
-        return result !== 0;
-    }
-}
-
-// The partition store artifact (flatsql-ps-threads.wasm): its URL, bytes and
-// integrity (docs/PARTITION-STORE-WASM.md).
-export * from './ps.js';
-
-export default initFlatSQL;

@@ -3,7 +3,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -17,21 +16,51 @@ static constexpr double RAD_TO_DEG = 180.0 / M_PI;
 // Geometry helpers
 // ---------------------------------------------------------------------------
 
-static geo::Geometry extractGeometry(sqlite3_context* ctx, sqlite3_value* val) {
-    if (sqlite3_value_type(val) == SQLITE_TEXT) {
-        const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
-        return geo::parseWKT(text);
-    } else if (sqlite3_value_type(val) == SQLITE_BLOB) {
-        const uint8_t* data = static_cast<const uint8_t*>(sqlite3_value_blob(val));
-        int len = sqlite3_value_bytes(val);
-        return geo::blobToGeometry(data, static_cast<size_t>(len));
+static bool extractGeometry(sqlite3_context* ctx, sqlite3_value* val, geo::Geometry* out) {
+    if (sqlite3_value_type(val) != SQLITE_BLOB || !geo::geometryFromFlatBuffer(
+            static_cast<const uint8_t*>(sqlite3_value_blob(val)),
+            static_cast<size_t>(sqlite3_value_bytes(val)), out)) {
+        sqlite3_result_error(ctx, "Expected a valid SDS GJN FlatBuffer", -1);
+        return false;
     }
-    throw std::runtime_error("Expected WKT text or geometry blob");
+    return true;
 }
 
-static void resultGeometry(sqlite3_context* ctx, const geo::Geometry& geom) {
-    auto blob = geo::geometryToBlob(geom);
+static void resultGeometry(sqlite3_context* ctx, geo::Geometry geom, bool altitude = false) {
+    // Derived map geometry is explicitly two-dimensional. ECEF -> geodetic
+    // is the one operation that computes a meaningful WGS84 altitude.
+    auto normalize=[&](auto&& self,geo::Geometry& g)->bool {
+        auto point=[&](geo::Point& p) {
+            if(!altitude){p.hasAltitude=false;p.z=0;}
+            return std::isfinite(p.x)&&std::isfinite(p.y)&&(!p.hasAltitude||std::isfinite(p.z));
+        };
+        if(g.type==geo::GeomType::POINT&&!point(g.point))return false;
+        for(auto& p:g.points)if(!point(p))return false;
+        for(auto& p:g.exterior.points)if(!point(p))return false;
+        for(auto& ring:g.holes)for(auto& p:ring.points)if(!point(p))return false;
+        for(auto& part:g.parts)if(!self(self,part))return false;
+        return true;
+    };
+    if(!normalize(normalize,geom)){sqlite3_result_error(ctx,"Non-finite geometry result",-1);return;}
+    auto blob = geo::geometryToFlatBuffer(geom);
     sqlite3_result_blob(ctx, blob.data(), static_cast<int>(blob.size()), SQLITE_TRANSIENT);
+}
+
+// The compact clipping implementation supports convex, hole-free polygons.
+// Reject other inputs instead of approximating a union or dropping holes.
+static bool convexPolygon(const geo::Geometry& g) {
+    if(g.type!=geo::GeomType::POLYGON || !g.holes.empty())return false;
+    const auto& p=g.exterior.points;if(p.empty())return true;
+    if(p.size()<4)return false;
+    int winding=0;double turns=0;
+    for(size_t i=0;i+1<p.size();++i) {
+        const auto a=p[i],b=p[(i+1)%(p.size()-1)],c=p[(i+2)%(p.size()-1)];
+        double cross=(b.x-a.x)*(c.y-b.y)-(b.y-a.y)*(c.x-b.x);
+        if(std::fabs(cross)<1e-15)continue;
+        int sign=cross>0?1:-1;if(winding && winding!=sign)return false;winding=sign;
+        turns+=std::atan2(cross,(b.x-a.x)*(c.x-b.x)+(b.y-a.y)*(c.y-b.y));
+    }
+    return winding!=0 && std::fabs(std::fabs(turns)-2*M_PI)<1e-8;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,9 +202,7 @@ static void geoDestinationFunc(sqlite3_context* ctx, int argc, sqlite3_value** a
     double lon2 = lon1 + atan2(sin(brng) * sin(dR) * cos(lat1),
                                cos(dR) - sin(lat1) * sin(lat2));
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%.8f,%.8f", lat2 * RAD_TO_DEG, lon2 * RAD_TO_DEG);
-    sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+    resultGeometry(ctx, geo::Geometry::makePoint(std::remainder(lon2 * RAD_TO_DEG,360.0), lat2 * RAD_TO_DEG));
 }
 
 // Great circle midpoint
@@ -203,9 +230,7 @@ static void geoMidpointFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv
                         sqrt((cos(lat1) + Bx) * (cos(lat1) + Bx) + By * By));
     double lon3 = lon1 + atan2(By, cos(lat1) + Bx);
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%.8f,%.8f", lat3 * RAD_TO_DEG, lon3 * RAD_TO_DEG);
-    sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+    resultGeometry(ctx, geo::Geometry::makePoint(std::remainder(lon3 * RAD_TO_DEG,360.0), lat3 * RAD_TO_DEG));
 }
 
 // Spherical area of bounding box (sq km)
@@ -359,88 +384,6 @@ static void geoGeohashDecodeLonFunc(sqlite3_context* ctx, int argc, sqlite3_valu
 // Geometry-based SQL functions
 // ---------------------------------------------------------------------------
 
-// geo_from_text(wkt) -> blob
-static void geoFromTextFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
-    if (argc != 1) {
-        sqlite3_result_error(ctx, "geo_from_text requires 1 arg: wkt_text", -1);
-        return;
-    }
-    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
-        sqlite3_result_null(ctx);
-        return;
-    }
-    try {
-        const char* wkt = reinterpret_cast<const char*>(sqlite3_value_text(argv[0]));
-        auto geom = geo::parseWKT(wkt);
-        resultGeometry(ctx, geom);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
-    }
-}
-
-// geo_as_text(geom) -> WKT text
-static void geoAsTextFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
-    if (argc != 1) {
-        sqlite3_result_error(ctx, "geo_as_text requires 1 arg: geom", -1);
-        return;
-    }
-    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
-        sqlite3_result_null(ctx);
-        return;
-    }
-    try {
-        // If already text, pass through
-        if (sqlite3_value_type(argv[0]) == SQLITE_TEXT) {
-            const char* text = reinterpret_cast<const char*>(sqlite3_value_text(argv[0]));
-            sqlite3_result_text(ctx, text, -1, SQLITE_TRANSIENT);
-            return;
-        }
-        auto geom = extractGeometry(ctx, argv[0]);
-        std::string wkt = geo::toWKT(geom);
-        sqlite3_result_text(ctx, wkt.c_str(), static_cast<int>(wkt.size()), SQLITE_TRANSIENT);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
-    }
-}
-
-// geo_from_geojson(json) -> blob
-static void geoFromGeoJSONFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
-    if (argc != 1) {
-        sqlite3_result_error(ctx, "geo_from_geojson requires 1 arg: json_text", -1);
-        return;
-    }
-    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
-        sqlite3_result_null(ctx);
-        return;
-    }
-    try {
-        const char* json = reinterpret_cast<const char*>(sqlite3_value_text(argv[0]));
-        auto geom = geo::parseGeoJSON(json);
-        resultGeometry(ctx, geom);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
-    }
-}
-
-// geo_as_geojson(geom) -> GeoJSON text
-static void geoAsGeoJSONFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
-    if (argc != 1) {
-        sqlite3_result_error(ctx, "geo_as_geojson requires 1 arg: geom", -1);
-        return;
-    }
-    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
-        sqlite3_result_null(ctx);
-        return;
-    }
-    try {
-        auto geom = extractGeometry(ctx, argv[0]);
-        std::string json = geo::toGeoJSON(geom);
-        sqlite3_result_text(ctx, json.c_str(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
-    }
-}
-
 // geo_contains(geom, lat, lon) -> 0/1
 static void geoContainsFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     if (argc != 3) {
@@ -453,14 +396,14 @@ static void geoContainsFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv
             return;
         }
     }
-    try {
-        auto geom = extractGeometry(ctx, argv[0]);
+    {
+        geo::Geometry geom;
+        if (!extractGeometry(ctx, argv[0], &geom)) return;
         double lat = sqlite3_value_double(argv[1]);
         double lon = sqlite3_value_double(argv[2]);
         geo::Point p(lon, lat);  // Point is (x=lon, y=lat)
         sqlite3_result_int(ctx, geo::pointInGeometry(p, geom) ? 1 : 0);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -476,13 +419,18 @@ static void geoIntersectionFunc(sqlite3_context* ctx, int argc, sqlite3_value** 
             return;
         }
     }
-    try {
-        auto g1 = extractGeometry(ctx, argv[0]);
-        auto g2 = extractGeometry(ctx, argv[1]);
+    {
+        geo::Geometry g1;
+        if (!extractGeometry(ctx, argv[0], &g1)) return;
+        geo::Geometry g2;
+        if (!extractGeometry(ctx, argv[1], &g2)) return;
+        if (!convexPolygon(g1) || !convexPolygon(g2)) {
+            sqlite3_result_error(ctx, "Polygon operation requires convex, hole-free POLYGON geometries", -1);
+            return;
+        }
         auto result = geo::polygonIntersection(g1, g2);
         resultGeometry(ctx, result);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -498,13 +446,18 @@ static void geoUnionFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
             return;
         }
     }
-    try {
-        auto g1 = extractGeometry(ctx, argv[0]);
-        auto g2 = extractGeometry(ctx, argv[1]);
+    {
+        geo::Geometry g1;
+        if (!extractGeometry(ctx, argv[0], &g1)) return;
+        geo::Geometry g2;
+        if (!extractGeometry(ctx, argv[1], &g2)) return;
+        if (!convexPolygon(g1) || !convexPolygon(g2)) {
+            sqlite3_result_error(ctx, "Polygon operation requires convex, hole-free POLYGON geometries", -1);
+            return;
+        }
         auto result = geo::polygonUnion(g1, g2);
         resultGeometry(ctx, result);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -520,13 +473,18 @@ static void geoDifferenceFunc(sqlite3_context* ctx, int argc, sqlite3_value** ar
             return;
         }
     }
-    try {
-        auto g1 = extractGeometry(ctx, argv[0]);
-        auto g2 = extractGeometry(ctx, argv[1]);
+    {
+        geo::Geometry g1;
+        if (!extractGeometry(ctx, argv[0], &g1)) return;
+        geo::Geometry g2;
+        if (!extractGeometry(ctx, argv[1], &g2)) return;
+        if (!convexPolygon(g1) || !convexPolygon(g2)) {
+            sqlite3_result_error(ctx, "Polygon operation requires convex, hole-free POLYGON geometries", -1);
+            return;
+        }
         auto result = geo::polygonDifference(g1, g2);
         resultGeometry(ctx, result);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -542,13 +500,18 @@ static void geoSymDifferenceFunc(sqlite3_context* ctx, int argc, sqlite3_value**
             return;
         }
     }
-    try {
-        auto g1 = extractGeometry(ctx, argv[0]);
-        auto g2 = extractGeometry(ctx, argv[1]);
+    {
+        geo::Geometry g1;
+        if (!extractGeometry(ctx, argv[0], &g1)) return;
+        geo::Geometry g2;
+        if (!extractGeometry(ctx, argv[1], &g2)) return;
+        if (!convexPolygon(g1) || !convexPolygon(g2)) {
+            sqlite3_result_error(ctx, "Polygon operation requires convex, hole-free POLYGON geometries", -1);
+            return;
+        }
         auto result = geo::polygonSymDifference(g1, g2);
         resultGeometry(ctx, result);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -564,13 +527,16 @@ static void geoBufferFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
             return;
         }
     }
-    try {
-        auto geom = extractGeometry(ctx, argv[0]);
+    {
+        geo::Geometry geom;
+        if (!extractGeometry(ctx, argv[0], &geom)) return;
         double dist = sqlite3_value_double(argv[1]);
+        if(geom.type!=geo::GeomType::POINT || !std::isfinite(dist) || dist<=0) {
+            sqlite3_result_error(ctx,"geo_buffer requires a POINT and a positive finite distance",-1);return;
+        }
         auto result = geo::polygonBuffer(geom, dist);
         resultGeometry(ctx, result);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -584,11 +550,11 @@ static void geoAreaGeomFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv
         sqlite3_result_null(ctx);
         return;
     }
-    try {
-        auto geom = extractGeometry(ctx, argv[0]);
+    {
+        geo::Geometry geom;
+        if (!extractGeometry(ctx, argv[0], &geom)) return;
         sqlite3_result_double(ctx, geo::polygonArea(geom));
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -602,13 +568,14 @@ static void geoCentroidFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv
         sqlite3_result_null(ctx);
         return;
     }
-    try {
-        auto geom = extractGeometry(ctx, argv[0]);
+    {
+        geo::Geometry geom;
+        if (!extractGeometry(ctx, argv[0], &geom)) return;
         auto c = geo::centroid(geom);
+        if(!std::isfinite(c.x) || !std::isfinite(c.y)){sqlite3_result_null(ctx);return;}
         auto result = geo::Geometry::makePoint(c.x, c.y);
         resultGeometry(ctx, result);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -622,11 +589,11 @@ static void geoLengthGeomFunc(sqlite3_context* ctx, int argc, sqlite3_value** ar
         sqlite3_result_null(ctx);
         return;
     }
-    try {
-        auto geom = extractGeometry(ctx, argv[0]);
+    {
+        geo::Geometry geom;
+        if (!extractGeometry(ctx, argv[0], &geom)) return;
         sqlite3_result_double(ctx, geo::lineLength(geom));
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -640,12 +607,12 @@ static void geoEnvelopeFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv
         sqlite3_result_null(ctx);
         return;
     }
-    try {
-        auto geom = extractGeometry(ctx, argv[0]);
+    {
+        geo::Geometry geom;
+        if (!extractGeometry(ctx, argv[0], &geom)) return;
         auto result = geo::envelope(geom);
         resultGeometry(ctx, result);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -659,12 +626,12 @@ static void geoConvexHullFunc(sqlite3_context* ctx, int argc, sqlite3_value** ar
         sqlite3_result_null(ctx);
         return;
     }
-    try {
-        auto geom = extractGeometry(ctx, argv[0]);
+    {
+        geo::Geometry geom;
+        if (!extractGeometry(ctx, argv[0], &geom)) return;
         auto result = geo::convexHull(geom);
         resultGeometry(ctx, result);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -680,9 +647,11 @@ static void geoVoronoiFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv)
             return;
         }
     }
-    try {
-        auto points = extractGeometry(ctx, argv[0]);
-        auto bounds = extractGeometry(ctx, argv[1]);
+    {
+        geo::Geometry points;
+        if (!extractGeometry(ctx, argv[0], &points)) return;
+        geo::Geometry bounds;
+        if (!extractGeometry(ctx, argv[1], &bounds)) return;
 
         // Collect points from the multipoint geometry
         std::vector<geo::Point> sites;
@@ -695,10 +664,13 @@ static void geoVoronoiFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv)
             return;
         }
 
+        if (!convexPolygon(bounds)) {
+            sqlite3_result_error(ctx, "Voronoi bounds must be a convex, hole-free POLYGON", -1);
+            return;
+        }
         auto result = geo::voronoiDiagram(sites, bounds);
         resultGeometry(ctx, result);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -712,8 +684,9 @@ static void geoDelaunayFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv
         sqlite3_result_null(ctx);
         return;
     }
-    try {
-        auto points = extractGeometry(ctx, argv[0]);
+    {
+        geo::Geometry points;
+        if (!extractGeometry(ctx, argv[0], &points)) return;
 
         std::vector<geo::Point> pts;
         if (points.type == geo::GeomType::MULTIPOINT) {
@@ -727,8 +700,7 @@ static void geoDelaunayFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv
 
         auto result = geo::delaunayTriangulation(pts);
         resultGeometry(ctx, result);
-    } catch (const std::exception& e) {
-        sqlite3_result_error(ctx, e.what(), -1);
+
     }
 }
 
@@ -736,7 +708,7 @@ static void geoDelaunayFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv
 // Coordinate transforms
 // ---------------------------------------------------------------------------
 
-// geo_to_ecef(lat, lon, alt) -> text "x,y,z"
+// geo_to_ecef_x/y/z(lat, lon, alt) -> numeric Cartesian component (meters)
 static void geoToEcefFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     if (argc != 3) {
         sqlite3_result_error(ctx, "geo_to_ecef requires 3 args: lat, lon, alt", -1);
@@ -754,12 +726,11 @@ static void geoToEcefFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
     double alt = sqlite3_value_double(argv[2]);
 
     auto ecef = geo::geodedicToECEF(lat, lon, alt);
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%.3f,%.3f,%.3f", ecef.x, ecef.y, ecef.z);
-    sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+    const int axis=static_cast<int>(reinterpret_cast<intptr_t>(sqlite3_user_data(ctx)));
+    sqlite3_result_double(ctx, axis==0 ? ecef.x : axis==1 ? ecef.y : ecef.z);
 }
 
-// geo_from_ecef(x, y, z) -> text "lat,lon,alt"
+// geo_from_ecef(x, y, z) -> SDS GJN point with altitude
 static void geoFromEcefFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     if (argc != 3) {
         sqlite3_result_error(ctx, "geo_from_ecef requires 3 args: x, y, z", -1);
@@ -778,9 +749,9 @@ static void geoFromEcefFunc(sqlite3_context* ctx, int argc, sqlite3_value** argv
 
     double lat, lon, alt;
     geo::ecefToGeodetic(x, y, z, lat, lon, alt);
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%.8f,%.8f,%.3f", lat, lon, alt);
-    sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+    auto result=geo::Geometry::makePoint(lon,lat);
+    result.point.z=alt;result.point.hasAltitude=true;
+    resultGeometry(ctx,result,true);
 }
 
 // ---------------------------------------------------------------------------
@@ -808,10 +779,6 @@ void registerGeoFunctions(sqlite3* db) {
     sqlite3_create_function(db, "geo_geohash_decode_lon", 1, flags, nullptr, geoGeohashDecodeLonFunc, nullptr, nullptr);
 
     // Geometry WKT/GeoJSON
-    sqlite3_create_function(db, "geo_from_text", 1, flags, nullptr, geoFromTextFunc, nullptr, nullptr);
-    sqlite3_create_function(db, "geo_as_text", 1, flags, nullptr, geoAsTextFunc, nullptr, nullptr);
-    sqlite3_create_function(db, "geo_from_geojson", 1, flags, nullptr, geoFromGeoJSONFunc, nullptr, nullptr);
-    sqlite3_create_function(db, "geo_as_geojson", 1, flags, nullptr, geoAsGeoJSONFunc, nullptr, nullptr);
 
     // Geometry operations
     sqlite3_create_function(db, "geo_contains", 3, flags, nullptr, geoContainsFunc, nullptr, nullptr);
@@ -829,7 +796,9 @@ void registerGeoFunctions(sqlite3* db) {
     sqlite3_create_function(db, "geo_delaunay", 1, flags, nullptr, geoDelaunayFunc, nullptr, nullptr);
 
     // Coordinate transforms
-    sqlite3_create_function(db, "geo_to_ecef", 3, flags, nullptr, geoToEcefFunc, nullptr, nullptr);
+    sqlite3_create_function(db, "geo_to_ecef_x", 3, flags, nullptr, geoToEcefFunc, nullptr, nullptr);
+    sqlite3_create_function(db, "geo_to_ecef_y", 3, flags, reinterpret_cast<void*>(1), geoToEcefFunc, nullptr, nullptr);
+    sqlite3_create_function(db, "geo_to_ecef_z", 3, flags, reinterpret_cast<void*>(2), geoToEcefFunc, nullptr, nullptr);
     sqlite3_create_function(db, "geo_from_ecef", 3, flags, nullptr, geoFromEcefFunc, nullptr, nullptr);
 }
 

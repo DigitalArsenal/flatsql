@@ -1,49 +1,105 @@
-# FlatSQL 3.12: one FlatBuffer API
+# FlatSQL 3.12 binary API
 
-Status: implementation contract for the work branch; this is not the shipped 3.11 API.
+FlatSQL has one public JavaScript entry point, `flatsql`, exporting `FlatSQL`
+and `FlatSQLError`, and one native ABI, `cpp/include/flatsql/flatsql.h`.
+`flatsql/flatsql.wasm` identifies the same WASI threads artifact on every host.
+There are no PS/P4 selectors, old engine aliases, or compatibility modes.
 
-## Release boundary
+## Schemas, records, and queries
 
-3.11.1 repairs CI and publishes the existing engine. 3.12.0 unifies the API and removes the legacy JSON/GeoJSON text surface. The unified release replaces the old entry points; it does not retain aliases, compatibility modes, or runtime version switches.
+- `FlatSQL.open(options)` opens persistent host storage. Node `root` is a
+  filesystem directory; browser `root` is an OPFS directory. Node without a
+  root creates a temporary store. `close()` drains/cancels operations and stops
+  the engine. Close an instance before opening the same directory again.
+- `registerSchema({name, fileIdentifier, bfbs, ...})` registers a binary
+  reflection schema. Type names are SQL identifiers, up to 64 characters; the
+  file identifier is four bytes. Indexed extraction rules and full-text
+  indexing are schema configuration, executed inside the guest.
+- `ingest(type, records, metadata)` accepts concatenated frames:
+  `[u32 little-endian payload length][FlatBuffer payload]`. The guest validates
+  records, computes identities, persists streams and updates indexes. Provider,
+  source, producer, batch and timestamp metadata are optional.
+- `query(request, options)` returns an async stream of byte chunks; `execute`
+  collects it within a byte budget. Requests are canonical SDS QRP buffers,
+  optionally size-prefixed, with `KIND=Request` and `REPRESENTATION=FlatBuffer`
+  (or their schema defaults). `SQL` and `PARAMETERS` drive the query. Express
+  filters, sort, selection, and paging in SQL; unrelated QRP selection fields
+  are rejected instead of silently ignored.
+- Projection output is a stream of size-prefixed SDS QRP pages: column names,
+  typed rows, and a final summary containing counts, status and truncation.
+  Chunk boundaries need not coincide with frame boundaries. QRP null, integer,
+  float, text and bytes preserve SQLite values; boolean parameters bind as
+  SQLite integers 0/1. Integers remain signed 64-bit values.
+- `SELECT _data` with `{records:true}` streams original record frames unchanged.
+  IDs, properties, altitude, null geometry and bounding boxes are preserved
+  byte for byte. Derived geometry has the separate semantics below.
+- Root scalar/string/byte-vector fields are exposed by BFBS reflection.
+  Complex/nested fields remain in `_data`. Unsigned integers above the SQLite
+  signed 64-bit range produce an error; retrieve `_data` to preserve them.
+- `surface()` returns the SQL catalog in QRP pages. `setQuota(bytes)` changes the
+  disk budget; zero removes that budget. Low-level mailbox maintenance and
+  storage controls are documented in the C header, behind the same engine.
 
-## Public contract
+`QueryOptions` provides cancellation (`AbortSignal`), elapsed timeout,
+rows/result bytes, rows examined, bytes read, and bulk/sandbox lane selection.
+QRP `MAX_ROWS`, `LIMIT`, `MAX_BYTES`, and `MAX_ELAPSED_MS` are enforced by the
+engine. Breaking a stream cancels and drains its lane before its slot is reused.
+`execute` defaults to a 16 MiB collected result budget, with bounded room for
+terminal framing. A budget failure throws `FlatSQLError`; already streamed
+chunks are partial, never a successful complete answer.
 
-- One database API backed by the optimized stream store. Applications do not select `p4`, `ps`, or a separate SQL engine.
-- One native ABI and one JavaScript package entry point for data operations. Runtime adapters supply memory, threads, files, and transport; they do not implement query or geometry semantics.
-- Register binary reflection schemas (`.bfbs`). Store and ingest FlatBuffer records. Use a documented, bounded size-prefixed stream for piped input and output.
-- Return whole records as unchanged FlatBuffer frames. Return projections and typed values through the existing SDS QRP schema; preserve null, bool, integer, float, text, and byte values without JSON conversion.
-- Preserve cancellation, request budgets, backpressure, quotas, source/feed metadata, durable reopen, compaction, and the optimized index read paths behind this API.
-- No engine JSON or GeoJSON text parser, serializer, result mode, or SQLite JSON extension. Package/build manifests are tooling metadata, not a database data format.
-- Conversion belongs outside the library: a separate converter such as flatc-wasm creates schema-conformant FlatBuffers, pipes them into FlatSQL, and optionally renders returned FlatBuffers. FlatSQL does not bundle that converter.
+The data boundary accepts `Uint8Array`, not JavaScript rows or SQL strings.
+The package does not parse or render JSON, GeoJSON or WKT, compile schema text,
+or provide the SQLite JSON extension. Manifest JSON is tooling metadata.
+Convert separately with flatc-wasm or generated SDS bindings. Private packed
+control messages configure memory and files; they do not carry a second public
+record or SQL result format.
 
-## Geospatial contract
+## Geometry
 
-Use canonical SDS GJN (`$GJN`, root `GJNFeatureCollection`). Do not introduce a second geometry wire format or preserve the existing custom geometry blob as a public format.
+Geometry arguments are canonical SDS GJN (`$GJN`, root `GJN`) FlatBuffers,
+provided as a payload or one size-prefixed frame. Results are GJN payloads in
+QRP `Bytes` values. Every result verifies against the same SDS schema. No
+custom geometry blob or JSON parser exists inside the engine.
 
-GJN data must remain valid under the canonical schema, including point, multipoint, line, multiline, polygon, multipolygon, and geometry collection. Preserve polygon holes, optional altitude, feature IDs, properties, null geometry, and bounding-box metadata when an operation preserves the original feature. Opaque property fields are not an invitation to parse JSON inside the engine.
+All seven GJN geometry kinds are decoded, including multi-geometries and
+collections. Multiple features are evaluated as a collection; null feature
+geometries contribute no points. SQL NULL propagates. Malformed buffers,
+non-finite positions, open polygon rings, and unsupported combinations produce
+SQL errors. Properties remain opaque, including SDS `JSON_VALUE` strings.
 
-Register the geospatial SQL functions on the optimized SQL lanes. Preserve the established scalar distance, bounding-box, and radius query behavior. Geometry-valued arguments and results use GJN FlatBuffers. Remove WKT/GeoJSON conversion functions alongside the legacy parsers so the binary boundary is unambiguous.
+| Function | Behavior |
+| --- | --- |
+| `geo_distance`, `geo_within_radius`, `geo_bearing` | Spherical calculations; distances/radii in kilometers, coordinates in latitude/longitude order. |
+| `geo_bbox_contains`, `geo_area_bbox` | Scalar bounding-box predicates and spherical area. |
+| `geo_contains(g,lat,lon)` | Point/polygon membership, including polygon holes and collection members. |
+| `geo_area_geom(g)` | Sum of planar polygon areas minus holes, in square degrees. Non-area members contribute zero. |
+| `geo_length_geom(g)` | Haversine line length in kilometers; collection members contribute their lengths. |
+| `geo_envelope(g)`, `geo_convex_hull(g)` | Two-dimensional envelope/hull over every member's coordinates. |
+| `geo_centroid(g)` | Planar centroid, weighted by polygon area minus holes, then line length, then point count. Highest-dimensional members contribute; empty/degenerate input returns NULL. |
+| `geo_intersection`, `geo_union`, `geo_difference`, `geo_sym_difference` | Convex, hole-free polygon operands, either winding. Exact clipped pieces; concave or holed operands are rejected. Results may contain multiple polygon pieces with touching boundaries. |
+| `geo_buffer(g,d)` | Point buffer with positive distance in degrees, approximated by a 16-segment circle. Other geometry kinds are rejected. |
+| `geo_voronoi`, `geo_delaunay` | Point/multipoint sites in the longitude/latitude plane. Voronoi bounds must be a convex, hole-free polygon. |
+| `geo_destination`, `geo_midpoint` | GJN point results from spherical calculations. |
+| `geo_to_ecef_x/y/z(lat,lon,alt)` | Separate numeric Cartesian components in meters; altitude input is meters. |
+| `geo_from_ecef(x,y,z)` | GJN point with WGS84 longitude, latitude and altitude in meters. |
 
-Define collection and altitude behavior explicitly for operations that compute new geometry. Reject unsupported input or operation combinations with a typed error; do not silently drop members or dimensions.
+Derived map geometry is explicitly 2D: it contains newly computed coordinates
+and no feature IDs, properties, source bbox or altitude. `geo_from_ecef` computes
+altitude. Scalar map measurements ignore altitude. Original record queries
+preserve the complete original 3D record. Geometry computations are planar
+unless explicitly described as spherical; they do not unwrap antimeridian
+crossings or act as a global spherical topology engine.
 
-## Source work
+## Integrity and hosts
 
-1. Define the unified entry point and exported ABI. Replace public PS/P4 exports, artifact names, declarations, and documentation together. Keep implementation details private.
-2. Reuse SDS QRP for parameters/projection values and GJN for geometry; generate bindings from the pinned SDS package. If a required control contract is missing, change and publish canonical SDS first. Do not repurpose an existing field or create a local schema copy.
-3. Connect the optimized SQL lanes to binary geospatial functions. Replace legacy geometry serialization and remove JSON/GeoJSON/WKT conversion code.
-4. Replace legacy JSON query response modes and public RB1 decoding with FlatBuffer result frames. Preserve the whole-record fast path and bounded streaming behavior.
-5. Replace the legacy schema-column compatibility rules with the unified schema contract where required for GJN; do not add a GJN-specific host query implementation.
-6. Update Node/browser/WASI hosts and downstream SDN consumers in coordinated tasks. Relevant consumers include `sdn-js/src/local-flatsql.ts`, `sdn-js/src/flatsql-io-store.ts`, `sdn-server/internal/flatsqlrt`, and `sdn-server/internal/storage/format4`.
-7. Rebuild and publish only the unified artifacts as 3.12.0 after the acceptance evidence is complete.
+Default loads verify the adjacent `integrity.json`: browser Fetch SRI and Node
+SHA-256. Supplying `wasmBytes` requires a verification callback, allowing a host
+to enforce its signed artifact policy before instantiation. Generic adapters
+provide threads, memory, filesystem I/O and transport; query, geometry, indexing,
+and record identity logic stay inside C++/WASM.
 
-## Required evidence
-
-- External flatc-wasm conversion into canonical GJN, binary ingest, SQL geo filtering/projection, and binary output that verifies against SDS.
-- Original scalar geo query cases, null behavior, malformed-buffer rejection, polygon holes, collections, altitude, and feature property preservation.
-- Field-for-field query equivalence on the storage fixture, including full records and projections, on native and WASM runtimes.
-- Durable reopen, crash/power-loss recovery, compaction during reads, cancellation, quotas, and bounded result memory.
-- Real browser interaction for every changed website demo and affected downstream feature; verify isolation/thread requirements and the exact shipped artifact.
-- Native and WASM artifact sizes and the package contents compared with 3.11.1. Confirm that removed parser code and legacy engine artifacts are absent.
-- Performance evidence on a pinned, unsaturated runtime using the same fixture and measurement conditions. No regressions hidden by a second engine or compatibility route.
-
-The work branch must not be presented as a completed release until these checks pass and all public consumers use the unified API.
+Browser hosting requires shared memory and cross-origin isolation. Worker URLs
+can be supplied explicitly for bundlers. The distributed private runtime
+adapters bundle only the necessary published SDK host code and its license;
+they do not bring the SDK's legacy FlatSQL dependency into the package.

@@ -1,3 +1,4 @@
+#include "flatsql/query_page.h"
 // Store format 4: reads (design §5.4, CONTRACT §3.5-§3.9, C-37 (6), (11),
 // C-38).
 //
@@ -191,12 +192,12 @@ int32_t snapStream(Feed* f, Conn* c, std::shared_ptr<Stream>* out) {
         }
         uint32_t gen = 0;
         int32_t st = snapGen(c, &gen);
-        if (st != P4_OK) return st;
+        if (st != FLATSQL_OK) return st;
         *out = streamAt(f, gen, &st);
-        if (st != P4_OK) return st;
-        if (*out) return P4_OK;
+        if (st != FLATSQL_OK) return st;
+        if (*out) return FLATSQL_OK;
     }
-    return P4_E_BUSY;
+    return FLATSQL_E_BUSY;
 }
 
 // ---- the scan ---------------------------------------------------------------------------------------
@@ -354,22 +355,22 @@ int cmpCell(const ps::rb1::Cell& a, int64_t i, const std::string* s, bool isInt)
 }
 
 bool predOn(const Spec2::Pred& p, bool present, int64_t i, const std::string* s, bool isInt) {
-    if (p.op == P4_OP_NOTNULL) return present;
+    if (p.op == FLATSQL_OP_NOTNULL) return present;
     if (!present) return false;
     auto cmp = [&](size_t k) { return cmpCell(p.vals[k], i, s, isInt); };
     switch (p.op) {
-        case P4_OP_EQ: return p.vals.size() == 1 && cmp(0) == 0;
-        case P4_OP_NE: return p.vals.size() == 1 && cmp(0) != 0;
-        case P4_OP_LT: return p.vals.size() == 1 && cmp(0) < 0;
-        case P4_OP_LE: return p.vals.size() == 1 && cmp(0) <= 0;
-        case P4_OP_GT: return p.vals.size() == 1 && cmp(0) > 0;
-        case P4_OP_GE: return p.vals.size() == 1 && cmp(0) >= 0;
-        case P4_OP_BETWEEN: return p.vals.size() == 2 && cmp(0) >= 0 && cmp(1) <= 0;
-        case P4_OP_IN:
+        case FLATSQL_OP_EQ: return p.vals.size() == 1 && cmp(0) == 0;
+        case FLATSQL_OP_NE: return p.vals.size() == 1 && cmp(0) != 0;
+        case FLATSQL_OP_LT: return p.vals.size() == 1 && cmp(0) < 0;
+        case FLATSQL_OP_LE: return p.vals.size() == 1 && cmp(0) <= 0;
+        case FLATSQL_OP_GT: return p.vals.size() == 1 && cmp(0) > 0;
+        case FLATSQL_OP_GE: return p.vals.size() == 1 && cmp(0) >= 0;
+        case FLATSQL_OP_BETWEEN: return p.vals.size() == 2 && cmp(0) >= 0 && cmp(1) <= 0;
+        case FLATSQL_OP_IN:
             for (size_t k = 0; k < p.vals.size(); k++)
                 if (cmp(k) == 0) return true;
             return false;
-        case P4_OP_LIKE: {
+        case FLATSQL_OP_LIKE: {
             if (p.vals.size() != 1 || p.vals[0].type != ps::rb1::kText) return false;
             const std::string text = isInt ? std::to_string(i) : *s;
             return sqlite3_strlike(p.vals[0].s.c_str(), text.c_str(), 0) == 0;
@@ -513,11 +514,11 @@ private:
 
 int32_t Scan::check() {
     if (L_->trip) return L_->trip;
-    if (L_->h && L_->h->cancel.load(std::memory_order_acquire)) return L_->trip = P4_E_CANCELLED;
-    if (e_->stopWord->load(std::memory_order_acquire)) return L_->trip = P4_E_STOPPED;
-    if (L_->maxRows && L_->rowsExamined > L_->maxRows) return L_->trip = P4_E_BUDGET;
-    if (L_->maxBytes && L_->bytesRead > L_->maxBytes) return L_->trip = P4_E_BUDGET;
-    return P4_OK;
+    if (L_->h && L_->h->cancel.load(std::memory_order_acquire)) return L_->trip = FLATSQL_E_CANCELLED;
+    if (e_->stopWord->load(std::memory_order_acquire)) return L_->trip = FLATSQL_E_STOPPED;
+    if (L_->maxRows && L_->rowsExamined > L_->maxRows) return L_->trip = FLATSQL_E_BUDGET;
+    if (L_->maxBytes && L_->bytesRead > L_->maxBytes) return L_->trip = FLATSQL_E_BUDGET;
+    return FLATSQL_OK;
 }
 
 uint32_t Scan::tokOf(std::string_view producer) {
@@ -535,7 +536,7 @@ uint32_t Scan::tokOf(std::string_view producer) {
 
 bool Scan::needData() const {
     bool need = s_.hydrate;
-    for (auto& p : s_.preds) need = need || p.field >= P4_F_COL0;
+    for (auto& p : s_.preds) need = need || p.field >= FLATSQL_F_COL0;
     return need;
 }
 
@@ -586,7 +587,7 @@ int32_t Scan::pickFiles() {
         if (s_.eNull && sp_->hasEpochRule && f->k.nnull == 0) continue;            // INDEX_PAGE phase 2: none without an epoch
         if (s_.eNotNull && sp_->hasEpochRule && f->k.nnull >= f->k.recs) continue;  // none with one
         if (s_.eNotNull && !sp_->hasEpochRule) continue;
-        if (f->quarantined) return P4_E_CORRUPT;
+        if (f->quarantined) return FLATSQL_E_CORRUPT;
         FRef r;
         r.f = f;
         r.fid = f->fid;
@@ -599,7 +600,7 @@ int32_t Scan::pickFiles() {
         files_.push_back(std::move(r));
     }
     for (size_t i = 0; i < files_.size(); i++) fiOf_[files_[i].fid] = int(i);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 std::shared_ptr<const Staged> Scan::staged(const FRef& fr) const {
@@ -613,7 +614,7 @@ std::shared_ptr<const Staged> Scan::staged(const FRef& fr) const {
 // the cut is the N-th newest seq of those files merged, and every other
 // filter applies above it.
 int32_t Scan::boundCut() {
-    if (!s_.bound || files_.empty()) return P4_OK;
+    if (!s_.bound || files_.empty()) return FLATSQL_OK;
     struct H {
         std::string path;
         bool indexed = true, done = false;
@@ -636,7 +637,7 @@ int32_t Scan::boundCut() {
             if (!c) return statusOfSqlite(rc);
             sqlite3_stmt* q = c->sql(h.indexed ? "SELECT seq FROM r INDEXED BY r_s WHERE seq<?1 ORDER BY seq DESC LIMIT ?2"
                                                : "SELECT seq FROM r WHERE rid<(?1<<16) ORDER BY rid DESC LIMIT ?2");
-            int32_t st = q ? P4_OK : P4_E_INTERNAL;
+            int32_t st = q ? FLATSQL_OK : FLATSQL_E_INTERNAL;
             size_t got = 0;
             if (q) {
                 sqlite3_bind_int64(q, 1, h.last);
@@ -652,10 +653,10 @@ int32_t Scan::boundCut() {
                 if (r != SQLITE_DONE) st = statusOfSqlite(r);
             }
             e_->rpool.release(c);
-            if (st != P4_OK) return st;
+            if (st != FLATSQL_OK) return st;
             if (got < chunk) h.done = true;
         }
-        return P4_OK;
+        return FLATSQL_OK;
     };
     uint64_t n = 0;
     int64_t last = 0;
@@ -663,7 +664,7 @@ int32_t Scan::boundCut() {
         int best = -1;
         for (size_t i = 0; i < hs.size(); i++) {
             const int32_t st = fetch(hs[i]);
-            if (st != P4_OK) return st;
+            if (st != FLATSQL_OK) return st;
             if (!hs[i].buf.empty() && (best < 0 || hs[i].buf.front() > hs[size_t(best)].buf.front())) best = int(i);
         }
         if (best < 0) break;
@@ -673,7 +674,7 @@ int32_t Scan::boundCut() {
     }
     L_->rowsExamined += n;
     if (n >= s_.bound && n > 0) lo_ = std::max(lo_, last - 1);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // Candidates instead of a walk: an exact CID (one probe of each feed file's
@@ -686,15 +687,15 @@ int32_t Scan::candidatesFromPreds(bool* used) {
     const int oc = sp_->hasObject ? sp_->tc.firstObjectCol() : -1;
     if (!s_.hasCid && oc >= 0 && oc <= 3)
         for (const auto& p : s_.preds)
-            if (p.field == P4_F_COL0 + oc && !p.vals.empty() && (p.op == P4_OP_EQ || p.op == P4_OP_IN)) {
+            if (p.field == FLATSQL_F_COL0 + oc && !p.vals.empty() && (p.op == FLATSQL_OP_EQ || p.op == FLATSQL_OP_IN)) {
                 bool ok = true;
                 for (const auto& v : p.vals) ok = ok && (v.type == ps::rb1::kInt || v.type == ps::rb1::kText);
                 if (ok) kp = &p;
                 break;
             }
-    if (!s_.hasCid && !kp) return P4_OK;
+    if (!s_.hasCid && !kp) return FLATSQL_OK;
     for (const FRef& fr : files_)
-        if (!fr.indexed) return P4_OK;  // a file before REBUILD 1: the walk
+        if (!fr.indexed) return FLATSQL_OK;  // a file before REBUILD 1: the walk
     struct E {
         int64_t seq, w, ov;
         uint8_t key[32];
@@ -720,10 +721,10 @@ int32_t Scan::candidatesFromPreds(bool* used) {
         sqlite3_stmt* q = c->sql(sql);
         if (!q) {
             e_->rpool.release(c);
-            return P4_OK;  // no object index: the walk
+            return FLATSQL_OK;  // no object index: the walk
         }
         c->exec("BEGIN");
-        int32_t st = P4_OK;
+        int32_t st = FLATSQL_OK;
         const size_t nv = s_.hasCid ? 1 : kp->vals.size();
         // ROWS_BY_OBJECT_EPOCH: the object's rows in the segments and the
         // tail (staged or merged), each read by its rid.
@@ -731,9 +732,9 @@ int32_t Scan::candidatesFromPreds(bool* used) {
         if (fsgObj) {
             sqlite3_stmt* keyId = c->sql("SELECT id FROM okey WHERE k=?1");
             sqlite3_stmt* row = c->sql(std::string("SELECT seq, w, cid, ") + ovCol + " FROM r WHERE rid=?1");
-            if (!keyId || !row) st = P4_E_INTERNAL;
+            if (!keyId || !row) st = FLATSQL_E_INTERNAL;
             std::vector<uint64_t> rids;
-            for (size_t vi = 0; vi < nv && st == P4_OK && ents.size() <= kMax; vi++) {
+            for (size_t vi = 0; vi < nv && st == FLATSQL_OK && ents.size() <= kMax; vi++) {
                 bindCell(keyId, 1, kp->vals[vi]);
                 int r = sqlite3_step(keyId);
                 const uint64_t kk = r == SQLITE_ROW ? uint64_t(sqlite3_column_int64(keyId, 0)) : 0;
@@ -762,10 +763,10 @@ int32_t Scan::candidatesFromPreds(bool* used) {
             }
             c->exec("COMMIT");
             e_->rpool.release(c);
-            if (st != P4_OK) return st;
+            if (st != FLATSQL_OK) return st;
             continue;
         }
-        for (size_t vi = 0; vi < nv && st == P4_OK && ents.size() <= kMax; vi++) {
+        for (size_t vi = 0; vi < nv && st == FLATSQL_OK && ents.size() <= kMax; vi++) {
             if (s_.hasCid) sqlite3_bind_blob(q, 1, s_.cidKey, 32, SQLITE_STATIC);
             else bindCell(q, 1, kp->vals[vi]);
             sqlite3_bind_int64(q, 2, lo_);
@@ -787,7 +788,7 @@ int32_t Scan::candidatesFromPreds(bool* used) {
         }
         c->exec("COMMIT");
         e_->rpool.release(c);
-        if (st != P4_OK) return st;
+        if (st != FLATSQL_OK) return st;
         // The file's staged rows of the CID or the object keys.
         if (view && view->rows) {
             std::vector<const StRow*> v;
@@ -815,7 +816,7 @@ int32_t Scan::candidatesFromPreds(bool* used) {
             }
         }
     }
-    if (ents.size() > kMax) return P4_OK;  // the walk
+    if (ents.size() > kMax) return FLATSQL_OK;  // the walk
     // One candidate per (file, seq), in the scan's order; in a keyed order
     // one per (file, seq, order value), each answered only at its own value.
     std::map<std::tuple<int, int64_t, int64_t>, Cand> bySeq;
@@ -845,7 +846,7 @@ int32_t Scan::candidatesFromPreds(bool* used) {
                      [&](const Cand& a, const Cand& b) { return before(asEnt(a), a.fi, asEnt(b), b.fi); });
     candMode_ = true;
     *used = true;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t Scan::open() {
@@ -857,34 +858,34 @@ int32_t Scan::open() {
     if (!s_.search.empty()) {
         // FTS5 (background index; C-4's exception), checked a page at a time.
         // A type without records answers none (below).
-        if (!sp_->fullText || (t_->hasFiles.load(std::memory_order_acquire) && !ioExists(t_->pFts))) return P4_E_UNSUPPORTED;
+        if (!sp_->fullText || (t_->hasFiles.load(std::memory_order_acquire) && !ioExists(t_->pFts))) return FLATSQL_E_UNSUPPORTED;
         fts_ = true;
     }
-    if (s_.order == 0) s_.order = P4_ORDER_SEQ_ASC;
+    if (s_.order == 0) s_.order = FLATSQL_ORDER_SEQ_ASC;
     switch (s_.order) {
-        case P4_ORDER_SEQ_DESC: wo_ = kSeqDesc; break;
-        case P4_ORDER_W_DESC: wo_ = s_.wAsc ? kWAsc : kWDesc; break;
-        case P4_ORDER_CID: wo_ = kCid; break;
-        case P4_ORDER_NEWEST: wo_ = s_.part == 2 ? kTsDesc : kAtDesc; break;   // local rows: their ts (format 1's untagged order)
-        case P4_ORDER_RECENT: wo_ = s_.part == 2 ? kSeqDesc : kAtDescSeq; break;
-        case P4_ORDER_W_ASC: wo_ = kWAsc; break;
+        case FLATSQL_ORDER_SEQ_DESC: wo_ = kSeqDesc; break;
+        case FLATSQL_ORDER_W_DESC: wo_ = s_.wAsc ? kWAsc : kWDesc; break;
+        case FLATSQL_ORDER_CID: wo_ = kCid; break;
+        case FLATSQL_ORDER_NEWEST: wo_ = s_.part == 2 ? kTsDesc : kAtDesc; break;   // local rows: their ts (format 1's untagged order)
+        case FLATSQL_ORDER_RECENT: wo_ = s_.part == 2 ? kSeqDesc : kAtDescSeq; break;
+        case FLATSQL_ORDER_W_ASC: wo_ = kWAsc; break;
         default: wo_ = kSeqAsc; break;
     }
     if (!t_->hasFiles.load(std::memory_order_acquire)) {
         done_ = true;
-        return P4_OK;
+        return FLATSQL_OK;
     }
     int32_t rc = pickFiles();
-    if (rc != P4_OK) return rc;
+    if (rc != FLATSQL_OK) return rc;
     if (files_.empty() || lo_ >= hi_) {
         done_ = true;
-        return P4_OK;
+        return FLATSQL_OK;
     }
     rc = boundCut();
-    if (rc != P4_OK) return rc;
+    if (rc != FLATSQL_OK) return rc;
     if (lo_ >= hi_) {
         done_ = true;
-        return P4_OK;
+        return FLATSQL_OK;
     }
     chunkMax_ = std::max<size_t>(32, std::min<size_t>(512, 1024 / files_.size()));
     // A limited scan reads what its first page needs, then doubles.
@@ -936,7 +937,7 @@ int32_t Scan::fetch(Stream& s) {
 }
 
 int32_t Scan::fetchChunk(Stream& s) {
-    if (s.done) return P4_OK;
+    if (s.done) return FLATSQL_OK;
     const FRef& fr = files_[size_t(s.fi)];
     const std::shared_ptr<const Staged> view = staged(fr);
     int orc = 0;
@@ -948,7 +949,7 @@ int32_t Scan::fetchChunk(Stream& s) {
     const int64_t ridLo = ((lo_ + 1) << 16), ridHi = (hi_ << 16) | 0xffff;
     const bool wBound = s_.wLo != INT64_MIN || s_.wHi != INT64_MAX;
     std::vector<Ent> got;
-    int32_t rc = P4_OK;
+    int32_t rc = FLATSQL_OK;
     // kind 0: seq; 1: rid, w; 2: rid, order value (w, at or ts), cid
     auto read = [&](sqlite3_stmt* q, int kind) -> int32_t {
         int r;
@@ -968,7 +969,7 @@ int32_t Scan::fetchChunk(Stream& s) {
             got.push_back(en);
         }
         sqlite3_reset(q);
-        return r == SQLITE_DONE ? P4_OK : statusOfSqlite(r);
+        return r == SQLITE_DONE ? FLATSQL_OK : statusOfSqlite(r);
     };
     c->exec("BEGIN");
     std::shared_ptr<const FsgView> fsgSeq;
@@ -999,7 +1000,7 @@ int32_t Scan::fetchChunk(Stream& s) {
         else sql = desc ? "SELECT rid, w FROM r WHERE rid<?1 AND rid>=?2 AND w>=?4 AND w<=?5 ORDER BY rid DESC LIMIT ?3"
                         : "SELECT rid, w FROM r WHERE rid>?1 AND rid<=?2 AND w>=?4 AND w<=?5 ORDER BY rid LIMIT ?3";
         sqlite3_stmt* q = c->sql(sql);
-        if (!q) rc = P4_E_INTERNAL;
+        if (!q) rc = FLATSQL_E_INTERNAL;
         else {
             if (!s.started) s.rKey = desc ? (idx ? hi_ + 1 : ridHi + 1) : (idx ? lo_ : ridLo - 1);
             sqlite3_bind_int64(q, 1, s.rKey);
@@ -1010,7 +1011,7 @@ int32_t Scan::fetchChunk(Stream& s) {
                 sqlite3_bind_int64(q, 5, s_.wHi);
             }
             rc = read(q, idx ? 0 : 1);
-            if (rc == P4_OK) {
+            if (rc == FLATSQL_OK) {
                 if (!got.empty()) s.rKey = idx ? got.back().seq : got.back().rid;
                 if (got.size() < chunk_) s.done = true;
                 s.started = true;
@@ -1027,7 +1028,7 @@ int32_t Scan::fetchChunk(Stream& s) {
         const std::string idx = isW ? "r_w" : wo_ == kTsDesc ? "r_t" : "r_a";
         const std::string mOnly = isW ? " AND m=1" : "";
         const int64_t lo = isW ? s_.wLo : INT64_MIN, hi = isW ? s_.wHi : INT64_MAX;
-        if (!fr.indexed) rc = P4_E_UNSUPPORTED;
+        if (!fr.indexed) rc = FLATSQL_E_UNSUPPORTED;
         // A file made before its r_a / r_t (an older store): the same answer
         // through a sort.
         auto prep = [&](const std::string& tail) {
@@ -1036,13 +1037,13 @@ int32_t Scan::fetchChunk(Stream& s) {
             return q;
         };
         bool full = false;
-        if (rc == P4_OK) {
+        if (rc == FLATSQL_OK) {
             if (!s.started) s.rKey = asc ? lo : hi;
             const std::string tail = col + (asc ? (s.started ? ">?1 AND " : ">=?1 AND ") : (s.started ? "<?1 AND " : "<=?1 AND ")) +
                                      col + (asc ? "<=?2" : ">=?2") + mOnly + " AND rid>=?3 AND rid<=?4 ORDER BY " + col +
                                      (asc ? " ASC" : " DESC") + " LIMIT ?5";
             sqlite3_stmt* q = prep(tail);
-            if (!q) rc = P4_E_INTERNAL;
+            if (!q) rc = FLATSQL_E_INTERNAL;
             else {
                 sqlite3_bind_int64(q, 1, s.rKey);
                 sqlite3_bind_int64(q, 2, asc ? hi : lo);
@@ -1052,12 +1053,12 @@ int32_t Scan::fetchChunk(Stream& s) {
                 rc = read(q, 2);
             }
             full = got.size() >= chunk_;
-            if (rc == P4_OK && full) {
+            if (rc == FLATSQL_OK && full) {
                 // The last key group whole.
                 const int64_t last = got.back().ov;
                 while (!got.empty() && got.back().ov == last) got.pop_back();
                 sqlite3_stmt* g = prep(col + "=?1" + mOnly + " AND rid>=?2 AND rid<=?3");
-                if (!g) rc = P4_E_INTERNAL;
+                if (!g) rc = FLATSQL_E_INTERNAL;
                 else {
                     sqlite3_bind_int64(g, 1, last);
                     sqlite3_bind_int64(g, 2, ridLo);
@@ -1065,7 +1066,7 @@ int32_t Scan::fetchChunk(Stream& s) {
                     rc = read(g, 2);
                 }
             }
-            if (rc == P4_OK && isW && view && view->rows) {
+            if (rc == FLATSQL_OK && isW && view && view->rows) {
                 // The staged rows of the interval this chunk covers: to its
                 // last group when the chunk is full, else to the range's end
                 // (whole groups past a chunk; the rest on the next fetch,
@@ -1091,7 +1092,7 @@ int32_t Scan::fetchChunk(Stream& s) {
                 if (!v.empty())
                     std::stable_sort(got.begin(), got.end(), [asc](const Ent& a, const Ent& b) { return asc ? a.ov < b.ov : a.ov > b.ov; });
             }
-            if (rc == P4_OK) {
+            if (rc == FLATSQL_OK) {
                 // Each group in CID order (RECENT: seq desc), then rid: a
                 // record's rows stay adjacent.
                 const bool bySeq = wo_ == kAtDescSeq;
@@ -1114,16 +1115,16 @@ int32_t Scan::fetchChunk(Stream& s) {
     } else {  // CID
         // r_c holds the merged rows; the staged rows of the same CID
         // interval come from the view.
-        if (!fr.indexed) rc = P4_E_UNSUPPORTED;
+        if (!fr.indexed) rc = FLATSQL_E_UNSUPPORTED;
         // cp (r_c's key) is the CID key's first 8 bytes: cp order is CID order,
         // a cp group put in order by the CID; the walk seeks to the resume
         // CID's prefix (bound as a blob of its own: a zero-length one at the
         // start, never NULL).
-        sqlite3_stmt* q = rc == P4_OK ? c->sql("SELECT rid, w, cid FROM r INDEXED BY r_c WHERE cp>=?6 AND (cid, rid) > (?1, ?2) AND m=1"
+        sqlite3_stmt* q = rc == FLATSQL_OK ? c->sql("SELECT rid, w, cid FROM r INDEXED BY r_c WHERE cp>=?6 AND (cid, rid) > (?1, ?2) AND m=1"
                                                " AND rid>=?3 AND rid<=?4 ORDER BY cp, cid, rid LIMIT ?5")
                                       : nullptr;
-        if (rc == P4_OK && !q) rc = P4_E_INTERNAL;
-        if (rc == P4_OK) {
+        if (rc == FLATSQL_OK && !q) rc = FLATSQL_E_INTERNAL;
+        if (rc == FLATSQL_OK) {
             if (!s.started) {
                 s.rCid.clear();
                 s.rRid = 0;
@@ -1137,7 +1138,7 @@ int32_t Scan::fetchChunk(Stream& s) {
             else sqlite3_bind_zeroblob(q, 6, 0);
             rc = read(q, 2);
             bool full = got.size() >= chunk_;
-            if (rc == P4_OK && view && view->rows) {
+            if (rc == FLATSQL_OK && view && view->rows) {
                 std::vector<const StRow*> v;
                 bool more = false;
                 const Ent* last = full ? &got.back() : nullptr;
@@ -1164,7 +1165,7 @@ int32_t Scan::fetchChunk(Stream& s) {
                 if (!v.empty())
                     std::sort(got.begin(), got.end(), [&](const Ent& a, const Ent& b) { return before(a.key, a.rid, b.key, b.rid); });
             }
-            if (rc == P4_OK) {
+            if (rc == FLATSQL_OK) {
                 if (!got.empty()) {
                     s.rCid.assign(reinterpret_cast<const char*>(got.back().key), 32);
                     s.rRid = got.back().rid;
@@ -1176,22 +1177,22 @@ int32_t Scan::fetchChunk(Stream& s) {
     }
     c->exec("COMMIT");
     e_->rpool.release(c);
-    if (rc != P4_OK) {
-        if (rc != P4_E_UNSUPPORTED) e_->bump(kStReadErrors);
+    if (rc != FLATSQL_OK) {
+        if (rc != FLATSQL_E_UNSUPPORTED) e_->bump(kStReadErrors);
         return rc;
     }
     for (Ent& en : got) s.buf.push_back(en);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t Scan::fill(Stream& s) {
     while (s.buf.empty() && !s.done) {
         const int32_t rc = fetch(s);
-        if (rc != P4_OK) return rc;
+        if (rc != FLATSQL_OK) return rc;
         const int32_t ck = check();
-        if (ck != P4_OK) return ck;
+        if (ck != FLATSQL_OK) return ck;
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // The next page of candidates: the scan's feed files merged in its order
@@ -1201,7 +1202,7 @@ int32_t Scan::page(std::vector<Cand>* out) {
     if (candMode_) {
         for (size_t i = 0; i < std::min<size_t>(256, pageWant_) && candAt_ < cands_.size(); i++) out->push_back(cands_[candAt_++]);
         if (candAt_ >= cands_.size()) done_ = true;
-        return P4_OK;
+        return FLATSQL_OK;
     }
     auto later = [&](int x, int y) {  // the heap's order: the front comes first
         return before(streams_[size_t(y)].buf.front(), streams_[size_t(y)].fi, streams_[size_t(x)].buf.front(), streams_[size_t(x)].fi);
@@ -1210,7 +1211,7 @@ int32_t Scan::page(std::vector<Cand>* out) {
         heapReady_ = true;
         for (size_t i = 0; i < streams_.size(); i++) {
             const int32_t rc = fill(streams_[i]);
-            if (rc != P4_OK) return rc;
+            if (rc != FLATSQL_OK) return rc;
             if (!streams_[i].buf.empty()) {
                 heap_.push_back(int(i));
                 std::push_heap(heap_.begin(), heap_.end(), later);
@@ -1226,7 +1227,7 @@ int32_t Scan::page(std::vector<Cand>* out) {
         const Ent en = s.buf.front();
         s.buf.pop_front();
         const int32_t rc = fill(s);
-        if (rc != P4_OK) return rc;
+        if (rc != FLATSQL_OK) return rc;
         if (!s.buf.empty()) {
             heap_.push_back(i);
             std::push_heap(heap_.begin(), heap_.end(), later);
@@ -1296,13 +1297,13 @@ bool rowDict(Feed* f, Conn* c, DictView& dv, RowV* x) {
 constexpr int64_t kFrameGap = int64_t(64) << 10, kFrameRun = int64_t(4) << 20;
 
 // The rows' frames, the stream read in offset order with neighbors joined;
-// each row's bytes are a slice of its read: P4_E_IO when a read fails,
-// P4_E_CORRUPT when a frame runs past the stream's end or its size prefix
+// each row's bytes are a slice of its read: FLATSQL_E_IO when a read fails,
+// FLATSQL_E_CORRUPT when a frame runs past the stream's end or its size prefix
 // differs.
 int32_t readFrames(p4::Stream* s, std::vector<RowV*>& rows) {
     std::sort(rows.begin(), rows.end(), [](const RowV* a, const RowV* b) { return a->off < b->off; });
     for (size_t i = 0; i < rows.size();) {
-        if (rows[i]->off < 0 || rows[i]->len < 0 || rows[i]->len > (int64_t(1) << 31) - 8) return P4_E_CORRUPT;
+        if (rows[i]->off < 0 || rows[i]->len < 0 || rows[i]->len > (int64_t(1) << 31) - 8) return FLATSQL_E_CORRUPT;
         const int64_t from = rows[i]->off;
         int64_t to = from + rows[i]->len + 4;
         size_t j = i + 1;
@@ -1313,17 +1314,17 @@ int32_t readFrames(p4::Stream* s, std::vector<RowV*>& rows) {
         }
         auto buf = std::make_shared<std::string>();
         const int32_t st = streamReadRange(s, from, size_t(to - from), buf.get());
-        if (st != P4_OK) return st;
+        if (st != FLATSQL_OK) return st;
         for (size_t k = i; k < j; k++) {
             RowV* x = rows[k];
             const size_t at = size_t(x->off - from);
-            if (ld32(reinterpret_cast<const uint8_t*>(buf->data() + at)) != uint32_t(x->len)) return P4_E_CORRUPT;
+            if (ld32(reinterpret_cast<const uint8_t*>(buf->data() + at)) != uint32_t(x->len)) return FLATSQL_E_CORRUPT;
             x->data = Bytes{buf, at + 4, size_t(x->len)};
             x->hasData = true;
         }
         i = j;
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 }  // namespace
 
@@ -1338,12 +1339,12 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::v
     std::shared_ptr<p4::Stream> stream;  // the feed's record stream (Scan::Stream is a walk)
     if (nd) {
         const int32_t st = snapStream(fr.f, c, &stream);
-        if (st != P4_OK) return st;
+        if (st != FLATSQL_OK) return st;
     }
-    if (!dictEnsure(fr.f, c)) return P4_E_IO;
+    if (!dictEnsure(fr.f, c)) return FLATSQL_E_IO;
     sqlite3_stmt* q = c->get(S_R_SEQ);
-    if (!q) return P4_E_INTERNAL;
-    if (seqs.empty()) return P4_OK;
+    if (!q) return FLATSQL_E_INTERNAL;
+    if (seqs.empty()) return FLATSQL_OK;
     const size_t first = out->size();
     const bool dense = seqs.back() - seqs.front() < int64_t(2 * seqs.size()) + 16;
     for (size_t i = 0; i < seqs.size(); i = dense ? seqs.size() : i + 1) {
@@ -1362,7 +1363,7 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::v
             rowColumns(q, fi, &x);
             if (!rowDict(fr.f, c, dv, &x)) {
                 sqlite3_reset(q);
-                return P4_E_CORRUPT;
+                return FLATSQL_E_CORRUPT;
             }
         }
         sqlite3_reset(q);
@@ -1373,7 +1374,7 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::v
         rows.reserve(out->size() - first);
         for (size_t i = first; i < out->size(); i++) rows.push_back(&(*out)[i]);
         const int32_t st = readFrames(stream.get(), rows);
-        if (st != P4_OK) return st;
+        if (st != FLATSQL_OK) return st;
     }
     for (size_t i = first; i < out->size(); i++) {
         RowV& x = (*out)[i];
@@ -1381,13 +1382,13 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::v
         if (x.c) x.ckey = dv.ckey(c, x.c);
         if (x.u && (s_.needTags || s_.lane)) x.url = dv.url(c, x.u);
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // The page's seqs that the search matches, from the full-text index (one
 // range read when the page's seqs are dense, else a probe per seq).
 int32_t Scan::ftsHits(const std::vector<int64_t>& seqs, std::unordered_set<int64_t>* hit) {
-    if (seqs.empty()) return P4_OK;
+    if (seqs.empty()) return FLATSQL_OK;
     int rc = 0;
     Conn* c = e_->rpool.acquire(t_->pFts, OpenKind::Reader, &rc, nullptr);
     if (!c) return statusOfSqlite(rc);
@@ -1396,10 +1397,10 @@ int32_t Scan::ftsHits(const std::vector<int64_t>& seqs, std::unordered_set<int64
         lo = std::min(lo, s);
         hi = std::max(hi, s);
     }
-    int32_t status = P4_OK;
+    int32_t status = FLATSQL_OK;
     if (uint64_t(hi - lo) <= uint64_t(seqs.size()) * 4) {
         sqlite3_stmt* q = c->sql("SELECT rowid FROM fts WHERE fts MATCH ?1 AND rowid>=?2 AND rowid<=?3");
-        if (!q) status = P4_E_SQL;
+        if (!q) status = FLATSQL_E_SQL;
         else {
             sqlite3_bind_text(q, 1, s_.search.data(), int(s_.search.size()), SQLITE_STATIC);
             sqlite3_bind_int64(q, 2, lo);
@@ -1407,18 +1408,18 @@ int32_t Scan::ftsHits(const std::vector<int64_t>& seqs, std::unordered_set<int64
             int r;
             while ((r = sqlite3_step(q)) == SQLITE_ROW) hit->insert(sqlite3_column_int64(q, 0));
             sqlite3_reset(q);
-            if (r != SQLITE_DONE) status = P4_E_SQL;
+            if (r != SQLITE_DONE) status = FLATSQL_E_SQL;
         }
     } else {
         sqlite3_stmt* q = c->sql("SELECT 1 FROM fts WHERE fts MATCH ?1 AND rowid=?2");
-        if (!q) status = P4_E_SQL;
-        for (size_t i = 0; q && i < seqs.size() && status == P4_OK; i++) {
+        if (!q) status = FLATSQL_E_SQL;
+        for (size_t i = 0; q && i < seqs.size() && status == FLATSQL_OK; i++) {
             sqlite3_bind_text(q, 1, s_.search.data(), int(s_.search.size()), SQLITE_STATIC);
             sqlite3_bind_int64(q, 2, seqs[i]);
             const int r = sqlite3_step(q);
             sqlite3_reset(q);
             if (r == SQLITE_ROW) hit->insert(seqs[i]);
-            else if (r != SQLITE_DONE) status = P4_E_SQL;
+            else if (r != SQLITE_DONE) status = FLATSQL_E_SQL;
         }
     }
     e_->rpool.release(c);
@@ -1455,13 +1456,13 @@ int32_t Scan::cols(const Row& r, ps::Extracted* x, uint8_t* scratch, size_t n) {
                 break;
             }
         }
-        return P4_OK;
+        return FLATSQL_OK;
     }
-    if (!r.hasData) return P4_E_INTERNAL;
+    if (!r.hasData) return FLATSQL_E_INTERNAL;
     // The frame in place (its size prefix precedes the bytes); r's read
     // buffer and the caller's scratch outlive x.
     sp_->tc.extract(r.data.frame(), r.data.size() + 4, x, scratch, n);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // A record's rows (the scan's files) -> its answer, or false when it does
@@ -1531,22 +1532,22 @@ bool Scan::evaluate(int64_t seq, const RowV* rows, const RowV* end, Row* out) {
     if (s_.lane && !r.hasTag && !(s_.part == 3 && files_[size_t(pick->fi)].local)) return false;
     if (s_.preds.empty()) return true;
     bool needCols = false;
-    for (auto& p : s_.preds) needCols = needCols || p.field >= P4_F_COL0;
+    for (auto& p : s_.preds) needCols = needCols || p.field >= FLATSQL_F_COL0;
     ps::Extracted x;
     uint8_t scratch[2048];
-    if (needCols && cols(r, &x, scratch, sizeof scratch) != P4_OK) return false;
+    if (needCols && cols(r, &x, scratch, sizeof scratch) != FLATSQL_OK) return false;
     for (auto& p : s_.preds) {
         switch (p.field) {
-            case P4_F_EPOCH:
+            case FLATSQL_F_EPOCH:
                 if (!predOn(p, r.hasE, r.e, nullptr, true)) return false;
                 break;
-            case P4_F_TS:
+            case FLATSQL_F_TS:
                 if (!predOn(p, true, r.ts, nullptr, true)) return false;
                 break;
-            case P4_F_W:
+            case FLATSQL_F_W:
                 if (!predOn(p, true, r.w, nullptr, true)) return false;
                 break;
-            case P4_F_EPOCH_DAY: {
+            case FLATSQL_F_EPOCH_DAY: {
                 char d[11];
                 if (r.hasE) dayText(r.e, d);
                 const std::string ds = r.hasE ? std::string(d, 10) : std::string();
@@ -1554,7 +1555,7 @@ bool Scan::evaluate(int64_t seq, const RowV* rows, const RowV* end, Row* out) {
                 break;
             }
             default: {
-                const int col = p.field - P4_F_COL0;
+                const int col = p.field - FLATSQL_F_COL0;
                 if (col < 0 || col > 3) return false;
                 const ps::ColValue& cv = x.cols[col];
                 if (cv.isU64) {
@@ -1600,7 +1601,7 @@ int32_t Scan::resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Ro
         const int32_t st = loadRows(int(fi), c, seqs, &rows_);
         c->exec("COMMIT");
         e_->rpool.release(c);
-        if (st != P4_OK) {
+        if (st != FLATSQL_OK) {
             e_->bump(kStReadErrors);
             return st;
         }
@@ -1626,7 +1627,7 @@ int32_t Scan::resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Ro
         std::vector<int64_t> seqs;
         for (const Cand& c : page) seqs.push_back(c.seq);
         const int32_t st = ftsHits(seqs, &hits);
-        if (st != P4_OK) return st;
+        if (st != FLATSQL_OK) return st;
     }
     out->reserve(out->size() + page.size());
     for (const Cand& c : page) {
@@ -1640,16 +1641,16 @@ int32_t Scan::resolve(std::vector<Cand>& page, std::vector<std::pair<int64_t, Ro
             out->push_back({c.seq, std::move(r)});
         }
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t Scan::answer(std::vector<Cand>& cands, std::vector<std::pair<int64_t, Row>>* out) {
     for (size_t at = 0; at < cands.size(); at += 256) {
         std::vector<Cand> page(cands.begin() + long(at), cands.begin() + long(std::min(cands.size(), at + 256)));
         const int32_t rc = resolve(page, out);
-        if (rc != P4_OK) return rc;
+        if (rc != FLATSQL_OK) return rc;
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t Scan::answerPicks(const std::vector<std::pair<uint32_t, int64_t>>& picks, std::vector<std::pair<int64_t, Row>>* out) {
@@ -1668,7 +1669,7 @@ int32_t Scan::answerPicks(const std::vector<std::pair<uint32_t, int64_t>>& picks
 int32_t Scan::next(Row** out) {
     for (;;) {
         int32_t rc = check();
-        if (rc != P4_OK) return rc;
+        if (rc != FLATSQL_OK) return rc;
         if (s_.limit && emitted_ >= s_.limit) return 0;
         if (!queue_.empty()) {
             out_ = std::move(queue_.front());
@@ -1689,14 +1690,14 @@ int32_t Scan::next(Row** out) {
         const uint64_t need = s_.limit && s_.limit + s_.offset > taken ? s_.limit + s_.offset - taken : 0;
         pageWant_ = need ? size_t(std::min<uint64_t>(512, std::max<uint64_t>(need, pageMin_))) : 512;
         rc = page(&pg);
-        if (rc != P4_OK) return rc;
+        if (rc != FLATSQL_OK) return rc;
         if (pg.empty()) {
             if (done_) return 0;
             continue;
         }
         std::vector<std::pair<int64_t, Row>> got;
         rc = resolve(pg, &got);
-        if (rc != P4_OK) return rc;
+        if (rc != FLATSQL_OK) return rc;
         if (got.size() < pg.size()) pageMin_ = std::min<size_t>(512, std::max(2 * pageMin_, 2 * pg.size()));
         for (auto& g : got) queue_.push_back(std::move(g.second));
     }
@@ -1709,17 +1710,17 @@ int32_t Scan::next(Row** out) {
 // without an object are their own entities (their CID).
 int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* best, bool* handled, EpochWant* want) {
     *handled = false;
-    if (!sp_->ek || !s_.search.empty() || profile < 2 || profile > 4) return P4_OK;
+    if (!sp_->ek || !s_.search.empty() || profile < 2 || profile > 4) return FLATSQL_OK;
     for (const FRef& fr : files_)
-        if (!fr.indexed) return P4_OK;  // a file before REBUILD 1: the walk
+        if (!fr.indexed) return FLATSQL_OK;  // a file before REBUILD 1: the walk
     *handled = true;
-    if (files_.empty() || done_) return P4_OK;
+    if (files_.empty() || done_) return FLATSQL_OK;
     bool needCheck = s_.hasPeer || s_.hasProducer || s_.hasCid || s_.lane;
-    for (const auto& p : s_.preds) needCheck = needCheck || (p.field != P4_F_EPOCH && p.field != P4_F_W);
+    for (const auto& p : s_.preds) needCheck = needCheck || (p.field != FLATSQL_F_EPOCH && p.field != FLATSQL_F_W);
     const int oc = sp_->tc.firstObjectCol();
     const Spec2::Pred* kp = nullptr;  // narrows the objects walked
     for (const auto& p : s_.preds)
-        if (oc >= 0 && oc <= 3 && p.field == P4_F_COL0 + oc && !p.vals.empty() && (p.op == P4_OP_EQ || p.op == P4_OP_IN)) {
+        if (oc >= 0 && oc <= 3 && p.field == FLATSQL_F_COL0 + oc && !p.vals.empty() && (p.op == FLATSQL_OP_EQ || p.op == FLATSQL_OP_IN)) {
             bool ok = true;
             for (const auto& v : p.vals) ok = ok && (v.type == ps::rb1::kInt || v.type == ps::rb1::kText);
             if (ok) kp = &p;
@@ -1771,8 +1772,8 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
             want->pruned = true;
         }
     };
-    int32_t rc = P4_OK;
-    for (size_t fi = 0; fi < files_.size() && rc == P4_OK; fi++) {
+    int32_t rc = FLATSQL_OK;
+    for (size_t fi = 0; fi < files_.size() && rc == FLATSQL_OK; fi++) {
         const uint32_t fid = files_[fi].fid;
         // r_ke holds the merged rows; the file's staged rows come from its view.
         const std::shared_ptr<const Staged> pin = staged(files_[fi]);
@@ -1816,9 +1817,9 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                 sqlite3_reset(row);
             }
             if(complete && (tailCommit!=ck->offset || !ck->current)) {
-                std::vector<uint64_t> tailRows; int32_t streamStatus=P4_OK;
+                std::vector<uint64_t> tailRows; int32_t streamStatus=FLATSQL_OK;
                 auto stream=streamCur(files_[fi].f,&streamStatus);
-                if(!stream || checkpointTailRows(files_[fi].f,stream.get(),*ck,tailCommit,&tailRows)!=P4_OK) complete=false;
+                if(!stream || checkpointTailRows(files_[fi].f,stream.get(),*ck,tailCommit,&tailRows)!=FLATSQL_OK) complete=false;
                 for(uint64_t rid:tailRows) {
                     if(!complete) break;
                     sqlite3_bind_int64(row,1,sqlite3_int64(rid));
@@ -1864,7 +1865,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
             e_->rpool.release(c);
             *handled = false;
             best->clear();
-            return P4_OK;
+            return FLATSQL_OK;
         }
         // A candidate passes the scan's filters: its rows read (only with a
         // filter beyond the epoch range).
@@ -1876,7 +1877,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
             std::vector<Cand> one{cd};
             std::vector<std::pair<int64_t, Row>> got;
             const int32_t r = resolve(one, &got);
-            if (r != P4_OK) return r;
+            if (r != FLATSQL_OK) return r;
             return got.empty() ? 0 : 1;
         };
         c->exec("BEGIN");
@@ -1916,10 +1917,10 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                     std::memcpy(out->key, g.key, 32);
                     out->fid = fid;
                     have = true;
-                    return P4_OK;
+                    return FLATSQL_OK;
                 }
                 group.clear();
-                return P4_OK;
+                return FLATSQL_OK;
             };
             size_t si = 0;
             bool sqlDone = false, pend = false;
@@ -1957,7 +1958,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                 }
                 if (!group.empty() && group[0].e != g.e) {
                     const int32_t s2 = settle();
-                    if (s2 != P4_OK) {
+                    if (s2 != FLATSQL_OK) {
                         sqlite3_reset(q);
                         return s2;
                     }
@@ -1968,7 +1969,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
             sqlite3_reset(q);
             if (!have && !group.empty()) {
                 const int32_t s2 = settle();
-                if (s2 != P4_OK) return s2;
+                if (s2 != FLATSQL_OK) return s2;
             }
             return have ? 1 : 0;
         };
@@ -1985,7 +1986,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                 if (r < 0) return r;
                 got |= r << 1;
             }
-            if (!got) return P4_OK;
+            if (!got) return FLATSQL_OK;
             const Pick& p = got == 1 ? b : got == 2 ? a : (better(b.e, b.key, a.e, a.key) ? b : a);
             take(ent, p);
             return check();
@@ -2018,8 +2019,8 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                 if (kr != SQLITE_ROW && kr != SQLITE_DONE) rc = statusOfSqlite(kr);
                 std::string tmp;
                 const std::string& ent = entOf(kv, &tmp);
-                if (rc == P4_OK && (kk || !sk.empty()) && !skip(ent)) rc = object(ent, kk, st ? &sk : nullptr);
-                if (rc != P4_OK) break;
+                if (rc == FLATSQL_OK && (kk || !sk.empty()) && !skip(ent)) rc = object(ent, kk, st ? &sk : nullptr);
+                if (rc != FLATSQL_OK) break;
             }
         } else {
             // okey's keys (one r_ke seek each for the merged rows) and the
@@ -2040,7 +2041,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
             };
             nextSql();
             uint64_t skipped = 0;
-            while (rc == P4_OK && (haveSql || oi < stObj.size())) {
+            while (rc == FLATSQL_OK && (haveSql || oi < stObj.size())) {
                 const int cmp = !haveSql ? 1 : oi >= stObj.size() ? -1 : kCmp(sqlK, stObj[oi].first);
                 const KVal& k = cmp <= 0 ? sqlK : stObj[oi].first;
                 std::string tmp;
@@ -2054,11 +2055,11 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                     if ((++skipped & 4095) == 0) rc = check();
                 }
                 if (cmp >= 0) oi++;
-                if (rc == P4_OK && cmp <= 0) nextSql();
+                if (rc == FLATSQL_OK && cmp <= 0) nextSql();
             }
             sqlite3_reset(keys);
             // Records without an object: each its own entity (its CID).
-            if (rc == P4_OK) {
+            if (rc == FLATSQL_OK) {
                 const int64_t a0 = profile == 4 ? std::max(at, wLo) : wLo;
                 const int64_t a1 = profile == 3 ? std::min(at, wHi) : wHi;
                 sqlite3_bind_int64(noK, 1, a0);
@@ -2066,7 +2067,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                 sqlite3_bind_int64(noK, 3, lo_);
                 sqlite3_bind_int64(noK, 4, hi_);
                 std::vector<Pick> ps;
-                while (rc == P4_OK && (r = sqlite3_step(noK)) == SQLITE_ROW) {
+                while (rc == FLATSQL_OK && (r = sqlite3_step(noK)) == SQLITE_ROW) {
                     L_->rowsExamined++;
                     if (sqlite3_column_bytes(noK, 1) != 32) continue;
                     Pick p;
@@ -2076,7 +2077,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                     p.fid = fid;
                     ps.push_back(p);
                 }
-                if (rc == P4_OK && r != SQLITE_DONE) rc = statusOfSqlite(r);
+                if (rc == FLATSQL_OK && r != SQLITE_DONE) rc = statusOfSqlite(r);
                 sqlite3_reset(noK);
                 if (stNoK)
                     for (const StRow* x : *stNoK) {
@@ -2090,7 +2091,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
                         ps.push_back(p);
                     }
                 for (const Pick& p : ps) {
-                    if (rc != P4_OK) break;
+                    if (rc != FLATSQL_OK) break;
                     char cid[60];
                     cidTextFromKey(p.key, cid);
                     const std::string ent(cid, kCidText);
@@ -2112,7 +2113,7 @@ int32_t Scan::epochPoints(int profile, int64_t at, std::map<std::string, Pick>* 
 int32_t decodePreds(const std::vector<Tlv>& v, std::vector<Spec2::Pred>* out) {
     for (const Tlv& t : v) {
         if (t.tag != 17) continue;
-        if (t.n < 4) return P4_E_ARG;
+        if (t.n < 4) return FLATSQL_E_ARG;
         Spec2::Pred p;
         p.field = t.v[0];
         p.op = t.v[1];
@@ -2121,17 +2122,17 @@ int32_t decodePreds(const std::vector<Tlv>& v, std::vector<Spec2::Pred>* out) {
         std::vector<uint8_t> buf(4);
         st32(buf.data(), n);
         buf.insert(buf.end(), t.v + 4, t.v + t.n);
-        if (!ps::rb1::decodeParams(buf.data(), buf.size(), &cells) || cells.size() != n) return P4_E_ARG;
-        const bool okField = (p.field >= P4_F_EPOCH && p.field <= P4_F_EPOCH_DAY) || (p.field >= P4_F_COL0 && p.field <= P4_F_COL3);
-        if (!okField || p.op < P4_OP_EQ || p.op > P4_OP_NOTNULL) return P4_E_ARG;
-        if ((p.op <= P4_OP_GE || p.op == P4_OP_LIKE) && n != 1) return P4_E_ARG;
-        if (p.op == P4_OP_BETWEEN && n != 2) return P4_E_ARG;
-        if (p.op == P4_OP_IN && n < 1) return P4_E_ARG;
-        if (p.op == P4_OP_NOTNULL && n != 0) return P4_E_ARG;
+        if (!ps::rb1::decodeParams(buf.data(), buf.size(), &cells) || cells.size() != n) return FLATSQL_E_ARG;
+        const bool okField = (p.field >= FLATSQL_F_EPOCH && p.field <= FLATSQL_F_EPOCH_DAY) || (p.field >= FLATSQL_F_COL0 && p.field <= FLATSQL_F_COL3);
+        if (!okField || p.op < FLATSQL_OP_EQ || p.op > FLATSQL_OP_NOTNULL) return FLATSQL_E_ARG;
+        if ((p.op <= FLATSQL_OP_GE || p.op == FLATSQL_OP_LIKE) && n != 1) return FLATSQL_E_ARG;
+        if (p.op == FLATSQL_OP_BETWEEN && n != 2) return FLATSQL_E_ARG;
+        if (p.op == FLATSQL_OP_IN && n < 1) return FLATSQL_E_ARG;
+        if (p.op == FLATSQL_OP_NOTNULL && n != 0) return FLATSQL_E_ARG;
         p.vals = std::move(cells);
         out->push_back(std::move(p));
     }
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // The first second of a "YYYY-MM-DD" day (false: not such a day).
@@ -2161,18 +2162,18 @@ bool dayStart(const ps::rb1::Cell& c, int64_t* sec) {
 // epoch when there is one.
 void predRange(Spec2* s) {
     for (auto& p : s->preds) {
-        if (p.field == P4_F_EPOCH_DAY) {
+        if (p.field == FLATSQL_F_EPOCH_DAY) {
             int64_t a = 0, b = 0;
             const bool okA = !p.vals.empty() && dayStart(p.vals[0], &a);
             const bool okB = p.vals.size() > 1 && dayStart(p.vals[1], &b);
             switch (p.op) {
-                case P4_OP_EQ: if (okA) { s->wLo = std::max(s->wLo, a); s->wHi = std::min(s->wHi, a + 86399); } break;
-                case P4_OP_GE: if (okA) s->wLo = std::max(s->wLo, a); break;
-                case P4_OP_GT: if (okA) s->wLo = std::max(s->wLo, a + 86400); break;
-                case P4_OP_LE: if (okA) s->wHi = std::min(s->wHi, a + 86399); break;
-                case P4_OP_LT: if (okA) s->wHi = std::min(s->wHi, a - 1); break;
-                case P4_OP_BETWEEN: if (okA && okB) { s->wLo = std::max(s->wLo, a); s->wHi = std::min(s->wHi, b + 86399); } break;
-                case P4_OP_IN: {
+                case FLATSQL_OP_EQ: if (okA) { s->wLo = std::max(s->wLo, a); s->wHi = std::min(s->wHi, a + 86399); } break;
+                case FLATSQL_OP_GE: if (okA) s->wLo = std::max(s->wLo, a); break;
+                case FLATSQL_OP_GT: if (okA) s->wLo = std::max(s->wLo, a + 86400); break;
+                case FLATSQL_OP_LE: if (okA) s->wHi = std::min(s->wHi, a + 86399); break;
+                case FLATSQL_OP_LT: if (okA) s->wHi = std::min(s->wHi, a - 1); break;
+                case FLATSQL_OP_BETWEEN: if (okA && okB) { s->wLo = std::max(s->wLo, a); s->wHi = std::min(s->wHi, b + 86399); } break;
+                case FLATSQL_OP_IN: {
                     int64_t lo = INT64_MAX, hi = INT64_MIN, d = 0;
                     bool all = true;
                     for (const auto& v : p.vals) {
@@ -2187,7 +2188,7 @@ void predRange(Spec2* s) {
             }
             continue;
         }
-        if (p.field != P4_F_EPOCH && p.field != P4_F_W) continue;
+        if (p.field != FLATSQL_F_EPOCH && p.field != FLATSQL_F_W) continue;
         auto iv = [&](size_t k, int64_t* out) {
             if (k >= p.vals.size()) return false;
             if (p.vals[k].type == ps::rb1::kInt) { *out = p.vals[k].i; return true; }
@@ -2196,12 +2197,12 @@ void predRange(Spec2* s) {
         };
         int64_t a, b;
         switch (p.op) {
-            case P4_OP_EQ: if (iv(0, &a)) { s->wLo = std::max(s->wLo, a); s->wHi = std::min(s->wHi, a); } break;
-            case P4_OP_GE: if (iv(0, &a)) s->wLo = std::max(s->wLo, a); break;
-            case P4_OP_GT: if (iv(0, &a) && p.vals[0].type == ps::rb1::kInt) s->wLo = std::max(s->wLo, a + 1); break;
-            case P4_OP_LE: if (iv(0, &a)) s->wHi = std::min(s->wHi, a); break;
-            case P4_OP_LT: if (iv(0, &a) && p.vals[0].type == ps::rb1::kInt) s->wHi = std::min(s->wHi, a - 1); break;
-            case P4_OP_BETWEEN: if (iv(0, &a) && iv(1, &b)) { s->wLo = std::max(s->wLo, a); s->wHi = std::min(s->wHi, b); } break;
+            case FLATSQL_OP_EQ: if (iv(0, &a)) { s->wLo = std::max(s->wLo, a); s->wHi = std::min(s->wHi, a); } break;
+            case FLATSQL_OP_GE: if (iv(0, &a)) s->wLo = std::max(s->wLo, a); break;
+            case FLATSQL_OP_GT: if (iv(0, &a) && p.vals[0].type == ps::rb1::kInt) s->wLo = std::max(s->wLo, a + 1); break;
+            case FLATSQL_OP_LE: if (iv(0, &a)) s->wHi = std::min(s->wHi, a); break;
+            case FLATSQL_OP_LT: if (iv(0, &a) && p.vals[0].type == ps::rb1::kInt) s->wHi = std::min(s->wHi, a - 1); break;
+            case FLATSQL_OP_BETWEEN: if (iv(0, &a) && iv(1, &b)) { s->wLo = std::max(s->wLo, a); s->wHi = std::min(s->wHi, b); } break;
             default: break;
         }
     }
@@ -2221,7 +2222,7 @@ int32_t decodeSpec(const std::vector<Tlv>& v, Spec2* s) {
     if (tlvI64(v, 7, &i64, &bad)) s->seqThrough = i64;
     const Tlv* cid = tlvFind(v, 8);
     if (cid) {
-        if (cid->n != kCidBin || !cidBinValid(cid->v)) return P4_E_ARG;
+        if (cid->n != kCidBin || !cidBinValid(cid->v)) return FLATSQL_E_ARG;
         cidKeyFromDigest(cid->v + 4, s->cidKey);
         s->hasCid = true;
     }
@@ -2239,14 +2240,14 @@ int32_t decodeSpec(const std::vector<Tlv>& v, Spec2* s) {
     // lane filter selects (format 1's "local" partition with lane source
     // "local").
     if (tlvU8(v, 20, &u8, &bad)) {
-        if (u8 != 0 && u8 != 2 && u8 != 3) return P4_E_ARG;
+        if (u8 != 0 && u8 != 2 && u8 != 3) return FLATSQL_E_ARG;
         s->part = u8;
     }
-    if (bad) return P4_E_ARG;
+    if (bad) return FLATSQL_E_ARG;
     const int32_t rc = decodePreds(v, &s->preds);
-    if (rc != P4_OK) return rc;
+    if (rc != FLATSQL_OK) return rc;
     predRange(s);
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 // ---- output -------------------------------------------------------------------------------------------
@@ -2259,7 +2260,7 @@ const std::vector<std::string>& recCols() {
 
 struct Out {
     P4Lane* L;
-    ps::rb1::Encoder enc;
+    query::Encoder enc;
     explicit Out(P4Lane* l) : L(l), enc(&l->out) {}
     // The header goes at once: a stream cut by a cap stays header, blocks, RB1E.
     void header(const std::vector<std::string>& cols) {
@@ -2269,13 +2270,13 @@ struct Out {
     // After a row: ship whole blocks; the result-rows cap.
     int32_t rowDone() {
         L->rowsOut++;
-        if (L->maxResultRows && L->rowsOut > L->maxResultRows) return L->trip = P4_E_BUDGET;
+        if (L->maxResultRows && L->rowsOut > L->maxResultRows) return L->trip = FLATSQL_E_BUDGET;
         if (enc.blockBytes() == 0 && !L->out.empty()) return flushOut(L);
         return L->trip;
     }
     void finish(int32_t status, const std::string& err0) {
         // An I/O-class failure names SQLite's last error on this thread.
-        const std::string err = status == P4_E_IO && tSqlLog[0] ? err0 + ": " + tSqlLog : err0;
+        const std::string err = status == FLATSQL_E_IO && tSqlLog[0] ? err0 + ": " + tSqlLog : err0;
         // Blocks still buffered when a cap or cancel tripped are dropped; the
         // RB1E always goes.
         if (L->trip) L->out.clear();
@@ -2288,7 +2289,7 @@ struct Out {
     }
 };
 
-void putText(ps::rb1::Encoder& enc, std::string_view s) { enc.text(s.data(), s.size()); }
+void putText(query::Encoder& enc, std::string_view s) { enc.text(s.data(), s.size()); }
 
 void writeRec(Out& o, const Row& r, const std::string* entityKey, bool tagsNull) {
     auto& enc = o.enc;
@@ -2325,7 +2326,7 @@ void writeRec(Out& o, const Row& r, const std::string* entityKey, bool tagsNull)
 
 int32_t typeOf(P4Lane* L, const std::string& name, Type** t) {
     *t = L->e->findType(name);
-    return *t ? P4_OK : P4_E_NOTYPE;
+    return *t ? FLATSQL_OK : FLATSQL_E_NOTYPE;
 }
 
 // A CID's rows in the feed files holding it (GET, TAGS; C-38 (1): each
@@ -2342,7 +2343,7 @@ struct Held {
 };
 int32_t heldRows(P4Lane* L, Type* t, const uint8_t key[32], bool hydrate, bool tags, bool firstOnly, Held* out) {
     *out = Held();
-    if (!t->hasFiles.load(std::memory_order_acquire)) return P4_OK;
+    if (!t->hasFiles.load(std::memory_order_acquire)) return FLATSQL_OK;
     const int64_t vis = t->vis.load(std::memory_order_acquire);
     struct F {
         Feed* f;
@@ -2372,11 +2373,11 @@ int32_t heldRows(P4Lane* L, Type* t, const uint8_t key[32], bool hydrate, bool t
         int64_t seq = 0;
         c->exec("BEGIN");
         std::shared_ptr<p4::Stream> stream;
-        int32_t st = hydrate ? snapStream(f, c, &stream) : P4_OK;
-        if (st == P4_OK) st = seqOfCid(c, fr.indexed, fr.st.get(), key, &seq);
-        if (st == P4_OK && seq && seq <= vis && !dictEnsure(f, c)) st = P4_E_IO;
-        sqlite3_stmt* q = st == P4_OK && seq && seq <= vis ? c->get(S_R_SEQ) : nullptr;
-        if (st == P4_OK && seq && seq <= vis && !q) st = P4_E_INTERNAL;
+        int32_t st = hydrate ? snapStream(f, c, &stream) : FLATSQL_OK;
+        if (st == FLATSQL_OK) st = seqOfCid(c, fr.indexed, fr.st.get(), key, &seq);
+        if (st == FLATSQL_OK && seq && seq <= vis && !dictEnsure(f, c)) st = FLATSQL_E_IO;
+        sqlite3_stmt* q = st == FLATSQL_OK && seq && seq <= vis ? c->get(S_R_SEQ) : nullptr;
+        if (st == FLATSQL_OK && seq && seq <= vis && !q) st = FLATSQL_E_INTERNAL;
         if (q) {
             sqlite3_bind_int64(q, 1, seq << 16);
             sqlite3_bind_int64(q, 2, (seq << 16) | 0xffff);
@@ -2402,10 +2403,10 @@ int32_t heldRows(P4Lane* L, Type* t, const uint8_t key[32], bool hydrate, bool t
                 if (hydrate) {
                     std::vector<RowV*> one{&v};
                     st = readFrames(stream.get(), one);
-                    if (st != P4_OK) break;
+                    if (st != FLATSQL_OK) break;
                 }
                 if (!rowDict(f, c, *dv, &v)) {
-                    st = P4_E_CORRUPT;
+                    st = FLATSQL_E_CORRUPT;
                     break;
                 }
                 L->rowsExamined++;
@@ -2413,8 +2414,8 @@ int32_t heldRows(P4Lane* L, Type* t, const uint8_t key[32], bool hydrate, bool t
                 rows.push_back(std::move(v));
             }
             sqlite3_reset(q);
-            if (st == P4_OK && r != SQLITE_DONE) st = statusOfSqlite(r);
-            if (st == P4_OK && tags)
+            if (st == FLATSQL_OK && r != SQLITE_DONE) st = statusOfSqlite(r);
+            if (st == FLATSQL_OK && tags)
                 for (RowV& v : rows) {
                     if (v.c) v.ckey = dv->ckey(c, v.c);
                     if (v.u) v.url = dv->url(c, v.u);
@@ -2422,15 +2423,15 @@ int32_t heldRows(P4Lane* L, Type* t, const uint8_t key[32], bool hydrate, bool t
         }
         c->exec("COMMIT");
         L->e->rpool.release(c);
-        if (st != P4_OK) return st;
+        if (st != FLATSQL_OK) return st;
         if (!rows.empty()) {
             out->files.push_back(Held::File{f, seq, std::move(rows), std::move(dv)});
-            if (firstOnly) return P4_OK;
+            if (firstOnly) return FLATSQL_OK;
         }
     }
     // A quarantined file may hold the CID: a miss is not certain.
-    if (quarantined && out->files.empty()) return P4_E_CORRUPT;
-    return P4_OK;
+    if (quarantined && out->files.empty()) return FLATSQL_E_CORRUPT;
+    return FLATSQL_OK;
 }
 
 // ---- ops ----------------------------------------------------------------------------------------------
@@ -2440,23 +2441,23 @@ int32_t opScanLike(P4Lane* L, const std::vector<Tlv>& v, uint32_t op) {
     Spec2 s;
     int32_t rc = decodeSpec(v, &s);
     Type* t = nullptr;
-    if (rc == P4_OK) rc = typeOf(L, s.type, &t);
-    if (rc == P4_OK) {
-        if (op == P4_OPC_SCAN) {
-            if (s.order == 0) s.order = P4_ORDER_SEQ_ASC;
-            if (s.order != P4_ORDER_SEQ_ASC && s.order != P4_ORDER_SEQ_DESC && s.order != P4_ORDER_NEWEST &&
-                s.order != P4_ORDER_RECENT && s.order != P4_ORDER_W_ASC)
-                rc = P4_E_ARG;
+    if (rc == FLATSQL_OK) rc = typeOf(L, s.type, &t);
+    if (rc == FLATSQL_OK) {
+        if (op == FLATSQL_OPC_SCAN) {
+            if (s.order == 0) s.order = FLATSQL_ORDER_SEQ_ASC;
+            if (s.order != FLATSQL_ORDER_SEQ_ASC && s.order != FLATSQL_ORDER_SEQ_DESC && s.order != FLATSQL_ORDER_NEWEST &&
+                s.order != FLATSQL_ORDER_RECENT && s.order != FLATSQL_ORDER_W_ASC)
+                rc = FLATSQL_E_ARG;
             // The two-part orders choose their files themselves (tag 20 is not theirs).
-            if (s.part != 0 && (s.order == P4_ORDER_NEWEST || s.order == P4_ORDER_RECENT || s.order == P4_ORDER_W_ASC))
-                rc = P4_E_ARG;
+            if (s.part != 0 && (s.order == FLATSQL_ORDER_NEWEST || s.order == FLATSQL_ORDER_RECENT || s.order == FLATSQL_ORDER_W_ASC))
+                rc = FLATSQL_E_ARG;
         } else {
-            if (s.order == 0) s.order = P4_ORDER_W_DESC;
-            if (s.order != P4_ORDER_W_DESC && s.order != P4_ORDER_CID) rc = P4_E_ARG;
+            if (s.order == 0) s.order = FLATSQL_ORDER_W_DESC;
+            if (s.order != FLATSQL_ORDER_W_DESC && s.order != FLATSQL_ORDER_CID) rc = FLATSQL_E_ARG;
         }
     }
-    if (rc != P4_OK) {
-        o.finish(rc, rc == P4_E_NOTYPE ? "type not registered" : "bad request");
+    if (rc != FLATSQL_OK) {
+        o.finish(rc, rc == FLATSQL_E_NOTYPE ? "type not registered" : "bad request");
         return rc;
     }
     // Format 1's two-part pages (C-39 E2, E3): the tagged records (the feed
@@ -2464,13 +2465,13 @@ int32_t opScanLike(P4Lane* L, const std::vector<Tlv>& v, uint32_t op) {
     // filter, the untagged records (the local file) from the start, as many
     // as the limit leaves (format 1 runs its untagged query without the
     // offset).
-    const bool twoPart = op == P4_OPC_SCAN && (s.order == P4_ORDER_NEWEST || s.order == P4_ORDER_RECENT || s.order == P4_ORDER_W_ASC);
+    const bool twoPart = op == FLATSQL_OPC_SCAN && (s.order == FLATSQL_ORDER_NEWEST || s.order == FLATSQL_ORDER_RECENT || s.order == FLATSQL_ORDER_W_ASC);
     uint64_t emitted = 0;
     auto run = [&](const Spec2& spec) -> int32_t {
         Scan sc(L, t, spec);
         int32_t st = sc.open();
         Row* r;
-        while (st == P4_OK) {
+        while (st == FLATSQL_OK) {
             const int32_t n = sc.next(&r);
             if (n <= 0) {
                 st = n;
@@ -2488,7 +2489,7 @@ int32_t opScanLike(P4Lane* L, const std::vector<Tlv>& v, uint32_t op) {
         Spec2 tagged = s;
         tagged.part = 1;
         rc = run(tagged);
-        if (rc == P4_OK && !s.lane && (!s.limit || emitted < s.limit)) {
+        if (rc == FLATSQL_OK && !s.lane && (!s.limit || emitted < s.limit)) {
             Spec2 untagged = s;
             untagged.part = 2;
             untagged.offset = 0;
@@ -2497,7 +2498,7 @@ int32_t opScanLike(P4Lane* L, const std::vector<Tlv>& v, uint32_t op) {
         }
     }
     L->e->bump(kStReads);
-    o.finish(rc, rc == P4_OK ? "" : "read failed");
+    o.finish(rc, rc == FLATSQL_OK ? "" : "read failed");
     return rc;
 }
 
@@ -2513,21 +2514,21 @@ int32_t opGet(P4Lane* L, const std::vector<Tlv>& v) {
     tlvU8(v, 41, &every, &bad);
     const Tlv* cids = tlvFind(v, 40);
     Type* t = nullptr;
-    int32_t rc = bad || !cids || cids->n < 4 || (cids->n - 4) != size_t(ld32(cids->v)) * kCidBin ? P4_E_ARG
+    int32_t rc = bad || !cids || cids->n < 4 || (cids->n - 4) != size_t(ld32(cids->v)) * kCidBin ? FLATSQL_E_ARG
                                                                                                   : typeOf(L, name, &t);
-    if (rc != P4_OK) {
+    if (rc != FLATSQL_OK) {
         o.finish(rc, "bad request");
         return rc;
     }
     const uint32_t n = ld32(cids->v);
-    for (uint32_t i = 0; i < n && rc == P4_OK; i++) {
+    for (uint32_t i = 0; i < n && rc == FLATSQL_OK; i++) {
         const uint8_t* c36 = cids->v + 4 + size_t(i) * kCidBin;
         if (!cidBinValid(c36)) continue;  // not a bafkrei CID: never stored, a miss
         uint8_t key[32];
         cidKeyFromDigest(c36 + 4, key);
         Held h;
         rc = heldRows(L, t, key, hydrate != 0, false, true, &h);
-        if (rc != P4_OK || h.files.empty()) continue;
+        if (rc != FLATSQL_OK || h.files.empty()) continue;
         // One row per copy (token), the lowest token first (C-12), from the
         // first feed file holding the CID (C-38 (4)).
         const Held::File& hf = h.files[0];
@@ -2567,11 +2568,11 @@ int32_t opGet(P4Lane* L, const std::vector<Tlv>& v) {
             for (int k = 0; k < 8; k++) o.enc.null();
             o.enc.endRow();
             rc = o.rowDone();
-            if (rc != P4_OK || !every) break;
+            if (rc != FLATSQL_OK || !every) break;
         }
     }
     e->bump(kStReads);
-    o.finish(rc, rc == P4_OK ? "" : "read failed");
+    o.finish(rc, rc == FLATSQL_OK ? "" : "read failed");
     return rc;
 }
 
@@ -2584,20 +2585,20 @@ int32_t opTags(P4Lane* L, const std::vector<Tlv>& v) {
     tlvText(v, 1, &name);
     const Tlv* cids = tlvFind(v, 40);
     Type* t = nullptr;
-    int32_t rc = !cids || cids->n < 4 || (cids->n - 4) != size_t(ld32(cids->v)) * kCidBin ? P4_E_ARG : typeOf(L, name, &t);
-    if (rc != P4_OK) {
+    int32_t rc = !cids || cids->n < 4 || (cids->n - 4) != size_t(ld32(cids->v)) * kCidBin ? FLATSQL_E_ARG : typeOf(L, name, &t);
+    if (rc != FLATSQL_OK) {
         o.finish(rc, "bad request");
         return rc;
     }
     const uint32_t n = ld32(cids->v);
-    for (uint32_t i = 0; i < n && rc == P4_OK; i++) {
+    for (uint32_t i = 0; i < n && rc == FLATSQL_OK; i++) {
         const uint8_t* c36 = cids->v + 4 + size_t(i) * kCidBin;
         if (!cidBinValid(c36)) continue;
         uint8_t key[32];
         cidKeyFromDigest(c36 + 4, key);
         Held h;
         rc = heldRows(L, t, key, false, true, false, &h);
-        if (rc != P4_OK) break;
+        if (rc != FLATSQL_OK) break;
         // One row per (cid, tag identity) over the feed files holding the
         // CID, merged over copies: at = the earliest; source_url = the
         // instance's (its rows carry the latest write's); producer = the copy
@@ -2658,11 +2659,11 @@ int32_t opTags(P4Lane* L, const std::vector<Tlv>& v) {
             o.enc.i64(m.at);
             o.enc.endRow();
             rc = o.rowDone();
-            if (rc != P4_OK) break;
+            if (rc != FLATSQL_OK) break;
         }
     }
     e->bump(kStReads);
-    o.finish(rc, rc == P4_OK ? "" : "read failed");
+    o.finish(rc, rc == FLATSQL_OK ? "" : "read failed");
     return rc;
 }
 
@@ -2675,9 +2676,9 @@ int32_t opHead(P4Lane* L, const std::vector<Tlv>& v) {
     uint64_t cap = 0;
     tlvU64(v, 19, &cap, &bad);
     Type* t = nullptr;
-    if (rc == P4_OK && bad) rc = P4_E_ARG;
-    if (rc == P4_OK) rc = typeOf(L, s.type, &t);
-    if (rc != P4_OK) {
+    if (rc == FLATSQL_OK && bad) rc = FLATSQL_E_ARG;
+    if (rc == FLATSQL_OK) rc = typeOf(L, s.type, &t);
+    if (rc != FLATSQL_OK) {
         o.finish(rc, "bad request");
         return rc;
     }
@@ -2716,15 +2717,15 @@ int32_t opHead(P4Lane* L, const std::vector<Tlv>& v) {
     }
     s.needTags = true;
     if (cap) {
-        if (s.order == 0) s.order = P4_ORDER_W_DESC;
-        if (s.order != P4_ORDER_W_DESC && s.order != P4_ORDER_CID) s.order = P4_ORDER_W_DESC;
+        if (s.order == 0) s.order = FLATSQL_ORDER_W_DESC;
+        if (s.order != FLATSQL_ORDER_W_DESC && s.order != FLATSQL_ORDER_CID) s.order = FLATSQL_ORDER_W_DESC;
     } else {
-        s.order = P4_ORDER_SEQ_ASC;
+        s.order = FLATSQL_ORDER_SEQ_ASC;
     }
     Scan sc(L, t, s);
     rc = sc.open();
     Row* r;
-    while (rc == P4_OK) {
+    while (rc == FLATSQL_OK) {
         const int32_t k = sc.next(&r);
         if (k <= 0) {
             rc = k;
@@ -2740,7 +2741,7 @@ int32_t opHead(P4Lane* L, const std::vector<Tlv>& v) {
         maxTs = std::max(maxTs, r->ts);
         for (int64_t a : r->ats) maxAt = std::max(maxAt, a);
     }
-    if (rc == P4_OK) {
+    if (rc == FLATSQL_OK) {
         o.enc.beginRow();
         o.enc.i64(n);
         o.enc.i64(bytes);
@@ -2753,7 +2754,7 @@ int32_t opHead(P4Lane* L, const std::vector<Tlv>& v) {
         rc = o.rowDone();
     }
     L->e->bump(kStReads);
-    o.finish(rc, rc == P4_OK ? "" : "read failed");
+    o.finish(rc, rc == FLATSQL_OK ? "" : "read failed");
     return rc;
 }
 
@@ -2772,8 +2773,8 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
     Spec2 s;
     int32_t rc = decodeSpec(v, &s);
     Type* t = nullptr;
-    if (rc == P4_OK) rc = typeOf(L, s.type, &t);
-    if (rc != P4_OK) {
+    if (rc == FLATSQL_OK) rc = typeOf(L, s.type, &t);
+    if (rc != FLATSQL_OK) {
         o.finish(rc, "bad request");
         return rc;
     }
@@ -2791,7 +2792,7 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
             uint8_t scratch[2048];
             bool have = false;
             if (r.hasData || r.sealed) {
-                if (sc.cols(r, &x, scratch, sizeof scratch) == P4_OK && x.cols[0].present && x.cols[0].isU64) {
+                if (sc.cols(r, &x, scratch, sizeof scratch) == FLATSQL_OK && x.cols[0].present && x.cols[0].isU64) {
                     o.enc.i64(int64_t(x.cols[0].u));
                     have = true;
                 }
@@ -2811,13 +2812,13 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
     uint64_t emitted = 0;
     if (sp->hasEpochRule) {
         Spec2 p1 = s;
-        p1.order = P4_ORDER_W_DESC;
+        p1.order = FLATSQL_ORDER_W_DESC;
         p1.eNotNull = true;
         p1.hydrate = !k0;
         Scan sc(L, t, p1);
         rc = sc.open();
         Row* r;
-        while (rc == P4_OK) {
+        while (rc == FLATSQL_OK) {
             const int32_t k = sc.next(&r);
             if (k <= 0) {
                 rc = k;
@@ -2826,7 +2827,7 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
             emitted++;
             rc = emit(sc, *r);
         }
-        if (rc == P4_OK && (!limit || emitted < limit)) {
+        if (rc == FLATSQL_OK && (!limit || emitted < limit)) {
             int64_t nnull = 0;
             {
                 std::lock_guard<std::mutex> g(t->mu);
@@ -2836,7 +2837,7 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
                 // the phase-1 total decides the phase-2 offset
                 uint64_t total = 0;
                 Spec2 cnt = s;
-                cnt.order = P4_ORDER_W_DESC;
+                cnt.order = FLATSQL_ORDER_W_DESC;
                 cnt.eNotNull = true;
                 cnt.offset = 0;
                 cnt.limit = 0;
@@ -2846,7 +2847,7 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
                     Scan cs(L, t, cnt);
                     rc = cs.open();
                     Row* rr;
-                    while (rc == P4_OK) {
+                    while (rc == FLATSQL_OK) {
                         const int32_t k = cs.next(&rr);
                         if (k < 0) rc = k;
                         if (k <= 0) break;
@@ -2854,14 +2855,14 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
                     }
                 }
                 Spec2 p2 = s;
-                p2.order = P4_ORDER_CID;
+                p2.order = FLATSQL_ORDER_CID;
                 p2.eNull = true;
                 p2.offset = offset > total ? offset - total : 0;
                 p2.limit = limit ? limit - emitted : 0;
                 p2.hydrate = !k0;
                 Scan sc2(L, t, p2);
-                if (rc == P4_OK) rc = sc2.open();
-                while (rc == P4_OK) {
+                if (rc == FLATSQL_OK) rc = sc2.open();
+                while (rc == FLATSQL_OK) {
                     const int32_t k = sc2.next(&r);
                     if (k <= 0) {
                         rc = k;
@@ -2872,12 +2873,12 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
             }
         }
     } else {
-        s.order = P4_ORDER_CID;
+        s.order = FLATSQL_ORDER_CID;
         s.hydrate = !k0;
         Scan sc(L, t, s);
         rc = sc.open();
         Row* r;
-        while (rc == P4_OK) {
+        while (rc == FLATSQL_OK) {
             const int32_t k = sc.next(&r);
             if (k <= 0) {
                 rc = k;
@@ -2887,7 +2888,7 @@ int32_t opIndexPage(P4Lane* L, const std::vector<Tlv>& v) {
         }
     }
     L->e->bump(kStReads);
-    o.finish(rc, rc == P4_OK ? "" : "read failed");
+    o.finish(rc, rc == FLATSQL_OK ? "" : "read failed");
     return rc;
 }
 
@@ -2903,20 +2904,20 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
     tlvI64(v, 31, &at, &bad);
     tlvI64(v, 32, &maxDelta, &bad);
     tlvU8(v, 33, &countOnly, &bad);
-    if (rc == P4_OK && (bad || profile < 1 || profile > 5)) rc = P4_E_ARG;
+    if (rc == FLATSQL_OK && (bad || profile < 1 || profile > 5)) rc = FLATSQL_E_ARG;
     Type* t = nullptr;
-    if (rc == P4_OK) rc = typeOf(L, s.type, &t);
+    if (rc == FLATSQL_OK) rc = typeOf(L, s.type, &t);
     if (countOnly) o.header({"n"});
     else if (profile == 5) o.header({"day", "n", "min_epoch", "max_epoch"});
     else o.header(recCols());
-    if (rc != P4_OK) {
+    if (rc != FLATSQL_OK) {
         o.finish(rc, "bad request");
         return rc;
     }
     s.eNotNull = true;
     if (profile == 1 || profile == 5) {
         Spec2 w = s;
-        w.order = P4_ORDER_W_DESC;
+        w.order = FLATSQL_ORDER_W_DESC;
         // A window is epoch ascending; a count or coverage takes any order
         // (the index's own: one range read a page).
         w.wAsc = !countOnly && profile == 1;
@@ -2931,7 +2932,7 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
         Scan sc(L, t, w);
         rc = sc.open();
         Row* r;
-        while (rc == P4_OK) {
+        while (rc == FLATSQL_OK) {
             const int32_t k = sc.next(&r);
             if (k <= 0) {
                 rc = k;
@@ -2954,13 +2955,13 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
                 rc = o.rowDone();
             }
         }
-        if (rc == P4_OK && countOnly) {
+        if (rc == FLATSQL_OK && countOnly) {
             o.enc.beginRow();
             o.enc.i64(count);
             o.enc.endRow();
             rc = o.rowDone();
         }
-        if (rc == P4_OK && profile == 5 && !countOnly) {
+        if (rc == FLATSQL_OK && profile == 5 && !countOnly) {
             for (auto& kv : days) {
                 o.enc.beginRow();
                 putText(o.enc, kv.first);
@@ -2969,11 +2970,11 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
                 o.enc.i64(kv.second[2]);
                 o.enc.endRow();
                 rc = o.rowDone();
-                if (rc != P4_OK) break;
+                if (rc != FLATSQL_OK) break;
             }
         }
         L->e->bump(kStReads);
-        o.finish(rc, rc == P4_OK ? "" : "read failed");
+        o.finish(rc, rc == FLATSQL_OK ? "" : "read failed");
         return rc;
     }
     // Point profiles: one record per entity, ranked exactly as format 1.
@@ -2991,7 +2992,7 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
         return std::memcmp(ak, bk, 32) < 0;
     };
     Spec2 w = s;
-    w.order = P4_ORDER_W_DESC;
+    w.order = FLATSQL_ORDER_W_DESC;
     w.limit = 0;
     w.offset = 0;
     w.hydrate = false;
@@ -3007,9 +3008,9 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
         Scan sc(L, t, w);
         int32_t st = sc.open();
         *handled = false;
-        if (st == P4_OK) st = sc.epochPoints(profile, at, &best, handled, need);
+        if (st == FLATSQL_OK) st = sc.epochPoints(profile, at, &best, handled, need);
         Row* r;
-        while (st == P4_OK && !*handled) {
+        while (st == FLATSQL_OK && !*handled) {
             const int32_t k = sc.next(&r);
             if (k <= 0) {
                 st = k;
@@ -3046,7 +3047,7 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
     bool handled = false;
     rc = points(need.countOnly || need.n ? &need : nullptr, &handled);
     const bool pruned = handled && need.n && need.pruned;
-    if (rc == P4_OK) {
+    if (rc == FLATSQL_OK) {
         std::vector<std::pair<std::string, Scan::Pick>> picks;
         // The picks within maxDelta, in entity order (cut: a pruned page's
         // n-th entity, past which `best` holds nothing complete).
@@ -3068,7 +3069,7 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
             // The records with their matched tags, written in the picks' order
             // (entity text ascending).
             Spec2 out = s;
-            out.order = P4_ORDER_SEQ_ASC;
+            out.order = FLATSQL_ORDER_SEQ_ASC;
             out.limit = 0;
             out.offset = 0;
             out.needTags = true;
@@ -3079,7 +3080,7 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
             // since it was picked (a delete in between); nothing is written.
             auto emit = [&](Scan& os, bool whole) -> bool {
                 size_t pos = size_t(std::min<uint64_t>(s.offset, picks.size()));
-                while (rc == P4_OK && pos < picks.size() && !(s.limit && emitted >= s.limit)) {
+                while (rc == FLATSQL_OK && pos < picks.size() && !(s.limit && emitted >= s.limit)) {
                     const size_t end = std::min(picks.size(), pos + size_t(s.limit ? std::min(kChunk, s.limit - emitted) : kChunk));
                     std::vector<std::pair<uint32_t, int64_t>> chunk;
                     for (size_t i = pos; i < end; i++) chunk.push_back({picks[i].second.fid, picks[i].second.seq});
@@ -3087,10 +3088,10 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
                     rc = os.answerPicks(chunk, &got);
                     std::map<std::pair<uint32_t, int64_t>, Row*> bySeq;
                     for (auto& g : got) bySeq[{g.second.fid, g.first}] = &g.second;
-                    if (rc == P4_OK && whole)
+                    if (rc == FLATSQL_OK && whole)
                         for (const auto& c : chunk)
                             if (!bySeq.count(c)) return false;
-                    for (size_t i = pos; rc == P4_OK && i < end; i++) {
+                    for (size_t i = pos; rc == FLATSQL_OK && i < end; i++) {
                         auto it = bySeq.find({picks[i].second.fid, picks[i].second.seq});
                         if (it == bySeq.end()) continue;  // gone since the pick, or filtered out
                         writeRec(o, *it->second, &picks[i].first, false);
@@ -3105,7 +3106,7 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
             {
                 Scan os(L, t, out);
                 rc = os.open();
-                done = rc != P4_OK || emit(os, pruned);
+                done = rc != FLATSQL_OK || emit(os, pruned);
             }
             if (!done) {
                 // The page as an unpruned one: every entity picked again (a new
@@ -3113,13 +3114,13 @@ int32_t opEpoch(P4Lane* L, const std::vector<Tlv>& v) {
                 rc = points(nullptr, &handled);
                 pickList(nullptr);
                 Scan os(L, t, out);
-                if (rc == P4_OK) rc = os.open();
-                if (rc == P4_OK) emit(os, false);
+                if (rc == FLATSQL_OK) rc = os.open();
+                if (rc == FLATSQL_OK) emit(os, false);
             }
         }
     }
     L->e->bump(kStReads);
-    o.finish(rc, rc == P4_OK ? "" : "read failed");
+    o.finish(rc, rc == FLATSQL_OK ? "" : "read failed");
     return rc;
 }
 
@@ -3142,8 +3143,8 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
         {"type", "state", "through"}};
     if (bad || kind < 1 || kind > 5) {
         o.header({});
-        o.finish(P4_E_ARG, "SUMMARY kind (tag 45) is 1-5");
-        return P4_E_ARG;
+        o.finish(FLATSQL_E_ARG, "SUMMARY kind (tag 45) is 1-5");
+        return FLATSQL_E_ARG;
     }
     o.header(cols[kind]);
     std::vector<Type*> types;
@@ -3153,12 +3154,12 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
             if (only.empty() || t->name == only) types.push_back(t.get());
     }
     if (!only.empty() && types.empty()) {
-        o.finish(P4_E_NOTYPE, "type not registered");
-        return P4_E_NOTYPE;
+        o.finish(FLATSQL_E_NOTYPE, "type not registered");
+        return FLATSQL_E_NOTYPE;
     }
-    int32_t rc = P4_OK;
+    int32_t rc = FLATSQL_OK;
     for (Type* t : types) {
-        if (rc != P4_OK) break;
+        if (rc != FLATSQL_OK) break;
         auto nullOr = [&](int64_t x, int64_t none) {
             if (x == none) o.enc.null(); else o.enc.i64(x);
         };
@@ -3221,7 +3222,7 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
                 o.enc.i64(files);
                 o.enc.endRow();
                 rc = o.rowDone();
-                if (rc != P4_OK) break;
+                if (rc != FLATSQL_OK) break;
             }
         } else if (kind == 3) {
             // One row per (feed, instance): the feed's provider and source, the
@@ -3260,7 +3261,7 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
                 nullOr(c.maxw, INT64_MIN);
                 o.enc.endRow();
                 rc = o.rowDone();
-                if (rc != P4_OK) break;
+                if (rc != FLATSQL_OK) break;
             }
         } else if (kind == 4) {
             // Maintained sizes, no file scans: each file's pages and free
@@ -3335,7 +3336,7 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
         }
     }
     e->bump(kStReads);
-    o.finish(rc, rc == P4_OK ? "" : "summary failed");
+    o.finish(rc, rc == FLATSQL_OK ? "" : "summary failed");
     return rc;
 }
 
@@ -3345,30 +3346,30 @@ int32_t opIpfs(P4Lane* L,const std::vector<Tlv>& v,uint32_t op) {
     Out o(L); std::string type,provider,source,err; bool bad=false; uint64_t from=0; uint8_t on=0; uint32_t generation=UINT32_MAX;
     tlvText(v,1,&type); const bool p=tlvText(v,3,&provider),s=tlvText(v,4,&source);
     tlvU64(v,80,&from,&bad); tlvU8(v,81,&on,&bad); tlvU32(v,82,&generation,&bad);
-    if(op==P4_OPC_RANGES) o.header({"path","offset","length","cid","kind","unit","block","provider","source","generation"});
-    else if(op==P4_OPC_FEED_ROOT) o.header({"provider","source","cid","unit","generation","blocked_generations"});
-    else if(op==P4_OPC_DROPS) o.header({"cid","unit","provider","source","generation"});
+    if(op==FLATSQL_OPC_RANGES) o.header({"path","offset","length","cid","kind","unit","block","provider","source","generation"});
+    else if(op==FLATSQL_OPC_FEED_ROOT) o.header({"provider","source","cid","unit","generation","blocked_generations"});
+    else if(op==FLATSQL_OPC_DROPS) o.header({"cid","unit","provider","source","generation"});
     else o.header({});
-    int32_t rc=P4_OK; Type* t=L->e->findType(type); std::vector<Feed*> feeds;
-    if(bad || p!=s || on>1 || ((op==P4_OPC_EXPOSURE || op==P4_OPC_RELEASE) && !p)) rc=P4_E_ARG;
-    else if(!t) rc=P4_E_NOTYPE;
+    int32_t rc=FLATSQL_OK; Type* t=L->e->findType(type); std::vector<Feed*> feeds;
+    if(bad || p!=s || on>1 || ((op==FLATSQL_OPC_EXPOSURE || op==FLATSQL_OPC_RELEASE) && !p)) rc=FLATSQL_E_ARG;
+    else if(!t) rc=FLATSQL_E_NOTYPE;
     else { std::lock_guard<std::mutex> lock(t->mu); for(auto& f:t->feeds) if(f->created && (!p || (f->provider==provider && f->source==source))) feeds.push_back(f.get()); }
     for(Feed* f:feeds) {
-        if(rc!=P4_OK) break;
-        if(op==P4_OPC_EXPOSURE) { rc=feedExposure(f,on!=0); continue; }
-        if(op==P4_OPC_RELEASE) { uint32_t gen=generation; if(gen==UINT32_MAX) { std::lock_guard<std::mutex> lock(f->smu); gen=f->gen; } rc=feedRelease(f,gen,from); continue; }
-        if(op==P4_OPC_DROPS) {
-            std::vector<DagDrop> drops; rc=feedDagDrops(f,from,&drops,&err); if(rc!=P4_OK) break;
-            for(const auto& d:drops) { o.enc.beginRow(); o.enc.blob(d.cid.data(),d.cid.size()); o.enc.i64(d.unit); putText(o.enc,f->provider); putText(o.enc,f->source); o.enc.i64(d.generation); o.enc.endRow(); rc=o.rowDone(); if(rc!=P4_OK) break; }
+        if(rc!=FLATSQL_OK) break;
+        if(op==FLATSQL_OPC_EXPOSURE) { rc=feedExposure(f,on!=0); continue; }
+        if(op==FLATSQL_OPC_RELEASE) { uint32_t gen=generation; if(gen==UINT32_MAX) { std::lock_guard<std::mutex> lock(f->smu); gen=f->gen; } rc=feedRelease(f,gen,from); continue; }
+        if(op==FLATSQL_OPC_DROPS) {
+            std::vector<DagDrop> drops; rc=feedDagDrops(f,from,&drops,&err); if(rc!=FLATSQL_OK) break;
+            for(const auto& d:drops) { o.enc.beginRow(); o.enc.blob(d.cid.data(),d.cid.size()); o.enc.i64(d.unit); putText(o.enc,f->provider); putText(o.enc,f->source); o.enc.i64(d.generation); o.enc.endRow(); rc=o.rowDone(); if(rc!=FLATSQL_OK) break; }
             continue;
         }
         // FEED_ROOT needs only the root; RANGES walks only what changed since `from`.
-        DagSnapshot snapshot; rc=feedDagSnapshot(f,&snapshot,&err,from,op!=P4_OPC_FEED_ROOT); if(rc!=P4_OK) break;
-        if(op==P4_OPC_FEED_ROOT) {
+        DagSnapshot snapshot; rc=feedDagSnapshot(f,&snapshot,&err,from,op!=FLATSQL_OPC_FEED_ROOT); if(rc!=FLATSQL_OK) break;
+        if(op==FLATSQL_OPC_FEED_ROOT) {
             o.enc.beginRow(); putText(o.enc,f->provider); putText(o.enc,f->source); o.enc.blob(snapshot.root.data(),snapshot.root.size()); o.enc.i64(snapshot.through); o.enc.i64(snapshot.generation); o.enc.i64(feedBlockedGenerations(f)); o.enc.endRow(); rc=o.rowDone();
         } else for(const auto& b:snapshot.blocks) {
             if(b.unit<from) continue;
-            o.enc.beginRow(); putText(o.enc,b.path); o.enc.i64(b.offset); o.enc.i64(b.length); o.enc.blob(b.cid.data(),b.cid.size()); o.enc.i64(b.kind); o.enc.i64(b.unit); o.enc.blob(b.bytes.data(),b.bytes.size()); putText(o.enc,f->provider); putText(o.enc,f->source); o.enc.i64(snapshot.generation); o.enc.endRow(); rc=o.rowDone(); if(rc!=P4_OK) break;
+            o.enc.beginRow(); putText(o.enc,b.path); o.enc.i64(b.offset); o.enc.i64(b.length); o.enc.blob(b.cid.data(),b.cid.size()); o.enc.i64(b.kind); o.enc.i64(b.unit); o.enc.blob(b.bytes.data(),b.bytes.size()); putText(o.enc,f->provider); putText(o.enc,f->source); o.enc.i64(snapshot.generation); o.enc.endRow(); rc=o.rowDone(); if(rc!=FLATSQL_OK) break;
         }
     }
     L->e->bump(kStReads); o.finish(rc,err); return rc;
@@ -3379,24 +3380,24 @@ int32_t opIpfs(P4Lane* L,const std::vector<Tlv>& v,uint32_t op) {
 int32_t runRead(P4Lane* L, uint32_t op) {
     std::vector<Tlv> v;
     if (!tlvParse(L->req, L->reqLen, &v)) {
-        respondEmpty(L, {}, P4_E_ARG, "malformed request");
-        return P4_E_ARG;
+        respondEmpty(L, {}, FLATSQL_E_ARG, "malformed request");
+        return FLATSQL_E_ARG;
     }
     tSqlLog[0] = 0;
     switch (op) {
-        case P4_OPC_GET: return opGet(L, v);
-        case P4_OPC_TAGS: return opTags(L, v);
-        case P4_OPC_SCAN:
-        case P4_OPC_WINDOW: return opScanLike(L, v, op);
-        case P4_OPC_HEAD: return opHead(L, v);
-        case P4_OPC_INDEX_PAGE: return opIndexPage(L, v);
-        case P4_OPC_EPOCH: return opEpoch(L, v);
-        case P4_OPC_SUMMARY: return opSummary(L, v);
-        case P4_OPC_RANGES: case P4_OPC_FEED_ROOT: case P4_OPC_DROPS:
-        case P4_OPC_EXPOSURE: case P4_OPC_RELEASE: return opIpfs(L,v,op);
+        case FLATSQL_OPC_GET: return opGet(L, v);
+        case FLATSQL_OPC_TAGS: return opTags(L, v);
+        case FLATSQL_OPC_SCAN:
+        case FLATSQL_OPC_WINDOW: return opScanLike(L, v, op);
+        case FLATSQL_OPC_HEAD: return opHead(L, v);
+        case FLATSQL_OPC_INDEX_PAGE: return opIndexPage(L, v);
+        case FLATSQL_OPC_EPOCH: return opEpoch(L, v);
+        case FLATSQL_OPC_SUMMARY: return opSummary(L, v);
+        case FLATSQL_OPC_RANGES: case FLATSQL_OPC_FEED_ROOT: case FLATSQL_OPC_DROPS:
+        case FLATSQL_OPC_EXPOSURE: case FLATSQL_OPC_RELEASE: return opIpfs(L,v,op);
         default:
-            respondEmpty(L, {}, P4_E_ARG, "unknown op");
-            return P4_E_ARG;
+            respondEmpty(L, {}, FLATSQL_E_ARG, "unknown op");
+            return FLATSQL_E_ARG;
     }
 }
 
@@ -3418,9 +3419,9 @@ struct P4Cursor {
 // The sources of the type's feeds (live: with records), sorted and distinct,
 // in the lane's buffers (valid until the lane's next call).
 static int32_t laneSources(P4Lane* lane, const char* type, bool live, const char* const** out, uint32_t* n) {
-    if (!lane || !type || !out || !n) return P4_E_ARG;
+    if (!lane || !type || !out || !n) return FLATSQL_E_ARG;
     Type* t = lane->e->findType(type);
-    if (!t) return P4_E_NOTYPE;
+    if (!t) return FLATSQL_E_NOTYPE;
     std::set<std::string> names;
     {
         std::lock_guard<std::mutex> g(t->mu);
@@ -3434,16 +3435,16 @@ static int32_t laneSources(P4Lane* lane, const char* type, bool live, const char
     for (auto& s : lane->srcStore) lane->srcPtrs.push_back(s.c_str());
     *out = lane->srcPtrs.data();
     *n = uint32_t(lane->srcPtrs.size());
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 extern "C" {
 
 int32_t p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out) {
     *out = nullptr;
-    if (!lane || !spec || !spec->type) return P4_E_ARG;
+    if (!lane || !spec || !spec->type) return FLATSQL_E_ARG;
     Type* t = lane->e->findType(spec->type);
-    if (!t) return P4_E_NOTYPE;
+    if (!t) return FLATSQL_E_NOTYPE;
     Spec2 s;
     s.type = spec->type;
     const char* lf[6] = {spec->lane.provider, spec->lane.source, spec->lane.batch, spec->lane.contentKeyId,
@@ -3455,7 +3456,7 @@ int32_t p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out) {
             s.lane = true;
         }
     if (spec->cid) {
-        if (!cidBinValid(spec->cid)) return P4_E_ARG;
+        if (!cidBinValid(spec->cid)) return FLATSQL_E_ARG;
         cidKeyFromDigest(spec->cid + 4, s.cidKey);
         s.hasCid = true;
     }
@@ -3486,35 +3487,35 @@ int32_t p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out) {
         s.preds.push_back(std::move(q));
     }
     if (spec->search) s.search = spec->search;
-    s.order = spec->order ? spec->order : P4_ORDER_SEQ_ASC;
-    if (s.order < P4_ORDER_SEQ_ASC || s.order > P4_ORDER_CID) return P4_E_ARG;
+    s.order = spec->order ? spec->order : FLATSQL_ORDER_SEQ_ASC;
+    if (s.order < FLATSQL_ORDER_SEQ_ASC || s.order > FLATSQL_ORDER_CID) return FLATSQL_E_ARG;
     s.hydrate = spec->hydrate != 0;
     s.needTags = spec->noTags == 0;
-    if (spec->part != 0 && spec->part != 2 && spec->part != 3) return P4_E_ARG;
+    if (spec->part != 0 && spec->part != 2 && spec->part != 3) return FLATSQL_E_ARG;
     s.part = spec->part;
     s.limit = spec->limit;
     s.offset = spec->offset;
     s.bound = spec->bound;
     predRange(&s);
     auto* c = new (std::nothrow) P4Cursor();
-    if (!c) return P4_E_NOMEM;
+    if (!c) return FLATSQL_E_NOMEM;
     c->lane = lane;
     c->scan.reset(new (std::nothrow) flatsql::p4::Scan(lane, t, std::move(s)));
     if (!c->scan) {
         delete c;
-        return P4_E_NOMEM;
+        return FLATSQL_E_NOMEM;
     }
     const int32_t rc = c->scan->open();
-    if (rc != P4_OK) {
+    if (rc != FLATSQL_OK) {
         delete c;
         return rc;
     }
     *out = c;
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 int32_t p4_cursor_next(P4Cursor* c, P4Row* row) {
-    if (!c || !row) return P4_E_ARG;
+    if (!c || !row) return FLATSQL_E_ARG;
     Row* r = nullptr;
     const int32_t k = c->scan->next(&r);
     if (k <= 0) return k;
@@ -3557,17 +3558,18 @@ int32_t p4_cursor_next(P4Cursor* c, P4Row* row) {
 void p4_cursor_close(P4Cursor* c) { delete c; }
 
 int32_t p4_lane_check(P4Lane* lane) {
-    if (!lane) return P4_E_ARG;
+    if (!lane) return FLATSQL_E_ARG;
     if (lane->trip) return lane->trip;
-    if (lane->h && lane->h->cancel.load(std::memory_order_acquire)) return lane->trip = P4_E_CANCELLED;
-    if (lane->e->stopWord->load(std::memory_order_acquire)) return lane->trip = P4_E_STOPPED;
-    if (lane->maxRows && lane->rowsExamined > lane->maxRows) return lane->trip = P4_E_BUDGET;
-    if (lane->maxBytes && lane->bytesRead > lane->maxBytes) return lane->trip = P4_E_BUDGET;
-    return P4_OK;
+    if (lane->h && lane->h->cancel.load(std::memory_order_acquire)) return lane->trip = FLATSQL_E_CANCELLED;
+    if (lane->e->stopWord->load(std::memory_order_acquire)) return lane->trip = FLATSQL_E_STOPPED;
+    if (lane->deadlineNs && monoNs() >= lane->deadlineNs) return lane->trip = FLATSQL_E_BUDGET;
+    if (lane->maxRows && lane->rowsExamined > lane->maxRows) return lane->trip = FLATSQL_E_BUDGET;
+    if (lane->maxBytes && lane->bytesRead > lane->maxBytes) return lane->trip = FLATSQL_E_BUDGET;
+    return FLATSQL_OK;
 }
 
 int32_t p4_emit(P4Lane* lane, const uint8_t* bytes, uint32_t n) {
-    if (!lane) return P4_E_ARG;
+    if (!lane) return FLATSQL_E_ARG;
     return emitBytes(lane, bytes, n);
 }
 
@@ -3578,7 +3580,7 @@ void p4_lane_set_sql_state(P4Lane* lane, void* state) {
 }
 
 int32_t p4_types(P4Lane* lane, const P4TypeInfo** out, uint32_t* n) {
-    if (!lane || !out || !n) return P4_E_ARG;
+    if (!lane || !out || !n) return FLATSQL_E_ARG;
     lane->specRefs.clear();
     lane->typeNames.clear();
     lane->typeInfos.clear();
@@ -3605,7 +3607,7 @@ int32_t p4_types(P4Lane* lane, const P4TypeInfo** out, uint32_t* n) {
     }
     *out = lane->typeInfos.data();
     *n = uint32_t(lane->typeInfos.size());
-    return P4_OK;
+    return FLATSQL_OK;
 }
 
 

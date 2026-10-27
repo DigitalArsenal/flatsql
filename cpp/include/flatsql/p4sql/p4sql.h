@@ -26,13 +26,13 @@ extern "C" {
 
 typedef struct P4SqlRequest {
     const char* sql; uint32_t sqlLen;
-    const uint8_t* params; uint32_t paramsLen;   /* RB1 params: u32 n, then n cells */
-    uint32_t flags;                              /* P4_SLOT_RAW | P4_SLOT_SANDBOX */
+    const uint8_t* params; uint32_t paramsLen;   /* verified QRP request payload, with typed PARAMETERS */
+    uint32_t flags;                              /* FLATSQL_SLOT_RAW | FLATSQL_SLOT_SANDBOX */
     uint64_t maxResultRows, maxResultBytes;      /* 0 = none */
 } P4SqlRequest;
-int32_t p4sql_global_init(void);                      /* in flatsql_p4_init, before sqlite3_initialize: installs the per-lane allocators */
+int32_t p4sql_global_init(void);                      /* in flatsql_init, before sqlite3_initialize: installs the per-lane allocators */
 int32_t p4sql_lane_init(P4Lane* lane);                /* on the lane thread at lane start: SQL connection + vtab modules */
-int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req);   /* op 30: emits the RB1 header and whole blocks (the ENGINE appends RB1E, C-28) or raw frames; returns the status */
+int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req);   /* op 30: emits the SDS QRP pages (the engine appends the final summary) or raw frames; returns the status */
 int32_t p4sql_surface(P4Lane* lane);                  /* op 31: emits the SURFACE rows */
 void    p4sql_lane_free(P4Lane* lane);
 uint64_t p4sql_heap_used(void);                      /* v9, C-30: bytes live in the SQLITE_CONFIG_MALLOC allocator (stat 29) */

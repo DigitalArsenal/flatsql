@@ -80,9 +80,9 @@
 #include "dag.h"
 #endif
 #include "checkpoint.h"
-#define P4_REPLAY_FORMAT5 1
+#define FLATSQL_REPLAY_FORMAT5 1
 #else
-#define P4_REPLAY_FORMAT5 0
+#define FLATSQL_REPLAY_FORMAT5 0
 #endif
 
 namespace flatsql {
@@ -92,7 +92,7 @@ P4Engine* currentEngine();
 }  // namespace p4
 }  // namespace flatsql
 
-#if defined(P4_REPLAY_NATIVE_IO)
+#if defined(FLATSQL_REPLAY_NATIVE_IO)
 uint64_t p4ReplayIoSyncs();
 #endif
 
@@ -179,12 +179,12 @@ struct Hash {
 // Native counts every real host sync, including SQLite WAL calls. Historical
 // binaries and WASM retain their existing engine counters for comparison.
 uint64_t syncs() {
-#if defined(P4_REPLAY_NATIVE_IO)
+#if defined(FLATSQL_REPLAY_NATIVE_IO)
     return p4ReplayIoSyncs();
 #else
     const std::vector<uint64_t> v = stats();
     return v.size() > size_t(flatsql::p4::kStJournalSyncs)
-               ? v[flatsql::p4::kStJournalSyncs] + (P4_REPLAY_FORMAT5 ? 0 : v[flatsql::p4::kStGroupCommits])
+               ? v[flatsql::p4::kStJournalSyncs] + (FLATSQL_REPLAY_FORMAT5 ? 0 : v[flatsql::p4::kStGroupCommits])
                : 0;
 #endif
 }
@@ -320,7 +320,7 @@ bool ingest(const std::vector<Batch>& batches, Hash* h, int64_t* ops) {
         const uint64_t before = callSyncs.enabled ? syncs() : 0;
         Result r = put(b);
         if (!callSyncs.observe(before)) return false;
-        if (r.status != P4_OK || r.rows.size() != b.recs.size()) {
+        if (r.status != FLATSQL_OK || r.rows.size() != b.recs.size()) {
             std::fprintf(stderr, "  ingest: PUT %d %s\n", r.status, r.err.c_str());
             return false;
         }
@@ -349,21 +349,21 @@ int32_t openNode(const std::string& root, uint8_t mode, uint64_t gseqFloor = 0) 
     w.text(1, root).u8(2, mode).u32(13, std::max(1u, std::thread::hardware_concurrency()));
     w.u32(21, 64).u32(23, 1024);
     if (gseqFloor) w.u64(12, gseqFloor);
-    int32_t rc = flatsql_p4_init(w.b.data(), int32_t(w.b.size()));
-    if (rc != P4_OK) {
+    int32_t rc = flatsql_init(w.b.data(), int32_t(w.b.size()));
+    if (rc != FLATSQL_OK) {
         std::fprintf(stderr, "    init: %d %s\n", rc, flatsql::p4::lastError().c_str());
         return rc;
     }
-    rc = flatsql_p4_start();
-    return rc < 0 ? rc : P4_OK;
+    rc = flatsql_start();
+    return rc < 0 ? rc : FLATSQL_OK;
 }
 
-bool registerAll() { return registerType(wxfType()) == P4_OK && registerType(ommType()) == P4_OK; }
+bool registerAll() { return registerType(wxfType()) == FLATSQL_OK && registerType(ommType()) == FLATSQL_OK; }
 
 Result head(const std::string& type) {
     TlvW w;
     w.text(1, type);
-    return call(P4_OPC_HEAD, w.b);
+    return call(FLATSQL_OPC_HEAD, w.b);
 }
 
 std::vector<uint8_t> predOf(uint8_t field, uint8_t op, const std::vector<int64_t>& vals) {
@@ -415,16 +415,16 @@ using Work = void (*)(const Probe&, Hash*, int64_t* rows, int64_t* ops);
 
 void wSyncNorad(const Probe& p, Hash* h, int64_t* rows, int64_t* ops) {
     for (uint32_t norad : p.norads) {
-        const auto k = predOf(P4_F_COL0, P4_OP_EQ, {int64_t(norad)});
-        const auto e = predOf(P4_F_EPOCH, P4_OP_BETWEEN, {p.epochLo, p.epochHi});
+        const auto k = predOf(FLATSQL_F_COL0, FLATSQL_OP_EQ, {int64_t(norad)});
+        const auto e = predOf(FLATSQL_F_EPOCH, FLATSQL_OP_BETWEEN, {p.epochLo, p.epochHi});
         for (uint64_t off = 0;; off += 100) {
             TlvW w;
-            w.text(1, "OMM").u8(2, 1).u64(3, 100).u64(4, off).u8(5, P4_ORDER_W_ASC);
+            w.text(1, "OMM").u8(2, 1).u64(3, 100).u64(4, off).u8(5, FLATSQL_ORDER_W_ASC);
             w.raw(17, k.data(), k.size()).raw(17, e.data(), e.size());
-            Result r = call(P4_OPC_SCAN, w.b);
+            Result r = call(FLATSQL_OPC_SCAN, w.b);
             (*ops)++;
             *rows += int64_t(r.rows.size());
-            const bool last = r.status != P4_OK || r.rows.size() < 100;
+            const bool last = r.status != FLATSQL_OK || r.rows.size() < 100;
             h->keep(std::move(r));
             if (last) break;
         }
@@ -433,16 +433,16 @@ void wSyncNorad(const Probe& p, Hash* h, int64_t* rows, int64_t* ops) {
 
 void wSyncWindow(const Probe& p, Hash* h, int64_t* rows, int64_t* ops) {
     for (const auto& win : p.windows) {
-        const auto e = predOf(P4_F_EPOCH, P4_OP_BETWEEN, {win.first, win.second});
+        const auto e = predOf(FLATSQL_F_EPOCH, FLATSQL_OP_BETWEEN, {win.first, win.second});
         int64_t after = 0;
         for (;;) {
             TlvW w;
-            w.text(1, "OMM").u8(2, 1).u64(3, 1000).u8(5, P4_ORDER_SEQ_ASC).i64(6, after);
+            w.text(1, "OMM").u8(2, 1).u64(3, 1000).u8(5, FLATSQL_ORDER_SEQ_ASC).i64(6, after);
             w.raw(17, e.data(), e.size());
-            Result r = call(P4_OPC_SCAN, w.b);
+            Result r = call(FLATSQL_OPC_SCAN, w.b);
             (*ops)++;
             *rows += int64_t(r.rows.size());
-            const bool none = r.status != P4_OK || r.rows.empty(), last = none || r.rows.size() < 1000;
+            const bool none = r.status != FLATSQL_OK || r.rows.empty(), last = none || r.rows.size() < 1000;
             for (size_t i = 0; !none && i < r.rows.size(); i++) after = std::max(after, r.i(i, "seq"));
             h->keep(std::move(r));
             if (last) break;
@@ -455,7 +455,7 @@ void latestAt(const Probe& p, uint8_t profile, Hash* h, int64_t* rows, int64_t* 
     w.text(1, "OMM").u8(2, 1).u64(3, 250000).u8(30, profile).i64(31, p.latestAt).i64(32, 0);
     CallOpts o;
     o.timeoutMs = 600000;
-    Result r = call(P4_OPC_EPOCH, w.b, o);
+    Result r = call(FLATSQL_OPC_EPOCH, w.b, o);
     (*ops)++;
     *rows += int64_t(r.rows.size());
     h->keep(std::move(r));
@@ -469,12 +469,12 @@ void wExplorer(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
     int64_t before = 0;
     for (int page = 0; page < 100; page++) {
         TlvW w;
-        w.text(1, "OMM").u8(2, 1).u64(3, 100).u8(5, P4_ORDER_SEQ_DESC);
+        w.text(1, "OMM").u8(2, 1).u64(3, 100).u8(5, FLATSQL_ORDER_SEQ_DESC);
         if (before > 1) w.i64(7, before - 1);
-        Result r = call(P4_OPC_SCAN, w.b);
+        Result r = call(FLATSQL_OPC_SCAN, w.b);
         (*ops)++;
         *rows += int64_t(r.rows.size());
-        const bool none = r.status != P4_OK || r.rows.empty();
+        const bool none = r.status != FLATSQL_OK || r.rows.empty();
         if (!none) before = r.i(r.rows.size() - 1, "seq");
         h->keep(std::move(r));
         if (none) break;
@@ -484,18 +484,18 @@ void wExplorer(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
 void wRetention(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
     Result hd = head("WXF");
     h->result(hd);
-    if (hd.status != P4_OK || hd.rows.size() != 1) return;
+    if (hd.status != FLATSQL_OK || hd.rows.size() != 1) return;
     const int64_t through = hd.i(0, "through");
     const int64_t before = kT0 + 4 * 86400;
     int64_t after = 0;
     const int pages = int(argInt("retention-pages", 20));
     for (int page = 0; page < pages; page++) {
         CallOpts bulk;
-        bulk.cls = P4_CLASS_BULK;
-        Result s = call(P4_OPC_SCAN, retentionScan(kBig, before, through, after), bulk);
+        bulk.cls = FLATSQL_CLASS_BULK;
+        Result s = call(FLATSQL_OPC_SCAN, retentionScan(kBig, before, through, after), bulk);
         h->result(s);
         (*ops)++;
-        if (s.status != P4_OK || s.rows.empty()) break;
+        if (s.status != FLATSQL_OK || s.rows.empty()) break;
         const size_t n = std::min<size_t>(s.rows.size(), 500);
         std::vector<std::vector<uint8_t>> cids;
         for (size_t i = 0; i < n; i++) {
@@ -506,7 +506,7 @@ void wRetention(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
         dw.text(1, "WXF");
         const std::vector<uint8_t> cl = cidList(cids, 0, cids.size());
         dw.raw(40, cl.data(), cl.size());
-        Result d = call(P4_OPC_DELETE, dw.b);
+        Result d = call(FLATSQL_OPC_DELETE, dw.b);
         h->result(d);
         (*ops)++;
         *rows += int64_t(n);
@@ -525,7 +525,7 @@ void wLead(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
         h->result(r);
         (*ops)++;
         *rows += int64_t(r.rows.size());
-        if (r.status != P4_OK) break;
+        if (r.status != FLATSQL_OK) break;
     }
 }
 
@@ -548,7 +548,7 @@ void scanPuts(int64_t from, int64_t n, std::vector<double>* lat, const std::atom
         const uint64_t t0 = flatsql::ps::monoNs();
         Result r = put(tileBatch(kBig, "scan-put-" + std::to_string(t), "scanput", t, kT0 + 6 * 86400, values));
         lat->push_back(double(flatsql::ps::monoNs() - t0) / 1e6);
-        if (r.status != P4_OK) break;
+        if (r.status != FLATSQL_OK) break;
     }
 }
 void wScanAll(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
@@ -558,7 +558,7 @@ void wScanAll(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
     scanPuts(0, puts, &out.idle, nullptr);
     Result hd = head("WXF");
     h->result(hd);
-    if (hd.status != P4_OK || hd.rows.size() != 1) return;
+    if (hd.status != FLATSQL_OK || hd.rows.size() != 1) return;
     const int64_t through = hd.i(0, "through");
     std::atomic<bool> done{false};
     std::thread writer([&] { scanPuts(1000000, puts, &out.during, &done); });
@@ -566,19 +566,19 @@ void wScanAll(const Probe&, Hash* h, int64_t* rows, int64_t* ops) {
     int64_t after = 0;
     for (;;) {
         TlvW w;
-        w.text(1, "WXF").u8(2, 1).u64(3, 50000).u8(5, P4_ORDER_SEQ_ASC).i64(7, through).text(11, kProvider).text(12, kBig);
+        w.text(1, "WXF").u8(2, 1).u64(3, 50000).u8(5, FLATSQL_ORDER_SEQ_ASC).i64(7, through).text(11, kProvider).text(12, kBig);
         if (after) w.i64(6, after);
         CallOpts o;
-        o.cls = P4_CLASS_BULK;
+        o.cls = FLATSQL_CLASS_BULK;
         o.timeoutMs = 600000;
         // A slow consumer (the node's JSON encoding): the page's ring fills
         // and the engine waits for room while the writer keeps writing.
-        const uint32_t slot = submit(P4_OPC_SCAN, w.b, o);
+        const uint32_t slot = submit(FLATSQL_OPC_SCAN, w.b, o);
         if (const int64_t stall = argInt("scan-stall-ms", 0)) flatsql::ps::sleepNs(uint64_t(stall) * 1000000ull);
         Result r = wait(slot, o.timeoutMs);
         (*ops)++;
         out.pages++;
-        const bool last = r.status != P4_OK || r.rows.size() < 50000;
+        const bool last = r.status != FLATSQL_OK || r.rows.size() < 50000;
         for (size_t i = 0; i < r.rows.size(); i++) after = std::max(after, r.i(i, "seq"));
         for (const auto& row : r.rows)
             for (const auto& c : row) out.bytes += int64_t(c.s.size());
@@ -799,7 +799,7 @@ void stock(const std::string& root, const std::string& workload, const Probe& p,
 }
 #endif
 
-#if P4_REPLAY_FORMAT5
+#if FLATSQL_REPLAY_FORMAT5
 // A stock SDS reader: all frame offsets, chain links and sha256 digests are
 // checked independently of FlatSQL's recovery/index code.
 struct StoreWalk {
@@ -885,14 +885,14 @@ AnswerHashes allReadHashes(const Probe& probe) {
     for (const char* type : {"OMM","WXF"}) heads.result(head(type));
     result["open"]=heads.hex();
     Hash wxf;
-    for (uint8_t order : {uint8_t(P4_ORDER_SEQ_ASC),uint8_t(P4_ORDER_SEQ_DESC),uint8_t(P4_ORDER_W_ASC)}) {
+    for (uint8_t order : {uint8_t(FLATSQL_ORDER_SEQ_ASC),uint8_t(FLATSQL_ORDER_SEQ_DESC),uint8_t(FLATSQL_ORDER_W_ASC)}) {
         TlvW w; w.text(1,"WXF").u8(2,1).u64(3,10000).u8(5,order);
-        wxf.result(call(P4_OPC_SCAN,w.b));
+        wxf.result(call(FLATSQL_OPC_SCAN,w.b));
     }
     result["wxf_orders"]=wxf.hex();
     // SUMMARY 1 (feed counters) and 3 (instances: url, first, updated).
     for (uint8_t kind : {uint8_t(1),uint8_t(3)}) {
-        Hash summary; TlvW w; w.u8(45,kind); summary.result(call(P4_OPC_SUMMARY,w.b));
+        Hash summary; TlvW w; w.u8(45,kind); summary.result(call(FLATSQL_OPC_SUMMARY,w.b));
         result["summary_"+std::to_string(kind)]=summary.hex();
     }
     return result;
@@ -916,7 +916,7 @@ bool forceCompaction() {
         { std::lock_guard<std::mutex> g(t->mu); for (const auto& f : t->feeds) if(f) ids.push_back(f->fid); }
         for (uint32_t fid : ids) {
             flatsql::p4::Internal in; in.what=fid; in.force=true;
-            if (flatsql::p4::runOnWriter(e,t.get(),flatsql::p4::kOpCompact,&in)!=P4_OK) {
+            if (flatsql::p4::runOnWriter(e,t.get(),flatsql::p4::kOpCompact,&in)!=FLATSQL_OK) {
                 std::fprintf(stderr,"force compaction: %s\n",in.err.c_str()); return false;
             }
         }
@@ -927,12 +927,12 @@ bool checkpointProof(const std::string& root, const Probe& probe) {
     StoreWalk stats;
     if (!walkStore(root,true,&stats) || stats.checkpoints<=stats.streams || !stats.merged) return false;
     const std::string reference=argStr("reference","")+"/fsql4";
-    if (reference=="/fsql4" || openNode(reference,1)!=P4_OK || !registerAll()) return false;
+    if (reference=="/fsql4" || openNode(reference,1)!=FLATSQL_OK || !registerAll()) return false;
     const auto want=allReadHashes(probe); closeEngine(600000);
     const size_t deleted=deleteIndexes(root);
     if (!deleted) return false;
     const uint64_t start=flatsql::ps::monoNs();
-    if (openNode(root,1)!=P4_OK || !registerAll()) return false;
+    if (openNode(root,1)!=FLATSQL_OK || !registerAll()) return false;
     const double totalMs=double(flatsql::ps::monoNs()-start)/1e6;
     uint64_t checkpointNs=0,rebuildNs=0;
     for (const auto& t : flatsql::p4::currentEngine()->types) for (const auto& f : t->feeds) if(f) {
@@ -964,16 +964,16 @@ std::string deadUrlInstance(const std::vector<Gp>& seed) {
         return b;
     };
     const Batch live=batchOf(kept,0,2), gone=batchOf(dead,2,1);
-    if (put(live).status!=P4_OK || put(gone).status!=P4_OK) return "";
+    if (put(live).status!=FLATSQL_OK || put(gone).status!=FLATSQL_OK) return "";
     uint8_t key[36]; cidOf(gone.recs[0].frame,key);
     TlvW dw; dw.text(1,"OMM"); const auto list=cidList({std::vector<uint8_t>(key,key+36)},0,1); dw.raw(40,list.data(),list.size());
-    if (call(P4_OPC_DELETE,dw.b).status!=P4_OK) return "";
-    TlvW sw; sw.u8(45,3).text(1,"OMM"); const Result s=call(P4_OPC_SUMMARY,sw.b);
+    if (call(FLATSQL_OPC_DELETE,dw.b).status!=FLATSQL_OK) return "";
+    TlvW sw; sw.u8(45,3).text(1,"OMM"); const Result s=call(FLATSQL_OPC_SUMMARY,sw.b);
     for (size_t i=0;i<s.rows.size();i++) if (s.s(i,"batch")=="url-proof" && s.i(i,"records")==2) return s.s(i,"source_url");
     return "";
 }
 bool compactionProof(const std::string& root,const Probe& probe,const std::vector<Gp>& seed) {
-    if (openNode(root,1)!=P4_OK || !registerAll()) return false;
+    if (openNode(root,1)!=FLATSQL_OK || !registerAll()) return false;
     Hash retention; int64_t rows=0,ops=0; wRetention(probe,&retention,&rows,&ops);
     const std::string deadUrl=deadUrlInstance(seed);
     if (deadUrl!="https://replay.invalid/url-dead") { std::fprintf(stderr,"compaction: url-proof instance url '%s'\n",deadUrl.c_str()); closeEngine(600000); return false; }
@@ -985,10 +985,10 @@ bool compactionProof(const std::string& root,const Probe& probe,const std::vecto
     if(!forceCompaction()) { closeEngine(600000);return false; }
     const auto after=allReadHashes(probe); closeEngine(600000);
     if(!equal(after,"compacted") || !walkStore(root,true,nullptr,true)) return false;
-    if(openNode(root,1)!=P4_OK || !registerAll()) return false;
+    if(openNode(root,1)!=FLATSQL_OK || !registerAll()) return false;
     const auto reopened=allReadHashes(probe);closeEngine(600000);
     if(!equal(reopened,"reopened") || !deleteIndexes(root)) return false;
-    if(openNode(root,1)!=P4_OK || !registerAll()) return false;
+    if(openNode(root,1)!=FLATSQL_OK || !registerAll()) return false;
     const auto rebuilt=allReadHashes(probe);closeEngine(600000);
     if(!equal(rebuilt,"rebuilt")) return false;
     std::printf("REPLAY_COMPACTION retention_rows=%lld reads=%zu summary_1=%s summary_3=%s dead_row_url=checkpoint genesis=first final_FCK=last chain=clean digests=matching answers=equal reopened=equal rebuilt=equal PASS\n",(long long)rows,before.size(),before.at("summary_1").c_str(),before.at("summary_3").c_str());
@@ -1012,7 +1012,7 @@ bool prepareProof(const std::string& root,const Probe& probe,const std::vector<G
         return b;
     };
     for (size_t i=0;i<warmPuts+2*timedPuts;i++) small.push_back(batchOf(per));
-    if (openNode(root,1)!=P4_OK || !registerAll()) return false;
+    if (openNode(root,1)!=FLATSQL_OK || !registerAll()) return false;
     auto* e=flatsql::p4::currentEngine();
     Feed* target=nullptr;
     for (const auto& t : e->types) if (t->name=="OMM") {
@@ -1035,7 +1035,7 @@ bool prepareProof(const std::string& root,const Probe& probe,const std::vector<G
         const uint64_t flushes=e->stat[flatsql::p4::kStIndexFlushes].load(), t0=flatsql::ps::monoNs();
         Result r=put(b);
         const double took=double(flatsql::ps::monoNs()-t0)/1e6;
-        if (r.status!=P4_OK || r.rows.size()!=b.recs.size()) { std::fprintf(stderr,"prepare PUT %d %s\n",r.status,r.err.c_str()); return false; }
+        if (r.status!=FLATSQL_OK || r.rows.size()!=b.recs.size()) { std::fprintf(stderr,"prepare PUT %d %s\n",r.status,r.err.c_str()); return false; }
         if (e->stat[flatsql::p4::kStIndexFlushes].load()!=flushes) merges++; else if (ms) ms->push_back(took);
         return true;
     };
@@ -1066,11 +1066,11 @@ bool prepareProof(const std::string& root,const Probe& probe,const std::vector<G
     const std::string index=target->path;
     const auto want=allReadHashes(probe); closeEngine(600000);
     if (!walkStore(root,false,nullptr,false,"OMM")) { std::fprintf(stderr,"checkpoint-prepare: stream walk\n"); return false; }
-    if (openNode(root,1)!=P4_OK || !registerAll()) return false;
+    if (openNode(root,1)!=FLATSQL_OK || !registerAll()) return false;
     const auto reopened=allReadHashes(probe); closeEngine(600000);
     if (reopened!=want) { std::fprintf(stderr,"checkpoint-prepare: reopened hash mismatch\n"); return false; }
     for (const char* suffix : {"","-wal","-shm"}) std::filesystem::remove(index+suffix);
-    if (openNode(root,1)!=P4_OK || !registerAll()) return false;
+    if (openNode(root,1)!=FLATSQL_OK || !registerAll()) return false;
     const auto rebuilt=allReadHashes(probe); closeEngine(600000);
     if (rebuilt!=want) { std::fprintf(stderr,"checkpoint-prepare: rebuilt hash mismatch\n"); return false; }
     auto pct=[](std::vector<double> v,double q) { std::sort(v.begin(),v.end()); return v[std::min(v.size()-1,size_t(q*double(v.size()-1)+0.5))]; };
@@ -1151,7 +1151,7 @@ bool ackMetadata(const std::string& root, const std::vector<LeadAck>& acks, uint
 
 std::string survivorHash(const std::string& root, int64_t through, const Probe& probe, double* reopenMs = nullptr) {
     const uint64_t opened = flatsql::ps::monoNs();
-    if (openNode(root, 1) != P4_OK || !registerAll()) return "open-failed";
+    if (openNode(root, 1) != FLATSQL_OK || !registerAll()) return "open-failed";
     if (reopenMs) *reopenMs = double(flatsql::ps::monoNs() - opened) / 1e6;
     Hash h;
     for (const auto& read : reads()) {
@@ -1161,16 +1161,16 @@ std::string survivorHash(const std::string& root, int64_t through, const Probe& 
     }
     // Replay the seq/window/explorer query shapes over WXF too, restricting
     // to acknowledged seqs because a committed call may die before logging.
-    for (uint8_t order : {uint8_t(P4_ORDER_SEQ_ASC), uint8_t(P4_ORDER_SEQ_DESC), uint8_t(P4_ORDER_W_ASC)}) {
+    for (uint8_t order : {uint8_t(FLATSQL_ORDER_SEQ_ASC), uint8_t(FLATSQL_ORDER_SEQ_DESC), uint8_t(FLATSQL_ORDER_W_ASC)}) {
         TlvW w;
         w.text(1, "WXF").u8(2, 1).u64(3, 10000).u8(5, order).i64(7, through);
-        Result r = call(P4_OPC_SCAN, w.b);
-        if (r.status != P4_OK) { closeEngine(); return "scan-failed"; }
+        Result r = call(FLATSQL_OPC_SCAN, w.b);
+        if (r.status != FLATSQL_OK) { closeEngine(); return "scan-failed"; }
         h.result(r);
     }
     TlvW rb; rb.u32(63, 8);
-    const Result checked = call(P4_OPC_REBUILD, rb.b);
-    bool clean = checked.status == P4_OK && checked.rows.size() == 2;
+    const Result checked = call(FLATSQL_OPC_REBUILD, rb.b);
+    bool clean = checked.status == FLATSQL_OK && checked.rows.size() == 2;
     for (size_t i = 0; i < checked.rows.size(); i++) clean = clean && checked.i(i, "mismatches") == 0;
     if (!clean) {
         std::fprintf(stderr, "REBUILD8 status=%d rows=%zu error=%s\n", checked.status, checked.rows.size(), checked.err.c_str());
@@ -1206,25 +1206,25 @@ bool formatGuards(const std::string& dir) {
         };
         const auto before = fingerprint();
         for (uint8_t mode : {uint8_t(0), uint8_t(1), uint8_t(2)}) {
-            if (openNode(root, mode) != P4_E_FORMAT || fingerprint() != before) return false;
+            if (openNode(root, mode) != FLATSQL_E_FORMAT || fingerprint() != before) return false;
         }
         std::filesystem::remove_all(root);
     }
     const std::string root = dir + "/reserved";
     std::filesystem::remove_all(root);
-    if (openNode(root, 1) != P4_OK) return false;
+    if (openNode(root, 1) != FLATSQL_OK) return false;
     for (const char* fid : {"$FMB", "$FCK", "$FSG"}) {
         TestType type = pnmLikeType("RES");
         std::memcpy(type.fid, fid, 4);
-        if (registerType(type) != P4_E_ARG) { closeEngine(); return false; }
+        if (registerType(type) != FLATSQL_E_ARG) { closeEngine(); return false; }
     }
-    if (registerType(wxfType()) != P4_OK) { closeEngine(); return false; }
+    if (registerType(wxfType()) != FLATSQL_OK) { closeEngine(); return false; }
     for (const char* fid : {"$FMB", "$FCK", "$FSG"}) {
         Batch b = crashTile(0);
         b.recs.resize(1);
         std::memcpy(b.recs[0].frame.data() + 8, fid, 4);
         const Result r = put(b);
-        if (r.status != P4_OK || r.rows.size() != 1 || r.i(0, "reject") != P4_REJ_FID) { closeEngine(); return false; }
+        if (r.status != FLATSQL_OK || r.rows.size() != 1 || r.i(0, "reject") != FLATSQL_REJ_FID) { closeEngine(); return false; }
     }
     closeEngine();
     std::filesystem::remove_all(root);
@@ -1246,7 +1246,7 @@ bool killLead(const std::string& dir) {
         std::filesystem::remove_all(base);
         std::filesystem::create_directories(base);
         for (const auto& p : {root, ref}) {
-            if (openNode(p, 1) != P4_OK || !registerAll() || !ingest(dayBatches(gp, "2026-09-16"), nullptr, nullptr)) return false;
+            if (openNode(p, 1) != FLATSQL_OK || !registerAll() || !ingest(dayBatches(gp, "2026-09-16"), nullptr, nullptr)) return false;
             closeEngine(600000);
         }
         const std::string log = base + "/acks.log";
@@ -1257,11 +1257,11 @@ bool killLead(const std::string& dir) {
         if (child == 0) {
             ::close(pipefd[0]);
             const int logfd = ::open(log.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
-            if (logfd < 0 || openNode(root, 1) != P4_OK || !registerAll()) _exit(2);
+            if (logfd < 0 || openNode(root, 1) != FLATSQL_OK || !registerAll()) _exit(2);
             for (int tile = 0; tile < tiles; tile++) {
                 if (::write(pipefd[1], &tile, sizeof tile) != sizeof tile) _exit(3);
                 Result r = put(crashTile(tile));
-                if (r.status != P4_OK || r.rows.size() != 9) _exit(4);
+                if (r.status != FLATSQL_OK || r.rows.size() != 9) _exit(4);
                 std::string line = std::to_string(tile);
                 for (size_t j = 0; j < r.rows.size(); j++) line += " " + std::to_string(r.i(j, "seq"));
                 line += "\n";
@@ -1286,10 +1286,10 @@ bool killLead(const std::string& dir) {
         if (got.size() != 32) { std::fprintf(stderr, "survivor: %s\n", got.c_str()); return false; }
         uint64_t extra = 0;
         if (!ackMetadata(root, acks, &extra) || !walkStore(root, false)) return false;
-        if (openNode(ref, 1) != P4_OK || !registerAll()) return false;
+        if (openNode(ref, 1) != FLATSQL_OK || !registerAll()) return false;
         for (const auto& ack : acks) {
             const Result r = put(crashTile(ack.tile));
-            if (r.status != P4_OK || r.rows.size() != 9) return false;
+            if (r.status != FLATSQL_OK || r.rows.size() != 9) return false;
             for (size_t j = 0; j < 9; j++) if (r.i(j, "seq") != ack.seq[j]) return false;
         }
         closeEngine(600000);
@@ -1348,11 +1348,11 @@ namespace {
 void runOne(const std::string& root, const std::string& workload);
 }  // namespace
 
-P4_SLOW_TEST(p4_replay) {
+FLATSQL_SLOW_TEST(p4_replay) {
     const std::string root = argStr("store", "") + "/fsql4";
     REQUIRE(root != "/fsql4", "--store");
     const std::string phase = argStr("phase", "run");
-#if P4_REPLAY_FORMAT5
+#if FLATSQL_REPLAY_FORMAT5
     if (phase == "checkpoint-prepare") {
         const auto seed=readGp(argStr("gp",""));
         REQUIRE(!seed.empty() && prepareProof(root,probeOf(seed,int(argInt("probes",40))),seed),phase);
@@ -1366,16 +1366,16 @@ P4_SLOW_TEST(p4_replay) {
     }
 #endif
 #if !defined(__wasm__)
-#if P4_REPLAY_FORMAT5
+#if FLATSQL_REPLAY_FORMAT5
     if (phase == "car-export" || phase == "car-restore") {
         // Native test-client archive commands; the node can adopt these same
         // writer-serialized functions when it wires its backup ABI.
         const std::string path=argStr("car","");
         REQUIRE(!path.empty(),"--car must name the CARv2 file");
-        REQUIRE(openNode(root,1)==P4_OK && registerAll(),"archive store open");
+        REQUIRE(openNode(root,1)==FLATSQL_OK && registerAll(),"archive store open");
         auto* type=flatsql::p4::currentEngine()->findType(argStr("type",""));
         REQUIRE(type,"--type must name a registered type");
-        flatsql::p4::CarStats stats; std::string err; int32_t rc=P4_E_ARG;
+        flatsql::p4::CarStats stats; std::string err; int32_t rc=FLATSQL_E_ARG;
         if(phase=="car-export") {
             flatsql::p4::Feed* feed=nullptr;
             { std::lock_guard<std::mutex> lock(type->mu);
@@ -1383,8 +1383,8 @@ P4_SLOW_TEST(p4_replay) {
             REQUIRE(feed,"--provider/--source must name an existing feed (empty = local)");
             rc=flatsql::p4::carExportFeed(feed,path,&stats,&err);
         } else rc=flatsql::p4::carRestoreFeed(type,path,nullptr,&stats,&err);
-        if(rc!=P4_OK) std::fprintf(stderr,"CAR: %s\n",err.c_str());
-        REQUIRE(rc==P4_OK,"CAR archive command");
+        if(rc!=FLATSQL_OK) std::fprintf(stderr,"CAR: %s\n",err.c_str());
+        REQUIRE(rc==FLATSQL_OK,"CAR archive command");
         closeEngine(600000);
         std::printf("REPLAY_CAR command=%s bytes=%llu blocks=%llu wall_ms=%.3f PASS\n",phase.c_str(),
             (unsigned long long)stats.bytes,(unsigned long long)stats.blocks,double(stats.wallNs)/1e6);
@@ -1424,18 +1424,18 @@ P4_SLOW_TEST(p4_replay) {
             const std::vector<uint8_t> values = payloadOf(size_t(argInt("payload", 8616)));
             const int64_t frameBytes = int64_t(wxfFrame(std::string(kBig) + "/seed/tile-0", 0, "seed", values).size());
             const int64_t tiles = std::max<int64_t>(1, want / (frameBytes + 4) / 9);
-            REQUIRE(openNode(root, 2, uint64_t(tiles * 9) + 1 + (1u << 20)) == P4_OK, "open the fixture");
+            REQUIRE(openNode(root, 2, uint64_t(tiles * 9) + 1 + (1u << 20)) == FLATSQL_OK, "open the fixture");
             REQUIRE(registerAll(), "register");
             REQUIRE(migrateLane(kBig, tiles, &seq, values, 1024, &bytes), "the sea feed");
             TlvW r1;
             r1.u32(63, 1);
             CallOpts slow;
             slow.timeoutMs = 3600000;
-            CHECK_EQ(call(P4_OPC_REBUILD, r1.b, slow).status, P4_OK, "REBUILD 1");
-            CHECK_EQ(flatsql_p4_activate(), P4_OK, "activate");
+            CHECK_EQ(call(FLATSQL_OPC_REBUILD, r1.b, slow).status, FLATSQL_OK, "REBUILD 1");
+            CHECK_EQ(flatsql_activate(), FLATSQL_OK, "activate");
             closeEngine(600000);
         }
-        REQUIRE(openNode(root, 1) == P4_OK, "reopen");
+        REQUIRE(openNode(root, 1) == FLATSQL_OK, "reopen");
         REQUIRE(registerAll(), "register");
         int64_t n = 0;
         for (const auto& day : byDay(readGp(argStr("gp", "")))) {
@@ -1467,7 +1467,7 @@ void runOne(const std::string& root, const std::string& workload) {
     Hash h;
     int64_t rows = 0, ops = 0;
     c.start();
-    REQUIRE(openNode(root, 1) == P4_OK, "open");
+    REQUIRE(openNode(root, 1) == FLATSQL_OK, "open");
     REQUIRE(registerAll(), "register");
     for (const char* t : {"OMM", "WXF"}) h.result(head(t));
     if (workload == "open") {
@@ -1530,7 +1530,7 @@ void runOne(const std::string& root, const std::string& workload) {
             batches = dayBatches(days[0].second, days[0].first);
             rows = int64_t(days[0].second.size());
         }
-        callSyncs.enabled = P4_REPLAY_FORMAT5 && (workload == "gp_ingest" || workload == "wxf_lead");
+        callSyncs.enabled = FLATSQL_REPLAY_FORMAT5 && (workload == "gp_ingest" || workload == "wxf_lead");
         c.start();
         if (workload == "gp_ingest") {
             REQUIRE(ingest(batches, &wh, &ops), "ingest");

@@ -106,7 +106,7 @@ const char* ct(sqlite3_stmt* s, int i) {
 
 }  // namespace
 
-P4_SLOW_TEST(g2_fixture) {
+FLATSQL_SLOW_TEST(g2_fixture) {
     const std::string fixture = argStr("fixture", "");
     const std::string bfbsDir = argStr("bfbs", "");
     if (fixture.empty() || bfbsDir.empty()) {
@@ -117,7 +117,7 @@ P4_SLOW_TEST(g2_fixture) {
         // The engine configures SQLite (the SQL surface's allocator) before
         // anything initializes it: the format-1 oracle below opens SQLite too.
         const std::string warm = scratchDir("g2init") + "/fsql4";
-        REQUIRE(openEngine(warm) == P4_OK, "engine init");
+        REQUIRE(openEngine(warm) == FLATSQL_OK, "engine init");
         closeEngine();
         removeTree(warm.substr(0, warm.size() - 6));
     }
@@ -171,8 +171,8 @@ P4_SLOW_TEST(g2_fixture) {
     struct stat stStore;
     const bool reuse = argInt("reuse", 0) != 0 && ::stat((root + "/STORE").c_str(), &stStore) == 0;
     if (!reuse) {
-    REQUIRE(openEngine(root, o) == P4_OK, "open the migration target");
-    for (auto& kv : types) REQUIRE(registerType(kv.second) == P4_OK, "register " + kv.first);
+    REQUIRE(openEngine(root, o) == FLATSQL_OK, "open the migration target");
+    for (auto& kv : types) REQUIRE(registerType(kv.second) == FLATSQL_OK, "register " + kv.first);
     // Load: one thread per format-1 partition table.
     std::atomic<int64_t> loaded{0}, rejected{0}, frameBytes{0}, orphans{0};
     std::map<std::string, std::string> firstTable;
@@ -212,12 +212,12 @@ P4_SLOW_TEST(g2_fixture) {
             auto flush = [&] {
                 if (b.recs.empty()) return;
                 Result r = put(b);
-                if (r.status != P4_OK || r.rows.size() != b.recs.size()) {
+                if (r.status != FLATSQL_OK || r.rows.size() != b.recs.size()) {
                     std::fprintf(stderr, "  %s: PUT %d %s\n", p.table.c_str(), r.status, r.err.c_str());
                     failures++;
                 } else {
                     for (size_t i = 0; i < r.rows.size(); i++)
-                        if (r.i(i, "action") == P4_ACT_REJECTED) {
+                        if (r.i(i, "action") == FLATSQL_ACT_REJECTED) {
                             if (rejected.fetch_add(1) < 5)
                                 std::fprintf(stderr, "  %s: reject %lld\n", p.table.c_str(), (long long)r.i(i, "reject"));
                         }
@@ -308,22 +308,22 @@ P4_SLOW_TEST(g2_fixture) {
     TlvW r1;
     r1.u32(63, 1);
     const uint64_t ti = flatsql::ps::monoNs();
-    CHECK_EQ(call(P4_OPC_REBUILD, r1.b).status, P4_OK, "REBUILD 1");
+    CHECK_EQ(call(FLATSQL_OPC_REBUILD, r1.b).status, FLATSQL_OK, "REBUILD 1");
     report("g2.rebuild1.seconds", double(flatsql::ps::monoNs() - ti) / 1e9, "s");
-    CHECK_EQ(flatsql_p4_activate(), P4_OK, "activate: " + fp::lastError());
+    CHECK_EQ(flatsql_activate(), FLATSQL_OK, "activate: " + fp::lastError());
     closeEngine(600000);
     }
     // Full text builds after activation (§11 step 5).
     o.createMode = 0;
-    REQUIRE(openEngine(root, o) == P4_OK, "reopen");
+    REQUIRE(openEngine(root, o) == FLATSQL_OK, "reopen");
     {
         const uint64_t tf = flatsql::ps::monoNs();
         bool ready = false;
         while (!ready && flatsql::ps::monoNs() - tf < 900ull * 1000 * 1000 * 1000) {
             TlvW f5;
             f5.u8(45, 5);
-            Result st = call(P4_OPC_SUMMARY, f5.b);
-            ready = st.status == P4_OK;
+            Result st = call(FLATSQL_OPC_SUMMARY, f5.b);
+            ready = st.status == FLATSQL_OK;
             for (size_t i = 0; i < st.rows.size(); i++)
                 if (st.s(i, "state") == "building") ready = false;
             if (!ready) std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -332,7 +332,7 @@ P4_SLOW_TEST(g2_fixture) {
         report("g2.fts.seconds", double(flatsql::ps::monoNs() - tf) / 1e9, "s");
         TlvW f4;
         f4.u8(45, 4);
-        Result st = call(P4_OPC_SUMMARY, f4.b);
+        Result st = call(FLATSQL_OPC_SUMMARY, f4.b);
         for (size_t i = 0; i < st.rows.size(); i++)
             std::printf("  %s: files %lld db %lld wal %lld journal %lld index %lld fts %lld free %lld\n", st.s(i, "type").c_str(),
                         (long long)st.i(i, "files"), (long long)st.i(i, "db_bytes"), (long long)st.i(i, "wal_bytes"),
@@ -353,14 +353,14 @@ P4_SLOW_TEST(g2_fixture) {
     CHECK(double(onDisk) / double(copiesF1) < 1742.0, "below both engines' bytes per copy");
 
     // Equivalence with format 1, per shape.
-    REQUIRE(openEngine(root, o) == P4_OK, "reopen");
+    REQUIRE(openEngine(root, o) == FLATSQL_OK, "reopen");
     int64_t mism = 0;
     for (auto& kv : types) {
         const std::string& type = kv.first;
         // counts (SUMMARY 1 records = format 1's index rows; copies = partition rows)
         TlvW sw;
         sw.u8(45, 1).text(1, type);
-        Result s1 = call(P4_OPC_SUMMARY, sw.b);
+        Result s1 = call(FLATSQL_OPC_SUMMARY, sw.b);
         if (s1.rows.size() == 1 && s1.i(0, "records") != uniqF1[type + ".fbs"]) {
             mism++;
             std::printf("  %s records %lld vs %lld\n", type.c_str(), (long long)s1.i(0, "records"), (long long)uniqF1[type + ".fbs"]);
@@ -399,7 +399,7 @@ P4_SLOW_TEST(g2_fixture) {
             fp::st32(cl.data(), 1);
             cl.insert(cl.end(), c36, c36 + 36);
             tw.raw(40, cl.data(), cl.size());
-            Result tg = call(P4_OPC_TAGS, tw.b);
+            Result tg = call(FLATSQL_OPC_TAGS, tw.b);
             std::set<std::string> a, bset;
             for (size_t i = 0; i < tg.rows.size(); i++)
                 a.insert(tg.s(i, "provider") + "|" + tg.s(i, "source") + "|" + tg.s(i, "source_url") + "|" + tg.s(i, "batch") + "|" +
@@ -425,7 +425,7 @@ P4_SLOW_TEST(g2_fixture) {
         // SCAN first page = format 1's rowid order
         TlvW sc;
         sc.text(1, type).u64(3, 1000);
-        Result scan = call(P4_OPC_SCAN, sc.b);
+        Result scan = call(FLATSQL_OPC_SCAN, sc.b);
         sqlite3_prepare_v2(fx, "SELECT rowid FROM sdn_record_index WHERE schema_name=?1 ORDER BY rowid LIMIT 1000", -1, &q, nullptr);
         sqlite3_bind_text(q, 1, (type + ".fbs").c_str(), -1, SQLITE_TRANSIENT);
         size_t i = 0;
@@ -442,7 +442,7 @@ P4_SLOW_TEST(g2_fixture) {
         // WINDOW (COALESCE(epoch_unix, source_timestamp) DESC, cid ASC), first 300
         TlvW wn;
         wn.text(1, type).u64(3, 300).u64(4, 100);
-        Result w = call(P4_OPC_WINDOW, wn.b);
+        Result w = call(FLATSQL_OPC_WINDOW, wn.b);
         sqlite3_prepare_v2(fx,
                            "SELECT cid FROM sdn_record_index WHERE schema_name=?1 ORDER BY coalesce(epoch_unix, source_timestamp) DESC,"
                            " cid ASC LIMIT 300 OFFSET 100",
@@ -462,7 +462,7 @@ P4_SLOW_TEST(g2_fixture) {
         // INDEX_PAGE (epoch_unix DESC, cid ASC), offset 1000
         TlvW ip;
         ip.text(1, type).u64(3, 50).u64(4, 1000);
-        Result pg = call(P4_OPC_INDEX_PAGE, ip.b);
+        Result pg = call(FLATSQL_OPC_INDEX_PAGE, ip.b);
         sqlite3_prepare_v2(fx, "SELECT cid FROM sdn_record_index WHERE schema_name=?1 ORDER BY epoch_unix DESC, cid ASC LIMIT 50 OFFSET 1000",
                            -1, &q, nullptr);
         sqlite3_bind_text(q, 1, (type + ".fbs").c_str(), -1, SQLITE_TRANSIENT);
@@ -529,7 +529,7 @@ P4_SLOW_TEST(g2_fixture) {
                     TlvW ep;
                     ep.text(1, type).u8(30, uint8_t(profile)).i64(31, at);
                     const uint64_t f4t = flatsql::ps::monoNs();
-                    Result er = call(P4_OPC_EPOCH, ep.b, CallOpts{0, 0, 0, 0, 0, 0, false, 600000});
+                    Result er = call(FLATSQL_OPC_EPOCH, ep.b, CallOpts{0, 0, 0, 0, 0, 0, false, 600000});
                     const double f4ms = double(flatsql::ps::monoNs() - f4t) / 1e6;
                     std::vector<std::string> got;
                     for (size_t i = 0; i < er.rows.size(); i++)
@@ -537,7 +537,7 @@ P4_SLOW_TEST(g2_fixture) {
                     std::printf("  %s EPOCH %d at %lld: %zu objects (F1 %zu), %.1f ms (F1 SQL %.1f ms), examined %llu\n",
                                 type.c_str(), profile, (long long)at, got.size(), want.size(), f4ms, f1ms,
                                 (unsigned long long)er.rowsExamined);
-                    if (er.status != P4_OK || got != want) {
+                    if (er.status != FLATSQL_OK || got != want) {
                         mism++;
                         size_t d = 0;
                         while (d < got.size() && d < want.size() && got[d] == want[d]) d++;
@@ -550,7 +550,7 @@ P4_SLOW_TEST(g2_fixture) {
     }
     TlvW v8;
     v8.u32(63, 8);
-    Result v = call(P4_OPC_REBUILD, v8.b);
+    Result v = call(FLATSQL_OPC_REBUILD, v8.b);
     for (size_t i = 0; i < v.rows.size(); i++) CHECK_EQ(v.i(i, "mismatches"), int64_t(0), "verify " + v.s(i, "type"));
     closeEngine(600000);
     sqlite3_close(fx);
@@ -571,7 +571,7 @@ namespace p4 {
 P4Engine* currentEngine();
 }
 }  // namespace flatsql
-P4_SLOW_TEST(a18_probe) {
+FLATSQL_SLOW_TEST(a18_probe) {
     const std::string store = argStr("store", "");
     if (store.empty()) {
         std::printf("  skipped: --store\n");
@@ -580,12 +580,12 @@ P4_SLOW_TEST(a18_probe) {
     EngineOpts o;
     o.createMode = 0;
     if (argInt("reader_cache_kib", 0)) o.extra = TlvW().u32(24, uint32_t(argInt("reader_cache_kib", 0))).b;
-    REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
+    REQUIRE(openEngine(store + "/fsql4", o) == FLATSQL_OK, "open");
     if (argInt("rebuild", argInt("rebuild1", 0))) {
         // REBUILD what (1: partition secondary indexes a newer engine adds; 2: the type index).
         TlvW r1;
         r1.u32(63, uint32_t(argInt("rebuild", 1)));
-        CHECK_EQ(call(P4_OPC_REBUILD, r1.b, CallOpts{0, 0, 0, 0, 0, 0, false, 3600000}).status, P4_OK, "REBUILD 1");
+        CHECK_EQ(call(FLATSQL_OPC_REBUILD, r1.b, CallOpts{0, 0, 0, 0, 0, 0, false, 3600000}).status, FLATSQL_OK, "REBUILD 1");
         closeEngine(600000);
         return;
     }
@@ -612,11 +612,11 @@ P4_SLOW_TEST(a18_probe) {
             P4ScanSpec spec{};
             spec.type = sh.type;
             spec.lane.source = sh.source;
-            spec.order = P4_ORDER_SEQ_DESC;
+            spec.order = FLATSQL_ORDER_SEQ_DESC;
             spec.hydrate = 1;
             spec.bound = sh.bound;
             P4Value v{1, sh.norad, 0, nullptr, 0};
-            P4Pred p{P4_F_COL0, P4_OP_EQ, 1, &v};
+            P4Pred p{FLATSQL_F_COL0, FLATSQL_OP_EQ, 1, &v};
             if (sh.norad >= 0) {
                 spec.preds = &p;
                 spec.nPreds = 1;
@@ -627,13 +627,13 @@ P4_SLOW_TEST(a18_probe) {
             P4Row row;
             uint64_t n = 0, b = 0;
             int32_t k = 0;
-            while (rc == P4_OK && (k = p4_cursor_next(c, &row)) == 1) {
+            while (rc == FLATSQL_OK && (k = p4_cursor_next(c, &row)) == 1) {
                 n++;
                 b += row.dataLen;
             }
             if (c) p4_cursor_close(c);
             ms.push_back(double(flatsql::ps::monoNs() - t0) / 1e6);
-            CHECK(rc == P4_OK && k == 0, std::string("cursor ") + sh.type);
+            CHECK(rc == FLATSQL_OK && k == 0, std::string("cursor ") + sh.type);
             uint64_t rb = 0;
             p4_lane_counters(&lane, &examined, &rb);
             rows = n;
@@ -649,8 +649,8 @@ P4_SLOW_TEST(a18_probe) {
     // HEAD by an exact CID (tag 8): one type-index probe, not a type scan.
     for (const char* type : {"OMM", "IQC"}) {
         TlvW sc;
-        sc.text(1, type).u8(5, P4_ORDER_SEQ_DESC).u64(3, 1);
-        Result one = call(P4_OPC_SCAN, sc.b);
+        sc.text(1, type).u8(5, FLATSQL_ORDER_SEQ_DESC).u64(3, 1);
+        Result one = call(FLATSQL_OPC_SCAN, sc.b);
         if (one.rows.size() != 1) continue;
         uint8_t d[32], c36[36] = {0x01, 0x55, 0x12, 0x20};
         const std::string cid = one.s(0, "cid");
@@ -662,7 +662,7 @@ P4_SLOW_TEST(a18_probe) {
             TlvW h;
             h.text(1, type).raw(8, c36, 36);
             const uint64_t t0 = flatsql::ps::monoNs();
-            Result r = call(P4_OPC_HEAD, h.b);
+            Result r = call(FLATSQL_OPC_HEAD, h.b);
             ms.push_back(double(flatsql::ps::monoNs() - t0) / 1e6);
             n = r.rows.size() == 1 ? r.i(0, "n") : -1;
         }
@@ -680,15 +680,15 @@ P4_SLOW_TEST(a18_probe) {
 //       OMM-celestrak-gp-b053 (benchset W06: every OMM record goes).
 //   --mode=w10 --store=<fixture clone>: quota GC to 90% of the store's bytes
 //       (benchset W10: the oldest arrivals go first).
-P4_SLOW_TEST(g3_bench) {
+FLATSQL_SLOW_TEST(g3_bench) {
     const std::string mode = argStr("mode", "producers");
     if (mode == "producers") {
         const std::string root = scratchDir("g3") + "/fsql4";
         EngineOpts o;
         o.writers = uint32_t(argInt("writers", 8));
         o.writeSlots = 64;
-        REQUIRE(openEngine(root, o) == P4_OK, "open");
-        REQUIRE(registerType(ommType()) == P4_OK, "register");
+        REQUIRE(openEngine(root, o) == FLATSQL_OK, "open");
+        REQUIRE(registerType(ommType()) == FLATSQL_OK, "register");
         const int producers = int(argInt("producers", 8));
         const int calls = int(argInt("calls", 40));
         std::vector<std::vector<double>> lat(static_cast<size_t>(producers));
@@ -715,7 +715,7 @@ P4_SLOW_TEST(g3_bench) {
                     const uint64_t s = flatsql::ps::monoNs();
                     Result r = put(b);
                     lat[size_t(pi)].push_back(double(flatsql::ps::monoNs() - s) / 1e6);
-                    if (r.status != P4_OK) failures++;
+                    if (r.status != FLATSQL_OK) failures++;
                 }
             });
         for (auto& t : th) t.join();
@@ -737,7 +737,7 @@ P4_SLOW_TEST(g3_bench) {
         // The count-scaled growth step's write shape (sds-tb-gen): --producers
         // (8) callers, each call 4,096 new OMM records from one of --peers
         // (1,024) producers picked by Zipf(1.1), until --records. A call that
-        // answers P4_E_BUSY is retried; one that makes no progress for
+        // answers FLATSQL_E_BUSY is retried; one that makes no progress for
         // --stuck-s (60) seconds fails the run (a hang, not slowness).
         const std::string root = argStr("store", "").empty() ? scratchDir("g3g") + "/fsql4" : argStr("store", "") + "/fsql4";
         EngineOpts o;
@@ -748,8 +748,8 @@ P4_SLOW_TEST(g3_bench) {
             x.u64(32, uint64_t(argInt("wal-total-mib", 0)) << 20);
             o.extra = x.b;
         }
-        REQUIRE(openEngine(root, o) == P4_OK, "open");
-        REQUIRE(registerType(ommType()) == P4_OK, "register");
+        REQUIRE(openEngine(root, o) == FLATSQL_OK, "open");
+        REQUIRE(registerType(ommType()) == FLATSQL_OK, "register");
         const int producers = int(argInt("producers", 8));
         const int peers = int(argInt("peers", 1024));
         const int64_t target = argInt("records", 8000000);
@@ -794,13 +794,13 @@ P4_SLOW_TEST(g3_bench) {
                     Result r;
                     for (;;) {
                         r = put(b);
-                        if (r.status != P4_E_BUSY) break;
+                        if (r.status != FLATSQL_E_BUSY) break;
                         busy++;
                         if (int64_t(flatsql::ps::monoNs() - s) > stuckNs || stop.load()) break;
                         std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     }
                     const double ms = double(flatsql::ps::monoNs() - s) / 1e6;
-                    if (r.status != P4_OK) {
+                    if (r.status != FLATSQL_OK) {
                         std::fprintf(stderr, "  call failed after %.0f ms: %d %s\n", ms, r.status, r.err.c_str());
                         stuck = true;
                         stop = true;
@@ -854,7 +854,7 @@ P4_SLOW_TEST(g3_bench) {
     EngineOpts o;
     o.createMode = 0;
     if (argInt("writer-cache-kib", 0)) o.extra = TlvW().u32(22, uint32_t(argInt("writer-cache-kib", 0))).b;
-    REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
+    REQUIRE(openEngine(store + "/fsql4", o) == FLATSQL_OK, "open");
     CallOpts slow{0, 0, 0, 0, 0, 0, false, 3600000};
 #if !defined(__wasm__)
     // The WAL while the op runs: the engine's stat and the -wal files on disk.
@@ -881,8 +881,8 @@ P4_SLOW_TEST(g3_bench) {
         // calls: rec/s and call p50/p99.
         TlvW s2;
         s2.u8(45, 2).text(1, "OMM");
-        Result parts = call(P4_OPC_SUMMARY, s2.b);
-        REQUIRE(parts.status == P4_OK && !parts.rows.empty(), parts.err);
+        Result parts = call(FLATSQL_OPC_SUMMARY, s2.b);
+        REQUIRE(parts.status == FLATSQL_OK && !parts.rows.empty(), parts.err);
         size_t big = 0;
         for (size_t i = 1; i < parts.rows.size(); i++)
             if (parts.i(i, "records") > parts.i(big, "records")) big = i;
@@ -916,7 +916,7 @@ P4_SLOW_TEST(g3_bench) {
             const uint64_t s = flatsql::ps::monoNs();
             Result r = put(b);
             lat.push_back(double(flatsql::ps::monoNs() - s) / 1e6);
-            CHECK_EQ(r.status, P4_OK, r.err);
+            CHECK_EQ(r.status, FLATSQL_OK, r.err);
             for (size_t i = 0; i < r.rows.size(); i++) actions[r.i(i, "action") * 1000 + (r.i(i, "reject") ? -r.i(i, "reject") : 0)]++;
         }
         const double secs = double(flatsql::ps::monoNs() - t0) / 1e9;
@@ -946,9 +946,9 @@ P4_SLOW_TEST(g3_bench) {
         TlvW s;
         s.text(1, "OMM").text(11, "space-data-network-02").text(12, "celestrak-gp").text(60, "OMM-celestrak-gp-b053").u8(61, 1);
         const uint64_t t0 = flatsql::ps::monoNs();
-        Result r = call(P4_OPC_SUPERSEDE, s.b, slow);
+        Result r = call(FLATSQL_OPC_SUPERSEDE, s.b, slow);
         const double secs = double(flatsql::ps::monoNs() - t0) / 1e9;
-        REQUIRE(r.status == P4_OK && r.rows.size() == 1, r.err);
+        REQUIRE(r.status == FLATSQL_OK && r.rows.size() == 1, r.err);
         report("w06.seconds", secs, "s");
         report("w06.records_deleted", double(r.i(0, "records_deleted")), "records");
         report("w06.tags_deleted", double(r.i(0, "tags_deleted")), "tags");
@@ -956,16 +956,16 @@ P4_SLOW_TEST(g3_bench) {
     } else if (mode == "w10") {
         TlvW f4;
         f4.u8(45, 4);
-        Result st = call(P4_OPC_SUMMARY, f4.b);
+        Result st = call(FLATSQL_OPC_SUMMARY, f4.b);
         int64_t total = 0;
         for (size_t i = 0; i < st.rows.size(); i++)
             total += st.i(i, "db_bytes") + st.i(i, "wal_bytes") + st.i(i, "index_bytes") + st.i(i, "fts_bytes");
         TlvW q;
         q.u64(62, uint64_t(double(total) * 0.9));
         const uint64_t t0 = flatsql::ps::monoNs();
-        Result r = call(P4_OPC_QUOTA_GC, q.b, slow);
+        Result r = call(FLATSQL_OPC_QUOTA_GC, q.b, slow);
         const double secs = double(flatsql::ps::monoNs() - t0) / 1e9;
-        REQUIRE(r.status == P4_OK && r.rows.size() == 1, r.err);
+        REQUIRE(r.status == FLATSQL_OK && r.rows.size() == 1, r.err);
         report("w10.seconds", secs, "s");
         report("w10.files_dropped", double(r.i(0, "files_dropped")), "files");
         report("w10.records_dropped", double(r.i(0, "records_dropped")), "records");
@@ -979,7 +979,7 @@ P4_SLOW_TEST(g3_bench) {
     if (argInt("exit-dirty", 0)) std::_Exit(0);  // as a kill: WALs left for the next open
     TlvW v8;
     v8.u32(63, 8);
-    Result v = call(P4_OPC_REBUILD, v8.b, slow);
+    Result v = call(FLATSQL_OPC_REBUILD, v8.b, slow);
     for (size_t i = 0; i < v.rows.size(); i++) CHECK_EQ(v.i(i, "mismatches"), int64_t(0), "verify " + v.s(i, "type"));
     closeEngine(600000);
 }
@@ -989,7 +989,7 @@ P4_SLOW_TEST(g3_bench) {
 //       [--store=<dir>] [--keep=1]: an OMM store of 101 producers (one file
 //       each) with epochs over 30 months, then EPOCH nearest (profile 2) over
 //       every object at 20 epochs: p50/p99 (gate: under format 2's p99).
-P4_SLOW_TEST(g6_bench) {
+FLATSQL_SLOW_TEST(g6_bench) {
     const std::string mode = argStr("mode", "nearest");
     if (mode == "iqc") {
         // IQC (ingest identities) to --entries records in
@@ -997,8 +997,8 @@ P4_SLOW_TEST(g6_bench) {
         const std::string root = argStr("store", scratchDir("g6iqc")) + "/fsql4";
         EngineOpts o;
         o.writers = 4;
-        REQUIRE(openEngine(root, o) == P4_OK, "open");
-        REQUIRE(registerType(iqcType()) == P4_OK, "register");
+        REQUIRE(openEngine(root, o) == FLATSQL_OK, "open");
+        REQUIRE(registerType(iqcType()) == FLATSQL_OK, "register");
         const int64_t entries = argInt("entries", 2000000);
         const int calls = int(entries / 4096);
         std::vector<double> perEntryUs;
@@ -1022,8 +1022,8 @@ P4_SLOW_TEST(g6_bench) {
             const uint64_t s = flatsql::ps::monoNs();
             Result r = put(b);
             perEntryUs.push_back(double(flatsql::ps::monoNs() - s) / 1e3 / 4096);
-            if (r.status != P4_OK) {
-                CHECK_EQ(r.status, P4_OK, r.err);
+            if (r.status != FLATSQL_OK) {
+                CHECK_EQ(r.status, FLATSQL_OK, r.err);
                 break;
             }
         }
@@ -1051,8 +1051,8 @@ P4_SLOW_TEST(g6_bench) {
     EngineOpts o;
     o.writers = 8;
     o.writeSlots = 64;
-    REQUIRE(openEngine(root, o) == P4_OK, "open");
-    REQUIRE(registerType(ommType()) == P4_OK, "register");
+    REQUIRE(openEngine(root, o) == FLATSQL_OK, "open");
+    REQUIRE(registerType(ommType()) == FLATSQL_OK, "register");
     const int64_t t0 = unixOf(2024, 1, 1);
     auto monthStart = [&](int m) { return unixOf(2024 + m / 12, 1 + m % 12, 1); };
     if (!exists) {
@@ -1075,7 +1075,7 @@ P4_SLOW_TEST(g6_bench) {
                         in.ts = 1790000000;
                         b.recs.push_back(std::move(in));
                     }
-                    if (put(b).status != P4_OK) failures++;
+                    if (put(b).status != FLATSQL_OK) failures++;
                 }
             });
         for (auto& t : th) t.join();
@@ -1085,7 +1085,7 @@ P4_SLOW_TEST(g6_bench) {
     {
         TlvW f4;
         f4.u8(45, 4).text(1, "OMM");
-        Result st = call(P4_OPC_SUMMARY, f4.b);
+        Result st = call(FLATSQL_OPC_SUMMARY, f4.b);
         if (st.rows.size() == 1) report("g6.files", double(st.i(0, "files")), "files");
     }
     std::mt19937 rng(11);
@@ -1096,9 +1096,9 @@ P4_SLOW_TEST(g6_bench) {
         TlvW ep;
         ep.text(1, "OMM").u8(30, 2).i64(31, at).u64(3, 50000);
         const uint64_t s = flatsql::ps::monoNs();
-        Result r = call(P4_OPC_EPOCH, ep.b, CallOpts{0, 0, 0, 0, 0, 0, false, 600000});
+        Result r = call(FLATSQL_OPC_EPOCH, ep.b, CallOpts{0, 0, 0, 0, 0, 0, false, 600000});
         ms.push_back(double(flatsql::ps::monoNs() - s) / 1e6);
-        CHECK_EQ(r.status, P4_OK, r.err);
+        CHECK_EQ(r.status, FLATSQL_OK, r.err);
         rows = r.rows.size();
         if (q == 0) report("g6.nearest.examined", double(r.rowsExamined), "rows");
     }
@@ -1113,7 +1113,7 @@ P4_SLOW_TEST(g6_bench) {
 // Opens a store and verifies it (REBUILD 8: the type index against the
 // files, integrity_check on every file), printing each type's answer.
 //   flatsql_p4_test --test=store_check --store=<dir with fsql4> [--mode=0|1|2]
-P4_SLOW_TEST(store_check) {
+FLATSQL_SLOW_TEST(store_check) {
     const std::string store = argStr("store", "");
     if (store.empty()) {
         std::printf("  skipped: --store\n");
@@ -1122,13 +1122,13 @@ P4_SLOW_TEST(store_check) {
     EngineOpts o;
     o.createMode = uint8_t(argInt("mode", 0));
     const int32_t rc = openEngine(store + "/fsql4", o);
-    REQUIRE(rc == P4_OK, "open: " + std::to_string(rc));
+    REQUIRE(rc == FLATSQL_OK, "open: " + std::to_string(rc));
     TlvW rb;
     rb.u32(63, uint32_t(argInt("what", 8)));
     const uint64_t t0 = flatsql::ps::monoNs();
-    Result v = call(P4_OPC_REBUILD, rb.b, CallOpts{0, 0, 0, 0, 0, 0, false, 3600000});
+    Result v = call(FLATSQL_OPC_REBUILD, rb.b, CallOpts{0, 0, 0, 0, 0, 0, false, 3600000});
     std::printf("  REBUILD %ld: %.0f ms (load %.1f)\n", argInt("what", 8), double(flatsql::ps::monoNs() - t0) / 1e6, loadAvg());
-    CHECK_EQ(v.status, P4_OK, v.err);
+    CHECK_EQ(v.status, FLATSQL_OK, v.err);
     for (size_t i = 0; i < v.rows.size(); i++) {
         std::printf("  %s: %lld entries, %lld mismatches\n", v.s(i, "type").c_str(), (long long)v.i(i, "entries"),
                     (long long)v.i(i, "mismatches"));
@@ -1142,7 +1142,7 @@ P4_SLOW_TEST(store_check) {
 // a type's T/ files appear with its first write, so the open and the close
 // cost O(types with data).
 //   flatsql_p4_test --test=open_bench [--types=232]
-P4_SLOW_TEST(open_bench) {
+FLATSQL_SLOW_TEST(open_bench) {
     const std::string root = scratchDir("openbench") + "/fsql4";
     const int n = int(argInt("types", 232));
     std::vector<TestType> types;
@@ -1158,13 +1158,13 @@ P4_SLOW_TEST(open_bench) {
     };
     for (int round = 0; round < 2; round++) {
         const uint64_t t0 = flatsql::ps::monoNs();
-        REQUIRE(openEngine(root) == P4_OK, "open");
+        REQUIRE(openEngine(root) == FLATSQL_OK, "open");
         const uint64_t t1 = flatsql::ps::monoNs();
-        for (auto& t : types) REQUIRE(registerType(t) == P4_OK, "register");
+        for (auto& t : types) REQUIRE(registerType(t) == FLATSQL_OK, "register");
         const uint64_t t2 = flatsql::ps::monoNs();
         if (round == 0) REQUIRE(put(Batch{"T7", "12D3KooWOpen", {Tag{"p", "s", "", "b", "", "", ""}}, 1790000000, 0,
                                           {In{buildFrame(types[7], {Field::str("FILE_ID", "x")}), 1790000000}}})
-                                    .status == P4_OK,
+                                    .status == FLATSQL_OK,
                                 "one write");
         const uint64_t t3 = flatsql::ps::monoNs();
         closeEngine();
@@ -1180,7 +1180,7 @@ P4_SLOW_TEST(open_bench) {
 // The read gate's material shapes (GATES-r1), as the SDN backend sends them
 // to the engine, on a fixture store: one cold call and three warm ones each.
 //   flatsql_p4_test --test=reads_bench --store=<dir with fsql4> [--only=<substring>[|...]]
-P4_SLOW_TEST(reads_bench) {
+FLATSQL_SLOW_TEST(reads_bench) {
     const std::string store = argStr("store", "");
     if (store.empty()) {
         std::printf("  skipped: --store\n");
@@ -1194,7 +1194,7 @@ P4_SLOW_TEST(reads_bench) {
         o.extra = x.b;
     }
     const uint64_t t0 = flatsql::ps::monoNs();
-    REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "open");
+    REQUIRE(openEngine(store + "/fsql4", o) == FLATSQL_OK, "open");
     std::printf("  open %.1f ms (load %.1f)\n", double(flatsql::ps::monoNs() - t0) / 1e6, loadAvg());
     if (argInt("settle-ms", 0) > 0) flatsql::ps::sleepNs(uint64_t(argInt("settle-ms", 0)) * 1000000ull);  // the start-up work first
     if (argInt("open-only", 0)) {
@@ -1220,221 +1220,221 @@ P4_SLOW_TEST(reads_bench) {
     {
         TlvW t;
         t.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052");
-        add("R10 HEAD OMM source+batch", P4_OPC_HEAD, t);
+        add("R10 HEAD OMM source+batch", FLATSQL_OPC_HEAD, t);
     }
     {
         TlvW t;
         t.text(1, "IQC").text(12, "IQEngine");
-        add("R10 HEAD IQC source", P4_OPC_HEAD, t);
+        add("R10 HEAD IQC source", FLATSQL_OPC_HEAD, t);
     }
     {
         TlvW t;
         t.text(1, "OMM");
-        auto p = text(P4_F_EPOCH_DAY, P4_OP_EQ, day14);
+        auto p = text(FLATSQL_F_EPOCH_DAY, FLATSQL_OP_EQ, day14);
         t.raw(17, p.data(), p.size());
-        add("R10 HEAD OMM EPOCH_DAY", P4_OPC_HEAD, t);
+        add("R10 HEAD OMM EPOCH_DAY", FLATSQL_OPC_HEAD, t);
     }
     for (int prof : {2, 3, 4}) {
         TlvW t;
         t.text(1, "OMM").text(12, "celestrak-gp").u8(30, uint8_t(prof)).i64(31, 1789371001).u64(3, 50000);
-        add(std::string("R18 EPOCH OMM@celestrak-gp ") + (prof == 2 ? "nearest" : prof == 3 ? "as_of" : "forward"), P4_OPC_EPOCH, t);
+        add(std::string("R18 EPOCH OMM@celestrak-gp ") + (prof == 2 ? "nearest" : prof == 3 ? "as_of" : "forward"), FLATSQL_OPC_EPOCH, t);
     }
     {
         TlvW t;
         t.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u64(3, 50000);
-        add("R16 EPOCH OMM nearest (no source)", P4_OPC_EPOCH, t);
+        add("R16 EPOCH OMM nearest (no source)", FLATSQL_OPC_EPOCH, t);
     }
     for (int prof : {2, 3}) {
         TlvW t;
         t.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b030").u8(30, uint8_t(prof)).i64(31, 1789371001).u64(3, 50000);
-        add(std::string("R18 EPOCH OMM@celestrak-gp b030 ") + (prof == 2 ? "nearest" : "as_of"), P4_OPC_EPOCH, t);
+        add(std::string("R18 EPOCH OMM@celestrak-gp b030 ") + (prof == 2 ? "nearest" : "as_of"), FLATSQL_OPC_EPOCH, t);
         TlvW m;
         m.text(1, "MPE").text(12, "celestrak-gp").u8(30, uint8_t(prof)).i64(31, 1789371001).u64(3, 50000);
-        add(std::string("R18 EPOCH MPE@celestrak-gp ") + (prof == 2 ? "nearest" : "as_of"), P4_OPC_EPOCH, m);
+        add(std::string("R18 EPOCH MPE@celestrak-gp ") + (prof == 2 ? "nearest" : "as_of"), FLATSQL_OPC_EPOCH, m);
     }
     {
         TlvW t;
         t.u8(45, 4);
-        add("R20 SUMMARY 4 (DiskUsage)", P4_OPC_SUMMARY, t);
+        add("R20 SUMMARY 4 (DiskUsage)", FLATSQL_OPC_SUMMARY, t);
     }
     {
         TlvW t;
         t.text(1, "OMM").text(12, "celestrak-gp").u64(3, 50).u64(4, 50);
-        add("R11 INDEX_PAGE OMM src page 2", P4_OPC_INDEX_PAGE, t);
+        add("R11 INDEX_PAGE OMM src page 2", FLATSQL_OPC_INDEX_PAGE, t);
     }
     {
         TlvW t;
         t.text(1, "IQC").text(12, "IQEngine").u64(3, 50).u64(4, 100);
-        add("R11 INDEX_PAGE IQC src page 3", P4_OPC_INDEX_PAGE, t);
+        add("R11 INDEX_PAGE IQC src page 3", FLATSQL_OPC_INDEX_PAGE, t);
     }
     {
         TlvW t;
         t.text(1, "MPE").text(12, "celestrak-gp").u64(3, 50).u64(4, 200);
-        add("R11 INDEX_PAGE MPE src page 5", P4_OPC_INDEX_PAGE, t);
+        add("R11 INDEX_PAGE MPE src page 5", FLATSQL_OPC_INDEX_PAGE, t);
     }
     {
         TlvW t;
         t.text(1, "CAT").u64(3, 50);
-        auto p = text(P4_F_COL0, P4_OP_LIKE, "%2554%");
+        auto p = text(FLATSQL_F_COL0, FLATSQL_OP_LIKE, "%2554%");
         t.raw(17, p.data(), p.size());
-        add("R11 INDEX_PAGE CAT norad LIKE", P4_OPC_INDEX_PAGE, t);
-        add("R11 HEAD CAT norad LIKE", P4_OPC_HEAD, t);
+        add("R11 INDEX_PAGE CAT norad LIKE", FLATSQL_OPC_INDEX_PAGE, t);
+        add("R11 HEAD CAT norad LIKE", FLATSQL_OPC_HEAD, t);
     }
     for (uint64_t off : {uint64_t(19950), uint64_t(99950), uint64_t(1690000)})
         for (const char* ty : {"OMM", "MPE"}) {
             TlvW t;
             t.text(1, ty).u64(3, 50).u64(4, off);
-            add(std::string("R11 INDEX_PAGE ") + ty + " offset " + std::to_string(off), P4_OPC_INDEX_PAGE, t);
+            add(std::string("R11 INDEX_PAGE ") + ty + " offset " + std::to_string(off), FLATSQL_OPC_INDEX_PAGE, t);
         }
     {
         TlvW t;
         t.text(1, "CAT").text(12, "celestrak-satcat").u64(3, 50).u64(4, 100);
-        add("R11 INDEX_PAGE CAT satcat page 3", P4_OPC_INDEX_PAGE, t);
+        add("R11 INDEX_PAGE CAT satcat page 3", FLATSQL_OPC_INDEX_PAGE, t);
         TlvW h;
         h.text(1, "CAT").text(12, "celestrak-satcat");
-        add("R11 HEAD CAT satcat", P4_OPC_HEAD, h);
+        add("R11 HEAD CAT satcat", FLATSQL_OPC_HEAD, h);
         TlvW c;
         c.text(1, "CAT").u8(2, 1).u64(3, 100);
-        add("R12 WINDOW CAT off=0", P4_OPC_WINDOW, c);
+        add("R12 WINDOW CAT off=0", FLATSQL_OPC_WINDOW, c);
         TlvW c2;
         c2.text(1, "CAT").u8(2, 1).u64(3, 100).u64(4, 1000);
-        add("R12 WINDOW CAT off=1000", P4_OPC_WINDOW, c2);
+        add("R12 WINDOW CAT off=1000", FLATSQL_OPC_WINDOW, c2);
     }
     for (const char* ty : {"CAT", "IQC", "MPE"}) {
         TlvW t;
         t.text(1, ty).u64(3, 50);
-        add(std::string("R11 INDEX_PAGE ") + ty + " page 1", P4_OPC_INDEX_PAGE, t);
+        add(std::string("R11 INDEX_PAGE ") + ty + " page 1", FLATSQL_OPC_INDEX_PAGE, t);
         TlvW t2;
         t2.text(1, ty).u64(3, 50).u64(4, 950);
-        add(std::string("R11 INDEX_PAGE ") + ty + " page 20", P4_OPC_INDEX_PAGE, t2);
+        add(std::string("R11 INDEX_PAGE ") + ty + " page 20", FLATSQL_OPC_INDEX_PAGE, t2);
     }
     {
         TlvW t;
         t.text(1, "OMM").text(12, "celestrak-gp").u64(19, 33554432);
-        add("R15 HEAD OMM source cap", P4_OPC_HEAD, t);
+        add("R15 HEAD OMM source cap", FLATSQL_OPC_HEAD, t);
         TlvW u;
         u.text(1, "OMM").u64(19, 33554432);
-        add("R15 HEAD OMM cap (no filter)", P4_OPC_HEAD, u);
+        add("R15 HEAD OMM cap (no filter)", FLATSQL_OPC_HEAD, u);
         TlvW c;
         c.text(1, "CAT").text(12, "celestrak-satcat-csv").u64(19, 1048576);
-        add("R15 HEAD CAT csv cap", P4_OPC_HEAD, c);
+        add("R15 HEAD CAT csv cap", FLATSQL_OPC_HEAD, c);
     }
     for (const char* b : {"OMM-celestrak-gp-b052", "OMM-celestrak-gp-b010"}) {
         TlvW t;
         t.text(1, "OMM").text(12, "celestrak-gp").text(13, b).u64(19, 33554432);
-        add(std::string("R15 HEAD OMM source+batch cap ") + b, P4_OPC_HEAD, t);
+        add(std::string("R15 HEAD OMM source+batch cap ") + b, FLATSQL_OPC_HEAD, t);
     }
     for (const char* q : {"SELECT COUNT(*) FROM OMM", "SELECT COUNT(*) FROM MPE", "SELECT COUNT(*) FROM CAT",
                           "SELECT COUNT(*) FROM IQC", "SELECT _source, COUNT(*) FROM MPE GROUP BY _source",
                           "SELECT OBJECT_NAME, EPOCH, NORAD_CAT_ID FROM OMM WHERE NORAD_CAT_ID BETWEEN 25000 AND 25600"}) {
         TlvW t;
         t.text(70, q);
-        add(std::string("R19 SQL ") + q, P4_OPC_SQL, t);
+        add(std::string("R19 SQL ") + q, FLATSQL_OPC_SQL, t);
     }
     for (const char* pat : {"%7%", "%00%", "%25544%"})
         for (const char* ty : {"CAT", "OMM"}) {
             TlvW t;
             t.text(1, ty).u64(3, 50);
-            auto p = text(P4_F_COL0, P4_OP_LIKE, pat);
+            auto p = text(FLATSQL_F_COL0, FLATSQL_OP_LIKE, pat);
             t.raw(17, p.data(), p.size());
-            add(std::string("R11 INDEX_PAGE ") + ty + " LIKE " + pat, P4_OPC_INDEX_PAGE, t);
-            add(std::string("R11 HEAD ") + ty + " LIKE " + pat, P4_OPC_HEAD, t);
+            add(std::string("R11 INDEX_PAGE ") + ty + " LIKE " + pat, FLATSQL_OPC_INDEX_PAGE, t);
+            add(std::string("R11 HEAD ") + ty + " LIKE " + pat, FLATSQL_OPC_HEAD, t);
         }
     {
         TlvW t;
         t.text(1, "OMM").u8(2, 1).u64(3, 1000);
-        auto p = text(P4_F_EPOCH_DAY, P4_OP_EQ, day14);
+        auto p = text(FLATSQL_F_EPOCH_DAY, FLATSQL_OP_EQ, day14);
         t.raw(17, p.data(), p.size());
-        add("R12 WINDOW OMM day", P4_OPC_WINDOW, t);
+        add("R12 WINDOW OMM day", FLATSQL_OPC_WINDOW, t);
     }
     for (const char* ty : {"CAT", "OMM", "MPE", "IQC"}) {
         TlvW t;
         t.text(1, ty).u8(2, 1).u64(3, 100).u64(4, 20000);
-        add(std::string("R12 WINDOW ") + ty + " off=20000", P4_OPC_WINDOW, t);
+        add(std::string("R12 WINDOW ") + ty + " off=20000", FLATSQL_OPC_WINDOW, t);
     }
     {
         TlvW t;
         t.text(1, "OMM").u8(30, 1).u64(3, 200);
-        auto p = text(P4_F_EPOCH_DAY, P4_OP_EQ, day20);
+        auto p = text(FLATSQL_F_EPOCH_DAY, FLATSQL_OP_EQ, day20);
         t.raw(17, p.data(), p.size());
-        add("R16 EPOCH OMM window day", P4_OPC_EPOCH, t);
+        add("R16 EPOCH OMM window day", FLATSQL_OPC_EPOCH, t);
     }
     {
         TlvW t;
         t.text(1, "OMM").u8(30, 5);
-        add("R16 EPOCH OMM coverage", P4_OPC_EPOCH, t);
+        add("R16 EPOCH OMM coverage", FLATSQL_OPC_EPOCH, t);
     }
     {
         TlvW t;
-        t.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(5, P4_ORDER_CID).u8(2, 1).u64(3, 1000);
-        add("R13 WINDOW OMM src+batch cid", P4_OPC_WINDOW, t);
+        t.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(5, FLATSQL_ORDER_CID).u8(2, 1).u64(3, 1000);
+        add("R13 WINDOW OMM src+batch cid", FLATSQL_OPC_WINDOW, t);
     }
     {
         TlvW t;
-        t.text(1, "IQC").u8(5, P4_ORDER_CID).u8(2, 1).u64(3, 1000).u64(4, 100000);
-        add("R13 WINDOW IQC cid off=100000", P4_OPC_WINDOW, t);
+        t.text(1, "IQC").u8(5, FLATSQL_ORDER_CID).u8(2, 1).u64(3, 1000).u64(4, 100000);
+        add("R13 WINDOW IQC cid off=100000", FLATSQL_OPC_WINDOW, t);
     }
     {
         TlvW t;
-        t.text(1, "CAT").u8(5, P4_ORDER_CID).u8(2, 1).u64(3, 200).u64(4, 60000);
-        add("R13 WINDOW CAT cid off=60000", P4_OPC_WINDOW, t);
+        t.text(1, "CAT").u8(5, FLATSQL_ORDER_CID).u8(2, 1).u64(3, 200).u64(4, 60000);
+        add("R13 WINDOW CAT cid off=60000", FLATSQL_OPC_WINDOW, t);
     }
     {
         TlvW t;
         t.text(1, "OMM").text(11, "space-data-network-02").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(2, 1).u64(3, 1000);
-        add("R09 SCAN OMM batch b052", P4_OPC_SCAN, t);
+        add("R09 SCAN OMM batch b052", FLATSQL_OPC_SCAN, t);
     }
     for (uint64_t off : {uint64_t(0), uint64_t(1000)})
         for (const char* src : {"celestrak-satcat-csv", "celestrak-satcat"}) {
             TlvW t;
             t.text(1, "CAT").text(12, src).u8(2, 1).u64(3, 100).u64(4, off);
-            add(std::string("R14 WINDOW CAT ") + src + " off=" + std::to_string(off), P4_OPC_WINDOW, t);
+            add(std::string("R14 WINDOW CAT ") + src + " off=" + std::to_string(off), FLATSQL_OPC_WINDOW, t);
         }
     {
         TlvW t;
         t.text(1, "IQC").text(12, "IQEngine").u8(2, 1).u64(3, 100).u64(4, 1000);
-        add("R14 WINDOW IQC IQEngine off=1000", P4_OPC_WINDOW, t);
+        add("R14 WINDOW IQC IQEngine off=1000", FLATSQL_OPC_WINDOW, t);
     }
     {
         TlvW t;
         t.text(1, "OMM").u8(2, 1).u64(3, 500);
-        auto p = text(P4_F_EPOCH_DAY, P4_OP_EQ, day14);
+        auto p = text(FLATSQL_F_EPOCH_DAY, FLATSQL_OP_EQ, day14);
         t.raw(17, p.data(), p.size());
-        add("R08 SCAN OMM day", P4_OPC_SCAN, t);
+        add("R08 SCAN OMM day", FLATSQL_OPC_SCAN, t);
     }
     {
         TlvW t;
         t.text(1, "OMM").u8(2, 1).u64(3, 100);
-        add("R05 SCAN OMM limit=100", P4_OPC_SCAN, t);
+        add("R05 SCAN OMM limit=100", FLATSQL_OPC_SCAN, t);
     }
     {
         TlvW t;
         t.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u64(3, 200);
-        add("R16 EPOCH OMM nearest limit=200", P4_OPC_EPOCH, t);
+        add("R16 EPOCH OMM nearest limit=200", FLATSQL_OPC_EPOCH, t);
     }
     {
         TlvW t;
         t.text(1, "OMM").u64(3, 50);
-        add("R11 INDEX_PAGE OMM page 1", P4_OPC_INDEX_PAGE, t);
+        add("R11 INDEX_PAGE OMM page 1", FLATSQL_OPC_INDEX_PAGE, t);
     }
     for (int prof : {2, 3}) {
         TlvW t;
         t.text(1, "OMM").u8(30, uint8_t(prof)).i64(31, 1789371001).u8(33, 1);
-        add(std::string("R16 EPOCH OMM count ") + (prof == 2 ? "nearest" : "as_of"), P4_OPC_EPOCH, t);
+        add(std::string("R16 EPOCH OMM count ") + (prof == 2 ? "nearest" : "as_of"), FLATSQL_OPC_EPOCH, t);
     }
     {
         TlvW t;
         t.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u64(3, 2000);
-        add("R16 EPOCH OMM nearest limit=2000", P4_OPC_EPOCH, t);
+        add("R16 EPOCH OMM nearest limit=2000", FLATSQL_OPC_EPOCH, t);
     }
     {
         TlvW t;
         t.text(1, "OMM");
-        add("R10 HEAD OMM (no filter)", P4_OPC_HEAD, t);
+        add("R10 HEAD OMM (no filter)", FLATSQL_OPC_HEAD, t);
     }
     {
         // The /epoch handler's counts: epoch.window (from .. to) and epoch.day.
-        std::vector<uint8_t> p = {P4_F_EPOCH, P4_OP_BETWEEN, 2, 0};
+        std::vector<uint8_t> p = {FLATSQL_F_EPOCH, FLATSQL_OP_BETWEEN, 2, 0};
         for (int64_t v : {int64_t(1788314401), int64_t(1793491200)}) {
             p.push_back(1);
             uint8_t b[8];
@@ -1445,18 +1445,18 @@ P4_SLOW_TEST(reads_bench) {
             TlvW t;
             t.text(1, ty).u8(30, 1).u8(33, 1);
             t.raw(17, p.data(), p.size());
-            add(std::string("R16 EPOCH ") + ty + " window count", P4_OPC_EPOCH, t);
+            add(std::string("R16 EPOCH ") + ty + " window count", FLATSQL_OPC_EPOCH, t);
             TlvW d;
             d.text(1, ty).u8(30, 1).u8(33, 1);
-            auto q = text(P4_F_EPOCH_DAY, P4_OP_EQ, day20);
+            auto q = text(FLATSQL_F_EPOCH_DAY, FLATSQL_OP_EQ, day20);
             d.raw(17, q.data(), q.size());
-            add(std::string("R16 EPOCH ") + ty + " day count", P4_OPC_EPOCH, d);
+            add(std::string("R16 EPOCH ") + ty + " day count", FLATSQL_OPC_EPOCH, d);
         }
     }
     {
         TlvW t;
         t.text(1, "OMM").u8(2, 1).u64(3, 100).u64(4, 1000);
-        add("R12 WINDOW OMM off=1000", P4_OPC_WINDOW, t);
+        add("R12 WINDOW OMM off=1000", FLATSQL_OPC_WINDOW, t);
     }
     const std::string only = argStr("only", "");
     CallOpts co{0, 0, 0, 0, 0, 0, false, 600000};
@@ -1472,8 +1472,8 @@ P4_SLOW_TEST(reads_bench) {
         real.schema = reflection::GetSchema(real.bfbs.data());
         TlvW s2;
         s2.u8(45, 2).text(1, "OMM");
-        Result parts = call(P4_OPC_SUMMARY, s2.b);
-        REQUIRE(parts.status == P4_OK && !parts.rows.empty(), parts.err);
+        Result parts = call(FLATSQL_OPC_SUMMARY, s2.b);
+        REQUIRE(parts.status == FLATSQL_OK && !parts.rows.empty(), parts.err);
         size_t big = 0;
         for (size_t i = 1; i < parts.rows.size(); i++)
             if (parts.i(i, "records") > parts.i(big, "records")) big = i;
@@ -1482,7 +1482,7 @@ P4_SLOW_TEST(reads_bench) {
         for (const char* ty : {"OMM", "MPE"}) {
             TlvW sc;
             sc.text(1, ty).u8(2, 1).u64(3, 50);
-            Result r = call(P4_OPC_SCAN, sc.b, co);
+            Result r = call(FLATSQL_OPC_SCAN, sc.b, co);
             for (size_t i = 0; i < r.rows.size(); i++) {
                 const std::string c = r.s(i, "cid");
                 uint8_t d[32], c36[36] = {0x01, 0x55, 0x12, 0x20};
@@ -1506,7 +1506,7 @@ P4_SLOW_TEST(reads_bench) {
                 for (int i = 0; !stop.load(); i++) {
                     const bool b0 = busy.load();
                     const uint64_t s = flatsql::ps::monoNs();
-                    int32_t st = P4_OK;
+                    int32_t st = FLATSQL_OK;
                     std::string err;
                     if (k == 0) {
                         Result r = get(i % 2 ? "MPE" : "OMM", {hits[size_t(i) % hits.size()]});
@@ -1515,26 +1515,26 @@ P4_SLOW_TEST(reads_bench) {
                     } else if (k == 1) {
                         TlvW t;
                         t.text(1, "OMM").u8(2, 1).u64(3, 100);
-                        Result r = call(P4_OPC_SCAN, t.b, co);
+                        Result r = call(FLATSQL_OPC_SCAN, t.b, co);
                         st = r.status;
                         err = r.err;
                     } else if (k == 2) {
                         TlvW t;
                         t.text(1, "OMM").u64(3, 50);
-                        Result r = call(P4_OPC_INDEX_PAGE, t.b, co);
+                        Result r = call(FLATSQL_OPC_INDEX_PAGE, t.b, co);
                         st = r.status;
                         err = r.err;
                     } else {
                         TlvW c, q;
                         c.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u8(33, 1);
                         q.text(1, "OMM").u8(30, 2).i64(31, 1789371001).u64(3, 200);
-                        Result r1 = call(P4_OPC_EPOCH, c.b, co);
-                        Result r2 = call(P4_OPC_EPOCH, q.b, co);
-                        st = r1.status != P4_OK ? r1.status : r2.status;
+                        Result r1 = call(FLATSQL_OPC_EPOCH, c.b, co);
+                        Result r2 = call(FLATSQL_OPC_EPOCH, q.b, co);
+                        st = r1.status != FLATSQL_OK ? r1.status : r2.status;
                         err = r1.err + r2.err;
                     }
                     const double ms = double(flatsql::ps::monoNs() - s) / 1e6;
-                    if (st != P4_OK) {
+                    if (st != FLATSQL_OK) {
                         errs++;
                         std::printf("  READ ERROR %s: %d %s\n", names[k], st, err.c_str());
                     }
@@ -1572,14 +1572,14 @@ P4_SLOW_TEST(reads_bench) {
         auto supersede = [&](const std::string& keep) {
             TlvW s;
             s.text(1, "OMM").text(11, "space-data-network-02").text(12, "celestrak-gp").text(60, keep).u8(61, 1);
-            return call(P4_OPC_SUPERSEDE, s.b, slow);
+            return call(FLATSQL_OPC_SUPERSEDE, s.b, slow);
         };
         double w06 = 0;
         if (!argInt("no-w06", 0)) {
             const uint64_t s = flatsql::ps::monoNs();
             Result r = supersede("OMM-celestrak-gp-b053");
             w06 = double(flatsql::ps::monoNs() - s) / 1e6;
-            CHECK_EQ(r.status, P4_OK, r.err);
+            CHECK_EQ(r.status, FLATSQL_OK, r.err);
             std::printf("  supersede keep b053: %.0f ms, wal max so far %.0f MiB (load %.1f)\n", w06,
                         double(walMax.load()) / 1048576.0, loadAvg());
         }
@@ -1605,12 +1605,12 @@ P4_SLOW_TEST(reads_bench) {
                     b.recs.push_back(std::move(in));
                 }
                 Result r = put(b);
-                if (r.status != P4_OK) std::printf("  put: %d %s\n", r.status, r.err.c_str());
+                if (r.status != FLATSQL_OK) std::printf("  put: %d %s\n", r.status, r.err.c_str());
             }
             putMs.push_back(double(flatsql::ps::monoNs() - s) / 1e6);
             const uint64_t s2 = flatsql::ps::monoNs();
             Result r = supersede(batch);
-            if (r.status != P4_OK) std::printf("  supersede: %d %s\n", r.status, r.err.c_str());
+            if (r.status != FLATSQL_OK) std::printf("  supersede: %d %s\n", r.status, r.err.c_str());
             supMs.push_back(double(flatsql::ps::monoNs() - s2) / 1e6);
             cycles++;
             if (cycles % 10 == 0)
@@ -1651,8 +1651,8 @@ P4_SLOW_TEST(reads_bench) {
                     TlvW all, lim;
                     all.text(1, ty).u8(30, uint8_t(prof)).i64(31, 1789371001);
                     lim.text(1, ty).u8(30, uint8_t(prof)).i64(31, 1789371001).u64(3, 200).u64(4, off);
-                    Result ra = call(P4_OPC_EPOCH, all.b, co), rl = call(P4_OPC_EPOCH, lim.b, co);
-                    bool same = ra.status == P4_OK && rl.status == P4_OK;
+                    Result ra = call(FLATSQL_OPC_EPOCH, all.b, co), rl = call(FLATSQL_OPC_EPOCH, lim.b, co);
+                    bool same = ra.status == FLATSQL_OK && rl.status == FLATSQL_OK;
                     size_t want = ra.rows.size() > off ? std::min<size_t>(200, ra.rows.size() - off) : 0;
                     same = same && rl.rows.size() == want;
                     for (size_t i = 0; same && i < rl.rows.size(); i++) same = rl.s(i, "cid") == ra.s(i + off, "cid");
@@ -1668,8 +1668,8 @@ P4_SLOW_TEST(reads_bench) {
                             cnt.i64(32, win);
                             rows.i64(32, win);
                         }
-                        Result rc = call(P4_OPC_EPOCH, cnt.b, co), rr = call(P4_OPC_EPOCH, rows.b, co);
-                        const bool ok = rc.status == P4_OK && rc.rows.size() == 1 && rc.i(0, "n") == int64_t(rr.rows.size());
+                        Result rc = call(FLATSQL_OPC_EPOCH, cnt.b, co), rr = call(FLATSQL_OPC_EPOCH, rows.b, co);
+                        const bool ok = rc.status == FLATSQL_OK && rc.rows.size() == 1 && rc.i(0, "n") == int64_t(rr.rows.size());
                         std::printf("  %s profile %d count (max delta %lld): %lld vs %zu rows %s\n", ty, prof, (long long)win,
                                     (long long)(rc.rows.empty() ? -1 : rc.i(0, "n")), rr.rows.size(), ok ? "equal" : "DIFFER");
                         if (!ok) bad++;
@@ -1679,13 +1679,13 @@ P4_SLOW_TEST(reads_bench) {
         for (uint64_t off : {uint64_t(0), uint64_t(1500)}) {
             TlvW all, win;
             all.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(2, 1).u64(3, 1000000);
-            win.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(5, P4_ORDER_CID).u8(2, 1).u64(3, 1000).u64(4, off);
-            Result ra = call(P4_OPC_SCAN, all.b, co), rw = call(P4_OPC_WINDOW, win.b, co);
+            win.text(1, "OMM").text(12, "celestrak-gp").text(13, "OMM-celestrak-gp-b052").u8(5, FLATSQL_ORDER_CID).u8(2, 1).u64(3, 1000).u64(4, off);
+            Result ra = call(FLATSQL_OPC_SCAN, all.b, co), rw = call(FLATSQL_OPC_WINDOW, win.b, co);
             std::vector<std::string> cids;
             for (size_t i = 0; i < ra.rows.size(); i++) cids.push_back(ra.s(i, "cid"));
             std::sort(cids.begin(), cids.end());
             cids.erase(std::unique(cids.begin(), cids.end()), cids.end());
-            bool same = ra.status == P4_OK && rw.status == P4_OK;
+            bool same = ra.status == FLATSQL_OK && rw.status == FLATSQL_OK;
             const size_t want = cids.size() > off ? std::min<size_t>(1000, cids.size() - off) : 0;
             same = same && rw.rows.size() == want;
             for (size_t i = 0; same && i < rw.rows.size(); i++) same = rw.s(i, "cid") == cids[i + off];
@@ -1696,10 +1696,10 @@ P4_SLOW_TEST(reads_bench) {
         // An unfiltered CID window at an offset = the walk from the start.
         for (auto tw : {std::make_pair("CAT", uint64_t(60000)), std::make_pair("IQC", uint64_t(100000))}) {
             TlvW all, win;
-            all.text(1, tw.first).u8(5, P4_ORDER_CID).u8(2, 0).u64(3, tw.second + 200);
-            win.text(1, tw.first).u8(5, P4_ORDER_CID).u8(2, 0).u64(3, 200).u64(4, tw.second);
-            Result ra = call(P4_OPC_WINDOW, all.b, co), rw = call(P4_OPC_WINDOW, win.b, co);
-            bool same = ra.status == P4_OK && rw.status == P4_OK && ra.rows.size() == tw.second + rw.rows.size() &&
+            all.text(1, tw.first).u8(5, FLATSQL_ORDER_CID).u8(2, 0).u64(3, tw.second + 200);
+            win.text(1, tw.first).u8(5, FLATSQL_ORDER_CID).u8(2, 0).u64(3, 200).u64(4, tw.second);
+            Result ra = call(FLATSQL_OPC_WINDOW, all.b, co), rw = call(FLATSQL_OPC_WINDOW, win.b, co);
+            bool same = ra.status == FLATSQL_OK && rw.status == FLATSQL_OK && ra.rows.size() == tw.second + rw.rows.size() &&
                         rw.rows.size() == 200;
             for (size_t i = 0; same && i < rw.rows.size(); i++) same = rw.s(i, "cid") == ra.s(i + tw.second, "cid");
             std::printf("  R13 %s cid window offset %llu: %zu rows %s\n", tw.first, (unsigned long long)tw.second,
@@ -1712,10 +1712,10 @@ P4_SLOW_TEST(reads_bench) {
     }
     if (const long rounds = argInt("burst", 0)) {
         // Open, then every shape at once from its own caller (M01's first
-        // reads after open), --burst rounds: every answer must be P4_OK.
+        // reads after open), --burst rounds: every answer must be FLATSQL_OK.
         int errors = 0;
         for (long round = 0; round < rounds; round++) {
-            if (round > 0) REQUIRE(openEngine(store + "/fsql4", o) == P4_OK, "reopen");
+            if (round > 0) REQUIRE(openEngine(store + "/fsql4", o) == FLATSQL_OK, "reopen");
             std::vector<std::thread> th;
             std::vector<Result> res(shapes.size());
             Result wr;
@@ -1747,12 +1747,12 @@ P4_SLOW_TEST(reads_bench) {
             for (size_t i = 0; i < shapes.size(); i++)
                 th.emplace_back([&, i] { res[i] = call(shapes[i].op, shapes[i].t.b, co); });
             for (auto& t : th) t.join();
-            if (!argStr("bfbs", "").empty() && wr.status != P4_OK) {
+            if (!argStr("bfbs", "").empty() && wr.status != FLATSQL_OK) {
                 errors++;
                 std::printf("  round %ld: write -> %d %s\n", round, wr.status, wr.err.c_str());
             }
             for (size_t i = 0; i < shapes.size(); i++)
-                if (res[i].status != P4_OK) {
+                if (res[i].status != FLATSQL_OK) {
                     errors++;
                     std::printf("  round %ld: %s -> %d %s\n", round, shapes[i].name.c_str(), res[i].status, res[i].err.c_str());
                 }
@@ -1788,7 +1788,7 @@ P4_SLOW_TEST(reads_bench) {
             rows = r.rows.size();
             st = r.status;
             ex = r.rowsExamined;
-            if (sh.op == P4_OPC_HEAD && r.rows.size() == 1 && i == 0) rows = size_t(r.i(0, "n"));
+            if (sh.op == FLATSQL_OPC_HEAD && r.rows.size() == 1 && i == 0) rows = size_t(r.i(0, "n"));
         }
         if (!argStr("dump", "").empty() && sh.name.find(argStr("dump", "")) != std::string::npos) {
             Result r = call(sh.op, sh.t.b, co);

@@ -1,5 +1,24 @@
 # Changelog
 
+
+## 3.12.0
+
+- Unify the public API and native ABI around one persistent WASI threads engine.
+- Accept binary reflection schemas and FlatBuffer record streams; use canonical
+  SDS QRP for typed SQL requests and result pages and SDS GJN for geometry.
+- Remove alternate engines and package entry points, in-engine JSON/GeoJSON/WKT
+  conversion, SQLite JSON, and obsolete generated artifacts. Conversion is a
+  separate program, such as flatc-wasm.
+- Add the binary streaming CLI, bundled generic Node/browser hosts, and a browser
+  GJN demo using the identical shipped WASM bytes.
+- Correct convex polygon boolean results; explicitly reject unsupported polygon
+  operands. Define collection, hole, altitude and derived-geometry semantics.
+- Persist an empty type registry before publishing registration, so empty schemas
+  reopen correctly on hosts without directory enumeration.
+- Gate releases on the installed tarball API/CLI, short native persistence and
+  compaction E2Es, artifact integrity and reproducible WASI builds. No unit suites.
+
+
 ## 3.11.1
 
 - Preserve positional writes in the Node filesystem adapter on Linux by

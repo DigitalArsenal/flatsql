@@ -1,3 +1,4 @@
+#include "flatsql/query_page.h"
 // FlatSQL store format 5 ("p4"): engine internals. FORMAT.md defines the bytes.
 //
 // One source feed x standard is one feed (CONTRACT C-37, C-38, owner layout of
@@ -82,7 +83,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "flatsql/p4/flatsql_p4.h"
+#include "flatsql/flatsql.h"
 #include "flatsql/p4/p4_reader.h"
 #include "flatsql/ps/platform.h"
 #include "flatsql/ps/result_block.h"
@@ -205,7 +206,7 @@ void decodeMarkers(const uint8_t* store, size_t storeLen, const uint8_t* mig, si
 
 // ---- host file helpers (flatsql_io) -------------------------------------------------------
 bool ioExists(const std::string& path);
-int32_t ioReadAll(const std::string& path, std::vector<uint8_t>* out);  // P4_E_IO when absent
+int32_t ioReadAll(const std::string& path, std::vector<uint8_t>* out);  // FLATSQL_E_IO when absent
 int32_t ioWriteNew(const std::string& path, const uint8_t* p, size_t n);  // CREATE|TRUNC|CREATE_PARENTS, write, sync
 int32_t ioAppend(const std::string& path, const uint8_t* p, size_t n);    // append, sync
 int32_t ioUnlink(const std::string& path);                                 // absent is fine
@@ -421,7 +422,7 @@ struct Feed {
     std::map<InstId, InstCount> inst;   // live instances (n > 0)
     std::map<uint32_t, TokCount> tokc;  // type token id -> its copies in this file (n > 0)
     bool created = false;      // exists on disk with its schema (readers skip it until then)
-    bool quarantined = false;  // corrupt: P4_E_CORRUPT for ops that need it
+    bool quarantined = false;  // corrupt: FLATSQL_E_CORRUPT for ops that need it
     bool indexed = true;       // secondary indexes present (false between a migration's append and REBUILD 1)
     bool registered = false;   // in the type index (a write registers it before its first commit)
     int64_t dbBytes = -1, freeBytes = 0;  // pages and free pages after its writer's last commit (-1: not read)
@@ -598,7 +599,7 @@ struct alignas(64) SlotHeader {
     uint32_t thread;
     uint8_t zero[44];
 };
-static_assert(sizeof(SlotHeader) == FLATSQL_P4_SLOT_HEADER, "slot header is 448 bytes");
+static_assert(sizeof(SlotHeader) == FLATSQL_SLOT_HEADER, "slot header is 448 bytes");
 
 struct alignas(16) QCell {
     std::atomic<uint64_t> seq;
@@ -636,7 +637,7 @@ struct CarStats;
 struct Internal {
     bool force = false; // explicit compaction request, independent of dead-byte heuristic
     std::atomic<bool> done{false};
-    int32_t status = P4_OK;
+    int32_t status = FLATSQL_OK;
     std::string err;
     int64_t a = 0, b = 0;  // QUOTA: records, bytes; REBUILD: entries, mismatches; COMPACT: bytes before, after
     std::vector<std::pair<uint32_t, int64_t>> seqs;  // QUOTA: the (feed, seq) row sets to delete
@@ -665,7 +666,7 @@ struct WriterState {
     std::condition_variable icv, dcv;  // work for the indexer; a unit done
     std::deque<PutUnit*> iq;
     bool istop = false;
-    int32_t poison = P4_OK;
+    int32_t poison = FLATSQL_OK;
     std::thread indexer;
     // Merges (the indexer's, between rounds) never run while the writer
     // reads and writes the feed files itself (hold, set by drain): the
@@ -803,7 +804,7 @@ struct P4Engine {
         return reinterpret_cast<flatsql::p4::SlotHeader*>(slotBase[p] + size_t(k) * slotStride[p]);
     }
     uint32_t poolOf(uint32_t i) const { return i < nSlots[0] ? 0 : 1; }
-    uint8_t* slotReq(uint32_t i) { return reinterpret_cast<uint8_t*>(slot(i)) + FLATSQL_P4_SLOT_HEADER; }
+    uint8_t* slotReq(uint32_t i) { return reinterpret_cast<uint8_t*>(slot(i)) + FLATSQL_SLOT_HEADER; }
     uint8_t* slotRing(uint32_t i) { return slotReq(i) + reqBytes[poolOf(i)]; }
     void bump(int s, uint64_t n = 1) { stat[s].fetch_add(n, std::memory_order_relaxed); }
     void wake(uint32_t thread);
@@ -826,6 +827,7 @@ struct P4Lane {
     uint32_t ringBytes = 0;
     uint64_t maxRows = 0, maxBytes = 0, maxResultRows = 0, maxResultBytes = 0, heapCap = 0;
     uint64_t rowsExamined = 0, bytesRead = 0, rowsOut = 0, outBytes = 0;
+    uint64_t deadlineNs = 0;
     int32_t trip = 0;  // a cap or cancel that tripped (sticky for the op)
     std::string err;   // the op's error text (p4_lane_set_error, C-19)
     // per-thread caches
@@ -866,13 +868,13 @@ std::string streamPath(const Feed* f, uint32_t gen);
 std::shared_ptr<Stream> streamCur(Feed* f, int32_t* rc);
 // The stream of generation gen for a reader whose snapshot names gen: the
 // current one, or the one a compaction just replaced while it is kept. nullptr
-// with *rc == P4_OK: that generation is gone (the snapshot is older than the
+// with *rc == FLATSQL_OK: that generation is gone (the snapshot is older than the
 // grace: the caller starts a new read transaction).
 std::shared_ptr<Stream> streamAt(Feed* f, uint32_t gen, int32_t* rc);
 // The record bytes of the frame at off: its size prefix must be len. frame:
 // the whole frame, the size prefix kept.
 int32_t streamRead(Stream* s, int64_t off, int64_t len, std::string* out, bool frame = false);
-// n bytes of the stream at off (several frames at once): P4_E_CORRUPT when it ends first.
+// n bytes of the stream at off (several frames at once): FLATSQL_E_CORRUPT when it ends first.
 int32_t streamReadRange(Stream* s, int64_t off, size_t n, std::string* out);
 // Appends bytes at off (the caller's end); syncs when sync is set.
 int32_t streamWrite(Stream* s, int64_t off, const uint8_t* p, size_t n);
@@ -1158,7 +1160,7 @@ public:
     Type* type = nullptr;
     bool seeded = false;  // planned on pending units' state
     std::atomic<bool> done{false};
-    int32_t status = P4_OK;
+    int32_t status = FLATSQL_OK;
 };
 // prevs: the writer's pending units, oldest first (those of the type seed it).
 std::unique_ptr<PutUnit> putPlan(P4Engine* e, Type* t, std::vector<WriteTask*>& tasks, const std::vector<const PutUnit*>& prevs);
@@ -1218,7 +1220,7 @@ int32_t runOnWriter(P4Engine* e, Type* t, int op, Internal* in);
 // ---- mailbox.cpp --------------------------------------------------------------------------------------
 extern thread_local uint32_t tThread;  // the running service thread's index
 int32_t mailboxInit(P4Engine* e, std::string* err);
-void mailboxLayout(P4Engine* e, FlatsqlP4Layout* out);
+void mailboxLayout(P4Engine* e, FlatSQLLayout* out);
 int32_t startThreads(P4Engine* e);
 // Queues a write task on its type's writer (internal tasks too).
 void pushTask(P4Engine* e, Type* t, WriteTask* wt);
@@ -1235,7 +1237,7 @@ struct SlotOut {
     P4Engine* e;
     uint32_t slot;
     std::vector<uint8_t> buf;
-    ps::rb1::Encoder enc{&buf};
+    query::Encoder enc{&buf};
     uint64_t rows = 0;
     explicit SlotOut(P4Engine* eng, uint32_t s) : e(eng), slot(s) {}
     int32_t flush();  // buffered bytes to the ring

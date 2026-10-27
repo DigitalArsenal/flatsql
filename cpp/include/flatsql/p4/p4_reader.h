@@ -8,20 +8,20 @@ typedef struct P4Engine P4Engine;
 typedef struct P4Lane P4Lane;
 typedef struct P4Cursor P4Cursor;
 
-enum { P4_ORDER_SEQ_ASC = 1, P4_ORDER_SEQ_DESC = 2, P4_ORDER_W_DESC = 3, P4_ORDER_CID = 4,
+enum { FLATSQL_ORDER_SEQ_ASC = 1, FLATSQL_ORDER_SEQ_DESC = 2, FLATSQL_ORDER_W_DESC = 3, FLATSQL_ORDER_CID = 4,
        /* SCAN over the mailbox only (C-39; p4_cursor_open refuses them): format 1's two-part pages, the
         * tagged records (feed files) in the order with the offset, then, without a lane filter, the
         * untagged (local) records from the start. NEWEST: delivery time desc, CID asc; local ts desc,
         * CID asc. RECENT: delivery time desc, seq desc; local seq desc. In NEWEST and RECENT a tagged
         * record's tag is the instance it is ordered by, its newest matching one (C-41 N9).
         * W_ASC: w asc, CID asc. */
-       P4_ORDER_NEWEST = 5, P4_ORDER_RECENT = 6, P4_ORDER_W_ASC = 7 };
-enum { P4_F_EPOCH = 1, P4_F_TS = 2, P4_F_W = 3, P4_F_EPOCH_DAY = 4,
-       P4_F_COL0 = 10, P4_F_COL1 = 11, P4_F_COL2 = 12, P4_F_COL3 = 13 };
-enum { P4_OP_EQ = 1, P4_OP_NE, P4_OP_LT, P4_OP_LE, P4_OP_GT, P4_OP_GE, P4_OP_BETWEEN, P4_OP_LIKE,
-       P4_OP_IN, P4_OP_NOTNULL };
-#define P4_SLOT_RAW 1u
-#define P4_SLOT_SANDBOX 2u
+       FLATSQL_ORDER_NEWEST = 5, FLATSQL_ORDER_RECENT = 6, FLATSQL_ORDER_W_ASC = 7 };
+enum { FLATSQL_F_EPOCH = 1, FLATSQL_F_TS = 2, FLATSQL_F_W = 3, FLATSQL_F_EPOCH_DAY = 4,
+       FLATSQL_F_COL0 = 10, FLATSQL_F_COL1 = 11, FLATSQL_F_COL2 = 12, FLATSQL_F_COL3 = 13 };
+enum { FLATSQL_OP_EQ = 1, FLATSQL_OP_NE, FLATSQL_OP_LT, FLATSQL_OP_LE, FLATSQL_OP_GT, FLATSQL_OP_GE, FLATSQL_OP_BETWEEN, FLATSQL_OP_LIKE,
+       FLATSQL_OP_IN, FLATSQL_OP_NOTNULL };
+#define FLATSQL_SLOT_RAW 1u
+#define FLATSQL_SLOT_SANDBOX 2u
 
 typedef struct P4Value { uint8_t type; int64_t i; double d; const uint8_t* s; uint32_t n; } P4Value; /* RB1 cell type 0..4 */
 typedef struct P4Pred { uint8_t field, op; uint16_t nvals; const P4Value* vals; } P4Pred;
@@ -36,7 +36,7 @@ typedef struct P4ScanSpec {
     int64_t seqThrough;          /* inclusive; 0 = none; always clamped to visible-through */
     const P4Pred* preds; uint32_t nPreds;
     const char* search;          /* FTS5 match; NULL = none */
-    uint8_t order;               /* P4_ORDER_* */
+    uint8_t order;               /* FLATSQL_ORDER_* */
     uint8_t hydrate;
     uint8_t noTags;              /* 1: the caller reads no row's tag (P4Row.tag may be NULL) */
     uint8_t part;                /* 0 every file; 2 the type's local file only; 3 the local file plus the feed files the
@@ -62,12 +62,12 @@ typedef struct P4TypeInfo { const char* name; const uint8_t* bfbs; uint32_t bfbs
                             uint64_t a18Bound; uint8_t epochProfile; uint8_t fullText;
                             const char* rules; uint32_t rulesLen; } P4TypeInfo;   /* rules: tag-4 text, verbatim (v2, C-16) */
 
-int32_t   p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out);  /* P4_OK or status */
-int32_t   p4_cursor_next(P4Cursor* c, P4Row* row);   /* 1 row, 0 end, < 0 status (P4_E_BUDGET, P4_E_CANCELLED, ...) */
+int32_t   p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out);  /* FLATSQL_OK or status */
+int32_t   p4_cursor_next(P4Cursor* c, P4Row* row);   /* 1 row, 0 end, < 0 status (FLATSQL_E_BUDGET, FLATSQL_E_CANCELLED, ...) */
 void      p4_cursor_close(P4Cursor* c);
-int32_t   p4_lane_check(P4Lane* lane);               /* P4_OK, P4_E_CANCELLED or P4_E_BUDGET (progress handler) */
+int32_t   p4_lane_check(P4Lane* lane);               /* FLATSQL_OK, FLATSQL_E_CANCELLED or FLATSQL_E_BUDGET (progress handler) */
 int32_t   p4_emit(P4Lane* lane, const uint8_t* bytes, uint32_t n);   /* append to the slot's ring; may wait for space;
-                                                                       P4_OK, P4_E_CANCELLED, P4_E_BUDGET (result bytes) */
+                                                                       FLATSQL_OK, FLATSQL_E_CANCELLED, FLATSQL_E_BUDGET (result bytes) */
 P4Engine* p4_lane_engine(P4Lane* lane);
 void*     p4_lane_sql_state(P4Lane* lane);
 void      p4_lane_set_sql_state(P4Lane* lane, void* state);
