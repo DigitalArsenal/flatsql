@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.11.1
+
+- Install the pinned SDS schema dependency before CMake configures native and
+  WASM CI builds.
+- Use explicit 64-bit bounds when recovery combines SQLite sequence values
+  with engine counters, fixing Linux compilation.
+- Check the current format-5 refusal message in the old-store rejection E2E.
+- Keep crash-verifier metadata and row offsets in one read snapshot and hold
+  its stream generation through compaction. A real-store E2E forces compaction
+  during verification without weakening the existing durability checks.
+- Show live main-branch CI status and the current published npm version on the
+  website.
+
 ## 3.11.0
 
 Store format 5, item 5: FlatBuffer index segments answer two read paths
