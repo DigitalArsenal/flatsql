@@ -10,6 +10,9 @@
 - Keep crash-verifier metadata and row offsets in one read snapshot and hold
   its stream generation through compaction. A real-store E2E forces compaction
   during verification without weakening the existing durability checks.
+- Measure idle reader memory after stopping background writes and warming the
+  settled store, retaining the existing growth limit and checking cache budgets
+  during the idle rounds as well as ingest.
 - Show live main-branch CI status and the current published npm version on the
   website.
 

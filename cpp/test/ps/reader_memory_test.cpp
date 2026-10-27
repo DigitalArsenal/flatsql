@@ -290,13 +290,21 @@ PS_TEST(reader_point_memory_plateaus_under_commits) {
     stop = true;
     for (auto& t : prod) t.join();
     REQUIRE(waitLabeledEngine(s.e.get(), pids, 60000000000ull));
-    sleepNs(500000000);  // merges settle
-    round(2000, true);   // the caches meet the settled store
+    // An idle-store measurement needs a fixed store. A timed sleep does not
+    // stop background merges from publishing new runs and invalidating the
+    // reader's caches, especially on the slower debug CI runners.
+    REQUIRE(s.e->stop() == 0);
+    // Warm the settled store with the same workload size that we measure.
+    // The ingest phase can leave a much larger store on a slower reader, so
+    // 2,000 statements need not fill its caches before the idle baseline.
+    round(perRound, true);
     const int64_t idle0 = gLaneLiveBytes.load() - fixed;
+    budgets = budgets && withinBudgets(r.inst.get(), rc);
     std::vector<int64_t> idle;
     for (int k = 1; k <= 2; k++) {
         round(perRound, true);
         idle.push_back(gLaneLiveBytes.load() - fixed);
+        budgets = budgets && withinBudgets(r.inst.get(), rc);
         std::printf("  %-7s %5d %9llu %10.2f MiB %10.2f MiB\n", "idle", k, (unsigned long long)sent.load(), mib(idle.back()),
                     mib(int64_t(r.inst->lane(0)->store().config().shared->used())));
     }
@@ -314,6 +322,7 @@ PS_TEST(reader_point_memory_plateaus_under_commits) {
     report("reader_mem_lane_live_last_ingest_round", mib(live.back()), "MiB");
     report("reader_mem_lane_live_peak", mib(peak), "MiB");
     report("reader_mem_bound", mib(bound), "MiB");
+    report("reader_mem_idle_baseline", mib(idle0), "MiB");
     report("reader_mem_idle_delta", mib(idle.back() - idle0), "MiB");
     report("reader_mem_errors", double(mix.errors), "statements");
     report("reader_mem_rows_missing", double(mix.rowsMissing), "statements");
@@ -321,6 +330,8 @@ PS_TEST(reader_point_memory_plateaus_under_commits) {
     CHECK_EQ(mix.rowsMissing, uint64_t(0));
     CHECK(budgets);
     CHECK(peak <= bound);
+    CHECK(idle0 <= bound);
+    CHECK(*std::max_element(idle.begin(), idle.end()) <= bound);
     // Flat: the last half of the rounds adds at most one lane cache's worth.
     CHECK(live.back() <= live[size_t(rounds / 2)] + int64_t(rc.laneCacheBytes));
     CHECK(idle.back() - idle0 <= int64_t(64u << 10));
