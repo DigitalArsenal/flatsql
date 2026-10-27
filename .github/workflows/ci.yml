@@ -17,6 +17,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
+    - name: Install build dependencies (SDS schemas)
+      run: npm ci --ignore-scripts --include=dev
+
     - name: Install dependencies (Ubuntu)
       if: runner.os == 'Linux'
       run: |
@@ -49,6 +56,13 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
+    - name: Install build dependencies (SDS schemas)
+      run: npm ci --ignore-scripts --include=dev
 
     - name: Setup Emscripten
       uses: mymindstorm/setup-emsdk@v14
@@ -177,6 +191,9 @@ jobs:
       with:
         node-version: '24'
 
+    - name: Install dependencies (SDS schemas and Node host)
+      run: npm ci --ignore-scripts --include=dev
+
     - name: Install wasi-sdk 30, ninja
       run: |
         sudo apt-get update
@@ -207,9 +224,6 @@ jobs:
         # weak defaults answer ops 30/31 with P4_E_UNSUPPORTED. Fail, never skip.
         ls cpp/src/p4sql/*.cpp >/dev/null 2>&1 || { echo "::error::cpp/src/p4sql is absent: the p4 engine ships with the SQL surface"; exit 1; }
         ls cpp/tests/p4sql/*.cpp >/dev/null 2>&1 || { echo "::error::cpp/tests/p4sql has no engine-backed SQL tests"; exit 1; }
-
-    - name: Install dependencies (the Node host imports space-data-module-sdk)
-      run: npm ci --ignore-scripts
 
     - name: Build the wasi-threads artifacts and test commands
       run: bash scripts/build-wasm.sh --ps-tests
