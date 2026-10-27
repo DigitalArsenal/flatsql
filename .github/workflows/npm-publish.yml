@@ -75,7 +75,10 @@ jobs:
         if: always()
         with:
           name: release-e2e-results
-          path: ci-results
+          path: |
+            ci-results
+            wasm/flatsql.wasm
+            wasm/integrity.json
       - name: Dry run package
         if: github.event_name == 'workflow_dispatch' && inputs.dry_run
         run: npm publish --dry-run
