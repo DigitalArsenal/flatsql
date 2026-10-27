@@ -260,7 +260,9 @@ export class FlatSQL {
         if (Atomics.load(this.#i32, state) === 5) {
           finished = true;
           const status = this.#view.getInt32(h + 88, true);
-          if (status < 0) throw new FlatSQLError(status, decoder.decode(this.#u8.subarray(h + 144, h + 144 + Math.min(256, this.#view.getUint32(h + 92, true)))));
+          // Browser TextDecoder rejects SharedArrayBuffer views. Copy only the
+          // bounded diagnostic; the record/result transport stays binary.
+          if (status < 0) throw new FlatSQLError(status, decoder.decode(this.#u8.slice(h + 144, h + 144 + Math.min(256, this.#view.getUint32(h + 92, true)))));
           break;
         }
         await pause();

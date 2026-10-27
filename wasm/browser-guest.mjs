@@ -8,7 +8,10 @@ async function init(bytes, options) {
   memory = new WebAssembly.Memory({ initial: 512, maximum: options.maximumPages ?? 8192, shared: true });
   const processState = createSharedWasiProcess({ env: {} });
   io = await createFlatsqlIoWorker({ backend: options.backend ?? 'opfs', rootDirectory: options.root ?? 'flatsql',
-    workerUrl: options.ioWorkerUrl, onError: fatal, lock: { name: `flatsql/${options.root ?? 'flatsql'}`, ifAvailable: true } });
+    workerUrl: options.ioWorkerUrl, onError: fatal,
+    // Memory stores own disjoint backing maps. Only durable OPFS stores share
+    // files and require an origin-wide lock on their root.
+    lock: options.backend === 'memory' ? undefined : { name: `flatsql/${options.root ?? 'flatsql'}`, ifAvailable: true } });
   await io.attachMemory(0, memory);
   const descriptors = [{ provider: 'flatsql-io', instanceId: 0, channels: [io.buffer] }];
   const wasi = createBrowserWasiShim({ processState });
