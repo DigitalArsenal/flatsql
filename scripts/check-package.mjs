@@ -11,7 +11,9 @@ function run(command,args,options={}) {
  assert.equal(r.status,0,`${command}: ${r.error??r.stderr}\n${r.stdout}`);return r.stdout;
 }
 try {
- const [pack]=JSON.parse(run('npm',['pack','--ignore-scripts','--json','--pack-destination',temp]));
+ // npm publish --dry-run exports npm_config_dry_run to lifecycle scripts.
+ // This local test still needs a real tarball to exercise the installed bytes.
+ const [pack]=JSON.parse(run('npm',['pack','--dry-run=false','--ignore-scripts','--json','--pack-destination',temp]));
  const files=pack.files.map(f=>f.path);
  for(const name of files) assert.match(name,/^(?:package\.json|README\.md|LICENSE|docs\/API-3\.12\.md|bin\/flatsql\.mjs|cpp\/README\.md|cpp\/include\/flatsql\/flatsql(?:_io)?\.h|wasm\/(?:index\.(?:js|d\.ts)|flatsql\.wasm|integrity\.json|runtime\/[\w.-]+\.(?:mjs|txt)))$/,name);
  assert.deepEqual(files.filter(f=>f.endsWith('.wasm')),['wasm/flatsql.wasm']);
