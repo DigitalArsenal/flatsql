@@ -75,6 +75,26 @@ try {
  assert.equal(await evaluate('crossOriginIsolated'),true);
  const diagnostic=await evaluate(`(async()=>{const {FlatSQL}=await import('/flatsql/assets/unified/api.mjs');const a=await FlatSQL.open({backend:'memory'});let b;try{b=await FlatSQL.open({backend:'memory'});try{await a.execute(new Uint8Array(${JSON.stringify(Array.from(invalidQuery))}));return null}catch(error){return {name:error.name,status:error.status,message:error.message}}}finally{await b?.close();await a.close()}})()`);
  assert.equal(diagnostic.name,'FlatSQLError');assert.equal(diagnostic.status,-13);assert.match(diagnostic.message,/json|function/i);
+ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSource}},JSON.stringify({SQL:'SELECT DISTINCT _data FROM GJN',REPRESENTATION:'FlatBuffer'}),{sizePrefix:true,strictJson:true});
+ const cleared=await evaluate(`(async()=>{
+   const {FlatSQL}=await import('/flatsql/assets/unified/api.mjs');
+   const bfbs=new Uint8Array(await (await fetch('/flatsql/assets/unified/GJN.bfbs')).arrayBuffer());
+   const frames=new Uint8Array(await (await fetch('/flatsql/assets/unified/samples.fb')).arrayBuffer());
+   const frame=frames.slice(0,4+new DataView(frames.buffer).getUint32(0,true));
+   const query=new Uint8Array(${JSON.stringify(Array.from(rawQuery))});
+   let db=await FlatSQL.open({root:'multi-source-e2e'});
+   try {
+     await db.registerSchema({name:'GJN',fileIdentifier:'$GJN',bfbs});
+     for(let i=0;i<12;i++)await db.ingest('GJN',frame,{source:'source-'+i,provider:'provider-'+i});
+     await db.close();db=await FlatSQL.open({root:'multi-source-e2e'});
+     const before=await db.execute(query,{records:true});
+     if(before.length!==frame.length||!before.every((b,i)=>b===frame[i]))throw Error('Shared record changed');
+     await db.remove('GJN',frame);
+     await db.close();db=await FlatSQL.open({root:'multi-source-e2e'});
+     return (await db.execute(query,{records:true})).length;
+   }finally{await db.close();}
+ })()`);
+ assert.equal(cleared,0);
  await evaluate("document.getElementById('btnBinaryIngest').click()");
  await wait(`(${status}).startsWith('3 binary records loaded')`,'binary ingest');
  assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('tbody tr')).map(r=>Array.from(r.cells).map(c=>c.textContent))"),[['1','1','96','0'],['2','0','0','0'],['3','0','0','111.19492664455873']]);
@@ -86,6 +106,8 @@ try {
    if(expected)assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('tbody tr')).map(r=>Array.from(r.cells).map(c=>c.textContent))"),expected);
  };
  await query('SELECT _rowid FROM GJN WHERE geo_contains(_data,2,2)',[['1']]);
+ await query("SELECT p.provider,p.source FROM GJN r JOIN flatsql_provenance('GJN',r._cid) p ORDER BY r._rowid",Array.from({length:3},()=>['demo','flatc-wasm']));
+ await shot('binary-provenance');
  await query('SELECT _rowid,geo_envelope(_data) FROM GJN');
  assert.equal(await evaluate("document.querySelectorAll('tbody tr').length"),3);
  assert.match(await evaluate("document.querySelector('tbody tr').lastElementChild.textContent"),/^\d+ bytes$/);
@@ -94,6 +116,7 @@ try {
  await wait(`(${status}).startsWith('Reopened')`,'durable reopen');
  assert.equal(await evaluate("document.querySelector('tbody').innerText"),'3');
  await send('Page.reload');await wait(`(${status}).startsWith('Ready')`,'page reload');
+ await query("SELECT count(*) FROM GJN r JOIN flatsql_provenance('GJN',r._cid) p WHERE p.provider='demo' AND p.source='flatc-wasm'",[['3']]);
  await query('SELECT COUNT(*) FROM GJN',[['3']]);
  await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
  await shot('binary-mobile');

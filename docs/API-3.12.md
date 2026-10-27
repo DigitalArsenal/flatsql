@@ -42,6 +42,18 @@ There are no PS/P4 selectors, old engine aliases, or compatibility modes.
   query, and never treat that condition as zero matches.
 - Hidden metadata columns `_cid`, `_seq`, `_ts`, `_epoch`, `_producer`, `_peer`
   and `_signature` are available alongside `_source`, `_rowid` and `_data`.
+- `flatsql_provenance(type, cid)` is a SQL table-valued function returning every
+  persisted copy and source tag for that content record. Both arguments are
+  required; `cid` is the `_cid` text from the record relation. Join it to the
+  record relation to preserve provider, source, batch, producer, original peer,
+  timestamp and signature when copying records. Its columns are `cid`, `seq`,
+  `producer`, `peer`, `ts`, `sig`, `provider`, `source`, `source_url`, `batch`,
+  `content_key_id`, `producer_peer`, `producer_pubkey` and `at`. Untagged copies
+  have NULL tag columns. Use distinct CIDs when joining the ordinary record
+  relation: a CID can occur in several feeds, and `_source` alone does not
+  enumerate every membership. Results use the same
+  typed QRP pages and query budgets as other SQL queries.
+  The function name is reserved and cannot be registered as a schema name.
 - Root scalar/string/byte-vector fields are exposed by BFBS reflection.
   Complex/nested fields remain in `_data`. Unsigned integers above the SQLite
   signed 64-bit range produce an error; retrieve `_data` to preserve them.

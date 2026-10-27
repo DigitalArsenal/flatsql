@@ -51,8 +51,9 @@ let db;
 try {
   db=await FlatSQL.open({root});
   await db.registerSchema({name:'GJN',fileIdentifier:'$GJN',bfbs,fullText:true});
+  await assert.rejects(db.registerSchema({name:'FlatSQL_Provenance',fileIdentifier:'$GJN',bfbs}), e=>e.status<0);
   await db.close();db=await FlatSQL.open({root});
-  const ingest=rows(await db.ingest('GJN',record,{source:'customer',provider:'external-flatc',signatures:[new Uint8Array([1,2,3,4])]}));
+  const ingest=rows(await db.ingest('GJN',record,{source:'customer',provider:'external-flatc',batch:'first',producer:'peer-A',timestamp:1700000000,signatures:[new Uint8Array([1,2,3,4])]}));
   assert.equal(ingest.length,1);
   assert.deepEqual(rows(await db.execute(request('SELECT _signature FROM GJN')))[0][0].BYTES_VALUE,[1,2,3,4]);
   const searchUntil = Date.now() + 10000;
@@ -107,8 +108,31 @@ try {
   db=await FlatSQL.open({root});
   assert.deepEqual(await db.execute(request('SELECT _data FROM GJN'),{records:true}),record);
   assert.equal(rows(await db.execute(request('SELECT COUNT(*) FROM "GJN@customer"')))[0][0].INT_VALUE,1);
-  assert.equal(rows(await db.remove('GJN',record))[0][0].INT_VALUE,1);
+  // One content record can have several independent copies and source tags.
+  // Read all of them through the same SQL/QRP interface, including after reopen.
+  await db.ingest('GJN',record,{source:'customer',provider:'second-provider',batch:'second',producer:'peer-B',timestamp:1700000001,signatures:[Uint8Array.of(8,9)]});
+  await db.ingest('GJN',record,{source:'archive',provider:'second-provider',batch:'third',producer:'peer-B',timestamp:1700000001,signatures:[Uint8Array.of(8,9)]});
+  const provenanceSql = "SELECT p.provider,p.source,p.batch,p.peer,p.ts,p.sig FROM (SELECT DISTINCT _cid FROM GJN) r JOIN flatsql_provenance('GJN',r._cid) p ORDER BY p.provider,p.source,p.batch";
+  const provenance = async () => rows(await db.execute(request(provenanceSql),{sandbox:true})).map(row=>row.map(c=>c.KIND==='Text'?c.TEXT_VALUE:c.KIND==='Int'?c.INT_VALUE:c.KIND==='Bytes'?c.BYTES_VALUE:c.KIND));
+  const expectedProvenance = [
+    ['external-flatc','customer','first','peer-A',1700000000,[1,2,3,4]],
+    ['second-provider','archive','third','peer-B',1700000001,[8,9]],
+    ['second-provider','customer','second','peer-B',1700000001,[8,9]],
+  ];
+  assert.deepEqual(await provenance(),expectedProvenance);
+  await assert.rejects(db.execute(request(provenanceSql),{maxRows:1}),e=>e.status<0);
+  await assert.rejects(db.execute(request("SELECT * FROM flatsql_provenance('GJN','bad-cid')")),e=>e.status<0);
+  await assert.rejects(db.execute(request('SELECT * FROM flatsql_provenance')),e=>e.status<0);
+  assert.equal(rows(await db.execute(request("SELECT * FROM flatsql_provenance('GJN',NULL)"))).length,0);
+  await db.close(); db=await FlatSQL.open({root});
+  assert.deepEqual(await provenance(),expectedProvenance);
+  assert.deepEqual(await db.execute(request('SELECT DISTINCT _data FROM GJN'),{records:true}),record);
+  assert.equal(rows(await db.remove('GJN',record))[0][0].INT_VALUE,2);
   assert.equal(rows(await db.execute(request('SELECT COUNT(*) FROM GJN')))[0][0].INT_VALUE,0);
+  await db.ingest('GJN',record,{producer:'untagged-peer',timestamp:1700000002});
+  const untagged=rows(await db.execute(request("SELECT provider,source,peer,ts FROM flatsql_provenance('GJN',(SELECT _cid FROM GJN LIMIT 1))")));
+  assert.deepEqual(untagged[0].map(c=>c.KIND==='Text'?c.TEXT_VALUE:c.KIND==='Int'?c.INT_VALUE:c.KIND),['Null','Null','untagged-peer',1700000002]);
+  await db.remove('GJN',record);
   await db.close();db=await FlatSQL.open({root});
   assert.equal(rows(await db.execute(request('SELECT COUNT(*) FROM GJN')))[0][0].INT_VALUE,0);
 

@@ -589,6 +589,110 @@ sqlite3_module gRelModule = {
     nullptr,  // xIntegrity
 };
 
+// Point lookup of every persisted copy and tag, including copies hidden by
+// the deduplicated record relation. Same SQL/QRP boundary as record queries.
+struct ProvenanceVtab : sqlite3_vtab { LaneState* ls = nullptr; };
+struct ProvenanceRow {
+    std::string cid, producer, peer, sig, provider, source, url, batch, key, producerPeer, producerKey;
+    int64_t seq = 0, ts = 0, at = 0;
+    bool tagged = false;
+};
+struct ProvenanceCursor : sqlite3_vtab_cursor {
+    ProvenanceVtab* vt = nullptr;
+    std::vector<ProvenanceRow> rows;
+    std::string type, cid;
+    size_t pos = 0;
+    LaneArena* arena = nullptr;
+};
+int provenanceConnect(sqlite3* db, void* aux, int, const char* const*, sqlite3_vtab** out, char**) {
+    const int rc = sqlite3_declare_vtab(db,
+        "CREATE TABLE x(cid TEXT,seq INTEGER,producer TEXT,peer TEXT,ts INTEGER,sig BLOB,"
+        "provider TEXT,source TEXT,source_url TEXT,batch TEXT,content_key_id TEXT,"
+        "producer_peer TEXT,producer_pubkey TEXT,at INTEGER,type TEXT HIDDEN,record_cid TEXT HIDDEN)");
+    if (rc != SQLITE_OK) return rc;
+    auto* v = new ProvenanceVtab(); v->ls = static_cast<LaneState*>(aux); *out = v;
+    return SQLITE_OK;
+}
+int provenanceDisconnect(sqlite3_vtab* v) { delete static_cast<ProvenanceVtab*>(v); return SQLITE_OK; }
+int provenanceBestIndex(sqlite3_vtab*, sqlite3_index_info* info) {
+    int args[2] = {-1,-1};
+    for (int i=0; i<info->nConstraint; ++i) {
+        const auto& c = info->aConstraint[i];
+        if (c.usable && c.op == SQLITE_INDEX_CONSTRAINT_EQ && c.iColumn >= 14 && c.iColumn <= 15)
+            args[c.iColumn-14] = i;
+    }
+    // Never allow an accidental unbounded scan of provenance across a store.
+    if (args[0] < 0 || args[1] < 0) return SQLITE_CONSTRAINT;
+    for (int i=0; i<2; ++i) { info->aConstraintUsage[args[i]].argvIndex = i+1; info->aConstraintUsage[args[i]].omit = 1; }
+    info->estimatedCost = 10; info->estimatedRows = 4;
+    return SQLITE_OK;
+}
+int provenanceOpen(sqlite3_vtab* v, sqlite3_vtab_cursor** out) {
+    auto* c = new ProvenanceCursor(); c->vt = static_cast<ProvenanceVtab*>(v); *out = c; return SQLITE_OK;
+}
+int provenanceClose(sqlite3_vtab_cursor* c) { delete static_cast<ProvenanceCursor*>(c); return SQLITE_OK; }
+int32_t provenanceCopy(void* context, const P4Row* row) {
+    auto* c = static_cast<ProvenanceCursor*>(context);
+    // Engine connections use the system allocator; retained SQL result cells
+    // belong to this statement's bounded arena.
+    LaneArena* before = arenaBound(); arenaBind(c->arena);
+    ProvenanceRow r;
+    r.cid = row->cid; r.seq = row->seq; r.producer = row->producer; r.peer = row->peer; r.ts = row->ts;
+    if (row->sigLen) r.sig.assign(reinterpret_cast<const char*>(row->sig), row->sigLen);
+    if (row->tag) {
+        const P4Tag& t = *row->tag; r.tagged = true;
+        r.provider=t.provider; r.source=t.source; r.url=t.sourceUrl; r.batch=t.batch;
+        r.key=t.contentKeyId; r.producerPeer=t.producerPeer; r.producerKey=t.producerPubkey; r.at=t.at;
+    }
+    c->rows.push_back(std::move(r));
+    arenaBind(before);
+    return FLATSQL_OK;
+}
+int provenanceFilter(sqlite3_vtab_cursor* cur, int, const char*, int argc, sqlite3_value** argv) {
+    auto* c = static_cast<ProvenanceCursor*>(cur); c->rows.clear(); c->pos=0;
+    if (argc != 2) return SQLITE_ERROR;
+    if (sqlite3_value_type(argv[0]) == SQLITE_NULL || sqlite3_value_type(argv[1]) == SQLITE_NULL) return SQLITE_OK;
+    for (int i=0; i<2; ++i) {
+        if (sqlite3_value_type(argv[i]) != SQLITE_TEXT) return SQLITE_MISMATCH;
+        const auto* text = reinterpret_cast<const char*>(sqlite3_value_text(argv[i]));
+        const size_t n = size_t(sqlite3_value_bytes(argv[i]));
+        if (!text || std::memchr(text, 0, n)) return SQLITE_MISMATCH;
+        (i ? c->cid : c->type).assign(text,n);
+    }
+    c->arena = arenaBound();
+    int32_t rc;
+    { EngineCall ec; rc = p4_record_provenance(c->vt->ls->lane, c->type.c_str(), c->cid.c_str(), provenanceCopy, c); }
+    if (rc >= 0) return SQLITE_OK;
+    if (c->vt->ls->cur) c->vt->ls->cur->raise(rc,"record provenance read failed");
+    sqlite3_free(c->vt->zErrMsg); c->vt->zErrMsg = sqlite3_mprintf("record provenance read failed");
+    return SQLITE_ERROR;
+}
+int provenanceNext(sqlite3_vtab_cursor* c) { ++static_cast<ProvenanceCursor*>(c)->pos; return SQLITE_OK; }
+int provenanceEof(sqlite3_vtab_cursor* c) { auto* p=static_cast<ProvenanceCursor*>(c); return p->pos >= p->rows.size(); }
+int provenanceRowid(sqlite3_vtab_cursor* c, sqlite3_int64* id) { *id=sqlite3_int64(static_cast<ProvenanceCursor*>(c)->pos+1); return SQLITE_OK; }
+int provenanceColumn(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int col) {
+    auto* c=static_cast<ProvenanceCursor*>(cur);
+    if (c->pos >= c->rows.size()) { sqlite3_result_null(ctx); return SQLITE_OK; }
+    const auto& r=c->rows[c->pos];
+    auto text=[&](const std::string& s) { sqlite3_result_text(ctx,s.data(),int(s.size()),SQLITE_TRANSIENT); };
+    if (col >= 6 && col <= 13 && !r.tagged) { sqlite3_result_null(ctx); return SQLITE_OK; }
+    switch (col) {
+        case 0: text(r.cid); break; case 1: sqlite3_result_int64(ctx,r.seq); break;
+        case 2: text(r.producer); break; case 3: text(r.peer); break; case 4: sqlite3_result_int64(ctx,r.ts); break;
+        case 5: if(r.sig.empty()) sqlite3_result_null(ctx); else sqlite3_result_blob(ctx,r.sig.data(),int(r.sig.size()),SQLITE_TRANSIENT); break;
+        case 6: text(r.provider); break; case 7: text(r.source); break; case 8: text(r.url); break;
+        case 9: text(r.batch); break; case 10: text(r.key); break; case 11: text(r.producerPeer); break;
+        case 12: text(r.producerKey); break; case 13: sqlite3_result_int64(ctx,r.at); break;
+        case 14: text(c->type); break; case 15: text(c->cid); break; default: sqlite3_result_null(ctx);
+    }
+    return SQLITE_OK;
+}
+sqlite3_module gProvenanceModule = {
+    3, nullptr, provenanceConnect, provenanceBestIndex, provenanceDisconnect, nullptr,
+    provenanceOpen, provenanceClose, provenanceFilter, provenanceNext, provenanceEof, provenanceColumn, provenanceRowid,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
+};
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -687,9 +791,14 @@ const std::string& RelScan::sourceText() {
     return source_;
 }
 
-int registerModule(LaneState* ls) { return sqlite3_create_module_v2(ls->db, "flatsql_p4", &gRelModule, ls, nullptr); }
+int registerModule(LaneState* ls) {
+    const int rc = sqlite3_create_module_v2(ls->db, "flatsql_p4", &gRelModule, ls, nullptr);
+    return rc == SQLITE_OK ? sqlite3_create_module_v2(ls->db,"flatsql_provenance",&gProvenanceModule,ls,nullptr) : rc;
+}
 
-bool isRelation(const LaneState* ls, const char* name) { return name && ls->relations.count(lower(name)) != 0; }
+bool isRelation(const LaneState* ls, const char* name) {
+    return name && (lower(name) == "flatsql_provenance" || ls->relations.count(lower(name)) != 0);
+}
 
 // Whether any registered type has a feed of the source `asked` (records or
 // none, as format 1 keeps every source's table): spelled exactly, or equal but

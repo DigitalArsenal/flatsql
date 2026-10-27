@@ -4,7 +4,6 @@
 // touched streams, commits the indexes at NORMAL, then publishes the views.
 // Local-to-feed moves persist MOVED_IN first and MOVED_OUT in local second.
 #include <algorithm>
-#include <future>
 
 #include "internal.h"
 #include "checkpoint.h"
@@ -1625,27 +1624,15 @@ int32_t applyRound(Engine* e, const std::vector<WriteCtx*>& units, std::string* 
         }
     }
     std::set<Feed*> committed;
-    // Different streams sync concurrently. A move's destination streams
-    // are durable before the local removal is even appended.
+    // A move's destination streams are durable before the local removal is
+    // even appended. Sync on the existing writer: one write can touch any
+    // number of feeds, but the WASI host has a bounded thread pool. Spawning
+    // one std::async thread per feed aborts the guest when that pool is full.
     auto syncFeeds = [&](const std::vector<Feed*>& fs) {
         if (first != FLATSQL_OK) return;
-        if (fs.size() == 1) {
-            first = syncTransaction(e, txns[fs.front()], err);
-            return;
-        }
-        std::vector<std::future<std::pair<int32_t, std::string>>> waits;
-        for (Feed* f : fs)
-            waits.push_back(std::async(std::launch::async, [&, f] {
-                std::string why;
-                const int32_t st = syncTransaction(e, txns.at(f), &why);
-                return std::make_pair(st, std::move(why));
-            }));
-        for (auto& wait : waits) {
-            auto result = wait.get();
-            if (first == FLATSQL_OK && result.first != FLATSQL_OK) {
-                first = result.first;
-                *err = std::move(result.second);
-            }
+        for (Feed* f : fs) {
+            first = syncTransaction(e, txns.at(f), err);
+            if (first != FLATSQL_OK) return;
         }
     };
     syncFeeds(feeds);

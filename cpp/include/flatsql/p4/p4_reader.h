@@ -65,6 +65,11 @@ typedef struct P4TypeInfo { const char* name; const uint8_t* bfbs; uint32_t bfbs
 int32_t   p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out);  /* FLATSQL_OK or status */
 int32_t   p4_cursor_next(P4Cursor* c, P4Row* row);   /* 1 row, 0 end, < 0 status (FLATSQL_E_BUDGET, FLATSQL_E_CANCELLED, ...) */
 void      p4_cursor_close(P4Cursor* c);
+/* Every stored copy/tag of one CID; no record hydration. Callback pointers
+ * last only for the callback. Used by the unified SQL provenance relation. */
+typedef int32_t (*P4ProvenanceVisitor)(void* context, const P4Row* row);
+int32_t p4_record_provenance(P4Lane* lane, const char* type, const char* cid,
+                             P4ProvenanceVisitor visitor, void* context);
 int32_t   p4_lane_check(P4Lane* lane);               /* FLATSQL_OK, FLATSQL_E_CANCELLED or FLATSQL_E_BUDGET (progress handler) */
 int32_t   p4_emit(P4Lane* lane, const uint8_t* bytes, uint32_t n);   /* append to the slot's ring; may wait for space;
                                                                        FLATSQL_OK, FLATSQL_E_CANCELLED, FLATSQL_E_BUDGET (result bytes) */

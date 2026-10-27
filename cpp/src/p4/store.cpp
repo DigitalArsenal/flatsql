@@ -29,6 +29,9 @@ std::string trimLine(const std::string& s) {
 }
 bool validTypeName(const std::string& n) {
     if (n.empty() || n.size() > 64) return false;
+    std::string folded = n;
+    for (char& c : folded) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+    if (folded == "flatsql_provenance") return false;
     for (char c : n)
         if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
     return true;

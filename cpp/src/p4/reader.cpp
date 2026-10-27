@@ -3443,6 +3443,38 @@ static int32_t laneSources(P4Lane* lane, const char* type, bool live, const char
 
 extern "C" {
 
+int32_t p4_record_provenance(P4Lane* lane, const char* type, const char* cid,
+                             P4ProvenanceVisitor visitor, void* context) {
+    if (!lane || !type || !cid || !visitor) return FLATSQL_E_ARG;
+    uint8_t digest[32], key[32];
+    if (!cidDigestFromText(cid, std::strlen(cid), digest)) return FLATSQL_E_ARG;
+    cidKeyFromDigest(digest, key);
+    Type* t = lane->e->findType(type);
+    if (!t) return FLATSQL_E_NOTYPE;
+    Held held;
+    int32_t rc = heldRows(lane, t, key, false, true, false, &held);
+    if (rc != FLATSQL_OK) return rc;
+    for (const Held::File& file : held.files) {
+        for (const RowV& copy : file.rows) {
+            rc = p4_lane_check(lane);
+            if (rc != FLATSQL_OK) return rc;
+            const std::string producer(copy.producer), peer(copy.peer), sourceUrl(copy.url),
+                batch(copy.batch), contentKey(copy.ckey), producerPeer(copy.ppeer), producerKey(copy.pkey);
+            P4Tag tag{file.f->provider.c_str(), file.f->source.c_str(), sourceUrl.c_str(), batch.c_str(),
+                contentKey.c_str(), producerPeer.c_str(), producerKey.c_str(), copy.at};
+            P4Row row{};
+            row.cid = cid; row.seq = file.seq; row.ts = copy.ts;
+            row.producer = producer.c_str(); row.peer = peer.c_str();
+            row.sig = reinterpret_cast<const uint8_t*>(copy.sig.data()); row.sigLen = uint32_t(copy.sig.size());
+            row.tag = copy.inst ? &tag : nullptr;
+            rc = visitor(context, &row);
+            if (rc != FLATSQL_OK) return rc;
+        }
+    }
+    lane->e->bump(kStReads);
+    return FLATSQL_OK;
+}
+
 int32_t p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out) {
     *out = nullptr;
     if (!lane || !spec || !spec->type) return FLATSQL_E_ARG;

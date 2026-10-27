@@ -1,6 +1,6 @@
 {
   "name": "flatsql",
-  "version": "3.12.0",
+  "version": "3.12.1",
   "description": "One SQL engine for binary FlatBuffer streams: SDS QRP queries and results, SDS GJN geometry, persistent indexed storage, and one WASI threads artifact across hosts.",
   "type": "module",
   "main": "wasm/index.js",
