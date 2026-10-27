@@ -279,7 +279,9 @@ int writeFold(Replay& r,Stream* stream,int64_t mark,uint64_t previous) {
         TokCount& tc=exactTok[it->second];
         auto hist=r.tokc.find(it->second);
         if(hist!=r.tokc.end()) { tc.mints=hist->second.mints; tc.maxts=hist->second.maxts; tc.maxseq=hist->second.maxseq; }
-        tc.mints=std::min(tc.mints,sqlite3_column_int64(q,1)); tc.maxts=std::max(tc.maxts,sqlite3_column_int64(q,2)); tc.maxseq=std::max(tc.maxseq,sqlite3_column_int64(q,3));
+        tc.mints=std::min<int64_t>(tc.mints,sqlite3_column_int64(q,1));
+        tc.maxts=std::max<int64_t>(tc.maxts,sqlite3_column_int64(q,2));
+        tc.maxseq=std::max<int64_t>(tc.maxseq,sqlite3_column_int64(q,3));
     }
     sqlite3_reset(q); if(rc!=SQLITE_DONE) return rc;
     std::map<uint32_t,TokCount> empty;
