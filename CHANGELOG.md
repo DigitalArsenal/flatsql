@@ -2,6 +2,9 @@
 
 ## 3.11.1
 
+- Preserve positional writes in the Node filesystem adapter on Linux by
+  creating files without append mode; the real persistence E2E covers ingest,
+  teardown, reopen, and index rebuild.
 - Replace multi-hour push CI with short real-engine E2Es on Linux and macOS,
   including binary persistence and compaction during reads. Publish check
   timings and logs; keep randomized stress campaigns outside the push gate.

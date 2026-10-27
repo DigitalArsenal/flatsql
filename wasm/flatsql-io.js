@@ -279,9 +279,13 @@ export function createNodeFsBackend(fs, options = {}) {
           fs.unlinkSync(full);
           return 0;
         }
-        let mode = 'r';
+        let mode = fs.constants.O_RDONLY;
         if (flags & FLATSQL_IO_WRITE) {
-          mode = flags & FLATSQL_IO_EXCL ? 'wx+' : flags & FLATSQL_IO_CREATE ? 'a+' : 'r+';
+          // SQLite needs positional writes. O_APPEND makes Linux ignore their
+          // offsets, corrupting the database as soon as it rewrites a page.
+          mode = fs.constants.O_RDWR;
+          if (flags & (FLATSQL_IO_CREATE | FLATSQL_IO_EXCL)) mode |= fs.constants.O_CREAT;
+          if (flags & FLATSQL_IO_EXCL) mode |= fs.constants.O_EXCL;
         }
         const fd = fs.openSync(full, mode);
         return handles.add({
