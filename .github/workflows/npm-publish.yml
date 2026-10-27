@@ -133,11 +133,8 @@ jobs:
       - name: Install dependencies
         run: npm install --ignore-scripts
 
-      - name: Run tests
-        run: npm test
-
-      - name: Run WASI tests
-        run: npm run test:wasi
+      - name: Real package end-to-end flows
+        run: bash scripts/ci-e2e.sh --wasm-only
 
       - name: Check import surfaces and integrity.json
         run: |

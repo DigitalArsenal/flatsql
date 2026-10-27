@@ -2,6 +2,9 @@
 
 ## 3.11.1
 
+- Replace multi-hour push CI with short real-engine E2Es on Linux and macOS,
+  including binary persistence and compaction during reads. Publish check
+  timings and logs; keep randomized stress campaigns outside the push gate.
 - Install the pinned SDS schema dependency before CMake configures native and
   WASM CI builds.
 - Use explicit 64-bit bounds when recovery combines SQLite sequence values

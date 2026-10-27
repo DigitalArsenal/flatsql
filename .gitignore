@@ -34,3 +34,4 @@ stress/results/
 # must never ship in the git tarball — see flatsql-build-native-tracked)
 cpp/build-native/
 cpp/build-gauntlet/
+cpp/build-ci-e2e/

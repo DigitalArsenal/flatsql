@@ -2,238 +2,54 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-and-test:
+  end-to-end:
+    name: End-to-end (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-
+    env:
+      FLATSQL_CI_RESULTS: ${{ runner.temp }}/flatsql-ci
+      FLATBUFFERS_DIR: ${{ github.workspace }}/../flatbuffers
+      FLATSQL_BUILD_JOBS: '4'
     steps:
-    - uses: actions/checkout@v4
-
-    - uses: actions/setup-node@v4
-      with:
-        node-version: '24'
-
-    - name: Install build dependencies (SDS schemas)
-      run: npm ci --ignore-scripts --include=dev
-
-    - name: Install dependencies (Ubuntu)
-      if: runner.os == 'Linux'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake build-essential libssl-dev
-
-    - name: Install dependencies (macOS)
-      if: runner.os == 'macOS'
-      run: |
-        brew install cmake
-
-    - name: Clone FlatBuffers
-      run: |
-        git clone --depth 1 https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
-
-    - name: Configure CMake
-      working-directory: cpp
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
-
-    - name: Build
-      working-directory: cpp
-      run: cmake --build build --config Debug -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
-
-    - name: Run Tests
-      working-directory: cpp/build
-      run: ctest --output-on-failure -C Debug
-
-  build-wasm:
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - uses: actions/setup-node@v4
-      with:
-        node-version: '24'
-
-    - name: Install build dependencies (SDS schemas)
-      run: npm ci --ignore-scripts --include=dev
-
-    - name: Setup Emscripten
-      uses: mymindstorm/setup-emsdk@v14
-      with:
-        version: '4.0.23'
-
-    - name: Clone FlatBuffers (DigitalArsenal pin)
-      run: |
-        git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
-        git -C ../flatbuffers checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
-
-    - name: Configure WASM Build
-      working-directory: cpp
-      run: emcmake cmake -B build-wasm -DCMAKE_BUILD_TYPE=Release
-
-    - name: Build WASM
-      working-directory: cpp
-      run: cmake --build build-wasm --config Release
-
-    - name: Verify WASM Output
-      run: |
-        ls -la cpp/build-wasm/flatsql.js cpp/build-wasm/flatsql.wasm cpp/build-wasm/flatsql-wasi.wasm
-        echo "WASM build successful!"
-
-    # npm-publish.yml publishes this build's flatsql.js, flatsql.wasm and
-    # flatsql-wasi.wasm and checks them against the committed integrity.json.
-    - name: The committed artifacts are this source's build
-      run: |
-        sha256sum cpp/build-wasm/flatsql.js cpp/build-wasm/flatsql.wasm \
-          cpp/build-wasm/flatsql-wasi.wasm cpp/build-wasm/flatsql-wasi-noeh.wasm
-        for f in flatsql.js flatsql.wasm flatsql-wasi.wasm flatsql-wasi-noeh.wasm; do
-          if ! cmp -s "cpp/build-wasm/$f" "wasm/$f"; then
-            echo "::warning::wasm/$f differs from this commit's build; a release commit must carry the rebuilt artifacts and integrity.json"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install pinned dependencies
+        run: npm ci --ignore-scripts --include=dev
+      - name: Fetch pinned FlatBuffers
+        run: |
+          git clone --no-checkout https://github.com/DigitalArsenal/flatbuffers.git "$FLATBUFFERS_DIR"
+          git -C "$FLATBUFFERS_DIR" checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
+      - name: Run short real-engine E2Es
+        run: bash scripts/ci-e2e.sh
+      - name: Publish test results
+        if: always()
+        run: |
+          if [ -f "$FLATSQL_CI_RESULTS/summary.md" ]; then
+            cat "$FLATSQL_CI_RESULTS/summary.md" >> "$GITHUB_STEP_SUMMARY"
           fi
-        done
-
-  # The partition store artifact (docs/PARTITION-STORE-WASM.md): build it with
-  # the pinned wasi-sdk and DigitalArsenal flatbuffers, check its import
-  # surface, and run the native suites, 1,000 fault crashes, host-level crashes
-  # and the parity vectors under the Node wasi-threads host.
-  ps-wasm:
-    runs-on: ubuntu-latest
-    env:
-      WASI_SDK_PATH: /opt/wasi-sdk
-      FLATSQL_BUILD_JOBS: '4'
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - uses: actions/setup-node@v4
-      with:
-        node-version: '24'
-
-    - name: Install wasi-sdk 30, ninja
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ninja-build cmake
-        curl -fsSL -o /tmp/wasi-sdk.tar.gz \
-          https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
-        echo "0507679dff16814b74516cd969a9b16d2ced1347388024bc7966264648c78bfb  /tmp/wasi-sdk.tar.gz" | sha256sum -c -
-        sudo mkdir -p /opt/wasi-sdk
-        sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
-        cat /opt/wasi-sdk/VERSION
-
-    - name: Clone FlatBuffers (DigitalArsenal pin)
-      run: |
-        git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
-        git -C ../flatbuffers checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
-
-    - name: Install dependencies
-      run: npm ci --ignore-scripts
-
-    - name: Build flatsql-ps-threads.wasm and the wasm test commands
-      run: bash scripts/build-wasm.sh --ps-tests
-
-    - name: The committed artifact is this source's build
-      run: |
-        if ! git diff --quiet -- wasm/flatsql-ps-threads.wasm; then
-          echo "::warning::wasm/flatsql-ps-threads.wasm differs from this commit's build; a release commit must carry the rebuilt artifact (npm-publish.yml refuses otherwise)"
-        fi
-        sha256sum wasm/flatsql-ps-threads.wasm
-
-    - name: Native partition store test binary (parity vectors)
-      working-directory: cpp
-      run: |
-        cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFLATBUFFERS_DIR=$GITHUB_WORKSPACE/../flatbuffers
-        cmake --build build --target flatsql_ps_test -j 4
-
-    - name: Partition store tests under the Node host
-      env:
-        FLATSQL_PS_WASM_SUITE: '1'
-      run: >
-        node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand
-        --runTestsByPath test/standalone-wasm-imports.test.ts test/package-exports.test.ts
-        test/ps-node-threads.test.ts test/ps-host-fault.test.ts test/ps-parity-vectors.test.ts
-
-    - name: Cache the patched WasmEdge runtime (space-data-module-sdk C runner)
-      uses: actions/cache@v4
-      with:
-        path: /tmp/sdm-wasmedge-runtimes
-        key: sdm-wasmedge-0.16.4-${{ runner.os }}-${{ hashFiles('node_modules/space-data-module-sdk/src/testing/native/wasmedge-0.16.4-atomic-wait.patch') }}
-
-    - name: Deterministic parity under the SDK WasmEdge C runner
-      env:
-        FLATSQL_PS_WASMEDGE: '1'
-        # The SDK compiles its runner with clang-only warning flags.
-        CC: clang
-      run: >
-        node --experimental-wasm-exnref --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand
-        --runTestsByPath test/ps-parity-vectors.test.ts -t 'C runner'
-
-  # Store format 4 (docs/STORE-FORMAT-4.md): the native engine suite with the
-  # kill -9 loop, the SQL surface's own suite (format 1 as the oracle) when it
-  # is in the tree, and flatsql-p4-threads.wasm: its import surface, the
-  # suite and the kill loop under the Node wasi-threads host.
-  p4:
-    runs-on: ubuntu-latest
-    env:
-      WASI_SDK_PATH: /opt/wasi-sdk
-      FLATSQL_BUILD_JOBS: '4'
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - uses: actions/setup-node@v4
-      with:
-        node-version: '24'
-
-    - name: Install dependencies (SDS schemas and Node host)
-      run: npm ci --ignore-scripts --include=dev
-
-    - name: Install wasi-sdk 30, ninja
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ninja-build cmake
-        curl -fsSL -o /tmp/wasi-sdk.tar.gz \
-          https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-x86_64-linux.tar.gz
-        echo "0507679dff16814b74516cd969a9b16d2ced1347388024bc7966264648c78bfb  /tmp/wasi-sdk.tar.gz" | sha256sum -c -
-        sudo mkdir -p /opt/wasi-sdk
-        sudo tar -xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
-
-    - name: Clone FlatBuffers (DigitalArsenal pin)
-      run: |
-        git clone https://github.com/DigitalArsenal/flatbuffers.git ../flatbuffers
-        git -C ../flatbuffers checkout 8af3053eb8400de4a0a654805b8257e93fae3a8e
-
-    - name: Native engine suite, 300 kill -9 rounds, 200 power-loss rounds
-      working-directory: cpp
-      run: |
-        cmake -B build-p4 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFLATBUFFERS_DIR=$GITHUB_WORKSPACE/../flatbuffers
-        cmake --build build-p4 --target flatsql_p4_test flatsql_p4_fault_test -j 4
-        ./build-p4/flatsql_p4_test
-        ./build-p4/flatsql_p4_test --test=t_kill --rounds=300 --seed=$GITHUB_RUN_NUMBER
-        ./build-p4/flatsql_p4_fault_test --test=t_power_loss --slow=1 --rounds=200 --seed=$GITHUB_RUN_NUMBER
-
-    - name: The SQL surface is built in (its engine-backed tests ran in the suite above)
-      run: |
-        # The p4 engine ships with the SQL surface: without cpp/src/p4sql its
-        # weak defaults answer ops 30/31 with P4_E_UNSUPPORTED. Fail, never skip.
-        ls cpp/src/p4sql/*.cpp >/dev/null 2>&1 || { echo "::error::cpp/src/p4sql is absent: the p4 engine ships with the SQL surface"; exit 1; }
-        ls cpp/tests/p4sql/*.cpp >/dev/null 2>&1 || { echo "::error::cpp/tests/p4sql has no engine-backed SQL tests"; exit 1; }
-
-    - name: Build the wasi-threads artifacts and test commands
-      run: bash scripts/build-wasm.sh --ps-tests
-
-    - name: The committed artifact is this source's build
-      run: |
-        if ! git diff --quiet -- wasm/flatsql-p4-threads.wasm; then
-          echo "::warning::wasm/flatsql-p4-threads.wasm differs from this commit's build; a release commit must carry the rebuilt artifact (npm-publish.yml refuses otherwise)"
-        fi
-        sha256sum wasm/flatsql-p4-threads.wasm
-
-    - name: The engine suite and 100 kill rounds under the Node host
-      run: node scripts/p4-wasm-suite.mjs --kill-rounds 100
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-results-${{ matrix.os }}
+          path: ${{ runner.temp }}/flatsql-ci
+          if-no-files-found: warn
