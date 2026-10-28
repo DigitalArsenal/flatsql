@@ -209,7 +209,10 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  await send('Page.navigate',{url:base});
  await wait("document.getElementById('binaryDemo')?.contentDocument?.getElementById('binaryStatus')?.textContent.startsWith('Ready')",'homepage demo');
  assert.equal(await evaluate("document.querySelectorAll('.hero-badges img').length"),2);
- await evaluate("document.getElementById('binaryDemo').scrollIntoView()");await shot('homepage-demo');
+ await evaluate("document.getElementById('binaryDemo').scrollIntoView({behavior:'instant',block:'start'})");
+ await wait("Math.abs(document.getElementById('binaryDemo').getBoundingClientRect().top-80)<5",'homepage demo visible');
+ await evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+ await shot('homepage-demo');
  assert.deepEqual(errors,[]);
  console.log(`PASS: identical WASM, Pages isolation, all SDS types, search, unique append, batched/continuous generation and stop, RAM/OPFS meters, binary queries, persistence/reload, clear, desktop/mobile and homepage. Screenshots: ${evidence}`);
 } finally {
