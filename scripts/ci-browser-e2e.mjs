@@ -117,7 +117,13 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  await evaluate("document.getElementById('btnBinaryIngest').click()");
  await wait("!document.getElementById('btnBinaryIngest').disabled",'append');
  await query('SELECT COUNT(*) FROM GJN',[['6']]);
- await evaluate("document.getElementById('typeSearch').value='orbit mean';document.getElementById('typeSearch').dispatchEvent(new Event('input'))");
+ await evaluate("document.getElementById('typeSearch').focus()");
+ for(const text of 'orbit mean') {
+  await send('Input.insertText',{text});
+  assert.equal(await evaluate("document.activeElement.id"),'typeSearch','typing must retain search focus');
+ }
+ assert.equal(await evaluate("document.getElementById('typeSearch').value"),'orbit mean');
+ await evaluate("document.getElementById('datasetSelect').value='OMM';document.getElementById('datasetSelect').dispatchEvent(new Event('change'))");
  await wait("!document.getElementById('btnBinaryIngest').disabled",'filtered type');
  assert.equal(await evaluate("document.getElementById('datasetSelect').value"),'OMM');
  await evaluate("document.getElementById('recordCount').value=7;document.getElementById('btnBinaryIngest').click()");

@@ -117,7 +117,9 @@ async function count(name=selected) {
 }
 async function query(){
  if(internalTypes.has(selected)) {
-  el('binaryResults').textContent=`${(current().counts.get(selected)||0).toLocaleString()} ${selected} records stored as size-prefixed FlatBuffers. These internal control schemas are kept outside FlatSQL feeds and cannot be queried with SQL.`;
+  const notice=document.createElement('p');notice.style.padding='12px';
+  notice.textContent=`${(current().counts.get(selected)||0).toLocaleString()} ${selected} records stored as size-prefixed FlatBuffers. These internal control schemas are kept outside FlatSQL feeds and cannot be queried with SQL.`;
+  el('binaryResults').replaceChildren(notice);
   el('binaryCount').textContent='Raw SDS collection';
  }else render(await db.execute(request(el('binarySql').value)));
 }
@@ -139,13 +141,15 @@ function selectedUI() {
 function filterTypes() {
  const term=el('typeSearch').value.trim().toLowerCase();
  const types=catalog.filter(t=>`${t.name} ${t.description}`.toLowerCase().includes(term));
- el('datasetSelect').replaceChildren(...types.map(t=>new Option(`${t.name} — ${t.description.split('\n')[0]}`,t.name)));
- el('datasetSelect').value=types.some(t=>t.name===selected)?selected:(types[0]?.name||'');
+ const containsSelected=types.some(t=>t.name===selected);
+ el('datasetSelect').replaceChildren(...(containsSelected?[]:[new Option(types.length?'Choose a matching type':'No matching types','')]),...types.map(t=>new Option(`${t.name} — ${t.description.split('\n')[0]}`,t.name)));
+ if(!containsSelected)el('datasetSelect').options[0].disabled=true;
+ el('datasetSelect').value=containsSelected?selected:'';
  el('typeCount').textContent=`${types.length} / ${catalog.length}`;
  if(!types.length)el('datasetHint').textContent='No matching SDS types. Try another search.';
+ else if(!containsSelected)el('datasetHint').textContent='Choose a matching type from the dropdown to generate records.';
  controls();
- if(types.length && el('datasetSelect').value!==selected)selectType(el('datasetSelect').value);
- else if(types.length)selectedUI();
+ if(containsSelected)selectedUI();
 }
 function selectType(name) {
  return action(async()=>{selected=name;selectedUI();await register();await count();await query();},'Ready · add more records to the selected type');
