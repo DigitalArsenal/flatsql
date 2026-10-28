@@ -3,6 +3,7 @@ import { FlatSQL } from './api.mjs';
 import * as fb from 'flatbuffers';
 import { QRP } from 'spacedatastandards.org/lib/js/QRP/QRP.js';
 import { qrpRepresentation } from 'spacedatastandards.org/lib/js/QRP/qrpRepresentation.js';
+import { RAW_TYPES } from './demo-raw-store.js';
 const asset=name=>new URL(name,import.meta.url);
 const el=id=>document.getElementById(id);
 const status=text=>{el('binaryStatus').textContent=text;};
@@ -11,7 +12,7 @@ const sessionId=saved('flatsql-demo-session')||crypto.randomUUID();
 saved('flatsql-demo-session',sessionId);
 const root=`flatsql-demo-${sessionId}`;
 const stores=new Map();
-const internalTypes=new Set(['FMB','FCK','FSG']);
+const internalTypes=new Set(RAW_TYPES);
 let mode=saved('flatsql-demo-backend')||'memory',selected='GJN',catalog=[],busy=false,stopping=false,db;
 const current=()=>stores.get(mode);
 function pages(stream) {
@@ -68,7 +69,7 @@ async function meters() {
 function controls() {
  for(const input of document.querySelectorAll('button,input,select'))input.disabled=busy||!db;
  el('btnStop').disabled=!busy||!generating;
- el('btnBinaryIngest').disabled=busy||!db||!el('datasetSelect').value||internalTypes.has(selected);
+ el('btnBinaryIngest').disabled=busy||!db||!el('datasetSelect').value;
  el('btnContinuous').disabled=el('btnBinaryIngest').disabled;
  for(const button of document.querySelectorAll('[data-count]'))button.disabled=el('btnBinaryIngest').disabled;
  for(const id of ['btnBinaryQuery','btnCount','btnPreview','btnSpatial'])el(id).disabled=busy||!db||internalTypes.has(selected);
@@ -101,16 +102,25 @@ async function open() {
   if(catalog.some(t=>t.name===name)){current().registered.add(name);await count(name);}
  }
  await register();
+ for(const type of RAW_TYPES)await count(type);
 }
 async function count(name=selected) {
- if(internalTypes.has(name))return 0;
+ if(internalTypes.has(name)) {
+  const result=await callGenerator({action:'rawCount',backend:mode,root,type:name});
+  current().counts.set(name,result.count);summary();return result.count;
+ }
  const stream=await db.execute(request(`SELECT COUNT(*) FROM "${name}"`));
  const rowPage=pages(stream).find(page=>page.rowsLength()>0);
  if(!rowPage)throw new Error('The record count query returned no row');
  const value=Number(rowPage.ROWS(0).CELLS(0).INT_VALUE());
  current().counts.set(name,value);summary();return value;
 }
-async function query(){if(!internalTypes.has(selected))render(await db.execute(request(el('binarySql').value)));}
+async function query(){
+ if(internalTypes.has(selected)) {
+  el('binaryResults').textContent=`${(current().counts.get(selected)||0).toLocaleString()} ${selected} records stored as size-prefixed FlatBuffers. These internal control schemas are kept outside FlatSQL feeds and cannot be queried with SQL.`;
+  el('binaryCount').textContent='Raw SDS collection';
+ }else render(await db.execute(request(el('binarySql').value)));
+}
 async function action(fn,message) {
  if(busy)return;
  busy=true;controls();
@@ -120,11 +130,11 @@ async function action(fn,message) {
 }
 function selectedUI() {
  const type=catalog.find(t=>t.name===selected);
- el('datasetHint').textContent=internalTypes.has(selected)?`${type.description} — Reserved for FlatSQL's internal store format; cannot be ingested as user records.`:type.description;
+ el('datasetHint').textContent=internalTypes.has(selected)?`${type.description} — Generated as raw binary records. SQL is unavailable because this type is reserved for FlatSQL's internal store format.`:type.description;
  el('schemaDownload').href=asset(`sds/${selected}.bfbs`);
  el('binarySql').value=`SELECT * FROM "${selected}" LIMIT 50`;
  el('btnSpatial').hidden=selected!=='GJN';summary();
- if(internalTypes.has(selected)){el('binaryResults').replaceChildren();el('binaryCount').textContent='Storage-internal schema: user record generation is unavailable.';}
+ if(internalTypes.has(selected))el('binarySql').value='SQL is unavailable for this internal control schema.';
 }
 function filterTypes() {
  const term=el('typeSearch').value.trim().toLowerCase();
@@ -142,7 +152,7 @@ function selectType(name) {
 }
 const generator=new Worker(asset('generator.mjs'),{type:'module'});
 let generationId=0,generating=false;
-function batch(type,count,start) {
+function callGenerator(params,transfer=[]) {
  return new Promise((resolve,reject)=>{
   const id=++generationId;
   const timer=setTimeout(()=>{cleanup();reject(new Error('Record generation timed out'));},30000);
@@ -150,7 +160,7 @@ function batch(type,count,start) {
   const message=({data})=>{if(data.id!==id)return;cleanup();data.error?reject(new Error(data.error)):resolve(data);};
   const error=event=>{cleanup();reject(new Error(event.message));};
   generator.addEventListener('message',message);generator.addEventListener('error',error);
-  generator.postMessage({id,type,count,start});
+  generator.postMessage({id,...params},transfer);
  });
 }
 function generate(continuous=false) {
@@ -163,9 +173,11 @@ function generate(continuous=false) {
   const start=await count();let added=0;
   try {
    while(added<requested&&!stopping) {
-    const next=await batch(selected,Math.min(1000,requested-added),start+added);
-    await db.ingest(selected,next.frames,{provider:'demo',source:'spacedatastandards.org'});
-    added+=next.count;current().bytes+=next.frames.length;await count();
+    const next=await callGenerator({type:selected,count:Math.min(1000,requested-added),start:start+added});
+    const generatedBytes=next.frames.length;
+    if(internalTypes.has(selected))await callGenerator({action:'rawAppend',type:selected,count:next.count,frames:next.frames,backend:mode,root},[next.frames.buffer]);
+    else await db.ingest(selected,next.frames,{provider:'demo',source:'spacedatastandards.org'});
+    added+=next.count;current().bytes+=generatedBytes;await count();
     if(!continuous)progress.value=added;
     status(`Generating · ${added.toLocaleString()} ${selected} records${continuous?'':` of ${requested.toLocaleString()}`}…`);
     await meters();
@@ -200,10 +212,11 @@ el('storageMode').onchange=()=>{
  saved('flatsql-demo-backend',mode);selectedUI();await count();await query();
 },'Ready · storage selected');
 };
-el('btnBinaryReopen').onclick=()=>action(async()=>{await db.close();db=null;stores.delete(mode);await open();await count();await query();},'Reopened disk store');
+el('btnBinaryReopen').onclick=()=>action(async()=>{await db.close();db=null;stores.delete(mode);await callGenerator({action:'rawReset',backend:mode,root});await open();await count();await query();},'Reopened disk store');
 el('btnBinaryClear').onclick=()=>action(async()=>{
  await db.close();db=null;stores.delete(mode);
  if(mode==='opfs'){const directory=await navigator.storage.getDirectory();await directory.removeEntry(root,{recursive:true});}
+ await callGenerator({action:'rawReset',backend:mode,root});
  await open();await count();await query();
 },'Demo store cleared');
 el('btnPersist').onclick=()=>action(async()=>{

@@ -135,20 +135,20 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  for(const type of allTypes) {
    await evaluate(`document.getElementById('datasetSelect').value=${JSON.stringify(type)};document.getElementById('datasetSelect').dispatchEvent(new Event('change'))`);
    await wait("!document.getElementById('datasetSelect').disabled",`${type} selected`);
-   if(['FMB','FCK','FSG'].includes(type)){
-     assert.equal(await evaluate("document.getElementById('btnBinaryIngest').disabled"),true);
-     assert.match(await evaluate("document.getElementById('datasetHint').textContent"),/Reserved/);
-     continue;
-   }
    assert.doesNotMatch(await evaluate(status),/^Error:/,type+' select');
    await evaluate("document.getElementById('recordCount').value=2;document.getElementById('btnBinaryIngest').click()");
    await wait("!document.getElementById('btnBinaryIngest').disabled",`${type} generation`);
    assert.match(await evaluate(status),/^Generated/,type+' generate');
    if(allTypes.indexOf(type)%50===0)console.log(`SDS browser progress: ${allTypes.indexOf(type)+1}/${allTypes.length}`);
+   if(['FMB','FCK','FSG'].includes(type)){
+     assert.equal(await evaluate("document.getElementById('btnBinaryQuery').disabled"),true);
+     assert.match(await evaluate("document.getElementById('binaryResults').textContent"),new RegExp(`^2 ${type} records stored`));
+     continue;
+   }
    const total=type==='GJN'?8:type==='OMM'?9:2;
    await query(`SELECT COUNT(*) FROM "${type}"`,[[String(total)]]);
  }
- console.log(`Verified ${allTypes.length-3} SDS record types and 3 reserved-type explanations through the browser controls`);
+ console.log(`Verified all ${allTypes.length} SDS generators: 283 SQL collections and 3 raw internal-schema collections`);
  await evaluate("document.getElementById('datasetSelect').value='GJN';document.getElementById('datasetSelect').dispatchEvent(new Event('change'))");
  await wait("!document.getElementById('btnBinaryIngest').disabled",'GJN selected');
  await evaluate("document.getElementById('recordCount').value=1001;document.getElementById('btnBinaryIngest').click()");
@@ -193,11 +193,44 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  await evaluate("document.getElementById('btnPersist').click()");
  await wait("!document.getElementById('btnPersist').disabled",'storage persistence request');
  assert.match(await evaluate("document.getElementById('persistenceStatus').textContent"),/granted/);
+ // Internal storage-control schemas remain standard binary records, stored
+ // outside engine feeds. They append and survive OPFS reopen/reload too.
+ await evaluate("document.getElementById('datasetSelect').value='FSG';document.getElementById('datasetSelect').dispatchEvent(new Event('change'))");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'FSG disk collection');
+ await evaluate("document.getElementById('recordCount').value=5;document.getElementById('btnBinaryIngest').click()");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'FSG disk generation');
+ await evaluate("document.getElementById('btnBinaryIngest').click()");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'FSG disk append');
+ assert.match(await evaluate("document.getElementById('binaryResults').textContent"),/^10 FSG records stored/);
+ const rawFrames=await evaluate(`(async()=>{
+  let dir=await navigator.storage.getDirectory();
+  for(const name of ['flatsql-demo-'+sessionStorage.getItem('flatsql-demo-session'),'demo-raw','FSG'])dir=await dir.getDirectoryHandle(name);
+  let count=0;
+  for await(const handle of dir.values()) {
+   const bytes=new Uint8Array(await(await handle.getFile()).arrayBuffer());
+   for(let at=0;at<bytes.length;) {
+    const size=new DataView(bytes.buffer,at,4).getUint32(0,true);
+    if(String.fromCharCode(...bytes.subarray(at+8,at+12))!=='$FSG'||at+4+size>bytes.length)throw Error('Invalid raw SDS frame');
+    at+=size+4;count++;
+   }
+  }
+  return count;
+ })()`);
+ assert.equal(rawFrames,10);
+ await send('Emulation.setDeviceMetricsOverride',{width:1100,height:1200,deviceScaleFactor:1,mobile:false});
+ await shot('raw-internal-sds');
+ await send('Emulation.setDeviceMetricsOverride',{width:1100,height:920,deviceScaleFactor:1,mobile:false});
  await evaluate("document.getElementById('btnBinaryReopen').click()");
  await wait(`(${status}).startsWith('Reopened')`,'durable reopen');
- assert.equal(await evaluate("document.querySelector('tbody').innerText"),'3');
+ assert.match(await evaluate("document.getElementById('binaryResults').textContent"),/^10 FSG records stored/);
  await send('Page.reload');await wait(`(${status}).startsWith('Ready')`,'page reload');
  await query("SELECT count(*) FROM GJN r JOIN flatsql_provenance('GJN',r._cid) p WHERE p.provider='demo' AND p.source='spacedatastandards.org'",[['3']]);
+ await query('SELECT COUNT(*) FROM GJN',[['3']]);
+ await evaluate("document.getElementById('datasetSelect').value='FSG';document.getElementById('datasetSelect').dispatchEvent(new Event('change'))");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'FSG after reload');
+ assert.match(await evaluate("document.getElementById('binaryResults').textContent"),/^10 FSG records stored/);
+ await evaluate("document.getElementById('datasetSelect').value='GJN';document.getElementById('datasetSelect').dispatchEvent(new Event('change'))");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'GJN after reload');
  await query('SELECT COUNT(*) FROM GJN',[['3']]);
  await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
  await shot('binary-mobile');
@@ -205,6 +238,10 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  await evaluate("document.getElementById('btnBinaryClear').click()");
  await wait(`(${status}).startsWith('Demo store cleared')`,'clear exact demo store');
  assert.equal(await evaluate("document.querySelector('tbody').innerText"),'0');
+ await evaluate("document.getElementById('datasetSelect').value='FSG';document.getElementById('datasetSelect').dispatchEvent(new Event('change'))");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'raw collection cleared');
+ assert.match(await evaluate("document.getElementById('binaryResults').textContent"),/^0 FSG records stored/);
+
  await send('Emulation.setDeviceMetricsOverride',{width:1280,height:1000,deviceScaleFactor:1,mobile:false});
  await send('Page.navigate',{url:base});
  await wait("document.getElementById('binaryDemo')?.contentDocument?.getElementById('binaryStatus')?.textContent.startsWith('Ready')",'homepage demo');

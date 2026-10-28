@@ -1,6 +1,7 @@
 // Generation stays off the UI thread; only one bounded batch is in flight.
 import { GJN, GJNT, GJNFeatureT, GJNGeometryT, GJNGeometryType, GJNLinearRingT, GJNPositionT, GJNPropertyT } from 'spacedatastandards.org/lib/js/GJN/main.js';
 import * as fb from 'flatbuffers';
+import { rawStore } from './demo-raw-store.js';
 const position=(x,y,z)=>new GJNPositionT(x,y,z??0,z!==undefined);
 const ring=(a,b)=>new GJNLinearRingT([[a,a],[b,a],[b,b],[a,b],[a,a]].map(([x,y])=>position(x,y)));
 const geometries=[
@@ -18,8 +19,10 @@ function gjn(id,index) {
   GJN.finishSizePrefixedGJNBuffer(b,new GJNT([feature]).pack(b));
   return b.asUint8Array();
 }
-self.onmessage=async({data:{id,type,count,start}})=>{
+self.onmessage=async({data})=>{
+  const {id,type,count,start,action}=data;
   try {
+    if(action?.startsWith('raw')){self.postMessage({id,...await rawStore(data)});return;}
     const {generators}=await import('./sds/generators.mjs');
     const {generate}=await generators[type]();
     const parts=[];let bytes=0;
