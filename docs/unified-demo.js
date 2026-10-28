@@ -4,10 +4,20 @@ import { FlatSQL } from './api.mjs';
 import * as fb from 'flatbuffers';
 import { QRP } from 'spacedatastandards.org/lib/js/QRP/QRP.js';
 import { qrpRepresentation } from 'spacedatastandards.org/lib/js/QRP/qrpRepresentation.js';
+import { GJN, GJNT, GJNFeatureT, GJNGeometryT, GJNGeometryType, GJNLinearRingT, GJNPositionT, GJNPropertyT } from 'spacedatastandards.org/lib/js/GJN/main.js';
 const asset = name => new URL(name, import.meta.url);
 const el = id => document.getElementById(id);
 let db;
-const root = 'flatsql-unified-demo';
+// Each browser session gets its own store. The id lives in sessionStorage, so a
+// reload keeps the store and a new tab or browser session starts an empty one.
+const sessionId = () => {
+ try {
+  let id = sessionStorage.getItem('flatsql-demo-session');
+  if (!id) { id = crypto.randomUUID(); sessionStorage.setItem('flatsql-demo-session', id); }
+  return id;
+ } catch { return crypto.randomUUID(); }
+};
+const root = `flatsql-demo-${sessionId()}`;
 const buttons = ['btnBinaryIngest','btnBinaryQuery','btnBinaryReopen','btnBinaryClear'];
 const status = text => { el('binaryStatus').textContent = text; };
 function request(sql) {
@@ -43,6 +53,30 @@ async function open() {
  const bfbs=new Uint8Array(await (await fetch(asset('GJN.bfbs'))).arrayBuffer());
  await db.registerSchema({name:'GJN',fileIdentifier:'$GJN',bfbs});
 }
+// Standard SDS GJN records built in the browser with the generated SDS bindings.
+const position = (LONGITUDE, LATITUDE, ALTITUDE) =>
+ new GJNPositionT(LONGITUDE, LATITUDE, ALTITUDE ?? 0, ALTITUDE !== undefined);
+const ring = (a, b) => new GJNLinearRingT([[a,a],[b,a],[b,b],[a,b],[a,a]].map(([x,y]) => position(x,y)));
+const geometries = [
+ new GJNGeometryT(GJNGeometryType.POLYGON, null, [], [ring(0,10), ring(4,6)]),
+ new GJNGeometryT(GJNGeometryType.POINT, position(20,20,420)),
+ new GJNGeometryT(GJNGeometryType.GEOMETRY_COLLECTION, null, [], [], [], [
+  new GJNGeometryT(GJNGeometryType.POINT, position(-73.98,40.75)),
+  new GJNGeometryT(GJNGeometryType.LINE_STRING, null, [position(0,0), position(1,0)]),
+ ]),
+];
+function generateRecords() {
+ const records = geometries.map((GEOMETRY, i) => {
+  const b = new fb.Builder(512);
+  const feature = new GJNFeatureT(`sample-${i+1}`, GEOMETRY, [new GJNPropertyT('source', 'generated in browser')], 0, false, true);
+  GJN.finishSizePrefixedGJNBuffer(b, new GJNT([feature]).pack(b));
+  return b.asUint8Array();
+ });
+ const frames = new Uint8Array(records.reduce((total, record) => total + record.length, 0));
+ let at = 0;
+ for (const record of records) { frames.set(record, at); at += record.length; }
+ return frames;
+}
 async function query() {render(await db.execute(request(el('binarySql').value)));}
 async function action(fn, message) {
  for(const id of buttons)el(id).disabled=true;
@@ -51,9 +85,8 @@ async function action(fn, message) {
  finally{for(const id of buttons)el(id).disabled=!db;}
 }
 el('btnBinaryIngest').onclick=()=>action(async()=>{
- const frames=new Uint8Array(await (await fetch(asset('samples.fb'))).arrayBuffer());
- await db.ingest('GJN',frames,{provider:'demo',source:'flatc-wasm'});await query();
-},'3 binary records loaded · spatial SQL ready');
+ await db.ingest('GJN',generateRecords(),{provider:'demo',source:'spacedatastandards.org'});await query();
+},'3 SDS GJN records generated and loaded · spatial SQL ready');
 el('btnBinaryQuery').onclick=()=>action(query,'Query complete');
 el('btnBinaryReopen').onclick=()=>action(async()=>{await db.close();db=null;await open();await query();},'Reopened persistent binary records');
 el('btnBinaryClear').onclick=()=>action(async()=>{
