@@ -62,8 +62,8 @@ try {
  };
  const wait=async(expression,label)=>{
    const deadline=Date.now()+30000;
-   while(Date.now()<deadline){try{if(await evaluate(expression))return;}catch{}await new Promise(r=>setTimeout(r,100));}
-   throw new Error(`Timed out: ${label}; ${await evaluate("JSON.stringify({text:document.body.innerText.slice(-1000),isolated:crossOriginIsolated,frame:document.getElementById('binaryDemo')?.contentDocument?.body.innerText,frameIsolation:document.getElementById('binaryDemo')?.contentWindow?.crossOriginIsolated})")}`);
+   while(Date.now()<deadline){try{if(await evaluate(expression))return;}catch{}await new Promise(r=>setTimeout(r,20));}
+   throw new Error(`Timed out: ${label}; ${await evaluate("JSON.stringify({status:document.getElementById('binaryStatus')?.textContent,text:document.body.innerText.slice(-1000),isolated:crossOriginIsolated,frame:document.getElementById('binaryDemo')?.contentDocument?.body.innerText,frameIsolation:document.getElementById('binaryDemo')?.contentWindow?.crossOriginIsolated})")}`);
  };
  const shot=async name=>{const s=await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(evidence,name+'.png'),Buffer.from(s.data,'base64'));};
  await send('Runtime.enable');await send('Page.enable');
@@ -96,8 +96,8 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
    }finally{await db.close();}
  })()`);
  assert.equal(cleared,0);
- await evaluate("document.getElementById('btnBinaryIngest').click()");
- await wait(`(${status}).startsWith('3 SDS GJN records generated and loaded')`,'binary ingest');
+ await evaluate("document.getElementById('recordCount').value=3;document.getElementById('binarySql').value='SELECT _rowid, geo_contains(_data,2,2), geo_area_geom(_data), geo_length_geom(_data) FROM GJN';document.getElementById('btnBinaryIngest').click()");
+ await wait(`(${status}).startsWith('Generated · 3 GJN')`,'binary ingest');
  assert.deepEqual(await evaluate("Array.from(document.querySelectorAll('tbody tr')).map(r=>Array.from(r.cells).map(c=>c.textContent))"),[['1','1','96','0'],['2','0','0','0'],['3','0','0','111.19492664455873']]);
  await shot('binary-desktop');
  const query=async(sql,expected)=>{
@@ -113,6 +113,86 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  assert.equal(await evaluate("document.querySelectorAll('tbody tr').length"),3);
  assert.match(await evaluate("document.querySelector('tbody tr').lastElementChild.textContent"),/^\d+ bytes$/);
  await query('SELECT COUNT(*) FROM GJN',[['3']]);
+ // Repeat generation appends unique content; changing types preserves GJN.
+ await evaluate("document.getElementById('btnBinaryIngest').click()");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'append');
+ await query('SELECT COUNT(*) FROM GJN',[['6']]);
+ await evaluate("document.getElementById('typeSearch').value='orbit mean';document.getElementById('typeSearch').dispatchEvent(new Event('input'))");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'filtered type');
+ assert.equal(await evaluate("document.getElementById('datasetSelect').value"),'OMM');
+ await evaluate("document.getElementById('recordCount').value=7;document.getElementById('btnBinaryIngest').click()");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'OMM batch');
+ await query('SELECT COUNT(*) FROM OMM',[['7']]);
+ await query('SELECT COUNT(*) FROM GJN',[['6']]);
+ await evaluate("document.getElementById('typeSearch').value='no such sds';document.getElementById('typeSearch').dispatchEvent(new Event('input'))");
+ assert.equal(await evaluate("document.getElementById('btnBinaryIngest').disabled"),true);
+ await evaluate("document.getElementById('typeSearch').value='';document.getElementById('typeSearch').dispatchEvent(new Event('input'))");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'clear filter');
+ assert.equal(await evaluate("document.getElementById('datasetSelect').options.length"),286);
+ // Exercise every catalog entry through the real picker, generator worker,
+ // binary ingest and SQL count, including nested/required fields and int64s.
+ const allTypes=await evaluate("Array.from(document.getElementById('datasetSelect').options,o=>o.value)");
+ for(const type of allTypes) {
+   await evaluate(`document.getElementById('datasetSelect').value=${JSON.stringify(type)};document.getElementById('datasetSelect').dispatchEvent(new Event('change'))`);
+   await wait("!document.getElementById('datasetSelect').disabled",`${type} selected`);
+   if(['FMB','FCK','FSG'].includes(type)){
+     assert.equal(await evaluate("document.getElementById('btnBinaryIngest').disabled"),true);
+     assert.match(await evaluate("document.getElementById('datasetHint').textContent"),/Reserved/);
+     continue;
+   }
+   assert.doesNotMatch(await evaluate(status),/^Error:/,type+' select');
+   await evaluate("document.getElementById('recordCount').value=2;document.getElementById('btnBinaryIngest').click()");
+   await wait("!document.getElementById('btnBinaryIngest').disabled",`${type} generation`);
+   assert.match(await evaluate(status),/^Generated/,type+' generate');
+   if(allTypes.indexOf(type)%50===0)console.log(`SDS browser progress: ${allTypes.indexOf(type)+1}/${allTypes.length}`);
+   const total=type==='GJN'?8:type==='OMM'?9:2;
+   await query(`SELECT COUNT(*) FROM "${type}"`,[[String(total)]]);
+ }
+ console.log(`Verified ${allTypes.length-3} SDS record types and 3 reserved-type explanations through the browser controls`);
+ await evaluate("document.getElementById('datasetSelect').value='GJN';document.getElementById('datasetSelect').dispatchEvent(new Event('change'))");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'GJN selected');
+ await evaluate("document.getElementById('recordCount').value=1001;document.getElementById('btnBinaryIngest').click()");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'multi-batch generation');
+ await query('SELECT COUNT(*) FROM GJN',[['1009']]);
+ await evaluate("document.getElementById('btnContinuous').click()");
+ await wait(`(${status}).startsWith('Generating · ')`,'continuous generation starts');
+ await evaluate("document.getElementById('btnStop').click()");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'continuous stop');
+ assert.match(await evaluate(status),/^Stopped/);
+ assert.equal(await evaluate("document.getElementById('recordCount').hasAttribute('max')"),false);
+ assert.match(await evaluate("document.getElementById('memoryText').textContent"),/heap|RAM/);
+ assert.match(await evaluate("document.getElementById('diskText').textContent"),/available/);
+ await query('SELECT COUNT(*) FROM GJN');
+ const ramCount=await evaluate("document.querySelector('tbody').innerText");
+ await shot('generator-desktop');
+ await evaluate("document.getElementById('recordCount').value=0;document.getElementById('btnBinaryIngest').click()");
+ assert.match(await evaluate(status),/positive whole number/);
+ assert.equal(await evaluate("document.getElementById('btnBinaryIngest').disabled"),false);
+ await evaluate("document.getElementById('binarySql').value='SELECT nonexistent FROM GJN';document.getElementById('btnBinaryQuery').click()");
+ await wait("!document.getElementById('btnBinaryQuery').disabled",'query error recovery');
+ assert.match(await evaluate(status),/^Error:/);
+
+ // Disk is an actual OPFS-backed separate store and RAM survives switching.
+ await evaluate("document.getElementById('storageMode').value='opfs';document.getElementById('storageMode').dispatchEvent(new Event('change'))");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'disk selection');
+ console.log('Disk selection:', await evaluate(status), await evaluate("document.getElementById('storageMode').value"));
+ assert.match(await evaluate(status),/^Ready/);
+ await query('SELECT COUNT(*) FROM GJN',[['0']]);
+ await evaluate("document.getElementById('recordCount').value=3;document.getElementById('btnBinaryIngest').click()");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'disk generation');
+ await query('SELECT COUNT(*) FROM GJN',[['3']]);
+ await evaluate("document.getElementById('storageMode').value='memory';document.getElementById('storageMode').dispatchEvent(new Event('change'))");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'return to RAM');
+ await query('SELECT COUNT(*) FROM GJN',[[ramCount]]);
+ await evaluate("document.getElementById('btnBinaryClear').click()");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'clear RAM only');
+ await query('SELECT COUNT(*) FROM GJN',[['0']]);
+ await evaluate("document.getElementById('storageMode').value='opfs';document.getElementById('storageMode').dispatchEvent(new Event('change'))");
+ await wait("!document.getElementById('btnBinaryIngest').disabled",'return to disk');
+ await query('SELECT COUNT(*) FROM GJN',[['3']]);
+ await evaluate("document.getElementById('btnPersist').click()");
+ await wait("!document.getElementById('btnPersist').disabled",'storage persistence request');
+ assert.match(await evaluate("document.getElementById('persistenceStatus').textContent"),/granted/);
  await evaluate("document.getElementById('btnBinaryReopen').click()");
  await wait(`(${status}).startsWith('Reopened')`,'durable reopen');
  assert.equal(await evaluate("document.querySelector('tbody').innerText"),'3');
@@ -131,7 +211,7 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  assert.equal(await evaluate("document.querySelectorAll('.hero-badges img').length"),2);
  await evaluate("document.getElementById('binaryDemo').scrollIntoView()");await shot('homepage-demo');
  assert.deepEqual(errors,[]);
- console.log(`PASS: identical WASM, Pages isolation, binary ingest/filter/projection, persistence/reload, clear, desktop/mobile and homepage. Screenshots: ${evidence}`);
+ console.log(`PASS: identical WASM, Pages isolation, all SDS types, search, unique append, batched/continuous generation and stop, RAM/OPFS meters, binary queries, persistence/reload, clear, desktop/mobile and homepage. Screenshots: ${evidence}`);
 } finally {
  socket?.close();child.kill('SIGTERM');
  await new Promise(resolve=>{if(child.exitCode!==null)return resolve();child.once('exit',resolve);setTimeout(resolve,3000);});

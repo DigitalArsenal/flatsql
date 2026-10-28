@@ -1,11 +1,36 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FlatSQL binary query demo</title>
-<style>body{margin:0;background:#080d15;color:#e8edf5;font:15px/1.55 system-ui}main{max-width:1050px;margin:auto;padding:24px}h1{font-size:26px;margin:0 0 8px}p{color:#a7b7cc}button{background:#162536;color:#c7f0ff;border:1px solid #32546e;border-radius:7px;padding:10px 14px;cursor:pointer}button:disabled{opacity:.45;cursor:wait}.controls{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}label{display:block;margin-top:16px}textarea{box-sizing:border-box;width:100%;min-height:106px;background:#101a28;border:1px solid #32546e;border-radius:8px;color:#d6f3ff;padding:14px;font:14px/1.6 monospace;resize:vertical}#binaryStatus{color:#69d9b1}#binaryResults{overflow:auto;min-height:110px;border:1px solid #24374c;border-radius:8px;margin-top:16px}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{padding:10px 14px;text-align:left;border-bottom:1px solid #24374c}th{color:#8bcfe7}small{color:#a7b7cc}a{color:#6dd7ff}</style></head><body><main>
-<h1>FlatBuffers in. FlatBuffers out.</h1>
-<p>Load three SDS GJN records prepared by flatc-wasm. Query a polygon with a hole, an altitude-bearing point, and a geometry collection. Each browser session gets its own store; reopening within a session keeps its records.</p>
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FlatSQL SDS record playground</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#080d15;color:#e8edf5;font:14px/1.55 system-ui}main{max-width:1120px;margin:auto;padding:24px}h1{font-size:26px;margin:0 0 6px}p{color:#a7b7cc;margin:8px 0}button,input,select,textarea{font:inherit;border:1px solid #32546e;border-radius:7px;background:#101a28;color:#d6f3ff;padding:10px 12px}button{cursor:pointer;background:#162536;white-space:nowrap}button:hover:not(:disabled){border-color:#69d9b1}button:disabled{opacity:.45;cursor:default}button.primary{background:#174c40;border-color:#3c9e82;color:#d2fff1}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid #69d9b1;outline-offset:2px}.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}label{display:block;color:#b8c9dc;font-weight:600;margin:12px 0 5px}.setup{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:20px}.panel{padding:16px;border:1px solid #24374c;border-radius:10px;background:#0c1420}input[type=search],select{width:100%}#recordCount{width:140px}#typeCount,small{color:#a7b7cc}#binaryStatus{color:#69d9b1;min-height:24px;overflow-wrap:anywhere}#datasetHint{min-height:44px}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}.metric{border:1px solid #24374c;border-radius:8px;padding:12px}.metric strong{display:block;margin-bottom:6px}meter{width:100%;height:12px;accent-color:#69d9b1}meter[hidden]{display:none}.metric small{display:block}#recordSummary{font-variant-numeric:tabular-nums;color:#d6f3ff}textarea{width:100%;min-height:84px;font:13px/1.6 monospace;resize:vertical}#binaryResults{overflow:auto;min-height:85px;max-height:320px;border:1px solid #24374c;border-radius:8px}table{border-collapse:collapse;width:100%;white-space:nowrap}th,td{padding:9px 12px;text-align:left;border-bottom:1px solid #24374c}th{color:#8bcfe7}a{color:#6dd7ff}#generationProgress{width:100%;accent-color:#69d9b1}details{margin-top:12px}summary{cursor:pointer;color:#a7b7cc}@media(max-width:650px){main{padding:16px}.setup,.metrics{grid-template-columns:1fr;gap:12px}h1{font-size:23px}.panel{padding:12px}}
+</style></head><body><main>
+<h1>SDS record playground</h1>
+<p>Pick any Space Data Standard and keep adding records. Query them together with FlatSQL.</p>
 <p id="binaryStatus" role="status">Loading engine…</p>
-<div class="controls"><button id="btnBinaryIngest" disabled>Generate and load SDS records</button><button id="btnBinaryReopen" disabled>Reopen store</button><button id="btnBinaryClear" disabled>Clear demo store</button></div>
-<label for="binarySql">SQL query</label><textarea id="binarySql" spellcheck="false">SELECT _rowid, geo_contains(_data,2,2) AS contains_point, geo_area_geom(_data) AS area, geo_length_geom(_data) AS length_km FROM GJN</textarea>
-<div class="controls"><button id="btnBinaryQuery" disabled>Run query</button><button data-binary-sql="SELECT COUNT(*) AS records FROM GJN">Count records</button><button data-binary-sql="SELECT _rowid, geo_envelope(_data) AS envelope FROM GJN">GJN envelopes</button><button data-binary-sql="SELECT _rowid FROM GJN WHERE geo_contains(_data,2,2)">Spatial filter</button></div>
+<div class="setup">
+<section class="panel" aria-label="Record generator">
+<label for="typeSearch">Find a record type</label><input id="typeSearch" type="search" placeholder="Search code or description, e.g. OMM or telemetry" autocomplete="off" disabled>
+<label for="datasetSelect">SDS type <small id="typeCount"></small></label><select id="datasetSelect" disabled></select>
+<p id="datasetHint"></p>
+<label for="recordCount">Records to add</label>
+<div class="controls"><input id="recordCount" type="number" min="1" step="1" value="1000" inputmode="numeric" disabled><button id="btnBinaryIngest" class="primary" disabled>Generate &amp; add</button><button id="btnStop" disabled>Stop</button></div>
+<div class="controls" aria-label="Batch sizes"><button data-count="1000" disabled>1,000</button><button data-count="10000" disabled>10,000</button><button data-count="100000" disabled>100,000</button><button id="btnContinuous" disabled>Keep generating</button></div>
+<progress id="generationProgress" hidden></progress>
+<small>No demo record cap. Generation stops when you stop it or the browser runs out of resources.</small>
+</section>
+<section class="panel" aria-label="Storage">
+<label for="storageMode">Store records in</label><select id="storageMode" disabled><option value="memory">RAM · temporary</option><option value="opfs">Disk · browser storage</option></select>
+<p id="storageHint">RAM and disk are separate stores. Switching keeps both stores available in this tab.</p>
+<div class="controls"><button id="btnBinaryReopen" disabled>Reopen disk store</button><button id="btnBinaryClear" disabled>Clear this store</button><button id="btnPersist" disabled>Keep disk data</button></div>
+<p id="persistenceStatus"></p>
+<p id="recordSummary" aria-live="polite">0 records</p>
+<small>Synthetic examples for testing queries; not operational space data. RAM is cleared on reload. Disk data survives reload in this tab.</small>
+</section></div>
+<div class="metrics">
+<div class="metric"><strong>Memory</strong><meter id="memoryMeter" min="0" max="1" value="0" aria-label="JavaScript heap usage" hidden></meter><small id="memoryText">Checking browser memory reporting…</small><small id="generatedBytes">0 B generated in this store</small></div>
+<div class="metric"><strong>Browser disk space</strong><meter id="diskMeter" min="0" max="1" value="0" aria-label="Origin disk quota usage" hidden></meter><small id="diskText">Checking storage quota…</small></div>
+</div>
+<label for="binarySql">SQL query</label><textarea id="binarySql" spellcheck="false"></textarea>
+<div class="controls"><button id="btnBinaryQuery" disabled>Run query</button><button id="btnCount" disabled>Count selected type</button><button id="btnPreview" disabled>Preview records</button><button id="btnSpatial" hidden disabled>Spatial filter</button></div>
 <div id="binaryResults" aria-live="polite"></div><p><small id="binaryCount"></small></p>
-<p><a href="./assets/unified/GJN.bfbs" download>Binary schema</a> · <a href="https://digitalarsenal.github.io/flatc-wasm/" target="_blank" rel="noopener">Convert externally with flatc-wasm</a></p>
+<details><summary>About capacity and these records</summary><p>Memory reporting is an approximate JavaScript heap budget when the browser exposes it. It does not measure free system RAM or all worker and WASM memory. Disk space is this origin’s estimated storage quota, shared with other pages on the origin.</p><p>Generation uses the official SDS bindings and binary schemas. Results display up to 100 rows per query; this does not limit how many records you can generate.</p><p><a id="schemaDownload" download>Download selected binary schema</a> · <span id="sdsVersion"></span></p></details>
 </main><script type="module" src="./assets/unified/demo.mjs"></script></body></html>

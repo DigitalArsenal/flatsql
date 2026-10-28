@@ -1,25 +1,27 @@
-// Product UI is a separate consumer of the binary library API. Generated SDS
-// bindings construct requests and render values; FlatSQL never renders JSON.
+// Demo controls consume the same binary API as every FlatSQL application.
 import { FlatSQL } from './api.mjs';
 import * as fb from 'flatbuffers';
 import { QRP } from 'spacedatastandards.org/lib/js/QRP/QRP.js';
 import { qrpRepresentation } from 'spacedatastandards.org/lib/js/QRP/qrpRepresentation.js';
-import { GJN, GJNT, GJNFeatureT, GJNGeometryT, GJNGeometryType, GJNLinearRingT, GJNPositionT, GJNPropertyT } from 'spacedatastandards.org/lib/js/GJN/main.js';
-const asset = name => new URL(name, import.meta.url);
-const el = id => document.getElementById(id);
-let db;
-// Each browser session gets its own store. The id lives in sessionStorage, so a
-// reload keeps the store and a new tab or browser session starts an empty one.
-const sessionId = () => {
- try {
-  let id = sessionStorage.getItem('flatsql-demo-session');
-  if (!id) { id = crypto.randomUUID(); sessionStorage.setItem('flatsql-demo-session', id); }
-  return id;
- } catch { return crypto.randomUUID(); }
-};
-const root = `flatsql-demo-${sessionId()}`;
-const buttons = ['btnBinaryIngest','btnBinaryQuery','btnBinaryReopen','btnBinaryClear'];
-const status = text => { el('binaryStatus').textContent = text; };
+const asset=name=>new URL(name,import.meta.url);
+const el=id=>document.getElementById(id);
+const status=text=>{el('binaryStatus').textContent=text;};
+const saved=(key,value)=>{try{if(value!==undefined)sessionStorage.setItem(key,value);return sessionStorage.getItem(key);}catch{return null;}};
+const sessionId=saved('flatsql-demo-session')||crypto.randomUUID();
+saved('flatsql-demo-session',sessionId);
+const root=`flatsql-demo-${sessionId}`;
+const stores=new Map();
+const internalTypes=new Set(['FMB','FCK','FSG']);
+let mode=saved('flatsql-demo-backend')||'memory',selected='GJN',catalog=[],busy=false,stopping=false,db;
+const current=()=>stores.get(mode);
+function pages(stream) {
+ const out=[];
+ for(let at=0;at<stream.length;) {
+  const n=new DataView(stream.buffer,stream.byteOffset+at,4).getUint32(0,true);
+  out.push(QRP.getSizePrefixedRootAsQRP(new fb.ByteBuffer(stream.subarray(at,at+n+4))));at+=n+4;
+ }
+ return out;
+}
 function request(sql) {
  const b = new fb.Builder(256); const text = b.createString(sql);
  QRP.startQRP(b); QRP.addSql(b,text); QRP.addRepresentation(b,qrpRepresentation.FlatBuffer); QRP.addMaxRows(b,100n);
@@ -48,54 +50,166 @@ function render(stream) {
  el('binaryResults').replaceChildren(table);
  el('binaryCount').textContent=`${rows.length} result row${rows.length===1?'':'s'} · ${stream.length.toLocaleString()} FlatBuffer bytes`;
 }
+const bytes=n=>{const units=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++;}return `${n.toLocaleString(undefined,{maximumFractionDigits:1})} ${units[i]}`;};
+async function meters() {
+ const memory=performance.memory;
+ if(memory?.jsHeapSizeLimit>0 && Number.isFinite(memory.usedJSHeapSize)) {
+  el('memoryMeter').hidden=false;el('memoryMeter').max=memory.jsHeapSizeLimit;el('memoryMeter').value=memory.usedJSHeapSize;
+  el('memoryText').textContent=`~${bytes(Math.max(0,memory.jsHeapSizeLimit-memory.usedJSHeapSize))} JS heap budget left · ${bytes(memory.usedJSHeapSize)} used. Excludes worker/WASM memory; free system RAM is unavailable.`;
+ } else {el('memoryText').textContent='This browser does not expose remaining RAM. Generated data size is shown below; engine and index memory are additional.';}
+ el('generatedBytes').textContent=`${bytes(current()?.bytes||0)} generated since opening this store`;
+ try {
+  const estimate=await navigator.storage?.estimate?.();
+  if(!estimate?.quota)throw new Error();
+  el('diskMeter').hidden=false;el('diskMeter').max=estimate.quota;el('diskMeter').value=estimate.usage||0;
+  el('diskText').textContent=`~${bytes(Math.max(0,estimate.quota-(estimate.usage||0)))} available · ${bytes(estimate.usage||0)} of ${bytes(estimate.quota)} origin quota used`;
+ }catch{el('diskMeter').hidden=true;el('diskText').textContent='Storage quota is unavailable in this browser.';}
+}
+function controls() {
+ for(const input of document.querySelectorAll('button,input,select'))input.disabled=busy||!db;
+ el('btnStop').disabled=!busy||!generating;
+ el('btnBinaryIngest').disabled=busy||!db||!el('datasetSelect').value||internalTypes.has(selected);
+ el('btnContinuous').disabled=el('btnBinaryIngest').disabled;
+ for(const button of document.querySelectorAll('[data-count]'))button.disabled=el('btnBinaryIngest').disabled;
+ for(const id of ['btnBinaryQuery','btnCount','btnPreview','btnSpatial'])el(id).disabled=busy||!db||internalTypes.has(selected);
+ el('btnBinaryReopen').disabled=busy||!db||mode!=='opfs';
+ el('btnPersist').disabled=busy||!db||mode!=='opfs'||!navigator.storage?.persist;
+ el('storageMode').querySelector('[value=opfs]').disabled=!navigator.storage?.getDirectory;
+ el('storageMode').disabled=busy;
+ el('storageMode').value=mode;
+}
+function summary() {
+ const counts=current()?.counts||new Map();
+ const total=[...counts.values()].reduce((a,b)=>a+b,0);
+ el('recordSummary').textContent=`${total.toLocaleString()} records in ${mode==='memory'?'RAM':'disk'} · ${(counts.get(selected)||0).toLocaleString()} ${selected} records`;
+}
+async function register() {
+ if(internalTypes.has(selected))return;
+ if(current().registered.has(selected))return;
+ const type=catalog.find(t=>t.name===selected);
+ const response=await fetch(asset(`sds/${selected}.bfbs`));
+ if(!response.ok)throw new Error(`Schema ${selected}: HTTP ${response.status}`);
+ await db.registerSchema({name:selected,fileIdentifier:type.fileIdentifier,bfbs:new Uint8Array(await response.arrayBuffer())});
+ current().registered.add(selected);
+}
 async function open() {
- db=await FlatSQL.open({root,wasmUrl:asset('flatsql.wasm'),workerUrl:asset('runtime/browser-guest.mjs'),threadWorkerUrl:asset('runtime/wasiThreadBrowserWorker.mjs'),ioWorkerUrl:asset('runtime/opfsIoWorker.mjs')});
- const bfbs=new Uint8Array(await (await fetch(asset('GJN.bfbs'))).arrayBuffer());
- await db.registerSchema({name:'GJN',fileIdentifier:'$GJN',bfbs});
+ if(stores.has(mode)){db=current().db;return;}
+ db=await FlatSQL.open({root,backend:mode,wasmUrl:asset('flatsql.wasm'),workerUrl:asset('runtime/browser-guest.mjs'),threadWorkerUrl:asset('runtime/wasiThreadBrowserWorker.mjs'),ioWorkerUrl:asset('runtime/opfsIoWorker.mjs')});
+ stores.set(mode,{db,registered:new Set(),counts:new Map(),bytes:0});
+ for(const page of pages(await db.surface()))for(let i=0;i<page.tablesLength();i++) {
+  const table=page.TABLES(i),name=table.NAME();
+  if(catalog.some(t=>t.name===name)){current().registered.add(name);await count(name);}
+ }
+ await register();
 }
-// Standard SDS GJN records built in the browser with the generated SDS bindings.
-const position = (LONGITUDE, LATITUDE, ALTITUDE) =>
- new GJNPositionT(LONGITUDE, LATITUDE, ALTITUDE ?? 0, ALTITUDE !== undefined);
-const ring = (a, b) => new GJNLinearRingT([[a,a],[b,a],[b,b],[a,b],[a,a]].map(([x,y]) => position(x,y)));
-const geometries = [
- new GJNGeometryT(GJNGeometryType.POLYGON, null, [], [ring(0,10), ring(4,6)]),
- new GJNGeometryT(GJNGeometryType.POINT, position(20,20,420)),
- new GJNGeometryT(GJNGeometryType.GEOMETRY_COLLECTION, null, [], [], [], [
-  new GJNGeometryT(GJNGeometryType.POINT, position(-73.98,40.75)),
-  new GJNGeometryT(GJNGeometryType.LINE_STRING, null, [position(0,0), position(1,0)]),
- ]),
-];
-function generateRecords() {
- const records = geometries.map((GEOMETRY, i) => {
-  const b = new fb.Builder(512);
-  const feature = new GJNFeatureT(`sample-${i+1}`, GEOMETRY, [new GJNPropertyT('source', 'generated in browser')], 0, false, true);
-  GJN.finishSizePrefixedGJNBuffer(b, new GJNT([feature]).pack(b));
-  return b.asUint8Array();
- });
- const frames = new Uint8Array(records.reduce((total, record) => total + record.length, 0));
- let at = 0;
- for (const record of records) { frames.set(record, at); at += record.length; }
- return frames;
+async function count(name=selected) {
+ if(internalTypes.has(name))return 0;
+ const stream=await db.execute(request(`SELECT COUNT(*) FROM "${name}"`));
+ const rowPage=pages(stream).find(page=>page.rowsLength()>0);
+ if(!rowPage)throw new Error('The record count query returned no row');
+ const value=Number(rowPage.ROWS(0).CELLS(0).INT_VALUE());
+ current().counts.set(name,value);summary();return value;
 }
-async function query() {render(await db.execute(request(el('binarySql').value)));}
-async function action(fn, message) {
- for(const id of buttons)el(id).disabled=true;
- try {await fn(); status(message);}
+async function query(){if(!internalTypes.has(selected))render(await db.execute(request(el('binarySql').value)));}
+async function action(fn,message) {
+ if(busy)return;
+ busy=true;controls();
+ try{await fn();if(message)status(message);}
  catch(error){status(`Error: ${error.message}`);}
- finally{for(const id of buttons)el(id).disabled=!db;}
+ finally{busy=false;controls();summary();await meters();}
 }
-el('btnBinaryIngest').onclick=()=>action(async()=>{
- await db.ingest('GJN',generateRecords(),{provider:'demo',source:'spacedatastandards.org'});await query();
-},'3 SDS GJN records generated and loaded · spatial SQL ready');
+function selectedUI() {
+ const type=catalog.find(t=>t.name===selected);
+ el('datasetHint').textContent=internalTypes.has(selected)?`${type.description} — Reserved for FlatSQL's internal store format; cannot be ingested as user records.`:type.description;
+ el('schemaDownload').href=asset(`sds/${selected}.bfbs`);
+ el('binarySql').value=`SELECT * FROM "${selected}" LIMIT 50`;
+ el('btnSpatial').hidden=selected!=='GJN';summary();
+ if(internalTypes.has(selected)){el('binaryResults').replaceChildren();el('binaryCount').textContent='Storage-internal schema: user record generation is unavailable.';}
+}
+function filterTypes() {
+ const term=el('typeSearch').value.trim().toLowerCase();
+ const types=catalog.filter(t=>`${t.name} ${t.description}`.toLowerCase().includes(term));
+ el('datasetSelect').replaceChildren(...types.map(t=>new Option(`${t.name} — ${t.description.split('\n')[0]}`,t.name)));
+ el('datasetSelect').value=types.some(t=>t.name===selected)?selected:(types[0]?.name||'');
+ el('typeCount').textContent=`${types.length} / ${catalog.length}`;
+ if(!types.length)el('datasetHint').textContent='No matching SDS types. Try another search.';
+ controls();
+ if(types.length && el('datasetSelect').value!==selected)selectType(el('datasetSelect').value);
+ else if(types.length)selectedUI();
+}
+function selectType(name) {
+ return action(async()=>{selected=name;selectedUI();await register();await count();await query();},'Ready · add more records to the selected type');
+}
+const generator=new Worker(asset('generator.mjs'),{type:'module'});
+let generationId=0,generating=false;
+function batch(type,count,start) {
+ return new Promise((resolve,reject)=>{
+  const id=++generationId;
+  const timer=setTimeout(()=>{cleanup();reject(new Error('Record generation timed out'));},30000);
+  const cleanup=()=>{clearTimeout(timer);generator.removeEventListener('message',message);generator.removeEventListener('error',error);};
+  const message=({data})=>{if(data.id!==id)return;cleanup();data.error?reject(new Error(data.error)):resolve(data);};
+  const error=event=>{cleanup();reject(new Error(event.message));};
+  generator.addEventListener('message',message);generator.addEventListener('error',error);
+  generator.postMessage({id,type,count,start});
+ });
+}
+function generate(continuous=false) {
+ const requested=continuous?Infinity:Number(el('recordCount').value);
+ if(!continuous&&(!Number.isSafeInteger(requested)||requested<1)){status('Enter a positive whole number of records.');return;}
+ generating=true;stopping=false;
+ return action(async()=>{
+  const progress=el('generationProgress');progress.hidden=false;
+  if(continuous)progress.removeAttribute('value');else{progress.max=requested;progress.value=0;}
+  const start=await count();let added=0;
+  try {
+   while(added<requested&&!stopping) {
+    const next=await batch(selected,Math.min(1000,requested-added),start+added);
+    await db.ingest(selected,next.frames,{provider:'demo',source:'spacedatastandards.org'});
+    added+=next.count;current().bytes+=next.frames.length;await count();
+    if(!continuous)progress.value=added;
+    status(`Generating · ${added.toLocaleString()} ${selected} records${continuous?'':` of ${requested.toLocaleString()}`}…`);
+    await meters();
+   }
+   await count();await query();
+   const stored=current().counts.get(selected)||0;
+   status(`${stopping?'Stopped':'Generated'} · ${added.toLocaleString()} ${selected} records · ${stored.toLocaleString()} stored${stored<start+added?' (identical content deduplicated)':''}`);
+  } catch(error) {
+   // A failed batch may contain committed records. Recount the store instead
+   // of displaying an invented all-or-nothing total.
+   await count().catch(()=>{});
+   throw new Error(`${error.message}. ${added.toLocaleString()} records acknowledged before this batch; see the store count. You can stop, clear, or choose disk storage.`);
+  } finally {generating=false;progress.hidden=true;}
+ });
+}
+el('typeSearch').oninput=filterTypes;
+el('datasetSelect').onchange=()=>selectType(el('datasetSelect').value);
+el('btnBinaryIngest').onclick=()=>generate();
+el('btnContinuous').onclick=()=>generate(true);
+el('btnStop').onclick=()=>{stopping=true;status('Stopping after the current batch…');};
+for(const button of document.querySelectorAll('[data-count]'))button.onclick=()=>{el('recordCount').value=button.dataset.count;generate();};
 el('btnBinaryQuery').onclick=()=>action(query,'Query complete');
-el('btnBinaryReopen').onclick=()=>action(async()=>{await db.close();db=null;await open();await query();},'Reopened persistent binary records');
+el('btnCount').onclick=()=>{el('binarySql').value=`SELECT COUNT(*) AS records FROM "${selected}"`;action(query,'Query complete');};
+el('btnPreview').onclick=()=>{el('binarySql').value=`SELECT * FROM "${selected}" LIMIT 50`;action(query,'Query complete');};
+el('btnSpatial').onclick=()=>{el('binarySql').value='SELECT _rowid FROM GJN WHERE geo_contains(_data,2,2) LIMIT 50';action(query,'Query complete');};
+el('storageMode').onchange=()=>{
+ const nextMode=el('storageMode').value;
+ return action(async()=>{
+ const before=mode;mode=nextMode;
+ try{await open();await register();}
+ catch(error){mode=before;db=current()?.db;throw error;}
+ saved('flatsql-demo-backend',mode);selectedUI();await count();await query();
+},'Ready · storage selected');
+};
+el('btnBinaryReopen').onclick=()=>action(async()=>{await db.close();db=null;stores.delete(mode);await open();await count();await query();},'Reopened disk store');
 el('btnBinaryClear').onclick=()=>action(async()=>{
- await db.close();db=null;
- const directory=await navigator.storage.getDirectory();
- await directory.removeEntry(root,{recursive:true});
- await open();await query();
+ await db.close();db=null;stores.delete(mode);
+ if(mode==='opfs'){const directory=await navigator.storage.getDirectory();await directory.removeEntry(root,{recursive:true});}
+ await open();await count();await query();
 },'Demo store cleared');
-for(const button of document.querySelectorAll('[data-binary-sql]'))button.onclick=()=>{el('binarySql').value=button.dataset.binarySql;};
+el('btnPersist').onclick=()=>action(async()=>{
+ const granted=await navigator.storage.persist();
+ el('persistenceStatus').textContent=granted?'Persistent storage granted by this browser.':'Persistence was not granted. Disk data remains subject to browser eviction.';
+},'Storage persistence checked');
 (async()=>{
  if(!crossOriginIsolated) {
   status('Preparing browser storage…');
@@ -106,5 +220,10 @@ for(const button of document.querySelectorAll('[data-binary-sql]'))button.onclic
   else navigator.serviceWorker.addEventListener('controllerchange',()=>location.reload(),{once:true});
   return;
  }
- await action(async()=>{await open();await query();},'Ready · binary records, persistent storage');
+ const response=await fetch(asset('sds/catalog.json'));
+ if(!response.ok)throw new Error(`SDS catalog: HTTP ${response.status}`);
+ const manifest=await response.json();catalog=manifest.types;el('sdsVersion').textContent=`SDS ${manifest.version} · ${catalog.length} types`;
+ filterTypes();
+ await action(async()=>{await open();await count();await query();},'Ready · choose a type and generate records');
+ setInterval(()=>{if(!busy)meters();},3000);
 })().catch(error=>status(`Error: ${error.message}`));
