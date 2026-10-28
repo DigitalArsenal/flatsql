@@ -4,6 +4,7 @@ import * as fb from 'flatbuffers';
 import { QRP } from 'spacedatastandards.org/lib/js/QRP/QRP.js';
 import { qrpRepresentation } from 'spacedatastandards.org/lib/js/QRP/qrpRepresentation.js';
 import { RAW_TYPES } from './demo-raw-store.js';
+import { createQueryView } from './demo-query.js';
 const asset=name=>new URL(name,import.meta.url);
 const el=id=>document.getElementById(id);
 const status=text=>{el('binaryStatus').textContent=text;};
@@ -15,6 +16,7 @@ const stores=new Map();
 const internalTypes=new Set(RAW_TYPES);
 let mode=saved('flatsql-demo-backend')||'memory',selected='GJN',catalog=[],busy=false,stopping=false,db;
 const current=()=>stores.get(mode);
+const queryView=createQueryView({results:el('binaryResults'),summary:el('binaryCount'),state:el('queryState'),elapsed:el('queryElapsed'),cancel:el('btnCancelQuery')});
 function pages(stream) {
  const out=[];
  for(let at=0;at<stream.length;) {
@@ -25,31 +27,8 @@ function pages(stream) {
 }
 function request(sql) {
  const b = new fb.Builder(256); const text = b.createString(sql);
- QRP.startQRP(b); QRP.addSql(b,text); QRP.addRepresentation(b,qrpRepresentation.FlatBuffer); QRP.addMaxRows(b,100n);
+ QRP.startQRP(b); QRP.addSql(b,text); QRP.addRepresentation(b,qrpRepresentation.FlatBuffer);
  QRP.finishSizePrefixedQRPBuffer(b,QRP.endQRP(b)); return b.asUint8Array();
-}
-function render(stream) {
- const cols=[],rows=[];
- for(let at=0;at<stream.length;) {
-  const n=new DataView(stream.buffer,stream.byteOffset+at,4).getUint32(0,true);
-  const page=QRP.getSizePrefixedRootAsQRP(new fb.ByteBuffer(stream.subarray(at,at+n+4)));
-  if(page.columnsLength() && !cols.length) for(let i=0;i<page.columnsLength();i++) cols.push(page.COLUMNS(i).NAME());
-  for(let i=0;i<page.rowsLength();i++) {
-   const row=page.ROWS(i),values=[];
-   for(let j=0;j<row.cellsLength();j++) {
-    const c=row.CELLS(j);
-    values.push(c.KIND()===0?'NULL':c.KIND()===1?String(c.BOOL_VALUE()):c.KIND()===2?String(c.INT_VALUE()):c.KIND()===3?String(c.FLOAT_VALUE()):c.KIND()===4?c.TEXT_VALUE():`${c.bytesValueLength()} bytes`);
-   }
-   rows.push(values);
-  }
-  at+=n+4;
- }
- const table=document.createElement('table'),head=table.createTHead().insertRow();
- for(const name of cols) {const th=document.createElement('th');th.textContent=name;head.append(th);}
- const body=table.createTBody();
- for(const row of rows) {const tr=body.insertRow();for(const value of row)tr.insertCell().textContent=value;}
- el('binaryResults').replaceChildren(table);
- el('binaryCount').textContent=`${rows.length} result row${rows.length===1?'':'s'} · ${stream.length.toLocaleString()} FlatBuffer bytes`;
 }
 const bytes=n=>{const units=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++;}return `${n.toLocaleString(undefined,{maximumFractionDigits:1})} ${units[i]}`;};
 async function meters() {
@@ -69,6 +48,7 @@ async function meters() {
 function controls() {
  for(const input of document.querySelectorAll('button,input,select'))input.disabled=busy||!db;
  el('btnStop').disabled=!busy||!generating;
+ el('btnCancelQuery').disabled=!queryView.running;
  el('btnBinaryIngest').disabled=busy||!db||!el('datasetSelect').value;
  el('btnContinuous').disabled=el('btnBinaryIngest').disabled;
  for(const button of document.querySelectorAll('[data-count]'))button.disabled=el('btnBinaryIngest').disabled;
@@ -117,16 +97,17 @@ async function count(name=selected) {
 }
 async function query(){
  if(internalTypes.has(selected)) {
+  queryView.reset();
   const notice=document.createElement('p');notice.style.padding='12px';
   notice.textContent=`${(current().counts.get(selected)||0).toLocaleString()} ${selected} records stored as size-prefixed FlatBuffers. These internal control schemas are kept outside FlatSQL feeds and cannot be queried with SQL.`;
   el('binaryResults').replaceChildren(notice);
   el('binaryCount').textContent='Raw SDS collection';
- }else render(await db.execute(request(el('binarySql').value)));
+ }else return queryView.run(db,request(el('binarySql').value));
 }
 async function action(fn,message) {
  if(busy)return;
  busy=true;controls();
- try{await fn();if(message)status(message);}
+ try{const result=await fn();if(message)status(result?.cancelled?'Query cancelled':message);}
  catch(error){status(`Error: ${error.message}`);}
  finally{busy=false;controls();summary();await meters();}
 }

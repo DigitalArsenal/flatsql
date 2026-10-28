@@ -160,6 +160,42 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  await evaluate("document.getElementById('recordCount').value=1001;document.getElementById('btnBinaryIngest').click()");
  await wait("!document.getElementById('btnBinaryIngest').disabled",'multi-batch generation');
  await query('SELECT COUNT(*) FROM GJN',[['1009']]);
+ // Removing SQL LIMIT must stream every row without the old hidden 100-row
+ // cap or the execute() collector's 16 MiB budget. Only the DOM is bounded.
+ await query('SELECT * FROM GJN');
+ assert.match(await evaluate("document.getElementById('binaryCount').textContent"),/^1,009 result rows received · showing 100 \(first 100 only\)/);
+ assert.equal(await evaluate("document.querySelectorAll('tbody tr').length"),100);
+ assert.equal(await evaluate("document.getElementById('queryState').dataset.state"),'complete');
+ assert.ok(await evaluate("parseFloat(document.getElementById('queryElapsed').textContent)>0"));
+ await query('SELECT a._rowid,b._rowid,a._data FROM GJN a CROSS JOIN GJN b WHERE b._rowid <= 50');
+ const largeResult=await evaluate("document.getElementById('binaryCount').textContent");
+ assert.match(largeResult,/^50,450 result rows received · showing 100/);
+ assert.ok(Number(largeResult.match(/([\d,]+) FlatBuffer bytes/)[1].replaceAll(',',''))>16*1024*1024,largeResult);
+ assert.equal(await evaluate("document.querySelectorAll('tbody tr').length"),100);
+ await evaluate("document.getElementById('binarySql').scrollIntoView({behavior:'instant',block:'start'})");
+ await shot('query-unbounded');
+ // An expensive aggregate produces no rows while it runs. The elapsed timer
+ // and Cancel must still respond, and cancellation must release the query lane.
+ await evaluate("document.getElementById('binarySql').value='SELECT COUNT(*) FROM GJN a CROSS JOIN GJN b CROSS JOIN GJN c';document.getElementById('btnBinaryQuery').click()");
+ await wait("document.getElementById('queryState').dataset.state==='running' && parseFloat(document.getElementById('queryElapsed').textContent)>=0.3",'live query timer');
+ const firstTick=await evaluate("parseFloat(document.getElementById('queryElapsed').textContent)");
+ await wait(`document.getElementById('queryState').dataset.state==='running' && parseFloat(document.getElementById('queryElapsed').textContent)>${firstTick+0.2}`,'query timer advances');
+ assert.equal(await evaluate("document.getElementById('btnBinaryQuery').disabled"),true);
+ assert.equal(await evaluate("document.getElementById('btnCancelQuery').disabled"),false);
+ await shot('query-running');
+ await evaluate("document.getElementById('btnCancelQuery').click()");
+ await wait("!document.getElementById('btnBinaryQuery').disabled",'query cancellation');
+ assert.equal(await evaluate("document.getElementById('queryState').dataset.state"),'cancelled');
+ assert.equal(await evaluate(status),'Query cancelled');
+ assert.equal(await evaluate("document.getElementById('btnCancelQuery').disabled"),true);
+ const cancelledTime=await evaluate("document.getElementById('queryElapsed').textContent");
+ await evaluate('new Promise(resolve=>setTimeout(resolve,250))');
+ assert.equal(await evaluate("document.getElementById('queryElapsed').textContent"),cancelledTime,'completed timer is frozen');
+ await shot('query-cancelled');
+ await query('SELECT COUNT(*) FROM GJN',[['1009']]);
+ await query('SELECT _rowid FROM GJN WHERE _rowid < 0',[]);
+ assert.match(await evaluate("document.getElementById('binaryCount').textContent"),/^0 result rows received/);
+ await evaluate("scrollTo({top:0,behavior:'instant'})");
  await evaluate("document.getElementById('btnContinuous').click()");
  await wait(`(${status}).startsWith('Generating · ')`,'continuous generation starts');
  await evaluate("document.getElementById('btnStop').click()");
@@ -177,6 +213,10 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  await evaluate("document.getElementById('binarySql').value='SELECT nonexistent FROM GJN';document.getElementById('btnBinaryQuery').click()");
  await wait("!document.getElementById('btnBinaryQuery').disabled",'query error recovery');
  assert.match(await evaluate(status),/^Error:/);
+ assert.equal(await evaluate("document.getElementById('queryState').dataset.state"),'error');
+ assert.match(await evaluate("document.getElementById('queryState').textContent"),/^Query failed:/);
+ await evaluate("document.getElementById('binarySql').scrollIntoView({behavior:'instant',block:'start'})");
+ await shot('query-error');
 
  // Disk is an actual OPFS-backed separate store and RAM survives switching.
  await evaluate("document.getElementById('storageMode').value='opfs';document.getElementById('storageMode').dispatchEvent(new Event('change'))");
@@ -241,9 +281,14 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  await send('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
  await shot('binary-mobile');
  assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true);
+ await query('SELECT * FROM GJN');
+ assert.match(await evaluate("document.getElementById('binaryCount').textContent"),/^3 result rows received/);
+ await evaluate("document.getElementById('binarySql').scrollIntoView({behavior:'instant',block:'start'})");
+ await shot('query-mobile');
+ assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true);
  await evaluate("document.getElementById('btnBinaryClear').click()");
  await wait(`(${status}).startsWith('Demo store cleared')`,'clear exact demo store');
- assert.equal(await evaluate("document.querySelector('tbody').innerText"),'0');
+ await query('SELECT COUNT(*) FROM GJN',[['0']]);
  await evaluate("document.getElementById('datasetSelect').value='FSG';document.getElementById('datasetSelect').dispatchEvent(new Event('change'))");
  await wait("!document.getElementById('btnBinaryIngest').disabled",'raw collection cleared');
  assert.match(await evaluate("document.getElementById('binaryResults').textContent"),/^0 FSG records stored/);
@@ -256,8 +301,19 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  await wait("Math.abs(document.getElementById('binaryDemo').getBoundingClientRect().top-80)<5",'homepage demo visible');
  await evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
  await shot('homepage-demo');
+ const embedded="document.getElementById('binaryDemo').contentDocument";
+ await evaluate(`{const d=${embedded};d.getElementById('recordCount').value=1001;d.getElementById('btnBinaryIngest').click()}`);
+ await wait(`!${embedded}.getElementById('btnBinaryIngest').disabled`,'embedded generation');
+ await evaluate(`{const d=${embedded};d.getElementById('binarySql').value='SELECT * FROM GJN';d.getElementById('btnBinaryQuery').click()}`);
+ await wait(`!${embedded}.getElementById('btnBinaryQuery').disabled`,'embedded unbounded query');
+ assert.equal(await evaluate(`${embedded}.getElementById('queryState').dataset.state`),'complete');
+ assert.match(await evaluate(`${embedded}.getElementById('binaryCount').textContent`),/^1,001 result rows received · showing 100/);
+ assert.ok(await evaluate(`parseFloat(${embedded}.getElementById('queryElapsed').textContent)>0`));
+ await evaluate(`${embedded}.getElementById('binarySql').scrollIntoView({behavior:'instant',block:'center'})`);
+ await evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+ await shot('homepage-query');
  assert.deepEqual(errors,[]);
- console.log(`PASS: identical WASM, Pages isolation, all SDS types, search, unique append, batched/continuous generation and stop, RAM/OPFS meters, binary queries, persistence/reload, clear, desktop/mobile and homepage. Screenshots: ${evidence}`);
+ console.log(`PASS: identical WASM, Pages isolation, all SDS types, search, unique append, batched/continuous generation and stop, RAM/OPFS meters, unbounded queries beyond 16 MiB, live timer, cancellation/recovery, persistence/reload, clear, desktop/mobile and homepage. Screenshots: ${evidence}`);
 } finally {
  socket?.close();child.kill('SIGTERM');
  await new Promise(resolve=>{if(child.exitCode!==null)return resolve();child.once('exit',resolve);setTimeout(resolve,3000);});
