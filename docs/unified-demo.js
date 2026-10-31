@@ -209,15 +209,8 @@ el('btnPersist').onclick=()=>action(async()=>{
  el('persistenceStatus').textContent=granted?'Persistent storage granted by this browser.':'Persistence was not granted. Disk data remains subject to browser eviction.';
 },'Storage persistence checked');
 (async()=>{
- if(!crossOriginIsolated) {
-  status('Preparing browser storage…');
-  if(!('serviceWorker' in navigator))throw new Error('This browser cannot isolate shared WASM memory');
-  await navigator.serviceWorker.register(new URL('../../coi-serviceworker.js',import.meta.url),{scope:new URL('../../',import.meta.url).pathname});
-  await navigator.serviceWorker.ready;
-  if(navigator.serviceWorker.controller)location.reload();
-  else navigator.serviceWorker.addEventListener('controllerchange',()=>location.reload(),{once:true});
-  return;
- }
+ status('Preparing browser storage…');
+ await flatsqlIsolation;
  const response=await fetch(asset('sds/catalog.json'));
  if(!response.ok)throw new Error(`SDS catalog: HTTP ${response.status}`);
  const manifest=await response.json();catalog=manifest.types;el('sdsVersion').textContent=`SDS ${manifest.version} · ${catalog.length} types`;

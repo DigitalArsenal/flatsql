@@ -2,6 +2,7 @@
 <html lang="en" data-sdn-light="invert">
 <head>
     <meta charset="UTF-8">
+    <script src="isolation.js"></script>
     <link rel="stylesheet" href="assets/sdn-chrome/sdn-chrome.css">
     <script src="assets/sdn-chrome/sdn-chrome.js"></script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1949,15 +1950,6 @@ await db.close();</pre></div>
 
     </script>
 
-    <script>
-        // Pages uses the same-origin worker to enable the shared WASM engine.
-        if (!crossOriginIsolated && 'serviceWorker' in navigator) {
-            navigator.serviceWorker.register('./coi-serviceworker.js').then(() => navigator.serviceWorker.ready).then(() => {
-                if (navigator.serviceWorker.controller) location.reload();
-                else navigator.serviceWorker.addEventListener('controllerchange', () => location.reload(), {once:true});
-            }).catch(error => console.error('Browser isolation setup failed', error));
-        }
-    </script>
     <script src="media/reel/reel.js" defer></script>
     <script src="assets/ai-credits/ai-credits.js" defer></script>
 </body>
