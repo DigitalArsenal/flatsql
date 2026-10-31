@@ -26,15 +26,20 @@ function shell() {
  }
  throw new Error('Install chromium-headless-shell, or set GAUNTLET_HEADLESS_SHELL');
 }
+let navStyleDelay=0;
 const server=http.createServer((req,res)=>{
  const pathname=new URL(req.url,'http://localhost').pathname;
  if(pathname.endsWith('/favicon.ico')){res.writeHead(204);res.end();return;}
- const relative=pathname.replace(/^\/flatsql\//,'/');
+ // The same site under a worker that adds no COOP/COEP: a browser that can never isolate.
+ if(pathname==='/no-isolation/coi-serviceworker.js'){res.writeHead(200,{'content-type':'text/javascript'});res.end("self.addEventListener('install',()=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));");return;}
+ const relative=pathname.replace(/^\/(flatsql|no-isolation)\//,'/');
  const file=path.resolve(root,'.'+(relative.endsWith('/')?relative+'index.html':relative));
  if(!file.startsWith(root+'/')||!fs.existsSync(file)||!fs.statSync(file).isFile()){res.writeHead(404);res.end();return;}
  const mime={'.html':'text/html','.js':'text/javascript','.mjs':'text/javascript','.css':'text/css','.wasm':'application/wasm','.svg':'image/svg+xml','.json':'application/json','.png':'image/png','.mp4':'video/mp4','.webm':'video/webm'};
  // Deliberately no COOP/COEP headers: verify the actual Pages isolation flow.
- res.setHeader('content-type',mime[path.extname(file)]??'application/octet-stream');fs.createReadStream(file).pipe(res);
+ res.setHeader('content-type',mime[path.extname(file)]??'application/octet-stream');
+ const respond=()=>fs.createReadStream(file).pipe(res);
+ if(navStyleDelay&&/sdn-stack-nav\..*\.css$/.test(file))setTimeout(respond,navStyleDelay);else respond();
 });
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 const profile=fs.mkdtempSync(path.join(os.tmpdir(),'flatsql-headless-'));
@@ -48,10 +53,11 @@ try {
  });
  const tab=await(await fetch(`http://127.0.0.1:${port}/json/new?about:blank`,{method:'PUT'})).json();
  socket=new WebSocket(tab.webSocketDebuggerUrl);await new Promise((resolve,reject)=>{socket.onopen=resolve;socket.onerror=reject;});
- let serial=0;const pending=new Map(),errors=[];
+ let serial=0,navigations=0;const pending=new Map(),errors=[];
  socket.onmessage=({data})=>{
    const m=JSON.parse(data);
    if(m.id){const p=pending.get(m.id);pending.delete(m.id);if(m.error)p.reject(new Error(m.error.message));else p.resolve(m.result);}
+   else if(m.method==='Page.frameNavigated'&&!m.params.frame.parentId)navigations++;
    else if(m.method==='Runtime.exceptionThrown')errors.push(m.params.exceptionDetails?.exception?.description??m.params.exceptionDetails.text);
    else if(m.method==='Runtime.consoleAPICalled' && m.params.type==='error')errors.push(m.params.args.map(a=>a.value??a.description).join(' '));
  };
@@ -67,12 +73,23 @@ try {
  };
  const shot=async name=>{const s=await send('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(evidence,name+'.png'),Buffer.from(s.data,'base64'));};
  await send('Runtime.enable');await send('Page.enable');
- const base=`http://127.0.0.1:${server.address().port}/flatsql/`;
+ const origin=`http://127.0.0.1:${server.address().port}`;
+ const base=`${origin}/flatsql/`;
  await send('Emulation.setDeviceMetricsOverride',{width:1100,height:920,deviceScaleFactor:1,mobile:false});
+ // No isolation: one reload, then the page stays put and the embedded demo says why.
+ await send('Page.navigate',{url:`${origin}/no-isolation/index.html`});
+ await wait(`document.getElementById('binaryDemo')?.contentDocument?.getElementById('binaryStatus')?.textContent.includes('cannot isolate')`,'demo reports no isolation');
+ await new Promise(resolve=>setTimeout(resolve,2000));
+ assert.equal(navigations,2);
+ assert.equal(await evaluate('crossOriginIsolated'),false);
+ await shot('no-isolation');
+ assert.deepEqual(errors,[]);
+ navigations=0;
  await send('Page.navigate',{url:base+'unified-demo.html'});
  const status="document.getElementById('binaryStatus')?.textContent??''";
  await wait(`(${status}).startsWith('Ready')`,'engine ready');
  assert.equal(await evaluate('crossOriginIsolated'),true);
+ assert.equal(navigations,2);
  const diagnostic=await evaluate(`(async()=>{const {FlatSQL}=await import('/flatsql/assets/unified/api.mjs');const a=await FlatSQL.open({backend:'memory'});let b;try{b=await FlatSQL.open({backend:'memory'});try{await a.execute(new Uint8Array(${JSON.stringify(Array.from(invalidQuery))}));return null}catch(error){return {name:error.name,status:error.status,message:error.message}}}finally{await b?.close();await a.close()}})()`);
  assert.equal(diagnostic.name,'FlatSQLError');assert.equal(diagnostic.status,-13);assert.match(diagnostic.message,/json|function/i);
  const gjnSource=fs.readFileSync(new URL('../node_modules/spacedatastandards.org/schema/GJN/main.fbs',import.meta.url),'utf8');
@@ -292,6 +309,25 @@ const rawQuery=converter.generateBinary({entry:'QRP.fbs',files:{'QRP.fbs':qrpSou
  await evaluate("document.getElementById('datasetSelect').value='FSG';document.getElementById('datasetSelect').dispatchEvent(new Event('change'))");
  await wait("!document.getElementById('btnBinaryIngest').disabled",'raw collection cleared');
  assert.match(await evaluate("document.getElementById('binaryResults').textContent"),/^0 FSG records stored/);
+
+ // The strip renders before its stylesheet arrives. Until then it must stay out of
+ // the hero's way, and the hero must end up clear of the header.
+ navStyleDelay=1500;
+ await send('Network.enable');await send('Network.setCacheDisabled',{cacheDisabled:true});
+ await send('Page.navigate',{url:base});
+ const strip="document.querySelector('sdn-stack-nav')?.shadowRoot?.querySelector('footer')";
+ await wait(`${strip}&&getComputedStyle(${strip}).position!=='fixed'`,'strip rendered before its stylesheet');
+ assert.equal(await evaluate("document.querySelector('.hero').getBoundingClientRect().top"),0);
+ await wait(`getComputedStyle(${strip}).position==='fixed'`,'strip stylesheet');
+ navStyleDelay=0;await send('Network.setCacheDisabled',{cacheDisabled:false});
+ assert.ok(await evaluate("document.querySelector('.hero').firstElementChild.getBoundingClientRect().top>=document.querySelector('.sdn-header').getBoundingClientRect().bottom"));
+ await shot('homepage-mobile');
+ // A phone's URL bar changes innerHeight and nothing else. The page must not move.
+ const layout="JSON.stringify([document.querySelector('.hero').style.paddingTop,document.querySelector('.hero + *').getBoundingClientRect().top+scrollY])";
+ const beforeBar=await evaluate(layout);
+ await evaluate("Object.defineProperty(window,'innerHeight',{configurable:true,value:innerHeight+60});window.dispatchEvent(new Event('resize'))");
+ await evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+ assert.equal(await evaluate(layout),beforeBar);
 
  await send('Emulation.setDeviceMetricsOverride',{width:1280,height:1000,deviceScaleFactor:1,mobile:false});
  await send('Page.navigate',{url:base});

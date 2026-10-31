@@ -210,7 +210,7 @@ el('btnPersist').onclick=()=>action(async()=>{
 },'Storage persistence checked');
 (async()=>{
  status('Preparing browser storage…');
- await flatsqlIsolation;
+ if(!await flatsqlIsolation)throw new Error('This browser cannot isolate shared WASM memory');
  const response=await fetch(asset('sds/catalog.json'));
  if(!response.ok)throw new Error(`SDS catalog: HTTP ${response.status}`);
  const manifest=await response.json();catalog=manifest.types;el('sdsVersion').textContent=`SDS ${manifest.version} · ${catalog.length} types`;

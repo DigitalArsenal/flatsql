@@ -14,6 +14,7 @@
 <script defer src="/flatsql/assets/vendor/hd-wallet-ui/2.2.1/sdn-wallet-public-client.9ab041131df957fcb6ef7e3d87bf9d19fe313bc5d7f1e53337752faf0ba354da.js" integrity="sha384-FNcHq8FI7eBz2YUhfO3jNfmdObbCXmfg4ugmBEHzXW/KBpbUdJXqIzpn30OWJBuB" crossorigin="anonymous" data-sdn-wallet-public-client="v1"></script>
 <script defer src="/flatsql/assets/vendor/sdn-stack-nav/1.2.0/sdn-stack-nav.ba268c55a1551bcacc390ac01347c319335a1660787b55b4b239df00fc3c1a4c.js" integrity="sha384-4BDI84CnpZ83otmTHK/KzA5+4pw8q5l+3LInURbEVJY96/iLGzCZUZsCyxjZ1Kpb" crossorigin="anonymous" data-nav-style-url="/flatsql/assets/vendor/sdn-stack-nav/1.2.0/sdn-stack-nav.36a36359ce18322185e9ff179f88175bab67d5ad84a14d9c08a54f2ff27267e7.css" data-nav-style-integrity="sha384-c4M8Fg+kYaeOYYtJVr7jJsde24IhSWkWaRyAOHEZU9jozhRck089aw+mnHwxymds" data-wallet-client-url="/flatsql/assets/vendor/hd-wallet-ui/2.2.1/sdn-wallet-public-client.9ab041131df957fcb6ef7e3d87bf9d19fe313bc5d7f1e53337752faf0ba354da.js" data-wallet-client-integrity="sha384-FNcHq8FI7eBz2YUhfO3jNfmdObbCXmfg4ugmBEHzXW/KBpbUdJXqIzpn30OWJBuB" data-wallet-style-url="/flatsql/assets/vendor/hd-wallet-ui/2.2.1/sdn-wallet-public-client.c3f68d1cfd88478f10d836a5e829d1dfc6a10157972cf0f7d4d319d0636f2cc4.css" data-wallet-style-integrity="sha384-fICuhN4I9xqOK1F5vGGzl26opuO+xQIvTZXMSV76lWTBiQ6AfzztMGLLDw8yRT8i" data-wallet-client-id="sdn-flatsql-pages-v1" data-wallet-callback-uri="https://digitalarsenal.github.io/flatsql/wallet-callback.html" data-wallet-registry-sha256="63784143e2ad8e2542d22148ff4a0a4da7a10f4b3f9909ae91a20dc0f60db06b"></script>
 <!-- SDN_CONSUMER_ASSETS_END -->
+    <link rel="preload" as="style" href="/flatsql/assets/vendor/sdn-stack-nav/1.2.0/sdn-stack-nav.36a36359ce18322185e9ff179f88175bab67d5ad84a14d9c08a54f2ff27267e7.css" integrity="sha384-c4M8Fg+kYaeOYYtJVr7jJsde24IhSWkWaRyAOHEZU9jozhRck089aw+mnHwxymds" crossorigin="anonymous">
     <style>
         /* Reset */
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -37,6 +38,27 @@
         }
 
         html { scroll-behavior: smooth; }
+
+        /* The strip's stylesheet loads inside its shadow root, after the strip has
+           rendered. Until then its content must stay out of the page's flow: it
+           would push the hero down, and the hero would center itself around it. */
+        sdn-stack-nav {
+            position: fixed;
+            right: 0;
+            bottom: 0;
+            left: 0;
+            z-index: 2147483000;
+            height: var(--sdn-stack-footer-height, 40px);
+            overflow: hidden;
+        }
+
+        /* The kit styles these once it wires them. A plain button's white would
+           fade out over the kit's transition. */
+        [data-sdn-theme-toggle]:not(.sdn-icon-button),
+        [data-sdn-menu-toggle]:not(.sdn-icon-button) {
+            background: transparent;
+            border: 0;
+        }
 
         body {
             font-family: var(--font-sans);
@@ -1543,7 +1565,7 @@
             </figure>
             <div class="hero-badges" aria-label="Project status">
                 <a href="https://github.com/DigitalArsenal/flatsql/actions/workflows/ci.yml?query=branch%3Amain" target="_blank" rel="noopener noreferrer">
-                    <img src="https://github.com/DigitalArsenal/flatsql/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status on main" height="20">
+                    <img src="https://img.shields.io/github/actions/workflow/status/DigitalArsenal/flatsql/ci.yml?branch=main&label=CI" alt="CI status on main" height="20">
                 </a>
                 <a href="https://www.npmjs.com/package/flatsql" target="_blank" rel="noopener noreferrer">
                     <img src="https://img.shields.io/npm/v/flatsql?label=npm" alt="Latest published FlatSQL version on npm" height="20">
