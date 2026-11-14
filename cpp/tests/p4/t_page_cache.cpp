@@ -175,3 +175,23 @@ FLATSQL_TEST(t_row_cache_view_ownership) {
     size_t count=0; const auto page=view->runs[0][0]->page(0,&count);
     CHECK(!page && page.status==FLATSQL_E_STOPPED,"view cannot use a destroyed cache");
 }
+
+FLATSQL_TEST(t_row_cache_sha256_vectors) {
+    auto hex=[](const uint8_t* digest) { const char* digits="0123456789abcdef"; std::string out;
+        for(size_t i=0;i<32;i++) { out.push_back(digits[digest[i]>>4]); out.push_back(digits[digest[i]&15]); } return out; };
+    const std::vector<std::pair<std::string,std::string>> vectors={
+        {"","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"abc","ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {std::string(1000000,'a'),"cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"}
+    };
+    for(const auto& vector:vectors) {
+        const auto* bytes=reinterpret_cast<const uint8_t*>(vector.first.data()); uint8_t digest[32];
+        flatsql::ps::sha256(bytes,vector.first.size(),digest);
+        CHECK_EQ(hex(digest),vector.second,"standard one-shot SHA-256 vector");
+        for(size_t chunk:{size_t(1),size_t(63),size_t(64),size_t(65),size_t(4096)}) {
+            flatsql::ps::Sha256 hash;
+            for(size_t i=0;i<vector.first.size();i+=chunk) hash.update(bytes+i,std::min(chunk,vector.first.size()-i));
+            hash.finish(digest); CHECK_EQ(hex(digest),vector.second,"standard incremental SHA-256 vector");
+        }
+    }
+}
