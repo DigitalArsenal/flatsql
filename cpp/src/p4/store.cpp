@@ -116,6 +116,30 @@ bool specFromFile(const std::vector<uint8_t>& b, std::vector<uint8_t>* tlv) {
     tlv->assign(b.begin(), b.begin() + long(at));
     return true;
 }
+// A durable intent retains a complete spec across an interrupted overwrite.
+// Recovery uses the same CRC as the authoritative file and is idempotent.
+int32_t recoverSpec(const std::string& path, std::vector<uint8_t>* bytes) {
+    const auto intentPath = path + ".intent";
+    const int32_t read = ioReadAll(path, bytes);
+    if (!ioExists(intentPath)) return read;
+    std::vector<uint8_t> intent, tlv;
+    if (ioReadAll(intentPath, &intent) != FLATSQL_OK) return FLATSQL_E_IO;
+    if (!specFromFile(intent, &tlv)) {
+        if (read != FLATSQL_OK || !specFromFile(*bytes, &tlv)) return FLATSQL_E_CORRUPT;
+        return ioUnlink(intentPath);
+    }
+    const int32_t rc = ioWriteNew(path, intent.data(), intent.size());
+    if (rc != FLATSQL_OK) return rc;
+    *bytes = std::move(intent);
+    return ioUnlink(intentPath);
+}
+int32_t writeSpec(const std::string& path, const std::vector<uint8_t>& bytes) {
+    const auto intent = path + ".intent";
+    int32_t rc = ioWriteNew(intent, bytes.data(), bytes.size());
+    if (rc == FLATSQL_OK) rc = ioWriteNew(path, bytes.data(), bytes.size());
+    if (rc == FLATSQL_OK) rc = ioUnlink(intent);
+    return rc;
+}
 // T/TYPES: records [u32 crc32c(name)][u16 len][name]; a torn tail is ignored.
 std::vector<std::string> catalogRead(const std::string& path) {
     std::vector<std::string> names;
