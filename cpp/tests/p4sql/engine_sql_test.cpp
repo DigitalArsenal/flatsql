@@ -370,6 +370,76 @@ FLATSQL_TEST(t_sql_unlimited_reader_mutations) {
     removeTree(root);
 }
 
+FLATSQL_TEST(t_sql_cid_equality_semantics) {
+    const auto root=scratchDir("cid_equality_semantics");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=0;
+    REQUIRE(registerType(type)==FLATSQL_OK,"register");
+    auto batch=ommBatch(1,4,kSrc,"synthetic");
+    REQUIRE(put(batch).status==FLATSQL_OK,"put");
+    auto other=ommBatch(20,1,"another-feed","synthetic");
+    REQUIRE(put(other).status==FLATSQL_OK,"other feed");
+    uint8_t cid[36]; cidOf(batch.recs[0].frame,cid);
+    const auto text=cidText(cid); std::string upper=text;
+    for(auto& c:upper) if(c>='a' && c<='z') c=char(c-'a'+'A');
+    std::vector<Cell> values;
+    for(const auto& value:{text,upper,text+"x",std::string("invalid")}) {
+        Cell c; c.type=flatsql::ps::rb1::kText; c.s=value; values.push_back(c);
+    }
+    values.push_back(intCell(7)); values.push_back(Cell{});
+    Cell blob; blob.type=flatsql::ps::rb1::kBlob; blob.s=text; values.push_back(blob);
+    for(const auto& value:values) for(const auto* coll:{"BINARY","NOCASE"}) {
+        const std::string suffix=std::string("=?1 COLLATE ")+coll+" ORDER BY _seq";
+        const auto indexed=sql("SELECT _seq FROM OMM WHERE _cid"+suffix,0,{value});
+        const auto scanned=sql("SELECT _seq FROM OMM WHERE (_cid||'')"+suffix,0,{value});
+        REQUIRE(indexed.status==FLATSQL_OK && scanned.status==FLATSQL_OK,"both equality forms succeed");
+        CHECK_EQ(indexed.rows.size(),scanned.rows.size(),"pushdown matches SQLite equality");
+        for(size_t i=0;i<std::min(indexed.rows.size(),scanned.rows.size());i++) CHECK_EQ(indexed.i(i,"_seq"),scanned.i(i,"_seq"),"same rows");
+    }
+    cidOf(other.recs[0].frame,cid);
+    const auto otherText=cidText(cid);
+    CHECK_EQ(sql("SELECT _seq FROM OMM WHERE _cid='"+otherText+"'").rows.size(),size_t(1),"other feed reachable");
+    CHECK(sql("SELECT _seq FROM \"OMM@"+std::string(kSrc)+"\" WHERE _cid='"+otherText+"'").rows.empty(),"source relation excludes other feed");
+    closeEngine(); removeTree(root);
+}
+
+FLATSQL_TEST(t_sql_cache_pin_budget) {
+    namespace p4=flatsql::p4;
+    const auto root=scratchDir("sql_cache_pin_budget");
+    EngineOpts tooSmall; TlvW tiny; tiny.u64(51,16383); tooSmall.extra=tiny.b;
+    CHECK_EQ(openEngine(root,tooSmall),FLATSQL_E_ARG,"reject nonzero cache below minimum");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=0;
+    REQUIRE(registerType(type)==FLATSQL_OK,"register");
+    REQUIRE(put(ommBatch(1,2048,kSrc,"synthetic")).status==FLATSQL_OK,"put");
+    REQUIRE(closeEngine()==FLATSQL_OK,"checkpoint on close");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"reopen");
+    auto* e=p4::currentEngine(); auto* t=e->findType("OMM");
+    p4::Feed* feed=nullptr;
+    { std::lock_guard<std::mutex> g(t->mu); for(auto& f:t->feeds) if(f->created) feed=f.get(); }
+    REQUIRE(feed && feed->checkpoint,"checkpoint");
+    auto ck=feed->checkpoint; int32_t status=0; auto stream=p4::streamCur(feed,&status);
+    REQUIRE(stream && status==FLATSQL_OK,"generation");
+    std::vector<std::shared_ptr<const p4::FsgVerified>> verified;
+    for(const auto& d:ck->segments) if(d.kind==p4::kFsgSeq) {
+        std::shared_ptr<const p4::FsgVerified> v;
+        REQUIRE(p4::checkpointVerifyPairs(feed,stream.get(),d,&v)==FLATSQL_OK,"verify before pressure");
+        verified.push_back(v);
+    }
+    REQUIRE(!verified.empty(),"row order exists");
+    const size_t limit=1u<<20; e->rowCache->configure(limit);
+    const auto used=e->rowCache->used(); REQUIRE(used+2048<limit,"space for pressure pin");
+    auto pin=e->rowCache->load<int>("test/sql-pressure",limit-used-2048,[]{ return std::make_shared<int>(1); });
+    REQUIRE(pin,"hold cache pressure");
+    const auto failed=sql("SELECT _seq FROM OMM ORDER BY _seq LIMIT 1");
+    CHECK_EQ(failed.status,FLATSQL_E_CACHE_BUDGET,"page admission has distinct SQL status");
+    pin.reset(); e->rowCache->trim(std::chrono::seconds(0));
+    const auto retried=sql("SELECT _seq FROM OMM ORDER BY _seq LIMIT 1");
+    CHECK_EQ(retried.status,FLATSQL_OK,retried.err);
+    CHECK_EQ(retried.rows.size(),size_t(1),"query succeeds after releasing pin");
+    verified.clear(); stream.reset(); closeEngine(); removeTree(root);
+}
+
 FLATSQL_TEST(t_sql_caps_and_sandbox) {
     const std::string root = scratchDir("t_sql_caps");
     REQUIRE(openEngine(root) == FLATSQL_OK, "open");
