@@ -3,7 +3,9 @@
 FlatSQL has one public JavaScript entry point, `flatsql`, exporting `FlatSQL`
 and `FlatSQLError`, and one native ABI, `cpp/include/flatsql/flatsql.h`.
 `flatsql/flatsql.wasm` identifies the same WASI threads artifact on every host.
-There are no PS/P4 selectors, old engine aliases, or compatibility modes.
+There are no PS/P4 selectors or old engine aliases. Normal opens require store
+format 5; an explicit native initialization mode converts a private format-4
+copy as described in `cpp/src/p4/FORMAT.md`. It is not a normal open mode.
 
 ## Schemas, records, and queries
 

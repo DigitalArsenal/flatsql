@@ -193,7 +193,8 @@ int32_t readMarkers(Engine* e, Markers* m) {
     return FLATSQL_OK;
 }
 
-int32_t writeMarkers(Engine* e, const uint8_t uuid[16], uint64_t floor, uint32_t from, bool migratedToo) {
+int32_t writeMarkers(Engine* e, const uint8_t uuid[16], uint64_t floor, uint32_t from, bool migratedToo,
+                     int64_t createdMs = wallMs()) {
     if (migratedToo) {
         uint8_t mig[40];
         encodeMigrated(mig, uuid, wallMs());
@@ -201,7 +202,7 @@ int32_t writeMarkers(Engine* e, const uint8_t uuid[16], uint64_t floor, uint32_t
         if (rc != FLATSQL_OK) return rc;
     }
     uint8_t st[64];
-    encodeStore(st, uuid, wallMs(), floor, from);
+    encodeStore(st, uuid, createdMs, floor, from);
     return ioWriteNew(pathJoin(e->cfg.root, "STORE"), st, sizeof st);
 }
 
@@ -582,7 +583,7 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
             *err="conversion: converted "+std::to_string(feeds)+" feed indexes, host inventoried "+std::to_string(e->cfg.conversionFeeds);
             return FLATSQL_E_CORRUPT;
         }
-        rc = writeMarkers(e, m.uuid, floor, 4, true);
+        rc = writeMarkers(e, m.uuid, floor, 4, true, m.createdMs);
         if (rc != FLATSQL_OK) { *err = "conversion: cannot activate verified copy"; return rc; }
         rc = readMarkers(e, &m);
         if (rc != FLATSQL_OK) return rc;

@@ -29,8 +29,9 @@ needs.
    4-byte file identifier. The non-record frames are SDS tables (§3). A stock
    FlatBuffers reader walks the file from byte 0 and dispatches on the
    identifier. It needs no FlatSQL code.
-5. **No back-compat.** Format-4 stores are refused with `P4_E_FORMAT`, and nodes
-   rebuild by re-sync (stack AGENTS.md).
+5. **Normal opens require format 5.** Format-4 stores are refused with
+   `FLATSQL_E_FORMAT`. The explicit offline converter below reads a private
+   format-4 copy and writes genuine format-5 streams before activation.
 6. **Each value lives in exactly one place** (owner, 2026-10-18). A value that
    can be re-derived from the record bytes is not stored again: epoch and object
    key are re-extracted on rebuild. `$FMB` holds only what the bytes cannot
@@ -44,7 +45,7 @@ needs.
 ## 1. Files
 
 ```
-<data>/fsql4/
+<data>/fsql5/
   STORE                    64 B, magic FSQ4, format 5 (format 4 => P4_E_FORMAT)
   T/<TYPE>.spec            registered spec TLV (unchanged)
   T/<TYPE>.idx             type index: CACHE (feed and token registries, rebuilt from the streams)
@@ -57,6 +58,29 @@ The changes from format 4:
 - The stream carries metadata, checkpoint and segment frames beside the records.
 - The `.db` and `.idx` stop being needed for durability.
 - `inst`, `tokc`, `ident`/`idst`, `moved` and `meta` become derived state.
+
+### Offline format-4 conversion
+
+`flatsql_init` create mode 3 is reserved for an offline, private copy of a
+complete format-4 store. Config TLV tag 51 is a required `u64` count of all
+physical feed index files in that copy. The host must hold an exclusive lock,
+retain the source, and publish the candidate only after init and close succeed.
+The engine never selects or removes the retained source directory.
+
+The converter uses the 3.7.2 feed reader and its SQLite metadata. It refuses
+missing indexes for existing streams, incomplete catalogs, truncated streams,
+unfinished moves, and identity history the rewrite cannot preserve. Each feed
+is compacted into format-5 record/FMB/FCK/FSG frames, then its index is deleted
+and rebuilt solely from those frames. Typed digests compare every record field,
+dictionary ID/value, historical instance/token counter, ingest identity,
+semantic feed counter, and live payload byte sequence before activation.
+Physical offsets and staging flags change as part of the rewrite. STORE and
+MIGRATED become format 5 only after every inventoried feed verifies.
+
+Fresh compaction checkpoints stream row-order segments in bounded runs of at
+most 65,536 rows. Each run stays below the 128 MiB frame-reader limit; the final
+checkpoint references the complete collection. The host may discard an
+interrupted candidate and restart from the retained format-4 source.
 
 File naming and generations are unchanged (`docs/STORE-FORMAT-4.md` §1, §5).
 
