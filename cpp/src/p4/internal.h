@@ -728,7 +728,7 @@ struct MaintTask {
 struct P4Engine {
     flatsql::p4::Config cfg;
     std::shared_ptr<flatsql::p4::PageCache> rowCache=std::make_shared<flatsql::p4::PageCache>();
-    bool unlimitedRelations=false;
+    std::atomic<bool> unlimitedRelations{false};
     flatsql::p4::Markers markers;
     std::atomic<uint64_t> stat[flatsql::p4::kStCount];
     std::atomic<uint64_t> quota{0};

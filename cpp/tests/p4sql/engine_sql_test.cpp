@@ -188,6 +188,36 @@ FLATSQL_TEST(t_sql_unlimited_promotion_recovery) {
     closeEngine(); removeTree(root);
 }
 
+FLATSQL_TEST(t_sql_registration_recovery_and_validation) {
+    namespace p4 = flatsql::p4;
+    const auto root=scratchDir("registration_recovery");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=2;
+    REQUIRE(registerType(type)==FLATSQL_OK,"bounded registration");
+    REQUIRE(put(ommBatch(1,8,kSrc,"synthetic")).status==FLATSQL_OK,"acknowledged rows");
+    auto invalid=type; invalid.a18=0; invalid.rules += "col 1 str:OBJECT_NAME\n";
+    CHECK_EQ(registerType(invalid),FLATSQL_E_FORMAT,"reject changed key rules");
+    CHECK_EQ(p4::currentEngine()->markers.layout,1,"failed registration does not promote");
+    CHECK(!p4::currentEngine()->unlimitedRelations.load(),"failed registration does not enable unlimited");
+    std::vector<uint8_t> before,after;
+    const auto path=root+"/T/OMM.spec";
+    REQUIRE(p4::ioReadAll(path,&before)==FLATSQL_OK,"read original spec");
+    type.a18=3; REQUIRE(registerType(type)==FLATSQL_OK,"new bound");
+    REQUIRE(p4::ioReadAll(path,&after)==FLATSQL_OK,"read new spec");
+    REQUIRE(closeEngine()==FLATSQL_OK,"close");
+    const size_t cuts[]={0,1,6,after.size()/2,after.size()-1,after.size()};
+    for(int phase=0;phase<2;phase++) for(size_t cut:cuts) {
+        REQUIRE(p4::ioWriteNew(path,before.data(),before.size())==FLATSQL_OK,"restore original");
+        REQUIRE(p4::ioWriteNew(path+".intent",after.data(),phase?after.size():cut)==FLATSQL_OK,"intent prefix");
+        if(phase) REQUIRE(p4::ioWriteNew(path,after.data(),cut)==FLATSQL_OK,"spec prefix");
+        REQUIRE(openEngine(root)==FLATSQL_OK,"automatic spec recovery");
+        CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),phase||cut==after.size()?3:2,"old or complete new policy");
+        CHECK(!p4::ioExists(path+".intent"),"intent removed");
+        REQUIRE(closeEngine()==FLATSQL_OK,"close recovered store");
+    }
+    removeTree(root);
+}
+
 FLATSQL_TEST(t_sql_metadata_only_visibility) {
     const auto root=scratchDir("metadata_only_visibility");
     REQUIRE(openEngine(root)==FLATSQL_OK,"open");

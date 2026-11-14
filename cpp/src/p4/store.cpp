@@ -268,7 +268,10 @@ int32_t promoteUnlimitedStore(Engine* e, std::string* err) {
     if (!e->markers.storeValid || e->markers.layout >= 2) return FLATSQL_OK;
     std::vector<uint8_t> marker;
     const auto path = pathJoin(e->cfg.root, "STORE");
-    if (ioReadAll(path, &marker) != FLATSQL_OK || marker.size() != 64) return FLATSQL_E_IO;
+    if (ioReadAll(path, &marker) != FLATSQL_OK || marker.size() != 64) {
+        *err = "unlimited relation guard could not read the STORE marker";
+        return FLATSQL_E_IO;
+    }
     st16(marker.data() + 6, 2);
     st32(marker.data() + 56, ps::crc32c(marker.data(), 56));
     // The synced intent retains the complete marker across a torn overwrite.
@@ -611,7 +614,11 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     for (const std::string& name : names) {
         std::vector<uint8_t> fb, tlv;
         const std::string sp = pathJoin(pathJoin(e->cfg.root, "T"), name + ".spec");
-        if (ioReadAll(sp, &fb) != FLATSQL_OK || !specFromFile(fb, &tlv)) continue;  // re-registered by the host
+        rc = recoverSpec(sp, &fb);
+        if (rc != FLATSQL_OK || !specFromFile(fb, &tlv)) {
+            *err = name + ": registered type spec is unreadable or corrupt";
+            return rc != FLATSQL_OK ? rc : FLATSQL_E_CORRUPT;
+        }
         std::shared_ptr<Spec> spec;
         std::string e2;
         if (buildSpec(tlv.data(), tlv.size(), &spec, &e2) != FLATSQL_OK || spec->name != name) continue;
@@ -631,10 +638,6 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
     int32_t rc = buildSpec(p, n, &spec, err);
     if (rc != FLATSQL_OK) return rc;
     std::lock_guard<std::mutex> g(e->typesMu);
-    if(!spec->a18Bound) e->unlimitedRelations=true;
-    // Layout 2 requires explicit unlimited-relation support. Publish this guard
-    // before any unlimited spec: older engines refuse the store on open.
-    if (!spec->a18Bound && (rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return rc;
     auto it = e->typeByName.find(spec->name);
     if (it != e->typeByName.end()) {
         Type* t = it->second;
@@ -656,16 +659,25 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
             *err = "the object and col rules of a type with data cannot change (C-5)";
             return FLATSQL_E_FORMAT;
         }
+        // Validate the registration before publishing its irreversible guard.
+        if (!spec->a18Bound) {
+            if ((rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return rc;
+            e->unlimitedRelations = true;
+        }
         const std::vector<uint8_t> fb = specFileBytes(spec->bytes);
-        rc = ioWriteNew(t->pSpec, fb.data(), fb.size());
+        rc = writeSpec(t->pSpec, fb);
         if (rc != FLATSQL_OK) { *err = "spec write failed"; return rc; }
         std::lock_guard<std::mutex> tg(t->mu);
         t->spec_ = spec;
         return FLATSQL_OK;
     }
     const std::string tdir = pathJoin(e->cfg.root, "T");
+    if (!spec->a18Bound) {
+        if ((rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return rc;
+        e->unlimitedRelations = true;
+    }
     const std::vector<uint8_t> fb = specFileBytes(spec->bytes);
-    rc = ioWriteNew(pathJoin(tdir, spec->name + ".spec"), fb.data(), fb.size());
+    rc = writeSpec(pathJoin(tdir, spec->name + ".spec"), fb);
     if (rc != FLATSQL_OK) { *err = "spec write failed"; return rc; }
     auto t = std::make_unique<Type>();
     rc = openType(e, t.get(), spec, err, true);
