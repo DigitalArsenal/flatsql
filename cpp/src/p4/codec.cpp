@@ -507,7 +507,7 @@ std::string batchKey(const std::string& batch, const std::string& ppeer, const s
 Conn::~Conn() {
     for (auto*& s : st)
         if (s) sqlite3_finalize(s);
-    for (auto& kv : dyn) sqlite3_finalize(kv.second);
+    for (auto& kv : dyn) sqlite3_finalize(kv.second.s);
     if (db) cacheClose(db);
 }
 
@@ -523,21 +523,35 @@ sqlite3_stmt* Conn::get(StmtId id) {
     return s;
 }
 
+// Up to 3.12.1 a full cache finalized dyn.begin(), whatever it was: in
+// libc++ often the statement handed out just before, which
+// appendConsolidated (frames.cpp:215-242) and checkpointAppend
+// (checkpoint.cpp:232-235) still hold across their next prepare. Per-object
+// SUPERSEDE texts (remove.cpp:123, 155) keep the cache full, and the held
+// statement was then stepped after sqlite3_finalize freed it.
 sqlite3_stmt* Conn::sql(const std::string& text) {
+    const uint64_t now = ++uses;
     auto it = dyn.find(text);
     if (it != dyn.end()) {
-        sqlite3_reset(it->second);
-        sqlite3_clear_bindings(it->second);
-        return it->second;
+        sqlite3_reset(it->second.s);
+        sqlite3_clear_bindings(it->second.s);
+        it->second.used = now;
+        return it->second.s;
     }
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v3(db, text.c_str(), int(text.size()), SQLITE_PREPARE_PERSISTENT, &s, nullptr) != SQLITE_OK)
         return nullptr;
-    if (dyn.size() >= 64) {
-        sqlite3_finalize(dyn.begin()->second);
-        dyn.erase(dyn.begin());
+    if (dyn.size() >= kDynStmts) {
+        auto victim = dyn.end();
+        for (auto i = dyn.begin(); i != dyn.end(); ++i)
+            if (!sqlite3_stmt_busy(i->second.s) && (victim == dyn.end() || i->second.used < victim->second.used))
+                victim = i;
+        if (victim != dyn.end()) {  // every one being stepped: grow by one instead
+            sqlite3_finalize(victim->second.s);
+            dyn.erase(victim);
+        }
     }
-    dyn.emplace(text, s);
+    dyn.emplace(text, DynStmt{s, now});
     return s;
 }
 
