@@ -37,6 +37,7 @@ extern "C" {
 #define FLATSQL_E_NOSPACE      -12   /* quota or device full: writes refuse, reads continue */
 #define FLATSQL_E_SQL          -13   /* SQL error; the text is in the slot's err */
 #define FLATSQL_E_INTERNAL     -14
+#define FLATSQL_E_CACHE_BUDGET -15   /* row-cache admission exhausted by pins or load reservations */
 
 /* Per-record rejects (PUT rows, `reject` column). -100..-109 are
  * ps::RejectCode from flatsql/typecfg/extract.h, unchanged. */

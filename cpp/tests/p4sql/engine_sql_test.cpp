@@ -195,7 +195,7 @@ FLATSQL_TEST(t_sql_metadata_count_consistency) {
     auto type=ommType(); type.a18=0;
     REQUIRE(registerType(type)==FLATSQL_OK,"unlimited registration");
     REQUIRE(put(ommBatch(1,8,kSrc,"synthetic")).status==FLATSQL_OK,"records");
-    CallOpts caps; caps.flags=FLATSQL_SLOT_SANDBOX; caps.maxBytes=1; caps.maxRows=1;
+    CallOpts caps; caps.flags=FLATSQL_SLOT_SANDBOX; caps.maxBytesRead=1; caps.maxRowsExamined=1;
     for(const auto* expr:{"COUNT(*)","COUNT(_cid)"}) {
         const auto result=call(FLATSQL_OPC_SQL,sqlReq(std::string("SELECT ")+expr+" AS n FROM OMM"),caps);
         CHECK_EQ(result.status,FLATSQL_OK,result.err);

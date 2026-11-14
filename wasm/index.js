@@ -61,7 +61,7 @@ export class FlatSQL {
     integer(options.maximumPages??8192,'maximumPages',8192,32768);
     integer(options.requestBytes??8*1024*1024,'requestBytes',1024,16*1024*1024);
     integer(options.writers??1,'writers',1,8);integer(options.readers??1,'readers',1,16);
-    integer(options.rowCacheBytes??32*1024*1024,'rowCacheBytes',1,0xffffffff);
+    integer(options.rowCacheBytes??32*1024*1024,'rowCacheBytes',16384,0xffffffff);
     if(options.backend && !['opfs','memory'].includes(options.backend))throw new TypeError('Unknown browser storage backend');
     const url = new URL(options.wasmUrl ?? './flatsql.wasm', import.meta.url);
     let artifact;

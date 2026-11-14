@@ -113,7 +113,7 @@ FLATSQL_TEST(t_row_cache_scan_and_generation_pin) {
     auto second=run->page(1,&count);
     REQUIRE(second,"second live pin");
     auto refused=run->page(2,&count);
-    CHECK(!refused && refused.status==FLATSQL_E_BUDGET,"row page reports exhausted pins");
+    CHECK(!refused && refused.status==FLATSQL_E_CACHE_BUDGET,"row page distinguishes exhausted cache pins");
     second={};
     auto retried=run->page(2,&count);
     REQUIRE(retried,"budget failure does not poison a later read");

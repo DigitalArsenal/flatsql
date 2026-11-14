@@ -12,7 +12,7 @@ FsgPage FsgRun::page(size_t pg,size_t* count,int ahead) const {
     const size_t first=pg*kPage; *count=std::min(kPage,n-first);
     if(p) return {p+first,keep};
     struct Page { std::vector<FsgPairV> pairs; std::shared_ptr<Stream> generation; };
-    int32_t status=FLATSQL_E_BUDGET;
+    int32_t status=FLATSQL_E_CACHE_BUDGET;
     auto value=cache->load<Page>(cacheKey+"/page/"+std::to_string(pg),*count*sizeof(FsgPairV)+sizeof(Page),[&]() -> std::shared_ptr<const Page> {
         std::string buf;
         status=streamReadRange(stream.get(),int64_t(base+first*sizeof(FsgPairV)),*count*sizeof(FsgPairV),&buf);
@@ -174,7 +174,17 @@ int32_t fsgObject(const FsgView& v,uint64_t kk,std::vector<uint64_t>* rids) {
     for(const auto& run:v.runs[1]) {
         const FsgRun& x=*run;
         int32_t status=FLATSQL_OK;
-        for(size_t i=x.lowerBound(FsgPairV{kk,0,0,0},&status);i<x.n && status==FLATSQL_OK;i++) { const FsgPairV q=x.at(i,&status); if(q.hi!=kk) break; rids->push_back(q.rid); }
+        size_t i=x.lowerBound(FsgPairV{kk,0,0,0},&status);
+        bool end=false;
+        while(i<x.n && status==FLATSQL_OK && !end) {
+            size_t count=0; const auto page=x.page(i/FsgRun::kPage,&count);
+            if(!page) { status=page.status; break; }
+            for(size_t j=i%FsgRun::kPage;j<count && i<x.n;j++,i++) {
+                const auto& pair=page[j];
+                if(pair.hi!=kk) { end=true; break; }
+                rids->push_back(pair.rid);
+            }
+        }
         if(status!=FLATSQL_OK) return status;
     }
     std::sort(rids->begin(),rids->end());
