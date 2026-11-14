@@ -39,6 +39,10 @@ configured bytes at zero-based positions 40, 41, and 42.
 This budget does not bound the entire engine: staging, checkpoint construction,
 SQLite, query results, and allocator retention are separate. Releasing cache
 entries does not guarantee that the runtime returns resident pages to the OS.
+Idle index merging can raise SQLite's temporary allocation peak while cache
+entries expire. Repeated scans can retain that resident high-water mark after
+live allocations fall. Sustained ingestion can still exhaust guest memory;
+row-cache admission does not bound every allocation path.
 Legacy arena stores and their host-side migration require separate changes.
 
 Readers use a snapshot for each buffered page, with a sequence ceiling fixed
