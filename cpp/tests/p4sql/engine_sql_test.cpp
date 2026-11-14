@@ -313,6 +313,23 @@ FLATSQL_TEST(t_sql_bounded_spec_recovery) {
     removeTree(root);
 }
 
+FLATSQL_TEST(t_sql_registration_preflight) {
+    namespace p4 = flatsql::p4;
+    const auto root=scratchDir("registration_preflight");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=0;
+    auto bytes=type.spec();
+    REQUIRE(flatsql_validate_type(bytes.data(),int32_t(bytes.size()))==FLATSQL_OK,"validate unlimited");
+    CHECK(!p4::currentEngine()->findType("OMM"),"validation creates no type");
+    CHECK(!p4::ioExists(root+"/T/OMM.spec"),"validation writes no spec");
+    CHECK_EQ(p4::currentEngine()->markers.layout,1,"validation keeps layout");
+    type.rules="invalid rule syntax\n";
+    CHECK_EQ(registerType(type),FLATSQL_E_ARG,"new invalid rules rejected before openType");
+    CHECK(!p4::ioExists(root+"/T/OMM.spec"),"invalid registration writes no spec");
+    CHECK_EQ(p4::currentEngine()->markers.layout,1,"invalid registration keeps layout");
+    closeEngine(); removeTree(root);
+}
+
 FLATSQL_TEST(t_sql_cid_only_not_queryable) {
     const auto root=scratchDir("metadata_only_visibility");
     REQUIRE(openEngine(root)==FLATSQL_OK,"open");

@@ -234,6 +234,7 @@ int32_t recoverUnlimitedPromotion(Engine* e, std::vector<uint8_t>* store,
     const int32_t rc = ioWriteNew(pathJoin(e->cfg.root, "STORE"), intent.data(), intent.size());
     if (rc != FLATSQL_OK) return rc;
     *store = std::move(intent);
+    std::fprintf(stderr, "FlatSQL: recovered interrupted layout-2 promotion; type registrations are restored from their persisted specs\n");
     return ioUnlink(intentPath);
 }
 
@@ -647,7 +648,7 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     return FLATSQL_OK;
 }
 
-int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* err) {
+int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* err, bool validateOnly) {
     std::shared_ptr<Spec> spec;
     int32_t rc = buildSpec(p, n, &spec, err);
     if (rc != FLATSQL_OK) return rc;
@@ -673,6 +674,7 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
             *err = "the object and col rules of a type with data cannot change (C-5)";
             return FLATSQL_E_FORMAT;
         }
+        if (validateOnly) return FLATSQL_OK;
         // Validate the registration before publishing its irreversible guard.
         if (!spec->a18Bound) {
             if ((rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return rc;
@@ -685,19 +687,32 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
         t->spec_ = spec;
         return FLATSQL_OK;
     }
+    if (validateOnly) return FLATSQL_OK;
     const std::string tdir = pathJoin(e->cfg.root, "T");
+    auto t = std::make_unique<Type>();
+    rc = openType(e, t.get(), spec, err, true);
+    if (rc != FLATSQL_OK) return rc;
+    // A new type has no published spec or catalog entry. Opening its index
+    // precedes the irreversible marker; release the connection on failure.
+    auto fail = [&](int32_t status) {
+        for (auto& f : t->feeds) {
+            writerDrop(e, f.get());
+            e->rpool.dropPath(f->path);
+            streamClose(f.get());
+            stagedPublish(e, f.get(), nullptr, false);
+        }
+        delete t->idx; t->idx=nullptr;
+        return status;
+    };
     if (!spec->a18Bound) {
-        if ((rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return rc;
+        if ((rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return fail(rc);
         e->unlimitedRelations = true;
     }
     const std::vector<uint8_t> fb = specFileBytes(spec->bytes);
     rc = writeSpec(pathJoin(tdir, spec->name + ".spec"), fb);
-    if (rc != FLATSQL_OK) { *err = "spec write failed"; return rc; }
-    auto t = std::make_unique<Type>();
-    rc = openType(e, t.get(), spec, err, true);
-    if (rc != FLATSQL_OK) return rc;
+    if (rc != FLATSQL_OK) { *err = "spec write failed"; return fail(rc); }
     rc = catalogAppend(pathJoin(tdir, "TYPES"), spec->name);
-    if (rc != FLATSQL_OK) { *err = "type catalog write failed"; return rc; }
+    if (rc != FLATSQL_OK) { *err = "type catalog write failed"; return fail(rc); }
     e->typeByName[spec->name] = t.get();
     e->types.push_back(std::move(t));
     return FLATSQL_OK;

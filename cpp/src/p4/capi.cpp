@@ -81,6 +81,15 @@ FLATSQL_EXPORT("flatsql_register_type") int32_t flatsql_register_type(const uint
     return rc;
 }
 
+FLATSQL_EXPORT("flatsql_validate_type") int32_t flatsql_validate_type(const uint8_t* spec, int32_t specLen) {
+    if (!gEngine) return FLATSQL_E_STOPPED;
+    if (!spec || specLen <= 0) return FLATSQL_E_ARG;
+    std::string err;
+    const int32_t rc = flatsql::p4::engineRegisterType(gEngine, spec, size_t(specLen), &err, true);
+    if (rc != FLATSQL_OK) gLastError = err;
+    return rc;
+}
+
 FLATSQL_EXPORT("flatsql_set_quota") int32_t flatsql_set_quota(double bytes) {
     if (!gEngine) return FLATSQL_E_STOPPED;
     if (!(bytes >= 0)) return FLATSQL_E_ARG;

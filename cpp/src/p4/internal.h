@@ -848,7 +848,7 @@ namespace p4 {
 
 // ---- store.cpp ----------------------------------------------------------------------------------
 int32_t engineInit(P4Engine* e, const uint8_t* cfg, size_t n, std::string* err);
-int32_t engineRegisterType(P4Engine* e, const uint8_t* spec, size_t n, std::string* err);
+int32_t engineRegisterType(P4Engine* e, const uint8_t* spec, size_t n, std::string* err, bool validateOnly = false);
 int32_t engineActivate(P4Engine* e, std::string* err);
 int32_t engineStop(P4Engine* e, double deadlineMs);
 int32_t engineStats(P4Engine* e, uint8_t* out, int32_t cap);
