@@ -703,6 +703,9 @@ int32_t engineStats(Engine* e, uint8_t* out, int32_t cap) {
     // allocator counts (0 without the surface).
     v[kStHeap] = p4sql_heap_used();
     v[kStHeapPeak] = p4sql_heap_peak();
+    v[kStRowCacheBytes] = e->rowCache->used();
+    v[kStRowCachePeak] = e->rowCache->peak();
+    v[kStRowCacheBudget] = e->cfg.rowCacheBytes;
     v[kStPendingBytes] = 0;  // nothing is held back: every write commits its feeds
     v[kStLiveFiles] = files;
     v[kStTypes] = types;

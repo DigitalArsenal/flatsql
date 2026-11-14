@@ -77,8 +77,12 @@ public:
         entries_.emplace(key,std::move(e)); used_+=bytes; peak_=std::max(peak_,used_);
         g.unlock();
         std::shared_ptr<const T> value;
+#if defined(__cpp_exceptions)
         try { value=loader(); }
         catch(...) { g.lock(); erase(entries_.find(key)); ready_.notify_all(); throw; }
+#else
+        value=loader();
+#endif
         g.lock();
         auto it=entries_.find(key);
         if(value) { it->second.value=value; it->second.loading=false; it->second.bytes-=workspace; used_-=workspace; }

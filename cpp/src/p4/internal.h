@@ -163,7 +163,7 @@ enum Stat : int {
     kStWalBytes, kStRebuilds, kStUnlinked, kStQuotaFiles, kStReads, kStReadErrors, kStBusy,
     kStWriterConns, kStReaderConns, kStTwoPhase, kStHeap, kStHeapPeak, kStPendingBytes,
     kStLiveFiles, kStTypes, kStPartitions, kStQuarantined, kStSqlStatements, kStSqlBudgetTrips,
-    kStMaxInflight, kStFtsRows, kStCount
+    kStMaxInflight, kStFtsRows, kStRowCacheBytes, kStRowCachePeak, kStRowCacheBudget, kStCount
 };
 
 // ---- config (§3.3) -------------------------------------------------------------------------
