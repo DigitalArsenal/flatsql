@@ -10,6 +10,7 @@
 #include "p4/p4_test.h"
 #include "internal.h"
 #include "checkpoint.h"
+#include <fstream>
 
 namespace flatsql { namespace p4 { P4Engine* currentEngine(); } }
 
@@ -346,6 +347,12 @@ FLATSQL_TEST(t_sql_unlimited_reader_mutations) {
     REQUIRE(newGeneration && newGeneration->gen!=oldGen,"generation changed");
     std::string header;
     CHECK_EQ(p4::streamReadRange(generation.get(),0,12,&header),FLATSQL_OK,"pinned generation still readable");
+    const std::string retiredPath=generation->path;
+    { std::lock_guard<std::mutex> g(feed->smu);
+      CHECK(feed->retiredBytes>0,"retired generation remains charged while pinned");
+      feed->retireAt=0; // exercise eligibility without waiting through the grace interval
+    }
+    CHECK(std::ifstream(retiredPath).good(),"pinned retired file remains present");
     int64_t previous=1; size_t seen=1;
     while((status=p4_cursor_next(cursor,&row))==1) {
         CHECK(row.seq>previous && row.seq<=512,"only already buffered rows survive mutations");
@@ -356,6 +363,16 @@ FLATSQL_TEST(t_sql_unlimited_reader_mutations) {
     CHECK_EQ(status,0,"cursor completed without freed-generation access");
     CHECK(seen>1 && seen<=512,"page snapshot retained");
     p4_cursor_close(cursor); generation.reset(); newGeneration.reset();
+    e->rowCache->trim(std::chrono::seconds(0));
+    bool reclaimed=false;
+    const auto reclaimDeadline=flatsql::ps::monoNs()+5000000000ull;
+    while(flatsql::ps::monoNs()<reclaimDeadline) {
+        { std::lock_guard<std::mutex> g(feed->smu); reclaimed=!feed->retired && feed->retiredBytes==0; }
+        if(reclaimed) break;
+        flatsql::ps::sleepNs(10000000);
+    }
+    CHECK(reclaimed,"retired byte charge clears after the last pin");
+    CHECK(!std::ifstream(retiredPath).good(),"retired file unlinked before charge clears");
     for(int pass=0;pass<2;pass++) {
         auto fresh=sql("SELECT _seq,_data FROM OMM ORDER BY _seq");
         REQUIRE(fresh.status==FLATSQL_OK && fresh.rows.size()==1,"new reader sees only retained batch");
