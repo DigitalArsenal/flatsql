@@ -117,9 +117,10 @@ bool specFromFile(const std::vector<uint8_t>& b, std::vector<uint8_t>* tlv) {
     return true;
 }
 // T/TYPES: records [u32 crc32c(name)][u16 len][name]; a torn tail is ignored.
-std::vector<std::string> catalogRead(const std::string& path) {
+std::vector<std::string> catalogRead(const std::string& path, bool* complete = nullptr) {
     std::vector<std::string> names;
     std::vector<uint8_t> b;
+    if(complete) *complete=!ioExists(path);
     if (ioReadAll(path, &b) != FLATSQL_OK) return names;
     size_t at = 0;
     while (b.size() - at >= 6) {
@@ -133,6 +134,7 @@ std::vector<std::string> catalogRead(const std::string& path) {
         if (!dup) names.push_back(name);
         at += 6 + len;
     }
+    if(complete) *complete=at==b.size();
     return names;
 }
 int32_t catalogAppend(const std::string& path, const std::string& name) {
@@ -217,6 +219,7 @@ bool markersActivated(const Markers& m) {
 int32_t typeFilesOpen(Type* t, std::string* err) {
     int32_t rc = typeIndexOpen(t, err);
     if (rc != FLATSQL_OK) return rc;
+    if (t->e->cfg.createMode == 3) return convertFormat4Type(t, err);
     std::vector<Feed*> feeds;
     {
         std::lock_guard<std::mutex> g(t->mu);
@@ -316,6 +319,7 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
         t->visRecompute();
     }
     if (!fresh && !ioExists(t->pIdx)) {
+        if (e->cfg.createMode == 3 && !ioExists(t->pDir)) return FLATSQL_OK;
         std::vector<std::string> streams;
         if (!p4ListStreams(t->pDir, &streams)) { *err = "missing type index requires stream directory enumeration"; return FLATSQL_E_UNSUPPORTED; }
         if (streams.empty()) return FLATSQL_OK;
@@ -490,12 +494,25 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     Markers& m = e->markers;
     rc = readMarkers(e, &m);
     if (rc != FLATSQL_OK) { *err = "markers: read failed"; return rc; }
-    if (m.storeValid && (m.format != 5 || m.layout > 1)) { *err = "STORE has an unsupported format or layout (requires format 5)"; return FLATSQL_E_FORMAT; }
-    if (m.migratedValid && m.migratedFormat != 5) { *err = "MIGRATED has an unsupported format (requires format 5)"; return FLATSQL_E_FORMAT; }
+    const bool converting = e->cfg.createMode == 3;
+    const uint16_t requiredFormat = converting ? 4 : 5;
+    if (m.storeValid && (m.format != requiredFormat || m.layout > 1)) { *err = "STORE requires format " + std::to_string(requiredFormat) + " and layout 1"; return FLATSQL_E_FORMAT; }
+    if (m.migratedValid && m.migratedFormat != requiredFormat) { *err = "MIGRATED has an unsupported format"; return FLATSQL_E_FORMAT; }
     const std::string catalog = pathJoin(pathJoin(e->cfg.root, "T"), "TYPES");
-    const std::vector<std::string> names = catalogRead(catalog);
+    bool completeCatalog=false;
+    const std::vector<std::string> names = catalogRead(catalog,&completeCatalog);
+    if(converting && !completeCatalog) { *err="conversion: incomplete type catalog"; return FLATSQL_E_CORRUPT; }
     uint64_t floor = e->cfg.gseqFloor;
     switch (e->cfg.createMode) {
+        case 3:
+            if (!m.storeValid || !m.migratedValid || m.format != 4 || m.migratedFormat != 4 ||
+                m.layout != 1 || std::memcmp(m.uuid, m.migratedUuid, 16)) {
+                *err = "conversion requires a complete format-4 copy";
+                return FLATSQL_E_FORMAT;
+            }
+            floor = m.gseqFloor;
+            e->ftsHold.store(true);
+            break;
         case 0:
             if (!markersActivated(m)) { *err = "not an activated format-5 store (STORE and MIGRATED)"; return FLATSQL_E_FORMAT; }
             floor = m.gseqFloor;
@@ -536,15 +553,41 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     for (const std::string& name : names) {
         std::vector<uint8_t> fb, tlv;
         const std::string sp = pathJoin(pathJoin(e->cfg.root, "T"), name + ".spec");
-        if (ioReadAll(sp, &fb) != FLATSQL_OK || !specFromFile(fb, &tlv)) continue;  // re-registered by the host
+        if (ioReadAll(sp, &fb) != FLATSQL_OK || !specFromFile(fb, &tlv)) {
+            if (converting) { *err = "conversion: unreadable spec " + sp; return FLATSQL_E_CORRUPT; }
+            continue;
+        }
         std::shared_ptr<Spec> spec;
         std::string e2;
-        if (buildSpec(tlv.data(), tlv.size(), &spec, &e2) != FLATSQL_OK || spec->name != name) continue;
+        if (buildSpec(tlv.data(), tlv.size(), &spec, &e2) != FLATSQL_OK || spec->name != name) {
+            // Old catalogs can register the SDS metadata types without ever
+            // creating a feed. Their specs stay in the copy, but format 5
+            // reserves these identifiers for its own authoritative frames.
+            if (converting && (name == "FMB" || name == "FCK" || name == "FSG") &&
+                !ioExists(pathJoin(pathJoin(e->cfg.root, "T"), name + ".idx")) &&
+                !ioExists(pathJoin(pathJoin(e->cfg.root, "P"), name))) continue;
+            if (converting) { *err = "conversion: invalid spec " + name + ": " + e2; return FLATSQL_E_FORMAT; }
+            continue;
+        }
         auto t = std::make_unique<Type>();
         rc = openType(e, t.get(), spec, &e2);
         if (rc != FLATSQL_OK) { *err = name + ": " + e2; return rc; }
         e->typeByName[name] = t.get();
         e->types.push_back(std::move(t));
+    }
+    if (converting) {
+        uint64_t feeds=0;
+        for(const auto& t:e->types) for(const auto& f:t->feeds) if(f->created) ++feeds;
+        if(feeds!=e->cfg.conversionFeeds) {
+            *err="conversion: converted "+std::to_string(feeds)+" feed indexes, host inventoried "+std::to_string(e->cfg.conversionFeeds);
+            return FLATSQL_E_CORRUPT;
+        }
+        rc = writeMarkers(e, m.uuid, floor, 4, true);
+        if (rc != FLATSQL_OK) { *err = "conversion: cannot activate verified copy"; return rc; }
+        rc = readMarkers(e, &m);
+        if (rc != FLATSQL_OK) return rc;
+        e->cfg.createMode = 0;
+        e->ftsHold.store(false);
     }
     e->markers = m;
     return FLATSQL_OK;

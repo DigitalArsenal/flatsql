@@ -289,6 +289,8 @@ int32_t rowOrders(Feed* f,Conn* c,Stream* stream,uint64_t previous,const Checkpo
     int32_t rc=changes(stream,previous,whole?0:old.appliedThrough,&tail,&scratch,true); if(rc!=FLATSQL_OK) return rc;
     if(tail.rows.empty()) return FLATSQL_OK;
     const bool hasObject=f->type->spec()->hasObject;
+    bySeq->reserve(tail.rows.size());
+    if(hasObject) byObject->reserve(tail.rows.size());
     auto add=[&](uint64_t rid,uint64_t ref,sqlite3_stmt* q,int k) {
         bySeq->push_back({rid,0,rid,ref});
         if(!hasObject) return;
@@ -462,7 +464,7 @@ int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState*
 }
 
 int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint64_t mark,const Counters& counters,const CheckpointState& old,
-                          bool fresh,const std::string& commitsRoot,CheckpointPlan* plan,std::string* err) {
+                          bool fresh,const std::string& commitsRoot,CheckpointPlan* plan,std::string* err,bool includeRowOrders) {
     plan->at=mark; plan->previous=previous; plan->frames.clear(); plan->lengths.clear();
     CheckpointState& out=plan->state; out=CheckpointState();
     out.tombstones=old.tombstones;
@@ -487,7 +489,10 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
     for(const auto& x:out.tokens) { auto it=old.tokens.find(x.first); if(it==old.tokens.end() || !tokenEqual(it->second,x.second)) deltas[3].tokens[x.first]=tokenEntry(x.first,x.second,out.dictionary.at({0,x.first}).text[0]); }
     for(const auto& x:old.tokens) if(!out.tokens.count(x.first)) deltas[3].tokens[x.first]=tokenEntry(x.first,TokCount{},out.dictionary.at({0,x.first}).text[0]);
     for(auto rid:out.tombstones) if(!old.tombstones.count(rid)) deltas[4].tombstones.insert(rid);
-    rc=rowOrders(f,c,stream,previous,old,&deltas[kFsgSeq].pairs,&deltas[kFsgObjectEpoch].pairs); if(rc!=FLATSQL_OK) { if(err) *err="checkpoint row orders "+f->path; return rc; }
+    if(includeRowOrders) {
+        rc=rowOrders(f,c,stream,previous,old,&deltas[kFsgSeq].pairs,&deltas[kFsgObjectEpoch].pairs);
+        if(rc!=FLATSQL_OK) { if(err) *err="checkpoint row orders "+f->path; return rc; }
+    }
     // This plan's own segments (offsets >= mark) are merged from memory.
     uint64_t cursor=mark; std::map<uint64_t,SegmentData> made;
     // Retention: each removal counts against the row-order segments whose
@@ -511,8 +516,24 @@ int32_t checkpointPrepare(Feed* f,Conn* c,Stream* stream,uint64_t previous,uint6
         }
     }
     // A row-order merge's output stays at most 1/8 of the live rows.
-    const uint64_t mergeCap=std::max<uint64_t>(4096,uint64_t(std::max<int64_t>(counters.rows,0))/8);
+    const uint64_t mergeCap=std::min<uint64_t>(2097152,std::max<uint64_t>(4096,uint64_t(std::max<int64_t>(counters.rows,0))/8));
     for(uint8_t kind=0;kind<=kFsgMaxKind;kind++) if(deltas[kind].size(kind)) {
+        // Recovery accepts frames up to 128 MiB. A fresh whole-feed row
+        // order can exceed that bound; write independently sorted runs.
+        // Do not also retain their decoded copies in the merge cache.
+        if(kind>=kFsgSeq && (fresh || deltas[kind].pairs.size()>2097152)) {
+            const auto& pairs=deltas[kind].pairs;
+            for(size_t at=0;at<pairs.size();at+=65536) {
+                SegmentData part;
+                const size_t end=std::min(pairs.size(),at+65536);
+                part.pairs.assign(pairs.begin()+at,pairs.begin()+end);
+                CheckpointSegment desc;
+                encodeSegment(f,kind,0,part,{},out.appliedThrough,counters,&cursor,plan,&desc);
+                out.segments.push_back(desc);
+            }
+            std::vector<FsgPairV>().swap(deltas[kind].pairs);
+            continue;
+        }
         CheckpointSegment desc; encodeSegment(f,kind,0,deltas[kind],{},out.appliedThrough,counters,&cursor,plan,&desc);
         made[desc.offset]=std::move(deltas[kind]); out.segments.push_back(desc);
         for(uint8_t level=0;level<63;level++) {
@@ -592,9 +613,73 @@ int32_t checkpointInstall(Feed* f,Stream* stream,CheckpointPlan& plan,int64_t* e
 
 int32_t checkpointAppend(Feed* f,Conn* c,Stream* stream,const Counters& counters,int64_t* end,uint64_t* previous,CheckpointState* state,bool fresh,std::string* err) {
     std::string commitsRoot; const CheckpointState empty; CheckpointPlan plan;
+    const uint64_t recordsThrough=*previous;
     int32_t rc=feedDagCommitRoot(f,stream,*previous,uint64_t(*end),&commitsRoot,err); if(rc!=FLATSQL_OK) return rc;
-    rc=checkpointPrepare(f,c,stream,*previous,uint64_t(*end),counters,fresh?empty:*state,fresh,commitsRoot,&plan,err); if(rc!=FLATSQL_OK) return rc;
-    return checkpointInstall(f,stream,plan,end,previous,state);
+    rc=checkpointPrepare(f,c,stream,*previous,uint64_t(*end),counters,fresh?empty:*state,fresh,commitsRoot,&plan,err,!fresh); if(rc!=FLATSQL_OK) return rc;
+    rc=checkpointInstall(f,stream,plan,end,previous,state);
+    if(rc!=FLATSQL_OK || !fresh || !counters.rows) return rc;
+
+    // A fresh generation contains only consolidated live rows, in bounded
+    // FMB commits. Each commit becomes its own sorted row-order runs. Never
+    // materialize a whole feed's RID map, pair vectors, or encoded segments.
+    const bool hasObject=f->type->spec()->hasObject;
+    auto* keys=hasObject?c->sql("SELECT kk,e FROM r WHERE rid=?1"):nullptr;
+    if(hasObject && !keys) return FLATSQL_E_IO;
+    uint64_t count=0,at=recordsThrough;
+    const std::string previousRoot=state->feedRoot;
+    auto writeRun=[&](uint8_t kind,SegmentData& data) -> int32_t {
+        if(data.pairs.empty()) return FLATSQL_OK;
+        std::sort(data.pairs.begin(),data.pairs.end());
+        CheckpointPlan chunk; CheckpointSegment desc; uint64_t cursor=uint64_t(*end);
+        encodeSegment(f,kind,0,data,{},state->appliedThrough,counters,&cursor,&chunk,&desc);
+        auto* bytes=reinterpret_cast<uint8_t*>(chunk.frames[0].data());
+        auto* table=const_cast<flatbuffers::Table*>(reinterpret_cast<const flatbuffers::Table*>(GetFSG(bytes)));
+        if(!table->SetField<uint64_t>(FSG::VT_PREVIOUS,*previous,0)) return FLATSQL_E_INTERNAL;
+        ps::sha256(bytes,desc.length,desc.digest.data());
+        const int32_t st=append(stream,bytes,desc.length,end,"FSG");
+        if(st!=FLATSQL_OK) return st;
+        *previous=desc.offset; state->segments.push_back(desc);
+        return FLATSQL_OK;
+    };
+    while(at) {
+        std::vector<uint64_t> storage; uint32_t n=0;
+        rc=frame(stream,at,&storage,&n); if(rc!=FLATSQL_OK) return rc;
+        const auto* bytes=reinterpret_cast<const uint8_t*>(storage.data());
+        flatbuffers::Verifier verifier(bytes,n);
+        if(!VerifyFMBBuffer(verifier)) return FLATSQL_E_CORRUPT;
+        const auto* m=GetFMB(bytes);
+        if(m->PREVIOUS()>=at || (m->REMOVALS() && m->REMOVALS()->size()) ||
+           (m->ROWS() && m->ROWS()->size()>65536)) return FLATSQL_E_CORRUPT;
+        SegmentData seq,object;
+        if(m->ROWS()) {
+            seq.pairs.reserve(m->ROWS()->size());
+            if(hasObject) object.pairs.reserve(m->ROWS()->size());
+            for(size_t i=0;i<m->ROWS()->size();i++) {
+                const auto* row=m->ROWS()->Get(flatbuffers::uoffset_t(i));
+                if(!(row->FLAGS()&FmbCompacted)) return FLATSQL_E_CORRUPT;
+                const uint64_t rid=(row->SEQ()<<16)|row->ROW_J(),ref=(at<<16)|uint64_t(i);
+                seq.pairs.push_back({rid,0,rid,ref}); ++count;
+                if(hasObject) {
+                    sqlite3_bind_int64(keys,1,sqlite3_int64(rid));
+                    const int sr=sqlite3_step(keys);
+                    if(sr!=SQLITE_ROW) { sqlite3_reset(keys); return FLATSQL_E_CORRUPT; }
+                    const uint64_t hi=sqlite3_column_type(keys,0)==SQLITE_NULL?0:uint64_t(sqlite3_column_int64(keys,0));
+                    const uint64_t lo=sqlite3_column_type(keys,1)==SQLITE_NULL?0:uint64_t(sqlite3_column_int64(keys,1))^(uint64_t(1)<<63);
+                    sqlite3_reset(keys); object.pairs.push_back({hi,lo,rid,ref});
+                }
+            }
+        }
+        rc=writeRun(kFsgSeq,seq); if(rc!=FLATSQL_OK) return rc;
+        rc=writeRun(kFsgObjectEpoch,object); if(rc!=FLATSQL_OK) return rc;
+        at=m->PREVIOUS();
+    }
+    if(count!=uint64_t(counters.rows)) { if(err) *err="fresh checkpoint row count mismatch"; return FLATSQL_E_CORRUPT; }
+    // The final checkpoint covers every run. Neither checkpoint is visible
+    // to another writer until the enclosing generation swap commits.
+    CheckpointPlan final;
+    final.at=uint64_t(*end); final.previous=*previous; final.previousRoot=previousRoot;
+    final.state=std::move(*state); final.state.segmentBytes=0;
+    return checkpointInstall(f,stream,final,end,previous,state);
 }
 
 bool checkpointDue(const Feed* f,bool idle) {

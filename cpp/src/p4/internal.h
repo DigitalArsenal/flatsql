@@ -169,6 +169,7 @@ enum Stat : int {
 struct Config {
     std::string root;
     uint8_t createMode = 0;
+    uint64_t conversionFeeds = UINT64_MAX; // tag 51: host inventory of format-4 feed indexes
     uint32_t writers = 0, interactive = 4, bulk = 1, sandbox = 1;
     uint32_t writeSlots = 16, readSlots = 64;
     uint32_t writeReqBytes = 8u << 20, readReqBytes = 64u << 10, ringBytes = 256u << 10;
@@ -1174,6 +1175,8 @@ void rebuildWork(P4Engine* e, Type* t, Internal* in);  // in->what: 1, 2, 8
 // (a pure stream again), its rows repointed in one transaction; the old
 // generation is unlinked once no reader holds it. in->what: the feed id.
 void compactWork(P4Engine* e, Type* t, Internal* in);
+// Offline conversion of a private format-4 copy; never used by normal opens.
+int32_t convertFormat4Type(Type* t, std::string* err);
 // Whether a feed's stream is worth compacting (its dead share). Type::mu held.
 bool compactDue(const Feed* f);
 // A missing or damaged index made again from the feed's stream (at open,

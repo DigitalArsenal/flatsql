@@ -936,6 +936,11 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         if (buf.size() >= (4u << 20)) flushBytes();
     }
     if (st == FLATSQL_OK && (!chunkRows.empty() || firstChunk)) flushCommit();
+    // The rewrite's offset maps are no longer needed. A fresh checkpoint
+    // builds row orders; do not retain a second whole-feed view beside it.
+    std::vector<std::pair<int64_t, int64_t>>().swap(rows);
+    std::map<int64_t, int64_t>().swap(live);
+    std::map<int64_t, std::vector<int64_t>>().swap(frameRows);
     Counters k;
     uint64_t retiredThrough=0;
     {
