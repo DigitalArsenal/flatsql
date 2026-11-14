@@ -127,7 +127,8 @@ export class FlatSQL {
     if(typeof fileIdentifier!=='string')throw new TypeError('A four-byte file identifier is required');
     if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name) || encoder.encode(fileIdentifier).length !== 4) throw new TypeError('Schema name and four-byte file identifier are required');
     const spec = control([[1, name], [2, fileIdentifier], [3, bfbs], [4, indexRules], [5, maxRecordBytes, 8],
-      [6, 4 * 1024 * 1024, 8], [7, 3], [8, 4096], [10, maxRows], [12, fullText ? 1 : 0, 1]]);
+      [6, 4 * 1024 * 1024, 8], [7, 3], [8, 4096], [10, maxRows], [12, fullText ? 1 : 0, 1],
+      ...(maxRows===0 ? [[13, 1, 1]] : [])]);
     await this.#withBytes(spec, async p => check(await this.#host.call('flatsql_register_type', p, spec.length)));
   }
   ingest(type, frames, options = {}) { return this.#records(1, type, frames, options); }

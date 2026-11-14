@@ -61,12 +61,18 @@ int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::s
         s->pageSize = u32;
     }
     if (tlvU8(v, 9, &u8, &bad)) s->identity = u8 != 0;
-    if (tlvU32(v, 10, &u32, &bad)) s->a18Bound = u32;
+    // Tag 10 zero retains its historical default meaning. Unlimited is an
+    // independent opt-in, so an old persisted zero never changes policy.
+    if (tlvU32(v, 10, &u32, &bad) && u32) s->a18Bound = u32;
     if (tlvU8(v, 11, &u8, &bad)) {
         if (u8 > 2) { *err = "spec: epoch profile"; return FLATSQL_E_ARG; }
         s->epochProfile = u8;
     }
     if (tlvU8(v, 12, &u8, &bad)) s->fullText = u8 != 0;
+    if (tlvU8(v, 13, &u8, &bad)) {
+        if (u8 > 1) bad = true;
+        else if (u8) s->a18Bound = 0;
+    }
     if (tlvU64(v, 5, &u64, &bad) && u64 == 0) bad = true;
     if (tlvU32(v, 7, &u32, &bad)) {}
     if (bad) { *err = "spec: a typed tag has the wrong length"; return FLATSQL_E_ARG; }
@@ -622,7 +628,10 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
         std::shared_ptr<Spec> spec;
         std::string e2;
         if (buildSpec(tlv.data(), tlv.size(), &spec, &e2) != FLATSQL_OK || spec->name != name) continue;
-        if(!spec->a18Bound) e->unlimitedRelations=true;
+        if(!spec->a18Bound) {
+            if ((rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return rc;
+            e->unlimitedRelations=true;
+        }
         auto t = std::make_unique<Type>();
         rc = openType(e, t.get(), spec, &e2);
         if (rc != FLATSQL_OK) { *err = name + ": " + e2; return rc; }

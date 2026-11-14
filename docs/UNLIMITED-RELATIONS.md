@@ -4,9 +4,10 @@ Complete relations expose more work to scans, sorts, and joins. Those queries
 can take longer or fail with an explicit execution-budget error. The shared
 row-order cache also replaces some retained-memory access with file reads.
 
-`flatsql_capabilities()` bit 0 advertises unlimited relations. Type-spec tag 10
-is a uint32: zero explicitly requests unlimited visibility, a positive value
-retains the newest-N policy, and an absent tag retains the historical default.
+`flatsql_capabilities()` bit 0 advertises unlimited relations. Type-spec tag 13
+is a uint8: 1 explicitly requests unlimited visibility. Tag 10 is a uint32:
+a positive value selects the newest-N policy; zero or an absent tag retains
+the historical default. An absent or zero tag 13 preserves bounded behavior.
 The JavaScript API accepts `maxRows: 0` only after checking the capability.
 COUNT, raw-record output, source aliases, and ordinary SQL use the same policy.
 Binary-collated `_cid = ?` predicates use the durable reader's CID index.
@@ -26,6 +27,12 @@ automatically completes a valid intent whose UUID matches MIGRATED. A torn
 intent is discarded only beside an intact activated marker pair. UUID and
 sequence-floor conflicts fail explicitly. No unlimited specification precedes
 the durable layout guard.
+
+Type-spec replacement syncs a complete CRC-protected `.spec.intent` before
+overwriting `.spec`. Open completes a valid intent and discards an incomplete
+intent only beside a valid prior spec. A corrupt registered spec prevents open;
+it cannot hide an unlimited relation from the bounded-downgrade check. This
+guard covers normal registration and interrupted writes, not manual file edits.
 
 Config tag 51 (`rowCacheBytes` in JavaScript) sets the shared row-order page and
 verified-metadata budget; its default is 32 MiB. Owning page views retain their

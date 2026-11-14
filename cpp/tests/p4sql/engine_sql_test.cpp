@@ -188,6 +188,31 @@ FLATSQL_TEST(t_sql_unlimited_promotion_recovery) {
     closeEngine(); removeTree(root);
 }
 
+FLATSQL_TEST(t_sql_legacy_zero_and_missing_bound) {
+    namespace p4 = flatsql::p4;
+    const auto root=scratchDir("legacy_zero_bound");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=0;
+    auto encoded=type.spec();
+    std::vector<p4::Tlv> tags;
+    REQUIRE(p4::tlvParse(encoded.data(),encoded.size(),&tags),"parse test spec");
+    for(bool omit:{false,true}) {
+        std::vector<uint8_t> legacy;
+        for(const auto& tag:tags) if(tag.tag!=13 && !(omit && tag.tag==10)) p4::tlvPut(legacy,tag.tag,tag.v,tag.n);
+        std::string err;
+        REQUIRE(p4::engineRegisterType(p4::currentEngine(),legacy.data(),legacy.size(),&err)==FLATSQL_OK,err);
+        CHECK_EQ(p4::currentEngine()->findType("OMM")->spec()->a18Bound,uint32_t(10000),"legacy default");
+        CHECK_EQ(closeEngine(),FLATSQL_OK,"close");
+        REQUIRE(openEngine(root)==FLATSQL_OK,"reopen explicit zero or missing bound");
+        CHECK_EQ(p4::currentEngine()->markers.layout,1,"legacy zero keeps layout 1");
+        CHECK_EQ(p4::currentEngine()->findType("OMM")->spec()->a18Bound,uint32_t(10000),"persisted legacy default");
+    }
+    REQUIRE(registerType(type)==FLATSQL_OK,"explicit unlimited flag");
+    CHECK_EQ(p4::currentEngine()->markers.layout,2,"flag promotes layout");
+    CHECK_EQ(p4::currentEngine()->findType("OMM")->spec()->a18Bound,uint32_t(0),"flag means unlimited");
+    closeEngine(); removeTree(root);
+}
+
 FLATSQL_TEST(t_sql_registration_recovery_and_validation) {
     namespace p4 = flatsql::p4;
     const auto root=scratchDir("registration_recovery");
