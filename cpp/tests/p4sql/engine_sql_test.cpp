@@ -8,6 +8,9 @@
 #include "flatsql/p4/p4_reader.h"
 #include "p4/p4_test.h"
 #include "internal.h"
+#include "checkpoint.h"
+
+namespace flatsql { namespace p4 { P4Engine* currentEngine(); } }
 
 using namespace p4t;
 
@@ -197,6 +200,68 @@ FLATSQL_TEST(t_sql_metadata_only_visibility) {
     CHECK_EQ(r.rows.size(),size_t(3),"metadata relation");
     CHECK_EQ(sql("SELECT OBJECT_NAME FROM OMM").status,FLATSQL_E_SQL,"no reflected plaintext fields");
     closeEngine(); removeTree(root);
+}
+
+FLATSQL_TEST(t_sql_unlimited_reader_mutations) {
+    namespace p4 = flatsql::p4;
+    const auto root=scratchDir("unlimited_reader_mutations");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=0;
+    REQUIRE(registerType(type)==FLATSQL_OK,"unlimited registration");
+    auto batch=ommBatch(1,2048,kSrc,"old");
+    REQUIRE(put(batch).status==FLATSQL_OK,"put initial records");
+    auto* e=p4::currentEngine(); auto* t=e->findType("OMM");
+    p4::Feed* feed=nullptr;
+    { std::lock_guard<std::mutex> g(t->mu); for(auto& f:t->feeds) if(f->created && f->source==kSrc) feed=f.get(); }
+    REQUIRE(feed,"feed");
+    int32_t status=FLATSQL_OK;
+    auto generation=p4::streamCur(feed,&status);
+    REQUIRE(generation && status==FLATSQL_OK,"pin generation");
+    const auto oldGen=generation->gen;
+    P4Lane lane; lane.e=e;
+    P4ScanSpec spec{}; spec.type="OMM"; spec.order=FLATSQL_ORDER_SEQ_ASC; spec.hydrate=1;
+    P4Cursor* cursor=nullptr;
+    REQUIRE(p4_cursor_open(&lane,&spec,&cursor)==FLATSQL_OK,"open cursor");
+    P4Row row{};
+    REQUIRE(p4_cursor_next(cursor,&row)==1 && row.seq==1,"first row");
+    // Delete one buffered row and one beyond the first page. Add a retained
+    // delivery before superseding the old batch in the same feed.
+    uint8_t ids[4+72]; p4::st32(ids,2);
+    cidOf(batch.recs[1].frame,ids+4); cidOf(batch.recs[1535].frame,ids+40);
+    TlvW del; del.text(1,"OMM").raw(40,ids,sizeof ids);
+    REQUIRE(call(FLATSQL_OPC_DELETE,del.b).status==FLATSQL_OK,"delete unreached records");
+    auto replacement=ommBatch(3000,1,kSrc,"keep");
+    REQUIRE(put(replacement).status==FLATSQL_OK,"replacement delivery");
+    TlvW supersede; supersede.text(1,"OMM").text(11,"space-data-network-02").text(12,kSrc).text(60,"keep").u8(61,1);
+    REQUIRE(call(FLATSQL_OPC_SUPERSEDE,supersede.b).status==FLATSQL_OK,"supersede old batch");
+    p4::Internal in; in.what=feed->fid; in.force=true;
+    REQUIRE(p4::runOnWriter(e,t,p4::kOpCompact,&in)==FLATSQL_OK,"compact during scan");
+    auto newGeneration=p4::streamCur(feed,&status);
+    REQUIRE(newGeneration && newGeneration->gen!=oldGen,"generation changed");
+    std::string header;
+    CHECK_EQ(p4::streamReadRange(generation.get(),0,12,&header),FLATSQL_OK,"pinned generation still readable");
+    int64_t previous=1; size_t seen=1;
+    while((status=p4_cursor_next(cursor,&row))==1) {
+        CHECK(row.seq>previous && row.seq<=512,"only already buffered rows survive mutations");
+        const auto& f=batch.recs[size_t(row.seq-1)].frame;
+        CHECK(row.dataLen==f.size()-4 && std::memcmp(row.data,f.data()+4,row.dataLen)==0,"buffered bytes unchanged");
+        previous=row.seq; seen++;
+    }
+    CHECK_EQ(status,0,"cursor completed without freed-generation access");
+    CHECK(seen>1 && seen<=512,"page snapshot retained");
+    p4_cursor_close(cursor); generation.reset(); newGeneration.reset();
+    for(int pass=0;pass<2;pass++) {
+        auto fresh=sql("SELECT _seq,_data FROM OMM ORDER BY _seq");
+        REQUIRE(fresh.status==FLATSQL_OK && fresh.rows.size()==1,"new reader sees only retained batch");
+        CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),1,"count agrees");
+        for(size_t i:{size_t(1),size_t(1535)}) {
+            uint8_t cid[36]; cidOf(batch.recs[i].frame,cid);
+            CHECK(sql("SELECT _seq FROM OMM WHERE _cid='"+cidText(cid)+"'").rows.empty(),"deleted record stays invisible");
+        }
+        REQUIRE(closeEngine()==FLATSQL_OK,"close");
+        if(!pass) REQUIRE(openEngine(root)==FLATSQL_OK,"reopen");
+    }
+    removeTree(root);
 }
 
 FLATSQL_TEST(t_sql_caps_and_sandbox) {
