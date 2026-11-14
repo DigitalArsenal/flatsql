@@ -128,7 +128,7 @@ int32_t checkpointReadAt(Feed*,Stream*,uint64_t,CheckpointState*,std::string* er
 // (including the $FMBs before the $FCK itself), including moves and retags
 // that preserve a sequence below the checkpoint's sequence high.
 int32_t checkpointTailRows(Feed*,Stream*,const CheckpointState&,uint64_t previous,std::vector<uint64_t>* rids,
-                          uint64_t* rowCount=nullptr,int64_t* lastCommitAt=nullptr,uint64_t stop=UINT64_MAX);
+                          uint64_t* rowCount=nullptr,int64_t* lastCommitAt=nullptr,uint64_t stop=UINT64_MAX,uint64_t workspace=0);
 // Restore row/idle cadence from already committed tail metadata after open.
 int32_t checkpointRestoreCadence(Feed*,Stream*);
 // Folds the feed as of mark (previous: its last commit) into a plan, reading

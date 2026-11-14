@@ -65,12 +65,13 @@ size_t FsgRun::lowerBound(const FsgPairV& key,int32_t* status) const {
 
 std::shared_ptr<const FsgView> fsgView(Feed* f,Conn* c,uint8_t kind,int64_t vis) {
     const int k=kind==kFsgSeq?0:1;
-    std::shared_ptr<const CheckpointState> ck; uint64_t previous=0;
-    { std::lock_guard<std::mutex> g(f->type->mu); ck=f->checkpoint; previous=f->lastCommit; }
+    std::shared_ptr<const CheckpointState> ck; uint64_t previous=0,mark=0;
+    { std::lock_guard<std::mutex> g(f->type->mu); ck=f->checkpoint; previous=f->lastCommit; mark=uint64_t(f->mark); }
     if(!ck) return nullptr;
-    // Tail materialization grows with ingest between checkpoints. The SQLite
-    // index already serves that snapshot without retaining a second row order.
-    if(previous!=ck->offset || !ck->current) return nullptr;
+    const bool hasTail=previous!=ck->offset || !ck->current;
+    if(mark<ck->appliedThrough) return nullptr;
+    const uint64_t span=hasTail?mark-ck->appliedThrough:0;
+    if(span>SIZE_MAX/16) return nullptr;
     // A checkpoint whose live rows have no row orders (written before they
     // existed): the SQLite index answers until the next checkpoint folds them.
     if(ck->counters.rows>0 && !checkpointHasRowOrders(*ck,kind)) return nullptr;
@@ -86,10 +87,10 @@ std::shared_ptr<const FsgView> fsgView(Feed* f,Conn* c,uint8_t kind,int64_t vis)
             return nullptr;
         }
     const auto key=stream->path+"/"+std::to_string(stream->gen)+"/view/"+
-        std::to_string(kind)+"/"+std::to_string(ck->offset)+"/"+std::to_string(previous);
+        std::to_string(kind)+"/"+std::to_string(ck->offset)+"/"+std::to_string(previous)+"/"+std::to_string(vis);
     auto cache=f->type->e->rowCache;
     if(auto ready=cache->find<FsgView>(key)) { f->fsg[k]=ready; return ready; }
-    const size_t count=size_t(std::count_if(ck->segments.begin(),ck->segments.end(),[&](const CheckpointSegment& d){return d.kind==kind;}));
+    const size_t count=size_t(std::count_if(ck->segments.begin(),ck->segments.end(),[&](const CheckpointSegment& d){return d.kind==kind;}))+size_t(hasTail);
     // Include run objects, control blocks, key capacities and vector slots.
     // Feeds hold weak references so inactive views remain globally evictable.
     const size_t perRun=sizeof(FsgRun)+128+2*(stream->path.size()+96)+2*sizeof(std::shared_ptr<const FsgRun>);
@@ -101,6 +102,37 @@ std::shared_ptr<const FsgView> fsgView(Feed* f,Conn* c,uint8_t kind,int64_t vis)
             if(d.kind!=kind) continue;
             auto run=std::make_shared<FsgRun>();
             if(checkpointReadPairs(f,stream,d,run.get())!=FLATSQL_OK) { lostVerification=true; return {}; }
+            view->runs[k].push_back(std::move(run));
+        }
+        if(hasTail) {
+            struct Tail { std::vector<FsgPairV> pairs; std::shared_ptr<Stream> generation; };
+            // Reserve before reading metadata. The span bounds each frame and
+            // row-ID vector; pairs and temporary parsing share cache admission.
+            // Large tails use SQLite without allocating a second row order.
+            auto tail=cache->load<Tail>(key+"/tail",sizeof(Tail)+size_t(span)*8,[&]() -> std::shared_ptr<const Tail> {
+                std::vector<uint64_t> rids;
+                if(checkpointTailRows(f,stream.get(),*ck,previous,&rids,nullptr,nullptr,UINT64_MAX,span)!=FLATSQL_OK) return {};
+                auto value=std::make_shared<Tail>(); value->generation=stream; value->pairs.reserve(rids.size());
+                sqlite3_stmt* q=kind==kFsgSeq?nullptr:c->sql("SELECT kk,e FROM r WHERE rid=?1");
+                if(kind!=kFsgSeq && !q) return {};
+                for(uint64_t rid:rids) {
+                    if(int64_t(rid>>16)>vis) continue;
+                    if(kind==kFsgSeq) { value->pairs.push_back({rid,0,rid,0}); continue; }
+                    // r includes committed staged rows before index merging.
+                    sqlite3_bind_int64(q,1,sqlite3_int64(rid)); const int rc=sqlite3_step(q);
+                    if(rc==SQLITE_ROW) {
+                        const uint64_t hi=sqlite3_column_type(q,0)==SQLITE_NULL?0:uint64_t(sqlite3_column_int64(q,0));
+                        const uint64_t lo=sqlite3_column_type(q,1)==SQLITE_NULL?0:uint64_t(sqlite3_column_int64(q,1))^(uint64_t(1)<<63);
+                        value->pairs.push_back({hi,lo,rid,0});
+                    }
+                    sqlite3_reset(q);
+                    if(rc!=SQLITE_ROW && rc!=SQLITE_DONE) return {};
+                }
+                std::sort(value->pairs.begin(),value->pairs.end());
+                return value;
+            },size_t(span)*4);
+            if(!tail) return {};
+            auto run=std::make_shared<FsgRun>(); run->p=tail->pairs.data(); run->n=tail->pairs.size(); run->keep=tail;
             view->runs[k].push_back(std::move(run));
         }
         return view;
