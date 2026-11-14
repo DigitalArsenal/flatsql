@@ -23,6 +23,13 @@ const std::string& lastError() { return gLastError; }
 
 extern "C" {
 
+FLATSQL_EXPORT("flatsql_capabilities") int32_t flatsql_capabilities(void) { return 1; }
+
+int32_t p4_cid_parse(const char* text,uint32_t length,uint8_t out[36]) {
+    out[0]=1; out[1]=0x55; out[2]=0x12; out[3]=0x20;
+    return flatsql::p4::cidDigestFromText(text,length,out+4)?1:0;
+}
+
 FLATSQL_EXPORT("flatsql_init") int32_t flatsql_init(const uint8_t* cfg, int32_t cfgLen) {
     if (gEngine) {
         if (gEngine->started && !gEngine->stopping.load()) return FLATSQL_E_ARG;  // one engine per instance

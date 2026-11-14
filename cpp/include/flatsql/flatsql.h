@@ -140,6 +140,8 @@ FLATSQL_EXPORT("flatsql_start")         int32_t flatsql_start(void);      /* >= 
 FLATSQL_EXPORT("flatsql_layout")        int32_t flatsql_layout(FlatSQLLayout* out); /* bytes written = 640 */
 FLATSQL_EXPORT("flatsql_wake")          int32_t flatsql_wake(uint32_t* addr, int32_t n); /* memory.atomic.notify; woken count */
 FLATSQL_EXPORT("flatsql_register_type") int32_t flatsql_register_type(const uint8_t* spec, int32_t specLen);
+/* Bit 0: explicit tag-10 zero gives unlimited SQL visibility, including opaque types. */
+FLATSQL_EXPORT("flatsql_capabilities")  int32_t flatsql_capabilities(void);
 FLATSQL_EXPORT("flatsql_set_quota")     int32_t flatsql_set_quota(double bytes);   /* 0 = none */
 FLATSQL_EXPORT("flatsql_activate")      int32_t flatsql_activate(void);            /* create mode 2 only */
 FLATSQL_EXPORT("flatsql_stats")         int32_t flatsql_stats(uint8_t* out, int32_t cap); /* bytes written; u64 LE array §3.10 */

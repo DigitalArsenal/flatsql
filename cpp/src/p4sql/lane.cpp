@@ -513,7 +513,8 @@ bool dataStream(LaneState* ls, const P4SqlRequest* req, Out& out, int32_t* statu
         const P4Row& r = scan.row();
         const uint8_t* p = nullptr;
         size_t n = 0;
-        payloadOf(t->fid, r.data, r.dataLen, &p, &n);
+        if(t->metadataOnly) { p=r.data; n=r.dataLen; }
+        else payloadOf(t->fid, r.data, r.dataLen, &p, &n);
         if (n == 0) {   // _data is NULL: not a BLOB cell, as on the SQL path
             *msg = "not-a-record-stream: raw stream queries must return only BLOB cells";
             rc = FLATSQL_E_SQL;
@@ -622,7 +623,8 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
     st.sandbox = (req->flags & FLATSQL_SLOT_SANDBOX) != 0;
     Out out(ls, (req->flags & FLATSQL_SLOT_RAW) != 0, req->maxResultRows, req->maxResultBytes);
     std::string msg;
-    int32_t status = FLATSQL_OK;
+    int32_t status = loadTypes(ls,&msg);
+    if(status!=FLATSQL_OK) return reply(ls,status,msg);
     if (dataStream(ls, req, out, &status, &msg)) {
         const int32_t emitted = out.finish(&msg);
         return reply(ls, status != FLATSQL_OK ? status : emitted, msg);

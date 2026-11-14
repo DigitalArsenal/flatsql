@@ -30,7 +30,7 @@ FLATSQL_TEST(t_row_cache_scan_and_generation_pin) {
     for(size_t i=0;i<pairs.size();++i) pairs[i]={i+1,0,i+1,0};
     { std::ofstream out(path,std::ios::binary); out.write(reinterpret_cast<const char*>(pairs.data()),pairs.size()*sizeof(FsgPairV)); }
     auto stream=std::make_shared<Stream>(); stream->path=path;
-    stream->h=flatsql_io_open(path.data(),int32_t(path.size()),FLATSQL_IO_READONLY);
+    stream->h=flatsql_io_open(path.data(),int32_t(path.size()),FLATSQL_IO_READ);
     REQUIRE(stream->h>=0,"open synthetic row order");
     std::weak_ptr<Stream> generation=stream;
     auto cache=std::make_shared<PageCache>(); cache->configure(16384);

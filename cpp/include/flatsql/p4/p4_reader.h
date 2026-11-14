@@ -63,6 +63,8 @@ typedef struct P4TypeInfo { const char* name; const uint8_t* bfbs; uint32_t bfbs
                             const char* rules; uint32_t rulesLen; } P4TypeInfo;   /* rules: tag-4 text, verbatim (v2, C-16) */
 
 int32_t   p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out);  /* FLATSQL_OK or status */
+/* Parse a canonical raw sha256 CID; returns 1 on success, 0 otherwise. */
+int32_t   p4_cid_parse(const char* text, uint32_t length, uint8_t out[36]);
 int32_t   p4_cursor_next(P4Cursor* c, P4Row* row);   /* 1 row, 0 end, < 0 status (FLATSQL_E_BUDGET, FLATSQL_E_CANCELLED, ...) */
 void      p4_cursor_close(P4Cursor* c);
 /* Every stored copy/tag of one CID; no record hydration. Callback pointers

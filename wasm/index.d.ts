@@ -11,6 +11,8 @@ export interface FlatSQLOptions {
   requestBytes?: number;
   writers?: number;
   readers?: number;
+  /** Shared row-order and verified-metadata cache budget; default 32 MiB. */
+  rowCacheBytes?: number;
   backend?: 'opfs' | 'memory';
   workerUrl?: string | URL;
   threadWorkerUrl?: string | URL;
@@ -34,6 +36,7 @@ export interface BinarySchema {
   bfbs: Uint8Array;
   indexRules?: string;
   maxRecordBytes?: number;
+  /** Zero requests capability-checked unlimited visibility. */
   maxRows?: number;
   fullText?: boolean;
 }
@@ -48,6 +51,7 @@ export interface IngestOptions extends QueryOptions {
 }
 export class FlatSQL {
   static open(options?: FlatSQLOptions): Promise<FlatSQL>;
+  capabilities(): Promise<{unlimitedRelations: boolean}>;
   registerSchema(schema: BinarySchema): Promise<void>;
   /** Frames are [u32 little-endian length][FlatBuffer payload], concatenated. */
   ingest(type: string, frames: Uint8Array, options?: IngestOptions): Promise<Uint8Array>;

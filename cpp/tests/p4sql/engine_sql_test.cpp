@@ -93,6 +93,60 @@ FLATSQL_TEST(t_sql_bounded_visibility) {
 }
 
 // Statuses, never traps: result caps, the sandbox, malformed parameters.
+FLATSQL_TEST(t_sql_unlimited_visibility) {
+    const auto root=scratchDir("unlimited_visibility");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=2;
+    REQUIRE(registerType(type)==FLATSQL_OK,"register bounded");
+    const auto batch=ommBatch(1,8,kSrc,"synthetic");
+    REQUIRE(put(batch).status==FLATSQL_OK,"put");
+    CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),2,"warm old policy");
+    type.a18=0;
+    REQUIRE(registerType(type)==FLATSQL_OK,"promote unlimited");
+    CHECK_EQ(flatsql_capabilities()&1,1,"capability");
+    for(int pass=0;pass<2;++pass) {
+        auto count=sql("SELECT COUNT(*) AS n FROM OMM");
+        CHECK_EQ(count.status,FLATSQL_OK,count.err);
+        CHECK_EQ(count.i(0,"n"),8,"all records counted");
+        for(size_t i=0;i<batch.recs.size();++i) {
+            uint8_t cid[36]; cidOf(batch.recs[i].frame,cid);
+            auto r=sql("SELECT _seq,_data FROM OMM WHERE _cid='"+cidText(cid)+"'");
+            CHECK_EQ(r.status,FLATSQL_OK,r.err);
+            REQUIRE(r.rows.size()==1,"CID visible");
+            CHECK_EQ(r.i(0,"_seq"),int64_t(i+1),"sequence");
+            const auto& frame=batch.recs[i].frame;
+            CHECK(r.s(0,"_data")==std::string(reinterpret_cast<const char*>(frame.data()+4),frame.size()-4),"exact payload");
+        }
+        auto scan=sql("SELECT _seq FROM OMM ORDER BY _seq");
+        CHECK_EQ(scan.rows.size(),size_t(8),"complete scan");
+        for(size_t i=0;i<scan.rows.size();++i) CHECK_EQ(scan.i(i,"_seq"),int64_t(i+1),"no gap or duplicate");
+        auto raw=sql("SELECT _data FROM OMM",FLATSQL_SLOT_RAW);
+        CHECK_EQ(raw.status,FLATSQL_OK,raw.err);
+        CallOpts limit; limit.maxResultRows=3;
+        CHECK_EQ(call(FLATSQL_OPC_SQL,sqlReq("SELECT _seq FROM OMM"),limit).status,FLATSQL_E_BUDGET,"explicit budget failure");
+        CHECK_EQ(closeEngine(),FLATSQL_OK,"close");
+        if(pass==0) REQUIRE(openEngine(root)==FLATSQL_OK,"reopen guarded store");
+    }
+    REQUIRE(openEngine(root)==FLATSQL_OK,"reopen for downgrade refusal");
+    type.a18=2;
+    CHECK_EQ(registerType(type),FLATSQL_E_FORMAT,"bounded downgrade refused");
+    closeEngine(); removeTree(root);
+}
+
+FLATSQL_TEST(t_sql_metadata_only_visibility) {
+    const auto root=scratchDir("metadata_only_visibility");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.bfbs.clear(); type.rules.clear(); type.flags=2; type.a18=0;
+    REQUIRE(registerType(type)==FLATSQL_OK,"opaque registration");
+    auto batch=ommBatch(1,3,kSrc,"synthetic");
+    REQUIRE(put(batch).status==FLATSQL_OK,"put");
+    auto r=sql("SELECT _seq,_cid,_data FROM OMM ORDER BY _seq");
+    CHECK_EQ(r.status,FLATSQL_OK,r.err);
+    CHECK_EQ(r.rows.size(),size_t(3),"metadata relation");
+    CHECK_EQ(sql("SELECT OBJECT_NAME FROM OMM").status,FLATSQL_E_SQL,"no reflected plaintext fields");
+    closeEngine(); removeTree(root);
+}
+
 FLATSQL_TEST(t_sql_caps_and_sandbox) {
     const std::string root = scratchDir("t_sql_caps");
     REQUIRE(openEngine(root) == FLATSQL_OK, "open");

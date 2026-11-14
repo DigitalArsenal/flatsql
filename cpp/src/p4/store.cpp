@@ -61,7 +61,7 @@ int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::s
         s->pageSize = u32;
     }
     if (tlvU8(v, 9, &u8, &bad)) s->identity = u8 != 0;
-    if (tlvU32(v, 10, &u32, &bad) && u32) s->a18Bound = u32;
+    if (tlvU32(v, 10, &u32, &bad)) s->a18Bound = u32;
     if (tlvU8(v, 11, &u8, &bad)) {
         if (u8 > 2) { *err = "spec: epoch profile"; return FLATSQL_E_ARG; }
         s->epochProfile = u8;
@@ -200,6 +200,7 @@ int32_t writeMarkers(Engine* e, const uint8_t uuid[16], uint64_t floor, uint32_t
     }
     uint8_t st[64];
     encodeStore(st, uuid, wallMs(), floor, from);
+    if(e->unlimitedRelations) { st16(st+6,2); st32(st+56,ps::crc32c(st,56)); }
     return ioWriteNew(pathJoin(e->cfg.root, "STORE"), st, sizeof st);
 }
 
@@ -491,7 +492,7 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     Markers& m = e->markers;
     rc = readMarkers(e, &m);
     if (rc != FLATSQL_OK) { *err = "markers: read failed"; return rc; }
-    if (m.storeValid && (m.format != 5 || m.layout > 1)) { *err = "STORE has an unsupported format or layout (requires format 5)"; return FLATSQL_E_FORMAT; }
+    if (m.storeValid && (m.format != 5 || m.layout > 2)) { *err = "STORE has an unsupported format or layout (requires format 5, layout 1 or 2)"; return FLATSQL_E_FORMAT; }
     if (m.migratedValid && m.migratedFormat != 5) { *err = "MIGRATED has an unsupported format (requires format 5)"; return FLATSQL_E_FORMAT; }
     const std::string catalog = pathJoin(pathJoin(e->cfg.root, "T"), "TYPES");
     const std::vector<std::string> names = catalogRead(catalog);
@@ -541,6 +542,7 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
         std::shared_ptr<Spec> spec;
         std::string e2;
         if (buildSpec(tlv.data(), tlv.size(), &spec, &e2) != FLATSQL_OK || spec->name != name) continue;
+        if(!spec->a18Bound) e->unlimitedRelations=true;
         auto t = std::make_unique<Type>();
         rc = openType(e, t.get(), spec, &e2);
         if (rc != FLATSQL_OK) { *err = name + ": " + e2; return rc; }
@@ -556,9 +558,22 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
     int32_t rc = buildSpec(p, n, &spec, err);
     if (rc != FLATSQL_OK) return rc;
     std::lock_guard<std::mutex> g(e->typesMu);
+    if(!spec->a18Bound) e->unlimitedRelations=true;
+    // Layout 2 requires explicit unlimited-relation support. Publish this guard
+    // before any unlimited spec: older engines refuse the store on open.
+    if(!spec->a18Bound && e->markers.storeValid && e->markers.layout<2) {
+        std::vector<uint8_t> marker;
+        const auto path=pathJoin(e->cfg.root,"STORE");
+        if(ioReadAll(path,&marker)!=FLATSQL_OK || marker.size()!=64) return FLATSQL_E_IO;
+        st16(marker.data()+6,2); st32(marker.data()+56,ps::crc32c(marker.data(),56));
+        rc=ioWriteNew(path,marker.data(),marker.size());
+        if(rc!=FLATSQL_OK) { *err="unlimited relation guard write failed"; return rc; }
+        e->markers.layout=2;
+    }
     auto it = e->typeByName.find(spec->name);
     if (it != e->typeByName.end()) {
         Type* t = it->second;
+        if(!t->spec()->a18Bound && spec->a18Bound) { *err="unlimited relation cannot be downgraded to a bounded relation"; return FLATSQL_E_FORMAT; }
         std::shared_ptr<const Spec> cur = t->spec();
         if (cur->bytes == spec->bytes) return FLATSQL_OK;
         bool hasData;

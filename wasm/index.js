@@ -95,7 +95,8 @@ export class FlatSQL {
       const cfg = control([[1, options.path ?? '/store'], [2, 1, 1], [3, options.writers ?? 1],
         [4, options.readers ?? 1], [5, 1], [6, 1], [7, 2], [8, 4], [9, requestBytes], [10, requestBytes],
         [11, 256 * 1024], [20, 384 * 1024 * 1024, 8], [21, 8], [23, 16], [25, 16 * 1024 * 1024, 8],
-        [26, 128 * 1024 * 1024, 8], [27, 192 * 1024 * 1024, 8], [48, 32 * 1024 * 1024, 8]]);
+        [26, 128 * 1024 * 1024, 8], [27, 192 * 1024 * 1024, 8], [48, 32 * 1024 * 1024, 8],
+        [51, options.rowCacheBytes ?? 32 * 1024 * 1024, 8]]);
       await db.#withBytes(cfg, async p => check(await host.call('flatsql_init', p, cfg.length)));
       const p = await host.call('flatsql_alloc', 640);
       if (!p) throw new FlatSQLError(-2);
@@ -113,9 +114,15 @@ export class FlatSQL {
     try { return await fn(p); } finally { await this.#host.call('flatsql_free', p); }
   }
   #assertOpen() { if (this.#closed || this.#host.faulted()) throw new FlatSQLError(-11, 'FlatSQL is closed or its guest failed'); }
+  async capabilities() {
+    this.#assertOpen();
+    try { return { unlimitedRelations: ((await this.#host.call('flatsql_capabilities')) & 1) !== 0 }; }
+    catch { return { unlimitedRelations: false }; }
+  }
   async registerSchema({ name, fileIdentifier, bfbs, indexRules = '', maxRecordBytes = 16 * 1024 * 1024, maxRows = 400000, fullText = false }) {
     this.#assertOpen(); bytes(bfbs);
-    integer(maxRecordBytes,'maxRecordBytes',8,128*1024*1024);integer(maxRows,'maxRows',1,0xffffffff);
+    integer(maxRecordBytes,'maxRecordBytes',8,128*1024*1024);integer(maxRows,'maxRows',0,0xffffffff);
+    if(maxRows===0 && !(await this.capabilities()).unlimitedRelations) throw new Error('Engine lacks unlimited relation support');
     if(typeof fileIdentifier!=='string')throw new TypeError('A four-byte file identifier is required');
     if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name) || encoder.encode(fileIdentifier).length !== 4) throw new TypeError('Schema name and four-byte file identifier are required');
     const spec = control([[1, name], [2, fileIdentifier], [3, bfbs], [4, indexRules], [5, maxRecordBytes, 8],
