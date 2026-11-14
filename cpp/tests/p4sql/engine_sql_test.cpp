@@ -188,6 +188,33 @@ FLATSQL_TEST(t_sql_unlimited_promotion_recovery) {
     closeEngine(); removeTree(root);
 }
 
+FLATSQL_TEST(t_sql_metadata_count_consistency) {
+    namespace p4 = flatsql::p4;
+    const auto root=scratchDir("metadata_count");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=0;
+    REQUIRE(registerType(type)==FLATSQL_OK,"unlimited registration");
+    REQUIRE(put(ommBatch(1,8,kSrc,"synthetic")).status==FLATSQL_OK,"records");
+    CallOpts caps; caps.flags=FLATSQL_SLOT_SANDBOX; caps.maxBytes=1; caps.maxRows=1;
+    for(const auto* expr:{"COUNT(*)","COUNT(_cid)"}) {
+        const auto result=call(FLATSQL_OPC_SQL,sqlReq(std::string("SELECT ")+expr+" AS n FROM OMM"),caps);
+        CHECK_EQ(result.status,FLATSQL_OK,result.err);
+        CHECK_EQ(result.i(0,"n"),8,"unfiltered count uses metadata");
+    }
+    auto* t=p4::currentEngine()->findType("OMM");
+    t->vis.store(3);
+    CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),3,"count respects visibility ceiling");
+    CHECK_EQ(sql("SELECT COUNT(_cid) AS n FROM OMM").i(0,"n"),3,"CID count respects visibility ceiling");
+    CHECK_EQ(sql("SELECT _cid FROM OMM").rows.size(),size_t(3),"same scan ceiling");
+    t->vis.store(8);
+    { std::lock_guard<std::mutex> g(t->mu); for(auto& f:t->feeds) if(f->created) f->quarantined=true; }
+    CHECK_EQ(sql("SELECT COUNT(*) FROM OMM").status,FLATSQL_E_CORRUPT,"count rejects quarantine");
+    CHECK_EQ(sql("SELECT COUNT(_cid) FROM OMM").status,FLATSQL_E_CORRUPT,"CID count rejects quarantine");
+    CHECK_EQ(sql("SELECT _cid FROM OMM").status,FLATSQL_E_CORRUPT,"scan rejects quarantine");
+    { std::lock_guard<std::mutex> g(t->mu); for(auto& f:t->feeds) f->quarantined=false; }
+    closeEngine(); removeTree(root);
+}
+
 FLATSQL_TEST(t_sql_empty_root_isolation) {
     const auto root=scratchDir("empty_root_isolation");
     REQUIRE(openEngine(root)==FLATSQL_OK,"open");

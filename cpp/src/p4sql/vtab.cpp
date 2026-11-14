@@ -403,10 +403,12 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
             EngineCall ec;
             n = p4_type_rows(vt->ls->lane, vt->t->name.c_str());
         }
-        if (n < 0) return fail(c, FLATSQL_E_NOTYPE, "type not registered");
-        if (vt->t->bound && uint64_t(n) > vt->t->bound) n = int64_t(vt->t->bound);  // A18: the newest N
-        c->scan.openCounted(n);
-        return SQLITE_OK;
+        if (n < 0 && n != FLATSQL_E_BUSY) return fail(c, int32_t(n), "metadata count unavailable");
+        if(n>=0) {
+            if (vt->t->bound && uint64_t(n) > vt->t->bound) n = int64_t(vt->t->bound);
+            c->scan.openCounted(n);
+            return SQLITE_OK;
+        }
     }
 
     // Constraints.
