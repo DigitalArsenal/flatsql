@@ -141,9 +141,21 @@ int32_t recoverSpec(const std::string& path, std::vector<uint8_t>* bytes) {
 }
 int32_t writeSpec(const std::string& path, const std::vector<uint8_t>& bytes) {
     const auto intent = path + ".intent";
+    std::vector<uint8_t> previous;
+    const bool existed=ioExists(path);
+    if (existed && ioReadAll(path,&previous)!=FLATSQL_OK) return FLATSQL_E_IO;
     int32_t rc = ioWriteNew(intent, bytes.data(), bytes.size());
     if (rc == FLATSQL_OK) rc = ioWriteNew(path, bytes.data(), bytes.size());
-    if (rc == FLATSQL_OK) rc = ioUnlink(intent);
+    if (rc == FLATSQL_OK) {
+        // The spec is durable. A leftover intent replays the same accepted
+        // value, so cleanup failure does not report a rejected registration.
+        ioUnlink(intent);
+        return FLATSQL_OK;
+    }
+    // A returned error must not leave a complete roll-forward intent.
+    const int32_t removed=ioUnlink(intent);
+    const int32_t restored=existed?ioWriteNew(path,previous.data(),previous.size()):ioUnlink(path);
+    if (removed!=FLATSQL_OK || restored!=FLATSQL_OK) return FLATSQL_E_IO;
     return rc;
 }
 // T/TYPES: records [u32 crc32c(name)][u16 len][name]; a torn tail is ignored.

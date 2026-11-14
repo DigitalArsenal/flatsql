@@ -163,7 +163,8 @@ FLATSQL_TEST(t_sql_unlimited_promotion_recovery) {
     auto promoted=original;
     p4::st16(promoted.data()+6,2);
     p4::st32(promoted.data()+56,flatsql::ps::crc32c(promoted.data(),56));
-    for(int phase=0;phase<2;phase++) for(size_t cut=0;cut<=64;cut++) {
+    // Intent, authoritative marker, and recovery's marker rewrite.
+    for(int phase=0;phase<3;phase++) for(size_t cut=0;cut<=64;cut++) {
         REQUIRE(p4::ioWriteNew(root+"/STORE",original.data(),original.size())==FLATSQL_OK,"restore baseline");
         REQUIRE(p4::ioWriteNew(root+"/STORE.unlimited",promoted.data(),phase?64:cut)==FLATSQL_OK,"intent prefix");
         if(phase) REQUIRE(p4::ioWriteNew(root+"/STORE",promoted.data(),cut)==FLATSQL_OK,"torn overwrite");
@@ -328,6 +329,32 @@ FLATSQL_TEST(t_sql_registration_preflight) {
     CHECK(!p4::ioExists(root+"/T/OMM.spec"),"invalid registration writes no spec");
     CHECK_EQ(p4::currentEngine()->markers.layout,1,"invalid registration keeps layout");
     closeEngine(); removeTree(root);
+}
+
+FLATSQL_TEST(t_sql_spec_all_prefixes) {
+    namespace p4 = flatsql::p4;
+    const auto root=scratchDir("spec_all_prefixes");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.bfbs.clear(); type.rules.clear(); type.flags=2; type.a18=2;
+    REQUIRE(registerType(type)==FLATSQL_OK,"original registration");
+    const auto path=root+"/T/OMM.spec";
+    std::vector<uint8_t> before,after;
+    REQUIRE(p4::ioReadAll(path,&before)==FLATSQL_OK,"original bytes");
+    type.a18=3; REQUIRE(registerType(type)==FLATSQL_OK,"replacement");
+    REQUIRE(p4::ioReadAll(path,&after)==FLATSQL_OK,"replacement bytes");
+    REQUIRE(closeEngine()==FLATSQL_OK,"close");
+    // All prefixes of intent, authoritative spec, and recovery spec rewrite.
+    for(int phase=0;phase<3;phase++) for(size_t cut=0;cut<=after.size();cut++) {
+        REQUIRE(p4::ioWriteNew(path,before.data(),before.size())==FLATSQL_OK,"baseline");
+        REQUIRE(p4::ioWriteNew(path+".intent",after.data(),phase?after.size():cut)==FLATSQL_OK,"intent prefix");
+        if(phase) REQUIRE(p4::ioWriteNew(path,after.data(),cut)==FLATSQL_OK,"spec prefix");
+        REQUIRE(openEngine(root)==FLATSQL_OK,"recovery");
+        REQUIRE(p4::currentEngine()->findType("OMM"),"registered type survives");
+        CHECK_EQ(p4::currentEngine()->findType("OMM")->spec()->a18Bound,phase||cut==after.size()?3u:2u,"complete policy");
+        REQUIRE(closeEngine()==FLATSQL_OK,"close recovered");
+    }
+    std::printf("spec prefix crash points: %zu; spec bytes: %zu\n",3*(after.size()+1),after.size());
+    removeTree(root);
 }
 
 FLATSQL_TEST(t_sql_cid_only_not_queryable) {
