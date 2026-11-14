@@ -393,3 +393,49 @@ FLATSQL_SLOW_TEST(t_power_loss) {
     std::printf("  t_power_loss: %d pass, %d fail of %d rounds\n", pass, fail, pass + fail);
     CHECK_EQ(fail, 0, "every round");
 }
+
+FLATSQL_TEST(t_unlimited_promotion_power_loss) {
+    auto& fs=faultFs();
+    uint64_t boundaries=0;
+    int cases=0;
+    for(int mode=0;mode<FaultFs::kModeCount;mode++) {
+        for(uint64_t boundary=0;boundary<=boundaries || boundary==0;boundary++) {
+            const auto root="/promotion/"+std::to_string(mode)+"/"+std::to_string(boundary);
+            auto type=faultType(); type.a18=2; type.fullText=false;
+            REQUIRE(openEngine(root)==FLATSQL_OK,"open bounded store");
+            REQUIRE(registerType(type)==FLATSQL_OK,"bounded registration");
+            Batch batch; batch.type="PNM";
+            for(int i=1;i<=8;i++) { In row; row.frame=faultFrame(i); batch.recs.push_back(std::move(row)); }
+            REQUIRE(put(batch).status==FLATSQL_OK,"acknowledged baseline");
+            REQUIRE(closeEngine()==FLATSQL_OK,"settle baseline");
+            REQUIRE(openEngine(root)==FLATSQL_OK,"reopen baseline");
+            const auto start=fs.mutatingOps();
+            fs.armCrashAtOp(boundary?start+boundary:0);
+            type.a18=0;
+            const auto status=registerType(type);
+            if(!boundary) {
+                REQUIRE(status==FLATSQL_OK,"control promotion");
+                boundaries=fs.mutatingOps()-start;
+                REQUIRE(boundaries>0,"observed mutating boundaries");
+            } else CHECK(fs.frozen(),"fault boundary reached");
+            fs.freeze();
+            closeEngine(10000);
+            fs.crash(FaultFs::CrashMode(mode),mode*100+boundary);
+            REQUIRE(openEngine(root)==FLATSQL_OK,"unattended recovery");
+            REQUIRE(registerType(type)==FLATSQL_OK,"complete unlimited registration");
+            std::vector<std::vector<uint8_t>> cids;
+            for(const auto& row:batch.recs) { uint8_t cid[36]; cidOf(row.frame,cid); cids.emplace_back(cid,cid+36); }
+            auto records=get("PNM",cids,true);
+            CHECK_EQ(records.status,FLATSQL_OK,records.err);
+            CHECK_EQ(records.rows.size(),size_t(8),"all acknowledged records");
+            TlvW scan; scan.text(1,"PNM").u8(5,FLATSQL_ORDER_SEQ_ASC).u64(3,100);
+            auto rows=call(FLATSQL_OPC_SCAN,scan.b);
+            REQUIRE(rows.status==FLATSQL_OK && rows.rows.size()==8,"complete scan");
+            for(size_t i=0;i<8;i++) CHECK_EQ(rows.i(i,"seq"),int64_t(i+1),"no gap or duplicate");
+            REQUIRE(closeEngine()==FLATSQL_OK,"close recovered store");
+            cases++;
+        }
+    }
+    std::printf("  promotion: %llu mutation boundaries, five device modes, %d recovered cases\n",
+                (unsigned long long)boundaries,cases);
+}
