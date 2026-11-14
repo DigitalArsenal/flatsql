@@ -756,6 +756,7 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
     uint64_t lastTick = 0;
     int sizeTicks = 0;
     for (;;) {
+        e->rowCache->trim();
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
         for (;;) {
             MaintTask mt;

@@ -1,0 +1,90 @@
+#ifndef FLATSQL_P4_PAGE_CACHE_H
+#define FLATSQL_P4_PAGE_CACHE_H
+#include <algorithm>
+#include <iterator>
+#include <chrono>
+#include <condition_variable>
+#include <list>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+
+namespace flatsql { namespace p4 {
+// Shared admission budget for immutable pages and verified segment metadata.
+// Reservations include loads in progress. An external shared_ptr pins an entry;
+// admission fails when pins exhaust the budget. No cache lock covers I/O.
+class PageCache {
+    using Clock=std::chrono::steady_clock;
+    struct Entry {
+        std::shared_ptr<const void> value;
+        size_t bytes=0;
+        bool loading=true;
+        Clock::time_point touched=Clock::now();
+        std::list<std::string>::iterator lru;
+    };
+    std::mutex mu_;
+    std::condition_variable ready_;
+    std::map<std::string,Entry> entries_;
+    std::list<std::string> lru_;
+    size_t limit_=32u<<20,used_=0,peak_=0;
+    void erase(std::map<std::string,Entry>::iterator it) {
+        used_-=it->second.bytes; lru_.erase(it->second.lru); entries_.erase(it);
+    }
+public:
+    void configure(size_t bytes) { std::lock_guard<std::mutex> g(mu_); limit_=bytes; }
+    size_t used() { std::lock_guard<std::mutex> g(mu_); return used_; }
+    size_t peak() { std::lock_guard<std::mutex> g(mu_); return peak_; }
+    // Evict idle unpinned entries; zero age supports explicit pressure trimming.
+    void trim(std::chrono::seconds age=std::chrono::seconds(30)) {
+        std::lock_guard<std::mutex> g(mu_); const auto now=Clock::now();
+        for(auto it=entries_.begin();it!=entries_.end();) {
+            auto cur=it++;
+            if(!cur->second.loading && cur->second.value.use_count()==1 && now-cur->second.touched>=age) erase(cur);
+        }
+    }
+    template<class T> std::shared_ptr<const T> find(const std::string& key) {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it=entries_.find(key);
+        if(it==entries_.end() || it->second.loading) return {};
+        it->second.touched=Clock::now(); lru_.splice(lru_.begin(),lru_,it->second.lru);
+        return std::static_pointer_cast<const T>(it->second.value);
+    }
+    template<class T,class Loader> std::shared_ptr<const T> load(const std::string& key,size_t bytes,Loader loader,size_t workspace=0) {
+        std::unique_lock<std::mutex> g(mu_);
+        for(;;) {
+            auto it=entries_.find(key);
+            if(it==entries_.end()) break;
+            if(it->second.loading) { ready_.wait(g); continue; }
+            it->second.touched=Clock::now(); lru_.splice(lru_.begin(),lru_,it->second.lru);
+            return std::static_pointer_cast<const T>(it->second.value);
+        }
+        // Account conservatively for map/list nodes, keys and shared ownership.
+        const size_t overhead=512+2*key.capacity();
+        if(bytes>limit_ || overhead>limit_-bytes || workspace>limit_-bytes-overhead) return {};
+        bytes+=overhead+workspace;
+        for(auto it=lru_.end();used_>limit_-bytes && it!=lru_.begin();) {
+            --it; auto entry=entries_.find(*it);
+            if(!entry->second.loading && entry->second.value.use_count()==1) {
+                auto prev=it; const bool first=it==lru_.begin();
+                if(!first) --prev;
+                erase(entry);
+                it=first?lru_.begin():std::next(prev);
+            }
+        }
+        if(used_>limit_-bytes) return {};
+        lru_.push_front(key); Entry e; e.bytes=bytes; e.lru=lru_.begin();
+        entries_.emplace(key,std::move(e)); used_+=bytes; peak_=std::max(peak_,used_);
+        g.unlock();
+        std::shared_ptr<const T> value;
+        try { value=loader(); }
+        catch(...) { g.lock(); erase(entries_.find(key)); ready_.notify_all(); throw; }
+        g.lock();
+        auto it=entries_.find(key);
+        if(value) { it->second.value=value; it->second.loading=false; it->second.bytes-=workspace; used_-=workspace; }
+        else erase(it);
+        ready_.notify_all(); return value;
+    }
+};
+} }
+#endif

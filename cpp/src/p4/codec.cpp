@@ -268,6 +268,7 @@ int32_t parseConfig(const uint8_t* p, size_t n, Config* c, std::string* err) {
     setU64(48, &c->sandboxHeap);
     setU64(49, &c->sandboxRows);
     setU64(50, &c->sandboxBytes);
+    setU64(51, &c->rowCacheBytes);
     if (bad) { *err = "config: a typed tag has the wrong length"; return FLATSQL_E_ARG; }
     if (c->createMode > 2) { *err = "config: create mode must be 0, 1 or 2"; return FLATSQL_E_ARG; }
     if (c->writers == 0) {

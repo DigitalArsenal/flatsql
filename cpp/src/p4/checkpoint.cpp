@@ -334,12 +334,11 @@ int32_t dropDead(Conn* c,const std::set<uint64_t>& tombstones,std::vector<FsgPai
 } // namespace
 
 namespace {
-struct VerifiedKey {
-    std::string path; uint32_t gen; uint64_t offset; uint32_t length; std::array<uint8_t,32> digest;
-    bool operator<(const VerifiedKey& x) const { return std::tie(path,gen,offset,length,digest)<std::tie(x.path,x.gen,x.offset,x.length,x.digest); }
-};
+std::string verifiedKey(Stream* s,uint64_t offset,uint32_t length,const std::array<uint8_t,32>& digest) {
+    return s->path+"/"+std::to_string(s->gen)+"/"+std::to_string(offset)+"/"+std::to_string(length)+"/"+
+        std::string(reinterpret_cast<const char*>(digest.data()),digest.size());
+}
 std::mutex gVerifiedMu;
-std::map<VerifiedKey,std::shared_ptr<const FsgVerified>> gVerified;
 FsgVerifyStats gVerifyStats;
 
 // The fence keys and PAIRS place of an FSG row-order buffer p (n bytes) at
@@ -361,48 +360,44 @@ std::shared_ptr<FsgVerified> pairsLayout(const uint8_t* p,uint64_t at,bool check
     }
     return ver;
 }
-void remember(const VerifiedKey& key,std::shared_ptr<const FsgVerified> ver,std::shared_ptr<const FsgVerified>* out) {
-    std::lock_guard<std::mutex> g(gVerifiedMu);
-    auto& slot=gVerified[key]; if(!slot) slot=std::move(ver);
-    if(out) *out=slot;
+void remember(Feed* f,const std::string& key,std::shared_ptr<const FsgVerified> ver) {
+    f->type->e->rowCache->load<FsgVerified>(key,sizeof(FsgVerified)+ver->fences.capacity()*sizeof(FsgPairV),[&] { return ver; });
 }
 } // namespace
 
 FsgVerifyStats fsgVerifyStats() { std::lock_guard<std::mutex> g(gVerifiedMu); return gVerifyStats; }
 
-bool checkpointPairsVerified(Stream* stream,const CheckpointSegment& desc) {
-    std::lock_guard<std::mutex> g(gVerifiedMu);
-    return gVerified.count(VerifiedKey{stream->path,stream->gen,desc.offset,desc.length,desc.digest})>0;
-}
-
-void checkpointPairsRetain(Stream* stream,const CheckpointState& ck) {
-    std::lock_guard<std::mutex> g(gVerifiedMu);
-    for(auto it=gVerified.lower_bound(VerifiedKey{stream->path,0,0,0,{}});it!=gVerified.end() && it->first.path==stream->path;) {
-        const bool live=it->first.gen==stream->gen && std::any_of(ck.segments.begin(),ck.segments.end(),[&](const CheckpointSegment& d){return d.offset==it->first.offset;});
-        it=live?std::next(it):gVerified.erase(it);
-    }
+bool checkpointPairsVerified(Feed* f,Stream* stream,const CheckpointSegment& desc) {
+    return bool(f->type->e->rowCache->find<FsgVerified>(verifiedKey(stream,desc.offset,desc.length,desc.digest)));
 }
 
 int32_t checkpointVerifyPairs(Feed* f,Stream* stream,const CheckpointSegment& desc,std::shared_ptr<const FsgVerified>* out,bool* fresh) {
     if(fresh) *fresh=false;
     if(desc.kind<kFsgSeq || desc.kind>kFsgMaxKind) return FLATSQL_E_ARG;
-    const VerifiedKey key{stream->path,stream->gen,desc.offset,desc.length,desc.digest};
-    { std::lock_guard<std::mutex> g(gVerifiedMu); auto it=gVerified.find(key); if(it!=gVerified.end()) { gVerifyStats.reused++; *out=it->second; return FLATSQL_OK; } }
+    const auto key=verifiedKey(stream,desc.offset,desc.length,desc.digest);
+    if(auto value=f->type->e->rowCache->find<FsgVerified>(key)) {
+        std::lock_guard<std::mutex> g(gVerifiedMu); gVerifyStats.reused++; *out=std::move(value); return FLATSQL_OK;
+    }
+    int32_t status=FLATSQL_E_BUDGET;
+    *out=f->type->e->rowCache->load<FsgVerified>(key,sizeof(FsgVerified)+size_t((desc.entries+FsgRun::kPage-1)/FsgRun::kPage)*sizeof(FsgPairV),[&]() -> std::shared_ptr<const FsgVerified> {
+    status=FLATSQL_E_CORRUPT;
     // First load in this process: the whole segment, its digest and
     // structure, as every other segment kind is checked when it is read.
     const uint64_t t0=ps::monoNs();
     std::vector<uint64_t> storage; uint32_t n=0;
-    int32_t rc=frame(stream,desc.offset,&storage,&n); if(rc!=FLATSQL_OK || n!=desc.length) return FLATSQL_E_CORRUPT;
+    int32_t rc=frame(stream,desc.offset,&storage,&n); if(rc!=FLATSQL_OK || n!=desc.length) return {};
     const auto* p=reinterpret_cast<const uint8_t*>(storage.data());
-    std::array<uint8_t,32> digest{}; ps::sha256(p,n,digest.data()); if(digest!=desc.digest) return FLATSQL_E_CORRUPT;
-    flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT;
+    std::array<uint8_t,32> digest{}; ps::sha256(p,n,digest.data()); if(digest!=desc.digest) return {};
+    flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return {};
     const auto* s=GetFSG(p);
     if(s->SELF_OFFSET()!=desc.offset || s->FEED_ID()!=f->fid || s->KIND()!=desc.kind || s->LEVEL()!=desc.level ||
-       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || !s->PAIRS() || s->PAIRS()->size()!=desc.entries) return FLATSQL_E_CORRUPT;
-    auto ver=pairsLayout(p,desc.offset,true); if(!ver) return FLATSQL_E_CORRUPT;
+       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || !s->PAIRS() || s->PAIRS()->size()!=desc.entries) return {};
+    auto ver=pairsLayout(p,desc.offset,true); if(!ver) return {};
     { std::lock_guard<std::mutex> g(gVerifiedMu); gVerifyStats.hashed++; gVerifyStats.hashedBytes+=n; gVerifyStats.hashNs+=ps::monoNs()-t0; }
-    remember(key,std::move(ver),out); if(fresh) *fresh=true;
-    return FLATSQL_OK;
+    if(fresh) *fresh=true;
+    return ver;
+    },size_t(desc.length)+8);
+    return *out?FLATSQL_OK:status;
 }
 
 int32_t checkpointReadPairs(Feed* f,const std::shared_ptr<Stream>& stream,const CheckpointSegment& desc,FsgRun* out) {
@@ -411,7 +406,7 @@ int32_t checkpointReadPairs(Feed* f,const std::shared_ptr<Stream>& stream,const 
     // The PAIRS vector stays on disk, read a page at a time; the fence keys
     // are in memory.
     out->stream=stream; out->base=ver->base; out->n=size_t(ver->n); out->verified=ver;
-    out->pages.assign((out->n+FsgRun::kPage-1)/FsgRun::kPage,nullptr);
+    out->cache=f->type->e->rowCache; out->cacheKey=verifiedKey(stream.get(),desc.offset,desc.length,desc.digest);
     return FLATSQL_OK;
 }
 
@@ -569,7 +564,7 @@ int32_t checkpointInstall(Feed* f,Stream* stream,CheckpointPlan& plan,int64_t* e
         // A row-order segment this process wrote is checked: its digest is
         // the hash of these bytes.
         if(GetFSG(p)->KIND()>=kFsgSeq) if(auto ver=pairsLayout(p,at,false))
-            remember(VerifiedKey{stream->path,stream->gen,at,n,digests[at]},std::move(ver),nullptr);
+            remember(f,verifiedKey(stream,at,n,digests[at]),std::move(ver));
     }
     for(auto& s:out.segments) if(s.offset>=plan.at) {
         s.offset=place(s.offset); auto d=digests.find(s.offset); if(d==digests.end()) return FLATSQL_E_INTERNAL; s.digest=d->second;

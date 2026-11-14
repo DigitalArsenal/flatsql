@@ -7,58 +7,56 @@
 namespace flatsql { namespace p4 {
 
 FsgPage FsgRun::page(size_t pg,size_t* count,int ahead) const {
+    (void)ahead;
+    if(pg>=n/kPage+(n%kPage!=0)) { *count=0; return {nullptr,{},FLATSQL_E_CORRUPT}; }
     const size_t first=pg*kPage; *count=std::min(kPage,n-first);
     if(p) return {p+first,keep};
-    std::lock_guard<std::mutex> g(mu);
-    if(!pages[pg]) {
-        // The missing pages from pg on in the walk's direction, one read.
-        size_t a=pg,b=pg+1; const size_t np=pages.size();
-        if(++faults>kFaults) { a=0; b=np; }  // a run read this often: all of it, once
-        else if(ahead>0) while(b<np && b-pg<size_t(ahead) && !pages[b]) b++;
-        if(ahead<0) while(a>0 && pg-a<size_t(-ahead) && !pages[a-1]) a--;
-        const size_t from=a*kPage,to=std::min(n,b*kPage);
-        std::string buf; const int32_t rc=streamReadRange(stream.get(),int64_t(base+from*sizeof(FsgPairV)),(to-from)*sizeof(FsgPairV),&buf);
-        if(rc!=FLATSQL_OK || buf.size()!=(to-from)*sizeof(FsgPairV)) { failed=true; return {}; }
-        for(size_t k=a;k<b;k++) {
-            if(pages[k]) continue;
-            const size_t f0=k*kPage,c=std::min(kPage,n-f0);
-            auto v=std::make_shared<std::vector<FsgPairV>>(c); std::memcpy(v->data(),buf.data()+(f0-from)*sizeof(FsgPairV),c*sizeof(FsgPairV));
-            if(!std::is_sorted(v->begin(),v->end())) { failed=true; return {}; }
-            pages[k]=std::move(v);
-        }
-    }
-    return {pages[pg]->data(),pages[pg]};
+    struct Page { std::vector<FsgPairV> pairs; std::shared_ptr<Stream> generation; };
+    int32_t status=FLATSQL_E_BUDGET;
+    auto value=cache->load<Page>(cacheKey+"/page/"+std::to_string(pg),*count*sizeof(FsgPairV)+sizeof(Page),[&]() -> std::shared_ptr<const Page> {
+        std::string buf;
+        status=streamReadRange(stream.get(),int64_t(base+first*sizeof(FsgPairV)),*count*sizeof(FsgPairV),&buf);
+        if(status!=FLATSQL_OK) return {};
+        if(buf.size()!=*count*sizeof(FsgPairV)) { status=FLATSQL_E_CORRUPT; return {}; }
+        auto v=std::make_shared<Page>(); v->generation=stream; v->pairs.resize(*count);
+        std::memcpy(v->pairs.data(),buf.data(),buf.size());
+        if(!std::is_sorted(v->pairs.begin(),v->pairs.end())) { status=FLATSQL_E_CORRUPT; return {}; }
+        return v;
+    },*count*sizeof(FsgPairV));
+    return value?FsgPage{value->pairs.data(),value}:FsgPage{nullptr,{},status};
 }
 
-FsgPairV FsgRun::at(size_t i) const {
+FsgPairV FsgRun::at(size_t i,int32_t* status) const {
     size_t count=0; const auto q=page(i/kPage,&count);
+    if(!q) *status=q.status;
     return q?q[i%kPage]:FsgPairV{UINT64_MAX,UINT64_MAX,UINT64_MAX,0};
 }
 
 // Interpolation on KEY_HI (rids and object ids are dense), one page a step,
 // then a binary search inside the page it lands in.
-size_t FsgRun::lowerBound(const FsgPairV& key) const {
-    if(verified && !verified->fences.empty()) {
+size_t FsgRun::lowerBound(const FsgPairV& key,int32_t* status) const {
+    const auto fences=verified.lock();
+    if(fences && !fences->fences.empty()) {
         // The fence keys (in memory) name the one page the answer lies in.
-        const auto& fc=verified->fences;
+        const auto& fc=fences->fences;
         const size_t L=size_t(std::lower_bound(fc.begin(),fc.end(),key)-fc.begin());
         if(L==0) return 0;
-        size_t count=0; const auto q=page(L-1,&count); if(!q) return n;
+        size_t count=0; const auto q=page(L-1,&count); if(!q) { *status=q.status; return n; }
         return (L-1)*kPage+size_t(std::lower_bound(q.data,q.data+count,key)-q.data);
     }
     size_t lo=0,hi=n;  // the answer lies in [lo, hi]
-    for(int step=0;hi-lo>kPage && step<6 && !failed;step++) {
-        const FsgPairV a=at(lo),b=at(hi-1);
+    for(int step=0;hi-lo>kPage && step<6 && *status==FLATSQL_OK;step++) {
+        const FsgPairV a=at(lo,status),b=at(hi-1,status);
         if(!(a<key)) return lo;
         if(b<key) return hi;
         const double fr=b.hi>a.hi && key.hi>=a.hi?double(key.hi-a.hi)/double(b.hi-a.hi):0.5;
         const size_t g=lo+std::min(hi-1-lo,size_t(fr*double(hi-1-lo)));
         const size_t p0=std::max(lo,g/kPage*kPage),p1=std::min(hi,g/kPage*kPage+kPage);
-        if(at(p1-1)<key) lo=p1;
-        else if(!(at(p0)<key)) hi=p0;
+        if(at(p1-1,status)<key) lo=p1;
+        else if(!(at(p0,status)<key)) hi=p0;
         else { lo=p0; hi=p1; break; }
     }
-    while(lo<hi && !failed) { const size_t mid=lo+(hi-lo)/2; if(at(mid)<key) lo=mid+1; else hi=mid; }
+    while(lo<hi && *status==FLATSQL_OK) { const size_t mid=lo+(hi-lo)/2; if(at(mid,status)<key) lo=mid+1; else hi=mid; }
     return lo;
 }
 
@@ -77,7 +75,7 @@ std::shared_ptr<const FsgView> fsgView(Feed* f,Conn* c,uint8_t kind,int64_t vis)
     // No reader hashes: a segment not yet checked in this process is checked
     // on the checkpoint worker, and until then the SQLite index answers.
     for(const auto& d:ck->segments)
-        if(d.kind==kind && !f->fsgSegments.count({stream->gen,d.offset}) && !checkpointPairsVerified(stream.get(),d)) {
+        if(d.kind==kind && !f->fsgSegments.count({stream->gen,d.offset}) && !checkpointPairsVerified(f,stream.get(),d)) {
             const bool queue=!f->fsgVerifying; g.unlock();
             if(queue) fsgVerifySchedule(f);
             return nullptr;
@@ -132,7 +130,6 @@ std::shared_ptr<const FsgView> fsgView(Feed* f,Conn* c,uint8_t kind,int64_t vis)
         const bool live=it->first.first==stream->gen && std::any_of(ck->segments.begin(),ck->segments.end(),[&](const CheckpointSegment& d){return d.offset==it->first.second;});
         it=live?std::next(it):f->fsgSegments.erase(it);
     }
-    if(!extend) checkpointPairsRetain(stream.get(),*ck);
     std::shared_ptr<const FsgView> out=std::move(v);
     if(complete) f->fsg[k]=out;
     return out;
@@ -145,11 +142,13 @@ int32_t fsgSeqs(const FsgView& v,bool desc,int64_t from,int64_t lo,int64_t hi,si
     const uint64_t ridLo=uint64_t(lo+1)<<16, ridHi=(uint64_t(hi)<<16)|0xffff;
     for(const auto& run:v.runs[0]) {
         const FsgRun& x=*run; size_t got=0; int64_t last=-1; bool end=false;
-        size_t i=desc?x.lowerBound(FsgPairV{ridHi+1,0,0,0}):x.lowerBound(FsgPairV{ridLo,0,0,0});
+        int32_t status=FLATSQL_OK;
+        size_t i=desc?x.lowerBound(FsgPairV{ridHi+1,0,0,0},&status):x.lowerBound(FsgPairV{ridLo,0,0,0},&status);
+        if(status!=FLATSQL_OK) return status;
         // asc: pairs i, i+1, ...; desc: pairs i-1, i-2, ...
         while(!end && got<n && (desc?i>0:i<x.n)) {
             const size_t at=desc?i-1:i, pg=at/FsgRun::kPage; size_t cnt=0;
-            const auto q=x.page(pg,&cnt,desc?-16:16); if(!q) return FLATSQL_E_CORRUPT;
+            const auto q=x.page(pg,&cnt,desc?-16:16); if(!q) return q.status;
             size_t j=at%FsgRun::kPage;
             for(;;) {
                 const uint64_t r=q[j].hi;
@@ -158,7 +157,6 @@ int32_t fsgSeqs(const FsgView& v,bool desc,int64_t from,int64_t lo,int64_t hi,si
                 if(desc) { i--; if(j==0) break; j--; } else { i++; if(++j>=cnt) break; }
             }
         }
-        if(x.failed) return FLATSQL_E_CORRUPT;
     }
     if(desc) std::sort(out->begin(),out->end(),std::greater<int64_t>()); else std::sort(out->begin(),out->end());
     out->erase(std::unique(out->begin(),out->end()),out->end());
@@ -170,8 +168,9 @@ int32_t fsgObject(const FsgView& v,uint64_t kk,std::vector<uint64_t>* rids) {
     rids->clear();
     for(const auto& run:v.runs[1]) {
         const FsgRun& x=*run;
-        for(size_t i=x.lowerBound(FsgPairV{kk,0,0,0});i<x.n;i++) { const FsgPairV q=x.at(i); if(q.hi!=kk) break; rids->push_back(q.rid); }
-        if(x.failed) return FLATSQL_E_CORRUPT;
+        int32_t status=FLATSQL_OK;
+        for(size_t i=x.lowerBound(FsgPairV{kk,0,0,0},&status);i<x.n && status==FLATSQL_OK;i++) { const FsgPairV q=x.at(i,&status); if(q.hi!=kk) break; rids->push_back(q.rid); }
+        if(status!=FLATSQL_OK) return status;
     }
     std::sort(rids->begin(),rids->end());
     rids->erase(std::unique(rids->begin(),rids->end()),rids->end());

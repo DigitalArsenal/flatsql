@@ -476,6 +476,7 @@ uint32_t tokFor(Type* t, const std::string& token, const std::string& peer, bool
 int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* err) {
     int32_t rc = parseConfig(cfgBytes, n, &e->cfg, err);
     if (rc != FLATSQL_OK) return rc;
+    e->rowCache->configure(size_t(std::min<uint64_t>(e->cfg.rowCacheBytes,SIZE_MAX)));
     rc = globalInit();
     if (rc != FLATSQL_OK) { *err = "SQLite or the SQL surface failed to initialize"; return rc; }
     for (auto& s : e->stat) s.store(0);

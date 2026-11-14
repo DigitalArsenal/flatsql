@@ -72,9 +72,7 @@ int32_t checkpointVerifyPairs(Feed*,Stream*,const CheckpointSegment&,std::shared
 // Whether ck lists a segment of row-order kind.
 bool checkpointHasRowOrders(const CheckpointState& ck,uint8_t kind);
 // Whether desc in stream is checked in this process (no read, no hash).
-bool checkpointPairsVerified(Stream*,const CheckpointSegment&);
-// Lets go of the checked identities of stream's file that ck no longer lists.
-void checkpointPairsRetain(Stream*,const CheckpointState&);
+bool checkpointPairsVerified(Feed*,Stream*,const CheckpointSegment&);
 // Checks the feed's checkpoint's row-order segments on the checkpoint worker
 // (off the readers and the writer); readers use the SQLite index until then.
 void fsgVerifySchedule(Feed*);
@@ -86,27 +84,25 @@ FsgVerifyStats fsgVerifyStats();
 struct FsgPage {
     const FsgPairV* data=nullptr;
     std::shared_ptr<const void> owner;
+    int32_t status=FLATSQL_OK;
     explicit operator bool() const { return data!=nullptr; }
     const FsgPairV& operator[](size_t i) const { return data[i]; }
 };
 struct FsgRun {
     static constexpr size_t kPage=128;
-    static constexpr int kFaults=8;
     const FsgPairV* p=nullptr; size_t n=0;
     std::shared_ptr<const void> keep;  // what p points into
     std::shared_ptr<Stream> stream; uint64_t base=0;
-    std::shared_ptr<const FsgVerified> verified;  // a segment run: its fence keys
-    mutable std::mutex mu;
-    mutable std::vector<std::shared_ptr<const std::vector<FsgPairV>>> pages;
-    mutable bool failed=false;
-    mutable int faults=0;  // reads so far; past kFaults the whole run is read at once
+    std::weak_ptr<const FsgVerified> verified;
+    std::shared_ptr<PageCache> cache;
+    std::string cacheKey;
     const FsgPairV* begin() const { return p; }  // a tail run
     const FsgPairV* end() const { return p+n; }
-    FsgPairV at(size_t i) const;
+    FsgPairV at(size_t i,int32_t* status) const;
     // Page pg's pairs (null after a read error: failed is set).
-    // A walk reads ahead `ahead` pages in the walk's direction with one read.
+    // Each returned view pins its allocation and stream generation.
     FsgPage page(size_t pg,size_t* count,int ahead=0) const;
-    size_t lowerBound(const FsgPairV& key) const;  // the first pair not below key
+    size_t lowerBound(const FsgPairV& key,int32_t* status) const;
 };
 int32_t checkpointReadPairs(Feed*,const std::shared_ptr<Stream>&,const CheckpointSegment&,FsgRun*);
 // The FlatBuffer row orders of a feed (fsg.cpp): its checkpoint's ROWS_BY_*

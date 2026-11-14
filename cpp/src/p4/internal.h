@@ -1,4 +1,5 @@
 #include "flatsql/query_page.h"
+#include "page_cache.h"
 // FlatSQL store format 5 ("p4"): engine internals. FORMAT.md defines the bytes.
 //
 // One source feed x standard is one feed (CONTRACT C-37, C-38, owner layout of
@@ -167,6 +168,7 @@ enum Stat : int {
 
 // ---- config (§3.3) -------------------------------------------------------------------------
 struct Config {
+    uint64_t rowCacheBytes = 32ull << 20;
     std::string root;
     uint8_t createMode = 0;
     uint32_t writers = 0, interactive = 4, bulk = 1, sandbox = 1;
@@ -725,6 +727,7 @@ struct MaintTask {
 // ---- the engine (opaque P4Engine in p4_reader.h) ------------------------------------------
 struct P4Engine {
     flatsql::p4::Config cfg;
+    std::shared_ptr<flatsql::p4::PageCache> rowCache=std::make_shared<flatsql::p4::PageCache>();
     flatsql::p4::Markers markers;
     std::atomic<uint64_t> stat[flatsql::p4::kStCount];
     std::atomic<uint64_t> quota{0};
