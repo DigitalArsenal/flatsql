@@ -149,7 +149,6 @@ struct TypeEntry {
     std::string name;                 // "OMM"
     uint8_t fid[4] = {0, 0, 0, 0};
     uint64_t bound = 0;               // A18
-    bool metadataOnly = false;
     std::vector<Column> cols;
     int col0 = -1, col1 = -1;         // schema column mapped to COL0 (int) / COL1 (text), or -1
 };

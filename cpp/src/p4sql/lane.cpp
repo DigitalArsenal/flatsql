@@ -134,13 +134,7 @@ int sandboxAuthorizer(void* user, int action, const char* a1, const char*, const
             // any other name read is a CTE or subquery (allowed), SQLite's own
             // schema, a pragma function or a flatsql_* name (never public).
             const char* t = a1 ? a1 : "";
-            if (isRelation(ctx->ls, t)) {
-                const auto relation=ctx->ls->relations.find(lower(t));
-                const auto* type=relation==ctx->ls->relations.end()?nullptr:typeByName(ctx->ls,relation->second.spec.type);
-                if(!type || !type->metadataOnly) return SQLITE_OK;
-                ctx->violation="metadata-only relation requires trusted SQL";
-                return SQLITE_DENY;
-            }
+            if (isRelation(ctx->ls, t)) return SQLITE_OK;
             if (std::strncmp(t, "sqlite_", 7) != 0 && std::strncmp(t, "pragma_", 7) != 0 &&
                 std::strncmp(t, "flatsql_", 8) != 0)
                 return SQLITE_OK;
@@ -527,7 +521,6 @@ bool metadataCount(LaneState* ls,const P4SqlRequest* req,Out& out,int32_t* statu
     RelSpec rel; if(resolveRelation(ls,name,&rel,msg)!=1 || rel.kind!=kRelType) return false;
     const auto* type=typeByName(ls,rel.type); if(!type) return false;
     // Metadata-only relations require a trusted SQL caller.
-    if(type->metadataOnly && (req->flags & FLATSQL_SLOT_SANDBOX)) return false;
     int64_t count;
     { EngineCall ec; count=p4_type_rows(ls->lane,type->name.c_str()); }
     if(count==FLATSQL_E_BUSY) return false; // an in-flight sequence needs the reader's ceiling
@@ -551,7 +544,6 @@ bool dataStream(LaneState* ls, const P4SqlRequest* req, Out& out, int32_t* statu
     if (resolveRelation(ls, name, &rel, &err) != 1) return false;
     const TypeEntry* t = typeByName(ls, rel.type);
     if (!t) return false;
-    if(t->metadataOnly && (req->flags & FLATSQL_SLOT_SANDBOX)) return false;
     RelScan scan;
     int32_t rc = scan.open(ls, *t, rel, ScanArgs());
     std::vector<Cell> cells(1);
@@ -559,8 +551,7 @@ bool dataStream(LaneState* ls, const P4SqlRequest* req, Out& out, int32_t* statu
         const P4Row& r = scan.row();
         const uint8_t* p = nullptr;
         size_t n = 0;
-        if(t->metadataOnly) { p=r.data; n=r.dataLen; }
-        else payloadOf(t->fid, r.data, r.dataLen, &p, &n);
+        payloadOf(t->fid, r.data, r.dataLen, &p, &n);
         if (n == 0) {   // _data is NULL: not a BLOB cell, as on the SQL path
             *msg = "not-a-record-stream: raw stream queries must return only BLOB cells";
             rc = FLATSQL_E_SQL;
@@ -592,7 +583,7 @@ int32_t surfaceRows(LaneState* ls, Out& out, std::string* msg) {
     int32_t rc = loadTypes(ls, msg);
     if (rc < 0) return rc;
     std::vector<const TypeEntry*> types;
-    for (const auto& kv : ls->types) if(!kv.second.metadataOnly) types.push_back(&kv.second);
+    for (const auto& kv : ls->types) types.push_back(&kv.second);
     std::sort(types.begin(), types.end(), [](const TypeEntry* a, const TypeEntry* b) { return a->name < b->name; });
     static const char* const kMetaNames[] = {"_source", "_rowid", "_offset", "_data"};
     const std::string table = "table", view = "view", none;

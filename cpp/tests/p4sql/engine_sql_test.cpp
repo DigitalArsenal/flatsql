@@ -291,21 +291,20 @@ FLATSQL_TEST(t_sql_registration_recovery_and_validation) {
     removeTree(root);
 }
 
-FLATSQL_TEST(t_sql_metadata_only_visibility) {
+FLATSQL_TEST(t_sql_cid_only_not_queryable) {
     const auto root=scratchDir("metadata_only_visibility");
     REQUIRE(openEngine(root)==FLATSQL_OK,"open");
     auto type=ommType(); type.bfbs.clear(); type.rules.clear(); type.flags=2; type.a18=0;
     REQUIRE(registerType(type)==FLATSQL_OK,"opaque registration");
     auto batch=ommBatch(1,3,kSrc,"synthetic");
     REQUIRE(put(batch).status==FLATSQL_OK,"put");
-    auto r=sql("SELECT _seq,_cid,_data FROM OMM ORDER BY _seq");
-    CHECK_EQ(r.status,FLATSQL_OK,r.err);
-    CHECK_EQ(r.rows.size(),size_t(3),"metadata relation");
-    CHECK_EQ(sql("SELECT OBJECT_NAME FROM OMM").status,FLATSQL_E_SQL,"no reflected plaintext fields");
-    for(const auto* query:{"SELECT COUNT(*) FROM OMM","SELECT COUNT(_cid) FROM OMM","SELECT _cid FROM OMM","SELECT _data FROM OMM","SELECT * FROM OMM"}) {
-        CHECK_EQ(sql(query,FLATSQL_SLOT_SANDBOX).status,FLATSQL_E_SQL,"metadata-only relation excluded from sandbox");
+    for(uint32_t flags:{0u,uint32_t(FLATSQL_SLOT_SANDBOX),uint32_t(FLATSQL_SLOT_RAW),uint32_t(FLATSQL_SLOT_SANDBOX|FLATSQL_SLOT_RAW)}) {
+        for(const auto* query:{"SELECT COUNT(*) FROM OMM","SELECT COUNT(_cid) FROM OMM","SELECT _cid FROM OMM","SELECT _data FROM OMM","SELECT * FROM OMM"}) {
+            auto r=sql(query,flags);
+            CHECK_EQ(r.status,FLATSQL_E_SQL,"CID-only registration has no SQL relation");
+            CHECK(r.err.find("no such table")!=std::string::npos,r.err);
+        }
     }
-    CHECK_EQ(sql("SELECT _data FROM OMM",FLATSQL_SLOT_SANDBOX|FLATSQL_SLOT_RAW).status,FLATSQL_E_SQL,"raw shortcut cannot bypass authorizer");
     closeEngine(); removeTree(root);
 }
 

@@ -96,7 +96,8 @@ int32_t loadTypes(LaneState* ls, std::string* err) {
     }
     for (uint32_t i = 0; i < n; i++) {
         const P4TypeInfo& ti = ts[i];
-        if (!ti.name) continue;
+        // CID-only registrations retain durable access without a SQL relation.
+        if (!ti.name || allZero(ti.fid) || !ti.bfbsLen) continue;
         const std::string key = lower(ti.name);
         auto cached=ls->types.find(key);
         if(cached!=ls->types.end()) { cached->second.bound=ti.a18Bound; continue; }
@@ -104,9 +105,8 @@ int32_t loadTypes(LaneState* ls, std::string* err) {
         t.name = ti.name;
         std::memcpy(t.fid, ti.fid, 4);
         t.bound = ti.a18Bound;
-        t.metadataOnly = ti.bfbsLen==0;
         std::string e;
-        if(ti.bfbsLen && !schemaColumns(t.name, ti.bfbs, ti.bfbsLen, &t.cols, &e)) {
+        if(!schemaColumns(t.name, ti.bfbs, ti.bfbsLen, &t.cols, &e)) {
             auto prior=ls->hiddenReasons.find(key);
             if(prior==ls->hiddenReasons.end() || prior->second!=e)
                 std::fprintf(stderr,"FlatSQL: SQL relation %s hidden: %s\n",t.name.c_str(),e.c_str());
@@ -535,8 +535,7 @@ int relColumn(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int i) {
             sqlite3_result_error(ctx, "flatsql_p4: record bytes not read (plan without hydration)", -1);
             return SQLITE_ERROR;
         }
-        if(vt->t->metadataOnly) { p=r.data; n=r.dataLen; }
-        else payloadOf(vt->t->fid, r.data, r.dataLen, &p, &n);
+        payloadOf(vt->t->fid, r.data, r.dataLen, &p, &n);
     }
     if (i < vt->ns) {
         resultColumn(ctx, vt->t->cols[size_t(i)], p, n);
