@@ -824,9 +824,18 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         in->err = er;
         return;
     }
-    // 1. The live frames, in stream order (arrival), and their new offsets.
-    std::vector<std::pair<int64_t, int64_t>> rows;  // (rid, off)
-    std::map<int64_t, int64_t> live;                // off -> len
+    // 1. One compact entry per live row, sorted into frame order. Separate
+    // frame maps and per-frame vectors retain several allocations per row
+    // and can exceed the WASM heap while rewriting a production feed.
+    struct FrameRow { int64_t off, rid, len; };
+    std::vector<FrameRow> frameRows;
+    if (f->k.rows < 0 || uint64_t(f->k.rows) > SIZE_MAX / sizeof(FrameRow)) {
+        writerUnpin(e, f);
+        in->status = FLATSQL_E_BUDGET;
+        in->err = "compaction row inventory exceeds address space";
+        return;
+    }
+    frameRows.reserve(size_t(f->k.rows));
     std::set<uint32_t> compactObjects, compactTokens;
     {
         std::lock_guard<std::mutex> g(t->mu);
@@ -836,8 +845,7 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         sqlite3_stmt* q = c->sql("SELECT rid, off, len FROM r");
         int r = q ? SQLITE_OK : SQLITE_ERROR;
         while (q && (r = sqlite3_step(q)) == SQLITE_ROW) {
-            rows.push_back({sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 1)});
-            live[sqlite3_column_int64(q, 1)] = sqlite3_column_int64(q, 2);
+            frameRows.push_back({sqlite3_column_int64(q, 1), sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 2)});
         }
         if (q) sqlite3_reset(q);
         if (r != SQLITE_DONE) {
@@ -847,6 +855,9 @@ void compactWork(Engine* e, Type* t, Internal* in) {
             return;
         }
     }
+    std::sort(frameRows.begin(), frameRows.end(), [](const FrameRow& a, const FrameRow& b) {
+        return a.off < b.off || (a.off == b.off && a.rid < b.rid);
+    });
     // State segments preserve even dictionary IDs whose original rows have
     // gone; future writes must not assign those IDs to another object.
     {
@@ -883,8 +894,6 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     // Keep each commit's records immediately before its metadata. Splitting
     // metadata alone after all records would put later NEW_FRAME rows before
     // their PREVIOUS commit point, making the chain unverifiable.
-    std::map<int64_t, std::vector<int64_t>> frameRows;
-    for (const auto& row : rows) frameRows[row.second].push_back(row.first);
     int64_t at = 0;
     uint64_t previous = 0;
     if (st == FLATSQL_OK) st = streamGenesis(f, next.get(), &at);
@@ -911,21 +920,27 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         chunkRows.clear();
         firstChunk = false;
     };
-    for (const auto& frame : live) {
+    for (size_t first = 0; first < frameRows.size();) {
         if (st != FLATSQL_OK) break;
-        const auto& ids = frameRows[frame.first];
-        if (ids.size() > 65536) { st = FLATSQL_E_CORRUPT; break; }
-        if (chunkRows.size() + ids.size() > 65536) flushCommit();
+        size_t last = first + 1;
+        while (last < frameRows.size() && frameRows[last].off == frameRows[first].off) {
+            if (frameRows[last].len != frameRows[first].len) { st = FLATSQL_E_CORRUPT; break; }
+            ++last;
+        }
+        const size_t count = last - first;
+        if (st != FLATSQL_OK || count > 65536) { st = FLATSQL_E_CORRUPT; break; }
+        if (chunkRows.size() + count > 65536) flushCommit();
         if (st != FLATSQL_OK) break;
         std::string bytes;
-        st = streamRead(old.get(), frame.first, frame.second, &bytes);
+        st = streamRead(old.get(), frameRows[first].off, frameRows[first].len, &bytes);
         if (st != FLATSQL_OK) break;
         const int64_t newOffset = at + int64_t(buf.size());
         uint8_t prefix[4];
         st32(prefix, uint32_t(bytes.size()));
         buf.append(reinterpret_cast<const char*>(prefix), 4);
         buf.append(bytes);
-        for (int64_t rid : ids) {
+        for (size_t i = first; i < last; ++i) {
+            const int64_t rid = frameRows[i].rid;
             sqlite3_bind_int64(q, 1, rid);
             sqlite3_bind_int64(q, 2, newOffset);
             r = sqlite3_step(q);
@@ -934,13 +949,12 @@ void compactWork(Engine* e, Type* t, Internal* in) {
             chunkRows.push_back(rid);
         }
         if (buf.size() >= (4u << 20)) flushBytes();
+        first = last;
     }
     if (st == FLATSQL_OK && (!chunkRows.empty() || firstChunk)) flushCommit();
-    // The rewrite's offset maps are no longer needed. A fresh checkpoint
+    // The rewrite's row inventory is no longer needed. A fresh checkpoint
     // builds row orders; do not retain a second whole-feed view beside it.
-    std::vector<std::pair<int64_t, int64_t>>().swap(rows);
-    std::map<int64_t, int64_t>().swap(live);
-    std::map<int64_t, std::vector<int64_t>>().swap(frameRows);
+    std::vector<FrameRow>().swap(frameRows);
     Counters k;
     uint64_t retiredThrough=0;
     {
