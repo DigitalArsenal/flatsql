@@ -134,7 +134,13 @@ int sandboxAuthorizer(void* user, int action, const char* a1, const char*, const
             // any other name read is a CTE or subquery (allowed), SQLite's own
             // schema, a pragma function or a flatsql_* name (never public).
             const char* t = a1 ? a1 : "";
-            if (isRelation(ctx->ls, t)) return SQLITE_OK;
+            if (isRelation(ctx->ls, t)) {
+                const auto relation=ctx->ls->relations.find(lower(t));
+                const auto* type=relation==ctx->ls->relations.end()?nullptr:typeByName(ctx->ls,relation->second.spec.type);
+                if(!type || !type->metadataOnly) return SQLITE_OK;
+                ctx->violation="metadata-only relation requires trusted SQL";
+                return SQLITE_DENY;
+            }
             if (std::strncmp(t, "sqlite_", 7) != 0 && std::strncmp(t, "pragma_", 7) != 0 &&
                 std::strncmp(t, "flatsql_", 8) != 0)
                 return SQLITE_OK;
@@ -545,6 +551,7 @@ bool dataStream(LaneState* ls, const P4SqlRequest* req, Out& out, int32_t* statu
     if (resolveRelation(ls, name, &rel, &err) != 1) return false;
     const TypeEntry* t = typeByName(ls, rel.type);
     if (!t) return false;
+    if(t->metadataOnly && (req->flags & FLATSQL_SLOT_SANDBOX)) return false;
     RelScan scan;
     int32_t rc = scan.open(ls, *t, rel, ScanArgs());
     std::vector<Cell> cells(1);

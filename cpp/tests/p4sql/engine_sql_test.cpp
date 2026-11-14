@@ -301,6 +301,10 @@ FLATSQL_TEST(t_sql_metadata_only_visibility) {
     CHECK_EQ(r.status,FLATSQL_OK,r.err);
     CHECK_EQ(r.rows.size(),size_t(3),"metadata relation");
     CHECK_EQ(sql("SELECT OBJECT_NAME FROM OMM").status,FLATSQL_E_SQL,"no reflected plaintext fields");
+    for(const auto* query:{"SELECT COUNT(*) FROM OMM","SELECT COUNT(_cid) FROM OMM","SELECT _cid FROM OMM","SELECT _data FROM OMM","SELECT * FROM OMM"}) {
+        CHECK_EQ(sql(query,FLATSQL_SLOT_SANDBOX).status,FLATSQL_E_SQL,"metadata-only relation excluded from sandbox");
+    }
+    CHECK_EQ(sql("SELECT _data FROM OMM",FLATSQL_SLOT_SANDBOX|FLATSQL_SLOT_RAW).status,FLATSQL_E_SQL,"raw shortcut cannot bypass authorizer");
     closeEngine(); removeTree(root);
 }
 
