@@ -171,12 +171,23 @@
     return y;
   }
 
+  // The viewport with a phone's URL bar showing. Unlike innerHeight it holds still
+  // while the bar slides, so the page does not jump under the reader's finger.
+  function viewHeight() {
+    var probe = document.createElement('div');
+    probe.style.cssText = 'position:fixed;top:0;width:0;height:100vh;height:100svh;visibility:hidden';
+    document.body.appendChild(probe);
+    var height = probe.offsetHeight;
+    probe.remove();
+    return height;
+  }
+
   function centerHero(hero) {
     var reel = hero.querySelector('.reel-frame');
     if (!reel || hero.getClientRects().length === 0) return;
     hero.style.paddingTop = '';
     reel.style.width = '';
-    var view = window.innerHeight;
+    var view = viewHeight();
     var top = restTop(hero);
     var above = restTop(reel) - top - (parseFloat(getComputedStyle(hero).paddingTop) || 0);
     var bar = document.querySelector('.sdn-header');
