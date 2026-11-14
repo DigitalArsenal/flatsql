@@ -57,10 +57,9 @@ struct CheckpointPlan {
     std::vector<uint32_t> lengths;
     std::string previousRoot;                  // PREVIOUS_FEED_ROOT_CID
 };
-// A ROWS_BY_* segment whose digest this process has checked (once per
-// process: segments are immutable and content-addressed, so a later load of
-// the same segment of the same file skips the hash): where its PAIRS lie and
-// the first pair of each page (the fence keys a lookup searches in memory).
+// Cached verification of an immutable ROWS_BY_* segment: its PAIRS location
+// and the first pair of each page. Eviction permits verification on a later
+// load; active readers own the metadata they use.
 struct FsgVerified {
     uint64_t base=0, n=0;
     std::vector<FsgPairV> fences;
@@ -99,7 +98,7 @@ struct FsgRun {
     const FsgPairV* begin() const { return p; }  // a tail run
     const FsgPairV* end() const { return p+n; }
     FsgPairV at(size_t i,int32_t* status) const;
-    // Page pg's pairs (null after a read error: failed is set).
+    // Page pg's pairs, or an explicit I/O, corruption, or admission status.
     // Each returned view pins its allocation and stream generation.
     FsgPage page(size_t pg,size_t* count,int ahead=0) const;
     size_t lowerBound(const FsgPairV& key,int32_t* status) const;

@@ -10,8 +10,8 @@
 // the stream with RB1E after the hook returns (C-28), with the row count set
 // here (C-29).
 //
-// Every plan is bounded by construction (each relation reads at most its A18
-// bound), so format 2's interactive admission (index-bounded plans only) has
+// Execution budgets bound work even for unlimited relations. The SQL surface
+// uses the request's resource limits; format 2's index-only admission has
 // nothing left to refuse.
 //
 // Status mapping (all returned, never trapped):
