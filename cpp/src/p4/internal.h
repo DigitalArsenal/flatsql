@@ -459,9 +459,8 @@ struct Feed {
     // The FlatBuffer row orders (fsg.cpp; fsgMu): the current view, and the
     // ROWS_BY_* segments read so far, by (generation, offset).
     std::mutex fsgMu;
-    std::shared_ptr<const FsgView> fsg[2];
+    std::weak_ptr<const FsgView> fsg[2];
     bool fsgVerifying = false;  // queued on the checkpoint worker
-    std::map<std::pair<uint32_t,uint64_t>,std::shared_ptr<const FsgRun>> fsgSegments;
     uint64_t checkpointOpenNs = 0, rowIndexRebuildNs = 0;
     uint64_t checkpointRows = 0, checkpointAt = 0; // rows since checkpoint; last commit monoNs
     int64_t metadataBytes = 0;  // committed non-record frame bytes

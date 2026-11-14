@@ -109,8 +109,6 @@ int32_t checkpointReadPairs(Feed*,const std::shared_ptr<Stream>&,const Checkpoin
 // sorted runs. A superset: a removed row's pair may remain (readers check
 // each candidate's row).
 struct FsgView {
-    std::shared_ptr<const CheckpointState> ck;
-    uint64_t previous=0;
     std::vector<std::shared_ptr<const FsgRun>> runs[2];  // [0] ROWS_BY_SEQ, [1] ROWS_BY_OBJECT_EPOCH
 };
 // The feed's view with kind (kFsgSeq or kFsgObjectEpoch) ready; null when

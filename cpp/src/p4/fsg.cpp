@@ -82,26 +82,28 @@ std::shared_ptr<const FsgView> fsgView(Feed* f,Conn* c,uint8_t kind,int64_t vis)
             if(queue) fsgVerifySchedule(f);
             return nullptr;
         }
-    if(f->fsg[k] && f->fsg[k]->ck==ck && f->fsg[k]->previous==previous) return f->fsg[k];
-    auto v=std::make_shared<FsgView>(); v->ck=ck; v->previous=previous;
-    for(const auto& d:ck->segments) {
-        if(d.kind!=kind) continue;
-        auto& slot=f->fsgSegments[{stream->gen,d.offset}];
-        if(!slot) { auto run=std::make_shared<FsgRun>(); if(checkpointReadPairs(f,stream,d,run.get())!=FLATSQL_OK) {
-            f->fsgSegments.erase({stream->gen,d.offset});
-            const bool queue=!f->fsgVerifying; g.unlock();
-            if(queue) fsgVerifySchedule(f);
-            return nullptr;
-        } slot=std::move(run); }
-        v->runs[k].push_back(slot);
-    }
-    // Segments the checkpoint no longer lists are let go.
-    for(auto it=f->fsgSegments.begin();it!=f->fsgSegments.end();) {
-        const bool live=it->first.first==stream->gen && std::any_of(ck->segments.begin(),ck->segments.end(),[&](const CheckpointSegment& d){return d.offset==it->first.second;});
-        it=live?std::next(it):f->fsgSegments.erase(it);
-    }
-    std::shared_ptr<const FsgView> out=std::move(v);
+    const auto key=stream->path+"/"+std::to_string(stream->gen)+"/view/"+
+        std::to_string(kind)+"/"+std::to_string(ck->offset)+"/"+std::to_string(previous);
+    auto cache=f->type->e->rowCache;
+    if(auto ready=cache->find<FsgView>(key)) { f->fsg[k]=ready; return ready; }
+    const size_t count=size_t(std::count_if(ck->segments.begin(),ck->segments.end(),[&](const CheckpointSegment& d){return d.kind==kind;}));
+    // Include run objects, control blocks, key capacities and vector slots.
+    // Feeds hold weak references so inactive views remain globally evictable.
+    const size_t perRun=sizeof(FsgRun)+128+2*(stream->path.size()+96)+2*sizeof(std::shared_ptr<const FsgRun>);
+    if(count>(SIZE_MAX-sizeof(FsgView))/perRun) return nullptr;
+    bool lostVerification=false;
+    auto out=cache->load<FsgView>(key,sizeof(FsgView)+count*perRun,[&]() -> std::shared_ptr<const FsgView> {
+        auto view=std::make_shared<FsgView>(); view->runs[k].reserve(count);
+        for(const auto& d:ck->segments) {
+            if(d.kind!=kind) continue;
+            auto run=std::make_shared<FsgRun>();
+            if(checkpointReadPairs(f,stream,d,run.get())!=FLATSQL_OK) { lostVerification=true; return {}; }
+            view->runs[k].push_back(std::move(run));
+        }
+        return view;
+    });
     f->fsg[k]=out;
+    if(lostVerification) { const bool queue=!f->fsgVerifying; g.unlock(); if(queue) fsgVerifySchedule(f); }
     return out;
 }
 

@@ -165,7 +165,7 @@ int32_t snapGen(Conn* c, uint32_t* gen) {
 void streamClose(Feed* f) {
     {
         std::lock_guard<std::mutex> g(f->fsgMu);
-        f->fsg[0].reset(); f->fsg[1].reset(); f->fsgSegments.clear();
+        f->fsg[0].reset(); f->fsg[1].reset();
     }
     std::shared_ptr<Stream> a, b;
     std::vector<RetiredGeneration> older;

@@ -1031,7 +1031,7 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     }
     {
         std::lock_guard<std::mutex> g(f->fsgMu);
-        f->fsg[0].reset(); f->fsg[1].reset(); f->fsgSegments.clear();
+        f->fsg[0].reset(); f->fsg[1].reset();
     }
     e->rowCache->dropPrefix(old->path+"/"+std::to_string(old->gen)+"/");
     // The registry follows (a missing index's rebuild reads it; open also

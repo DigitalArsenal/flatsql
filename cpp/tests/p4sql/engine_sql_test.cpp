@@ -453,6 +453,9 @@ FLATSQL_TEST(t_sql_cache_pin_budget) {
         verified.push_back(v);
     }
     REQUIRE(!verified.empty(),"row order exists");
+    REQUIRE(sql("SELECT _seq FROM OMM ORDER BY _seq LIMIT 1").status==FLATSQL_OK,"prepare cached view");
+    auto view=feed->fsg[0].lock(); REQUIRE(view,"view is cache-owned");
+    e->rowCache->trim(std::chrono::seconds(0));
     const size_t limit=1u<<20; e->rowCache->configure(limit);
     const auto used=e->rowCache->used(); REQUIRE(used+2048<limit,"space for pressure pin");
     auto pin=e->rowCache->load<int>("test/sql-pressure",limit-used-2048,[]{ return std::make_shared<int>(1); });
@@ -463,6 +466,9 @@ FLATSQL_TEST(t_sql_cache_pin_budget) {
     const auto retried=sql("SELECT _seq FROM OMM ORDER BY _seq LIMIT 1");
     CHECK_EQ(retried.status,FLATSQL_OK,retried.err);
     CHECK_EQ(retried.rows.size(),size_t(1),"query succeeds after releasing pin");
+    view.reset(); e->rowCache->trim(std::chrono::seconds(0));
+    CHECK(feed->fsg[0].expired(),"feed does not retain an evicted row-order view");
+    CHECK(e->rowCache->used()<=limit,"views and pages share the admission budget");
     verified.clear(); stream.reset(); closeEngine(); removeTree(root);
 }
 
