@@ -733,7 +733,6 @@ int32_t Scan::candidatesFromPreds(bool* used) {
             sqlite3_stmt* keyId = c->sql("SELECT id FROM okey WHERE k=?1");
             sqlite3_stmt* row = c->sql(std::string("SELECT seq, w, cid, ") + ovCol + " FROM r WHERE rid=?1");
             if (!keyId || !row) st = FLATSQL_E_INTERNAL;
-            std::vector<uint64_t> rids;
             for (size_t vi = 0; vi < nv && st == FLATSQL_OK && ents.size() <= kMax; vi++) {
                 bindCell(keyId, 1, kp->vals[vi]);
                 int r = sqlite3_step(keyId);
@@ -741,10 +740,9 @@ int32_t Scan::candidatesFromPreds(bool* used) {
                 sqlite3_reset(keyId);
                 if (r != SQLITE_ROW && r != SQLITE_DONE) st = statusOfSqlite(r);
                 if (!kk) continue;
-                st = fsgObject(*fsgObj, kk, &rids);
-                for (uint64_t rid : rids) {
+                const int32_t walk = fsgObject(*fsgObj, kk, [&](uint64_t rid) {
                     const int64_t sq = int64_t(rid >> 16);
-                    if (sq <= lo_ || sq > hi_) continue;
+                    if (sq <= lo_ || sq > hi_) return true;
                     sqlite3_bind_int64(row, 1, sqlite3_int64(rid));
                     r = sqlite3_step(row);
                     if (r == SQLITE_ROW && sqlite3_column_bytes(row, 2) == 32) {
@@ -758,8 +756,9 @@ int32_t Scan::candidatesFromPreds(bool* used) {
                     }
                     sqlite3_reset(row);
                     if (r != SQLITE_ROW && r != SQLITE_DONE) st = statusOfSqlite(r);
-                    if (ents.size() > kMax) break;
-                }
+                    return st == FLATSQL_OK && ents.size() <= kMax;
+                });
+                if(walk != FLATSQL_OK) st = walk;
             }
             c->exec("COMMIT");
             e_->rpool.release(c);

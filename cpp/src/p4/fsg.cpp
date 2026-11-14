@@ -65,6 +65,9 @@ std::shared_ptr<const FsgView> fsgView(Feed* f,Conn* c,uint8_t kind,int64_t vis)
     std::shared_ptr<const CheckpointState> ck; uint64_t previous=0;
     { std::lock_guard<std::mutex> g(f->type->mu); ck=f->checkpoint; previous=f->lastCommit; }
     if(!ck) return nullptr;
+    // Tail materialization grows with ingest between checkpoints. The SQLite
+    // index already serves that snapshot without retaining a second row order.
+    if(previous!=ck->offset || !ck->current) return nullptr;
     // A checkpoint whose live rows have no row orders (written before they
     // existed): the SQLite index answers until the next checkpoint folds them.
     if(ck->counters.rows>0 && !checkpointHasRowOrders(*ck,kind)) return nullptr;
@@ -92,51 +95,13 @@ std::shared_ptr<const FsgView> fsgView(Feed* f,Conn* c,uint8_t kind,int64_t vis)
         } slot=std::move(run); }
         v->runs[k].push_back(slot);
     }
-    bool complete=true;
-    // A view of the same checkpoint at an earlier commit: its tail runs, and
-    // the rows the commits since then added.
-    const auto& old=f->fsg[k];
-    const bool extend=old && old->ck==ck && old->previous!=ck->offset;
-    if(extend) {
-        for(const auto& r:old->runs[k]) if(r->p) v->runs[k].push_back(r);
-        // Many small tail runs: one.
-        if(v->runs[k].size()-std::count_if(v->runs[k].begin(),v->runs[k].end(),[](const std::shared_ptr<const FsgRun>& r){return !r->p;})>8) {
-            auto all=std::make_shared<std::vector<FsgPairV>>();
-            std::vector<std::shared_ptr<const FsgRun>> keep;
-            for(const auto& r:v->runs[k]) { if(r->p) all->insert(all->end(),r->begin(),r->end()); else keep.push_back(r); }
-            std::sort(all->begin(),all->end()); all->erase(std::unique(all->begin(),all->end(),[](const FsgPairV& a,const FsgPairV& b){return a.rid==b.rid && a.hi==b.hi && a.lo==b.lo;}),all->end());
-            auto run=std::make_shared<FsgRun>(); run->p=all->data(); run->n=all->size(); run->keep=std::move(all);
-            keep.push_back(std::move(run)); v->runs[k]=std::move(keep);
-        }
-    }
-    if(previous!=ck->offset || !ck->current) {
-        std::vector<uint64_t> rids;
-        if(checkpointTailRows(f,stream.get(),*ck,previous,&rids,nullptr,nullptr,extend?old->previous:UINT64_MAX)!=FLATSQL_OK) return nullptr;
-        auto tail=std::make_shared<std::vector<FsgPairV>>(); tail->reserve(rids.size());
-        if(kind==kFsgSeq) { for(uint64_t rid:rids) tail->push_back({rid,0,rid,0}); }
-        else {
-            sqlite3_stmt* q=c->sql("SELECT kk,e FROM r WHERE rid=?1"); if(!q) return nullptr;
-            for(uint64_t rid:rids) {
-                sqlite3_bind_int64(q,1,sqlite3_int64(rid)); const int r=sqlite3_step(q);
-                if(r==SQLITE_ROW) {
-                    const uint64_t hi=sqlite3_column_type(q,0)==SQLITE_NULL?0:uint64_t(sqlite3_column_int64(q,0));
-                    const uint64_t lo=sqlite3_column_type(q,1)==SQLITE_NULL?0:uint64_t(sqlite3_column_int64(q,1))^(uint64_t(1)<<63);
-                    tail->push_back({hi,lo,rid,0});
-                } else if(r!=SQLITE_DONE) { sqlite3_reset(q); return nullptr; }
-                else if(int64_t(rid>>16)>vis) complete=false;  // committed to the stream, not yet in this snapshot
-                sqlite3_reset(q);
-            }
-            std::sort(tail->begin(),tail->end());
-        }
-        if(!tail->empty()) { auto run=std::make_shared<FsgRun>(); run->p=tail->data(); run->n=tail->size(); run->keep=std::move(tail); v->runs[k].push_back(std::move(run)); }
-    }
     // Segments the checkpoint no longer lists are let go.
     for(auto it=f->fsgSegments.begin();it!=f->fsgSegments.end();) {
         const bool live=it->first.first==stream->gen && std::any_of(ck->segments.begin(),ck->segments.end(),[&](const CheckpointSegment& d){return d.offset==it->first.second;});
         it=live?std::next(it):f->fsgSegments.erase(it);
     }
     std::shared_ptr<const FsgView> out=std::move(v);
-    if(complete) f->fsg[k]=out;
+    f->fsg[k]=out;
     return out;
 }
 
@@ -162,6 +127,10 @@ int32_t fsgSeqs(const FsgView& v,bool desc,int64_t from,int64_t lo,int64_t hi,si
                 if(desc) { i--; if(j==0) break; j--; } else { i++; if(++j>=cnt) break; }
             }
         }
+        if(desc) std::sort(out->begin(),out->end(),std::greater<int64_t>());
+        else std::sort(out->begin(),out->end());
+        out->erase(std::unique(out->begin(),out->end()),out->end());
+        if(out->size()>n) out->resize(n);
     }
     if(desc) std::sort(out->begin(),out->end(),std::greater<int64_t>()); else std::sort(out->begin(),out->end());
     out->erase(std::unique(out->begin(),out->end()),out->end());
@@ -169,8 +138,7 @@ int32_t fsgSeqs(const FsgView& v,bool desc,int64_t from,int64_t lo,int64_t hi,si
     return FLATSQL_OK;
 }
 
-int32_t fsgObject(const FsgView& v,uint64_t kk,std::vector<uint64_t>* rids) {
-    rids->clear();
+int32_t fsgObject(const FsgView& v,uint64_t kk,const std::function<bool(uint64_t)>& visit) {
     for(const auto& run:v.runs[1]) {
         const FsgRun& x=*run;
         int32_t status=FLATSQL_OK;
@@ -182,13 +150,11 @@ int32_t fsgObject(const FsgView& v,uint64_t kk,std::vector<uint64_t>* rids) {
             for(size_t j=i%FsgRun::kPage;j<count && i<x.n;j++,i++) {
                 const auto& pair=page[j];
                 if(pair.hi!=kk) { end=true; break; }
-                rids->push_back(pair.rid);
+                if(!visit(pair.rid)) return FLATSQL_OK;
             }
         }
         if(status!=FLATSQL_OK) return status;
     }
-    std::sort(rids->begin(),rids->end());
-    rids->erase(std::unique(rids->begin(),rids->end()),rids->end());
     return FLATSQL_OK;
 }
 } }

@@ -119,8 +119,9 @@ struct FsgView {
 std::shared_ptr<const FsgView> fsgView(Feed*,Conn* c,uint8_t kind,int64_t vis);
 // The next n distinct seqs after `from` (asc: > from, desc: < from) inside (lo, hi].
 int32_t fsgSeqs(const FsgView&,bool desc,int64_t from,int64_t lo,int64_t hi,size_t n,std::vector<int64_t>* out);
-// The rids an object id (0: rows without one) holds.
-int32_t fsgObject(const FsgView&,uint64_t kk,std::vector<uint64_t>* rids);
+// Visit an object's row IDs while holding each page once. False stops the walk.
+// Runs may overlap; the consumer deduplicates candidates.
+int32_t fsgObject(const FsgView&,uint64_t kk,const std::function<bool(uint64_t)>& visit);
 int32_t checkpointFindNewest(Feed*,Stream*,CheckpointState*,bool* found,std::string* err);
 // Reads a candidate checkpoint and every listed segment, including its digest.
 // Tail-search and commit-chain validation belong to the recovery caller.
