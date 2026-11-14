@@ -209,6 +209,19 @@ bool markersActivated(const Markers& m) {
            m.migratedFormat == 5;
 }
 
+int32_t promoteUnlimitedStore(Engine* e, std::string* err) {
+    if (!e->markers.storeValid || e->markers.layout >= 2) return FLATSQL_OK;
+    std::vector<uint8_t> marker;
+    const auto path = pathJoin(e->cfg.root, "STORE");
+    if (ioReadAll(path, &marker) != FLATSQL_OK || marker.size() != 64) return FLATSQL_E_IO;
+    st16(marker.data() + 6, 2);
+    st32(marker.data() + 56, ps::crc32c(marker.data(), 56));
+    const int32_t rc = ioWriteNew(path, marker.data(), marker.size());
+    if (rc != FLATSQL_OK) { *err = "unlimited relation guard write failed"; return rc; }
+    e->markers.layout = 2;
+    return FLATSQL_OK;
+}
+
 // The type index opened (made when absent), then every feed it names, before
 // any read (M8): each feed file's counters, instances and tokens read from
 // the file, its stream cut back to its committed mark; a missing or damaged
@@ -561,15 +574,7 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
     if(!spec->a18Bound) e->unlimitedRelations=true;
     // Layout 2 requires explicit unlimited-relation support. Publish this guard
     // before any unlimited spec: older engines refuse the store on open.
-    if(!spec->a18Bound && e->markers.storeValid && e->markers.layout<2) {
-        std::vector<uint8_t> marker;
-        const auto path=pathJoin(e->cfg.root,"STORE");
-        if(ioReadAll(path,&marker)!=FLATSQL_OK || marker.size()!=64) return FLATSQL_E_IO;
-        st16(marker.data()+6,2); st32(marker.data()+56,ps::crc32c(marker.data(),56));
-        rc=ioWriteNew(path,marker.data(),marker.size());
-        if(rc!=FLATSQL_OK) { *err="unlimited relation guard write failed"; return rc; }
-        e->markers.layout=2;
-    }
+    if (!spec->a18Bound && (rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return rc;
     auto it = e->typeByName.find(spec->name);
     if (it != e->typeByName.end()) {
         Type* t = it->second;
