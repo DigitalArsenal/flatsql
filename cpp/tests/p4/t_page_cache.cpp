@@ -44,6 +44,14 @@ FLATSQL_TEST(t_row_cache_scan_and_generation_pin) {
     }
     size_t count=0; auto pinned=run->page(0,&count);
     REQUIRE(pinned,"reload evicted first page");
+    auto second=run->page(1,&count);
+    REQUIRE(second,"second live pin");
+    auto refused=run->page(2,&count);
+    CHECK(!refused && refused.status==FLATSQL_E_BUDGET,"row page reports exhausted pins");
+    second={};
+    auto retried=run->page(2,&count);
+    REQUIRE(retried,"budget failure does not poison a later read");
+    retried={};
     run.reset(); stream.reset(); cache->trim(std::chrono::seconds(0));
     CHECK(!generation.expired(),"owning page retains generation");
     CHECK_EQ(pinned[0].rid,uint64_t(1),"pinned bytes survive trim");
