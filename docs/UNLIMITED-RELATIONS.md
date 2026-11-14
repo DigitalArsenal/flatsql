@@ -20,9 +20,12 @@ The first unlimited registration promotes STORE to layout 2 before writing its
 specification. The stream format remains 5. Layout-1-only engines refuse that
 store, and a supporting engine rejects a registration that changes an unlimited
 relation back to a bounded relation. Activation of a migration target preserves
-the layout requirement. An interrupted marker write fails closed and requires
-marker recovery with an engine that supports layout 2; automatic recovery of
-this transition is not provided.
+the layout requirement. Promotion first syncs the complete new marker in
+`STORE.unlimited`, then writes and syncs STORE, then removes the intent. Open
+automatically completes a valid intent whose UUID matches MIGRATED. A torn
+intent is discarded only beside an intact activated marker pair. UUID and
+sequence-floor conflicts fail explicitly. No unlimited specification precedes
+the durable layout guard.
 
 Config tag 51 (`rowCacheBytes` in JavaScript) sets the shared row-order page and
 verified-metadata budget; its default is 32 MiB. Owning page views retain their
@@ -37,3 +40,10 @@ This budget does not bound the entire engine: staging, checkpoint construction,
 SQLite, query results, and allocator retention are separate. Releasing cache
 entries does not guarantee that the runtime returns resident pages to the OS.
 Legacy arena stores and their host-side migration require separate changes.
+
+Readers use a snapshot for each buffered page, with a sequence ceiling fixed
+when the cursor opens. A deleted or superseded row already buffered can still
+be returned by that cursor. Later pages observe the changed state, and a new
+cursor observes the deletion or supersede. Owning generation views keep old
+stream bytes readable across compaction. Checkpoint publication alone does
+not replace the stream generation; compaction does.
