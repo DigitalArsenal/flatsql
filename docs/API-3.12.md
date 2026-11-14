@@ -20,7 +20,8 @@ There are no PS/P4 selectors, old engine aliases, or compatibility modes.
   Native type-spec tag 13 value 1 requests unlimited visibility; tag 10 zero
   or omission retains the historical default. Layout-1-only engines refuse a
   promoted store. Back up before selecting unlimited visibility.
-- `rowCacheBytes` controls the shared row-order cache (32 MiB default,
+- `rowCacheBytes` controls shared row-order pages, verification metadata, views
+  and run descriptors (32 MiB default,
   16 KiB minimum). Status -15 identifies cache admission blocked by pinned
   pages; status -8 identifies statement execution budgets. Whole-type,
   unfiltered `COUNT(*)` and `COUNT(_cid)` use visible live metadata and reject
