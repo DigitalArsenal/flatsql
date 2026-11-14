@@ -592,7 +592,7 @@ int32_t surfaceRows(LaneState* ls, Out& out, std::string* msg) {
     int32_t rc = loadTypes(ls, msg);
     if (rc < 0) return rc;
     std::vector<const TypeEntry*> types;
-    for (const auto& kv : ls->types) types.push_back(&kv.second);
+    for (const auto& kv : ls->types) if(!kv.second.metadataOnly) types.push_back(&kv.second);
     std::sort(types.begin(), types.end(), [](const TypeEntry* a, const TypeEntry* b) { return a->name < b->name; });
     static const char* const kMetaNames[] = {"_source", "_rowid", "_offset", "_data"};
     const std::string table = "table", view = "view", none;

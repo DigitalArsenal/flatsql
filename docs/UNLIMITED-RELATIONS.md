@@ -15,7 +15,8 @@ Binary-collated `_cid = ?` predicates use the durable reader's CID index.
 Registrations without reflection schemas expose metadata and stored bytes.
 They have no reflected plaintext fields or plaintext extraction indexes.
 Metadata-only relations require trusted SQL and are denied by the sandbox,
-including count and raw-record shortcuts. An empty reflection schema selects
+including count and raw-record shortcuts; the public surface omits them.
+An empty reflection schema selects
 this policy; a supplied schema follows the reflected-column path.
 Supplied reflection schemas without SQL columns remain ingest-only. The engine
 logs the hidden relation and its reason; other relations and statements work.
