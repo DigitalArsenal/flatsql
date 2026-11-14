@@ -83,6 +83,12 @@ struct FsgVerifyStats { uint64_t hashed=0, hashedBytes=0, hashNs=0, reused=0; };
 FsgVerifyStats fsgVerifyStats();
 // A sorted run of pairs: a tail in memory, or a segment's PAIRS read from
 // the stream a page (128 pairs) at a time as lookups reach them.
+struct FsgPage {
+    const FsgPairV* data=nullptr;
+    std::shared_ptr<const void> owner;
+    explicit operator bool() const { return data!=nullptr; }
+    const FsgPairV& operator[](size_t i) const { return data[i]; }
+};
 struct FsgRun {
     static constexpr size_t kPage=128;
     static constexpr int kFaults=8;
@@ -99,7 +105,7 @@ struct FsgRun {
     FsgPairV at(size_t i) const;
     // Page pg's pairs (null after a read error: failed is set).
     // A walk reads ahead `ahead` pages in the walk's direction with one read.
-    const FsgPairV* page(size_t pg,size_t* count,int ahead=0) const;
+    FsgPage page(size_t pg,size_t* count,int ahead=0) const;
     size_t lowerBound(const FsgPairV& key) const;  // the first pair not below key
 };
 int32_t checkpointReadPairs(Feed*,const std::shared_ptr<Stream>&,const CheckpointSegment&,FsgRun*);

@@ -70,6 +70,28 @@ Cell intCell(int64_t v) {
 
 }  // namespace
 
+// Characterizes the bounded relation before explicit unlimited registration.
+FLATSQL_TEST(t_sql_bounded_visibility) {
+    const auto root=scratchDir("bounded_visibility");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=2;
+    REQUIRE(registerType(type)==FLATSQL_OK,"register");
+    const auto batch=ommBatch(1,3,kSrc,"synthetic");
+    REQUIRE(put(batch).status==FLATSQL_OK,"put");
+    uint8_t cid[36]; cidOf(batch.recs[0].frame,cid);
+    auto count=sql("SELECT COUNT(*) AS n FROM OMM");
+    CHECK_EQ(count.status,FLATSQL_OK,count.err);
+    CHECK_EQ(count.i(0,"n"),2,"bounded count");
+    auto old=sql("SELECT _seq FROM OMM WHERE _cid='"+cidText(cid)+"'");
+    CHECK_EQ(old.status,FLATSQL_OK,old.err);
+    CHECK_EQ(old.rows.size(),size_t(0),"old CID outside relation");
+    auto seq=sql("SELECT _seq FROM OMM WHERE _seq=1");
+    CHECK_EQ(seq.status,FLATSQL_OK,seq.err);
+    CHECK_EQ(seq.rows.size(),size_t(1),"existing sequence cutoff inconsistency");
+    CHECK_EQ(closeEngine(),FLATSQL_OK,"close");
+    removeTree(root);
+}
+
 // Statuses, never traps: result caps, the sandbox, malformed parameters.
 FLATSQL_TEST(t_sql_caps_and_sandbox) {
     const std::string root = scratchDir("t_sql_caps");
