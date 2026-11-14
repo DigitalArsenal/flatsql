@@ -12,12 +12,9 @@ The JavaScript API accepts `maxRows: 0` only after checking the capability.
 COUNT, raw-record output, source aliases, and ordinary SQL use the same policy.
 Binary-collated `_cid = ?` predicates use the durable reader's CID index.
 
-Registrations without reflection schemas expose metadata and stored bytes.
-They have no reflected plaintext fields or plaintext extraction indexes.
-Metadata-only relations require trusted SQL and are denied by the sandbox,
-including count and raw-record shortcuts; the public surface omits them.
-An empty reflection schema selects
-this policy; a supplied schema follows the reflected-column path.
+Registrations without reflection schemas have no SQL relation, including
+through trusted queries. They retain durable record access by CID.
+A supplied schema follows the reflected-column path.
 Supplied reflection schemas without SQL columns remain ingest-only. The engine
 logs the hidden relation and its reason; other relations and statements work.
 Execution row, byte, result, deadline, and heap limits remain in force.
@@ -35,7 +32,8 @@ the durable layout guard.
 
 Type-spec replacement syncs a complete CRC-protected `.spec.intent` before
 overwriting `.spec`. Open completes a valid intent and discards an incomplete
-intent only beside a valid prior spec. A corrupt registered spec prevents open;
+intent only beside a valid prior spec. Layout 1 skips a corrupt spec so the
+host can restore its bounded registration. Layout 2 refuses a corrupt spec;
 it cannot hide an unlimited relation from the bounded-downgrade check. This
 guard covers normal registration and interrupted writes, not manual file edits.
 
