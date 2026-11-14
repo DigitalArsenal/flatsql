@@ -57,6 +57,8 @@ Idle index merging can raise SQLite's temporary allocation peak while cache
 entries expire. Repeated scans can retain that resident high-water mark after
 live allocations fall. Sustained ingestion can still exhaust guest memory;
 row-cache admission does not bound every allocation path.
+Allocation failure inside a cache loader can trap in exception-free WebAssembly;
+admission accounting is not allocator-failure recovery.
 Legacy arena stores and their host-side migration require separate changes.
 
 Readers use a snapshot for each buffered page, with a sequence ceiling fixed
