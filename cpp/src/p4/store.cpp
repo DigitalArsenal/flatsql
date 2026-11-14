@@ -320,7 +320,10 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
         t->visRecompute();
     }
     if (!fresh && !ioExists(t->pIdx)) {
-        if (e->cfg.createMode == 3 && !ioExists(t->pDir)) return FLATSQL_OK;
+        // An unused registered type can have only its spec, including after
+        // conversion. Absence of the stream directory proves there is
+        // nothing to enumerate on hosts whose I/O ABI has no readdir.
+        if (!ioExists(t->pDir)) return FLATSQL_OK;
         std::vector<std::string> streams;
         if (!p4ListStreams(t->pDir, &streams)) { *err = "missing type index requires stream directory enumeration"; return FLATSQL_E_UNSUPPORTED; }
         if (streams.empty()) return FLATSQL_OK;
