@@ -315,13 +315,19 @@ int32_t build(Feed* feed,Stream* stream,uint64_t previous,uint64_t end,DagSnapsh
         const auto& root=feed->type->e->cfg.root; ptr->path=stream->path;
         if(ptr->path.compare(0,root.size(),root)==0 && ptr->path.size()>root.size() && ptr->path[root.size()]=='/') ptr->path.erase(0,root.size()+1);
     }
-    DagState& s=*ptr; std::vector<Meta> tail; uint64_t at=previous;
+    // The acknowledged prefix is immutable. Keep only the chain's offsets,
+    // then read/apply one metadata frame at a time in forward order. Keeping
+    // every frame's bytes here can consume the WASM heap before replay starts.
+    DagState& s=*ptr; std::vector<uint64_t> tail; uint64_t at=previous;
     while(at!=UINT64_MAX && (s.last==UINT64_MAX || at>s.last)) {
         Meta m; const int32_t rc=readMeta(stream,at,end,&m); if(rc!=FLATSQL_OK) { if(err) *err="invalid acknowledged DAG chain: "+stream->path; return rc; }
-        at=m.previous; tail.push_back(std::move(m));
+        tail.push_back(at); at=m.previous;
     }
     if(s.last!=UINT64_MAX && at!=s.last) return FLATSQL_E_CORRUPT;
-    for(auto it=tail.rbegin();it!=tail.rend();++it) { const int32_t rc=apply(s,*it); if(rc!=FLATSQL_OK) return rc; }
+    for(auto it=tail.rbegin();it!=tail.rend();++it) {
+        Meta m; int32_t rc=readMeta(stream,*it,end,&m); if(rc!=FLATSQL_OK) return rc;
+        rc=apply(s,m); if(rc!=FLATSQL_OK) return rc;
+    }
     if(!s.hasCheckpoint) return FLATSQL_E_CORRUPT;
     updateTree(s,previous);
     DagSnapshot result; result.through=previous; result.generation=stream->gen;

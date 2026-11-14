@@ -7,6 +7,7 @@
 // Normal opens never accept format 4. The host retains the source and publishes
 // this copy only after conversion, verification, and activation all succeed.
 #include "internal.h"
+#include "dag.h"
 #include <cstdio>
 #include <map>
 
@@ -255,6 +256,10 @@ int32_t convertFormat4Type(Type* t,std::string* err) {
         Internal work; work.force=true; work.what=f->fid;
         compactWork(e,t,&work);
         if(work.status!=FLATSQL_OK) { if(err) *err=work.err; return work.status; }
+        // Conversion has no published ranges or concurrent readers. The
+        // committed checkpoint retains its root; release this feed's derived
+        // DAG inventory before replay and before converting the next feed.
+        feedDagReset(f);
         // Recreate the disposable index entirely from the new stream. This
         // proves the new metadata is authoritative, not a relabeled cache.
         std::fprintf(stderr,"store conversion 4 -> 5: replaying %s/%s\n",t->name.c_str(),f->name.c_str());
