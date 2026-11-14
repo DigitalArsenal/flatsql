@@ -624,7 +624,11 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
     Out out(ls, (req->flags & FLATSQL_SLOT_RAW) != 0, req->maxResultRows, req->maxResultBytes);
     std::string msg;
     int32_t status = loadTypes(ls,&msg);
-    if(status!=FLATSQL_OK) return reply(ls,status,msg);
+    if(status!=FLATSQL_OK) {
+        out.header({});
+        out.finish(&msg);
+        return reply(ls,status,msg);
+    }
     if (dataStream(ls, req, out, &status, &msg)) {
         const int32_t emitted = out.finish(&msg);
         return reply(ls, status != FLATSQL_OK ? status : emitted, msg);

@@ -188,6 +188,25 @@ FLATSQL_TEST(t_sql_unlimited_promotion_recovery) {
     closeEngine(); removeTree(root);
 }
 
+FLATSQL_TEST(t_sql_empty_root_isolation) {
+    const auto root=scratchDir("empty_root_isolation");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto ordinary=ommType();
+    REQUIRE(registerType(ordinary)==FLATSQL_OK,"ordinary registration");
+    REQUIRE(put(ommBatch(1,3,kSrc,"synthetic")).status==FLATSQL_OK,"ordinary records");
+    auto empty=ommType(); empty.name="EMPTY"; empty.rules.clear();
+    const auto* schema=reflection::GetSchema(empty.bfbs.data());
+    auto* fields=const_cast<flatbuffers::Vector<flatbuffers::Offset<reflection::Field>>*>(schema->root_table()->fields());
+    flatbuffers::WriteScalar(reinterpret_cast<uint32_t*>(fields),uint32_t(0));
+    REQUIRE(registerType(empty)==FLATSQL_OK,"legal ingest-only empty root");
+    CHECK_EQ(sql("SELECT 1 AS n").i(0,"n"),1,"unrelated statement works");
+    auto result=sql("SELECT _seq FROM OMM ORDER BY _seq");
+    CHECK_EQ(result.status,FLATSQL_OK,result.err);
+    CHECK_EQ(result.rows.size(),size_t(3),"normal relation unchanged");
+    CHECK_EQ(sql("SELECT * FROM EMPTY").status,FLATSQL_E_SQL,"ingest-only relation hidden");
+    closeEngine(); removeTree(root);
+}
+
 FLATSQL_TEST(t_sql_legacy_zero_and_missing_bound) {
     namespace p4 = flatsql::p4;
     const auto root=scratchDir("legacy_zero_bound");

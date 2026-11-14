@@ -14,7 +14,8 @@ Binary-collated `_cid = ?` predicates use the durable reader's CID index.
 
 Registrations without reflection schemas expose metadata and stored bytes.
 They have no reflected plaintext fields or plaintext extraction indexes.
-Malformed supplied reflection schemas fail instead of silently hiding a type.
+Supplied reflection schemas without SQL columns remain ingest-only. The engine
+logs the hidden relation and its reason; other relations and statements work.
 Execution row, byte, result, deadline, and heap limits remain in force.
 
 The first unlimited registration promotes STORE to layout 2 before writing its

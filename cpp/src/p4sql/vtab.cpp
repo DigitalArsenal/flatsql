@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <deque>
 #include <memory>
 
@@ -106,9 +107,13 @@ int32_t loadTypes(LaneState* ls, std::string* err) {
         t.metadataOnly = ti.bfbsLen==0;
         std::string e;
         if(ti.bfbsLen && !schemaColumns(t.name, ti.bfbs, ti.bfbsLen, &t.cols, &e)) {
-            if(err) *err=e;
-            return FLATSQL_E_ARG;
+            auto prior=ls->hiddenReasons.find(key);
+            if(prior==ls->hiddenReasons.end() || prior->second!=e)
+                std::fprintf(stderr,"FlatSQL: SQL relation %s hidden: %s\n",t.name.c_str(),e.c_str());
+            ls->hiddenReasons[key]=e;
+            continue;
         }
+        ls->hiddenReasons.erase(key);
         mapCols(&t, rulesOf(ti));
         ls->types.emplace(key, std::move(t));
     }
