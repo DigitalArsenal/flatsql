@@ -446,7 +446,7 @@ int32_t checkpointVerifyPairs(Feed* f,Stream* stream,const CheckpointSegment& de
     { std::lock_guard<std::mutex> g(gVerifiedMu); gVerifyStats.hashed++; gVerifyStats.hashedBytes+=n; gVerifyStats.hashNs+=ps::monoNs()-t0; }
     if(fresh) *fresh=true;
     return ver;
-    },(128u<<10)+1024);
+    },(128u<<10)+1024,&status);
     return *out?FLATSQL_OK:status;
 }
 
