@@ -4,6 +4,7 @@
 #include <iterator>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <list>
 #include <map>
 #include <memory>
@@ -19,6 +20,7 @@ class PageCache {
     using Clock=std::chrono::steady_clock;
     struct Flight {
         bool done=false;
+        int32_t status=0;
         std::shared_ptr<const void> value;
     };
     struct Entry {
@@ -74,7 +76,7 @@ public:
         it->second.touched=Clock::now(); lru_.splice(lru_.begin(),lru_,it->second.lru);
         return std::static_pointer_cast<const T>(it->second.value);
     }
-    template<class T,class Loader> std::shared_ptr<const T> load(const std::string& key,size_t bytes,Loader loader,size_t workspace=0) {
+    template<class T,class Loader> std::shared_ptr<const T> load(const std::string& key,size_t bytes,Loader loader,size_t workspace=0,int32_t* completionStatus=nullptr) {
         Garbage garbage;
         std::unique_lock<std::mutex> g(mu_);
         for(;;) {
@@ -83,9 +85,11 @@ public:
             if(it->second.loading) {
                 const auto flight=it->second.flight;
                 ready_.wait(g,[&] { return flight->done; });
+                if(completionStatus) *completionStatus=flight->status;
                 return std::static_pointer_cast<const T>(flight->value);
             }
             it->second.touched=Clock::now(); lru_.splice(lru_.begin(),lru_,it->second.lru);
+            if(completionStatus) *completionStatus=0;
             return std::static_pointer_cast<const T>(it->second.value);
         }
         // Account conservatively for map/list nodes, keys and shared ownership.
@@ -116,6 +120,8 @@ public:
 #endif
         g.lock();
         auto it=entries_.find(key);
+        if(value && completionStatus) *completionStatus=0;
+        flight->status=completionStatus?*completionStatus:0;
         flight->value=value; flight->done=true;
         if(value) { it->second.value=value; it->second.loading=false; it->second.flight.reset(); it->second.bytes-=workspace; used_-=workspace; }
         else erase(it,garbage);

@@ -22,7 +22,7 @@ FsgPage FsgRun::page(size_t pg,size_t* count,int ahead) const {
         std::memcpy(v->pairs.data(),buf.data(),buf.size());
         if(!std::is_sorted(v->pairs.begin(),v->pairs.end())) { status=FLATSQL_E_CORRUPT; return {}; }
         return v;
-    },*count*sizeof(FsgPairV));
+    },*count*sizeof(FsgPairV),&status);
     return value?FsgPage{value->pairs.data(),value}:FsgPage{nullptr,{},status};
 }
 
