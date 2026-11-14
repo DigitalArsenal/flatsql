@@ -250,13 +250,19 @@ int32_t convertFormat4Type(Type* t,std::string* err) {
         std::fflush(stderr);
         std::vector<Digest> before,after;
         int32_t rc=snapshot(e,f,&before,err); if(rc!=FLATSQL_OK) return rc;
+        std::fprintf(stderr,"store conversion 4 -> 5: rewriting %s/%s\n",t->name.c_str(),f->name.c_str());
+        std::fflush(stderr);
         Internal work; work.force=true; work.what=f->fid;
         compactWork(e,t,&work);
         if(work.status!=FLATSQL_OK) { if(err) *err=work.err; return work.status; }
         // Recreate the disposable index entirely from the new stream. This
         // proves the new metadata is authoritative, not a relabeled cache.
+        std::fprintf(stderr,"store conversion 4 -> 5: replaying %s/%s\n",t->name.c_str(),f->name.c_str());
+        std::fflush(stderr);
         int64_t indexed=0;
         rc=replayRebuildFeed(e,t,f,&indexed,err); if(rc!=FLATSQL_OK) return rc;
+        std::fprintf(stderr,"store conversion 4 -> 5: comparing %s/%s\n",t->name.c_str(),f->name.c_str());
+        std::fflush(stderr);
         rc=snapshot(e,f,&after,err); if(rc!=FLATSQL_OK) return rc;
         if(before!=after) {
             size_t i=0; while(i<before.size() && i<after.size() && before[i]==after[i]) i++;
