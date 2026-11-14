@@ -1,6 +1,17 @@
 # Changelog
 
 
+## 3.12.2
+
+- Keep a statement a caller is still stepping when a connection's SQL
+  statement cache is full. The cache used to finalize an arbitrary entry,
+  often the statement just handed out, which compaction (appendConsolidated)
+  and checkpointAppend still held: with one SUPERSEDE per object the engine
+  stepped freed memory and corrupted the shared heap (wasm traps). A full
+  cache now evicts the least recently handed-out statement that is not being
+  stepped, and grows by one when all are. The store format is unchanged.
+
+
 ## 3.12.0
 
 - Unify the public API and native ABI around one persistent WASI threads engine.

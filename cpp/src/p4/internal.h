@@ -224,7 +224,18 @@ enum StmtId : int {
 struct Conn {
     sqlite3* db = nullptr;
     sqlite3_stmt* st[S_COUNT] = {};
-    std::unordered_map<std::string, sqlite3_stmt*> dyn;  // other statements, by SQL text
+    // Other statements, by SQL text: at most kDynStmts. A full cache evicts
+    // the statement handed out longest ago that is not being stepped, so a
+    // statement stays valid while its caller holds it, as long as the caller
+    // asks this connection for fewer than kDynStmts - 1 other new texts
+    // meanwhile.
+    static constexpr size_t kDynStmts = 64;
+    struct DynStmt {
+        sqlite3_stmt* s = nullptr;
+        uint64_t used = 0;  // `uses` when last handed out
+    };
+    std::unordered_map<std::string, DynStmt> dyn;
+    uint64_t uses = 0;
     std::string path;
     uint32_t cacheKiB = 0;  // a pooled reader's page cache (its share of the pool's budget)
     ~Conn();
