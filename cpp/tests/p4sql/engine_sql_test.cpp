@@ -339,6 +339,10 @@ FLATSQL_TEST(t_sql_unlimited_keyset_with_ingest) {
     REQUIRE(registerType(type)==FLATSQL_OK,"bounded registration");
     REQUIRE(put(ommBatch(1,512,kSrc,"initial")).status==FLATSQL_OK,"initial rows");
     CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),2,"warm readers under bounded policy");
+    auto* registered=flatsql::p4::currentEngine()->findType("OMM");
+    { std::lock_guard<std::mutex> g(registered->mu); for(auto& f:registered->feeds) f->quarantined=true; }
+    CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),2,"bounded quarantine count preserves main");
+    { std::lock_guard<std::mutex> g(registered->mu); for(auto& f:registered->feeds) f->quarantined=false; }
     type.a18=0; REQUIRE(registerType(type)==FLATSQL_OK,"promote with readers already used");
     CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),512,"cached readers see new policy");
     REQUIRE(closeEngine()==FLATSQL_OK,"checkpoint close");
