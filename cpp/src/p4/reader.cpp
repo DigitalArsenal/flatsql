@@ -3663,8 +3663,9 @@ int64_t p4_type_rows(P4Lane* lane, const char* type) {
     if (!lane || !type) return FLATSQL_E_ARG;
     flatsql::p4::Type* t = lane->e->findType(type);
     if (!t) return FLATSQL_E_NOTYPE;
+    const auto bound=t->spec()->a18Bound;
     std::lock_guard<std::mutex> g(t->mu);
-    if(t->spec()->a18Bound) return t->totals().recs; // Preserve the shipped bounded COUNT result.
+    if(bound) return t->totals().recs; // Preserve the shipped bounded COUNT result.
     const auto visible=t->vis.load(std::memory_order_acquire);
     for(const auto& f:t->feeds) {
         if(f->created && f->quarantined) return FLATSQL_E_CORRUPT;
