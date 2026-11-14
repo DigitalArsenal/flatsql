@@ -162,3 +162,16 @@ FLATSQL_TEST(t_row_cache_failed_load_waiters) {
     auto retry=cache.load<int>("failure",sizeof(int),[] { return std::make_shared<const int>(5); });
     REQUIRE(retry,"later request retries failed admission");
 }
+
+FLATSQL_TEST(t_row_cache_view_ownership) {
+    auto cache=std::make_shared<PageCache>(); std::weak_ptr<PageCache> weak=cache;
+    auto view=cache->load<FsgView>("view",sizeof(FsgView)+sizeof(FsgRun)+128,[&] {
+        auto v=std::make_shared<FsgView>(); auto run=std::make_shared<FsgRun>();
+        run->cache=cache; run->n=1; v->runs[0].push_back(run); return v;
+    });
+    REQUIRE(view,"cached view");
+    cache.reset();
+    CHECK(weak.expired(),"cached runs do not form a cache ownership cycle");
+    size_t count=0; const auto page=view->runs[0][0]->page(0,&count);
+    CHECK(!page && page.status==FLATSQL_E_STOPPED,"view cannot use a destroyed cache");
+}

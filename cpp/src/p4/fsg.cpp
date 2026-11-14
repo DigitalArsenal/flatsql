@@ -12,8 +12,10 @@ FsgPage FsgRun::page(size_t pg,size_t* count,int ahead) const {
     const size_t first=pg*kPage; *count=std::min(kPage,n-first);
     if(p) return {p+first,keep};
     struct Page { std::vector<FsgPairV> pairs; std::shared_ptr<Stream> generation; };
+    auto sharedCache=cache.lock();
+    if(!sharedCache) return {nullptr,{},FLATSQL_E_STOPPED};
     int32_t status=FLATSQL_E_CACHE_BUDGET;
-    auto value=cache->load<Page>(cacheKey+"/page/"+std::to_string(pg),*count*sizeof(FsgPairV)+sizeof(Page),[&]() -> std::shared_ptr<const Page> {
+    auto value=sharedCache->load<Page>(cacheKey+"/page/"+std::to_string(pg),*count*sizeof(FsgPairV)+sizeof(Page),[&]() -> std::shared_ptr<const Page> {
         std::string buf;
         status=streamReadRange(stream.get(),int64_t(base+first*sizeof(FsgPairV)),*count*sizeof(FsgPairV),&buf);
         if(status!=FLATSQL_OK) return {};
@@ -35,7 +37,8 @@ FsgPairV FsgRun::at(size_t i,int32_t* status) const {
 // Interpolation on KEY_HI (rids and object ids are dense), one page a step,
 // then a binary search inside the page it lands in.
 size_t FsgRun::lowerBound(const FsgPairV& key,int32_t* status) const {
-    const auto fences=cache ? cache->find<FsgVerified>(cacheKey) : verified.lock();
+    const auto sharedCache=cache.lock();
+    const auto fences=sharedCache ? sharedCache->find<FsgVerified>(cacheKey) : verified.lock();
     if(fences && !fences->fences.empty()) {
         // The fence keys (in memory) name the one page the answer lies in.
         const auto& fc=fences->fences;

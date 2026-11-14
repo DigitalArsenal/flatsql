@@ -93,7 +93,7 @@ struct FsgRun {
     std::shared_ptr<const void> keep;  // what p points into
     std::shared_ptr<Stream> stream; uint64_t base=0;
     std::weak_ptr<const FsgVerified> verified;
-    std::shared_ptr<PageCache> cache;
+    std::weak_ptr<PageCache> cache;
     std::string cacheKey;
     const FsgPairV* begin() const { return p; }  // a tail run
     const FsgPairV* end() const { return p+n; }
