@@ -42,6 +42,16 @@ uint32_t crc32c(uint32_t crc, const void* data, size_t len);
 inline uint32_t crc32c(const void* data, size_t len) { return crc32c(0, data, len); }
 
 // SHA-256 (FIPS 180-4). Used to verify the CID of unsealed frames.
+class Sha256 {
+    uint32_t h_[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    uint8_t tail_[64] = {};
+    size_t pending_ = 0;
+    uint64_t bytes_ = 0;
+public:
+    void update(const void* data, size_t len);
+    void finish(uint8_t out[32]);
+};
 void sha256(const void* data, size_t len, uint8_t out[32]);
 
 // 64-bit non-cryptographic hash (bloom filters, tuple identities, tables).
