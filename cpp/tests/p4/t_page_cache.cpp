@@ -187,11 +187,11 @@ FLATSQL_TEST(t_row_cache_sha256_vectors) {
     for(const auto& vector:vectors) {
         const auto* bytes=reinterpret_cast<const uint8_t*>(vector.first.data()); uint8_t digest[32];
         flatsql::ps::sha256(bytes,vector.first.size(),digest);
-        CHECK_EQ(hex(digest),vector.second,"standard one-shot SHA-256 vector");
+        CHECK(hex(digest)==vector.second,"standard one-shot SHA-256 vector");
         for(size_t chunk:{size_t(1),size_t(63),size_t(64),size_t(65),size_t(4096)}) {
             flatsql::ps::Sha256 hash;
             for(size_t i=0;i<vector.first.size();i+=chunk) hash.update(bytes+i,std::min(chunk,vector.first.size()-i));
-            hash.finish(digest); CHECK_EQ(hex(digest),vector.second,"standard incremental SHA-256 vector");
+            hash.finish(digest); CHECK(hex(digest)==vector.second,"standard incremental SHA-256 vector");
         }
     }
 }
