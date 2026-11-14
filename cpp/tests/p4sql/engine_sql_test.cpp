@@ -1,4 +1,5 @@
 #include "QRP/main_generated.h"
+#include "flatbuffers/reflection_generated.h"
 // The SQL surface over the real engine (CONTRACT.md §3.5 ops 30/31, §3.9):
 // records PUT through the mailbox, then op 30 (SQL) and op 31 (SURFACE)
 // answered by p4sql on the engine's lanes, cursors from the engine's reader.

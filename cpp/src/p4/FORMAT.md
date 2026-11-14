@@ -45,7 +45,8 @@ needs.
 
 ```
 <data>/fsql4/
-  STORE                    64 B, magic FSQ4, format 5 (format 4 => P4_E_FORMAT)
+  STORE                    64 B, magic FSQ4, format 5, layout 1 or 2
+  STORE.unlimited          synced layout-2 promotion intent, removed after recovery
   T/<TYPE>.spec            registered spec TLV (unchanged)
   T/<TYPE>.idx             type index: CACHE (feed and token registries, rebuilt from the streams)
   T/<TYPE>.fts             full text: CACHE (unchanged)
@@ -58,7 +59,11 @@ The changes from format 4:
 - The `.db` and `.idx` stop being needed for durability.
 - `inst`, `tokc`, `ident`/`idst`, `moved` and `meta` become derived state.
 
-File naming and generations are unchanged (`docs/STORE-FORMAT-4.md` §1, §5).
+Layout 2 records explicit unlimited SQL visibility and refuses layout-1-only
+readers. The layout guard precedes every unlimited type spec. Type specs use a
+CRC-protected `.spec.intent` for recoverable replacement. Type-spec tag 13
+value 1 selects unlimited visibility; tag 10 zero retains its historical
+default. File naming and generations are unchanged (`docs/STORE-FORMAT-4.md` §1, §5).
 
 ## 2. The stream
 

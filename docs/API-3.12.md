@@ -15,6 +15,18 @@ There are no PS/P4 selectors, old engine aliases, or compatibility modes.
   reflection schema. Type names are SQL identifiers, up to 64 characters; the
   file identifier is four bytes. Indexed extraction rules and full-text
   indexing are schema configuration, executed inside the guest.
+- `maxRows: 0` requests complete SQL visibility after a capability check and
+  promotes the store to layout 2. Positive values retain bounded relations.
+  Native type-spec tag 13 value 1 requests unlimited visibility; tag 10 zero
+  or omission retains the historical default. Layout-1-only engines refuse a
+  promoted store. Back up before selecting unlimited visibility.
+- `rowCacheBytes` controls the shared row-order cache (32 MiB default,
+  16 KiB minimum). Status -15 identifies cache admission blocked by pinned
+  pages; status -8 identifies statement execution budgets. Whole-type,
+  unfiltered `COUNT(*)` and `COUNT(_cid)` use visible live metadata and reject
+  quarantined feeds. A filtered count retains scan budgets: metadata bytes,
+  and payload bytes when its predicate requires payload hydration, are charged
+  to bytes read; returned rows are charged separately.
 - `ingest(type, records, metadata)` accepts concatenated frames:
   `[u32 little-endian payload length][FlatBuffer payload]`. The guest validates
   records, computes identities, persists streams and updates indexes. Provider,
