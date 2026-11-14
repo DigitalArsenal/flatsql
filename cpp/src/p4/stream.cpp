@@ -78,9 +78,13 @@ std::shared_ptr<Stream> streamAt(Feed* f, uint32_t gen, int32_t* rc) {
     *rc = FLATSQL_OK;
     std::lock_guard<std::mutex> g(f->smu);
     if (f->stream && f->stream->gen == gen) return f->stream;
-    if (f->retired && f->retired->gen == gen) return f->retired;
+    if (f->retired && f->retired->gen == gen) {
+        if(f->retired->unlinking) { *rc=FLATSQL_E_BUSY; return nullptr; }
+        return f->retired;
+    }
     for (auto& retired : f->olderRetired) {
         if (retired.stream->gen != gen) continue;
+        if(retired.stream->unlinking) { *rc=FLATSQL_E_BUSY; return nullptr; }
         // Startup retirement tracks paths without spending an I/O handle on
         // each one. Open lazily if an existing snapshot still names one.
         if (retired.stream->h < 0) {

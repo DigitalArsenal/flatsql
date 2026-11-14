@@ -399,6 +399,7 @@ struct Stream {
     uint32_t gen = 0;
     int32_t h = -1;
     std::atomic<bool> drop{false};
+    bool unlinking=false; // Feed::smu; prevents a new pin during retirement I/O
     ~Stream();
 };
 
