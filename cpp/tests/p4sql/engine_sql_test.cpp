@@ -7,6 +7,7 @@
 
 #include "flatsql/p4/p4_reader.h"
 #include "p4/p4_test.h"
+#include "internal.h"
 
 using namespace p4t;
 
@@ -140,6 +141,47 @@ FLATSQL_TEST(t_sql_unlimited_visibility) {
     REQUIRE(openEngine(root)==FLATSQL_OK,"reopen for downgrade refusal");
     type.a18=2;
     CHECK_EQ(registerType(type),FLATSQL_E_FORMAT,"bounded downgrade refused");
+    closeEngine(); removeTree(root);
+}
+
+FLATSQL_TEST(t_sql_unlimited_promotion_recovery) {
+    namespace p4 = flatsql::p4;
+    const auto root=scratchDir("promotion_recovery");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=2;
+    REQUIRE(registerType(type)==FLATSQL_OK,"bounded registration");
+    const auto batch=ommBatch(1,8,kSrc,"synthetic");
+    REQUIRE(put(batch).status==FLATSQL_OK,"acknowledged rows");
+    REQUIRE(closeEngine()==FLATSQL_OK,"close");
+    std::vector<uint8_t> original;
+    REQUIRE(p4::ioReadAll(root+"/STORE",&original)==FLATSQL_OK,"original marker");
+    auto promoted=original;
+    p4::st16(promoted.data()+6,2);
+    p4::st32(promoted.data()+56,flatsql::ps::crc32c(promoted.data(),56));
+    for(int phase=0;phase<2;phase++) for(size_t cut=0;cut<=64;cut++) {
+        REQUIRE(p4::ioWriteNew(root+"/STORE",original.data(),original.size())==FLATSQL_OK,"restore baseline");
+        REQUIRE(p4::ioWriteNew(root+"/STORE.unlimited",promoted.data(),phase?64:cut)==FLATSQL_OK,"intent prefix");
+        if(phase) REQUIRE(p4::ioWriteNew(root+"/STORE",promoted.data(),cut)==FLATSQL_OK,"torn overwrite");
+        REQUIRE(openEngine(root)==FLATSQL_OK,"automatic reopen");
+        auto scan=sql("SELECT _seq,_data FROM OMM ORDER BY _seq");
+        // The persisted type policy is still bounded: promotion precedes it.
+        CHECK_EQ(scan.status,FLATSQL_OK,scan.err);
+        CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),2,"no unlimited spec persisted");
+        REQUIRE(closeEngine()==FLATSQL_OK,"close recovered store");
+        std::vector<uint8_t> actual;
+        REQUIRE(p4::ioReadAll(root+"/STORE",&actual)==FLATSQL_OK,"recovered marker");
+        CHECK(actual==(phase||cut==64?promoted:original),"exact recovery marker");
+        CHECK(!p4::ioExists(root+"/STORE.unlimited"),"intent retired");
+    }
+    REQUIRE(openEngine(root)==FLATSQL_OK,"reopen recovered store");
+    type.a18=0; REQUIRE(registerType(type)==FLATSQL_OK,"unlimited registration after recovery");
+    auto scan=sql("SELECT _seq,_data FROM OMM ORDER BY _seq");
+    REQUIRE(scan.status==FLATSQL_OK && scan.rows.size()==8,"all acknowledged records survived");
+    for(size_t i=0;i<8;i++) {
+        CHECK_EQ(scan.i(i,"_seq"),int64_t(i+1),"no gap or duplicate");
+        const auto& f=batch.recs[i].frame;
+        CHECK(scan.s(i,"_data")==std::string(reinterpret_cast<const char*>(f.data()+4),f.size()-4),"exact payload");
+    }
     closeEngine(); removeTree(root);
 }
 

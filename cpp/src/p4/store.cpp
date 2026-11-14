@@ -178,14 +178,45 @@ void randomUuid(uint8_t out[16]) {
     out[8] = uint8_t((out[8] & 0x3f) | 0x80);
 }
 
+int32_t recoverUnlimitedPromotion(Engine* e, std::vector<uint8_t>* store,
+                                 const std::vector<uint8_t>& migrated) {
+    const auto intentPath = pathJoin(e->cfg.root, "STORE.unlimited");
+    if (!ioExists(intentPath)) return FLATSQL_OK;
+    std::vector<uint8_t> intent;
+    if (ioReadAll(intentPath, &intent) != FLATSQL_OK) return FLATSQL_E_IO;
+    Markers pending, existing;
+    decodeMarkers(intent.data(), intent.size(), migrated.data(), migrated.size(), &pending);
+    decodeMarkers(store->data(), store->size(), migrated.data(), migrated.size(), &existing);
+    const bool valid = pending.storeValid && pending.layout == 2 && pending.format == 5 &&
+        pending.migratedValid && pending.migratedFormat == 5 &&
+        std::memcmp(pending.uuid, pending.migratedUuid, 16) == 0;
+    if (!valid) {
+        // An incomplete intent cannot precede a STORE overwrite. Discard it
+        // only when the original activated marker is intact.
+        if (!existing.storeValid || !existing.migratedValid || existing.layout > 2 ||
+            existing.format != 5 || existing.migratedFormat != 5 ||
+            std::memcmp(existing.uuid, existing.migratedUuid, 16) != 0) return FLATSQL_E_FORMAT;
+        return ioUnlink(intentPath);
+    }
+    if (existing.storeValid && (existing.layout > 2 || existing.format != 5 ||
+        existing.gseqFloor != pending.gseqFloor || std::memcmp(existing.uuid, pending.uuid, 16) != 0))
+        return FLATSQL_E_FORMAT;
+    const int32_t rc = ioWriteNew(pathJoin(e->cfg.root, "STORE"), intent.data(), intent.size());
+    if (rc != FLATSQL_OK) return rc;
+    *store = std::move(intent);
+    return ioUnlink(intentPath);
+}
+
 int32_t readMarkers(Engine* e, Markers* m) {
     std::vector<uint8_t> s, g;
     const std::string sp = pathJoin(e->cfg.root, "STORE"), mp = pathJoin(e->cfg.root, "MIGRATED");
     const bool hs = ioExists(sp), hm = ioExists(mp);
     if (hs && ioReadAll(sp, &s) != FLATSQL_OK) return FLATSQL_E_IO;
     if (hm && ioReadAll(mp, &g) != FLATSQL_OK) return FLATSQL_E_IO;
+    const int32_t recovered = recoverUnlimitedPromotion(e, &s, g);
+    if (recovered != FLATSQL_OK) return recovered;
     *m = Markers();
-    decodeMarkers(hs ? s.data() : nullptr, s.size(), hm ? g.data() : nullptr, g.size(), m);
+    decodeMarkers(s.empty() ? nullptr : s.data(), s.size(), hm ? g.data() : nullptr, g.size(), m);
     if (hs && !s.data()) m->storePresent = true;
     if (hm && !g.data()) m->migratedPresent = true;
     return FLATSQL_OK;
@@ -216,10 +247,15 @@ int32_t promoteUnlimitedStore(Engine* e, std::string* err) {
     if (ioReadAll(path, &marker) != FLATSQL_OK || marker.size() != 64) return FLATSQL_E_IO;
     st16(marker.data() + 6, 2);
     st32(marker.data() + 56, ps::crc32c(marker.data(), 56));
-    const int32_t rc = ioWriteNew(path, marker.data(), marker.size());
+    // The synced intent retains the complete marker across a torn overwrite.
+    // It precedes STORE and every unlimited type spec; recovery is idempotent.
+    const auto intent = pathJoin(e->cfg.root, "STORE.unlimited");
+    int32_t rc = ioWriteNew(intent, marker.data(), marker.size());
+    if (rc != FLATSQL_OK) { *err = "unlimited relation intent write failed"; return rc; }
+    rc = ioWriteNew(path, marker.data(), marker.size());
     if (rc != FLATSQL_OK) { *err = "unlimited relation guard write failed"; return rc; }
     e->markers.layout = 2;
-    return FLATSQL_OK;
+    return ioUnlink(intent);
 }
 
 // The type index opened (made when absent), then every feed it names, before
