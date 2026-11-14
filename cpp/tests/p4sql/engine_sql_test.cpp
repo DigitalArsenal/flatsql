@@ -122,6 +122,16 @@ FLATSQL_TEST(t_sql_unlimited_visibility) {
         for(size_t i=0;i<scan.rows.size();++i) CHECK_EQ(scan.i(i,"_seq"),int64_t(i+1),"no gap or duplicate");
         auto raw=sql("SELECT _data FROM OMM",FLATSQL_SLOT_RAW);
         CHECK_EQ(raw.status,FLATSQL_OK,raw.err);
+        std::set<std::vector<uint8_t>> expected;
+        for(const auto& r:batch.recs) expected.insert(r.frame);
+        size_t at=0;
+        while(at+4<=raw.raw.size()) {
+            const size_t n=flatbuffers::ReadScalar<uint32_t>(raw.raw.data()+at)+4;
+            REQUIRE(n>=4 && n<=raw.raw.size()-at,"complete raw frame");
+            CHECK_EQ(expected.erase(std::vector<uint8_t>(raw.raw.begin()+at,raw.raw.begin()+at+n)),size_t(1),"exact raw frame once");
+            at+=n;
+        }
+        CHECK(at==raw.raw.size() && expected.empty(),"complete raw stream");
         CallOpts limit; limit.maxResultRows=3;
         CHECK_EQ(call(FLATSQL_OPC_SQL,sqlReq("SELECT _seq FROM OMM"),limit).status,FLATSQL_E_BUDGET,"explicit budget failure");
         CHECK_EQ(closeEngine(),FLATSQL_OK,"close");

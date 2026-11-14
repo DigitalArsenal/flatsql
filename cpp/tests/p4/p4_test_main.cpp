@@ -547,7 +547,8 @@ Result wait(uint32_t slot, uint64_t timeoutMs) {
                 e->bells[th].doorbell.fetch_add(1);
                 flatsql_wake(reinterpret_cast<uint32_t*>(&e->bells[th].doorbell), 1);
             }
-            if (!dec.feed(buf.data(), k)) {
+            if(h->flags & FLATSQL_SLOT_RAW) res.raw.insert(res.raw.end(),buf.data(),buf.data()+k);
+            else if (!dec.feed(buf.data(), k)) {
                 res.status = -999;
                 res.err = "RB1 decode: " + dec.error();
             }
@@ -571,7 +572,7 @@ Result wait(uint32_t slot, uint64_t timeoutMs) {
         res.status = -997;
         res.err = "RB1E status " + std::to_string(dec.status()) + " != slot status " + std::to_string(h->status);
     }
-    if (!dec.done() && res.status != -999) {
+    if (!(h->flags & FLATSQL_SLOT_RAW) && !dec.done() && res.status != -999) {
         res.status = -996;
         res.err = "no RB1E (" + res.err + ")";
     }
