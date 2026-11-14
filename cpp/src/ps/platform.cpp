@@ -23,6 +23,17 @@ extern "C" int __ulock_wake(uint32_t operation, void* addr, uint64_t wakeValue);
 #  include <climits>
 #endif
 
+// The hardware CRC32C intrinsics (crc32c below). Their headers stay outside
+// the namespace: with GCC 15, <nmmintrin.h> reaches <cstdlib> through
+// <mm_malloc.h>, which declared inside flatsql::ps breaks the build.
+#if !defined(__wasm__) && defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#  include <arm_acle.h>
+#  define PS_HW_CRC32C 1
+#elif !defined(__wasm__) && defined(__x86_64__) && defined(__SSE4_2__)
+#  include <nmmintrin.h>
+#  define PS_HW_CRC32C 2
+#endif
+
 namespace flatsql {
 namespace ps {
 
@@ -163,14 +174,6 @@ inline uint32_t load32le(const uint8_t* p) {
 }
 
 }  // namespace
-
-#if !defined(__wasm__) && defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
-#  include <arm_acle.h>
-#  define PS_HW_CRC32C 1
-#elif !defined(__wasm__) && defined(__x86_64__) && defined(__SSE4_2__)
-#  include <nmmintrin.h>
-#  define PS_HW_CRC32C 2
-#endif
 
 uint32_t crc32c(uint32_t crc, const void* data, size_t len) {
 #if defined(PS_HW_CRC32C)
