@@ -138,3 +138,23 @@ FLATSQL_TEST(t_row_cache_concurrent_miss) {
     CHECK_EQ(loads.load(),1,"miss coalesced");
     CHECK(a==b,"same owned allocation");
 }
+
+FLATSQL_TEST(t_row_cache_failed_load_waiters) {
+    PageCache cache; std::atomic<int> entered{0},loads{0};
+    std::shared_ptr<const int> a,b;
+    auto load=[&] {
+        entered.fetch_add(1);
+        while(entered.load()!=2) std::this_thread::yield();
+        return cache.load<int>("failure",sizeof(int),[&]() -> std::shared_ptr<const int> {
+            ++loads;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            return {};
+        });
+    };
+    std::thread first([&] { a=load(); }); std::thread second([&] { b=load(); });
+    first.join(); second.join();
+    CHECK(!a && !b,"all waiters receive failed load");
+    CHECK_EQ(loads.load(),1,"failed miss coalesced");
+    auto retry=cache.load<int>("failure",sizeof(int),[] { return std::make_shared<const int>(5); });
+    REQUIRE(retry,"later request retries failed admission");
+}

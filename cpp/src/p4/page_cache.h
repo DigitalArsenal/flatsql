@@ -17,10 +17,15 @@ namespace flatsql { namespace p4 {
 // admission fails when pins exhaust the budget. No cache lock covers I/O.
 class PageCache {
     using Clock=std::chrono::steady_clock;
+    struct Flight {
+        bool done=false;
+        std::shared_ptr<const void> value;
+    };
     struct Entry {
         std::shared_ptr<const void> value;
         size_t bytes=0;
         bool loading=true;
+        std::shared_ptr<Flight> flight;
         Clock::time_point touched=Clock::now();
         std::list<std::string>::iterator lru;
     };
@@ -75,7 +80,11 @@ public:
         for(;;) {
             auto it=entries_.find(key);
             if(it==entries_.end()) break;
-            if(it->second.loading) { ready_.wait(g); continue; }
+            if(it->second.loading) {
+                const auto flight=it->second.flight;
+                ready_.wait(g,[&] { return flight->done; });
+                return std::static_pointer_cast<const T>(flight->value);
+            }
             it->second.touched=Clock::now(); lru_.splice(lru_.begin(),lru_,it->second.lru);
             return std::static_pointer_cast<const T>(it->second.value);
         }
@@ -93,20 +102,22 @@ public:
             }
         }
         if(used_>limit_-bytes) return {};
-        lru_.push_front(key); Entry e; e.bytes=bytes; e.lru=lru_.begin();
+        auto flight=std::make_shared<Flight>();
+        lru_.push_front(key); Entry e; e.bytes=bytes; e.lru=lru_.begin(); e.flight=flight;
         entries_.emplace(key,std::move(e)); used_+=bytes; peak_=std::max(peak_,used_);
         g.unlock();
         garbage.clear();
         std::shared_ptr<const T> value;
 #if defined(__cpp_exceptions)
         try { value=loader(); }
-        catch(...) { g.lock(); erase(entries_.find(key),garbage); ready_.notify_all(); throw; }
+        catch(...) { g.lock(); flight->done=true; erase(entries_.find(key),garbage); ready_.notify_all(); throw; }
 #else
         value=loader();
 #endif
         g.lock();
         auto it=entries_.find(key);
-        if(value) { it->second.value=value; it->second.loading=false; it->second.bytes-=workspace; used_-=workspace; }
+        flight->value=value; flight->done=true;
+        if(value) { it->second.value=value; it->second.loading=false; it->second.flight.reset(); it->second.bytes-=workspace; used_-=workspace; }
         else erase(it,garbage);
         ready_.notify_all(); return value;
     }
