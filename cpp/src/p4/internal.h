@@ -456,8 +456,8 @@ struct Feed {
     bool checkpointPreparing = false;
     uint64_t checkpointRetryAt = 0;  // after a failed preparation (monoNs)
     std::shared_ptr<CheckpointState> checkpoint; // immutable checkpoint state, Type::mu
-    // The FlatBuffer row orders (fsg.cpp; fsgMu): the current view, and the
-    // ROWS_BY_* segments read so far, by (generation, offset).
+    // Current row-order views (fsg.cpp; fsgMu). Cache admission owns their
+    // descriptors; these weak references cannot pin inactive feed views.
     std::mutex fsgMu;
     std::weak_ptr<const FsgView> fsg[2];
     bool fsgVerifying = false;  // queued on the checkpoint worker
