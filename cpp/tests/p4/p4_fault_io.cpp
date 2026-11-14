@@ -55,6 +55,7 @@ namespace {
 // retain the seeded random operation schedule and all five device modes.
 std::atomic<int> stateFaultKind{0};
 std::atomic<int> stateFaultHits{0};
+std::atomic<int> specFailureMode{0},specFailureHandle{-1};
 FaultFs& faultFs() {
     static FaultFs* fs = new FaultFs(true);
     return *fs;
@@ -77,9 +78,15 @@ bool p4ListStreams(const std::string& directory, std::vector<std::string>* names
 } }  // namespace flatsql::p4
 
 extern "C" {
-int32_t flatsql_io_open(const char* path, int32_t pathLen, int32_t flags) { return faultFs().open(path, pathLen, flags); }
+int32_t flatsql_io_open(const char* path, int32_t pathLen, int32_t flags) {
+    const int32_t h=faultFs().open(path,pathLen,flags);
+    const std::string name(path,size_t(pathLen));
+    if(specFailureMode.load() && name.size()>=5 && name.compare(name.size()-5,5,".spec")==0 && (flags&FLATSQL_IO_TRUNC)) specFailureHandle.store(h);
+    return h;
+}
 int32_t flatsql_io_read(int32_t h, void* dst, int32_t len, double off) { return faultFs().read(h, dst, len, off); }
 int32_t flatsql_io_write(int32_t h, const void* src, int32_t len, double off) {
+    if(h==specFailureHandle.load() && specFailureMode.load()==1) { specFailureMode.store(0); return FLATSQL_IO_ERR_IO; }
     const int kind=stateFaultKind.load();
     const auto* p=static_cast<const uint8_t*>(src);
     if(kind && off>0 && len>=12 && !std::memcmp(p+8,kind==1?"$FSG":"$FCK",4) && stateFaultKind.exchange(0)==kind) {
@@ -93,7 +100,10 @@ int32_t flatsql_io_write(int32_t h, const void* src, int32_t len, double off) {
     return faultFs().write(h, src, len, off);
 }
 int32_t flatsql_io_truncate(int32_t h, double size) { return faultFs().truncate(h, size); }
-int32_t flatsql_io_sync(int32_t h) { return faultFs().sync(h); }
+int32_t flatsql_io_sync(int32_t h) {
+    if(h==specFailureHandle.load() && specFailureMode.load()==2) { specFailureMode.store(0); return FLATSQL_IO_ERR_IO; }
+    return faultFs().sync(h);
+}
 double flatsql_io_size(int32_t h) { return faultFs().size(h); }
 int32_t flatsql_io_close(int32_t h) { return faultFs().close(h); }
 }
@@ -394,6 +404,25 @@ FLATSQL_SLOW_TEST(t_power_loss) {
     }
     std::printf("  t_power_loss: %d pass, %d fail of %d rounds\n", pass, fail, pass + fail);
     CHECK_EQ(fail, 0, "every round");
+}
+
+FLATSQL_TEST(t_rejected_spec_does_not_recover) {
+    auto& fs=faultFs();
+    for(int mode=0;mode<3;mode++) {
+        const auto root="/rejected-spec/"+std::to_string(mode);
+        auto type=faultType(); type.a18=2; type.fullText=false;
+        REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+        REQUIRE(registerType(type)==FLATSQL_OK,"original registration");
+        if(mode==0) fs.failSyncs(".spec.intent",1);
+        else specFailureMode.store(mode);
+        type.a18=3;
+        CHECK_EQ(registerType(type),FLATSQL_E_IO,"injected replacement error");
+        CHECK(!fs.exists(root+"/T/PNM.spec.intent"),"rejected intent removed");
+        REQUIRE(closeEngine()==FLATSQL_OK,"close");
+        REQUIRE(openEngine(root)==FLATSQL_OK,"reopen");
+        CHECK_EQ(fp::currentEngine()->findType("PNM")->spec()->a18Bound,2u,"rejected policy never becomes effective");
+        REQUIRE(closeEngine()==FLATSQL_OK,"close recovered");
+    }
 }
 
 FLATSQL_TEST(t_unlimited_promotion_power_loss) {
