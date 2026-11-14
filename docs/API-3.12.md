@@ -27,6 +27,10 @@ There are no PS/P4 selectors, old engine aliases, or compatibility modes.
   quarantined feeds. A filtered count retains scan budgets: metadata bytes,
   and payload bytes when its predicate requires payload hydration, are charged
   to bytes read; returned rows are charged separately.
+  Uncheckpointed tails use the SQLite snapshot index without retaining another
+  row-order vector. The cache budget does not bound all engine allocations.
+  Metadata-only relations are trusted storage surfaces: the public catalog and
+  sandbox exclude them, including CID, count and raw-record queries.
 - `ingest(type, records, metadata)` accepts concatenated frames:
   `[u32 little-endian payload length][FlatBuffer payload]`. The guest validates
   records, computes identities, persists streams and updates indexes. Provider,
