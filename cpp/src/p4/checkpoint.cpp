@@ -375,10 +375,11 @@ int32_t checkpointVerifyPairs(Feed* f,Stream* stream,const CheckpointSegment& de
     if(fresh) *fresh=false;
     if(desc.kind<kFsgSeq || desc.kind>kFsgMaxKind) return FLATSQL_E_ARG;
     const auto key=verifiedKey(stream,desc.offset,desc.length,desc.digest);
+    if(auto failed=f->type->e->rowCache->find<int32_t>(key+"/failed")) return *failed;
     if(auto value=f->type->e->rowCache->find<FsgVerified>(key)) {
         std::lock_guard<std::mutex> g(gVerifiedMu); gVerifyStats.reused++; *out=std::move(value); return FLATSQL_OK;
     }
-    int32_t status=FLATSQL_E_BUDGET;
+    int32_t status=FLATSQL_E_CACHE_BUDGET;
     *out=f->type->e->rowCache->load<FsgVerified>(key,sizeof(FsgVerified)+size_t((desc.entries+FsgRun::kPage-1)/FsgRun::kPage)*sizeof(FsgPairV),[&]() -> std::shared_ptr<const FsgVerified> {
     status=FLATSQL_E_CORRUPT;
     // Verify the table header with a temporarily empty PAIRS vector, then
@@ -447,6 +448,9 @@ int32_t checkpointVerifyPairs(Feed* f,Stream* stream,const CheckpointSegment& de
     if(fresh) *fresh=true;
     return ver;
     },(128u<<10)+1024,&status);
+    if(!*out && status==FLATSQL_E_CORRUPT) {
+        f->type->e->rowCache->load<int32_t>(key+"/failed",sizeof(int32_t),[] { return std::make_shared<const int32_t>(FLATSQL_E_CORRUPT); });
+    }
     return *out?FLATSQL_OK:status;
 }
 

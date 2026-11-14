@@ -107,13 +107,10 @@ int32_t loadTypes(LaneState* ls, std::string* err) {
         t.bound = ti.a18Bound;
         std::string e;
         if(!schemaColumns(t.name, ti.bfbs, ti.bfbsLen, &t.cols, &e)) {
-            auto prior=ls->hiddenReasons.find(key);
-            if(prior==ls->hiddenReasons.end() || prior->second!=e)
+            if(p4_report_hidden_once(ls->lane,ti.name))
                 std::fprintf(stderr,"FlatSQL: SQL relation %s hidden: %s\n",t.name.c_str(),e.c_str());
-            ls->hiddenReasons[key]=e;
             continue;
         }
-        ls->hiddenReasons.erase(key);
         mapCols(&t, rulesOf(ti));
         ls->types.emplace(key, std::move(t));
     }

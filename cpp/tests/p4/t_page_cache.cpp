@@ -39,6 +39,10 @@ FLATSQL_TEST(t_row_cache_large_segment) {
     FsgRun absent;
     CHECK_EQ(checkpointReadPairs(&feed,stream,desc,&absent),FLATSQL_E_BUSY,"evicted verification never hashes on reader");
     CHECK_EQ(fsgVerifyStats().hashed,hashes,"reader hash count unchanged");
+    auto corrupt=desc; corrupt.digest[0]^=1;
+    CHECK_EQ(checkpointVerifyPairs(&feed,stream.get(),corrupt,&verified),FLATSQL_E_CORRUPT,"bad digest");
+    flatsql_io_close(stream->h); stream->h=-1;
+    CHECK_EQ(checkpointVerifyPairs(&feed,stream.get(),corrupt,&verified),FLATSQL_E_CORRUPT,"negative cache avoids rereading closed stream");
     stream.reset(); run.stream.reset(); engine.rowCache->trim(std::chrono::seconds(0));
     removeTree(root);
 }
@@ -131,11 +135,15 @@ FLATSQL_TEST(t_row_cache_concurrent_miss) {
     PageCache cache; std::atomic<int> loads{0};
     std::shared_ptr<const int> a,b;
     auto load=[&] { return cache.load<int>("shared",sizeof(int),[&] {
-        ++loads; std::this_thread::sleep_for(std::chrono::milliseconds(10)); return std::make_shared<const int>(3);
+        ++loads;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(!cache.coalesced() && loads.load()==1 && std::chrono::steady_clock::now()<deadline) std::this_thread::yield();
+        return std::make_shared<const int>(3);
     }); };
     std::thread t([&] { a=load(); }); b=load(); t.join();
     REQUIRE(a && b,"both readers");
     CHECK_EQ(loads.load(),1,"miss coalesced");
+    CHECK_EQ(cache.coalesced(),size_t(1),"second caller waited on an in-flight load");
     CHECK(a==b,"same owned allocation");
 }
 

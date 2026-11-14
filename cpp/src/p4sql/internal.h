@@ -200,7 +200,6 @@ struct LaneState {
     LaneArena* arena = nullptr;   // sandboxed statements' heap, made at the first one
     sqlite3* db = nullptr;
     std::map<std::string, TypeEntry> types;      // key: lower-case name
-    std::map<std::string, std::string> hiddenReasons;
     std::map<std::string, Relation> relations;   // key: lower-case relation name
     uint64_t gen = 0;                            // the running statement's number
     Stmt* cur = nullptr;

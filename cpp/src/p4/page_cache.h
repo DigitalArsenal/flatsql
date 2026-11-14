@@ -36,6 +36,7 @@ class PageCache {
     std::map<std::string,Entry> entries_;
     std::list<std::string> lru_;
     size_t limit_=32u<<20,used_=0,peak_=0;
+    size_t coalesced_=0;
     using Garbage=std::vector<std::shared_ptr<const void>>;
     void erase(std::map<std::string,Entry>::iterator it,Garbage& garbage) {
         garbage.push_back(std::move(it->second.value));
@@ -45,6 +46,7 @@ public:
     void configure(size_t bytes) { std::lock_guard<std::mutex> g(mu_); limit_=bytes; }
     size_t used() { std::lock_guard<std::mutex> g(mu_); return used_; }
     size_t peak() { std::lock_guard<std::mutex> g(mu_); return peak_; }
+    size_t coalesced() { std::lock_guard<std::mutex> g(mu_); return coalesced_; }
     // Evict idle unpinned entries; zero age supports explicit pressure trimming.
     void trim(std::chrono::seconds age=std::chrono::seconds(30)) {
         Garbage garbage;
@@ -83,6 +85,7 @@ public:
             auto it=entries_.find(key);
             if(it==entries_.end()) break;
             if(it->second.loading) {
+                ++coalesced_;
                 const auto flight=it->second.flight;
                 ready_.wait(g,[&] { return flight->done; });
                 if(completionStatus) *completionStatus=flight->status;

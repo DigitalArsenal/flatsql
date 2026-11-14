@@ -532,6 +532,7 @@ struct Type {
     // The type index exists (the type has had a write, or it was on disk at
     // open). Set once, under openMu; readers check it first.
     std::atomic<bool> hasFiles{false};
+    std::atomic<bool> sqlHiddenReported{false};
     std::mutex openMu;
     std::shared_ptr<const Spec> spec_;  // mu
     std::shared_ptr<const Spec> spec() {

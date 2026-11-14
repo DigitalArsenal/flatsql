@@ -78,6 +78,7 @@ Cell intCell(int64_t v) {
 
 // Characterizes the bounded relation before explicit unlimited registration.
 FLATSQL_TEST(t_sql_bounded_visibility) {
+    // Characterization: bounded relations retain the shipped visibility policy.
     const auto root=scratchDir("bounded_visibility");
     REQUIRE(openEngine(root)==FLATSQL_OK,"open");
     auto type=ommType(); type.a18=2;
@@ -328,6 +329,30 @@ FLATSQL_TEST(t_sql_registration_preflight) {
     CHECK_EQ(registerType(type),FLATSQL_E_ARG,"new invalid rules rejected before openType");
     CHECK(!p4::ioExists(root+"/T/OMM.spec"),"invalid registration writes no spec");
     CHECK_EQ(p4::currentEngine()->markers.layout,1,"invalid registration keeps layout");
+    closeEngine(); removeTree(root);
+}
+
+FLATSQL_TEST(t_sql_unlimited_keyset_with_ingest) {
+    const auto root=scratchDir("unlimited_keyset_ingest");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=2;
+    REQUIRE(registerType(type)==FLATSQL_OK,"bounded registration");
+    REQUIRE(put(ommBatch(1,512,kSrc,"initial")).status==FLATSQL_OK,"initial rows");
+    CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),2,"warm readers under bounded policy");
+    type.a18=0; REQUIRE(registerType(type)==FLATSQL_OK,"promote with readers already used");
+    CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),512,"cached readers see new policy");
+    REQUIRE(closeEngine()==FLATSQL_OK,"checkpoint close");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"reopen");
+    REQUIRE(put(ommBatch(513,40,kSrc,"tail")).status==FLATSQL_OK,"uncheckpointed staged rows");
+    int64_t last=0;
+    for(;;) {
+        auto page=sql("SELECT _seq FROM OMM WHERE _seq>"+std::to_string(last)+" ORDER BY _seq LIMIT 17");
+        REQUIRE(page.status==FLATSQL_OK,page.err);
+        if(page.rows.empty()) break;
+        for(size_t i=0;i<page.rows.size();i++) { CHECK_EQ(page.i(i,"_seq"),last+1,"no keyset gap or duplicate"); last++; }
+    }
+    CHECK_EQ(last,553-1,"all initial and staged rows");
+    CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),last,"keyset equals count");
     closeEngine(); removeTree(root);
 }
 

@@ -3653,11 +3653,18 @@ int32_t p4_feed_sources(P4Lane* lane, const char* type, const char* const** out,
     return laneSources(lane, type, false, out, n);
 }
 
+int32_t p4_report_hidden_once(P4Lane* lane, const char* type) {
+    if(!lane || !type) return 0;
+    auto* t=lane->e->findType(type);
+    return t && !t->sqlHiddenReported.exchange(true);
+}
+
 int64_t p4_type_rows(P4Lane* lane, const char* type) {
     if (!lane || !type) return FLATSQL_E_ARG;
     flatsql::p4::Type* t = lane->e->findType(type);
     if (!t) return FLATSQL_E_NOTYPE;
     std::lock_guard<std::mutex> g(t->mu);
+    if(t->spec()->a18Bound) return t->totals().recs; // Preserve the shipped bounded COUNT result.
     const auto visible=t->vis.load(std::memory_order_acquire);
     for(const auto& f:t->feeds) {
         if(f->created && f->quarantined) return FLATSQL_E_CORRUPT;

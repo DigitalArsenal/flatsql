@@ -39,7 +39,11 @@ guard covers normal registration and interrupted writes, not manual file edits.
 
 Config tag 51 (`rowCacheBytes` in JavaScript) sets the shared row-order page and
 verified-metadata budget; its default is 32 MiB. Owning page views retain their
-stream generation. Pins and temporary loads count against admission. Duplicate
+stream generation. The 16 KiB minimum permits SQLite fallback; row-order
+verification requires a 129 KiB workspace plus metadata, so it cannot run at
+that minimum. Committed tails enter the same cache before row-order use;
+tails whose reservation cannot fit use SQLite.
+Pins and temporary loads count against admission. Duplicate
 misses share a load, idle entries expire after 30 seconds, and the cache evicts
 unpinned entries to admit new pages. Exhausted pins produce `FLATSQL_E_BUDGET`.
 Large verification work that exceeds this budget leaves the SQLite reader

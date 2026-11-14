@@ -83,6 +83,7 @@ int32_t   p4_sources(P4Lane* lane, const char* type, const char* const** out, ui
 int32_t   p4_feed_sources(P4Lane* lane, const char* type, const char* const** out, uint32_t* n); /* the sources of every feed
                                                                the type has, records or none (relation names, C-43 B3) */
 int64_t   p4_visible_through(P4Engine* e, const char* type);
+int32_t   p4_report_hidden_once(P4Lane* lane, const char* type);
 int64_t   p4_type_rows(P4Lane* lane, const char* type);   /* the type's records (copies once, as a scan returns
                                                                them); -1 for an unknown type */
 uint64_t  p4_lane_heap_cap(P4Lane* lane);            /* v2, C-18: slot sandbox heap cap (tag 48, else default) */
