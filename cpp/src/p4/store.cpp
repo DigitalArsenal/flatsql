@@ -701,6 +701,9 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
     }
     if (validateOnly) return FLATSQL_OK;
     const std::string tdir = pathJoin(e->cfg.root, "T");
+    // Create the catalog's parent before SQLite opens a new type index.
+    rc = ioAppend(pathJoin(tdir, "TYPES"), nullptr, 0);
+    if (rc != FLATSQL_OK) { *err="type directory creation failed"; return rc; }
     auto t = std::make_unique<Type>();
     rc = openType(e, t.get(), spec, err, true);
     if (rc != FLATSQL_OK) return rc;
@@ -724,7 +727,11 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
     rc = writeSpec(pathJoin(tdir, spec->name + ".spec"), fb);
     if (rc != FLATSQL_OK) { *err = "spec write failed"; return fail(rc); }
     rc = catalogAppend(pathJoin(tdir, "TYPES"), spec->name);
-    if (rc != FLATSQL_OK) { *err = "type catalog write failed"; return fail(rc); }
+    if (rc != FLATSQL_OK) {
+        ioUnlink(t->pSpec+".intent");
+        ioUnlink(t->pSpec);
+        *err = "type catalog write failed"; return fail(rc);
+    }
     e->typeByName[spec->name] = t.get();
     e->types.push_back(std::move(t));
     return FLATSQL_OK;
