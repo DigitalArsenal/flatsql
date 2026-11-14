@@ -69,8 +69,11 @@ std::shared_ptr<const FsgView> fsgView(Feed* f,Conn* c,uint8_t kind,int64_t vis)
     { std::lock_guard<std::mutex> g(f->type->mu); ck=f->checkpoint; previous=f->lastCommit; mark=uint64_t(f->mark); }
     if(!ck) return nullptr;
     const bool hasTail=previous!=ck->offset || !ck->current;
-    if(mark<ck->appliedThrough) return nullptr;
-    const uint64_t span=hasTail?mark-ck->appliedThrough:0;
+    // A current checkpoint ends the walk at its manifest. Its row-order
+    // segments precede that manifest and are read through their own pages.
+    const uint64_t tailStart=ck->current?ck->offset:ck->appliedThrough;
+    if(mark<tailStart) return nullptr;
+    const uint64_t span=hasTail?mark-tailStart:0;
     if(span>SIZE_MAX/16) return nullptr;
     // A checkpoint whose live rows have no row orders (written before they
     // existed): the SQLite index answers until the next checkpoint folds them.
