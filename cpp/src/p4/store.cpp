@@ -622,12 +622,17 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
         const std::string sp = pathJoin(pathJoin(e->cfg.root, "T"), name + ".spec");
         rc = recoverSpec(sp, &fb);
         if (rc != FLATSQL_OK || !specFromFile(fb, &tlv)) {
-            *err = name + ": registered type spec is unreadable or corrupt";
+            if (m.layout < 2) continue; // The host restores bounded registrations.
+            *err = sp + ": registered type spec is unreadable or corrupt; restore the spec from a valid backup before reopening layout 2";
             return rc != FLATSQL_OK ? rc : FLATSQL_E_CORRUPT;
         }
         std::shared_ptr<Spec> spec;
         std::string e2;
-        if (buildSpec(tlv.data(), tlv.size(), &spec, &e2) != FLATSQL_OK || spec->name != name) continue;
+        if (buildSpec(tlv.data(), tlv.size(), &spec, &e2) != FLATSQL_OK || spec->name != name) {
+            if (m.layout < 2) continue;
+            *err = sp + ": invalid registered spec; restore the spec from a valid backup before reopening layout 2";
+            return FLATSQL_E_CORRUPT;
+        }
         if(!spec->a18Bound) {
             if ((rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return rc;
             e->unlimitedRelations=true;

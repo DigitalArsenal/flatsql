@@ -291,6 +291,28 @@ FLATSQL_TEST(t_sql_registration_recovery_and_validation) {
     removeTree(root);
 }
 
+FLATSQL_TEST(t_sql_bounded_spec_recovery) {
+    namespace p4 = flatsql::p4;
+    const auto root=scratchDir("bounded_spec_recovery");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+    auto type=ommType(); type.a18=2;
+    REQUIRE(registerType(type)==FLATSQL_OK,"bounded registration");
+    REQUIRE(put(ommBatch(1,3,kSrc,"synthetic")).status==FLATSQL_OK,"durable data");
+    REQUIRE(closeEngine()==FLATSQL_OK,"close");
+    const auto path=root+"/T/OMM.spec";
+    const uint8_t torn=0;
+    REQUIRE(p4::ioWriteNew(path,&torn,1)==FLATSQL_OK,"torn spec");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"bounded store skips torn spec");
+    REQUIRE(registerType(type)==FLATSQL_OK,"host restores registration");
+    CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),2,"bounded data preserved");
+    type.a18=0;
+    REQUIRE(registerType(type)==FLATSQL_OK,"promote");
+    REQUIRE(closeEngine()==FLATSQL_OK,"close promoted");
+    REQUIRE(p4::ioWriteNew(path,&torn,1)==FLATSQL_OK,"torn unlimited spec");
+    CHECK_EQ(openEngine(root),FLATSQL_E_CORRUPT,"layout 2 refuses hidden unlimited type");
+    removeTree(root);
+}
+
 FLATSQL_TEST(t_sql_cid_only_not_queryable) {
     const auto root=scratchDir("metadata_only_visibility");
     REQUIRE(openEngine(root)==FLATSQL_OK,"open");
