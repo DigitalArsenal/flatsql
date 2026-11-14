@@ -909,18 +909,23 @@ void slowLoop(Engine* e) {
             for (Feed* f : fs) {
                 std::vector<std::shared_ptr<Stream>> gone;
                 std::lock_guard<std::mutex> g(f->smu);
-                if (f->retired && now >= f->retireAt && streamGenerationReleased(f, f->retired->gen)) {
-                    f->retired->drop.store(true);
+                auto removeReleased = [&](const std::shared_ptr<Stream>& stream) {
+                    e->rowCache->dropPrefix(stream->path+"/"+std::to_string(stream->gen)+"/");
+                    // External views keep both the file and its quota charge.
+                    if(stream.use_count()!=1 || !streamGenerationReleased(f,stream->gen)) return false;
+                    if(ioUnlink(stream->path)!=FLATSQL_OK) return false;
+                    stream->drop.store(false);
+                    e->bump(kStUnlinked);
+                    return true;
+                };
+                if (f->retired && now >= f->retireAt && removeReleased(f->retired)) {
                     gone.push_back(std::move(f->retired));
                     f->retiredBytes = 0;
-                    e->bump(kStUnlinked);
                 }
                 for (auto it = f->olderRetired.begin(); it != f->olderRetired.end();) {
-                    if (now < it->retireAt || !streamGenerationReleased(f, it->stream->gen)) { ++it; continue; }
-                    it->stream->drop.store(true);
+                    if (now < it->retireAt || !removeReleased(it->stream)) { ++it; continue; }
                     gone.push_back(std::move(it->stream));
                     it = f->olderRetired.erase(it);
-                    e->bump(kStUnlinked);
                 }
             }
             for (uint32_t fid : due) {

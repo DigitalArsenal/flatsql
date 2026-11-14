@@ -74,6 +74,21 @@ FLATSQL_TEST(t_row_cache_admission) {
     CHECK_EQ(cache.used(),size_t(0),"idle release");
 }
 
+FLATSQL_TEST(t_row_cache_destruction_unlocked) {
+    PageCache cache; cache.configure(4096);
+    bool destroyed=false;
+    auto value=cache.load<int>("generation/page/1",2000,[&] {
+        return std::shared_ptr<const int>(new int(7),[&](const int* p) {
+            // Reentering the cache deadlocks if destruction holds its mutex.
+            CHECK(cache.used()<=4096,"destructor runs outside cache mutex");
+            destroyed=true; delete p;
+        });
+    });
+    value.reset(); cache.dropPrefix("generation/");
+    CHECK(destroyed,"retirement drops unpinned generation pages");
+    CHECK_EQ(cache.used(),size_t(0),"retirement accounting");
+}
+
 FLATSQL_TEST(t_row_cache_scan_and_generation_pin) {
     const auto root=scratchDir("row_cache");
     const auto path=root+"/pairs.bin";
