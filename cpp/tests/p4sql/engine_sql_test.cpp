@@ -360,9 +360,9 @@ FLATSQL_TEST(t_sql_unlimited_reader_mutations) {
         auto fresh=sql("SELECT _seq,_data FROM OMM ORDER BY _seq");
         REQUIRE(fresh.status==FLATSQL_OK && fresh.rows.size()==1,"new reader sees only retained batch");
         CHECK_EQ(sql("SELECT COUNT(*) AS n FROM OMM").i(0,"n"),1,"count agrees");
-        for(size_t i:{size_t(1),size_t(1535)}) {
+        for(size_t i:{size_t(0),size_t(1),size_t(1535)}) {
             uint8_t cid[36]; cidOf(batch.recs[i].frame,cid);
-            CHECK(sql("SELECT _seq FROM OMM WHERE _cid='"+cidText(cid)+"'").rows.empty(),"deleted record stays invisible");
+            CHECK(sql("SELECT _seq FROM OMM WHERE _cid='"+cidText(cid)+"'").rows.empty(),"deleted or superseded record stays invisible");
         }
         REQUIRE(closeEngine()==FLATSQL_OK,"close");
         if(!pass) REQUIRE(openEngine(root)==FLATSQL_OK,"reopen");
@@ -379,6 +379,15 @@ FLATSQL_TEST(t_sql_cid_equality_semantics) {
     REQUIRE(put(batch).status==FLATSQL_OK,"put");
     auto other=ommBatch(20,1,"another-feed","synthetic");
     REQUIRE(put(other).status==FLATSQL_OK,"other feed");
+    auto foreignType=type; foreignType.name="OTHER"; foreignType.bfbs.clear(); foreignType.rules.clear(); foreignType.flags=2;
+    std::memcpy(foreignType.fid,"$OTH",4);
+    REQUIRE(registerType(foreignType)==FLATSQL_OK,"register other type");
+    auto foreign=ommBatch(9000,1,"other-type","synthetic"); foreign.type="OTHER";
+    std::memcpy(foreign.recs[0].frame.data()+8,"$OTH",4);
+    REQUIRE(put(foreign).status==FLATSQL_OK,"put other type");
+    uint8_t foreignCid[36]; cidOf(foreign.recs[0].frame,foreignCid);
+    CHECK_EQ(sql("SELECT _cid FROM OTHER").rows.size(),size_t(1),"other type has record");
+    CHECK(sql("SELECT _seq FROM OMM WHERE _cid='"+cidText(foreignCid)+"'").rows.empty(),"CID pushdown excludes other type");
     uint8_t cid[36]; cidOf(batch.recs[0].frame,cid);
     const auto text=cidText(cid); std::string upper=text;
     for(auto& c:upper) if(c>='a' && c<='z') c=char(c-'a'+'A');
