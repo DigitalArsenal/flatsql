@@ -35,7 +35,7 @@ FsgPairV FsgRun::at(size_t i,int32_t* status) const {
 // Interpolation on KEY_HI (rids and object ids are dense), one page a step,
 // then a binary search inside the page it lands in.
 size_t FsgRun::lowerBound(const FsgPairV& key,int32_t* status) const {
-    const auto fences=verified.lock();
+    const auto fences=cache ? cache->find<FsgVerified>(cacheKey) : verified.lock();
     if(fences && !fences->fences.empty()) {
         // The fence keys (in memory) name the one page the answer lies in.
         const auto& fc=fences->fences;
@@ -69,22 +69,27 @@ std::shared_ptr<const FsgView> fsgView(Feed* f,Conn* c,uint8_t kind,int64_t vis)
     // existed): the SQLite index answers until the next checkpoint folds them.
     if(ck->counters.rows>0 && !checkpointHasRowOrders(*ck,kind)) return nullptr;
     std::unique_lock<std::mutex> g(f->fsgMu);
-    if(f->fsg[k] && f->fsg[k]->ck==ck && f->fsg[k]->previous==previous) return f->fsg[k];
     int32_t st=FLATSQL_OK; auto stream=streamCur(f,&st);
     if(!stream || st!=FLATSQL_OK) return nullptr;
     // No reader hashes: a segment not yet checked in this process is checked
     // on the checkpoint worker, and until then the SQLite index answers.
     for(const auto& d:ck->segments)
-        if(d.kind==kind && !f->fsgSegments.count({stream->gen,d.offset}) && !checkpointPairsVerified(f,stream.get(),d)) {
+        if(d.kind==kind && !checkpointPairsVerified(f,stream.get(),d)) {
             const bool queue=!f->fsgVerifying; g.unlock();
             if(queue) fsgVerifySchedule(f);
             return nullptr;
         }
+    if(f->fsg[k] && f->fsg[k]->ck==ck && f->fsg[k]->previous==previous) return f->fsg[k];
     auto v=std::make_shared<FsgView>(); v->ck=ck; v->previous=previous;
     for(const auto& d:ck->segments) {
         if(d.kind!=kind) continue;
         auto& slot=f->fsgSegments[{stream->gen,d.offset}];
-        if(!slot) { auto run=std::make_shared<FsgRun>(); if(checkpointReadPairs(f,stream,d,run.get())!=FLATSQL_OK) { f->fsgSegments.erase({stream->gen,d.offset}); return nullptr; } slot=std::move(run); }
+        if(!slot) { auto run=std::make_shared<FsgRun>(); if(checkpointReadPairs(f,stream,d,run.get())!=FLATSQL_OK) {
+            f->fsgSegments.erase({stream->gen,d.offset});
+            const bool queue=!f->fsgVerifying; g.unlock();
+            if(queue) fsgVerifySchedule(f);
+            return nullptr;
+        } slot=std::move(run); }
         v->runs[k].push_back(slot);
     }
     bool complete=true;

@@ -381,28 +381,79 @@ int32_t checkpointVerifyPairs(Feed* f,Stream* stream,const CheckpointSegment& de
     int32_t status=FLATSQL_E_BUDGET;
     *out=f->type->e->rowCache->load<FsgVerified>(key,sizeof(FsgVerified)+size_t((desc.entries+FsgRun::kPage-1)/FsgRun::kPage)*sizeof(FsgPairV),[&]() -> std::shared_ptr<const FsgVerified> {
     status=FLATSQL_E_CORRUPT;
-    // First load in this process: the whole segment, its digest and
-    // structure, as every other segment kind is checked when it is read.
+    // Verify the table header with a temporarily empty PAIRS vector, then
+    // hash and check the actual vector in bounded chunks. The generated
+    // verifier still validates every other field in the header.
     const uint64_t t0=ps::monoNs();
-    std::vector<uint64_t> storage; uint32_t n=0;
-    int32_t rc=frame(stream,desc.offset,&storage,&n); if(rc!=FLATSQL_OK || n!=desc.length) return {};
-    const auto* p=reinterpret_cast<const uint8_t*>(storage.data());
-    std::array<uint8_t,32> digest{}; ps::sha256(p,n,digest.data()); if(digest!=desc.digest) return {};
-    flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return {};
+    constexpr size_t chunk=64u<<10;
+    std::string prefix;
+    int32_t rc=streamReadRange(stream,int64_t(desc.offset),4,&prefix);
+    if(rc!=FLATSQL_OK) { status=rc; return {}; }
+    if(prefix.size()!=4 || ld32(reinterpret_cast<const uint8_t*>(prefix.data()))!=desc.length) return {};
+    const uint32_t n=desc.length;
+    std::string header;
+    rc=streamReadRange(stream,int64_t(desc.offset+4),std::min<size_t>(n,chunk),&header);
+    if(rc!=FLATSQL_OK) { status=rc; return {}; }
+    const size_t size=header.size();
+    if(size<8) return {};
+    auto* p=reinterpret_cast<uint8_t*>(&header[0]);
+    const uint64_t table=ld32(p);
+    if(table>size-4) return {};
+    const int64_t vt=int64_t(table)-int32_t(ld32(p+table));
+    if(vt<0 || uint64_t(vt)>size-4) return {};
+    const uint16_t vn=ld16(p+vt),tn=ld16(p+vt+2);
+    if(vn<=FSG::VT_PAIRS+1 || vn>size-uint64_t(vt) || tn<4 || tn>size-table) return {};
+    const uint16_t slot=ld16(p+vt+FSG::VT_PAIRS);
+    if(slot<4 || slot>tn-4) return {};
+    const uint64_t vec=table+slot+ld32(p+table+slot);
+    if(vec>size-4) return {};
+    const uint64_t entries=ld32(p+vec),base=vec+4;
+    if(entries!=desc.entries || base>n || entries>(n-base)/sizeof(FsgPairV)) return {};
+    st32(p+vec,0);
+    flatbuffers::Verifier v(p,size); if(!VerifyFSGBuffer(v)) return {};
     const auto* s=GetFSG(p);
     if(s->SELF_OFFSET()!=desc.offset || s->FEED_ID()!=f->fid || s->KIND()!=desc.kind || s->LEVEL()!=desc.level ||
-       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || !s->PAIRS() || s->PAIRS()->size()!=desc.entries) return {};
-    auto ver=pairsLayout(p,desc.offset,true); if(!ver) return {};
+       s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq) return {};
+    st32(p+vec,uint32_t(entries));
+    auto ver=std::make_shared<FsgVerified>(); ver->n=entries; ver->base=desc.offset+4+base;
+    ver->fences.reserve(size_t((entries+FsgRun::kPage-1)/FsgRun::kPage));
+    ps::Sha256 hash; hash.update(p,size_t(base));
+    FsgPairV previous{};
+    for(uint64_t first=0;first<entries;) {
+        const size_t count=size_t(std::min<uint64_t>(entries-first,chunk/sizeof(FsgPairV)));
+        std::string bytes;
+        rc=streamReadRange(stream,int64_t(ver->base+first*sizeof(FsgPairV)),count*sizeof(FsgPairV),&bytes);
+        if(rc!=FLATSQL_OK) { status=rc; return {}; }
+        if(bytes.size()!=count*sizeof(FsgPairV)) return {};
+        hash.update(bytes.data(),bytes.size());
+        const auto* q=reinterpret_cast<const uint8_t*>(bytes.data());
+        for(size_t i=0;i<count;i++,q+=sizeof(FsgPairV)) {
+            const FsgPairV pair{ld64(q),ld64(q+8),ld64(q+16),ld64(q+24)};
+            if(first+i && pair<previous) return {};
+            if((first+i)%FsgRun::kPage==0) ver->fences.push_back(pair);
+            previous=pair;
+        }
+        first+=count;
+    }
+    for(uint64_t at=base+entries*sizeof(FsgPairV);at<n;) {
+        const size_t count=size_t(std::min<uint64_t>(n-at,chunk));
+        std::string bytes; rc=streamReadRange(stream,int64_t(desc.offset+4+at),count,&bytes);
+        if(rc!=FLATSQL_OK) { status=rc; return {}; }
+        if(bytes.size()!=count) return {};
+        hash.update(bytes.data(),bytes.size()); at+=count;
+    }
+    std::array<uint8_t,32> digest{}; hash.finish(digest.data()); if(digest!=desc.digest) return {};
     { std::lock_guard<std::mutex> g(gVerifiedMu); gVerifyStats.hashed++; gVerifyStats.hashedBytes+=n; gVerifyStats.hashNs+=ps::monoNs()-t0; }
     if(fresh) *fresh=true;
     return ver;
-    },size_t(desc.length)+8);
+    },(128u<<10)+1024);
     return *out?FLATSQL_OK:status;
 }
 
 int32_t checkpointReadPairs(Feed* f,const std::shared_ptr<Stream>& stream,const CheckpointSegment& desc,FsgRun* out) {
-    std::shared_ptr<const FsgVerified> ver;
-    const int32_t rc=checkpointVerifyPairs(f,stream.get(),desc,&ver); if(rc!=FLATSQL_OK) return rc;
+    const auto key=verifiedKey(stream.get(),desc.offset,desc.length,desc.digest);
+    auto ver=f->type->e->rowCache->find<FsgVerified>(key);
+    if(!ver) return FLATSQL_E_BUSY;
     // The PAIRS vector stays on disk, read a page at a time; the fence keys
     // are in memory.
     out->stream=stream; out->base=ver->base; out->n=size_t(ver->n); out->verified=ver;

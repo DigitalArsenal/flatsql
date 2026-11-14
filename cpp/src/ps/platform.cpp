@@ -2,6 +2,7 @@
 #include "flatsql/ps/platform.h"
 
 #include <cstring>
+#include <algorithm>
 #include <ctime>
 
 #if defined(__wasm__)

@@ -3,8 +3,59 @@
 #include "flatsql/flatsql_io.h"
 #include <fstream>
 #include <thread>
+#include "FSG/main_generated.h"
 using namespace p4t;
 using namespace flatsql::p4;
+
+FLATSQL_TEST(t_row_cache_large_segment) {
+    const auto root=scratchDir("large_segment");
+    const auto path=root+"/pairs.fsdata";
+    Engine engine; Type type; type.e=&engine; Feed feed; feed.type=&type; feed.fid=1;
+    constexpr size_t count=2100000;
+    std::vector<FSGPair> pairs; pairs.reserve(count);
+    for(size_t i=0;i<count;i++) pairs.emplace_back(i+1,0,i+1,0);
+    flatbuffers::FlatBufferBuilder builder;
+    auto vector=builder.CreateVectorOfStructs(pairs);
+    FSGBuilder table(builder); table.add_FEED_ID(1); table.add_KIND(fckSegmentKind(kFsgSeq)); table.add_PAIRS(vector);
+    FinishFSGBuffer(builder,table.Finish());
+    CheckpointSegment desc; desc.kind=kFsgSeq; desc.entries=count; desc.length=uint32_t(builder.GetSize());
+    flatsql::ps::sha256(builder.GetBufferPointer(),builder.GetSize(),desc.digest.data());
+    uint8_t length[4]; st32(length,desc.length);
+    { std::ofstream file(path,std::ios::binary); file.write(reinterpret_cast<char*>(length),4); file.write(reinterpret_cast<const char*>(builder.GetBufferPointer()),builder.GetSize()); }
+    pairs.clear(); pairs.shrink_to_fit(); builder.Clear();
+    auto stream=std::make_shared<Stream>(); stream->path=path;
+    stream->h=flatsql_io_open(path.data(),int32_t(path.size()),FLATSQL_IO_READ);
+    REQUIRE(stream->h>=0,"open large segment");
+    std::shared_ptr<const FsgVerified> verified;
+    REQUIRE(checkpointVerifyPairs(&feed,stream.get(),desc,&verified)==FLATSQL_OK,"large segment verified within default cache");
+    CHECK_EQ(verified->n,uint64_t(count),"complete row order");
+    CHECK(engine.rowCache->peak()<=32u<<20,"verification admission bounded");
+    FsgRun run; REQUIRE(checkpointReadPairs(&feed,stream,desc,&run)==FLATSQL_OK,"reader gets acceleration");
+    int32_t status=FLATSQL_OK;
+    CHECK_EQ(run.lowerBound(FsgPairV{count,0,count,0},&status),count-1,"last row found");
+    CHECK_EQ(status,FLATSQL_OK,"page read");
+    verified.reset(); engine.rowCache->trim(std::chrono::seconds(0));
+    const auto hashes=fsgVerifyStats().hashed;
+    FsgRun absent;
+    CHECK_EQ(checkpointReadPairs(&feed,stream,desc,&absent),FLATSQL_E_BUSY,"evicted verification never hashes on reader");
+    CHECK_EQ(fsgVerifyStats().hashed,hashes,"reader hash count unchanged");
+    stream.reset(); run.stream.reset(); engine.rowCache->trim(std::chrono::seconds(0));
+    removeTree(root);
+}
+
+FLATSQL_TEST(t_row_cache_verification_touch) {
+    auto cache=std::make_shared<PageCache>();
+    auto value=std::make_shared<FsgVerified>(); value->fences.push_back(FsgPairV{1,0,1,0});
+    auto pinned=cache->load<FsgVerified>("verification",sizeof(FsgVerified)+sizeof(FsgPairV),[&] {return value;});
+    FsgRun run; run.cache=cache; run.cacheKey="verification"; run.verified=pinned;
+    value.reset(); pinned.reset();
+    std::this_thread::sleep_for(std::chrono::milliseconds(650));
+    int32_t status=FLATSQL_OK;
+    CHECK_EQ(run.lowerBound(FsgPairV{},&status),size_t(0),"lookup touches verification");
+    std::this_thread::sleep_for(std::chrono::milliseconds(650));
+    cache->trim(std::chrono::seconds(1));
+    CHECK(!run.verified.expired(),"recent verification survives idle trim");
+}
 
 FLATSQL_TEST(t_row_cache_admission) {
     PageCache cache; cache.configure(4096);
