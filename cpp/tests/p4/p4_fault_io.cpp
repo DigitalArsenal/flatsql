@@ -37,6 +37,7 @@
 #include "p4/p4_test.h"
 #include "p4/frame_walk.h"
 #include "ps/io_fault.h"
+#include "QRP/main_generated.h"
 
 using namespace p4t;
 namespace fp = flatsql::p4;
@@ -45,6 +46,7 @@ using flatsql::ps::test::FaultFs;
 namespace flatsql {
 namespace p4 {
 const std::string& lastError();
+P4Engine* currentEngine();
 }
 }  // namespace flatsql
 
@@ -438,4 +440,60 @@ FLATSQL_TEST(t_unlimited_promotion_power_loss) {
     }
     std::printf("  promotion: %llu mutation boundaries, five device modes, %d recovered cases\n",
                 (unsigned long long)boundaries,cases);
+}
+
+FLATSQL_TEST(t_unlimited_transition_power_loss) {
+    auto& fs=faultFs();
+    auto query=[](const std::string& text) {
+        flatbuffers::FlatBufferBuilder b;
+        auto sql=b.CreateString(text); QRPBuilder q(b); q.add_SQL(sql); q.add_REPRESENTATION(qrpRepresentation_FlatBuffer);
+        FinishSizePrefixedQRPBuffer(b,q.Finish());
+        return call(FLATSQL_OPC_SQL,std::vector<uint8_t>(b.GetBufferPointer(),b.GetBufferPointer()+b.GetSize()));
+    };
+    const char* names[]={"ingest","checkpoint-close","compaction"};
+    for(int op=0;op<3;op++) {
+        uint64_t boundaries=0; int cases=0;
+        for(int mode=0;mode<FaultFs::kModeCount;mode++) for(uint64_t cut=0;cut<=boundaries || !cut;cut++) {
+            const auto root="/transition/"+std::to_string(op)+"/"+std::to_string(mode)+"/"+std::to_string(cut);
+            auto type=faultType(); type.a18=0; type.fullText=false;
+            REQUIRE(openEngine(root)==FLATSQL_OK,"open baseline");
+            REQUIRE(registerType(type)==FLATSQL_OK,"unlimited registration");
+            Batch base; base.type="PNM";
+            for(int i=1;i<=8;i++) { In r; r.frame=faultFrame(i); base.recs.push_back(std::move(r)); }
+            REQUIRE(put(base).status==FLATSQL_OK,"acknowledged baseline");
+            REQUIRE(closeEngine()==FLATSQL_OK,"settle baseline");
+            REQUIRE(openEngine(root)==FLATSQL_OK,"reopen baseline");
+            Batch extra; extra.type="PNM";
+            for(int i=9;i<=12;i++) { In r; r.frame=faultFrame(i); extra.recs.push_back(std::move(r)); }
+            if(op==1) REQUIRE(put(extra).status==FLATSQL_OK,"acknowledged checkpoint input");
+            auto* e=fp::currentEngine(); auto* t=e->findType("PNM");
+            uint32_t fid=0;
+            { std::lock_guard<std::mutex> g(t->mu); for(auto& f:t->feeds) if(f->created) fid=f->fid; }
+            const auto start=fs.mutatingOps(); fs.armCrashAtOp(cut?start+cut:0);
+            int32_t status=FLATSQL_OK;
+            if(op==0) status=put(extra).status;
+            if(op==1) status=closeEngine(10000);
+            if(op==2) { fp::Internal in; in.what=fid; in.force=true; status=fp::runOnWriter(e,t,fp::kOpCompact,&in); }
+            if(!cut) { REQUIRE(status==FLATSQL_OK,"control operation"); boundaries=fs.mutatingOps()-start; REQUIRE(boundaries>0,"operation boundaries"); }
+            else CHECK(fs.frozen(),"boundary reached");
+            fs.freeze(); if(op!=1) closeEngine(10000);
+            fs.crash(FaultFs::CrashMode(mode),op*10000+mode*1000+cut);
+            REQUIRE(openEngine(root)==FLATSQL_OK,"automatic recovery");
+            auto rows=query("SELECT _seq,_cid,_data FROM PNM ORDER BY _seq");
+            REQUIRE(rows.status==FLATSQL_OK,rows.err);
+            const size_t count=rows.rows.size();
+            CHECK(count==8 || (op!=2 && count==12),"unacknowledged batch absent or complete");
+            if(op==1 || (op==0 && status==FLATSQL_OK)) CHECK_EQ(count,size_t(12),"acknowledged input survived");
+            auto total=query("SELECT COUNT(*) AS n FROM PNM");
+            CHECK_EQ(total.status,FLATSQL_OK,total.err); CHECK_EQ(total.i(0,"n"),int64_t(count),"COUNT equals scan");
+            for(size_t i=0;i<count;i++) {
+                auto frame=faultFrame(i+1); uint8_t cid[36]; cidOf(frame,cid);
+                CHECK_EQ(rows.i(i,"_seq"),int64_t(i+1),"no gap or duplicate");
+                CHECK(rows.s(i,"_cid")==cidText(cid),"exact CID");
+                CHECK(rows.s(i,"_data")==std::string(reinterpret_cast<const char*>(frame.data()+4),frame.size()-4),"no half-visible payload");
+            }
+            REQUIRE(closeEngine()==FLATSQL_OK,"close recovered store"); cases++;
+        }
+        std::printf("  %s: %llu mutation boundaries, five device modes, %d cases\n",names[op],(unsigned long long)boundaries,cases);
+    }
 }
