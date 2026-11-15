@@ -97,6 +97,15 @@ if (mode === "pool") {
       if (running <= max || Atomics.compareExchange(pool, POOL_MAX_RUNNING, max, running) === max) break;
     }
     try {
+      // This worker got a SharedArrayBuffer of the memory's size when its
+      // workerData began to deserialize, and joined the memory's grow
+      // notifications only when the Memory was attached, after the module
+      // ahead of it. A grow in between (the host's heap pre-grow while warm
+      // workers boot) never reached it, and the heap never grows again, so V8
+      // would bounds-check this thread's atomics against the old size: its
+      // first one, the tid store in __wasi_thread_start_C, traps. grow(0)
+      // reads the memory's current size and refreshes this worker's view.
+      memory.grow(0);
       const instance = new WebAssembly.Instance(wasmModule, imports);
       instance.exports.wasi_thread_start(tid, arg);
     } catch (error) {

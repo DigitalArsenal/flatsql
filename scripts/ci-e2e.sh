@@ -29,6 +29,7 @@ run() {
 run package-build npm run build
 run public-types npm run check:types
 run packaged-binary-cli-persistence-and-geo npm run check:package
+run pool-worker-stale-memory-view node scripts/ci-stale-memory-view-e2e.mjs
 run artifact-imports npm run check:imports
 run artifact-integrity npm run check:integrity
 
@@ -38,7 +39,8 @@ if [[ "$mode" != --wasm-only ]]; then
   build="${FLATSQL_CI_BUILD_DIR:-cpp/build-ci-e2e}"
   run native-configure cmake -S cpp -B "$build" -DCMAKE_BUILD_TYPE=Release "-DFLATBUFFERS_DIR=$FLATBUFFERS_DIR"
   run native-build cmake --build "$build" --target flatsql_p4_test --parallel "${FLATSQL_BUILD_JOBS:-4}"
-  for flow in t_gjn_binary_query_reopen t_sql_surface t_kill_check_compaction; do
+  for flow in t_gjn_binary_query_reopen t_sql_surface t_kill_check_compaction \
+      t_sql_window_cut_ranges t_sql_scattered_rowid_lookups t_sql_lookup_opens_charged t_sql_math_functions; do
     run "$flow" "$build/flatsql_p4_test" "--test=$flow"
     # The test harness permits an unmatched filter; an empty run is not evidence.
     grep -q '^1 tests, 0 failures$' "$results/$flow.log"

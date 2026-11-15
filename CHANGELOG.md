@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Node host: a guest thread no longer traps at open with "memory access out
+  of bounds" in `__wasi_thread_start_C`. The host grows the heap once, right
+  after the guest starts, while its 16 warm pool workers boot. A worker still
+  deserializing the shared memory when that growth landed kept the old size
+  (32 MiB) for good, and V8 checks atomics against it, so the first atomic of
+  a thread it ran (its tid store, at about 55 MiB) trapped. Each pool worker
+  now refreshes its view (`memory.grow(0)`) before it starts a guest thread.
+  The race is in every 3.12 release on Node (about 1 in 200 `check:package`
+  runs on GitHub's Linux runners, more on a runner's first run); 3.12.4's
+  engine changes play no part. `flatsql.wasm` and the store format are
+  unchanged.
+
 ## 3.12.4
 
 - Answer rowid lookups spread over a large type. SQLite opens one reader
