@@ -76,6 +76,9 @@ target_link_libraries(flatsql_p4_wasm PUBLIC sqlite3_p4_wasm)
 # heap before flatsql_start with flatsql_alloc/free.
 set(FLATSQL_P4_THREADS_LINK
     -pthread
+    # wasi-sdk 30 otherwise discovers wasm-opt on PATH. The same pinned
+    # compiler must emit the same release bytes on every build host.
+    --no-wasm-opt
     -Wl,--strip-debug
     -Wl,--import-memory
     -Wl,--export-memory

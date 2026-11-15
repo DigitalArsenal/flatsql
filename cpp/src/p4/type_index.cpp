@@ -29,13 +29,14 @@ int32_t typeIndexOpen(Type* t, std::string* err) {
         if(rc==SQLITE_OK) rc=c->exec(kIndexSchema);
         if(rc==SQLITE_OK) break;
         delete c; c=nullptr;
+        if(t->e->cfg.createMode==3) return statusOfSqlite(rc);
         if(attempt || ((rc&0xff)!=SQLITE_CORRUPT && (rc&0xff)!=SQLITE_NOTADB)) return statusOfSqlite(rc);
         damagedIndex=true;
         for(const char* suffix:{"","-wal","-shm","-journal"}) ioUnlink(t->pIdx+suffix);
     }
     sqlite3_wal_hook(c->db, walHook, t->e);  // its WAL is checkpointed by the maintenance thread
     t->idx = c;
-    const int32_t discovered = streamDiscover(t, c, err);
+    const int32_t discovered = t->e->cfg.createMode==3 ? FLATSQL_OK : streamDiscover(t, c, err);
     if (discovered != FLATSQL_OK && (discovered != FLATSQL_E_UNSUPPORTED || damagedIndex)) return discovered;
     std::lock_guard<std::mutex> g(t->mu);
     // Every registry read either completes or fails the open (M9): a statement

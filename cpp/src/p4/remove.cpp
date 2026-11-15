@@ -824,28 +824,29 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         in->err = er;
         return;
     }
-    // 1. The live frames, in stream order (arrival), and their new offsets.
-    std::vector<std::pair<int64_t, int64_t>> rows;  // (rid, off)
-    std::map<int64_t, int64_t> live;                // off -> len
+    // 1. Walk the old offsets from a separate WAL snapshot while the writer
+    // remaps them. The covering index supplies frame/row order without a
+    // whole-feed vector or an in-memory SQL sort. Only one frame's row IDs
+    // are retained; a production feed can have millions of rows.
+    int inventoryStatus = c->exec("CREATE INDEX IF NOT EXISTS compact_frame_order ON r(off,rid,len)");
+    Conn* inventoryConn = nullptr;
+    if (inventoryStatus == SQLITE_OK)
+        inventoryStatus = openConn(f->path, OpenKind::Reader, e->cfg.readerCacheKiB, 0, &inventoryConn, &er);
+    std::unique_ptr<Conn> inventory(inventoryConn);
+    if (inventoryStatus == SQLITE_OK) inventoryStatus = inventory->exec("BEGIN");
+    sqlite3_stmt* rows = inventoryStatus == SQLITE_OK
+        ? inventory->sql("SELECT off,rid,len FROM r INDEXED BY compact_frame_order ORDER BY off,rid") : nullptr;
+    if (inventoryStatus == SQLITE_OK && !rows) inventoryStatus = SQLITE_ERROR;
+    if (inventoryStatus != SQLITE_OK) {
+        writerUnpin(e, f);
+        in->status = statusOfSqlite(inventoryStatus);
+        in->err = "compaction row inventory of " + f->path + ": " + er;
+        return;
+    }
     std::set<uint32_t> compactObjects, compactTokens;
     {
         std::lock_guard<std::mutex> g(t->mu);
         for (size_t i = 0; i < t->toks.size(); ++i) compactTokens.insert(uint32_t(i + 1));
-    }
-    {
-        sqlite3_stmt* q = c->sql("SELECT rid, off, len FROM r");
-        int r = q ? SQLITE_OK : SQLITE_ERROR;
-        while (q && (r = sqlite3_step(q)) == SQLITE_ROW) {
-            rows.push_back({sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 1)});
-            live[sqlite3_column_int64(q, 1)] = sqlite3_column_int64(q, 2);
-        }
-        if (q) sqlite3_reset(q);
-        if (r != SQLITE_DONE) {
-            writerUnpin(e, f);
-            in->status = statusOfSqlite(r);
-            in->err = "rows of " + f->path;
-            return;
-        }
     }
     // State segments preserve even dictionary IDs whose original rows have
     // gone; future writes must not assign those IDs to another object.
@@ -883,8 +884,6 @@ void compactWork(Engine* e, Type* t, Internal* in) {
     // Keep each commit's records immediately before its metadata. Splitting
     // metadata alone after all records would put later NEW_FRAME rows before
     // their PREVIOUS commit point, making the chain unverifiable.
-    std::map<int64_t, std::vector<int64_t>> frameRows;
-    for (const auto& row : rows) frameRows[row.second].push_back(row.first);
     int64_t at = 0;
     uint64_t previous = 0;
     if (st == FLATSQL_OK) st = streamGenesis(f, next.get(), &at);
@@ -911,21 +910,38 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         chunkRows.clear();
         firstChunk = false;
     };
-    for (const auto& frame : live) {
+    int rowStatus = sqlite3_step(rows);
+    uint64_t inventoryRows = 0;
+    std::vector<int64_t> frameRows;
+    while (st == FLATSQL_OK && rowStatus == SQLITE_ROW) {
+        const int64_t oldOffset = sqlite3_column_int64(rows, 0);
+        const int64_t length = sqlite3_column_int64(rows, 2);
+        frameRows.clear();
+        do {
+            if (sqlite3_column_int64(rows, 2) != length || frameRows.size() == 65536) {
+                st = FLATSQL_E_CORRUPT;
+                break;
+            }
+            frameRows.push_back(sqlite3_column_int64(rows, 1));
+            ++inventoryRows;
+            rowStatus = sqlite3_step(rows);
+        } while (rowStatus == SQLITE_ROW && sqlite3_column_int64(rows, 0) == oldOffset);
         if (st != FLATSQL_OK) break;
-        const auto& ids = frameRows[frame.first];
-        if (ids.size() > 65536) { st = FLATSQL_E_CORRUPT; break; }
-        if (chunkRows.size() + ids.size() > 65536) flushCommit();
+        if (rowStatus != SQLITE_ROW && rowStatus != SQLITE_DONE) {
+            st = statusOfSqlite(rowStatus);
+            break;
+        }
+        if (chunkRows.size() + frameRows.size() > 65536) flushCommit();
         if (st != FLATSQL_OK) break;
         std::string bytes;
-        st = streamRead(old.get(), frame.first, frame.second, &bytes);
+        st = streamRead(old.get(), oldOffset, length, &bytes);
         if (st != FLATSQL_OK) break;
         const int64_t newOffset = at + int64_t(buf.size());
         uint8_t prefix[4];
         st32(prefix, uint32_t(bytes.size()));
         buf.append(reinterpret_cast<const char*>(prefix), 4);
         buf.append(bytes);
-        for (int64_t rid : ids) {
+        for (const int64_t rid : frameRows) {
             sqlite3_bind_int64(q, 1, rid);
             sqlite3_bind_int64(q, 2, newOffset);
             r = sqlite3_step(q);
@@ -935,6 +951,10 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         }
         if (buf.size() >= (4u << 20)) flushBytes();
     }
+    if (st == FLATSQL_OK && rowStatus != SQLITE_DONE) st = statusOfSqlite(rowStatus);
+    if (st == FLATSQL_OK && inventoryRows != uint64_t(f->k.rows)) st = FLATSQL_E_CORRUPT;
+    // Release the old snapshot before checkpointing or closing the writer.
+    inventory.reset();
     if (st == FLATSQL_OK && (!chunkRows.empty() || firstChunk)) flushCommit();
     Counters k;
     uint64_t retiredThrough=0;

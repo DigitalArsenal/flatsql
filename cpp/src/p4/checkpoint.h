@@ -136,7 +136,7 @@ int32_t checkpointRestoreCadence(Feed*,Stream*);
 // it extends (empty with fresh=true: a new generation with full level-zero
 // segments). commitsRoot is the commits tree as of mark.
 int32_t checkpointPrepare(Feed*,Conn* c,Stream*,uint64_t previous,uint64_t mark,const Counters&,const CheckpointState& old,
-                          bool fresh,const std::string& commitsRoot,CheckpointPlan*,std::string* err);
+                          bool fresh,const std::string& commitsRoot,CheckpointPlan*,std::string* err,bool includeRowOrders=true);
 // Appends the plan's segments and its $FCK at *end (the caller owns the
 // stream's appends). Writes no sync and publishes nothing.
 int32_t checkpointInstall(Feed*,Stream*,CheckpointPlan&,int64_t* end,uint64_t* previous,CheckpointState* state);

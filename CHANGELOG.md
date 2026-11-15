@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.12.3
+
+- Add an explicit offline conversion mode for a private copy of a complete
+  format-4 store. The real 3.7.2 reader loads the source, the engine writes
+  format-5 metadata, and a stream-only index replay must preserve every
+  record, provenance dictionary, identity and historical counter before
+  activation. The caller must supply its complete feed-index inventory;
+  normal opens still reject format 4.
+- Stream compaction rows through an indexed SQLite snapshot and emit
+  bounded checkpoint row-order runs that respect recovery frame limits.
+- Read checkpoint DAG metadata one frame at a time and release each offline
+  conversion feed’s derived DAG cache before replaying its index.
+- Reopen unused registered schemas whose index and stream directory are
+  both absent, including schemas retained by conversion.
+- Make the pinned WASM link independent of an optional host wasm-opt binary.
+
 
 ## 3.12.2
 
