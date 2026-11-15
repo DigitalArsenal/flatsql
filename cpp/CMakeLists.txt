@@ -95,7 +95,8 @@ find_package(Threads REQUIRED)
 enable_testing()
 
 # ---- store format 4 ("p4": one SQLite file per partition, producer x record type) ----
-# SQLite 3.53.4 unmodified: multi-thread mode, WAL, FTS5, no memory
+# SQLite 3.53.4 unmodified: multi-thread mode, WAL, FTS5, the built-in math
+# functions (pow, sqrt, sin, atan2, ln, ...), no memory
 # statistics (C-30: the SQL surface's allocator counts and enforces the
 # hard heap); files only through FlatSQL's own VFS (flatsql_io). The SQL
 # surface (src/p4sql) is globbed in; without it src/p4/p4sql_weak.cpp
@@ -112,6 +113,7 @@ target_compile_definitions(sqlite3_p4 PRIVATE
     SQLITE_OMIT_JSON=1
     SQLITE_DQS=0
     SQLITE_ENABLE_FTS5=1
+    SQLITE_ENABLE_MATH_FUNCTIONS=1
 )
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(sqlite3_p4 PRIVATE -w)

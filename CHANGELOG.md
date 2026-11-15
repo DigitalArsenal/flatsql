@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Answer rowid lookups spread over a large type. SQLite opens one reader
+  cursor per value of `_rowid IN (...)` (and of an OR of `_rowid =` terms),
+  and each cursor's A18 window cut walked the type's seqs from its rowid down
+  to the bound N, below the range it reads, counting every seq walked as a
+  row examined. Sixteen rowids spread over 150,000 records walked over
+  1,000,000 seqs and failed with "reader cursor failed" (the sandbox's
+  rows-examined cap); seven near the newest end did too. The cut now stops at
+  the range's floor, which never moves it, so the rows answered are the same
+  and a lookup examines two rows: 10,000 spread rowids in one statement
+  answer in about 0.1 s. The store format is unchanged.
+- Build SQLite with its math functions (`SQLITE_ENABLE_MATH_FUNCTIONS`):
+  `pow`, `sqrt`, `sin`, `atan2`, `ln`, `log10`, `exp`, `pi`, `degrees`, ...
+  answered "no such function" before.
+
 ## 3.12.3
 
 - Add an explicit offline conversion mode for a private copy of a complete

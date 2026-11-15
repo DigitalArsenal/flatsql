@@ -611,8 +611,15 @@ std::shared_ptr<const Staged> Scan::staged(const FRef& fr) const {
 // A18 (C-31): the bound is the newest N records of lane.source when it is
 // set (its feed files), or of the local file ("<TYPE>@local", with part 3 also
 // the feed files of the source "local"), else of the type (every feed file);
-// the cut is the N-th newest seq of those files merged, and every other
-// filter applies above it.
+// the cut is the N-th newest seq of those files merged, at or below the
+// range's top, and every other filter applies above it.
+//
+// The walk stays inside the range (lo_, hi_]: a cut at or below lo_ leaves
+// lo_ as it is, so the seqs below the range never move it. Walking them made
+// every point lookup read up to N seqs below its rowid, and SQLite opens one
+// cursor per value of `_rowid IN (...)`: 16 rowids spread over 150,000
+// records walked over 1,000,000 seqs, every one a row examined, and tripped
+// the sandbox's rows-examined cap (stack issue 676).
 int32_t Scan::boundCut() {
     if (!s_.bound || files_.empty()) return FLATSQL_OK;
     struct H {
@@ -635,13 +642,14 @@ int32_t Scan::boundCut() {
             int rc = 0;
             Conn* c = e_->rpool.acquire(h.path, OpenKind::Reader, &rc, nullptr);
             if (!c) return statusOfSqlite(rc);
-            sqlite3_stmt* q = c->sql(h.indexed ? "SELECT seq FROM r INDEXED BY r_s WHERE seq<?1 ORDER BY seq DESC LIMIT ?2"
-                                               : "SELECT seq FROM r WHERE rid<(?1<<16) ORDER BY rid DESC LIMIT ?2");
+            sqlite3_stmt* q = c->sql(h.indexed ? "SELECT seq FROM r INDEXED BY r_s WHERE seq<?1 AND seq>?3 ORDER BY seq DESC LIMIT ?2"
+                                               : "SELECT seq FROM r WHERE rid<(?1<<16) AND rid>=((?3+1)<<16) ORDER BY rid DESC LIMIT ?2");
             int32_t st = q ? FLATSQL_OK : FLATSQL_E_INTERNAL;
             size_t got = 0;
             if (q) {
                 sqlite3_bind_int64(q, 1, h.last);
                 sqlite3_bind_int64(q, 2, int64_t(chunk));
+                sqlite3_bind_int64(q, 3, lo_);
                 int r;
                 while ((r = sqlite3_step(q)) == SQLITE_ROW) {
                     got++;
