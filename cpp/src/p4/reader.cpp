@@ -611,8 +611,21 @@ std::shared_ptr<const Staged> Scan::staged(const FRef& fr) const {
 // A18 (C-31): the bound is the newest N records of lane.source when it is
 // set (its feed files), or of the local file ("<TYPE>@local", with part 3 also
 // the feed files of the source "local"), else of the type (every feed file);
-// the cut is the N-th newest seq of those files merged, and every other
-// filter applies above it.
+// the cut is the N-th newest seq of those files merged, at or below the
+// range's top, and every other filter applies above it.
+//
+// The walk stays inside the range (lo_, hi_]: a cut at or below lo_ leaves
+// lo_ as it is, so the seqs below the range never move it. Walking them made
+// every point lookup read up to N seqs below its rowid, and SQLite opens one
+// cursor per value of `_rowid IN (...)`: 16 rowids spread over 150,000
+// records walked over 1,000,000 seqs, every one a row examined, and tripped
+// the sandbox's rows-examined cap (stack issue 676).
+//
+// The cut is charged its work: every seq it takes and every query it runs,
+// one per feed file of the bound at the least, a row found or not. A point
+// lookup still runs a query in each of those files; charged only the rows it
+// found, a statement of lookups on a type of many feed files ran for minutes
+// under the cap.
 int32_t Scan::boundCut() {
     if (!s_.bound || files_.empty()) return FLATSQL_OK;
     struct H {
@@ -630,18 +643,21 @@ int32_t Scan::boundCut() {
             if (f->created && f->k.recs > 0 && !f->quarantined) hs.push_back(H{f->path, f->indexed, false, hi_ + 1, {}});
     }
     const size_t chunk = size_t(std::min<uint64_t>(s_.bound, 4096));
+    uint64_t probes = 0;  // the queries run
     auto fetch = [&](H& h) -> int32_t {
         while (h.buf.empty() && !h.done) {
             int rc = 0;
             Conn* c = e_->rpool.acquire(h.path, OpenKind::Reader, &rc, nullptr);
             if (!c) return statusOfSqlite(rc);
-            sqlite3_stmt* q = c->sql(h.indexed ? "SELECT seq FROM r INDEXED BY r_s WHERE seq<?1 ORDER BY seq DESC LIMIT ?2"
-                                               : "SELECT seq FROM r WHERE rid<(?1<<16) ORDER BY rid DESC LIMIT ?2");
+            sqlite3_stmt* q = c->sql(h.indexed ? "SELECT seq FROM r INDEXED BY r_s WHERE seq<?1 AND seq>?3 ORDER BY seq DESC LIMIT ?2"
+                                               : "SELECT seq FROM r WHERE rid<(?1<<16) AND rid>=((?3+1)<<16) ORDER BY rid DESC LIMIT ?2");
             int32_t st = q ? FLATSQL_OK : FLATSQL_E_INTERNAL;
             size_t got = 0;
             if (q) {
+                probes++;
                 sqlite3_bind_int64(q, 1, h.last);
                 sqlite3_bind_int64(q, 2, int64_t(chunk));
+                sqlite3_bind_int64(q, 3, lo_);
                 int r;
                 while ((r = sqlite3_step(q)) == SQLITE_ROW) {
                     got++;
@@ -672,9 +688,9 @@ int32_t Scan::boundCut() {
         hs[size_t(best)].buf.pop_front();
         n++;
     }
-    L_->rowsExamined += n;
+    L_->rowsExamined += n + probes;
     if (n >= s_.bound && n > 0) lo_ = std::max(lo_, last - 1);
-    return FLATSQL_OK;
+    return check();
 }
 
 // Candidates instead of a walk: an exact CID (one probe of each feed file's
@@ -874,16 +890,18 @@ int32_t Scan::open() {
         case FLATSQL_ORDER_W_ASC: wo_ = kWAsc; break;
         default: wo_ = kSeqAsc; break;
     }
-    if (!t_->hasFiles.load(std::memory_order_acquire)) {
+    // An open that reads no file (a type without records, no feed file of
+    // the scan's, a range past the newest rowid) still counts one row
+    // examined: no open is free, so a statement of them meets the cap too.
+    auto none = [&]() {
+        L_->rowsExamined++;
         done_ = true;
-        return FLATSQL_OK;
-    }
+        return check();
+    };
+    if (!t_->hasFiles.load(std::memory_order_acquire)) return none();
     int32_t rc = pickFiles();
     if (rc != FLATSQL_OK) return rc;
-    if (files_.empty() || lo_ >= hi_) {
-        done_ = true;
-        return FLATSQL_OK;
-    }
+    if (files_.empty() || lo_ >= hi_) return none();
     rc = boundCut();
     if (rc != FLATSQL_OK) return rc;
     if (lo_ >= hi_) {

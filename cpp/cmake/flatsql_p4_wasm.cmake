@@ -18,6 +18,7 @@ set(FLATSQL_P4_WASM_FLAGS
 
 # ---- SQLite 3.53.4, unmodified ------------------------------------------------
 # Multi-thread mode (a connection is used by one thread at a time), WAL, FTS5,
+# the built-in math functions (pow, sqrt, sin, atan2, ln, ...),
 # no memory statistics (C-30: the SQL surface's allocator counts and enforces
 # the hard heap; a global statistics mutex cost every lane), temp storage in
 # memory.
@@ -38,6 +39,7 @@ target_compile_definitions(sqlite3_p4_wasm PRIVATE
     SQLITE_OMIT_JSON=1
     SQLITE_DQS=0
     SQLITE_ENABLE_FTS5=1
+    SQLITE_ENABLE_MATH_FUNCTIONS=1
 )
 
 # ---- engine ------------------------------------------------------------------
