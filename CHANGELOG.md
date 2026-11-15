@@ -1,18 +1,22 @@
 # Changelog
 
-## Unreleased
+## 3.12.5
 
-- Node host: a guest thread no longer traps at open with "memory access out
-  of bounds" in `__wasi_thread_start_C`. The host grows the heap once, right
-  after the guest starts, while its 16 warm pool workers boot. A worker still
-  deserializing the shared memory when that growth landed kept the old size
-  (32 MiB) for good, and V8 checks atomics against it, so the first atomic of
-  a thread it ran (its tid store, at about 55 MiB) trapped. Each pool worker
-  now refreshes its view (`memory.grow(0)`) before it starts a guest thread.
-  The race is in every 3.12 release on Node (about 1 in 200 `check:package`
-  runs on GitHub's Linux runners, more on a runner's first run); 3.12.4's
-  engine changes play no part. `flatsql.wasm` and the store format are
-  unchanged.
+- Fix an occasional crash when a database opens under Node: "guest thread N
+  trapped: RuntimeError: memory access out of bounds" in
+  `__wasi_thread_start_C`. Right after the engine starts, the Node host grows
+  its shared memory once, from 32 MiB to about 510 MiB, while its 16 worker
+  threads are still starting. A worker that was still receiving the memory
+  when it grew could go on seeing the old 32 MiB size for good, and the first
+  engine thread it ran crashed on its first write above that. Each worker now
+  rechecks the memory's size (`memory.grow(0)`) before it runs an engine
+  thread. The race is in every 3.12 release on Node (about 1 in 200 runs of
+  the packaged-install test on GitHub's Linux runners, more on a runner's
+  first run); 3.12.4's engine changes play no part. The browser host is not
+  affected. `flatsql.wasm` and the store format are unchanged.
+- 3.12.4 was tagged but never published to npm: its release run hit this
+  crash. 3.12.5 is the first npm release with 3.12.4's changes (spread rowid
+  lookups, SQLite's math functions).
 
 ## 3.12.4
 
