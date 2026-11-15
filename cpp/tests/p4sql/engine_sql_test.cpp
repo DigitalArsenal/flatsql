@@ -218,7 +218,9 @@ FLATSQL_TEST(t_sql_scattered_rowid_lookups) {
         }
         CHECK(got == std::set<int64_t>(want.begin(), want.end()), what + ": the rows asked for");
         CHECK(own, what + ": each row from its own record");
-        // A lookup examines its own record, not the window below it.
+        // A lookup examines its own record, not the window below it: 3 rows on
+        // this type of one feed file (the cut's query and the seq it takes, then
+        // the row).
         CHECK(r.rowsExamined <= 4 * want.size(), what + ": " + std::to_string(r.rowsExamined) + " rows examined");
     };
     // The issue's rowids: 15 answered, the 16th (in any order) failed.
@@ -254,6 +256,78 @@ FLATSQL_TEST(t_sql_scattered_rowid_lookups) {
     for (int64_t id : spread(16)) mixed.push_back(id);
     for (size_t i = 0; i < r.rows.size(); i++) norad[fresh[i]] = kRecords + 1 + int64_t(i) + 25000;
     lookup("16 new and 16 old", "_rowid IN (" + joined(mixed, ",") + ")", mixed);
+}
+
+// Every reader cursor a statement opens is charged against the rows-examined
+// cap for its work. The A18 cut runs one query in each feed file of its bound
+// on every open (the type's, or the source's through "<TYPE>@<source>"),
+// found or not, and each query counts one row; an open past the newest rowid
+// reads no file and counts one. Charged only the rows they found (2 for a
+// hit, 0 for a miss) whatever the feed files, lookups on a type of many feed
+// files ran for minutes under the cap.
+FLATSQL_TEST(t_sql_lookup_opens_charged) {
+    const std::string root = scratchDir("t_sql_lookup_opens");
+    REQUIRE(openEngine(root) == FLATSQL_OK, "open");
+    const OpenedEngine opened{root};
+    REQUIRE(registerType(ommType()) == FLATSQL_OK, "register");   // A18 bound 400,000: every record is in the window
+    const int kFeeds = 16, kEach = 64;   // one feed file per source
+    auto source = [](int k) { return "feed-" + std::to_string(k); };
+    for (int k = 0; k < kFeeds; k++)
+        REQUIRE(put(ommBatch(1 + k * kEach, kEach, source(k), "b" + std::to_string(k))).status == FLATSQL_OK, "put");
+    const Result all = sql("SELECT _rowid AS RID, _source AS S FROM OMM ORDER BY _rowid", FLATSQL_SLOT_SANDBOX);
+    REQUIRE(all.status == FLATSQL_OK && all.rows.size() == size_t(kFeeds * kEach), all.err);
+    std::vector<int64_t> rowids;
+    std::map<std::string, std::vector<int64_t>> bySource;
+    for (size_t i = 0; i < all.rows.size(); i++) {
+        rowids.push_back(all.i(i, "RID"));
+        bySource[all.s(i, "S")].push_back(all.i(i, "RID"));
+    }
+    REQUIRE(bySource.size() == size_t(kFeeds), "one feed file per source");
+    const int64_t first = rowids.front(), newest = rowids.back();
+    REQUIRE(newest - first == int64_t(rowids.size()) - 1, "the records' rowids are contiguous");
+    const uint64_t n = 64;
+    auto examined = [&](const std::string& what, const std::string& q, size_t rows, uint64_t lo, uint64_t hi) {
+        const Result r = sql(q, FLATSQL_SLOT_SANDBOX);
+        CHECK_EQ(r.status, FLATSQL_OK, what + ": " + r.err);
+        CHECK_EQ(r.rows.size(), rows, what);
+        CHECK(r.rowsExamined >= lo && r.rowsExamined <= hi,
+              what + ": " + std::to_string(r.rowsExamined) + " rows examined, want " + std::to_string(lo) + ".." +
+                  std::to_string(hi));
+    };
+    // Hits on the type: each probes the type's 16 feed files, then takes and reads its record (18).
+    std::vector<int64_t> hits;
+    for (uint64_t j = 0; j < n; j++) hits.push_back(rowids[(j * 97) % rowids.size()]);
+    examined("64 hits", "SELECT _rowid FROM OMM WHERE _rowid IN (" + joined(hits, ",") + ")", n, n * kFeeds,
+             n * (kFeeds + 4));
+    // Misses through a source's relation (feed-0's rowids looked up in feed-1): each probes feed-1's one file.
+    const std::string other = "\"OMM@" + source(1) + "\"";
+    examined("64 misses, per source",
+             "SELECT _rowid FROM " + other + " WHERE _rowid IN (" + joined(bySource["OMM@" + source(0)], ",") + ")", 0,
+             n, 4 * n);
+    // Past the newest rowid: no file is read; each open counts one.
+    std::vector<int64_t> past;
+    for (uint64_t j = 1; j <= n; j++) past.push_back(newest + 1000000000 + int64_t(j));
+    examined("64 past the newest", "SELECT _rowid FROM OMM WHERE _rowid IN (" + joined(past, ",") + ")", 0, n, 4 * n);
+    examined("64 past the newest, per source",
+             "SELECT _rowid FROM " + other + " WHERE _rowid IN (" + joined(past, ",") + ")", 0, n, 4 * n);
+    // A statement of 400,000 hits stops at the sandbox's cap (1,000,000), 18
+    // each: after about 55,000 opens, within seconds and one open past the
+    // cap at most. Charged 2 each, all of them answered, in about 40 s.
+    const uint64_t cap = 1000000;
+    const auto t0 = std::chrono::steady_clock::now();
+    const Result many = sql("WITH RECURSIVE k(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM k WHERE i < 399999) "
+                            "SELECT COUNT(*) AS C FROM k CROSS JOIN OMM WHERE OMM._rowid = ?1 + k.i % ?2",
+                            FLATSQL_SLOT_SANDBOX, {intCell(first), intCell(int64_t(rowids.size()))});
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    report("lookup opens.400k hits on 16 feed files.ms", ms, "ms");
+    report("lookup opens.400k hits on 16 feed files.rows_examined", double(many.rowsExamined), "rows");
+    CHECK_EQ(many.status, FLATSQL_E_BUDGET, "400,000 hits on 16 feed files: " + std::to_string(many.rows.size()) +
+                                                " rows, " + std::to_string(many.rowsExamined) + " examined, " + many.err);
+    CHECK(many.rowsExamined > cap && many.rowsExamined <= cap + kFeeds + 2,
+          "stopped at the cap: " + std::to_string(many.rowsExamined) + " rows examined");
+    // The store serves on.
+    const Result count = sql("SELECT COUNT(*) FROM OMM", FLATSQL_SLOT_SANDBOX);
+    CHECK(count.status == FLATSQL_OK && count.rows.size() == 1 && count.rows[0][0].i == kFeeds * kEach, count.err);
 }
 
 // The A18 window of a range read stays what it was: the newest N records at
