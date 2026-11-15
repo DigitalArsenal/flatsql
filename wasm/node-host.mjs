@@ -155,9 +155,12 @@ const MAXIMUM_BYTES = new WeakMap();
 // fills a block carved from memory another thread has just grown traps
 // ("memory access out of bounds"). So the heap grows to the memory's maximum
 // before any guest thread starts, and never grows after (a partial pre-grow
-// only moves the failure). The heap stops 16 MiB short of 4 GiB: a segment
-// ending at 2^32 would wrap the guest allocator's pointer arithmetic.
-// WasmEdge (the SDN host) keeps one shared size and is not affected.
+// only moves the failure). A pool worker still deserializing its workerData
+// while the heap grows misses the growth for good; it refreshes its view
+// before each guest thread (node-guest.mjs). The heap stops 16 MiB short of
+// 4 GiB: a segment ending at 2^32 would wrap the guest allocator's pointer
+// arithmetic. WasmEdge (the SDN host) keeps one shared size and is not
+// affected.
 function heapLimitBytes(memory, options) {
   const max = MAXIMUM_BYTES.get(memory) ?? memory.buffer.byteLength;
   const cap = options.heapBytes ?? Infinity;

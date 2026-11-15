@@ -22,13 +22,20 @@ run() {
   local name=$1 before=$SECONDS status=0
   shift
   "$@" 2>&1 | tee "$results/$name.log" || status=$?
-  printf '| %s | %s | %s |\n' "$name" "$([[ $status == 0 ]] && echo PASS || echo FAIL)" "$((SECONDS-before))" >> "$results/summary.md"
+  local result=FAIL
+  if [[ $status == 0 ]]; then
+    # A check that cannot apply on this machine says so on a line of its own.
+    result=PASS
+    if grep -q '^SKIP: ' "$results/$name.log"; then result=SKIP; fi
+  fi
+  printf '| %s | %s | %s |\n' "$name" "$result" "$((SECONDS-before))" >> "$results/summary.md"
   return "$status"
 }
 
 run package-build npm run build
 run public-types npm run check:types
 run packaged-binary-cli-persistence-and-geo npm run check:package
+run pool-worker-stale-memory-view node scripts/ci-stale-memory-view-e2e.mjs
 run artifact-imports npm run check:imports
 run artifact-integrity npm run check:integrity
 
