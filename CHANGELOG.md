@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.12.4
 
 - Answer rowid lookups spread over a large type. SQLite opens one reader
   cursor per value of `_rowid IN (...)` (and of an OR of `_rowid =` terms),
@@ -18,10 +18,15 @@
   about 0.1 s; on a type of 64 feed files it is 66, so about 15,000 lookups
   fit under the sandbox's cap of 1,000,000. A cursor that reads no file (a
   rowid past the newest, a type without records) counts one row; those
-  lookups were free before. The store format is unchanged.
+  lookups were free before. A sandboxed statement of more lookups than its
+  type's feed files allow under the cap now fails with `FLATSQL_E_BUDGET`
+  ("reader cursor failed"), even where 3.12.3 answered it (for example many
+  lookups of low rowids on a type of many feed files); split such IN lists.
+  The rows a statement returns do not change. The store format is unchanged.
 - Build SQLite with its math functions (`SQLITE_ENABLE_MATH_FUNCTIONS`):
   `pow`, `sqrt`, `sin`, `atan2`, `ln`, `log10`, `exp`, `pi`, `degrees`, ...
   answered "no such function" before.
+
 
 ## 3.12.3
 
