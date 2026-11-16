@@ -42,6 +42,14 @@ copy as described in `cpp/src/p4/FORMAT.md`. It is not a normal open mode.
   engine's FTS5 index over the record's text fields, including nested text.
   The engine returns `BUSY` while its background index catches up; retry the
   query, and never treat that condition as zero matches.
+  Bare and size-prefixed stored records have identical search semantics; stored
+  bytes and their content addresses are preserved. An existing full-text index
+  that skipped size-prefixed records retains those missing entries after reopen.
+  Rebuild that derived index with `FLATSQL_OPC_REBUILD` (opcode 5), type name in
+  TLV 1 and full-text mask `4` as a uint32 in TLV 63. This explicit operation
+  re-extracts existing records; opening the database does not trigger a rebuild.
+  The JavaScript API has no rebuild method. A host using the C ABI can submit
+  the maintenance operation. No store-format migration is involved.
 - Hidden metadata columns `_cid`, `_seq`, `_ts`, `_epoch`, `_producer`, `_peer`
   and `_signature` are available alongside `_source`, `_rowid` and `_data`.
 - `flatsql_provenance(type, cid)` is a SQL table-valued function returning every

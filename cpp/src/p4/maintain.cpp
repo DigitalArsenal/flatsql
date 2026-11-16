@@ -639,9 +639,13 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
                 // verifies from that origin, any other from its own (C-46 (3)).
                 if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 2) == SQLITE_NULL &&
                     streamRead(stream.get(), sqlite3_column_int64(s, 0), sqlite3_column_int64(s, 1), &bytes, true) == FLATSQL_OK) {
+                    const auto* frame = reinterpret_cast<const uint8_t*>(bytes.data());
+                    // Keep the prefix that defines the record's alignment. For a
+                    // record with its own prefix, skip only the transport length.
+                    const size_t offset = ps::frameRootOffset(frame, bytes.size(), sp->tc.fid()) - 4;
                     std::string text, err;
                     if (reflectedRecordSearchText(sp->tc.bfbs().data(), sp->tc.bfbs().size(), fid,
-                                                  reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), text, &err)) {
+                                                  frame + offset, bytes.size() - offset, text, &err)) {
                         sqlite3_stmt* ins = t->fts->sql("INSERT OR REPLACE INTO fts(rowid, t) VALUES(?1,?2)");
                         sqlite3_bind_int64(ins, 1, seq);
                         sqlite3_bind_text(ins, 2, text.data(), int(text.size()), SQLITE_TRANSIENT);
