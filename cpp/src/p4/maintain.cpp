@@ -491,7 +491,6 @@ int32_t openFts(Engine* e, Type* t) {
         if (rc != SQLITE_DONE) { delete c; return FLATSQL_E_IO; }
         sqlite3_wal_hook(c->db, walHook, e);
         t->fts = c;
-        t->ftsThrough = through;
         t->ftsVersion = version;
         if (version < kFtsExtractorVersion && target != kFtsExtractorVersion) {
             const int32_t reset = resetFts(t);
@@ -502,12 +501,21 @@ int32_t openFts(Engine* e, Type* t) {
                 t->ftsVersion = 0;
                 return reset;
             }
+        } else {
+            t->ftsThrough = through;
         }
     }
     return FLATSQL_OK;
 }
 
 int32_t resetFts(Type* t) {
+    // Publish reset entry before SQLite can expose cleared rows, and exit
+    // after the durable cursor is published, including on a failed reset.
+    struct ResetGuard {
+        Type* t;
+        explicit ResetGuard(Type* type) : t(type) { ++t->ftsReset; }
+        ~ResetGuard() { ++t->ftsReset; }
+    } guard(t);
     if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) return FLATSQL_E_IO;
     if (t->fts->exec((std::string("DELETE FROM fts;") +
                      "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through',0),('extractor_version',0),"

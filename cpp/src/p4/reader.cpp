@@ -494,6 +494,11 @@ private:
     WalkOrder wo_ = kSeqAsc;
     int64_t vis_ = 0, lo_ = 0, hi_ = 0;  // seq range (lo exclusive, hi inclusive)
     bool fts_ = false;
+    uint64_t ftsReset_ = 0;
+    bool ftsReady() const {
+        return !(ftsReset_ & 1) && t_->ftsReset.load() == ftsReset_ &&
+               t_->ftsThrough.load() >= hi_ && t_->ftsReset.load() == ftsReset_;
+    }
     bool done_ = false;
     std::vector<Stream> streams_;
     std::vector<int> heap_;  // stream indexes with entries; the front is the next in order
@@ -877,10 +882,8 @@ int32_t Scan::open() {
         // A type without records answers none (below).
         if (!sp_->fullText) return FLATSQL_E_UNSUPPORTED;
         // A search is complete only after its index covers this snapshot.
-        if (vis_ > 0) {
-            std::unique_lock<std::mutex> lock(t_->ftsMu, std::try_to_lock);
-            if (!lock.owns_lock() || t_->ftsState != 2 || t_->ftsThrough < hi_) return FLATSQL_E_BUSY;
-        }
+        ftsReset_ = t_->ftsReset.load();
+        if (!ftsReady()) return FLATSQL_E_BUSY;
         fts_ = true;
     }
     if (s_.order == 0) s_.order = FLATSQL_ORDER_SEQ_ASC;
@@ -1413,12 +1416,15 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::v
 // range read when the page's seqs are dense, else a probe per seq).
 int32_t Scan::ftsHits(const std::vector<int64_t>& seqs, std::unordered_set<int64_t>* hit) {
     if (seqs.empty()) return FLATSQL_OK;
-    // A rebuild can start after Scan::open or between result pages. Keep
-    // readiness and the FTS read under one lock so it cannot return a partial
-    // rebuilt index as a complete result.
-    std::unique_lock<std::mutex> lock(t_->ftsMu, std::try_to_lock);
-    if (!lock.owns_lock() || t_->ftsState != 2 || t_->ftsThrough < hi_) return FLATSQL_E_BUSY;
-    return queryFts(seqs, hit);
+    // Each pooled connection belongs to this query. A reset invalidates the
+    // entire scan, including a reset that completes between result pages.
+    if (!ftsReady()) return FLATSQL_E_BUSY;
+    const int32_t rc = queryFts(seqs, hit);
+    if (!ftsReady()) {
+        hit->clear();
+        return FLATSQL_E_BUSY;
+    }
+    return rc;
 }
 
 int32_t Scan::queryFts(const std::vector<int64_t>& seqs, std::unordered_set<int64_t>* hit) {
@@ -3355,7 +3361,6 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
             {
                 // A type without records yet has nothing to index: ready, so a
                 // search answers no rows as format 1 does (C-46 (2)).
-                std::lock_guard<std::mutex> g(t->ftsMu);
                 const bool empty = t->vis.load(std::memory_order_acquire) == 0 || !t->hasFiles.load(std::memory_order_acquire);
                 state = !sp->fullText ? "off" : (t->ftsState == 2 && t->ftsThrough >= t->vis.load(std::memory_order_acquire)) || empty ? "ready" : "building";
                 through = t->ftsThrough;
