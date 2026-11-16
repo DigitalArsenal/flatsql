@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Index full text from records stored with their FlatBuffer size prefix. The
+  storage frame adds a transport length; search extraction treated that length
+  as the record prefix and checked the file identifier at the wrong offset.
+  Search and projection share record-envelope detection, preserving the
+  alignment origin, stored bytes, and content address. Existing affected
+  full-text indexes require an explicit full-text rebuild (REBUILD mask 4);
+  reopening alone retains the missing matches. The store format is unchanged.
+
 ## 3.12.5
 
 - Fix an occasional crash when a database opens under Node: "guest thread N
