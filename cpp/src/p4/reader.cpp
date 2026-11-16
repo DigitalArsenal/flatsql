@@ -874,7 +874,7 @@ int32_t Scan::open() {
     if (!s_.search.empty()) {
         // FTS5 (background index; C-4's exception), checked a page at a time.
         // A type without records answers none (below).
-        if (!sp_->fullText || (t_->hasFiles.load(std::memory_order_acquire) && !ioExists(t_->pFts))) return FLATSQL_E_UNSUPPORTED;
+        if (!sp_->fullText) return FLATSQL_E_UNSUPPORTED;
         // A search is complete only after its index covers this snapshot.
         if (vis_ > 0) {
             std::unique_lock<std::mutex> lock(t_->ftsMu, std::try_to_lock);
