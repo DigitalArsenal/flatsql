@@ -1,4 +1,5 @@
 #include "flatsql/record_search.h"
+#include "flatsql/record_buffer.h"
 #include <flatbuffers/reflection.h>
 #include <algorithm>
 #include <cstring>
@@ -221,8 +222,8 @@ bool reflectedRecordSearchText(const uint8_t* binarySchema, size_t schemaLength,
         return fail("Binary search schema identifier differs from registered table");
     if (!schemaLayoutValid(*schema)) return fail("Unsupported binary search schema layout");
     if (!record || recordLength < 8 || recordLength > maxBytes) return fail("Search record exceeds bounds");
-    const bool prefixed = recordLength >= 12 && flatbuffers::ReadScalar<uint32_t>(record) == recordLength - 4 &&
-        std::memcmp(record + 8, fileId.data(), 4) == 0;
+    const bool prefixed = recordRootOffset(record, recordLength,
+        reinterpret_cast<const uint8_t*>(fileId.data())) != 0;
     // A compiler-emitted size prefix participates in alignment. An external
     // transport length around a bare FlatBuffer does not. Verify each supported
     // framing form against its original alignment origin before extracting.
