@@ -480,18 +480,28 @@ int32_t openFts(Engine* e, Type* t) {
     return FLATSQL_OK;
 }
 
-void resetFts(Type* t) {
-    if (t->fts) t->fts->exec("DELETE FROM fts");
+int32_t resetFts(Type* t) {
+    if (!t->fts) { t->ftsThrough = 0; return FLATSQL_OK; }
+    if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) return FLATSQL_E_IO;
+    if (t->fts->exec("DELETE FROM fts;"
+                     "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through',0),('extractor_version',0);") != SQLITE_OK ||
+        t->fts->exec("COMMIT") != SQLITE_OK) {
+        t->fts->exec("ROLLBACK");
+        return FLATSQL_E_IO;
+    }
     t->ftsThrough = 0;
+    t->ftsState = 1;
+    return FLATSQL_OK;
 }
 
-void writeFtsThrough(Type* t, int64_t through) {
+int32_t writeFtsThrough(Type* t, int64_t through) {
     sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
+    if (!m) return FLATSQL_E_IO;
     sqlite3_bind_int64(m, 1, through);
-    sqlite3_step(m);
+    const int rc = sqlite3_step(m);
     sqlite3_reset(m);
+    return rc == SQLITE_DONE ? FLATSQL_OK : FLATSQL_E_IO;
 }
-
 
 int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<int64_t, 2>>* rows,
                   std::vector<Type*>* rowTypes, std::string* firstBad) {
@@ -515,9 +525,11 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
         if (what & 4) {
             {
                 std::lock_guard<std::mutex> g(t->ftsMu);
-                resetFts(t);
+                const int32_t rc = resetFts(t);
+                if (rc != FLATSQL_OK) return rc;
             }
-            ftsCatchUp(e, t, true);
+            const int32_t rc = ftsCatchUp(e, t, true);
+            if (rc != FLATSQL_OK) return rc;
         }
         rows->push_back({entries, mismatches});
         rowTypes->push_back(t);
@@ -621,7 +633,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         }
         std::map<uint32_t, std::vector<int64_t>> byFile;
         for (auto& p : page) byFile[p.second].push_back(p.first);
-        t->fts->exec("BEGIN IMMEDIATE");
+        if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) { status = FLATSQL_E_IO; break; }
         for (auto& kv : byFile) {
             Feed* f;
             {
@@ -666,10 +678,12 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
                     if (reflectedRecordSearchText(sp->tc.bfbs().data(), sp->tc.bfbs().size(), fid,
                                                   frame + offset, bytes.size() - offset, text, &err)) {
                         sqlite3_stmt* ins = t->fts->sql("INSERT OR REPLACE INTO fts(rowid, t) VALUES(?1,?2)");
+                        if (!ins) { status = FLATSQL_E_IO; break; }
                         sqlite3_bind_int64(ins, 1, seq);
                         sqlite3_bind_text(ins, 2, text.data(), int(text.size()), SQLITE_TRANSIENT);
-                        sqlite3_step(ins);
+                        const int inserted = sqlite3_step(ins);
                         sqlite3_reset(ins);
+                        if (inserted != SQLITE_DONE) { status = FLATSQL_E_IO; break; }
                         e->bump(kStFtsRows);
                     }
                 }
@@ -684,14 +698,18 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             break;
         }
         through = end ? vis : page.back().first;
-        writeFtsThrough(t, through);
-        t->fts->exec("COMMIT");
+        status = writeFtsThrough(t, through);
+        if (status != FLATSQL_OK || t->fts->exec("COMMIT") != SQLITE_OK) {
+            t->fts->exec("ROLLBACK");
+            status = FLATSQL_E_IO;
+            break;
+        }
         t->ftsThrough = through;
         done += int64_t(page.size());
     }
     if (status == FLATSQL_OK && through >= vis) {
-        writeFtsThrough(t, vis);
-        t->ftsThrough = vis;
+        status = writeFtsThrough(t, vis);
+        if (status == FLATSQL_OK) t->ftsThrough = vis;
     }
     t->ftsState = t->ftsThrough >= vis ? 2 : 1;
     return status;
