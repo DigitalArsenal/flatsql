@@ -759,14 +759,24 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         bool complete = false;
         const int32_t rc = ftsPage(e, t, &complete);
         if (rc != FLATSQL_OK || complete || !all) return rc;
-        // Each page owns ftsMu independently, including its commit. Searches
-        // can observe building between pages and refuse without waiting.
+        // Each page owns ftsMu independently, including its commit.
         if (e->stopping.load()) return FLATSQL_E_STOPPED;
     }
 }
 
 // ---- the loop -------------------------------------------------------------------------------------------
 namespace {
+constexpr uint64_t kFtsTickBudgetNs = 80ull * 1000 * 1000;
+void ftsTick(Engine* e, Type* t) {
+    const uint64_t start = monoNs();
+    do {
+        if (e->stopping.load() || e->slowStop.load()) return;
+        bool complete = false;
+        if (ftsPage(e, t, &complete) != FLATSQL_OK || complete) return;
+        // The page releases ftsMu before the budget check and another page.
+    } while (monoNs() - start < kFtsTickBudgetNs);
+}
+
 void runMaintSlot(Engine* e, uint32_t slot) {
     SlotHeader* h = e->slot(slot);
     SlotOut out(e, slot);
@@ -948,7 +958,11 @@ void slowLoop(Engine* e) {
         std::vector<uint32_t> refused;
         {
             std::unique_lock<std::mutex> g(e->slowMu);
-            if (e->slowQ.empty() && !e->slowStop) e->slowCv.wait_for(g, std::chrono::milliseconds(100));
+            if (e->slowQ.empty() && !e->slowStop) {
+                const uint64_t elapsed = monoNs() - lastTick;
+                constexpr uint64_t tickNs = 100ull * 1000 * 1000;
+                if (elapsed < tickNs) e->slowCv.wait_for(g, std::chrono::nanoseconds(tickNs - elapsed));
+            }
             if (e->slowStop) {
                 refused.assign(e->slowQ.begin(), e->slowQ.end());
                 e->slowQ.clear();
@@ -976,7 +990,7 @@ void slowLoop(Engine* e) {
         const uint64_t now = monoNs();
         if (now - lastTick < 100ull * 1000 * 1000) continue;
         lastTick = now;
-        for (Type* t : typesWithFiles(e)) ftsCatchUp(e, t, false);
+        for (Type* t : typesWithFiles(e)) ftsTick(e, t);
         // Streams: a generation a compaction replaced goes once its grace is
         // over (unlinked when the last reader holding it lets go), and a
         // stream more than half dead is compacted on its type's writer.
