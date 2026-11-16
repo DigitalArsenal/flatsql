@@ -379,7 +379,7 @@ FLATSQL_TEST(t_fts_rebuild_retry) {
 }
 
 namespace {
-void stopBackground(fp::P4Engine* e) {
+void stopBackground(P4Engine* e) {
     {
         std::lock_guard<std::mutex> lock(e->slowMu);
         e->slowStop = true;
@@ -387,7 +387,7 @@ void stopBackground(fp::P4Engine* e) {
     e->slowCv.notify_all();
     if (e->slowThread.joinable()) e->slowThread.join();
 }
-void startBackground(fp::P4Engine* e) {
+void startBackground(P4Engine* e) {
     e->slowStop = false;
     e->slowThread = std::thread(fp::slowLoop, e);
 }
