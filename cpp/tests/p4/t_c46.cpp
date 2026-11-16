@@ -175,7 +175,17 @@ FLATSQL_TEST(t_fts_record_envelopes) {
         rebuild.text(1, "MPE").u32(63, 4);
         REQUIRE(call(FLATSQL_OPC_REBUILD, rebuild.b).status == FLATSQL_OK, "rebuild full text");
     }
+    for (size_t i = 0; i < cids.size(); ++i) {
+        const Result stored = get("MPE", {cids[i]}, true);
+        REQUIRE(stored.status == FLATSQL_OK && stored.rows.size() == 1, "GET by hash of original stored bytes");
+        CHECK(stored.s(0, "data") == std::string(reinterpret_cast<const char*>(frames[i].data() + 4), frames[i].size() - 4),
+              "original record bytes returned unchanged");
+        CHECK(stored.s(0, "cid") == cidText(cids[i].data()), "content address of original bytes");
+    }
     if (!retained.empty() && !reopen) { closeEngine(); return; }
+    closeEngine();
+    REQUIRE(openEngine(root) == FLATSQL_OK, "reopen indexed store");
+    REQUIRE(ftsCaughtUp("MPE", 2), "reopened full-text index ready");
     for (const auto& query : {"violet", "\"violet comet\""}) {
         const Result r = search("MPE", query);
         CHECK(r.status == FLATSQL_OK && r.rows.size() == 2, "both envelopes: " + std::string(query));
