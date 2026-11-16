@@ -461,6 +461,38 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFr
 
 // ---- REBUILD ------------------------------------------------------------------------------------------
 namespace {
+// The caller holds ftsMu for connection and progress changes.
+int32_t openFts(Engine* e, Type* t) {
+    if (!t->fts) {
+        Conn* c = nullptr;
+        if (openConn(t->pFts, OpenKind::Index, 4096, 4096, &c, nullptr) != SQLITE_OK) return FLATSQL_E_IO;
+        if (c->exec("CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(t, content='', contentless_delete=1);"
+                    "CREATE TABLE IF NOT EXISTS ftsmeta(k TEXT PRIMARY KEY, v) WITHOUT ROWID;") != SQLITE_OK) {
+            delete c;
+            return FLATSQL_E_IO;
+        }
+        sqlite3_stmt* s = c->sql("SELECT v FROM ftsmeta WHERE k='through'");
+        if (s && sqlite3_step(s) == SQLITE_ROW) t->ftsThrough = sqlite3_column_int64(s, 0);
+        if (s) sqlite3_reset(s);
+        sqlite3_wal_hook(c->db, walHook, e);
+        t->fts = c;
+    }
+    return FLATSQL_OK;
+}
+
+void resetFts(Type* t) {
+    if (t->fts) t->fts->exec("DELETE FROM fts");
+    t->ftsThrough = 0;
+}
+
+void writeFtsThrough(Type* t, int64_t through) {
+    sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
+    sqlite3_bind_int64(m, 1, through);
+    sqlite3_step(m);
+    sqlite3_reset(m);
+}
+
+
 int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<int64_t, 2>>* rows,
                   std::vector<Type*>* rowTypes, std::string* firstBad) {
     std::vector<Type*> types;
@@ -483,8 +515,7 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
         if (what & 4) {
             {
                 std::lock_guard<std::mutex> g(t->ftsMu);
-                if (t->fts) t->fts->exec("DELETE FROM fts");
-                t->ftsThrough = 0;
+                resetFts(t);
             }
             ftsCatchUp(e, t, true);
         }
@@ -500,20 +531,8 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
     std::shared_ptr<const Spec> sp = t->spec();
     if (!sp->fullText || !t->hasFiles.load(std::memory_order_acquire)) return FLATSQL_OK;  // no data: no .fts yet
     std::lock_guard<std::mutex> g(t->ftsMu);
-    if (!t->fts) {
-        Conn* c = nullptr;
-        if (openConn(t->pFts, OpenKind::Index, 4096, 4096, &c, nullptr) != SQLITE_OK) return FLATSQL_E_IO;
-        if (c->exec("CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(t, content='', contentless_delete=1);"
-                    "CREATE TABLE IF NOT EXISTS ftsmeta(k TEXT PRIMARY KEY, v) WITHOUT ROWID;") != SQLITE_OK) {
-            delete c;
-            return FLATSQL_E_IO;
-        }
-        sqlite3_stmt* s = c->sql("SELECT v FROM ftsmeta WHERE k='through'");
-        if (s && sqlite3_step(s) == SQLITE_ROW) t->ftsThrough = sqlite3_column_int64(s, 0);
-        if (s) sqlite3_reset(s);
-        sqlite3_wal_hook(c->db, walHook, e);
-        t->fts = c;
-    }
+    const int32_t opened = openFts(e, t);
+    if (opened != FLATSQL_OK) return opened;
     // Seqs whose row set left a feed file since the last pass: their
     // full-text rows go, for those the full text holds (a seq past
     // ftsThrough was never added, and catching up skips it: no rows). A
@@ -665,19 +684,13 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             break;
         }
         through = end ? vis : page.back().first;
-        sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
-        sqlite3_bind_int64(m, 1, through);
-        sqlite3_step(m);
-        sqlite3_reset(m);
+        writeFtsThrough(t, through);
         t->fts->exec("COMMIT");
         t->ftsThrough = through;
         done += int64_t(page.size());
     }
     if (status == FLATSQL_OK && through >= vis) {
-        sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
-        sqlite3_bind_int64(m, 1, vis);
-        sqlite3_step(m);
-        sqlite3_reset(m);
+        writeFtsThrough(t, vis);
         t->ftsThrough = vis;
     }
     t->ftsState = t->ftsThrough >= vis ? 2 : 1;
