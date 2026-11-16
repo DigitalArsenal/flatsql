@@ -15,9 +15,9 @@ using namespace p4t;
 
 namespace {
 TestType textType() { auto t = mpeType(); t.fullText = true; return t; }
-Batch records(int n) {
+Batch records(int n, int from = 0) {
     Batch b; b.type = "MPE"; b.peer = "synthetic-peer";
-    for (int i = 0; i < n; ++i) {
+    for (int i = from; i < from + n; ++i) {
         In r;
         r.frame = buildFrame(textType(), {Field::str("ENTITY_ID", "violet comet " + std::to_string(i)),
                                           Field::f64("EPOCH", 1789000000.0)});
@@ -32,7 +32,7 @@ Batch records(int n) {
     return b;
 }
 Result findText(uint64_t timeout = 5000) {
-    TlvW q; q.text(1, "MPE").text(18, "violet").u64(3, 10000);
+    TlvW q; q.text(1, "MPE").text(18, "violet").u64(3, 100000);
     CallOpts o; o.timeoutMs = timeout;
     return call(FLATSQL_OPC_SCAN, q.b, o);
 }
@@ -211,3 +211,117 @@ FLATSQL_TEST(t_fts_repair_crash) {
     removeTree(root);
 }
 #endif
+
+
+FLATSQL_TEST(t_fts_concurrent_readers) {
+    const std::string root = scratchDir("fts-concurrent");
+    constexpr int n = 20000;
+    REQUIRE(seed(root, n), "seed idle index");
+    REQUIRE(openEngine(root) == FLATSQL_OK && ready(), "reopen ready");
+    for (auto count : {std::make_pair(4, 25), std::make_pair(8, 50)}) {
+        std::atomic<int> ok{0}, busy{0}, other{0};
+        std::vector<std::thread> threads;
+        for (int k = 0; k < count.first; ++k) threads.emplace_back([&] {
+            for (int j = 0; j < count.second; ++j) {
+                const auto r = findText(30000);
+                if (r.status == FLATSQL_OK && r.rows.size() == n) ++ok;
+                else if (r.status == FLATSQL_E_BUSY) ++busy;
+                else ++other;
+            }
+        });
+        for (auto& t : threads) t.join();
+        std::printf("  %d x %d: ok=%d busy=%d other=%d\n", count.first, count.second,
+                    ok.load(), busy.load(), other.load());
+        CHECK_EQ(ok.load(), count.first * count.second, "every complete search succeeds");
+        CHECK_EQ(busy.load(), 0, "readers do not contend");
+        CHECK_EQ(other.load(), 0, "no other errors");
+    }
+    // A maintenance page's mutex cannot block a reader of a complete snapshot.
+    {
+        std::lock_guard<std::mutex> lock(fp::currentEngine()->findType("MPE")->ftsMu);
+        CHECK_EQ(findText().status, FLATSQL_OK, "search does not take maintenance mutex");
+    }
+    closeEngine(); removeTree(root);
+}
+
+namespace {
+uint32_t pausedSearch() {
+    TlvW q; q.text(1, "MPE").text(18, "violet").u64(3, 100000);
+    const uint32_t slot = submit(FLATSQL_OPC_SCAN, q.b);
+    auto* e = fp::currentEngine(); auto* h = e->slot(slot);
+    for (int i = 0; i < 2000; ++i) {
+        // An undrained ring pauses a multi-page query after its snapshot opens.
+        if (h->ringTail.load() >= e->ringBytes[e->poolOf(slot)] / 2) return slot;
+        if (h->state.load() == FLATSQL_SLOT_DONE) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return slot;
+}
+}
+
+FLATSQL_TEST(t_fts_snapshot_ingest) {
+    const std::string root = scratchDir("fts-snapshot");
+    constexpr int n = 20000;
+    REQUIRE(seed(root, n), "seed");
+    REQUIRE(openEngine(root) == FLATSQL_OK && ready(), "ready");
+    const uint32_t slot = pausedSearch();
+    auto* e = fp::currentEngine(); auto* t = e->findType("MPE");
+    e->ftsHold = true;
+    REQUIRE(put(records(100, n)).status == FLATSQL_OK, "ingest beyond search snapshot");
+    for (int i = 0; i < 200 && state() != "building"; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(state() == "building", "new records await extraction");
+    const auto r = wait(slot);
+    CHECK_EQ(r.status, FLATSQL_OK, "indexed snapshot succeeds during ingest");
+    CHECK_EQ(r.rows.size(), size_t(n), "snapshot excludes later records");
+    e->ftsHold = false;
+    closeEngine(); removeTree(root);
+}
+
+FLATSQL_TEST(t_fts_snapshot_reset) {
+    const std::string root = scratchDir("fts-reset-search");
+    constexpr int n = 20000;
+    REQUIRE(seed(root, n), "seed");
+    REQUIRE(openEngine(root) == FLATSQL_OK && ready(), "ready");
+    const uint32_t slot = pausedSearch();
+    REQUIRE(rebuild().status == FLATSQL_OK, "reset accepted");
+    REQUIRE(ready(), "rebuild completes before old search resumes");
+    const auto r = wait(slot);
+    CHECK_EQ(r.status, FLATSQL_E_BUSY, "reset invalidates old search even after catch-up");
+    closeEngine(); removeTree(root);
+}
+
+// Explicitly selected million-record comparison; ordinary test runs skip it.
+FLATSQL_TEST(t_fts_reextract_timing) {
+    const std::string root = argStr("fts-timing-store", "");
+    if (root.empty()) return;
+    constexpr int n = 1000000;
+    if (argInt("fts-timing-seed", 0)) {
+        REQUIRE(openEngine(root) == FLATSQL_OK, "seed open");
+        fp::currentEngine()->ftsHold = true;
+        REQUIRE(registerType(textType()) == FLATSQL_OK, "seed register");
+        for (int i = 0; i < n; i += 2000)
+            REQUIRE(put(records(2000, i)).status == FLATSQL_OK, "synthetic seed batch");
+        REQUIRE(closeEngine() == FLATSQL_OK, "seed close");
+        return;
+    }
+    REQUIRE(editIndex(root, "DELETE FROM fts; DELETE FROM ftsmeta;"), "reset closed derived index");
+    REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "open before timing");
+    const auto start = std::chrono::steady_clock::now();
+    REQUIRE(flatsql_start() >= 0, "start background repair");
+    auto* e = fp::currentEngine(); auto* t = e->findType("MPE");
+    bool complete = false;
+    for (int i = 0; i < 120000; ++i) {
+        {
+            std::lock_guard<std::mutex> lock(t->ftsMu);
+            complete = t->ftsState == 2 && t->ftsThrough >= t->vis.load();
+        }
+        if (complete) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    CHECK(complete, "million-record repair completed");
+    CHECK_EQ(extracted(), uint64_t(n), "each record extracted once");
+    std::printf("  TIMING records=%d seconds=%.6f records_per_second=%.3f\n", n, seconds, n / seconds);
+    REQUIRE(closeEngine() == FLATSQL_OK, "timed close");
+}
