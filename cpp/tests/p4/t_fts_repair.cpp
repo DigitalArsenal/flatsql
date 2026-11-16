@@ -309,6 +309,10 @@ FLATSQL_TEST(t_fts_reextract_timing) {
         REQUIRE(closeEngine() == FLATSQL_OK, "seed close");
         return;
     }
+    // Configure the engine's SQLite allocator before the standalone fixture
+    // editor opens SQLite. Initialization is outside the measured interval.
+    REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "initialize SQLite");
+    REQUIRE(closeEngine() == FLATSQL_OK, "close before fixture edit");
     REQUIRE(editIndex(root, "DELETE FROM fts; DELETE FROM ftsmeta;"), "reset closed derived index");
     REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "open before timing");
     const auto start = std::chrono::steady_clock::now();
