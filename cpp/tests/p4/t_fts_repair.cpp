@@ -325,3 +325,24 @@ FLATSQL_TEST(t_fts_reextract_timing) {
     std::printf("  TIMING records=%d seconds=%.6f records_per_second=%.3f\n", n, seconds, n / seconds);
     REQUIRE(closeEngine() == FLATSQL_OK, "timed close");
 }
+
+
+FLATSQL_TEST(t_fts_version_range) {
+    const std::string root = scratchDir("fts-version-range");
+    REQUIRE(seed(root, 2), "seed certified prefix");
+    REQUIRE(openEngine(root) == FLATSQL_OK && ready(), "current open");
+    REQUIRE(put(records(4, 2)).status == FLATSQL_OK && ready(), "append suffix");
+    REQUIRE(closeEngine() == FLATSQL_OK, "close before simulating older engine");
+    // The older engine keeps unknown keys, skips prefixed rows, and advances
+    // through. The two-record certified prefix remains intact.
+    REQUIRE(editIndex(root, "DELETE FROM fts WHERE rowid>2 AND rowid%2=0;"
+                            "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('extractor_through',2)"), "older append");
+    REQUIRE(openEngine(root) == FLATSQL_OK && ready(), "repair suffix automatically");
+    CHECK_EQ(extracted(), uint64_t(4), "only uncovered suffix extracted");
+    CHECK_EQ(matches(), size_t(6), "prefix and suffix both complete");
+    REQUIRE(closeEngine() == FLATSQL_OK, "close repaired range");
+    REQUIRE(openEngine(root) == FLATSQL_OK && ready(), "current reopen");
+    CHECK_EQ(extracted(), uint64_t(0), "current range re-extracts nothing");
+    CHECK_EQ(matches(), size_t(6), "all matches persist");
+    closeEngine(); removeTree(root);
+}

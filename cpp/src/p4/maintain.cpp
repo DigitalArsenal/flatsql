@@ -464,7 +464,7 @@ namespace {
 // Version 0 includes indexes with no extractor metadata. Version 1 accepts
 // records with their own size prefix inside the storage frame.
 constexpr int64_t kFtsExtractorVersion = 1;
-int32_t resetFts(Type* t);
+int32_t resetFts(Type* t, int64_t through = 0);
 
 // The caller holds ftsMu for connection and progress changes.
 int32_t openFts(Engine* e, Type* t) {
@@ -476,7 +476,7 @@ int32_t openFts(Engine* e, Type* t) {
             delete c;
             return FLATSQL_E_IO;
         }
-        int64_t through = 0, version = 0, target = 0;
+        int64_t through = 0, version = 0, target = 0, extractedThrough = 0;
         sqlite3_stmt* s = c->sql("SELECT k,v FROM ftsmeta");
         if (!s) { delete c; return FLATSQL_E_IO; }
         int rc;
@@ -486,14 +486,18 @@ int32_t openFts(Engine* e, Type* t) {
             if (key == "through") through = value;
             else if (key == "extractor_version") version = value;
             else if (key == "extractor_target") target = value;
+            else if (key == "extractor_through") extractedThrough = value;
         }
         sqlite3_reset(s);
         if (rc != SQLITE_DONE) { delete c; return FLATSQL_E_IO; }
         sqlite3_wal_hook(c->db, walHook, e);
         t->fts = c;
         t->ftsVersion = version;
-        if (version < kFtsExtractorVersion && target != kFtsExtractorVersion) {
-            const int32_t reset = resetFts(t);
+        const bool old = version < kFtsExtractorVersion && target != kFtsExtractorVersion;
+        // An older engine can advance through without advancing our coverage.
+        // Preserve the certified prefix and repair only the uncovered suffix.
+        if (old || through > extractedThrough) {
+            const int32_t reset = resetFts(t, old ? 0 : extractedThrough);
             if (reset != FLATSQL_OK) {
                 delete t->fts;
                 t->fts = nullptr;
@@ -508,7 +512,7 @@ int32_t openFts(Engine* e, Type* t) {
     return FLATSQL_OK;
 }
 
-int32_t resetFts(Type* t) {
+int32_t resetFts(Type* t, int64_t through) {
     // Publish reset entry before SQLite can expose cleared rows, and exit
     // after the durable cursor is published, including on a failed reset.
     struct ResetGuard {
@@ -517,21 +521,23 @@ int32_t resetFts(Type* t) {
         ~ResetGuard() { ++t->ftsReset; }
     } guard(t);
     if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) return FLATSQL_E_IO;
-    if (t->fts->exec((std::string("DELETE FROM fts;") +
-                     "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through',0),('extractor_version',0),"
-                     "('extractor_target'," + std::to_string(kFtsExtractorVersion) + ");").c_str()) != SQLITE_OK ||
+    const std::string mark = std::to_string(through);
+    if (t->fts->exec(("DELETE FROM fts WHERE rowid>" + mark + ";" +
+                     "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through'," + mark + "),('extractor_version',0),"
+                     "('extractor_through'," + mark + "),('extractor_target'," +
+                     std::to_string(kFtsExtractorVersion) + ");").c_str()) != SQLITE_OK ||
         t->fts->exec("COMMIT") != SQLITE_OK) {
         t->fts->exec("ROLLBACK");
         return FLATSQL_E_IO;
     }
-    t->ftsThrough = 0;
+    t->ftsThrough = through;
     t->ftsVersion = 0;
     t->ftsState = 1;
     return FLATSQL_OK;
 }
 
 int32_t writeFtsProgress(Type* t, int64_t through, bool complete) {
-    sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
+    sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1),('extractor_through', ?1)");
     if (!m) return FLATSQL_E_IO;
     sqlite3_bind_int64(m, 1, through);
     const int rc = sqlite3_step(m);
