@@ -461,6 +461,114 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFr
 
 // ---- REBUILD ------------------------------------------------------------------------------------------
 namespace {
+// Version 0 includes indexes with no extractor metadata. Version 1 accepts
+// records with their own size prefix inside the storage frame.
+constexpr int64_t kFtsExtractorVersion = 1;
+int32_t resetFts(Type* t, int64_t through = 0);
+
+// The caller holds ftsMu for connection and progress changes.
+int32_t openFts(Engine* e, Type* t) {
+    if (!t->fts) {
+        Conn* c = nullptr;
+        if (openConn(t->pFts, OpenKind::Index, 4096, 4096, &c, nullptr) != SQLITE_OK) return FLATSQL_E_IO;
+        if (c->exec("CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(t, content='', contentless_delete=1);"
+                    "CREATE TABLE IF NOT EXISTS ftsmeta(k TEXT PRIMARY KEY, v) WITHOUT ROWID;") != SQLITE_OK) {
+            delete c;
+            return FLATSQL_E_IO;
+        }
+        int64_t through = 0, version = 0, target = 0, extractedThrough = 0, repairThrough = -1, repairFrom = 0;
+        sqlite3_stmt* s = c->sql("SELECT k,v FROM ftsmeta");
+        if (!s) { delete c; return FLATSQL_E_IO; }
+        int rc;
+        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+            const std::string key(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+            const int64_t value = sqlite3_column_int64(s, 1);
+            if (key == "through") through = value;
+            else if (key == "extractor_version") version = value;
+            else if (key == "extractor_target") target = value;
+            else if (key == "extractor_through") extractedThrough = value;
+            else if (key == "repair_through") repairThrough = value;
+            else if (key == "repair_from") repairFrom = value;
+        }
+        sqlite3_reset(s);
+        if (rc != SQLITE_DONE) { delete c; return FLATSQL_E_IO; }
+        sqlite3_wal_hook(c->db, walHook, e);
+        t->fts = c;
+        t->ftsVersion = version;
+        t->ftsRepairThrough = repairThrough;
+        t->ftsRepairFrom = repairFrom;
+        const bool old = version < kFtsExtractorVersion && target != kFtsExtractorVersion;
+        // An older engine can advance through without advancing our coverage.
+        // Preserve the certified prefix and repair only the uncovered suffix.
+        if (old || through > extractedThrough) {
+            const int32_t reset = resetFts(t, old ? 0 : extractedThrough);
+            if (reset != FLATSQL_OK) {
+                delete t->fts;
+                t->fts = nullptr;
+                t->ftsThrough = 0;
+                t->ftsVersion = 0;
+                return reset;
+            }
+        } else {
+            // Repairs accepted without a completion mark adopt one on open.
+            // Persist it before extracting so a reopen cannot move the goal.
+            if (version < kFtsExtractorVersion && repairThrough < 0) {
+                repairThrough = t->vis.load(std::memory_order_acquire);
+                if (c->exec(("INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('repair_through'," +
+                             std::to_string(repairThrough) + ")").c_str()) != SQLITE_OK) {
+                    delete t->fts;
+                    t->fts = nullptr;
+                    return FLATSQL_E_IO;
+                }
+                t->ftsRepairThrough = repairThrough;
+            }
+            t->ftsThrough = through;
+            t->ftsState = version >= kFtsExtractorVersion ? 2 : 1;
+        }
+    }
+    return FLATSQL_OK;
+}
+
+int32_t resetFts(Type* t, int64_t through) {
+    // Publish reset entry before SQLite can expose cleared rows, and exit
+    // after the durable cursor is published, including on a failed reset.
+    struct ResetGuard {
+        Type* t;
+        explicit ResetGuard(Type* type) : t(type) { ++t->ftsReset; }
+        ~ResetGuard() { ++t->ftsReset; }
+    } guard(t);
+    if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) return FLATSQL_E_IO;
+    const std::string mark = std::to_string(through);
+    const int64_t repairThrough = t->vis.load(std::memory_order_acquire);
+    if (t->fts->exec(("DELETE FROM fts WHERE rowid>" + mark + ";" +
+                     "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through'," + mark + "),('extractor_version',0),"
+                     "('extractor_through'," + mark + "),('extractor_target'," +
+                     std::to_string(kFtsExtractorVersion) + "),('repair_through'," +
+                     std::to_string(repairThrough) + "),('repair_from'," + mark + ");").c_str()) != SQLITE_OK ||
+        t->fts->exec("COMMIT") != SQLITE_OK) {
+        t->fts->exec("ROLLBACK");
+        return FLATSQL_E_IO;
+    }
+    t->ftsThrough = through;
+    t->ftsVersion = 0;
+    t->ftsRepairThrough = repairThrough;
+    t->ftsRepairFrom = through;
+    t->ftsState = 1;
+    return FLATSQL_OK;
+}
+
+int32_t writeFtsProgress(Type* t, int64_t through, bool complete) {
+    sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1),('extractor_through', ?1)");
+    if (!m) return FLATSQL_E_IO;
+    sqlite3_bind_int64(m, 1, through);
+    const int rc = sqlite3_step(m);
+    sqlite3_reset(m);
+    if (rc != SQLITE_DONE) return FLATSQL_E_IO;
+    if (complete && t->fts->exec(("INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('extractor_version'," +
+                               std::to_string(kFtsExtractorVersion) + ");").c_str()) != SQLITE_OK) return FLATSQL_E_IO;
+    return FLATSQL_OK;
+}
+
 int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<int64_t, 2>>* rows,
                   std::vector<Type*>* rowTypes, std::string* firstBad) {
     std::vector<Type*> types;
@@ -480,13 +588,20 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
             mismatches = in.b;
             if (firstBad && firstBad->empty() && !in.firstBad.empty()) *firstBad = in.firstBad;
         }
-        if (what & 4) {
-            {
-                std::lock_guard<std::mutex> g(t->ftsMu);
-                if (t->fts) t->fts->exec("DELETE FROM fts");
-                t->ftsThrough = 0;
+        if ((what & 4) && t->spec()->fullText && t->hasFiles.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> g(t->ftsMu);
+            const uint64_t before = t->ftsReset.load();
+            const int32_t opened = openFts(e, t);
+            if (opened != FLATSQL_OK) return opened;
+            if (t->ftsRepairFrom > 0 ||
+                (t->ftsReset.load() == before && t->ftsVersion >= kFtsExtractorVersion)) {
+                // A suffix repair does not fulfill a request for the whole
+                // index. A full repair already in progress keeps its pages.
+                const int32_t rc = resetFts(t);
+                if (rc != FLATSQL_OK) return rc;
             }
-            ftsCatchUp(e, t, true);
+            // The committed reset is the operation. Extraction runs in the
+            // background; returning BUSY here would invite destructive retries.
         }
         rows->push_back({entries, mismatches});
         rowTypes->push_back(t);
@@ -496,24 +611,13 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
 }  // namespace
 
 // ---- FTS (background; never on the ingest path) -------------------------------------------------------
-int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
+namespace {
+int32_t ftsPage(Engine* e, Type* t, bool* complete) {
     std::shared_ptr<const Spec> sp = t->spec();
-    if (!sp->fullText || !t->hasFiles.load(std::memory_order_acquire)) return FLATSQL_OK;  // no data: no .fts yet
+    if (!sp->fullText || !t->hasFiles.load(std::memory_order_acquire)) { *complete = true; return FLATSQL_OK; }
     std::lock_guard<std::mutex> g(t->ftsMu);
-    if (!t->fts) {
-        Conn* c = nullptr;
-        if (openConn(t->pFts, OpenKind::Index, 4096, 4096, &c, nullptr) != SQLITE_OK) return FLATSQL_E_IO;
-        if (c->exec("CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(t, content='', contentless_delete=1);"
-                    "CREATE TABLE IF NOT EXISTS ftsmeta(k TEXT PRIMARY KEY, v) WITHOUT ROWID;") != SQLITE_OK) {
-            delete c;
-            return FLATSQL_E_IO;
-        }
-        sqlite3_stmt* s = c->sql("SELECT v FROM ftsmeta WHERE k='through'");
-        if (s && sqlite3_step(s) == SQLITE_ROW) t->ftsThrough = sqlite3_column_int64(s, 0);
-        if (s) sqlite3_reset(s);
-        sqlite3_wal_hook(c->db, walHook, e);
-        t->fts = c;
-    }
+    const int32_t opened = openFts(e, t);
+    if (opened != FLATSQL_OK) return opened;
     // Seqs whose row set left a feed file since the last pass: their
     // full-text rows go, for those the full text holds (a seq past
     // ftsThrough was never added, and catching up skips it: no rows). A
@@ -563,17 +667,18 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         }
     }
     const int64_t vis = t->vis.load(std::memory_order_acquire);
-    if (t->ftsThrough >= vis) {
+    if (t->ftsThrough >= vis && t->ftsVersion >= kFtsExtractorVersion) {
         t->ftsState = 2;
+        *complete = true;
         return FLATSQL_OK;
     }
-    t->ftsState = 1;
-    if (e->ftsHold.load()) return FLATSQL_OK;
+    if (e->ftsHold.load()) return FLATSQL_E_BUSY;
+    if (e->stopping.load()) return FLATSQL_E_STOPPED;
     const std::string fid(reinterpret_cast<const char*>(sp->tc.fid()), 4);
     // Pages of the feed files merged by seq, each seq read once from the
     // first feed file holding it, a file at a time.
     int64_t through = t->ftsThrough;
-    const int64_t limit = all ? INT64_MAX : 20000;
+    const int64_t limit = 4096;
     int64_t done = 0;
     int32_t status = FLATSQL_OK;
     SeqMerge merge(e, t, through, vis, 1024);
@@ -596,13 +701,9 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             page.push_back({seq, ffid});
         }
         if (status != FLATSQL_OK) break;
-        if (page.empty()) {
-            through = vis;
-            break;
-        }
         std::map<uint32_t, std::vector<int64_t>> byFile;
         for (auto& p : page) byFile[p.second].push_back(p.first);
-        t->fts->exec("BEGIN IMMEDIATE");
+        if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) { status = FLATSQL_E_IO; break; }
         for (auto& kv : byFile) {
             Feed* f;
             {
@@ -639,14 +740,20 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
                 // verifies from that origin, any other from its own (C-46 (3)).
                 if (sqlite3_step(s) == SQLITE_ROW && sqlite3_column_type(s, 2) == SQLITE_NULL &&
                     streamRead(stream.get(), sqlite3_column_int64(s, 0), sqlite3_column_int64(s, 1), &bytes, true) == FLATSQL_OK) {
+                    const auto* frame = reinterpret_cast<const uint8_t*>(bytes.data());
+                    // Keep the prefix that defines the record's alignment. For a
+                    // record with its own prefix, skip only the transport length.
+                    const size_t offset = ps::frameRootOffset(frame, bytes.size(), sp->tc.fid()) - 4;
                     std::string text, err;
                     if (reflectedRecordSearchText(sp->tc.bfbs().data(), sp->tc.bfbs().size(), fid,
-                                                  reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), text, &err)) {
+                                                  frame + offset, bytes.size() - offset, text, &err)) {
                         sqlite3_stmt* ins = t->fts->sql("INSERT OR REPLACE INTO fts(rowid, t) VALUES(?1,?2)");
+                        if (!ins) { status = FLATSQL_E_IO; break; }
                         sqlite3_bind_int64(ins, 1, seq);
                         sqlite3_bind_text(ins, 2, text.data(), int(text.size()), SQLITE_TRANSIENT);
-                        sqlite3_step(ins);
+                        const int inserted = sqlite3_step(ins);
                         sqlite3_reset(ins);
+                        if (inserted != SQLITE_DONE) { status = FLATSQL_E_IO; break; }
                         e->bump(kStFtsRows);
                     }
                 }
@@ -661,27 +768,50 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             break;
         }
         through = end ? vis : page.back().first;
-        sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
-        sqlite3_bind_int64(m, 1, through);
-        sqlite3_step(m);
-        sqlite3_reset(m);
-        t->fts->exec("COMMIT");
+        const bool repaired = through >= t->ftsRepairThrough;
+        status = writeFtsProgress(t, through, repaired);
+        if (status != FLATSQL_OK || t->fts->exec("COMMIT") != SQLITE_OK) {
+            t->fts->exec("ROLLBACK");
+            status = FLATSQL_E_IO;
+            break;
+        }
         t->ftsThrough = through;
+        if (repaired) t->ftsVersion = kFtsExtractorVersion;
         done += int64_t(page.size());
     }
-    if (status == FLATSQL_OK && through >= vis) {
-        sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
-        sqlite3_bind_int64(m, 1, vis);
-        sqlite3_step(m);
-        sqlite3_reset(m);
-        t->ftsThrough = vis;
-    }
-    t->ftsState = t->ftsThrough >= vis ? 2 : 1;
+    t->ftsState = t->ftsVersion >= kFtsExtractorVersion ? 2 : 1;
+    *complete = t->ftsThrough >= vis && t->ftsState == 2;
     return status;
+}
+}  // namespace
+
+int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
+    for (;;) {
+        bool complete = false;
+        const int32_t rc = ftsPage(e, t, &complete);
+        if (rc != FLATSQL_OK || complete || !all) return rc;
+        // Each page owns ftsMu independently, including its commit.
+        if (e->stopping.load()) return FLATSQL_E_STOPPED;
+    }
 }
 
 // ---- the loop -------------------------------------------------------------------------------------------
 namespace {
+constexpr uint64_t kFtsTickBudgetNs = 80ull * 1000 * 1000;
+void ftsTick(Engine* e, Type* t) {
+    const uint64_t start = monoNs();
+    do {
+        if (e->stopping.load()) return;
+        {
+            std::lock_guard<std::mutex> lock(e->slowMu);
+            if (e->slowStop) return;
+        }
+        bool complete = false;
+        if (ftsPage(e, t, &complete) != FLATSQL_OK || complete) return;
+        // The page releases ftsMu before the budget check and another page.
+    } while (monoNs() - start < kFtsTickBudgetNs);
+}
+
 void runMaintSlot(Engine* e, uint32_t slot) {
     SlotHeader* h = e->slot(slot);
     SlotOut out(e, slot);
@@ -863,7 +993,11 @@ void slowLoop(Engine* e) {
         std::vector<uint32_t> refused;
         {
             std::unique_lock<std::mutex> g(e->slowMu);
-            if (e->slowQ.empty() && !e->slowStop) e->slowCv.wait_for(g, std::chrono::milliseconds(100));
+            if (e->slowQ.empty() && !e->slowStop) {
+                const uint64_t elapsed = monoNs() - lastTick;
+                constexpr uint64_t tickNs = 100ull * 1000 * 1000;
+                if (elapsed < tickNs) e->slowCv.wait_for(g, std::chrono::nanoseconds(tickNs - elapsed));
+            }
             if (e->slowStop) {
                 refused.assign(e->slowQ.begin(), e->slowQ.end());
                 e->slowQ.clear();
@@ -891,7 +1025,7 @@ void slowLoop(Engine* e) {
         const uint64_t now = monoNs();
         if (now - lastTick < 100ull * 1000 * 1000) continue;
         lastTick = now;
-        for (Type* t : typesWithFiles(e)) ftsCatchUp(e, t, false);
+        for (Type* t : typesWithFiles(e)) ftsTick(e, t);
         // Streams: a generation a compaction replaced goes once its grace is
         // over (unlinked when the last reader holding it lets go), and a
         // stream more than half dead is compacted on its type's writer.

@@ -28,5 +28,6 @@ try {
  assert.deepEqual(Object.keys(api),['FlatSQL','FlatSQLError']);
  const output=run(process.execPath,['scripts/ci-unified-e2e.mjs'],{env:{...process.env,FLATSQL_TEST_PACKAGE:pkg},timeout:60000});
  process.stdout.write(output);
+ process.stdout.write(run(process.execPath,['scripts/ci-fts-envelopes-e2e.mjs'],{env:{...process.env,FLATSQL_TEST_PACKAGE:pkg},timeout:60000}));
  console.log(`PASS: installed tarball, one API/artifact, no runtime dependencies; ${pack.size} compressed bytes, ${pack.unpackedSize} unpacked bytes`);
 } finally { await fs.rm(temp,{recursive:true,force:true}); }

@@ -570,8 +570,13 @@ struct Type {
     std::atomic<int64_t> idxBytes{0}, ftsBytes{0};  // T/ files, set by the maintenance thread
     std::mutex ftsMu;
     struct Conn* fts = nullptr;
-    int64_t ftsThrough = 0;
-    uint8_t ftsState = 0;  // 0 off, 1 building, 2 ready
+    std::atomic<int64_t> ftsThrough{0};
+    // Odd during a reset; even generations identify one continuous index.
+    std::atomic<uint64_t> ftsReset{0};
+    int64_t ftsVersion = 0;
+    int64_t ftsRepairFrom = 0;  // zero for a full repair, protected by ftsMu
+    int64_t ftsRepairThrough = 0;  // fixed completion mark, protected by ftsMu
+    std::atomic<uint8_t> ftsState{0};  // 0 off, 1 building, 2 ready
     // Seqs whose row set left a feed file since the full text last caught up:
     // their full-text rows are deleted by the long-work thread (a migrated
     // seq only once no feed file holds it).

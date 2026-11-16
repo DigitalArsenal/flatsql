@@ -45,7 +45,7 @@ if [[ "$mode" != --wasm-only ]]; then
   build="${FLATSQL_CI_BUILD_DIR:-cpp/build-ci-e2e}"
   run native-configure cmake -S cpp -B "$build" -DCMAKE_BUILD_TYPE=Release "-DFLATBUFFERS_DIR=$FLATBUFFERS_DIR"
   run native-build cmake --build "$build" --target flatsql_p4_test --parallel "${FLATSQL_BUILD_JOBS:-4}"
-  for flow in t_gjn_binary_query_reopen t_sql_surface t_kill_check_compaction; do
+  for flow in t_gjn_binary_query_reopen t_sql_surface t_kill_check_compaction t_fts_prefix_aligned t_fts_record_envelopes t_fts_upgrade t_fts_rebuild_immediate t_fts_repair_pages t_fts_rebuild_held t_fts_repair_crash t_fts_empty_type t_fts_concurrent_readers t_fts_snapshot_ingest t_fts_snapshot_reset t_fts_version_range t_fts_rebuild_retry t_fts_summary_ingest t_fts_summary_repair_mark t_fts_rebuild_range; do
     run "$flow" "$build/flatsql_p4_test" "--test=$flow"
     # The test harness permits an unmatched filter; an empty run is not evidence.
     grep -q '^1 tests, 0 failures$' "$results/$flow.log"

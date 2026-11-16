@@ -131,6 +131,81 @@ FLATSQL_TEST(t_fts_prefix_aligned) {
     removeTree(root);
 }
 
+// The same content in each accepted record envelope has the same search text.
+FLATSQL_TEST(t_fts_record_envelopes) {
+    const std::string retained = argStr("fts-store", "");
+    const bool reopen = argInt("fts-reopen", 0) != 0;
+    const std::string root = retained.empty() ? scratchDir("t_fts_record_envelopes") : retained;
+    TestType type = mpeType();
+    type.fullText = true;
+    const auto bare = buildFrame(type, {Field::str("ENTITY_ID", "violet comet beacon"),
+                                       Field::f64("EPOCH", 1789000000.0), Field::f64("MEAN_MOTION", 15.5)});
+    std::vector<uint8_t> prefixed(4);
+    flatbuffers::WriteScalar<uint32_t>(prefixed.data(), uint32_t(bare.size()));
+    prefixed.insert(prefixed.end(), bare.begin(), bare.end());
+    std::vector<std::vector<uint8_t>> frames{bare, prefixed}, cids;
+    for (const auto& frame : frames) {
+        uint8_t cid[36];
+        cidOf(frame, cid);
+        cids.emplace_back(cid, cid + 36);
+    }
+    CHECK(cids[0] != cids[1], "the stored envelopes have distinct content addresses");
+    REQUIRE(openEngine(root) == FLATSQL_OK, "open");
+    REQUIRE(registerType(type) == FLATSQL_OK, "register");
+    if (!reopen) {
+        Batch b;
+        b.type = "MPE";
+        b.peer = "synthetic-peer";
+        for (const auto& frame : frames) { In r; r.frame = frame; r.ts = 1790000000; b.recs.push_back(r); }
+        REQUIRE(put(b).status == FLATSQL_OK, "put both envelopes");
+    }
+    REQUIRE(ftsCaughtUp("MPE", 2), "full text caught up");
+    const Result initial = search("MPE", "violet");
+    REQUIRE(initial.status == FLATSQL_OK, initial.err);
+    for (size_t i = 0; i < cids.size(); ++i) {
+        size_t matches = 0;
+        for (size_t j = 0; j < initial.rows.size(); ++j)
+            matches += initial.s(j, "cid") == cidText(cids[i].data());
+        std::printf("  envelope=%s matches=%zu\n", i ? "prefixed" : "bare", matches);
+        CHECK_EQ(matches, size_t(1), "each envelope matches after automatic repair");
+    }
+    if (reopen) {
+        TlvW rebuild;
+        rebuild.text(1, "MPE").u32(63, 4);
+        REQUIRE(call(FLATSQL_OPC_REBUILD, rebuild.b).status == FLATSQL_OK, "rebuild full text");
+    }
+    for (size_t i = 0; i < cids.size(); ++i) {
+        const Result stored = get("MPE", {cids[i]}, true);
+        REQUIRE(stored.status == FLATSQL_OK && stored.rows.size() == 1, "GET by hash of original stored bytes");
+        CHECK(stored.s(0, "data") == std::string(reinterpret_cast<const char*>(frames[i].data() + 4), frames[i].size() - 4),
+              "original record bytes returned unchanged");
+        CHECK(stored.s(0, "cid") == cidText(cids[i].data()), "content address of original bytes");
+    }
+    if (!retained.empty() && !reopen) { closeEngine(); return; }
+    closeEngine();
+    REQUIRE(openEngine(root) == FLATSQL_OK, "reopen indexed store");
+    REQUIRE(ftsCaughtUp("MPE", 2), "reopened full-text index ready");
+    for (const auto& query : {"violet", "\"violet comet\""}) {
+        const Result r = search("MPE", query);
+        CHECK(r.status == FLATSQL_OK && r.rows.size() == 2, "both envelopes: " + std::string(query));
+    }
+    const Result absent = search("MPE", "absentword");
+    CHECK(absent.status == FLATSQL_OK && absent.rows.empty(), "no match");
+    for (const auto& cid : cids) {
+        TlvW del;
+        std::vector<uint8_t> list{1, 0, 0, 0};
+        list.insert(list.end(), cid.begin(), cid.end());
+        del.text(1, "MPE").raw(40, list.data(), list.size());
+        REQUIRE(call(FLATSQL_OPC_DELETE, del.b).status == FLATSQL_OK, "delete");
+    }
+    for (int i = 0; i < 100 && !search("MPE", "violet").rows.empty(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const Result removed = search("MPE", "violet");
+    CHECK(removed.status == FLATSQL_OK && removed.rows.empty(), "deleted records do not match");
+    closeEngine();
+    if (retained.empty()) removeTree(root);
+}
+
 // C-46 (2): full text on a type with no records answers like format 1: no
 // rows (its index has nothing to build), not "building".
 FLATSQL_TEST(t_fts_empty_type) {

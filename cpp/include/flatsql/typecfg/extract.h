@@ -29,6 +29,7 @@
 #ifndef FLATSQL_TYPECFG_EXTRACT_H
 #define FLATSQL_TYPECFG_EXTRACT_H
 
+#include "flatsql/record_buffer.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -192,10 +193,7 @@ private:
 // the CID (over the record) are the same either way.
 inline size_t frameRootOffset(const uint8_t* frame, size_t len, const uint8_t fid[4]) {
     if (len >= 12 && std::memcmp(frame + 8, fid, 4) == 0) return 4;
-    if (len >= 16 && uint32_t(frame[4] | frame[5] << 8 | frame[6] << 16 | uint32_t(frame[7]) << 24) == len - 8 &&
-        std::memcmp(frame + 12, fid, 4) == 0)
-        return 8;
-    return 4;
+    return len >= 4 ? 4 + recordRootOffset(frame + 4, len - 4, fid) : 4;
 }
 
 // Sealed envelope check (A19): encfield "SDF1"/"SDFN" + version 1.

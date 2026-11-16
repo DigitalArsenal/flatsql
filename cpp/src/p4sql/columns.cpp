@@ -7,6 +7,7 @@
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/reflection_generated.h"
 #include "internal.h"
+#include "flatsql/record_buffer.h"
 
 namespace flatsql {
 namespace p4sql {
@@ -209,13 +210,9 @@ void resultColumn(sqlite3_context* ctx, const Column& c, const uint8_t* data, si
 }
 
 void payloadOf(const uint8_t fid[4], const uint8_t* d, size_t n, const uint8_t** p, size_t* len) {
-    if (d && n >= 12 && uint64_t(rd<uint32_t>(d)) + 4 == uint64_t(n) && std::memcmp(d + 8, fid, 4) == 0) {
-        *p = d + 4;
-        *len = n - 4;
-        return;
-    }
-    *p = d;
-    *len = n;
+    const size_t offset = recordRootOffset(d, n, fid);
+    *p = offset ? d + offset : d;
+    *len = n - offset;
 }
 
 }  // namespace p4sql
