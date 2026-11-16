@@ -12,7 +12,8 @@
   commit progress and resume after interruption. Current indexes reopen without
   re-extraction. Explicit full-text REBUILD (mask 4) also works immediately after
   open and acknowledges the committed reset while extraction continues in the
-  background. Repeated requests preserve active repair progress. Resetting the
+  background. Repeated requests preserve full repair progress; a request during
+  a suffix repair escalates it to a full reset. Resetting the
   index and its progress is atomic. Concurrent searches do not contend with
   each other or maintenance, and an indexed snapshot remains searchable during
   ingest. Reset generations invalidate searches spanning a rebuild. An 80 ms

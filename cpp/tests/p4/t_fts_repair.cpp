@@ -468,3 +468,46 @@ FLATSQL_TEST(t_fts_summary_repair_mark) {
         closeEngine(); removeTree(root);
     }
 }
+
+FLATSQL_TEST(t_fts_rebuild_range) {
+    for (bool reopen : {false, true}) {
+        const std::string root = scratchDir("fts-rebuild-range");
+        constexpr int n = 12200;
+        REQUIRE(seed(root, n), "seed certified index");
+        // Simulate an older engine rebuilding the certified prefix and then
+        // advancing the suffix. Only an explicit rebuild repairs both parts.
+        REQUIRE(editIndex(root, "DELETE FROM fts WHERE rowid%2=0;"
+                                "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('extractor_through',2)"), "older engine");
+        REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "open without threads");
+        auto* e = fp::currentEngine(); auto* t = e->findType("MPE");
+        REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_OK, "first suffix page");
+        REQUIRE(t->ftsThrough == 4098, "nonzero suffix progress");
+        if (reopen) {
+            REQUIRE(closeEngine() == FLATSQL_OK, "close partial suffix repair");
+            REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "reopen suffix repair");
+            e = fp::currentEngine(); t = e->findType("MPE");
+            e->ftsHold = true;
+            REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_E_BUSY, "load durable repair origin");
+        }
+        const auto generation = t->ftsReset.load();
+        e->ftsHold = true;
+        e->slowStop = true;
+        REQUIRE(flatsql_start() >= 0, "start readers and maintenance requests");
+        CHECK_EQ(rebuild().status, FLATSQL_OK, "whole-index rebuild accepted during suffix repair");
+        CHECK_EQ(t->ftsThrough.load(), int64_t(0), "suffix repair escalated to full reset");
+        CHECK_EQ(t->ftsReset.load(), generation + 2, "one full reset");
+        CHECK(state() == "building", "full reset is building");
+        CHECK_EQ(rebuild().status, FLATSQL_OK, "second rebuild acknowledges full reset");
+        CHECK_EQ(t->ftsReset.load(), generation + 2, "second request preserves reset");
+        e->ftsHold = false;
+        REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_OK, "first full page");
+        CHECK_EQ(t->ftsThrough.load(), int64_t(4096), "full rebuild has progress");
+        CHECK_EQ(rebuild().status, FLATSQL_OK, "third rebuild preserves progress");
+        CHECK_EQ(t->ftsThrough.load(), int64_t(4096), "third request keeps committed page");
+        CHECK_EQ(t->ftsReset.load(), generation + 2, "third request does not reset");
+        REQUIRE(fp::ftsCatchUp(e, t, true) == FLATSQL_OK, "finish full repair");
+        CHECK(state() == "ready", "whole-index rebuild complete");
+        CHECK_EQ(matches(), size_t(n), "explicit rebuild restores uncertified prefix and suffix");
+        closeEngine(); removeTree(root);
+    }
+}

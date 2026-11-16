@@ -476,7 +476,7 @@ int32_t openFts(Engine* e, Type* t) {
             delete c;
             return FLATSQL_E_IO;
         }
-        int64_t through = 0, version = 0, target = 0, extractedThrough = 0, repairThrough = -1;
+        int64_t through = 0, version = 0, target = 0, extractedThrough = 0, repairThrough = -1, repairFrom = 0;
         sqlite3_stmt* s = c->sql("SELECT k,v FROM ftsmeta");
         if (!s) { delete c; return FLATSQL_E_IO; }
         int rc;
@@ -488,6 +488,7 @@ int32_t openFts(Engine* e, Type* t) {
             else if (key == "extractor_target") target = value;
             else if (key == "extractor_through") extractedThrough = value;
             else if (key == "repair_through") repairThrough = value;
+            else if (key == "repair_from") repairFrom = value;
         }
         sqlite3_reset(s);
         if (rc != SQLITE_DONE) { delete c; return FLATSQL_E_IO; }
@@ -495,6 +496,7 @@ int32_t openFts(Engine* e, Type* t) {
         t->fts = c;
         t->ftsVersion = version;
         t->ftsRepairThrough = repairThrough;
+        t->ftsRepairFrom = repairFrom;
         const bool old = version < kFtsExtractorVersion && target != kFtsExtractorVersion;
         // An older engine can advance through without advancing our coverage.
         // Preserve the certified prefix and repair only the uncovered suffix.
@@ -542,7 +544,7 @@ int32_t resetFts(Type* t, int64_t through) {
                      "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through'," + mark + "),('extractor_version',0),"
                      "('extractor_through'," + mark + "),('extractor_target'," +
                      std::to_string(kFtsExtractorVersion) + "),('repair_through'," +
-                     std::to_string(repairThrough) + ");").c_str()) != SQLITE_OK ||
+                     std::to_string(repairThrough) + "),('repair_from'," + mark + ");").c_str()) != SQLITE_OK ||
         t->fts->exec("COMMIT") != SQLITE_OK) {
         t->fts->exec("ROLLBACK");
         return FLATSQL_E_IO;
@@ -550,6 +552,7 @@ int32_t resetFts(Type* t, int64_t through) {
     t->ftsThrough = through;
     t->ftsVersion = 0;
     t->ftsRepairThrough = repairThrough;
+    t->ftsRepairFrom = through;
     t->ftsState = 1;
     return FLATSQL_OK;
 }
@@ -590,8 +593,10 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
             const uint64_t before = t->ftsReset.load();
             const int32_t opened = openFts(e, t);
             if (opened != FLATSQL_OK) return opened;
-            if (t->ftsReset.load() == before && t->ftsVersion >= kFtsExtractorVersion) {
-                // A repeat request preserves an accepted rebuild's progress.
+            if (t->ftsRepairFrom > 0 ||
+                (t->ftsReset.load() == before && t->ftsVersion >= kFtsExtractorVersion)) {
+                // A suffix repair does not fulfill a request for the whole
+                // index. A full repair already in progress keeps its pages.
                 const int32_t rc = resetFts(t);
                 if (rc != FLATSQL_OK) return rc;
             }

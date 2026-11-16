@@ -65,7 +65,11 @@ copy as described in `cpp/src/p4/FORMAT.md`. It is not a normal open mode.
   full-text mask `4` as a uint32 in TLV 63, re-extracts the type at any time,
   including immediately after open. It opens the index connection as needed
   and returns OK once the reset commits; extraction continues in the background.
-  Repeating REBUILD during an active repair returns OK and preserves its progress.
+  Repeating REBUILD during a full rebuild or repair from zero returns OK and
+  preserves its progress. During a suffix repair, REBUILD resets the whole index
+  once; repeated requests preserve that full rebuild's progress.
+  An index rebuilt by a 3.12.5 or older engine after this engine indexed it is
+  not repaired automatically; call REBUILD once on this engine.
   A held extraction remains building after the accepted reset. The
   JavaScript API has no rebuild method; the C ABI exposes this maintenance
   operation. Automatic repair requires no embedder action or store-format migration.
