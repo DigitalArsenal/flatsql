@@ -572,9 +572,8 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
             const uint64_t before = t->ftsReset.load();
             const int32_t opened = openFts(e, t);
             if (opened != FLATSQL_OK) return opened;
-            if (t->ftsReset.load() == before) {
+            if (t->ftsReset.load() == before && t->ftsVersion >= kFtsExtractorVersion) {
                 // A repeat request preserves an accepted rebuild's progress.
-                if (t->ftsVersion < kFtsExtractorVersion) return FLATSQL_E_BUSY;
                 const int32_t rc = resetFts(t);
                 if (rc != FLATSQL_OK) return rc;
             }

@@ -171,7 +171,7 @@ FLATSQL_TEST(t_fts_rebuild_held) {
     CHECK_EQ(rebuild().status, FLATSQL_OK, "committed reset succeeds while extraction is held");
     auto* t = fp::currentEngine()->findType("MPE");
     const auto generation = t->ftsReset.load();
-    CHECK_EQ(rebuild().status, FLATSQL_E_BUSY, "duplicate pending rebuild changes nothing");
+    CHECK_EQ(rebuild().status, FLATSQL_OK, "duplicate pending rebuild is already accepted");
     CHECK_EQ(t->ftsReset.load(), generation, "duplicate request does not reset again");
     CHECK(state() == "building", "reset persists incomplete state");
     CHECK_EQ(findText().status, FLATSQL_E_BUSY, "held reset cannot answer empty success");
@@ -348,5 +348,29 @@ FLATSQL_TEST(t_fts_version_range) {
     REQUIRE(openEngine(root) == FLATSQL_OK && ready(), "current reopen");
     CHECK_EQ(extracted(), uint64_t(0), "current range re-extracts nothing");
     CHECK_EQ(matches(), size_t(6), "all matches persist");
+    closeEngine(); removeTree(root);
+}
+
+
+FLATSQL_TEST(t_fts_rebuild_retry) {
+    const std::string root = scratchDir("fts-rebuild-retry");
+    REQUIRE(seed(root, 4100), "seed");
+    REQUIRE(editIndex(root, oldIndex(true)), "request automatic repair");
+    REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "init without background thread");
+    auto* e = fp::currentEngine(); auto* t = e->findType("MPE");
+    REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_OK, "commit first repair page");
+    const auto generation = t->ftsReset.load();
+    REQUIRE(t->ftsThrough == 4096, "nonzero partial progress");
+    e->ftsHold = true;
+    TlvW w; w.text(1, "MPE").u32(63, 4);
+    const uint32_t slot = submit(FLATSQL_OPC_REBUILD, w.b);
+    REQUIRE(flatsql_start() >= 0, "start");
+    CHECK_EQ(wait(slot).status, FLATSQL_OK, "pending repair is already accepted");
+    CHECK_EQ(t->ftsThrough.load(), int64_t(4096), "retry preserves committed progress");
+    CHECK_EQ(t->ftsReset.load(), generation, "retry does not reset index");
+    e->ftsHold = false;
+    REQUIRE(ready(), "finish background repair");
+    CHECK_EQ(extracted(), uint64_t(4100), "no page repeated");
+    CHECK_EQ(matches(), size_t(4100), "all matches restored");
     closeEngine(); removeTree(root);
 }
