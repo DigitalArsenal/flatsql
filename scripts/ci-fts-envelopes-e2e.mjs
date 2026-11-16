@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import { FlatcRunner } from 'flatc-wasm/runner';
 const packageRoot = process.env.FLATSQL_TEST_PACKAGE;
@@ -68,6 +69,26 @@ try {
   assert.deepEqual((await search('"violet comet"')).sort(), [...cids].sort());
   assert.deepEqual(await search('absentword'), []);
   await db.close();
+  for (const absentVersion of [true, false]) {
+    // Reproduce an old extractor's mixed index without shipping a fixture.
+    const index = new DatabaseSync(path.join(root, 'T/GJN.fts'));
+    try {
+      index.exec(`DELETE FROM fts WHERE rowid=2;
+        DELETE FROM ftsmeta WHERE k IN ('extractor_version','extractor_target');`);
+      if (!absentVersion) index.exec("INSERT INTO ftsmeta(k,v) VALUES('extractor_version',0)");
+      assert.equal(index.prepare("SELECT count(*) AS n FROM fts WHERE fts MATCH 'violet'").get().n, 1);
+    } finally { index.close(); }
+    db = await FlatSQL.open({ root });
+    assert.deepEqual((await search('violet')).sort(), [...cids].sort());
+    assert.deepEqual((await search('"violet comet"')).sort(), [...cids].sort());
+    await db.close();
+    const repaired = new DatabaseSync(path.join(root, 'T/GJN.fts'), { readOnly: true });
+    try {
+      assert.equal(repaired.prepare("SELECT v FROM ftsmeta WHERE k='extractor_version'").get().v, 1);
+      assert.equal(repaired.prepare("SELECT count(*) AS n FROM fts WHERE fts MATCH 'violet'").get().n, 2);
+    } finally { repaired.close(); }
+    console.log(`PASS: automatic WASM repair with ${absentVersion ? 'absent' : 'old'} extractor version`);
+  }
   db = await FlatSQL.open({ root });
   assert.deepEqual((await search('violet')).sort(), [...cids].sort());
   await db.remove('GJN', framed);
