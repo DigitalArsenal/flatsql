@@ -509,9 +509,9 @@ int32_t openFts(Engine* e, Type* t) {
 
 int32_t resetFts(Type* t) {
     if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) return FLATSQL_E_IO;
-    if (t->fts->exec("DELETE FROM fts;"
+    if (t->fts->exec((std::string("DELETE FROM fts;") +
                      "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through',0),('extractor_version',0),"
-                     "('extractor_target'," + std::to_string(kFtsExtractorVersion) + ");") != SQLITE_OK ||
+                     "('extractor_target'," + std::to_string(kFtsExtractorVersion) + ");").c_str()) != SQLITE_OK ||
         t->fts->exec("COMMIT") != SQLITE_OK) {
         t->fts->exec("ROLLBACK");
         return FLATSQL_E_IO;
@@ -529,8 +529,8 @@ int32_t writeFtsProgress(Type* t, int64_t through, bool complete) {
     const int rc = sqlite3_step(m);
     sqlite3_reset(m);
     if (rc != SQLITE_DONE) return FLATSQL_E_IO;
-    if (complete && t->fts->exec("INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('extractor_version'," +
-                               std::to_string(kFtsExtractorVersion) + ");") != SQLITE_OK) return FLATSQL_E_IO;
+    if (complete && t->fts->exec(("INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('extractor_version'," +
+                               std::to_string(kFtsExtractorVersion) + ");").c_str()) != SQLITE_OK) return FLATSQL_E_IO;
     return FLATSQL_OK;
 }
 
