@@ -572,9 +572,10 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
 }  // namespace
 
 // ---- FTS (background; never on the ingest path) -------------------------------------------------------
-int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
+namespace {
+int32_t ftsPage(Engine* e, Type* t, bool* complete) {
     std::shared_ptr<const Spec> sp = t->spec();
-    if (!sp->fullText || !t->hasFiles.load(std::memory_order_acquire)) return FLATSQL_OK;  // no data: no .fts yet
+    if (!sp->fullText || !t->hasFiles.load(std::memory_order_acquire)) { *complete = true; return FLATSQL_OK; }
     std::lock_guard<std::mutex> g(t->ftsMu);
     const int32_t opened = openFts(e, t);
     if (opened != FLATSQL_OK) return opened;
@@ -629,15 +630,17 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
     const int64_t vis = t->vis.load(std::memory_order_acquire);
     if (t->ftsThrough >= vis && t->ftsVersion >= kFtsExtractorVersion) {
         t->ftsState = 2;
+        *complete = true;
         return FLATSQL_OK;
     }
     t->ftsState = 1;
-    if (e->ftsHold.load()) return all ? FLATSQL_E_BUSY : FLATSQL_OK;
+    if (e->ftsHold.load()) return FLATSQL_E_BUSY;
+    if (e->stopping.load()) return FLATSQL_E_STOPPED;
     const std::string fid(reinterpret_cast<const char*>(sp->tc.fid()), 4);
     // Pages of the feed files merged by seq, each seq read once from the
     // first feed file holding it, a file at a time.
     int64_t through = t->ftsThrough;
-    const int64_t limit = all ? INT64_MAX : 20000;
+    const int64_t limit = 4096;
     int64_t done = 0;
     int32_t status = FLATSQL_OK;
     SeqMerge merge(e, t, through, vis, 1024);
@@ -738,7 +741,20 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         done += int64_t(page.size());
     }
     t->ftsState = t->ftsThrough >= vis && t->ftsVersion >= kFtsExtractorVersion ? 2 : 1;
+    *complete = t->ftsState == 2;
     return status;
+}
+}  // namespace
+
+int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
+    for (;;) {
+        bool complete = false;
+        const int32_t rc = ftsPage(e, t, &complete);
+        if (rc != FLATSQL_OK || complete || !all) return rc;
+        // Each page owns ftsMu independently, including its commit. Searches
+        // can observe building between pages and refuse without waiting.
+        if (e->stopping.load()) return FLATSQL_E_STOPPED;
+    }
 }
 
 // ---- the loop -------------------------------------------------------------------------------------------

@@ -876,8 +876,9 @@ int32_t Scan::open() {
         // A type without records answers none (below).
         if (!sp_->fullText || (t_->hasFiles.load(std::memory_order_acquire) && !ioExists(t_->pFts))) return FLATSQL_E_UNSUPPORTED;
         // A search is complete only after its index covers this snapshot.
-        { std::lock_guard<std::mutex> lock(t_->ftsMu);
-          if (t_->ftsThrough < hi_) return FLATSQL_E_BUSY; }
+        { std::unique_lock<std::mutex> lock(t_->ftsMu, std::try_to_lock);
+          if (!lock.owns_lock() || (t_->hasFiles.load(std::memory_order_acquire) &&
+              (t_->ftsState != 2 || t_->ftsThrough < hi_))) return FLATSQL_E_BUSY; }
         fts_ = true;
     }
     if (s_.order == 0) s_.order = FLATSQL_ORDER_SEQ_ASC;
@@ -1410,6 +1411,11 @@ int32_t Scan::loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::v
 // range read when the page's seqs are dense, else a probe per seq).
 int32_t Scan::ftsHits(const std::vector<int64_t>& seqs, std::unordered_set<int64_t>* hit) {
     if (seqs.empty()) return FLATSQL_OK;
+    // A rebuild can start after Scan::open or between result pages. Keep
+    // readiness and the FTS read under one lock so it cannot return a partial
+    // rebuilt index as a complete result.
+    std::unique_lock<std::mutex> lock(t_->ftsMu, std::try_to_lock);
+    if (!lock.owns_lock() || t_->ftsState != 2 || t_->ftsThrough < hi_) return FLATSQL_E_BUSY;
     int rc = 0;
     Conn* c = e_->rpool.acquire(t_->pFts, OpenKind::Reader, &rc, nullptr);
     if (!c) return statusOfSqlite(rc);
@@ -3345,7 +3351,7 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
                 // search answers no rows as format 1 does (C-46 (2)).
                 std::lock_guard<std::mutex> g(t->ftsMu);
                 const bool empty = !t->hasFiles.load(std::memory_order_acquire);
-                state = !sp->fullText ? "off" : t->ftsState == 2 || empty ? "ready" : "building";
+                state = !sp->fullText ? "off" : (t->ftsState == 2 && t->ftsThrough >= t->vis.load(std::memory_order_acquire)) || empty ? "ready" : "building";
                 through = t->ftsThrough;
             }
             o.enc.beginRow();
