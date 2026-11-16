@@ -378,6 +378,21 @@ FLATSQL_TEST(t_fts_rebuild_retry) {
     closeEngine(); removeTree(root);
 }
 
+namespace {
+void stopBackground(fp::P4Engine* e) {
+    {
+        std::lock_guard<std::mutex> lock(e->slowMu);
+        e->slowStop = true;
+    }
+    e->slowCv.notify_all();
+    if (e->slowThread.joinable()) e->slowThread.join();
+}
+void startBackground(fp::P4Engine* e) {
+    e->slowStop = false;
+    e->slowThread = std::thread(fp::slowLoop, e);
+}
+}
+
 // The same cadence and record count as the ingest review probe.
 FLATSQL_TEST(t_fts_summary_ingest) {
     const std::string root = scratchDir("fts-summary-ingest");
@@ -421,7 +436,7 @@ FLATSQL_TEST(t_fts_summary_repair_mark) {
             "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('extractor_through',2)"), "suffix repair");
         REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "open before threads");
         auto* e = fp::currentEngine();
-        e->slowStop = true;
+        e->slowStop = kind != 1;
         e->ftsHold = true;
         REQUIRE(flatsql_start() >= 0, "start readers and writers");
         if (kind == 0) {
@@ -429,8 +444,10 @@ FLATSQL_TEST(t_fts_summary_repair_mark) {
             REQUIRE(put(records(n)).status == FLATSQL_OK, "initial records");
         }
         auto* t = e->findType("MPE");
-        if (kind == 1) REQUIRE(rebuild().status == FLATSQL_OK, "explicit reset");
-        else REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_E_BUSY, "open held repair");
+        if (kind == 1) {
+            REQUIRE(rebuild().status == FLATSQL_OK, "explicit reset");
+            stopBackground(e);
+        } else REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_E_BUSY, "open held repair");
         CHECK(state() == "building", "initial/reset/upgrade/range repair reports building");
         const int64_t goal = t->ftsRepairThrough;
         REQUIRE(goal == n, "fixed mark includes existing records");
@@ -491,7 +508,6 @@ FLATSQL_TEST(t_fts_rebuild_range) {
         }
         const auto generation = t->ftsReset.load();
         e->ftsHold = true;
-        e->slowStop = true;
         REQUIRE(flatsql_start() >= 0, "start readers and maintenance requests");
         CHECK_EQ(rebuild().status, FLATSQL_OK, "whole-index rebuild accepted during suffix repair");
         CHECK_EQ(t->ftsThrough.load(), int64_t(0), "suffix repair escalated to full reset");
@@ -499,12 +515,17 @@ FLATSQL_TEST(t_fts_rebuild_range) {
         CHECK(state() == "building", "full reset is building");
         CHECK_EQ(rebuild().status, FLATSQL_OK, "second rebuild acknowledges full reset");
         CHECK_EQ(t->ftsReset.load(), generation + 2, "second request preserves reset");
+        stopBackground(e);
         e->ftsHold = false;
         REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_OK, "first full page");
         CHECK_EQ(t->ftsThrough.load(), int64_t(4096), "full rebuild has progress");
+        e->ftsHold = true;
+        startBackground(e);
         CHECK_EQ(rebuild().status, FLATSQL_OK, "third rebuild preserves progress");
         CHECK_EQ(t->ftsThrough.load(), int64_t(4096), "third request keeps committed page");
         CHECK_EQ(t->ftsReset.load(), generation + 2, "third request does not reset");
+        stopBackground(e);
+        e->ftsHold = false;
         REQUIRE(fp::ftsCatchUp(e, t, true) == FLATSQL_OK, "finish full repair");
         CHECK(state() == "ready", "whole-index rebuild complete");
         CHECK_EQ(matches(), size_t(n), "explicit rebuild restores uncertified prefix and suffix");
