@@ -57,7 +57,7 @@ try {
           PARAMETERS: [{ KIND: 'Text', TEXT_VALUE: term }],
         }))).map(row => row[0].TEXT_VALUE);
       } catch (error) {
-        if (![-6, -9].includes(error.status) || Date.now() >= deadline) throw error;
+        if (error.status !== -6 || Date.now() >= deadline) throw error;
         await new Promise(resolve => setTimeout(resolve, 10));
       }
     }
@@ -71,7 +71,7 @@ try {
   await db.close();
   for (const absentVersion of [true, false]) {
     // Reproduce an old extractor's mixed index without shipping a fixture.
-    const index = new DatabaseSync(path.join(root, 'T/GJN.fts'));
+    const index = new DatabaseSync(path.join(root, 'store/T/GJN.fts'));
     try {
       index.exec(`DELETE FROM fts WHERE rowid=2;
         DELETE FROM ftsmeta WHERE k IN ('extractor_version','extractor_target');`);
@@ -82,7 +82,7 @@ try {
     assert.deepEqual((await search('violet')).sort(), [...cids].sort());
     assert.deepEqual((await search('"violet comet"')).sort(), [...cids].sort());
     await db.close();
-    const repaired = new DatabaseSync(path.join(root, 'T/GJN.fts'), { readOnly: true });
+    const repaired = new DatabaseSync(path.join(root, 'store/T/GJN.fts'), { readOnly: true });
     try {
       assert.equal(repaired.prepare("SELECT v FROM ftsmeta WHERE k='extractor_version'").get().v, 1);
       assert.equal(repaired.prepare("SELECT count(*) AS n FROM fts WHERE fts MATCH 'violet'").get().n, 2);
