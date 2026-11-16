@@ -779,7 +779,11 @@ constexpr uint64_t kFtsTickBudgetNs = 80ull * 1000 * 1000;
 void ftsTick(Engine* e, Type* t) {
     const uint64_t start = monoNs();
     do {
-        if (e->stopping.load() || e->slowStop.load()) return;
+        if (e->stopping.load()) return;
+        {
+            std::lock_guard<std::mutex> lock(e->slowMu);
+            if (e->slowStop) return;
+        }
         bool complete = false;
         if (ftsPage(e, t, &complete) != FLATSQL_OK || complete) return;
         // The page releases ftsMu before the budget check and another page.
