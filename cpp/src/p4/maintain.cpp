@@ -481,7 +481,6 @@ int32_t openFts(Engine* e, Type* t) {
 }
 
 int32_t resetFts(Type* t) {
-    if (!t->fts) { t->ftsThrough = 0; return FLATSQL_OK; }
     if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) return FLATSQL_E_IO;
     if (t->fts->exec("DELETE FROM fts;"
                      "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through',0),('extractor_version',0);") != SQLITE_OK ||
@@ -522,9 +521,11 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
             mismatches = in.b;
             if (firstBad && firstBad->empty() && !in.firstBad.empty()) *firstBad = in.firstBad;
         }
-        if (what & 4) {
+        if ((what & 4) && t->spec()->fullText && t->hasFiles.load(std::memory_order_acquire)) {
             {
                 std::lock_guard<std::mutex> g(t->ftsMu);
+                const int32_t opened = openFts(e, t);
+                if (opened != FLATSQL_OK) return opened;
                 const int32_t rc = resetFts(t);
                 if (rc != FLATSQL_OK) return rc;
             }
@@ -599,7 +600,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         return FLATSQL_OK;
     }
     t->ftsState = 1;
-    if (e->ftsHold.load()) return FLATSQL_OK;
+    if (e->ftsHold.load()) return all ? FLATSQL_E_BUSY : FLATSQL_OK;
     const std::string fid(reinterpret_cast<const char*>(sp->tc.fid()), 4);
     // Pages of the feed files merged by seq, each seq read once from the
     // first feed file holding it, a file at a time.
