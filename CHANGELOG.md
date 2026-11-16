@@ -11,7 +11,14 @@
   a search. Repair reports building and searches return BUSY; bounded pages
   commit progress and resume after interruption. Current indexes reopen without
   re-extraction. Explicit full-text REBUILD (mask 4) also works immediately after
-  open. Resetting the index and its progress is atomic. The store format is unchanged.
+  open and acknowledges the committed reset while extraction continues in the
+  background. Repeated requests preserve active repair progress. Resetting the
+  index and its progress is atomic. Concurrent searches do not contend with
+  each other or maintenance, and an indexed snapshot remains searchable during
+  ingest. Reset generations invalidate searches spanning a rebuild. An 80 ms
+  extraction budget runs several bounded pages per tick. Extractor coverage
+  detects an older engine advancing the index and repairs only the uncovered
+  suffix. The store format is unchanged.
 
 ## 3.12.5
 

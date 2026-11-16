@@ -40,11 +40,11 @@ copy as described in `cpp/src/p4/FORMAT.md`. It is not a normal open mode.
   byte for byte. Derived geometry has the separate semantics below.
 - With `registerSchema({..., fullText:true})`, SQL `_search MATCH ?1` uses the
   engine's FTS5 index over the record's text fields, including nested text.
-  The engine returns `BUSY` while its background index catches up; retry the
-  query, and never treat that condition as zero matches.
+  The engine returns `BUSY` when the index does not cover the search snapshot;
+  retry the query, and never treat that condition as zero matches.
   Bare and size-prefixed stored records have identical search semantics; stored
   bytes and their content addresses are preserved. The index records its
-  extractor version. Opening an index built by an older extractor automatically
+  extractor version and the sequence range it covers. Opening an index built by an older extractor automatically
   re-extracts that type in the background, including records previously skipped
   because of their size prefix. Repair runs even without a search or rebuild
   request. SUMMARY mode 5 reports `building` during repair; searches return
@@ -52,11 +52,19 @@ copy as described in `cpp/src/p4/FORMAT.md`. It is not a normal open mode.
   Retry the entire query on BUSY; partial streamed pages are not a complete answer.
   Progress commits in bounded pages, resumes after interruption, and records
   the completed extractor version with the final page. A current index reopens
-  without re-extracting its records.
+  without re-extracting its records. If an older engine advances the index beyond
+  the recorded extractor coverage, opening repairs only that uncovered suffix.
+  Searches on a complete snapshot do not contend with maintenance or other
+  readers, and continue while newer records await extraction. A reset counter
+  invalidates searches spanning a reset, even if the index catches up again.
+  Background extraction commits 4,096-record pages within an 80 ms budget per
+  type per 100 ms tick, releasing its maintenance mutex between pages.
   An explicit `FLATSQL_OPC_REBUILD` (opcode 5), with the type name in TLV 1 and
   full-text mask `4` as a uint32 in TLV 63, re-extracts the type at any time,
-  including immediately after open. It opens the index connection as needed;
-  a held extraction returns BUSY with durable incomplete progress. The
+  including immediately after open. It opens the index connection as needed
+  and returns OK once the reset commits; extraction continues in the background.
+  Repeating REBUILD during an active repair returns OK and preserves its progress.
+  A held extraction remains building after the accepted reset. The
   JavaScript API has no rebuild method; the C ABI exposes this maintenance
   operation. Automatic repair requires no embedder action or store-format migration.
 - Hidden metadata columns `_cid`, `_seq`, `_ts`, `_epoch`, `_producer`, `_peer`

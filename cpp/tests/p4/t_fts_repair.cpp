@@ -145,8 +145,8 @@ FLATSQL_TEST(t_fts_repair_pages) {
     CHECK_EQ(findText().status, FLATSQL_E_BUSY, "partial index returns BUSY");
     {
         std::lock_guard<std::mutex> lock(t->ftsMu);
-        // Waiting on ftsMu here would time out: BUSY must arrive while held.
-        CHECK_EQ(findText(1000).status, FLATSQL_E_BUSY, "busy lock returns immediately");
+        // Incomplete coverage returns BUSY without taking maintenance mutex.
+        CHECK_EQ(findText(1000).status, FLATSQL_E_BUSY, "incomplete coverage returns immediately");
     }
     const auto b = records(n);
     eraseRecord(b.recs.front());   // already extracted
