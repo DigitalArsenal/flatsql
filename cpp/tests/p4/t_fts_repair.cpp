@@ -168,7 +168,11 @@ FLATSQL_TEST(t_fts_rebuild_held) {
     REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "init");
     fp::currentEngine()->ftsHold = true;
     REQUIRE(flatsql_start() >= 0, "start");
-    CHECK_EQ(rebuild().status, FLATSQL_E_BUSY, "held rebuild is incomplete");
+    CHECK_EQ(rebuild().status, FLATSQL_OK, "committed reset succeeds while extraction is held");
+    auto* t = fp::currentEngine()->findType("MPE");
+    const auto generation = t->ftsReset.load();
+    CHECK_EQ(rebuild().status, FLATSQL_E_BUSY, "duplicate pending rebuild changes nothing");
+    CHECK_EQ(t->ftsReset.load(), generation, "duplicate request does not reset again");
     CHECK(state() == "building", "reset persists incomplete state");
     CHECK_EQ(findText().status, FLATSQL_E_BUSY, "held reset cannot answer empty success");
     closeEngine();

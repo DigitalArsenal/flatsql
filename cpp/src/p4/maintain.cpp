@@ -568,15 +568,18 @@ int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<i
             if (firstBad && firstBad->empty() && !in.firstBad.empty()) *firstBad = in.firstBad;
         }
         if ((what & 4) && t->spec()->fullText && t->hasFiles.load(std::memory_order_acquire)) {
-            {
-                std::lock_guard<std::mutex> g(t->ftsMu);
-                const int32_t opened = openFts(e, t);
-                if (opened != FLATSQL_OK) return opened;
+            std::lock_guard<std::mutex> g(t->ftsMu);
+            const uint64_t before = t->ftsReset.load();
+            const int32_t opened = openFts(e, t);
+            if (opened != FLATSQL_OK) return opened;
+            if (t->ftsReset.load() == before) {
+                // A repeat request preserves an accepted rebuild's progress.
+                if (t->ftsVersion < kFtsExtractorVersion) return FLATSQL_E_BUSY;
                 const int32_t rc = resetFts(t);
                 if (rc != FLATSQL_OK) return rc;
             }
-            const int32_t rc = ftsCatchUp(e, t, true);
-            if (rc != FLATSQL_OK) return rc;
+            // The committed reset is the operation. Extraction runs in the
+            // background; returning BUSY here would invite destructive retries.
         }
         rows->push_back({entries, mismatches});
         rowTypes->push_back(t);
