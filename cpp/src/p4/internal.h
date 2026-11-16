@@ -571,6 +571,7 @@ struct Type {
     std::mutex ftsMu;
     struct Conn* fts = nullptr;
     int64_t ftsThrough = 0;
+    int64_t ftsVersion = 0;
     uint8_t ftsState = 0;  // 0 off, 1 building, 2 ready
     // Seqs whose row set left a feed file since the full text last caught up:
     // their full-text rows are deleted by the long-work thread (a migrated

@@ -461,6 +461,11 @@ int32_t quotaGc(Engine* e, uint64_t maxBytes, int64_t* records, int64_t* bytesFr
 
 // ---- REBUILD ------------------------------------------------------------------------------------------
 namespace {
+// Version 0 includes indexes with no extractor metadata. Version 1 accepts
+// records with their own size prefix inside the storage frame.
+constexpr int64_t kFtsExtractorVersion = 1;
+int32_t resetFts(Type* t);
+
 // The caller holds ftsMu for connection and progress changes.
 int32_t openFts(Engine* e, Type* t) {
     if (!t->fts) {
@@ -471,11 +476,33 @@ int32_t openFts(Engine* e, Type* t) {
             delete c;
             return FLATSQL_E_IO;
         }
-        sqlite3_stmt* s = c->sql("SELECT v FROM ftsmeta WHERE k='through'");
-        if (s && sqlite3_step(s) == SQLITE_ROW) t->ftsThrough = sqlite3_column_int64(s, 0);
-        if (s) sqlite3_reset(s);
+        int64_t through = 0, version = 0, target = 0;
+        sqlite3_stmt* s = c->sql("SELECT k,v FROM ftsmeta");
+        if (!s) { delete c; return FLATSQL_E_IO; }
+        int rc;
+        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+            const std::string key(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
+            const int64_t value = sqlite3_column_int64(s, 1);
+            if (key == "through") through = value;
+            else if (key == "extractor_version") version = value;
+            else if (key == "extractor_target") target = value;
+        }
+        sqlite3_reset(s);
+        if (rc != SQLITE_DONE) { delete c; return FLATSQL_E_IO; }
         sqlite3_wal_hook(c->db, walHook, e);
         t->fts = c;
+        t->ftsThrough = through;
+        t->ftsVersion = version;
+        if (version < kFtsExtractorVersion && target != kFtsExtractorVersion) {
+            const int32_t reset = resetFts(t);
+            if (reset != FLATSQL_OK) {
+                delete t->fts;
+                t->fts = nullptr;
+                t->ftsThrough = 0;
+                t->ftsVersion = 0;
+                return reset;
+            }
+        }
     }
     return FLATSQL_OK;
 }
@@ -483,23 +510,28 @@ int32_t openFts(Engine* e, Type* t) {
 int32_t resetFts(Type* t) {
     if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) return FLATSQL_E_IO;
     if (t->fts->exec("DELETE FROM fts;"
-                     "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through',0),('extractor_version',0);") != SQLITE_OK ||
+                     "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through',0),('extractor_version',0),"
+                     "('extractor_target'," + std::to_string(kFtsExtractorVersion) + ");") != SQLITE_OK ||
         t->fts->exec("COMMIT") != SQLITE_OK) {
         t->fts->exec("ROLLBACK");
         return FLATSQL_E_IO;
     }
     t->ftsThrough = 0;
+    t->ftsVersion = 0;
     t->ftsState = 1;
     return FLATSQL_OK;
 }
 
-int32_t writeFtsThrough(Type* t, int64_t through) {
+int32_t writeFtsProgress(Type* t, int64_t through, bool complete) {
     sqlite3_stmt* m = t->fts->sql("INSERT OR REPLACE INTO ftsmeta(k, v) VALUES('through', ?1)");
     if (!m) return FLATSQL_E_IO;
     sqlite3_bind_int64(m, 1, through);
     const int rc = sqlite3_step(m);
     sqlite3_reset(m);
-    return rc == SQLITE_DONE ? FLATSQL_OK : FLATSQL_E_IO;
+    if (rc != SQLITE_DONE) return FLATSQL_E_IO;
+    if (complete && t->fts->exec("INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('extractor_version'," +
+                               std::to_string(kFtsExtractorVersion) + ");") != SQLITE_OK) return FLATSQL_E_IO;
+    return FLATSQL_OK;
 }
 
 int32_t rebuildOp(Engine* e, Type* only, uint32_t what, std::vector<std::array<int64_t, 2>>* rows,
@@ -595,7 +627,7 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
         }
     }
     const int64_t vis = t->vis.load(std::memory_order_acquire);
-    if (t->ftsThrough >= vis) {
+    if (t->ftsThrough >= vis && t->ftsVersion >= kFtsExtractorVersion) {
         t->ftsState = 2;
         return FLATSQL_OK;
     }
@@ -628,10 +660,6 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             page.push_back({seq, ffid});
         }
         if (status != FLATSQL_OK) break;
-        if (page.empty()) {
-            through = vis;
-            break;
-        }
         std::map<uint32_t, std::vector<int64_t>> byFile;
         for (auto& p : page) byFile[p.second].push_back(p.first);
         if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) { status = FLATSQL_E_IO; break; }
@@ -699,20 +727,17 @@ int32_t ftsCatchUp(Engine* e, Type* t, bool all) {
             break;
         }
         through = end ? vis : page.back().first;
-        status = writeFtsThrough(t, through);
+        status = writeFtsProgress(t, through, end);
         if (status != FLATSQL_OK || t->fts->exec("COMMIT") != SQLITE_OK) {
             t->fts->exec("ROLLBACK");
             status = FLATSQL_E_IO;
             break;
         }
         t->ftsThrough = through;
+        if (end) t->ftsVersion = kFtsExtractorVersion;
         done += int64_t(page.size());
     }
-    if (status == FLATSQL_OK && through >= vis) {
-        status = writeFtsThrough(t, vis);
-        if (status == FLATSQL_OK) t->ftsThrough = vis;
-    }
-    t->ftsState = t->ftsThrough >= vis ? 2 : 1;
+    t->ftsState = t->ftsThrough >= vis && t->ftsVersion >= kFtsExtractorVersion ? 2 : 1;
     return status;
 }
 
