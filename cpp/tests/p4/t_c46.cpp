@@ -167,8 +167,7 @@ FLATSQL_TEST(t_fts_record_envelopes) {
         for (size_t j = 0; j < initial.rows.size(); ++j)
             matches += initial.s(j, "cid") == cidText(cids[i].data());
         std::printf("  envelope=%s matches=%zu\n", i ? "prefixed" : "bare", matches);
-        if (!reopen) CHECK_EQ(matches, size_t(1), "each envelope matches");
-        else CHECK_EQ(matches, i ? size_t(0) : size_t(1), "old index persists across upgrade");
+        CHECK_EQ(matches, size_t(1), "each envelope matches after automatic repair");
     }
     if (reopen) {
         TlvW rebuild;
