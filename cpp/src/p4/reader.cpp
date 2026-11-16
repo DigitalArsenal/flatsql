@@ -477,6 +477,7 @@ private:
     bool evaluate(int64_t seq, const RowV* rows, const RowV* end, Row* out);
     int32_t loadRows(int fi, Conn* c, const std::vector<int64_t>& seqs, std::vector<RowV>* out);
     int32_t ftsHits(const std::vector<int64_t>& seqs, std::unordered_set<int64_t>* hit);
+    int32_t queryFts(const std::vector<int64_t>& seqs, std::unordered_set<int64_t>* hit);
     bool needData() const;
     bool laneMatch(const RowV& r) const;
     bool copyMatch(const RowV& r) const;
@@ -1417,6 +1418,10 @@ int32_t Scan::ftsHits(const std::vector<int64_t>& seqs, std::unordered_set<int64
     // rebuilt index as a complete result.
     std::unique_lock<std::mutex> lock(t_->ftsMu, std::try_to_lock);
     if (!lock.owns_lock() || t_->ftsState != 2 || t_->ftsThrough < hi_) return FLATSQL_E_BUSY;
+    return queryFts(seqs, hit);
+}
+
+int32_t Scan::queryFts(const std::vector<int64_t>& seqs, std::unordered_set<int64_t>* hit) {
     int rc = 0;
     Conn* c = e_->rpool.acquire(t_->pFts, OpenKind::Reader, &rc, nullptr);
     if (!c) return statusOfSqlite(rc);
