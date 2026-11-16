@@ -6,9 +6,12 @@
   storage frame adds a transport length; search extraction treated that length
   as the record prefix and checked the file identifier at the wrong offset.
   Search and projection share record-envelope detection, preserving the
-  alignment origin, stored bytes, and content address. Existing affected
-  full-text indexes require an explicit full-text rebuild (REBUILD mask 4);
-  reopening alone retains the missing matches. The store format is unchanged.
+  alignment origin, stored bytes, and content address. Full-text indexes record
+  their extractor version and repair themselves after an upgrade, even without
+  a search. Repair reports building and searches return BUSY; bounded pages
+  commit progress and resume after interruption. Current indexes reopen without
+  re-extraction. Explicit full-text REBUILD (mask 4) also works immediately after
+  open. Resetting the index and its progress is atomic. The store format is unchanged.
 
 ## 3.12.5
 
