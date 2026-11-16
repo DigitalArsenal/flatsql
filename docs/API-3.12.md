@@ -47,8 +47,10 @@ copy as described in `cpp/src/p4/FORMAT.md`. It is not a normal open mode.
   extractor version and the sequence range it covers. Opening an index built by an older extractor automatically
   re-extracts that type in the background, including records previously skipped
   because of their size prefix. Repair runs even without a search or rebuild
-  request. SUMMARY mode 5 reports `building` during repair; searches return
-  `FLATSQL_E_BUSY` (-6), including searches that overlap an explicit rebuild.
+  request. SUMMARY mode 5 reports `building` through the fixed sequence mark
+  captured when a build or repair starts, then `ready` even while newer records
+  await extraction. That mark survives reopening. Searches whose snapshot is
+  not covered return `FLATSQL_E_BUSY` (-6), as do searches that overlap a reset.
   Retry the entire query on BUSY; partial streamed pages are not a complete answer.
   Progress commits in bounded pages, resumes after interruption, and records
   the completed extractor version with the final page. A current index reopens

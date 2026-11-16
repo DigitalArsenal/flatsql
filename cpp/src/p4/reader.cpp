@@ -3362,7 +3362,9 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
                 // A type without records yet has nothing to index: ready, so a
                 // search answers no rows as format 1 does (C-46 (2)).
                 const bool empty = t->vis.load(std::memory_order_acquire) == 0 || !t->hasFiles.load(std::memory_order_acquire);
-                state = !sp->fullText ? "off" : (t->ftsState == 2 && t->ftsThrough >= t->vis.load(std::memory_order_acquire)) || empty ? "ready" : "building";
+                const uint64_t reset = t->ftsReset.load();
+                const bool ready = t->ftsState == 2 || empty;
+                state = !sp->fullText ? "off" : ready && !(reset & 1) && t->ftsReset.load() == reset ? "ready" : "building";
                 through = t->ftsThrough;
             }
             o.enc.beginRow();

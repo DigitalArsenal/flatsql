@@ -272,9 +272,8 @@ FLATSQL_TEST(t_fts_snapshot_ingest) {
     auto* e = fp::currentEngine(); auto* t = e->findType("MPE");
     e->ftsHold = true;
     REQUIRE(put(records(100, n)).status == FLATSQL_OK, "ingest beyond search snapshot");
-    for (int i = 0; i < 200 && state() != "building"; ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    CHECK(state() == "building", "new records await extraction");
+    CHECK(t->ftsThrough < t->vis.load(), "new records await extraction");
+    CHECK(state() == "ready", "ordinary ingest preserves SUMMARY readiness");
     const auto r = wait(slot);
     CHECK_EQ(r.status, FLATSQL_OK, "indexed snapshot succeeds during ingest");
     CHECK_EQ(r.rows.size(), size_t(n), "snapshot excludes later records");
@@ -339,7 +338,7 @@ FLATSQL_TEST(t_fts_version_range) {
     const std::string root = scratchDir("fts-version-range");
     REQUIRE(seed(root, 2), "seed certified prefix");
     REQUIRE(openEngine(root) == FLATSQL_OK && ready(), "current open");
-    REQUIRE(put(records(4, 2)).status == FLATSQL_OK && ready(), "append suffix");
+    REQUIRE(put(records(4, 2)).status == FLATSQL_OK && matches() == 6, "append and index suffix");
     REQUIRE(closeEngine() == FLATSQL_OK, "close before simulating older engine");
     // The older engine keeps unknown keys, skips prefixed rows, and advances
     // through. The two-record certified prefix remains intact.
@@ -377,4 +376,95 @@ FLATSQL_TEST(t_fts_rebuild_retry) {
     CHECK_EQ(extracted(), uint64_t(4100), "no page repeated");
     CHECK_EQ(matches(), size_t(4100), "all matches restored");
     closeEngine(); removeTree(root);
+}
+
+// The same cadence and record count as the ingest review probe.
+FLATSQL_TEST(t_fts_summary_ingest) {
+    const std::string root = scratchDir("fts-summary-ingest");
+    REQUIRE(seed(root, 20000), "seed");
+    REQUIRE(openEngine(root) == FLATSQL_OK && ready(), "open ready");
+    std::atomic<bool> stop{false};
+    std::atomic<int> writeErrors{0};
+    std::thread writer([&] {
+        for (int at = 20000; !stop.load(); at += 200) {
+            if (put(records(200, at)).status != FLATSQL_OK) ++writeErrors;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    });
+    int readyCount = 0, building = 0, ok = 0, busy = 0, other = 0;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < until) {
+        if (state() == "ready") ++readyCount; else ++building;
+        const auto r = findText();
+        if (r.status == FLATSQL_OK) ++ok;
+        else if (r.status == FLATSQL_E_BUSY) ++busy;
+        else ++other;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    stop = true;
+    writer.join();
+    std::printf("  steady ingest: ok=%d busy=%d other=%d summary ready=%d building=%d\n",
+                ok, busy, other, readyCount, building);
+    CHECK(readyCount > 0, "SUMMARY sampled");
+    CHECK_EQ(building, 0, "ordinary ingest never reports building");
+    CHECK_EQ(other + writeErrors.load(), 0, "only supported responses");
+    closeEngine(); removeTree(root);
+}
+
+FLATSQL_TEST(t_fts_summary_repair_mark) {
+    for (int kind = 0; kind < 4; ++kind) {
+        const std::string root = scratchDir("fts-summary-mark");
+        constexpr int n = 8200;
+        if (kind != 0) REQUIRE(seed(root, n), "seed existing index");
+        if (kind == 2) REQUIRE(editIndex(root, oldIndex(true)), "older extractor");
+        if (kind == 3) REQUIRE(editIndex(root,
+            "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('extractor_through',2)"), "suffix repair");
+        REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "open before threads");
+        auto* e = fp::currentEngine();
+        e->slowStop = true;
+        e->ftsHold = true;
+        REQUIRE(flatsql_start() >= 0, "start readers and writers");
+        if (kind == 0) {
+            REQUIRE(registerType(textType()) == FLATSQL_OK, "first type");
+            REQUIRE(put(records(n)).status == FLATSQL_OK, "initial records");
+        }
+        auto* t = e->findType("MPE");
+        if (kind == 1) REQUIRE(rebuild().status == FLATSQL_OK, "explicit reset");
+        else REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_E_BUSY, "open held repair");
+        CHECK(state() == "building", "initial/reset/upgrade/range repair reports building");
+        const int64_t goal = t->ftsRepairThrough;
+        REQUIRE(goal == n, "fixed mark includes existing records");
+        e->ftsHold = false;
+        REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_OK, "first page");
+        CHECK(state() == "building", "partial page below repair mark");
+        REQUIRE(put(records(5000, n)).status == FLATSQL_OK, "ingest after repair began");
+        REQUIRE(closeEngine() == FLATSQL_OK, "close partial repair");
+        REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "resume partial repair");
+        e = fp::currentEngine(); t = e->findType("MPE");
+        e->slowStop = true; e->ftsHold = true;
+        REQUIRE(flatsql_start() >= 0, "restart readers and writers");
+        REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_E_BUSY, "open held resume");
+        CHECK_EQ(t->ftsRepairThrough, goal, "reopen preserves original mark");
+        CHECK(state() == "building", "resumed repair still below mark");
+        e->ftsHold = false;
+        int at = n + 5000;
+        for (int page = 0; page < 4 && t->ftsThrough < goal; ++page) {
+            REQUIRE(put(records(5000, at)).status == FLATSQL_OK, "continuous ingest");
+            at += 5000;
+            REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_OK, "repair page under ingest");
+            CHECK(state() == (t->ftsThrough < goal ? "building" : "ready"), "state follows fixed mark");
+        }
+        CHECK(t->ftsThrough >= goal && t->ftsThrough < t->vis.load(), "repair reached mark with ingest still ahead");
+        CHECK(state() == "ready", "ingest cannot prolong repair status");
+        CHECK_EQ(findText().status, FLATSQL_E_BUSY, "SCAN still checks its newer snapshot");
+        REQUIRE(closeEngine() == FLATSQL_OK, "close completed repair with lag");
+        REQUIRE(openEngine(root, {}, false) == FLATSQL_OK, "reopen completed repair with lag");
+        e = fp::currentEngine(); t = e->findType("MPE");
+        e->slowStop = true; e->ftsHold = true;
+        REQUIRE(flatsql_start() >= 0, "start");
+        REQUIRE(fp::ftsCatchUp(e, t, false) == FLATSQL_E_BUSY, "hold ordinary catch-up");
+        CHECK(state() == "ready", "completed repair stays ready after reopen despite lag");
+        CHECK_EQ(extracted(), uint64_t(0), "reopen does not repeat repair");
+        closeEngine(); removeTree(root);
+    }
 }

@@ -18,7 +18,8 @@
   ingest. Reset generations invalidate searches spanning a rebuild. An 80 ms
   extraction budget runs several bounded pages per tick. Extractor coverage
   detects an older engine advancing the index and repairs only the uncovered
-  suffix. The store format is unchanged.
+  suffix. SUMMARY reports building through a fixed repair mark and stays ready
+  during ordinary ingest. The store format is unchanged.
 
 ## 3.12.5
 

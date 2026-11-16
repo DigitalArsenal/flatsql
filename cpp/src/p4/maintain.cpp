@@ -476,7 +476,7 @@ int32_t openFts(Engine* e, Type* t) {
             delete c;
             return FLATSQL_E_IO;
         }
-        int64_t through = 0, version = 0, target = 0, extractedThrough = 0;
+        int64_t through = 0, version = 0, target = 0, extractedThrough = 0, repairThrough = -1;
         sqlite3_stmt* s = c->sql("SELECT k,v FROM ftsmeta");
         if (!s) { delete c; return FLATSQL_E_IO; }
         int rc;
@@ -487,12 +487,14 @@ int32_t openFts(Engine* e, Type* t) {
             else if (key == "extractor_version") version = value;
             else if (key == "extractor_target") target = value;
             else if (key == "extractor_through") extractedThrough = value;
+            else if (key == "repair_through") repairThrough = value;
         }
         sqlite3_reset(s);
         if (rc != SQLITE_DONE) { delete c; return FLATSQL_E_IO; }
         sqlite3_wal_hook(c->db, walHook, e);
         t->fts = c;
         t->ftsVersion = version;
+        t->ftsRepairThrough = repairThrough;
         const bool old = version < kFtsExtractorVersion && target != kFtsExtractorVersion;
         // An older engine can advance through without advancing our coverage.
         // Preserve the certified prefix and repair only the uncovered suffix.
@@ -506,7 +508,20 @@ int32_t openFts(Engine* e, Type* t) {
                 return reset;
             }
         } else {
+            // Repairs accepted without a completion mark adopt one on open.
+            // Persist it before extracting so a reopen cannot move the goal.
+            if (version < kFtsExtractorVersion && repairThrough < 0) {
+                repairThrough = t->vis.load(std::memory_order_acquire);
+                if (c->exec(("INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('repair_through'," +
+                             std::to_string(repairThrough) + ")").c_str()) != SQLITE_OK) {
+                    delete t->fts;
+                    t->fts = nullptr;
+                    return FLATSQL_E_IO;
+                }
+                t->ftsRepairThrough = repairThrough;
+            }
             t->ftsThrough = through;
+            t->ftsState = version >= kFtsExtractorVersion ? 2 : 1;
         }
     }
     return FLATSQL_OK;
@@ -522,16 +537,19 @@ int32_t resetFts(Type* t, int64_t through) {
     } guard(t);
     if (t->fts->exec("BEGIN IMMEDIATE") != SQLITE_OK) return FLATSQL_E_IO;
     const std::string mark = std::to_string(through);
+    const int64_t repairThrough = t->vis.load(std::memory_order_acquire);
     if (t->fts->exec(("DELETE FROM fts WHERE rowid>" + mark + ";" +
                      "INSERT OR REPLACE INTO ftsmeta(k,v) VALUES('through'," + mark + "),('extractor_version',0),"
                      "('extractor_through'," + mark + "),('extractor_target'," +
-                     std::to_string(kFtsExtractorVersion) + ");").c_str()) != SQLITE_OK ||
+                     std::to_string(kFtsExtractorVersion) + "),('repair_through'," +
+                     std::to_string(repairThrough) + ");").c_str()) != SQLITE_OK ||
         t->fts->exec("COMMIT") != SQLITE_OK) {
         t->fts->exec("ROLLBACK");
         return FLATSQL_E_IO;
     }
     t->ftsThrough = through;
     t->ftsVersion = 0;
+    t->ftsRepairThrough = repairThrough;
     t->ftsState = 1;
     return FLATSQL_OK;
 }
@@ -649,7 +667,6 @@ int32_t ftsPage(Engine* e, Type* t, bool* complete) {
         *complete = true;
         return FLATSQL_OK;
     }
-    t->ftsState = 1;
     if (e->ftsHold.load()) return FLATSQL_E_BUSY;
     if (e->stopping.load()) return FLATSQL_E_STOPPED;
     const std::string fid(reinterpret_cast<const char*>(sp->tc.fid()), 4);
@@ -746,18 +763,19 @@ int32_t ftsPage(Engine* e, Type* t, bool* complete) {
             break;
         }
         through = end ? vis : page.back().first;
-        status = writeFtsProgress(t, through, end);
+        const bool repaired = through >= t->ftsRepairThrough;
+        status = writeFtsProgress(t, through, repaired);
         if (status != FLATSQL_OK || t->fts->exec("COMMIT") != SQLITE_OK) {
             t->fts->exec("ROLLBACK");
             status = FLATSQL_E_IO;
             break;
         }
         t->ftsThrough = through;
-        if (end) t->ftsVersion = kFtsExtractorVersion;
+        if (repaired) t->ftsVersion = kFtsExtractorVersion;
         done += int64_t(page.size());
     }
-    t->ftsState = t->ftsThrough >= vis && t->ftsVersion >= kFtsExtractorVersion ? 2 : 1;
-    *complete = t->ftsState == 2;
+    t->ftsState = t->ftsVersion >= kFtsExtractorVersion ? 2 : 1;
+    *complete = t->ftsThrough >= vis && t->ftsState == 2;
     return status;
 }
 }  // namespace
