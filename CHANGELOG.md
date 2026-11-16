@@ -1,26 +1,44 @@
 # Changelog
 
-## Unreleased
+## 3.12.6
 
-- Index full text from records stored with their FlatBuffer size prefix. The
-  storage frame adds a transport length; search extraction treated that length
-  as the record prefix and checked the file identifier at the wrong offset.
-  Search and projection share record-envelope detection, preserving the
-  alignment origin, stored bytes, and content address. Full-text indexes record
-  their extractor version and repair themselves after an upgrade, even without
-  a search. Repair reports building and searches return BUSY; bounded pages
-  commit progress and resume after interruption. Current indexes reopen without
-  re-extraction. Explicit full-text REBUILD (mask 4) also works immediately after
-  open and acknowledges the committed reset while extraction continues in the
-  background. Repeated requests preserve full repair progress; a request during
-  a suffix repair escalates it to a full reset. Resetting the
-  index and its progress is atomic. Concurrent searches do not contend with
-  each other or maintenance, and an indexed snapshot remains searchable during
-  ingest. Reset generations invalidate searches spanning a rebuild. An 80 ms
-  extraction budget runs several bounded pages per tick. Extractor coverage
-  detects an older engine advancing the index and repairs only the uncovered
-  suffix. SUMMARY reports building through a fixed repair mark and stays ready
-  during ordinary ingest. The store format is unchanged.
+- Full-text search finds records that were stored with their FlatBuffer size
+  prefix. Such a record was stored and projected correctly, but its text was
+  never indexed: the storage frame puts its own length in front of the record,
+  and the search extractor took that length for the record's prefix and looked
+  for the file identifier four bytes too early. Search and projection now
+  share one detection of the two record forms. Stored bytes, content
+  addresses and the store format are unchanged, and a record without a prefix
+  is indexed exactly as before.
+- A full-text index built by an older engine repairs itself. Each index now
+  records which extractor built it and how far. The first time this engine
+  opens a store it indexes every full-text type again, once, in the
+  background, whether or not anything searches; later opens index nothing
+  again. The repair commits in pages of 4,096 records and, after a close or a
+  crash, continues from where it stopped. On a made-up store of 1,000,000
+  records it ran at about 267,000 records a second (the schedule before this
+  release: about 118,000).
+- What an embedder sees:
+  - After the upgrade, each full-text type reports "building" in `SUMMARY`
+    and answers a search with BUSY (-6) until its repair is done. A search is
+    never answered from a partly built index.
+  - `REBUILD` with mask 4 works whenever it is called. Called right after
+    open it used to return OK and do nothing. It now returns OK as soon as the
+    index is reset and goes on in the background; the type reports "building"
+    until it is done. A second call while a rebuild is running keeps the
+    progress; a call during a partial repair rebuilds the whole index.
+  - Clearing an index and resetting its progress is one transaction. A crash
+    can no longer leave an empty index that reports itself complete.
+  - Searches no longer wait behind index maintenance, and searches on one type
+    no longer wait for each other. A search that spans a rebuild answers BUSY;
+    discard any pages already read.
+  - `SUMMARY` reports "ready" while an index is only catching up with newly
+    written records, as before. One difference: when catch-up cannot make
+    progress (the index file's disk is full, for example) `SUMMARY` still
+    says "ready" while searches answer BUSY; earlier releases said "building".
+  - If a 3.12.5 or older engine only added to an index after this engine
+    built it, the part it added is repaired at the next open. If the older
+    engine rebuilt the index, call `REBUILD` once on this engine.
 
 ## 3.12.5
 
