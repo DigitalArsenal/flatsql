@@ -876,9 +876,10 @@ int32_t Scan::open() {
         // A type without records answers none (below).
         if (!sp_->fullText || (t_->hasFiles.load(std::memory_order_acquire) && !ioExists(t_->pFts))) return FLATSQL_E_UNSUPPORTED;
         // A search is complete only after its index covers this snapshot.
-        { std::unique_lock<std::mutex> lock(t_->ftsMu, std::try_to_lock);
-          if (!lock.owns_lock() || (t_->hasFiles.load(std::memory_order_acquire) &&
-              (t_->ftsState != 2 || t_->ftsThrough < hi_))) return FLATSQL_E_BUSY; }
+        if (vis_ > 0) {
+            std::unique_lock<std::mutex> lock(t_->ftsMu, std::try_to_lock);
+            if (!lock.owns_lock() || t_->ftsState != 2 || t_->ftsThrough < hi_) return FLATSQL_E_BUSY;
+        }
         fts_ = true;
     }
     if (s_.order == 0) s_.order = FLATSQL_ORDER_SEQ_ASC;
@@ -3350,7 +3351,7 @@ int32_t opSummary(P4Lane* L, const std::vector<Tlv>& v) {
                 // A type without records yet has nothing to index: ready, so a
                 // search answers no rows as format 1 does (C-46 (2)).
                 std::lock_guard<std::mutex> g(t->ftsMu);
-                const bool empty = !t->hasFiles.load(std::memory_order_acquire);
+                const bool empty = t->vis.load(std::memory_order_acquire) == 0 || !t->hasFiles.load(std::memory_order_acquire);
                 state = !sp->fullText ? "off" : (t->ftsState == 2 && t->ftsThrough >= t->vis.load(std::memory_order_acquire)) || empty ? "ready" : "building";
                 through = t->ftsThrough;
             }
