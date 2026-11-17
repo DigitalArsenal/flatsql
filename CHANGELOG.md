@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.12.8
+## 3.12.9
 
 - A browser no longer aborts the engine when its threads are slow to start.
   In a browser each engine thread runs on a worker that has to be ready before
@@ -24,7 +24,12 @@
   workers never answer.
 - The browser and Node runtime adapters are bundled from
   space-data-module-sdk 0.10.4 (was 0.8.24).
-- The WASM artifact is 3.12.7's, unchanged.
+- The WASM artifact is 3.12.8's, unchanged.
+
+## 3.12.8
+
+The docs site's copy of the engine is the release's engine. 3.12.7 was tagged
+but not published: its release check found the docs copy of the engine stale.
 
 ## 3.12.7
 
