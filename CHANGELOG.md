@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.12.7
+## 3.12.8
 
 - A browser no longer aborts the engine when its threads are slow to start.
   In a browser each engine thread runs on a worker that has to be ready before
@@ -12,9 +12,10 @@
   worker waits for that one download. Now the browser runtime reads from the
   configured engine how many threads it starts (two per writer, one per
   reader, and five more) and starts the engine only when every thread has its
-  worker. The wait ends as soon as all are ready (under 0.1 s once the worker script is loaded). Workers that
-  are merely slow get 4 seconds, and one more attempt with fresh workers;
-  a worker that cannot load or fails ends the wait at once. New `open()`
+  worker. The wait ends as soon as all are ready (under 0.1 s once the worker
+  script is loaded). Workers that are merely slow get 4 seconds, and one
+  more attempt with fresh workers; a worker that cannot load or fails ends
+  the wait at once. New `open()`
   options `threadArmingMs` and `threadAttempts` set the two. If the browser
   does not provide the workers, `open()` rejects with an error named
   `FlatSQLThreadPoolError` that says how many threads were needed, how many
@@ -23,7 +24,19 @@
   workers never answer.
 - The browser and Node runtime adapters are bundled from
   space-data-module-sdk 0.10.4 (was 0.8.24).
-- The WASM artifact is unchanged.
+- The WASM artifact is 3.12.7's, unchanged.
+
+## 3.12.7
+
+- A feed of more than about a million distinct object keys keeps every record
+  over a stop and a start. Stream frames were verified with FlatBuffers'
+  default limit of 1,000,000 tables, and a checkpoint's dictionary segment is
+  one table per key, so a larger segment was refused: the checkpoint at stop
+  failed with status -4, and the next open replayed the stream and cut it at
+  the refused segment, losing every record after it. Frames are now verified
+  with a table limit sized to the frame (a table takes at least 4 bytes),
+  never below the default. A store written by an earlier version still holds
+  those records in its stream and keeps them when this version opens it.
 
 ## 3.12.6
 

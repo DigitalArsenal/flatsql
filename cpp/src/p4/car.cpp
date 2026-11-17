@@ -112,7 +112,7 @@ FmbEntry decodeEntry(const ::FMBEntry* d) { FmbEntry e; e.kind=uint8_t(d->KIND()
 struct Batch { uint64_t oldOffset=0; FmbCommit commit; };
 struct Record { std::array<uint8_t,32> digest{},bytesDigest{}; std::string cid; uint32_t length=0; };
 bool decodeBatch(const std::string& bytes,Batch* batch,std::map<uint64_t,Record>* records) {
-    Aligned a(bytes); flatbuffers::Verifier v(a.data(),a.size); if(!VerifyFMBBuffer(v)) return false; const auto* m=GetFMB(a.data());
+    Aligned a(bytes); flatbuffers::Verifier v(a.data(),a.size,frameVerifierOptions(a.size)); if(!VerifyFMBBuffer(v)) return false; const auto* m=GetFMB(a.data());
     batch->oldOffset=m->SELF_OFFSET(); auto& out=batch->commit; out.committedAt=m->COMMITTED_AT(); out.typeSeqHigh=m->TYPE_SEQ_HIGH();
     if(m->GROUPS()) for(const auto* g:*m->GROUPS()) out.groups.push_back({g->DELIVERED_AT(),g->NODE_ID(),g->BATCH_ID(),g->CONTENT_KEY_ID(),g->URL_ID()});
     if(m->DICTIONARY()) for(const auto* d:*m->DICTIONARY()) out.dictionary.push_back(decodeEntry(d));
@@ -162,7 +162,7 @@ flatbuffers::Offset<::FMBEntry> encodeEntry(flatbuffers::FlatBufferBuilder& b,co
 int32_t appendSegments(Feed* f,Stream* stream,const std::vector<std::string>& segmentBytes,const FCK* ck,
                        const std::map<uint64_t,uint64_t>& refs,const std::string& previousRoot,uint64_t applied,int64_t* end,uint64_t* previous) {
     std::map<uint64_t,std::string> source;
-    for(const auto& bytes:segmentBytes) { Aligned a(bytes); flatbuffers::Verifier v(a.data(),a.size); if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT; source.emplace(GetFSG(a.data())->SELF_OFFSET(),bytes); }
+    for(const auto& bytes:segmentBytes) { Aligned a(bytes); flatbuffers::Verifier v(a.data(),a.size,frameVerifierOptions(a.size)); if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT; source.emplace(GetFSG(a.data())->SELF_OFFSET(),bytes); }
     std::vector<::FCKSegment> desc; std::vector<uint8_t> digests;
     if(ck->SEGMENTS()) for(const auto* old:*ck->SEGMENTS()) {
         auto i=source.find(old->OFFSET()); if(i==source.end()) return FLATSQL_E_CORRUPT;
@@ -221,7 +221,7 @@ static int32_t carRestoreOnWriter(Type* type,const std::string& path,Feed** rest
     if(!archive.block(archive.root,&root) || !ipldLinks(root,&links)) return FLATSQL_E_CORRUPT;
     std::string checkpoint; for(const auto& link:links) if(link.name=="checkpoint" && !archive.block(link.cid,&checkpoint)) return FLATSQL_E_CORRUPT;
     if(checkpoint.empty()) return FLATSQL_E_CORRUPT;
-    Aligned ckBytes(checkpoint); flatbuffers::Verifier verifier(ckBytes.data(),ckBytes.size); if(!VerifyFCKBuffer(verifier)) return FLATSQL_E_CORRUPT; const auto* ck=GetFCK(ckBytes.data());
+    Aligned ckBytes(checkpoint); flatbuffers::Verifier verifier(ckBytes.data(),ckBytes.size,frameVerifierOptions(ckBytes.size)); if(!VerifyFCKBuffer(verifier)) return FLATSQL_E_CORRUPT; const auto* ck=GetFCK(ckBytes.data());
     if(!ck->FEED_ID() || ck->FEED_ID()>1000000 || !ck->TYPE() || ck->TYPE()->str()!=type->name || !ck->PROVIDER() || !ck->SOURCE() || !ck->COUNTERS()) return FLATSQL_E_CORRUPT;
     std::vector<Batch> batches; std::vector<std::string> segments; std::map<uint64_t,Record> records;
     for(const auto& cid:archive.order) {
