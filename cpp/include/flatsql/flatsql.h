@@ -136,7 +136,8 @@ enum {
 /* ---- §3.3 Exports (exact) ------------------------------------------------ */
 
 FLATSQL_EXPORT("flatsql_init")          int32_t flatsql_init(const uint8_t* cfg, int32_t cfgLen);
-FLATSQL_EXPORT("flatsql_start")         int32_t flatsql_start(void);      /* >= 0: threads started */
+FLATSQL_EXPORT("flatsql_start")         int32_t flatsql_start(void);      /* >= 0: threads started; FLATSQL_E_BUSY: a thread
+                                                                              could not be created, none was started, retry */
 FLATSQL_EXPORT("flatsql_layout")        int32_t flatsql_layout(FlatSQLLayout* out); /* bytes written = 640 */
 FLATSQL_EXPORT("flatsql_wake")          int32_t flatsql_wake(uint32_t* addr, int32_t n); /* memory.atomic.notify; woken count */
 FLATSQL_EXPORT("flatsql_register_type") int32_t flatsql_register_type(const uint8_t* spec, int32_t specLen);

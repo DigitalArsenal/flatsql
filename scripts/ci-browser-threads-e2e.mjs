@@ -13,6 +13,9 @@
 //            engine starts with the default options and answers a request.
 //   broken:  they fail (404): open fails with a FlatSQLThreadPoolError within
 //            a second of the last failure, without waiting out any arming time.
+//   failing: they load and then fail while arming (the answer a worker gives
+//            when it cannot instantiate the module): FlatSQLThreadPoolError
+//            within a second of the last failure, one attempt.
 //   stalled: they never come: FlatSQLThreadPoolError once the default budget
 //            (2 attempts of 4 s) is spent, not later.
 // Every case: no wasm fault on the page.
@@ -28,7 +31,10 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const PROMPT = 3;
-const cases = { slow: 2300, broken: 0, stalled: 3600000 };
+const cases = { slow: 2300, broken: 0, failing: 0, stalled: 3600000 };
+// A worker script that loads and answers the pool's probe as a worker that
+// cannot instantiate the module does (space-data-module-sdk wasiThreadBrowserWorker).
+const failingWorker = "self.onmessage = e => { if (e.data && e.data.t === 'probe') self.postMessage({ t: 'ready', ok: false, error: 'test: the module cannot be instantiated here' }); };";
 const BUDGET_MS = 2 * 4000;
 function shell() {
   if (process.env.GAUNTLET_HEADLESS_SHELL) return process.env.GAUNTLET_HEADLESS_SHELL;
@@ -74,6 +80,7 @@ const server = http.createServer((req, res) => {
     // Headers at once, body later: the browser's cache lock on one URL then
     // lets every worker's request through instead of queuing them.
     if (n > PROMPT && run.startsWith('broken')) { lastFailure.set(run, Date.now()); res.writeHead(404); res.end(); return; }
+    if (n > PROMPT && run.startsWith('failing')) { lastFailure.set(run, Date.now()); res.writeHead(200); res.end(failingWorker); return; }
     if (n > PROMPT) { held.add(res); res.flushHeaders(); timers.add(setTimeout(respond, cases[run.split('-')[0]])); return; }
   }
   respond();
@@ -133,7 +140,7 @@ try {
         assert.equal(result.started, false);
         assert.equal(result.name, 'FlatSQLThreadPoolError', `${name} pool: expected FlatSQLThreadPoolError, got ${result.name}: ${result.message}`);
         assert.ok(Number.isInteger(result.needed) && result.needed > PROMPT, `needed ${result.needed}`);
-        if (name === 'broken') {
+        if (name === 'broken' || name === 'failing') {
           assert.equal(result.attempts.length, 1, 'a worker that cannot load is not retried');
           assert.ok(afterLastFailureMs < 1000, `the error came ${afterLastFailureMs} ms after the last worker failed`);
         } else {

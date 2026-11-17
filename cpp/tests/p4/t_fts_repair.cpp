@@ -389,7 +389,7 @@ void stopBackground(P4Engine* e) {
 }
 void startBackground(P4Engine* e) {
     e->slowStop = false;
-    e->slowThread = std::thread(fp::slowLoop, e);
+    REQUIRE(e->slowThread.start([e] { fp::slowLoop(e); }) == 0, "start the slow-work thread");
 }
 }
 

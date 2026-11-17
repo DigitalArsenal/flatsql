@@ -106,7 +106,9 @@ export class FlatSQL {
         db.#layout = new DataView((await host.read(p, 640)).buffer);
         if (db.#layout.getUint32(0, true) !== 1 || db.#layout.getUint32(8, true) !== 448) throw new Error('Invalid FlatSQL mailbox layout');
       } finally { await host.call('flatsql_free', p); }
-      check(await host.start());
+      const started = await host.start();
+      if (started === -6) throw new FlatSQLError(-6, 'FlatSQL could not create its engine threads (the host has no thread left for it); nothing was started');
+      check(started);
       return db;
     } catch (error) { await host.close(); throw error; }
   }

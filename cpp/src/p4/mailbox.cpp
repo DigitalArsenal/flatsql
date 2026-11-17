@@ -847,22 +847,68 @@ void laneLoop(Engine* e, uint32_t ti, uint32_t cls) {
 
 }  // namespace
 
+// Every thread is created first and waits at the start gate; only when all of
+// them exist do they run. A thread that cannot be created (a WASI host with no
+// worker left) sends the others home before they touch anything: the engine
+// is as it was before the call, and FLATSQL_E_BUSY says to retry.
 int32_t startThreads(Engine* e) {
     if (e->started) return FLATSQL_E_ARG;
+    {
+        std::lock_guard<std::mutex> g(e->startMu);
+        e->startGate = 0;
+    }
+    auto gated = [e](std::function<void()> body) {
+        return [e, body = std::move(body)] {
+            bool run;
+            {
+                std::unique_lock<std::mutex> g(e->startMu);
+                e->startCv.wait(g, [e] { return e->startGate != 0; });
+                run = e->startGate == 1;
+            }
+            if (run) body();
+        };
+    };
+    int failed = 0;
+    auto spawn = [&](EngineThread& t, std::function<void()> body) {
+        if (!failed) failed = t.start(gated(std::move(body)));
+    };
     // Each writer's indexer first (a writer hands it units from its start).
     for (uint32_t w = 0; w < e->writers.size(); w++) {
         e->writers[w]->istop = false;
-        e->writers[w]->indexer = std::thread(indexerLoop, e, w);
+        spawn(e->writers[w]->indexer, [e, w] { indexerLoop(e, w); });
     }
-    for (uint32_t i = 0; i < e->nThreads; i++) {
+    e->threads.clear();
+    e->threads.reserve(e->nThreads);
+    for (uint32_t i = 0; i < e->nThreads && !failed; i++) {
         const uint32_t cls = e->threadClass[i];
-        if (cls == FLATSQL_CLASS_WRITE) e->threads.emplace_back(writerLoop, e, i - e->firstOfClass[1]);
-        else if (cls == FLATSQL_CLASS_MAINTENANCE) e->threads.emplace_back(maintenanceLoop, e, i);
-        else e->threads.emplace_back(laneLoop, e, i, cls);
+        e->threads.emplace_back();
+        if (cls == FLATSQL_CLASS_WRITE) {
+            const uint32_t wi = i - e->firstOfClass[1];
+            spawn(e->threads.back(), [e, wi] { writerLoop(e, wi); });
+        } else if (cls == FLATSQL_CLASS_MAINTENANCE) {
+            spawn(e->threads.back(), [e, i] { maintenanceLoop(e, i); });
+        } else {
+            spawn(e->threads.back(), [e, i, cls] { laneLoop(e, i, cls); });
+        }
     }
-    e->slowThread = std::thread(slowLoop, e);
+    spawn(e->slowThread, [e] { slowLoop(e); });
     e->ckStop = false;
-    e->ckThread = std::thread(checkpointLoop, e);
+    spawn(e->ckThread, [e] { checkpointLoop(e); });
+    {
+        std::lock_guard<std::mutex> g(e->startMu);
+        e->startGate = failed ? 2 : 1;
+    }
+    e->startCv.notify_all();
+    if (failed) {
+        for (auto& ws : e->writers)
+            if (ws->indexer.joinable()) ws->indexer.join();
+        for (auto& th : e->threads)
+            if (th.joinable()) th.join();
+        e->threads.clear();
+        if (e->slowThread.joinable()) e->slowThread.join();
+        if (e->ckThread.joinable()) e->ckThread.join();
+        return FLATSQL_E_BUSY;
+    }
     e->started = true;
     return int32_t(e->nThreads);
 }
