@@ -78,6 +78,10 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <functional>
+#include <new>
+#include <cerrno>
+#include <pthread.h>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -100,6 +104,52 @@ namespace p4 {
 using Engine = ::P4Engine;
 using ps::monoNs;
 using ps::wallMs;
+
+// An engine thread whose creation is a return value. std::thread reports a
+// thread it cannot create by throwing, and in this build (no exceptions) that
+// aborts the process; a WASI host that runs out of workers would end the whole
+// engine. start() gives pthread_create's error instead.
+class EngineThread {
+public:
+    EngineThread() = default;
+    EngineThread(const EngineThread&) = delete;
+    EngineThread& operator=(const EngineThread&) = delete;
+    EngineThread(EngineThread&& o) noexcept : t_(o.t_), live_(o.live_) { o.live_ = false; }
+    EngineThread& operator=(EngineThread&& o) noexcept {
+        t_ = o.t_;
+        live_ = o.live_;
+        o.live_ = false;
+        return *this;
+    }
+    // 0, or the error that kept the thread from starting (nothing runs then).
+    int start(std::function<void()> body) {
+        auto* f = new (std::nothrow) std::function<void()>(std::move(body));
+        if (!f) return ENOMEM;
+        const int rc = pthread_create(&t_, nullptr, &EngineThread::run, f);
+        if (rc != 0) {
+            delete f;
+            return rc;
+        }
+        live_ = true;
+        return 0;
+    }
+    bool joinable() const { return live_; }
+    void join() {
+        if (!live_) return;
+        pthread_join(t_, nullptr);
+        live_ = false;
+    }
+
+private:
+    static void* run(void* arg) {
+        auto* f = static_cast<std::function<void()>*>(arg);
+        (*f)();
+        delete f;
+        return nullptr;
+    }
+    pthread_t t_{};
+    bool live_ = false;
+};
 
 // ---- byte order ------------------------------------------------------------------
 inline uint16_t ld16(const uint8_t* p) { return uint16_t(p[0] | p[1] << 8); }
@@ -684,7 +734,7 @@ struct WriterState {
     std::deque<PutUnit*> iq;
     bool istop = false;
     int32_t poison = FLATSQL_OK;
-    std::thread indexer;
+    EngineThread indexer;
     // Merges (the indexer's, between rounds) never run while the writer
     // reads and writes the feed files itself (hold, set by drain): the
     // writer waits out a running merge (merging) first.
@@ -771,8 +821,13 @@ struct P4Engine {
     uint32_t nThreads = 0;
     uint32_t threadClass[64] = {};
     uint32_t firstOfClass[6] = {}, countOfClass[6] = {};
-    std::vector<std::thread> threads;
+    std::vector<flatsql::p4::EngineThread> threads;
     bool started = false;
+    // startThreads: threads wait here until every one exists (1 runs them,
+    // 2 sends them home: a thread could not be created).
+    std::mutex startMu;
+    std::condition_variable startCv;
+    int startGate = 0;
 
     // writers
     std::vector<std::unique_ptr<flatsql::p4::WriterState>> writers;
@@ -801,14 +856,14 @@ struct P4Engine {
     // Long maintenance (REBUILD and QUOTA_GC slots, the configured quota, the
     // full-text index) runs on its own thread, so WAL checkpoints never wait
     // behind it. Its type work runs on each type's writer thread.
-    std::thread slowThread;
+    flatsql::p4::EngineThread slowThread;
     std::mutex slowMu;
     std::condition_variable slowCv;
     std::deque<uint32_t> slowQ;
     bool slowStop = false;
     // Checkpoint preparation (checkpoint_worker.cpp): feeds to fold off
     // their writer, one at a time.
-    std::thread ckThread;
+    flatsql::p4::EngineThread ckThread;
     std::mutex ckMu;
     std::condition_variable ckCv;
     std::deque<flatsql::p4::Feed*> ckQ;

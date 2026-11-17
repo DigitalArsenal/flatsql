@@ -15,6 +15,8 @@ const ATTEMPTS = 2;
 // service thread of the mailbox layout, one indexer per writer, the slow-work
 // thread and the checkpoint thread. Layout offsets: cpp/include/flatsql/flatsql.h.
 const LAYOUT_BYTES = 640, LAYOUT_THREADS = 120, LAYOUT_CLASSES = 128, CLASS_WRITE = 1, ENGINE_THREADS = 2;
+// flatsql_start: a thread could not be created and none was started (flatsql.h).
+const FLATSQL_E_BUSY = -6;
 function threadsToStart() {
   const p = instance.exports.flatsql_alloc(LAYOUT_BYTES);
   if (!p) throw new Error('FlatSQL allocation failed');
@@ -61,7 +63,15 @@ async function start() {
     const ms = Math.round(performance.now() - began);
     if (report.poolSize === needed && report.armed === needed) {
       threadSpawn = threads.threadSpawn;
-      return instance.exports.flatsql_start();
+      const started = instance.exports.flatsql_start();
+      if (started !== FLATSQL_E_BUSY) return started;
+      // A worker refused a thread after all; the engine started none of them.
+      threadSpawn = () => -1;
+      await threads.terminateAll();
+      threads = null;
+      attempts.push({ armed: report.armed, failed: 0, ms: Math.round(performance.now() - began),
+        reason: 'the engine could not create a thread on the armed pool, so it started none' });
+      throw new FlatSQLThreadPoolError(needed, attempts);
     }
     await threads.terminateAll();
     threads = null;

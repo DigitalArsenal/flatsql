@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.12.10
+
+- The engine no longer aborts when its host cannot give it a thread.
+  `flatsql_start` created its threads with `std::thread`, and in the WASM
+  build, which has no exceptions, a thread that could not be created ended
+  the whole instance with `RuntimeError: unreachable`. Now every thread is
+  created first and waits; only when all of them exist do they run. If one
+  cannot be created, the others exit before doing anything, and
+  `flatsql_start` returns `FLATSQL_E_BUSY` (-6): nothing was started, the
+  engine is as it was before the call, and `flatsql_start` may be called
+  again or `flatsql_stop` called as for an engine that never started.
+- `open()` turns that status into an error instead of a fault of the host. In
+  Node it is a `FlatSQLError` with status -6 ("FlatSQL could not create its
+  engine threads"). In a browser it is the `FlatSQLThreadPoolError` that a
+  short thread pool already gives.
+- The browser test also covers a thread worker that loads and then fails while
+  it starts: `open()` rejects within a second, without a second attempt.
+- The WASM artifact is rebuilt (`scripts/build-wasm.sh --linux`).
+
 ## 3.12.9
 
 - A browser no longer aborts the engine when its threads are slow to start.

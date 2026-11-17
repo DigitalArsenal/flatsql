@@ -27,6 +27,9 @@ persistent reopen/reload, clear, mobile layout, and the homepage iframe.
 workers that are slow to start still give a started engine; workers that fail
 give a `FlatSQLThreadPoolError` within a second, and workers that never answer
 give it within the default budget, never a WASM abort.
+`scripts/ci-e2e.sh` runs `scripts/ci-engine-thread-start-e2e.mjs`: a Node host whose
+thread pool is smaller than the engine's threads gets `FlatSQLError` -6 from
+`open()`, not an abort, and the same store then opens normally.
 `GAUNTLET_HEADLESS_SHELL` overrides the installed shell path;
 `FLATSQL_BROWSER_RESULTS` selects the screenshot directory.
 

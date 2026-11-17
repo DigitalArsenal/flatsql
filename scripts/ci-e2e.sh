@@ -36,6 +36,7 @@ run package-build npm run build
 run public-types npm run check:types
 run packaged-binary-cli-persistence-and-geo npm run check:package
 run pool-worker-stale-memory-view node scripts/ci-stale-memory-view-e2e.mjs
+run engine-thread-start node scripts/ci-engine-thread-start-e2e.mjs
 run artifact-imports npm run check:imports
 run artifact-integrity npm run check:integrity
 

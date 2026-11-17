@@ -174,6 +174,14 @@ named `FlatSQLThreadPoolError` and the engine is not started. Its fields:
 `armedPerAttempt`, and `attempts` (per attempt: `armed`, `failed`, `ms`,
 `reason`). A worker that cannot load or fails gives that error within a second;
 workers that never answer give it after `threadArmingMs` x `threadAttempts`
-(8 s by default). The distributed private runtime
+(8 s by default).
+
+On any host, an engine thread that cannot be created is a status, not a
+fault: `flatsql_start` creates every thread before any runs, and if one cannot
+be created it starts none and returns `FLATSQL_E_BUSY` (-6). The engine is as
+before the call; `flatsql_start` may be called again, or `flatsql_stop`. In
+Node, `open()` then rejects with a `FlatSQLError` of status -6 (for example
+when `maxThreads` caps the host's pool below the engine's threads); in a
+browser, with the `FlatSQLThreadPoolError` above. The distributed private runtime
 adapters bundle only the necessary published SDK host code and its license;
 they do not bring the SDK's legacy FlatSQL dependency into the package.
