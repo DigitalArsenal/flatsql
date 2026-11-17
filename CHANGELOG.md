@@ -1,5 +1,31 @@
 # Changelog
 
+## 3.12.9
+
+- A browser no longer aborts the engine when its threads are slow to start.
+  In a browser each engine thread runs on a worker that has to be ready before
+  the engine starts. The workers had 1.5 seconds to get ready; on a busy
+  machine some did not, the engine started anyway, and the thread that had no
+  worker ended the engine with `RuntimeError: unreachable` in
+  `flatsql::p4::startThreads` (the WASM build has no exceptions). A thread
+  worker's script that is slow to download is enough: on a fresh page every
+  worker waits for that one download. Now the browser runtime reads from the
+  configured engine how many threads it starts (two per writer, one per
+  reader, and five more) and starts the engine only when every thread has its
+  worker. The wait ends as soon as all are ready (under 0.1 s once the worker
+  script is loaded). Workers that are merely slow get 4 seconds, and one
+  more attempt with fresh workers; a worker that cannot load or fails ends
+  the wait at once. New `open()`
+  options `threadArmingMs` and `threadAttempts` set the two. If the browser
+  does not provide the workers, `open()` rejects with an error named
+  `FlatSQLThreadPoolError` that says how many threads were needed, how many
+  workers were ready and why; the WASM engine is not started. That error
+  comes within a second when a worker fails, and after 8 seconds at most when
+  workers never answer.
+- The browser and Node runtime adapters are bundled from
+  space-data-module-sdk 0.10.4 (was 0.8.24).
+- The WASM artifact is 3.12.8's, unchanged.
+
 ## 3.12.8
 
 The docs site's copy of the engine is the release's engine. 3.12.7 was tagged

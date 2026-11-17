@@ -23,6 +23,10 @@ FlatBuffers is pinned to `8af3053eb8400de4a0a654805b8257e93fae3a8e`.
 The browser E2E uses Chromium headless shell and the identical packaged WASM.
 It tests Pages-style isolation, binary ingest, spatial filtering/projection,
 persistent reopen/reload, clear, mobile layout, and the homepage iframe.
+`npm run test:browser` also runs `scripts/ci-browser-threads-e2e.mjs`: thread
+workers that are slow to start still give a started engine; workers that fail
+give a `FlatSQLThreadPoolError` within a second, and workers that never answer
+give it within the default budget, never a WASM abort.
 `GAUNTLET_HEADLESS_SHELL` overrides the installed shell path;
 `FLATSQL_BROWSER_RESULTS` selects the screenshot directory.
 

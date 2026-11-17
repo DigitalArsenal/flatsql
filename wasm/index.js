@@ -61,6 +61,8 @@ export class FlatSQL {
     integer(options.maximumPages??8192,'maximumPages',8192,32768);
     integer(options.requestBytes??8*1024*1024,'requestBytes',1024,16*1024*1024);
     integer(options.writers??1,'writers',1,8);integer(options.readers??1,'readers',1,16);
+    if(options.threadArmingMs!==undefined)integer(options.threadArmingMs,'threadArmingMs',100,60000);
+    if(options.threadAttempts!==undefined)integer(options.threadAttempts,'threadAttempts',1,5);
     if(options.backend && !['opfs','memory'].includes(options.backend))throw new TypeError('Unknown browser storage backend');
     const url = new URL(options.wasmUrl ?? './flatsql.wasm', import.meta.url);
     let artifact;
@@ -104,7 +106,7 @@ export class FlatSQL {
         db.#layout = new DataView((await host.read(p, 640)).buffer);
         if (db.#layout.getUint32(0, true) !== 1 || db.#layout.getUint32(8, true) !== 448) throw new Error('Invalid FlatSQL mailbox layout');
       } finally { await host.call('flatsql_free', p); }
-      check(await host.call('flatsql_start'));
+      check(await host.start());
       return db;
     } catch (error) { await host.close(); throw error; }
   }
