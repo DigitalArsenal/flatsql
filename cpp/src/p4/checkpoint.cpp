@@ -45,7 +45,7 @@ int32_t appliedEnd(Stream* stream,uint64_t previous,uint64_t* end) {
     while(at!=UINT64_MAX) {
         std::vector<uint64_t> storage; uint32_t n=0;
         const int32_t rc=frame(stream,at,&storage,&n); if(rc!=FLATSQL_OK) return rc;
-        const auto* p=reinterpret_cast<const uint8_t*>(storage.data()); flatbuffers::Verifier v(p,n);
+        const auto* p=reinterpret_cast<const uint8_t*>(storage.data()); flatbuffers::Verifier v(p,n,frameVerifierOptions(n));
         if(flatbuffers::BufferHasIdentifier(p,"$FMB")) { if(!VerifyFMBBuffer(v)) return FLATSQL_E_CORRUPT; *end=at+4+n; return FLATSQL_OK; }
         if(flatbuffers::BufferHasIdentifier(p,"$FCK")) { if(!VerifyFCKBuffer(v)) return FLATSQL_E_CORRUPT; *end=GetFCK(p)->APPLIED_THROUGH(); return FLATSQL_OK; }
         if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT;
@@ -102,7 +102,7 @@ int32_t readSegment(Feed* f,Stream* stream,const CheckpointSegment& desc,Segment
     int32_t rc=frame(stream,desc.offset,&storage,&n); if(rc!=FLATSQL_OK || n!=desc.length) return FLATSQL_E_CORRUPT;
     const auto* p=reinterpret_cast<const uint8_t*>(storage.data());
     std::array<uint8_t,32> digest{}; ps::sha256(p,n,digest.data()); if(digest!=desc.digest) return FLATSQL_E_CORRUPT;
-    flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT;
+    flatbuffers::Verifier v(p,n,frameVerifierOptions(n)); if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT;
     const auto* s=GetFSG(p);
     if(s->SELF_OFFSET()!=desc.offset || s->FEED_ID()!=f->fid || s->KIND()!=desc.kind || s->LEVEL()!=desc.level ||
        s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || desc.kind>kFsgMaxKind) return FLATSQL_E_CORRUPT;
@@ -185,7 +185,7 @@ int32_t changes(Stream* stream,uint64_t previous,uint64_t after,TailChanges* cha
     uint64_t at=previous;
     while(at!=UINT64_MAX) {
         std::vector<uint64_t> storage; uint32_t n=0; int32_t rc=frame(stream,at,&storage,&n); if(rc!=FLATSQL_OK) return rc;
-        const auto* p=reinterpret_cast<const uint8_t*>(storage.data()); flatbuffers::Verifier v(p,n); uint64_t prev;
+        const auto* p=reinterpret_cast<const uint8_t*>(storage.data()); flatbuffers::Verifier v(p,n,frameVerifierOptions(n)); uint64_t prev;
         const bool tail=at+4+n>after;
         if(flatbuffers::BufferHasIdentifier(p,"$FMB")) {
             if(!VerifyFMBBuffer(v)) return FLATSQL_E_CORRUPT; const auto* m=GetFMB(p); prev=m->PREVIOUS();
@@ -397,7 +397,7 @@ int32_t checkpointVerifyPairs(Feed* f,Stream* stream,const CheckpointSegment& de
     int32_t rc=frame(stream,desc.offset,&storage,&n); if(rc!=FLATSQL_OK || n!=desc.length) return FLATSQL_E_CORRUPT;
     const auto* p=reinterpret_cast<const uint8_t*>(storage.data());
     std::array<uint8_t,32> digest{}; ps::sha256(p,n,digest.data()); if(digest!=desc.digest) return FLATSQL_E_CORRUPT;
-    flatbuffers::Verifier v(p,n); if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT;
+    flatbuffers::Verifier v(p,n,frameVerifierOptions(n)); if(!VerifyFSGBuffer(v)) return FLATSQL_E_CORRUPT;
     const auto* s=GetFSG(p);
     if(s->SELF_OFFSET()!=desc.offset || s->FEED_ID()!=f->fid || s->KIND()!=desc.kind || s->LEVEL()!=desc.level ||
        s->COVERS_THROUGH()!=desc.coversThrough || s->MIN_SEQ()!=desc.minSeq || s->MAX_SEQ()!=desc.maxSeq || !s->PAIRS() || s->PAIRS()->size()!=desc.entries) return FLATSQL_E_CORRUPT;
@@ -420,7 +420,7 @@ int32_t checkpointReadPairs(Feed* f,const std::shared_ptr<Stream>& stream,const 
 int32_t checkpointReadAt(Feed* f,Stream* stream,uint64_t offset,CheckpointState* state,std::string* err) {
     std::vector<uint64_t> storage; uint32_t n=0; int32_t rc=frame(stream,offset,&storage,&n);
     auto fail=[&]() { if(err) *err="invalid checkpoint or segment in "+stream->path+" at "+std::to_string(offset); return FLATSQL_E_CORRUPT; };
-    if(rc!=FLATSQL_OK) return fail(); const auto* p=reinterpret_cast<const uint8_t*>(storage.data()); flatbuffers::Verifier v(p,n);
+    if(rc!=FLATSQL_OK) return fail(); const auto* p=reinterpret_cast<const uint8_t*>(storage.data()); flatbuffers::Verifier v(p,n,frameVerifierOptions(n));
     if(!VerifyFCKBuffer(v)) return fail(); const auto* ck=GetFCK(p);
     if(ck->SELF_OFFSET()!=offset || ck->FEED_ID()!=f->fid || ck->GENERATION()!=stream->gen || !ck->COUNTERS() || ck->APPLIED_THROUGH()>offset) return fail();
     CheckpointState out; out.offset=offset; out.end=offset+4+n; out.appliedThrough=ck->APPLIED_THROUGH(); out.typeSeqHigh=ck->TYPE_SEQ_HIGH(); out.checkpointBytes=n+4;
@@ -645,7 +645,7 @@ int32_t checkpointAppend(Feed* f,Conn* c,Stream* stream,const Counters& counters
         std::vector<uint64_t> storage; uint32_t n=0;
         rc=frame(stream,at,&storage,&n); if(rc!=FLATSQL_OK) return rc;
         const auto* bytes=reinterpret_cast<const uint8_t*>(storage.data());
-        flatbuffers::Verifier verifier(bytes,n);
+        flatbuffers::Verifier verifier(bytes,n,frameVerifierOptions(n));
         if(!VerifyFMBBuffer(verifier)) return FLATSQL_E_CORRUPT;
         const auto* m=GetFMB(bytes);
         if(m->PREVIOUS()>=at || (m->REMOVALS() && m->REMOVALS()->size()) ||

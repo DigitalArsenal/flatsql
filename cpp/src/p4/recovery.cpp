@@ -308,7 +308,7 @@ void collectMoves(Stream* stream,uint64_t previous,Feed* f,std::set<int64_t>* mo
         std::vector<uint64_t> aligned; uint32_t size;
         if(!loadAligned(stream,previous,&aligned,&size)) return;
         const uint8_t* p=reinterpret_cast<const uint8_t*>(aligned.data());
-        flatbuffers::Verifier verifier(p,size);
+        flatbuffers::Verifier verifier(p,size,frameVerifierOptions(size));
         if(!std::memcmp(p+4,"$FCK",4)) {
             if(!VerifyFCKBuffer(verifier)) return;
             const auto* ck=GetFCK(p);
@@ -369,7 +369,7 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
         for(;;) {
             std::vector<uint64_t> aligned; uint32_t n=0;
             if(!loadAligned(stream.get(),point,&aligned,&n) || point+4+n>uint64_t(meta.mark)) break;
-            const auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier v(p,n);
+            const auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier v(p,n,frameVerifierOptions(n));
             uint64_t prior=UINT64_MAX;
             if(!std::memcmp(p+4,"$FCK",4)) {
                 if(!VerifyFCKBuffer(v) || GetFCK(p)->SELF_OFFSET()!=point || GetFCK(p)->FEED_ID()!=f->fid) break;
@@ -442,7 +442,7 @@ int32_t recoverFeed(Type* t,Feed* f,Conn* c,std::vector<int64_t>* moved,std::str
         uint32_t actual;
         if(!loadAligned(stream.get(),uint64_t(at),&aligned,&actual)) break;
         const auto* bytes=reinterpret_cast<const uint8_t*>(aligned.data());
-        flatbuffers::Verifier verifier(bytes,n);
+        flatbuffers::Verifier verifier(bytes,n,frameVerifierOptions(n));
         if(batch) {
             if(!VerifyFMBBuffer(verifier)) break;
             const auto* m=GetFMB(bytes);

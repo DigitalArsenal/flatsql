@@ -67,7 +67,7 @@ int32_t readMeta(Stream* stream,uint64_t at,uint64_t end,Meta* m) {
     const uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data())); if(n<8 || uint64_t(n)>end-at-4) return FLATSQL_E_CORRUPT;
     rc=streamReadRange(stream,int64_t(at+4),n,&m->bytes); if(rc!=FLATSQL_OK) return rc;
     std::vector<uint64_t> aligned((n+7)/8); std::memcpy(aligned.data(),m->bytes.data(),n);
-    const auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier v(p,n);
+    const auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier v(p,n,frameVerifierOptions(n));
     m->offset=at;
     if(!std::memcmp(p+4,"$FMB",4) && VerifyFMBBuffer(v)) { const auto* x=GetFMB(p); m->previous=x->PREVIOUS(); m->kind=FLATSQL_RANGE_FMB; if(x->SELF_OFFSET()!=at) return FLATSQL_E_CORRUPT; }
     else if(!std::memcmp(p+4,"$FCK",4) && VerifyFCKBuffer(v)) { const auto* x=GetFCK(p); m->previous=x->PREVIOUS(); m->kind=FLATSQL_RANGE_FCK; if(x->SELF_OFFSET()!=at) return FLATSQL_E_CORRUPT; }

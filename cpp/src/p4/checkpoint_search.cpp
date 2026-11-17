@@ -23,7 +23,7 @@ bool readFrame(Stream* s,uint64_t at,uint64_t size,Frame* f) {
     std::memcpy(f->aligned.data(),bytes.data(),n); return true;
 }
 bool commitHeader(Frame* f,Feed* feed) {
-    flatbuffers::Verifier v(f->data(),f->length);
+    flatbuffers::Verifier v(f->data(),f->length,frameVerifierOptions(f->length));
     if(!std::memcmp(f->data()+4,"$FCK",4)) {
         if(!VerifyFCKBuffer(v)) return false;
         const auto* x=GetFCK(f->data());
