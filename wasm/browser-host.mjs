@@ -31,6 +31,7 @@ export async function createBrowserInstance(bytes, options = {}) {
   try {
     const memory = await rpc({ op: 'init', bytes, options: {
       maximumPages: options.maximumPages, root: options.root, backend: options.backend,
+      threadArmingMs: options.threadArmingMs, threadAttempts: options.threadAttempts,
       threadWorkerUrl: options.threadWorkerUrl ? String(options.threadWorkerUrl) : undefined,
       ioWorkerUrl: options.ioWorkerUrl ? String(options.ioWorkerUrl) : undefined,
     } });

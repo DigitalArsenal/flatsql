@@ -6,13 +6,16 @@
 // starts; a worker that arms late was dropped from the pool, the engine's
 // std::thread then failed to start, and the build without exceptions aborted:
 // "RuntimeError: unreachable" at flatsql::p4::startThreads <- flatsql_start.
-// Busy machines arm late; here it is certain: the server answers the first
-// worker-script requests at once and holds the rest back.
-//   slow:       the held workers come after 3 s (past the old 1.5 s arming
-//               deadline): the engine starts and answers a request.
-//   impossible: the held workers never come: open fails with a
-//               FlatSQLThreadPoolError that says how many threads were needed
-//               and how many armed, and the page has no wasm fault.
+// A worker script that is slow to arrive arms late (on the live site one fetch
+// in twenty took 2.3 s); here it is certain: the server answers the first
+// worker-script requests at once and treats the rest as the case says.
+//   slow:    they come after 2.3 s (past the old 1.5 s arming time): the
+//            engine starts with the default options and answers a request.
+//   broken:  they fail (404): open fails with a FlatSQLThreadPoolError within
+//            a second of the last failure, without waiting out any arming time.
+//   stalled: they never come: FlatSQLThreadPoolError once the default budget
+//            (2 attempts of 4 s) is spent, not later.
+// Every case: no wasm fault on the page.
 // Chromium headless shell only.
 // Usage: node scripts/ci-browser-threads-e2e.mjs
 import assert from 'node:assert/strict';
@@ -25,7 +28,8 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const PROMPT = 3;
-const cases = { slow: 3000, impossible: 3600000 };
+const cases = { slow: 2300, broken: 0, stalled: 3600000 };
+const BUDGET_MS = 2 * 4000;
 function shell() {
   if (process.env.GAUNTLET_HEADLESS_SHELL) return process.env.GAUNTLET_HEADLESS_SHELL;
   const cache = process.env.PLAYWRIGHT_BROWSERS_PATH ?? path.join(os.homedir(), process.platform === 'darwin' ? 'Library/Caches/ms-playwright' : '.cache/ms-playwright');
@@ -45,13 +49,14 @@ window.runCase = async run => {
     await db.close();
     return { started: true, surfaceBytes: surface.length };
   } catch (error) {
-    return { started: false, name: error.name, message: String(error.message), needed: error.needed, armed: error.armed };
+    return { started: false, name: error.name, message: String(error.message), needed: error.needed, armed: error.armed, attempts: error.attempts };
   }
 };
 </script>`;
 const requests = new Map();
 const held = new Set();
 const timers = new Set();
+const lastFailure = new Map();
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
   res.setHeader('cross-origin-opener-policy', 'same-origin');
@@ -68,6 +73,7 @@ const server = http.createServer((req, res) => {
     const n = (requests.get(run) ?? 0) + 1; requests.set(run, n);
     // Headers at once, body later: the browser's cache lock on one URL then
     // lets every worker's request through instead of queuing them.
+    if (n > PROMPT && run.startsWith('broken')) { lastFailure.set(run, Date.now()); res.writeHead(404); res.end(); return; }
     if (n > PROMPT) { held.add(res); res.flushHeaders(); timers.add(setTimeout(respond, cases[run.split('-')[0]])); return; }
   }
   respond();
@@ -115,7 +121,9 @@ try {
     const run = `${name}-${Date.now()}`;
     const started = Date.now();
     const result = await evaluate(`runCase(${JSON.stringify(run)})`);
-    const report = { case: name, seconds: (Date.now() - started) / 1000, workerScriptRequests: requests.get(run) ?? 0, result, pageErrors: errors.slice() };
+    const answered = Date.now();
+    const afterLastFailureMs = lastFailure.has(run) ? answered - lastFailure.get(run) : undefined;
+    const report = { case: name, seconds: (answered - started) / 1000, afterLastFailureMs, workerScriptRequests: requests.get(run) ?? 0, result, pageErrors: errors.slice() };
     console.log(JSON.stringify(report));
     try {
       if (name === 'slow') {
@@ -123,9 +131,16 @@ try {
         assert.ok(result.surfaceBytes > 0);
       } else {
         assert.equal(result.started, false);
-        assert.equal(result.name, 'FlatSQLThreadPoolError', `impossible pool: expected FlatSQLThreadPoolError, got ${result.name}: ${result.message}`);
+        assert.equal(result.name, 'FlatSQLThreadPoolError', `${name} pool: expected FlatSQLThreadPoolError, got ${result.name}: ${result.message}`);
         assert.ok(Number.isInteger(result.needed) && result.needed > PROMPT, `needed ${result.needed}`);
-        assert.equal(result.armed, PROMPT);
+        if (name === 'broken') {
+          assert.equal(result.attempts.length, 1, 'a worker that cannot load is not retried');
+          assert.ok(afterLastFailureMs < 1000, `the error came ${afterLastFailureMs} ms after the last worker failed`);
+        } else {
+          assert.equal(result.armed, PROMPT);
+          assert.equal(result.attempts.length, 2);
+          assert.ok(answered - started < BUDGET_MS + 2000, `the error came after ${answered - started} ms (budget ${BUDGET_MS} ms)`);
+        }
       }
       assert.ok(!errors.some(e => /unreachable|startThreads/.test(e)), `wasm fault on the page: ${errors.join('\n')}`);
       console.log(`PASS ${name}`);

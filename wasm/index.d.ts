@@ -15,6 +15,10 @@ export interface FlatSQLOptions {
   workerUrl?: string | URL;
   threadWorkerUrl?: string | URL;
   ioWorkerUrl?: string | URL;
+  /** Browser: how long one attempt waits for the engine's thread workers to be ready (100 to 60000 ms). */
+  threadArmingMs?: number;
+  /** Browser: attempts with fresh workers when some were not ready in time (1 to 5). */
+  threadAttempts?: number;
 }
 export interface QueryOptions {
   signal?: AbortSignal;

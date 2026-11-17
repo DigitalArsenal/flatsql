@@ -7,9 +7,10 @@ const fatal = error => postMessage({ fatal: String(error?.stack ?? error) });
 // A browser engine thread is a pooled worker that must load its script and
 // instantiate the module over the shared memory (arm) before the engine starts:
 // a spawn the pool cannot serve is a std::thread failure, and the engine is
-// built without exceptions. Each attempt gives the workers this long to arm.
-const ARMING_MS = 8000;
-const ATTEMPTS = 3;
+// built without exceptions. Defaults of open()'s threadArmingMs and
+// threadAttempts (measured: docs/API-3.12.md).
+const ARMING_MS = 4000;
+const ATTEMPTS = 2;
 // Threads flatsql_start creates (cpp/src/p4/mailbox.cpp startThreads): every
 // service thread of the mailbox layout, one indexer per writer, the slow-work
 // thread and the checkpoint thread. Layout offsets: cpp/include/flatsql/flatsql.h.
@@ -27,32 +28,50 @@ function threadsToStart() {
   } finally { instance.exports.flatsql_free(p); }
 }
 class FlatSQLThreadPoolError extends Error {
-  constructor(needed, armedPerAttempt) {
-    const armed = Math.max(...armedPerAttempt);
-    super(`FlatSQL starts ${needed} engine threads; the browser armed at most ${armed} of ${needed} thread workers ` +
-      `(${armedPerAttempt.join(', ')} in ${armedPerAttempt.length} attempts of ${ARMING_MS} ms each), so the engine was not started`);
+  constructor(needed, attempts) {
+    const armed = Math.max(...attempts.map(a => a.armed));
+    super(`FlatSQL starts ${needed} engine threads and the browser did not provide them, so the engine was not started: ` +
+      attempts.map((a, i) => `attempt ${i + 1}: ${a.armed} of ${needed} thread workers ready after ${a.ms} ms, ${a.reason}`).join('; '));
     this.name = 'FlatSQLThreadPoolError';
-    this.detail = { name: this.name, message: this.message, needed, armed, armedPerAttempt };
+    this.detail = { name: this.name, message: this.message, needed, armed,
+      armedPerAttempt: attempts.map(a => a.armed), attempts };
   }
 }
-// Start the engine only on a pool that holds every thread it starts.
+// Start the engine only on a pool that holds every thread it starts. The SDK's
+// arming ends as soon as every worker has answered: ready, failed (an error
+// event or a failed instantiation, at once) or silent past the arming time. A
+// worker script that never loads makes the SDK throw at once. So an attempt
+// that ends before the arming time lost its workers to errors, which another
+// attempt would repeat: only an attempt that ran out of time is retried.
 async function start() {
   const needed = threadsToStart();
-  const armedPerAttempt = [];
-  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
-    threads = await createWasiThreadSpawn({ wasmModule: engine.module, memory, processState: engine.processState,
-      poolSize: needed, probeTimeoutMs: ARMING_MS, extraImports: engine.descriptors, instanceId: 0,
-      enableBrowserThreads: true, browserWorkerUrl: engine.threadWorkerUrl, onGuestError: (_id, _tid, e) => fatal(e) });
+  const attempts = [];
+  for (let attempt = 0; attempt < engine.attempts; attempt++) {
+    const began = performance.now();
+    try {
+      threads = await createWasiThreadSpawn({ wasmModule: engine.module, memory, processState: engine.processState,
+        poolSize: needed, probeTimeoutMs: engine.armingMs, extraImports: engine.descriptors, instanceId: 0,
+        enableBrowserThreads: true, browserWorkerUrl: engine.threadWorkerUrl, onGuestError: (_id, _tid, e) => fatal(e) });
+    } catch (error) {
+      attempts.push({ armed: 0, failed: needed, ms: Math.round(performance.now() - began),
+        reason: `a thread worker could not start (${error?.name ?? 'Error'}: ${error?.message ?? error})` });
+      throw new FlatSQLThreadPoolError(needed, attempts);
+    }
     const report = threads.spawnReport();
-    armedPerAttempt.push(report.armed);
+    const ms = Math.round(performance.now() - began);
     if (report.poolSize === needed && report.armed === needed) {
       threadSpawn = threads.threadSpawn;
       return instance.exports.flatsql_start();
     }
     await threads.terminateAll();
     threads = null;
+    const outOfTime = ms >= engine.armingMs;
+    attempts.push({ armed: report.armed, failed: report.failedToArm, ms,
+      reason: outOfTime ? `not every worker was ready within ${engine.armingMs} ms`
+        : `${report.failedToArm} failed while arming (the browser console has the worker's error)` });
+    if (!outOfTime) break;
   }
-  throw new FlatSQLThreadPoolError(needed, armedPerAttempt);
+  throw new FlatSQLThreadPoolError(needed, attempts);
 }
 async function init(bytes, options) {
   const module = await WebAssembly.compile(bytes);
@@ -82,7 +101,8 @@ async function init(bytes, options) {
   }
   for (const p of allocations) instance.exports.flatsql_free(p);
   // The pool is made at start, sized from the configured engine's layout.
-  engine = { module, processState, descriptors, threadWorkerUrl: options.threadWorkerUrl };
+  engine = { module, processState, descriptors, threadWorkerUrl: options.threadWorkerUrl,
+    armingMs: options.threadArmingMs ?? ARMING_MS, attempts: options.threadAttempts ?? ATTEMPTS };
   return memory;
 }
 async function close() {
