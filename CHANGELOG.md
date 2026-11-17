@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.12.8
+
+The docs site's copy of the engine is the release's engine. 3.12.7 was tagged
+but not published: its release check found the docs copy of the engine stale.
+
 ## 3.12.7
 
 - A feed of more than about a million distinct object keys keeps every record
