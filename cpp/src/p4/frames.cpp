@@ -284,7 +284,7 @@ bool completedGeneration(Stream* stream,uint32_t fid,uint32_t gen) {
         if(fmb || fck || fsg) {
             std::string data; if(streamRead(stream,at,n,&data)!=FLATSQL_OK) break;
             std::vector<uint64_t> aligned((n+7)/8); std::memcpy(aligned.data(),data.data(),n);
-            auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier verifier(p,n);
+            auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier verifier(p,n,frameVerifierOptions(n));
             if(fmb) {
                 if(!VerifyFMBBuffer(verifier)) break;
                 const auto* m=GetFMB(p);
@@ -346,7 +346,7 @@ int32_t streamDiscover(Type* t,Conn* idx,std::string* err) {
         uint32_t n=ld32(reinterpret_cast<const uint8_t*>(prefix.data())); if(n<8 || n>(1u<<20) || int64_t(n)+4>size) continue;
         std::string bytes; if(streamRead(&stream,0,n,&bytes)!=FLATSQL_OK) continue;
         std::vector<uint64_t> aligned((n+7)/8); std::memcpy(aligned.data(),bytes.data(),n);
-        const auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier v(p,n);
+        const auto* p=reinterpret_cast<const uint8_t*>(aligned.data()); flatbuffers::Verifier v(p,n,frameVerifierOptions(n));
         if(!VerifyFCKBuffer(v)) continue;
         const auto* ck=GetFCK(p);
         if(ck->SELF_OFFSET()!=0 || ck->PREVIOUS()!=UINT64_MAX || !ck->FEED_ID() || ck->FEED_ID()>1000000 || !ck->TYPE() || ck->TYPE()->str()!=t->name || !ck->PROVIDER() || !ck->SOURCE()) continue;
