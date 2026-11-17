@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.12.7
+
+- A feed of more than about a million distinct object keys keeps every record
+  over a stop and a start. Stream frames were verified with FlatBuffers'
+  default limit of 1,000,000 tables, and a checkpoint's dictionary segment is
+  one table per key, so a larger segment was refused: the checkpoint at stop
+  failed with status -4, and the next open replayed the stream and cut it at
+  the refused segment, losing every record after it. Frames are now verified
+  with a table limit sized to the frame (a table takes at least 4 bytes),
+  never below the default. A store written by an earlier version still holds
+  those records in its stream and keeps them when this version opens it.
+
 ## 3.12.6
 
 - Full-text search finds records that were stored with their FlatBuffer size
