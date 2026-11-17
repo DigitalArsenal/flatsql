@@ -104,7 +104,7 @@ export class FlatSQL {
         db.#layout = new DataView((await host.read(p, 640)).buffer);
         if (db.#layout.getUint32(0, true) !== 1 || db.#layout.getUint32(8, true) !== 448) throw new Error('Invalid FlatSQL mailbox layout');
       } finally { await host.call('flatsql_free', p); }
-      check(await host.call('flatsql_start'));
+      check(await host.start());
       return db;
     } catch (error) { await host.close(); throw error; }
   }

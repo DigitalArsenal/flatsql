@@ -25,17 +25,20 @@ export async function createBrowserInstance(bytes, options = {}) {
     const request = pending.get(data.id);
     if (!request) return;
     pending.delete(data.id);
-    if (data.error) request.reject(new Error(data.error)); else request.resolve(data.value);
+    if (data.error) request.reject(Object.assign(new Error(data.detail?.message ?? data.error), data.detail));
+    else request.resolve(data.value);
   };
   try {
     const memory = await rpc({ op: 'init', bytes, options: {
       maximumPages: options.maximumPages, root: options.root, backend: options.backend,
-      poolSize: (options.writers ?? 1) * 2 + (options.readers ?? 1) + 6,
       threadWorkerUrl: options.threadWorkerUrl ? String(options.threadWorkerUrl) : undefined,
       ioWorkerUrl: options.ioWorkerUrl ? String(options.ioWorkerUrl) : undefined,
     } });
     return {
       memory,
+      // The guest starts the engine only on a thread pool that holds every
+      // engine thread, or rejects with a FlatSQLThreadPoolError.
+      start: () => rpc({ op: 'start' }),
       call: (fn, ...args) => rpc({ op: 'call', fn, args }),
       write: bytes => rpc({ op: 'write', bytes }),
       read: (ptr, len) => rpc({ op: 'read', ptr, len }),

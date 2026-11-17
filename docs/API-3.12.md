@@ -154,6 +154,12 @@ provide threads, memory, filesystem I/O and transport; query, geometry, indexing
 and record identity logic stay inside C++/WASM.
 
 Browser hosting requires shared memory and cross-origin isolation. Worker URLs
-can be supplied explicitly for bundlers. The distributed private runtime
+can be supplied explicitly for bundlers. In a browser each engine thread runs on
+a worker that is started before the engine: `open()` reads from the configured
+engine how many threads it starts (two per writer, one per reader, and five
+more), waits up to 8 seconds for that many workers to be ready, tries three
+times, and only then starts the engine. If the browser does not provide them,
+`open()` rejects with an error named `FlatSQLThreadPoolError` whose `needed`
+and `armed` fields give the thread count and the most workers that were ready. The distributed private runtime
 adapters bundle only the necessary published SDK host code and its license;
 they do not bring the SDK's legacy FlatSQL dependency into the package.

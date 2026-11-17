@@ -406,6 +406,7 @@ export async function createNodeInstance(wasm, options = {}) {
   return {
     memory,
     root: fsRoot.root,
+    start: () => rpc({ op: "call", fn: "flatsql_start", args: [] }),
     call: (fn, ...args) => rpc({ op: "call", fn, args }),
     write: (data) => rpc({ op: "write", bytes: data instanceof Uint8Array ? data : new Uint8Array(data) }),
     read: (ptr, len) => rpc({ op: "read", ptr, len }),
