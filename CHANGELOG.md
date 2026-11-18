@@ -1,5 +1,43 @@
 # Changelog
 
+## 3.12.11
+
+- A feed of more than 8,388,608 records no longer ends the engine with
+  `bad_alloc` (`RuntimeError: unreachable` in `flatsql::p4::build` under
+  `feedDagCommitRootHeld`, on the checkpoint thread). The feed's DAG cache
+  kept every record frame in one doubling vector of 56-byte entries: growing
+  it past 8,388,608 frames asked for one 939,524,096-byte block of the 2 GiB
+  heap while it still held the 469,762,048-byte array it replaced, and two
+  feeds of 9.6 and 12.1 million records could not both hold their caches.
+- A frame in the cache is now 24 bytes: its offset, length, reference count
+  and the first 8 bytes of its digest. The full digest is read back from the
+  frame's FMB in the stream when a unit node, a closure or a drop needs its
+  CID; a frame's unit is found from the units' first frames. Frames and live
+  rows are held in blocks of 65,536 entries, so growing them never moves
+  them and never needs one block the size of the whole array. The first
+  block grows as a vector does, so a small feed holds only what it uses.
+- Measured on a store of an OMM feed of 9,611,180 records and an MPE feed of
+  12,112,720 records over 33,000 objects (the engine's operator-new bytes):
+  3.12.10 failed at 8,323,252 frames of the first feed holding 636,388,684
+  bytes; this build holds 914,035,944 bytes for both feeds together.
+- Every commits root is unchanged: a store whose checkpoints 3.12.10 wrote
+  replays to the same `COMMITS_ROOT_CID` in each of its FCK frames.
+- A reopened engine reads each unit's digests back from the stream when it
+  first builds a feed's DAG. On a store of 605,980 records, from an empty
+  cache: the commits root takes 455-463 ms (3.12.10: 303-315 ms), RANGES
+  1,017-1,058 ms (855-906 ms), DROPS 510-529 ms (360-374 ms).
+- A failed stream read while the DAG cache folds a round drops that
+  generation's cache, and the next build replays the stream from its start.
+  The fold changes the cache before it reads a removed frame's digest, so
+  keeping the cache after such a failure left it half-folded: the next build
+  folded the round again, and after a DELETE round it answered OK with a
+  commits root other than the one a build from an empty cache gives.
+- `t_dag_roots` (in `scripts/ci-e2e.sh`) pins a feed's commits root,
+  FEED_ROOT, RANGES and DROPS to the values 3.12.10 computes, with distinct
+  digest prefixes and with every prefix equal (`flatsql_p4_collide_test`);
+  `t_dag_round_read_fault` fails a read in the middle of a round.
+- The WASM artifact is rebuilt (`scripts/build-wasm.sh --linux`).
+
 ## 3.12.10
 
 - The engine no longer aborts when its host cannot give it a thread.
