@@ -126,6 +126,9 @@ file(GLOB FLATSQL_P4SQL_PRESENT "${CMAKE_CURRENT_SOURCE_DIR}/src/p4sql/*.cpp")
 if(FLATSQL_P4SQL_PRESENT)
     list(FILTER FLATSQL_P4_SOURCES EXCLUDE REGEX "/p4sql_weak\\.cpp$")
 endif()
+# The DAG cache (src/p4/dag.cpp) is an object of its own, so a test build
+# can link the engine with a variant of it (flatsql_p4_collide_test).
+list(FILTER FLATSQL_P4_SOURCES EXCLUDE REGEX "/src/p4/dag\\.cpp$")
 # The engine without host I/O: flatsql_p4 adds the native seven imports;
 # the fault tests supply their own.
 add_library(flatsql_p4_core OBJECT
@@ -153,7 +156,21 @@ target_link_libraries(flatsql_p4_core PUBLIC sqlite3_p4 Threads::Threads)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(flatsql_p4_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
-add_library(flatsql STATIC $<TARGET_OBJECTS:flatsql_p4_core> src/flatsql_io_native.cpp)
+function(flatsql_p4_dag_object target)
+    add_library(${target} OBJECT src/p4/dag.cpp)
+    target_include_directories(${target} PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR}
+        ${SQLITE_DIR}
+    )
+    flatsql_p4_use_sds(${target})
+    target_link_libraries(${target} PUBLIC sqlite3_p4 Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+endfunction()
+flatsql_p4_dag_object(flatsql_p4_dag)
+add_library(flatsql STATIC $<TARGET_OBJECTS:flatsql_p4_core> $<TARGET_OBJECTS:flatsql_p4_dag> src/flatsql_io_native.cpp)
 target_include_directories(flatsql PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${FLATBUFFERS_INCLUDE_DIR}
@@ -173,11 +190,13 @@ if(FLATSQL_P4_TEST_SOURCES)
     # Rename only this test object's symbol; production I/O stays unchanged.
     add_library(flatsql_p4_replay_native_io OBJECT src/flatsql_io_native.cpp)
     target_include_directories(flatsql_p4_replay_native_io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_compile_definitions(flatsql_p4_replay_native_io PRIVATE flatsql_io_sync=p4ReplayNativeSync)
+    target_compile_definitions(flatsql_p4_replay_native_io PRIVATE flatsql_io_sync=p4ReplayNativeSync
+        flatsql_io_read=p4ReplayNativeRead)
     # The engine's objects, not the archive: every object is linked
     # (the SQL surface's included), as in the wasm artifact.
     add_executable(flatsql_p4_test ${FLATSQL_P4_TEST_SOURCES}
         $<TARGET_OBJECTS:flatsql_p4_core>
+        $<TARGET_OBJECTS:flatsql_p4_dag>
         $<TARGET_OBJECTS:flatsql_p4_replay_native_io>
         ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
         ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
@@ -197,6 +216,7 @@ if(FLATSQL_P4_TEST_SOURCES)
     add_executable(flatsql_p4_fault_test
         tests/p4/p4_test_main.cpp tests/p4/p4_fault_io.cpp test/io_fault.cpp
         $<TARGET_OBJECTS:flatsql_p4_core>
+        $<TARGET_OBJECTS:flatsql_p4_dag>
         ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
         ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
         ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
@@ -207,5 +227,24 @@ if(FLATSQL_P4_TEST_SOURCES)
         ${FLATBUFFERS_INCLUDE_DIR} ${SQLITE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests
         ${CMAKE_CURRENT_SOURCE_DIR}/src/p4 ${CMAKE_CURRENT_SOURCE_DIR}/test)
     target_compile_definitions(flatsql_p4_fault_test PRIVATE
+        FLATSQL_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
+    # The DAG cache with every frame's digest prefix the same: t_dag_roots
+    # must give the roots, ranges and drops it gives with distinct prefixes.
+    flatsql_p4_dag_object(flatsql_p4_dag_collide)
+    target_compile_definitions(flatsql_p4_dag_collide PRIVATE FLATSQL_TEST_PREFIX_COLLIDE=1)
+    add_executable(flatsql_p4_collide_test
+        tests/p4/p4_test_main.cpp tests/p4/t_dag_roots.cpp src/flatsql_io_native.cpp
+        $<TARGET_OBJECTS:flatsql_p4_core>
+        $<TARGET_OBJECTS:flatsql_p4_dag_collide>
+        ${FLATBUFFERS_SRC_DIR}/idl_parser.cpp
+        ${FLATBUFFERS_SRC_DIR}/idl_gen_text.cpp
+        ${FLATBUFFERS_SRC_DIR}/file_manager.cpp
+        ${FLATBUFFERS_SRC_DIR}/file_name_manager.cpp)
+    flatsql_p4_use_sds(flatsql_p4_collide_test)
+    target_link_libraries(flatsql_p4_collide_test PRIVATE sqlite3_p4 Threads::Threads)
+    target_include_directories(flatsql_p4_collide_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${FLATBUFFERS_INCLUDE_DIR} ${SQLITE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/p4)
+    target_compile_definitions(flatsql_p4_collide_test PRIVATE
         FLATSQL_SCHEMA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/p4/schemas")
 endif()

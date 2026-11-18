@@ -1,13 +1,13 @@
 {
   "algorithm": "sha384",
-  "hash": "J6Xzl0lBlCCnWWtvZxDz7ZLG0+Mci/dPY1/47WP3FoSyPU7aj3YEtcvDWn+SD7G3",
-  "sri": "sha384-J6Xzl0lBlCCnWWtvZxDz7ZLG0+Mci/dPY1/47WP3FoSyPU7aj3YEtcvDWn+SD7G3",
-  "size": 3800745,
+  "hash": "w0pW3U9LeOTz33QrrCxoYGBghvWMQMvOqTpcEKqi5d0b4jGRq/ndACQs0nkf2h+v",
+  "sri": "sha384-w0pW3U9LeOTz33QrrCxoYGBghvWMQMvOqTpcEKqi5d0b4jGRq/ndACQs0nkf2h+v",
+  "size": 3815841,
   "files": {
     "flatsql.wasm": {
-      "sha256": "d9143e9f221951650d5588315307acf931a57c0e8b94876c84ef535f10a04744",
-      "sri": "sha384-J6Xzl0lBlCCnWWtvZxDz7ZLG0+Mci/dPY1/47WP3FoSyPU7aj3YEtcvDWn+SD7G3",
-      "size": 3800745
+      "sha256": "2c7f67782c19a94d4beea6e49e900f3edffff534ffbbdcf300cddc35c62be585",
+      "sri": "sha384-w0pW3U9LeOTz33QrrCxoYGBghvWMQMvOqTpcEKqi5d0b4jGRq/ndACQs0nkf2h+v",
+      "size": 3815841
     }
   }
 }
