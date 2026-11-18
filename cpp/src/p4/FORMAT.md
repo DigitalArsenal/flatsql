@@ -46,7 +46,8 @@ needs.
 
 ```
 <data>/fsql5/
-  STORE                    64 B, magic FSQ4, format 5 (format 4 => P4_E_FORMAT)
+  STORE                    64 B, magic FSQ4, format 5, layout 1 or 2 (format 4 => P4_E_FORMAT)
+  STORE.unlimited          synced layout-2 promotion intent, removed after recovery
   T/<TYPE>.spec            registered spec TLV (unchanged)
   T/<TYPE>.idx             type index: CACHE (feed and token registries, rebuilt from the streams)
   T/<TYPE>.fts             full text: CACHE (unchanged)
@@ -82,7 +83,11 @@ most 65,536 rows. Each run stays below the 128 MiB frame-reader limit; the final
 checkpoint references the complete collection. The host may discard an
 interrupted candidate and restart from the retained format-4 source.
 
-File naming and generations are unchanged (`docs/STORE-FORMAT-4.md` §1, §5).
+Layout 2 records explicit unlimited SQL visibility and refuses layout-1-only
+readers. The layout guard precedes every unlimited type spec. Type specs use a
+CRC-protected `.spec.intent` for recoverable replacement. Type-spec tag 13
+value 1 selects unlimited visibility; tag 10 zero retains its historical
+default. File naming and generations are unchanged (`docs/STORE-FORMAT-4.md` §1, §5).
 
 ## 2. The stream
 

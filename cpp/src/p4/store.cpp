@@ -61,12 +61,18 @@ int32_t buildSpec(const uint8_t* p, size_t n, std::shared_ptr<Spec>* out, std::s
         s->pageSize = u32;
     }
     if (tlvU8(v, 9, &u8, &bad)) s->identity = u8 != 0;
+    // Tag 10 zero retains its historical default meaning. Unlimited is an
+    // independent opt-in, so an old persisted zero never changes policy.
     if (tlvU32(v, 10, &u32, &bad) && u32) s->a18Bound = u32;
     if (tlvU8(v, 11, &u8, &bad)) {
         if (u8 > 2) { *err = "spec: epoch profile"; return FLATSQL_E_ARG; }
         s->epochProfile = u8;
     }
     if (tlvU8(v, 12, &u8, &bad)) s->fullText = u8 != 0;
+    if (tlvU8(v, 13, &u8, &bad)) {
+        if (u8 > 1) bad = true;
+        else if (u8) s->a18Bound = 0;
+    }
     if (tlvU64(v, 5, &u64, &bad) && u64 == 0) bad = true;
     if (tlvU32(v, 7, &u32, &bad)) {}
     if (bad) { *err = "spec: a typed tag has the wrong length"; return FLATSQL_E_ARG; }
@@ -115,6 +121,43 @@ bool specFromFile(const std::vector<uint8_t>& b, std::vector<uint8_t>* tlv) {
     if (ld32(&b[at + 6]) != ps::crc32c(b.data(), at)) return false;
     tlv->assign(b.begin(), b.begin() + long(at));
     return true;
+}
+// A durable intent retains a complete spec across an interrupted overwrite.
+// Recovery uses the same CRC as the authoritative file and is idempotent.
+int32_t recoverSpec(const std::string& path, std::vector<uint8_t>* bytes) {
+    const auto intentPath = path + ".intent";
+    const int32_t read = ioReadAll(path, bytes);
+    if (!ioExists(intentPath)) return read;
+    std::vector<uint8_t> intent, tlv;
+    if (ioReadAll(intentPath, &intent) != FLATSQL_OK) return FLATSQL_E_IO;
+    if (!specFromFile(intent, &tlv)) {
+        if (read != FLATSQL_OK || !specFromFile(*bytes, &tlv)) return FLATSQL_E_CORRUPT;
+        return ioUnlink(intentPath);
+    }
+    const int32_t rc = ioWriteNew(path, intent.data(), intent.size());
+    if (rc != FLATSQL_OK) return rc;
+    *bytes = std::move(intent);
+    return ioUnlink(intentPath);
+}
+int32_t writeSpec(const std::string& path, const std::vector<uint8_t>& bytes) {
+    const auto intent = path + ".intent";
+    std::vector<uint8_t> previous;
+    const bool existed=ioExists(path);
+    if (existed && ioReadAll(path,&previous)!=FLATSQL_OK) return FLATSQL_E_IO;
+    int32_t rc = ioWriteNew(intent, bytes.data(), bytes.size());
+    if (rc == FLATSQL_OK) rc = ioWriteNew(path, bytes.data(), bytes.size());
+    if (rc == FLATSQL_OK) {
+        // The spec is durable. A leftover intent replays the same accepted
+        // value, so cleanup failure does not report a rejected registration.
+        ioUnlink(intent);
+        return FLATSQL_OK;
+    }
+    // A returned error must not leave a complete roll-forward intent, also
+    // after a power loss: the removal is made durable.
+    const int32_t removed=ioUnlinkDurable(intent);
+    const int32_t restored=existed?ioWriteNew(path,previous.data(),previous.size()):ioUnlink(path);
+    if (removed!=FLATSQL_OK || restored!=FLATSQL_OK) return FLATSQL_E_IO;
+    return rc;
 }
 // T/TYPES: records [u32 crc32c(name)][u16 len][name]; a torn tail is ignored.
 std::vector<std::string> catalogRead(const std::string& path, bool* complete = nullptr) {
@@ -180,14 +223,46 @@ void randomUuid(uint8_t out[16]) {
     out[8] = uint8_t((out[8] & 0x3f) | 0x80);
 }
 
+int32_t recoverUnlimitedPromotion(Engine* e, std::vector<uint8_t>* store,
+                                 const std::vector<uint8_t>& migrated) {
+    const auto intentPath = pathJoin(e->cfg.root, "STORE.unlimited");
+    if (!ioExists(intentPath)) return FLATSQL_OK;
+    std::vector<uint8_t> intent;
+    if (ioReadAll(intentPath, &intent) != FLATSQL_OK) return FLATSQL_E_IO;
+    Markers pending, existing;
+    decodeMarkers(intent.data(), intent.size(), migrated.data(), migrated.size(), &pending);
+    decodeMarkers(store->data(), store->size(), migrated.data(), migrated.size(), &existing);
+    const bool valid = pending.storeValid && pending.layout == 2 && pending.format == 5 &&
+        pending.migratedValid && pending.migratedFormat == 5 &&
+        std::memcmp(pending.uuid, pending.migratedUuid, 16) == 0;
+    if (!valid) {
+        // An incomplete intent cannot precede a STORE overwrite. Discard it
+        // only when the original activated marker is intact.
+        if (!existing.storeValid || !existing.migratedValid || existing.layout > 2 ||
+            existing.format != 5 || existing.migratedFormat != 5 ||
+            std::memcmp(existing.uuid, existing.migratedUuid, 16) != 0) return FLATSQL_E_FORMAT;
+        return ioUnlink(intentPath);
+    }
+    if (existing.storeValid && (existing.layout > 2 || existing.format != 5 ||
+        existing.gseqFloor != pending.gseqFloor || std::memcmp(existing.uuid, pending.uuid, 16) != 0))
+        return FLATSQL_E_FORMAT;
+    const int32_t rc = ioWriteNew(pathJoin(e->cfg.root, "STORE"), intent.data(), intent.size());
+    if (rc != FLATSQL_OK) return rc;
+    *store = std::move(intent);
+    std::fprintf(stderr, "FlatSQL: recovered interrupted layout-2 promotion; type registrations are restored from their persisted specs\n");
+    return ioUnlink(intentPath);
+}
+
 int32_t readMarkers(Engine* e, Markers* m) {
     std::vector<uint8_t> s, g;
     const std::string sp = pathJoin(e->cfg.root, "STORE"), mp = pathJoin(e->cfg.root, "MIGRATED");
     const bool hs = ioExists(sp), hm = ioExists(mp);
     if (hs && ioReadAll(sp, &s) != FLATSQL_OK) return FLATSQL_E_IO;
     if (hm && ioReadAll(mp, &g) != FLATSQL_OK) return FLATSQL_E_IO;
+    const int32_t recovered = recoverUnlimitedPromotion(e, &s, g);
+    if (recovered != FLATSQL_OK) return recovered;
     *m = Markers();
-    decodeMarkers(hs ? s.data() : nullptr, s.size(), hm ? g.data() : nullptr, g.size(), m);
+    decodeMarkers(s.empty() ? nullptr : s.data(), s.size(), hm ? g.data() : nullptr, g.size(), m);
     if (hs && !s.data()) m->storePresent = true;
     if (hm && !g.data()) m->migratedPresent = true;
     return FLATSQL_OK;
@@ -203,12 +278,51 @@ int32_t writeMarkers(Engine* e, const uint8_t uuid[16], uint64_t floor, uint32_t
     }
     uint8_t st[64];
     encodeStore(st, uuid, createdMs, floor, from);
+    if (e->unlimitedRelations) { st16(st + 6, 2); st32(st + 56, ps::crc32c(st, 56)); }
     return ioWriteNew(pathJoin(e->cfg.root, "STORE"), st, sizeof st);
 }
 
 bool markersActivated(const Markers& m) {
     return m.storeValid && m.migratedValid && std::memcmp(m.uuid, m.migratedUuid, 16) == 0 && m.format == 5 &&
            m.migratedFormat == 5;
+}
+
+int32_t promoteUnlimitedStore(Engine* e, std::string* err) {
+    if (!e->markers.storeValid || e->markers.layout >= 2) return FLATSQL_OK;
+    std::vector<uint8_t> marker, original;
+    const auto path = pathJoin(e->cfg.root, "STORE");
+    if (ioReadAll(path, &marker) != FLATSQL_OK || marker.size() != 64) {
+        *err = "unlimited relation guard could not read the STORE marker";
+        return FLATSQL_E_IO;
+    }
+    original = marker;
+    st16(marker.data() + 6, 2);
+    st32(marker.data() + 56, ps::crc32c(marker.data(), 56));
+    // The synced intent retains the complete marker across a torn overwrite.
+    // It precedes STORE and every unlimited type spec; recovery is idempotent.
+    const auto intent = pathJoin(e->cfg.root, "STORE.unlimited");
+    int32_t rc = ioWriteNew(intent, marker.data(), marker.size());
+    if (rc != FLATSQL_OK) {
+        // An incomplete intent is discarded at open beside the intact STORE.
+        ioUnlinkDurable(intent);
+        *err = "unlimited relation intent write failed";
+        return rc;
+    }
+    rc = ioWriteNew(path, marker.data(), marker.size());
+    if (rc != FLATSQL_OK) {
+        // The truncating overwrite failed (EIO, a full device). A returned
+        // error must not take effect at the next open: put the layout-1
+        // marker back, then drop the intent. When STORE cannot be restored,
+        // the intent is the store's only complete marker: it stays, and the
+        // next open completes the promotion (and logs it).
+        *err = "unlimited relation guard write failed";
+        const bool restored = ioWriteNew(path, original.data(), original.size()) == FLATSQL_OK;
+        if (!restored || ioUnlinkDurable(intent) != FLATSQL_OK)
+            *err += "; the promotion was not withdrawn: the next open completes it from STORE.unlimited";
+        return rc;
+    }
+    e->markers.layout = 2;
+    return ioUnlink(intent);
 }
 
 // The type index opened (made when absent), then every feed it names, before
@@ -321,12 +435,18 @@ int32_t openType(Engine* e, Type* t, const std::shared_ptr<const Spec>& sp, std:
     }
     if (!fresh && !ioExists(t->pIdx)) {
         // An unused registered type can have only its spec, including after
-        // conversion. Absence of the stream directory proves there is
-        // nothing to enumerate on hosts whose I/O ABI has no readdir.
-        if (!ioExists(t->pDir)) return FLATSQL_OK;
+        // conversion. Enumerate streams when supported; on hosts whose I/O
+        // ABI has no readdir, absence of the stream directory proves there
+        // is nothing to enumerate.
         std::vector<std::string> streams;
-        if (!p4ListStreams(t->pDir, &streams)) { *err = "missing type index requires stream directory enumeration"; return FLATSQL_E_UNSUPPORTED; }
-        if (streams.empty()) return FLATSQL_OK;
+        if (p4ListStreams(t->pDir, &streams)) {
+            if (streams.empty()) return FLATSQL_OK;
+        } else if (!ioExists(t->pDir)) {
+            return FLATSQL_OK;
+        } else {
+            *err = "missing type index requires stream directory enumeration";
+            return FLATSQL_E_UNSUPPORTED;
+        }
     }
     const int32_t rc = typeFilesOpen(t, err);
     if (rc != FLATSQL_OK) {
@@ -484,6 +604,7 @@ uint32_t tokFor(Type* t, const std::string& token, const std::string& peer, bool
 int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* err) {
     int32_t rc = parseConfig(cfgBytes, n, &e->cfg, err);
     if (rc != FLATSQL_OK) return rc;
+    e->rowCache->configure(size_t(std::min<uint64_t>(e->cfg.rowCacheBytes,SIZE_MAX)));
     rc = globalInit();
     if (rc != FLATSQL_OK) { *err = "SQLite or the SQL surface failed to initialize"; return rc; }
     for (auto& s : e->stat) s.store(0);
@@ -500,8 +621,17 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     if (rc != FLATSQL_OK) { *err = "markers: read failed"; return rc; }
     const bool converting = e->cfg.createMode == 3;
     const uint16_t requiredFormat = converting ? 4 : 5;
-    if (m.storeValid && (m.format != requiredFormat || m.layout > 1)) { *err = "STORE requires format " + std::to_string(requiredFormat) + " and layout 1"; return FLATSQL_E_FORMAT; }
-    if (m.migratedValid && m.migratedFormat != requiredFormat) { *err = "MIGRATED has an unsupported format"; return FLATSQL_E_FORMAT; }
+    const uint16_t maxLayout = converting ? 1 : 2;
+    if (m.storeValid && (m.format != requiredFormat || m.layout > maxLayout)) {
+        *err = converting ? "STORE requires format 4 and layout 1"
+                          : "STORE has an unsupported format or layout (requires format 5, layout 1 or 2)";
+        return FLATSQL_E_FORMAT;
+    }
+    if (m.migratedValid && m.migratedFormat != requiredFormat) {
+        *err = converting ? "MIGRATED has an unsupported format"
+                          : "MIGRATED has an unsupported format (requires format 5)";
+        return FLATSQL_E_FORMAT;
+    }
     const std::string catalog = pathJoin(pathJoin(e->cfg.root, "T"), "TYPES");
     bool completeCatalog=false;
     const std::vector<std::string> names = catalogRead(catalog,&completeCatalog);
@@ -557,9 +687,18 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     for (const std::string& name : names) {
         std::vector<uint8_t> fb, tlv;
         const std::string sp = pathJoin(pathJoin(e->cfg.root, "T"), name + ".spec");
-        if (ioReadAll(sp, &fb) != FLATSQL_OK || !specFromFile(fb, &tlv)) {
-            if (converting) { *err = "conversion: unreadable spec " + sp; return FLATSQL_E_CORRUPT; }
-            continue;
+        if (converting) {
+            if (ioReadAll(sp, &fb) != FLATSQL_OK || !specFromFile(fb, &tlv)) {
+                *err = "conversion: unreadable spec " + sp;
+                return FLATSQL_E_CORRUPT;
+            }
+        } else {
+            rc = recoverSpec(sp, &fb);
+            if (rc != FLATSQL_OK || !specFromFile(fb, &tlv)) {
+                if (m.layout < 2) continue;  // The host restores bounded registrations.
+                *err = sp + ": registered type spec is unreadable or corrupt; restore the spec from a valid backup before reopening layout 2";
+                return rc != FLATSQL_OK ? rc : FLATSQL_E_CORRUPT;
+            }
         }
         std::shared_ptr<Spec> spec;
         std::string e2;
@@ -571,7 +710,13 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
                 !ioExists(pathJoin(pathJoin(e->cfg.root, "T"), name + ".idx")) &&
                 !ioExists(pathJoin(pathJoin(e->cfg.root, "P"), name))) continue;
             if (converting) { *err = "conversion: invalid spec " + name + ": " + e2; return FLATSQL_E_FORMAT; }
-            continue;
+            if (m.layout < 2) continue;
+            *err = sp + ": invalid registered spec; restore the spec from a valid backup before reopening layout 2";
+            return FLATSQL_E_CORRUPT;
+        }
+        if (!spec->a18Bound) {
+            if (!converting && (rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return rc;
+            e->unlimitedRelations = true;
         }
         auto t = std::make_unique<Type>();
         rc = openType(e, t.get(), spec, &e2);
@@ -597,7 +742,7 @@ int32_t engineInit(Engine* e, const uint8_t* cfgBytes, size_t n, std::string* er
     return FLATSQL_OK;
 }
 
-int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* err) {
+int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* err, bool validateOnly) {
     std::shared_ptr<Spec> spec;
     int32_t rc = buildSpec(p, n, &spec, err);
     if (rc != FLATSQL_OK) return rc;
@@ -605,6 +750,7 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
     auto it = e->typeByName.find(spec->name);
     if (it != e->typeByName.end()) {
         Type* t = it->second;
+        if(!t->spec()->a18Bound && spec->a18Bound) { *err="unlimited relation cannot be downgraded to a bounded relation"; return FLATSQL_E_FORMAT; }
         std::shared_ptr<const Spec> cur = t->spec();
         if (cur->bytes == spec->bytes) return FLATSQL_OK;
         bool hasData;
@@ -622,22 +768,52 @@ int32_t engineRegisterType(Engine* e, const uint8_t* p, size_t n, std::string* e
             *err = "the object and col rules of a type with data cannot change (C-5)";
             return FLATSQL_E_FORMAT;
         }
+        if (validateOnly) return FLATSQL_OK;
+        // Validate the registration before publishing its irreversible guard.
+        if (!spec->a18Bound) {
+            if ((rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return rc;
+            e->unlimitedRelations = true;
+        }
         const std::vector<uint8_t> fb = specFileBytes(spec->bytes);
-        rc = ioWriteNew(t->pSpec, fb.data(), fb.size());
+        rc = writeSpec(t->pSpec, fb);
         if (rc != FLATSQL_OK) { *err = "spec write failed"; return rc; }
         std::lock_guard<std::mutex> tg(t->mu);
         t->spec_ = spec;
         return FLATSQL_OK;
     }
+    if (validateOnly) return FLATSQL_OK;
     const std::string tdir = pathJoin(e->cfg.root, "T");
-    const std::vector<uint8_t> fb = specFileBytes(spec->bytes);
-    rc = ioWriteNew(pathJoin(tdir, spec->name + ".spec"), fb.data(), fb.size());
-    if (rc != FLATSQL_OK) { *err = "spec write failed"; return rc; }
+    // Create the catalog's parent before SQLite opens a new type index.
+    rc = ioAppend(pathJoin(tdir, "TYPES"), nullptr, 0);
+    if (rc != FLATSQL_OK) { *err="type directory creation failed"; return rc; }
     auto t = std::make_unique<Type>();
     rc = openType(e, t.get(), spec, err, true);
     if (rc != FLATSQL_OK) return rc;
+    // A new type has no published spec or catalog entry. Opening its index
+    // precedes the irreversible marker; release the connection on failure.
+    auto fail = [&](int32_t status) {
+        for (auto& f : t->feeds) {
+            writerDrop(e, f.get());
+            e->rpool.dropPath(f->path);
+            streamClose(f.get());
+            stagedPublish(e, f.get(), nullptr, false);
+        }
+        delete t->idx; t->idx=nullptr;
+        return status;
+    };
+    if (!spec->a18Bound) {
+        if ((rc = promoteUnlimitedStore(e, err)) != FLATSQL_OK) return fail(rc);
+        e->unlimitedRelations = true;
+    }
+    const std::vector<uint8_t> fb = specFileBytes(spec->bytes);
+    rc = writeSpec(pathJoin(tdir, spec->name + ".spec"), fb);
+    if (rc != FLATSQL_OK) { *err = "spec write failed"; return fail(rc); }
     rc = catalogAppend(pathJoin(tdir, "TYPES"), spec->name);
-    if (rc != FLATSQL_OK) { *err = "type catalog write failed"; return rc; }
+    if (rc != FLATSQL_OK) {
+        ioUnlink(t->pSpec+".intent");
+        ioUnlink(t->pSpec);
+        *err = "type catalog write failed"; return fail(rc);
+    }
     e->typeByName[spec->name] = t.get();
     e->types.push_back(std::move(t));
     return FLATSQL_OK;
@@ -734,6 +910,9 @@ int32_t engineStats(Engine* e, uint8_t* out, int32_t cap) {
     // allocator counts (0 without the surface).
     v[kStHeap] = p4sql_heap_used();
     v[kStHeapPeak] = p4sql_heap_peak();
+    v[kStRowCacheBytes] = e->rowCache->used();
+    v[kStRowCachePeak] = e->rowCache->peak();
+    v[kStRowCacheBudget] = e->cfg.rowCacheBytes;
     v[kStPendingBytes] = 0;  // nothing is held back: every write commits its feeds
     v[kStLiveFiles] = files;
     v[kStTypes] = types;

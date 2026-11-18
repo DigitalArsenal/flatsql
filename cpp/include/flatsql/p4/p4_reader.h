@@ -63,6 +63,8 @@ typedef struct P4TypeInfo { const char* name; const uint8_t* bfbs; uint32_t bfbs
                             const char* rules; uint32_t rulesLen; } P4TypeInfo;   /* rules: tag-4 text, verbatim (v2, C-16) */
 
 int32_t   p4_cursor_open(P4Lane* lane, const P4ScanSpec* spec, P4Cursor** out);  /* FLATSQL_OK or status */
+/* Parse a canonical raw sha256 CID; returns 1 on success, 0 otherwise. */
+int32_t   p4_cid_parse(const char* text, uint32_t length, uint8_t out[36]);
 int32_t   p4_cursor_next(P4Cursor* c, P4Row* row);   /* 1 row, 0 end, < 0 status (FLATSQL_E_BUDGET, FLATSQL_E_CANCELLED, ...) */
 void      p4_cursor_close(P4Cursor* c);
 /* Every stored copy/tag of one CID; no record hydration. Callback pointers
@@ -81,6 +83,7 @@ int32_t   p4_sources(P4Lane* lane, const char* type, const char* const** out, ui
 int32_t   p4_feed_sources(P4Lane* lane, const char* type, const char* const** out, uint32_t* n); /* the sources of every feed
                                                                the type has, records or none (relation names, C-43 B3) */
 int64_t   p4_visible_through(P4Engine* e, const char* type);
+int32_t   p4_report_hidden_once(P4Lane* lane, const char* type);
 int64_t   p4_type_rows(P4Lane* lane, const char* type);   /* the type's records (copies once, as a scan returns
                                                                them); -1 for an unknown type */
 uint64_t  p4_lane_heap_cap(P4Lane* lane);            /* v2, C-18: slot sandbox heap cap (tag 48, else default) */

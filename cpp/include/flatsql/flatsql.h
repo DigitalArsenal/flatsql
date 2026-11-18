@@ -37,6 +37,7 @@ extern "C" {
 #define FLATSQL_E_NOSPACE      -12   /* quota or device full: writes refuse, reads continue */
 #define FLATSQL_E_SQL          -13   /* SQL error; the text is in the slot's err */
 #define FLATSQL_E_INTERNAL     -14
+#define FLATSQL_E_CACHE_BUDGET -15   /* row-cache admission exhausted by pins or load reservations */
 
 /* Per-record rejects (PUT rows, `reject` column). -100..-109 are
  * ps::RejectCode from flatsql/typecfg/extract.h, unchanged. */
@@ -141,6 +142,10 @@ FLATSQL_EXPORT("flatsql_start")         int32_t flatsql_start(void);      /* >= 
 FLATSQL_EXPORT("flatsql_layout")        int32_t flatsql_layout(FlatSQLLayout* out); /* bytes written = 640 */
 FLATSQL_EXPORT("flatsql_wake")          int32_t flatsql_wake(uint32_t* addr, int32_t n); /* memory.atomic.notify; woken count */
 FLATSQL_EXPORT("flatsql_register_type") int32_t flatsql_register_type(const uint8_t* spec, int32_t specLen);
+// Checks schema, rules and existing-type compatibility without writing files.
+FLATSQL_EXPORT("flatsql_validate_type") int32_t flatsql_validate_type(const uint8_t* spec, int32_t specLen);
+/* Bit 0: type-spec tag 13 value 1 selects unlimited SQL visibility. */
+FLATSQL_EXPORT("flatsql_capabilities")  int32_t flatsql_capabilities(void);
 FLATSQL_EXPORT("flatsql_set_quota")     int32_t flatsql_set_quota(double bytes);   /* 0 = none */
 FLATSQL_EXPORT("flatsql_activate")      int32_t flatsql_activate(void);            /* create mode 2 only */
 FLATSQL_EXPORT("flatsql_stats")         int32_t flatsql_stats(uint8_t* out, int32_t cap); /* bytes written; u64 LE array §3.10 */

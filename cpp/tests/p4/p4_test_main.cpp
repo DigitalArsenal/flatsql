@@ -186,6 +186,7 @@ std::vector<uint8_t> TestType::spec() const {
     TlvW w;
     w.text(1, name + ".fbs").raw(2, fid, 4).raw(3, bfbs.data(), bfbs.size()).text(4, rules).u64(5, 16u << 20).u64(6, 4u << 20).u32(7, flags);
     w.u32(8, pageSize).u8(9, identity ? 1 : 0).u32(10, a18).u8(11, profile).u8(12, fullText ? 1 : 0);
+    if (!a18) w.u8(13, 1);
     return w.b;
 }
 
@@ -547,7 +548,8 @@ Result wait(uint32_t slot, uint64_t timeoutMs) {
                 e->bells[th].doorbell.fetch_add(1);
                 flatsql_wake(reinterpret_cast<uint32_t*>(&e->bells[th].doorbell), 1);
             }
-            if (!dec.feed(buf.data(), k)) {
+            if(h->flags & FLATSQL_SLOT_RAW) res.raw.insert(res.raw.end(),buf.data(),buf.data()+k);
+            else if (!dec.feed(buf.data(), k)) {
                 res.status = -999;
                 res.err = "RB1 decode: " + dec.error();
             }
@@ -571,7 +573,7 @@ Result wait(uint32_t slot, uint64_t timeoutMs) {
         res.status = -997;
         res.err = "RB1E status " + std::to_string(dec.status()) + " != slot status " + std::to_string(h->status);
     }
-    if (!dec.done() && res.status != -999) {
+    if (!(h->flags & FLATSQL_SLOT_RAW) && !dec.done() && res.status != -999) {
         res.status = -996;
         res.err = "no RB1E (" + res.err + ")";
     }

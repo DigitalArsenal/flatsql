@@ -220,6 +220,7 @@ struct ScanPred {
 
 // What a relation scan is asked for (the pushed-down constraints).
 struct ScanArgs {
+    std::string cid;
     int64_t seqAfter = 0, seqThrough = 0;   // exclusive / inclusive; 0 = none
     std::vector<ScanPred> preds;
     std::string search;
@@ -266,6 +267,7 @@ private:
     std::vector<P4Pred> preds_;
     std::deque<std::string> strs_;
     P4ScanSpec spec_{};
+    uint8_t cid_[36]{};
 };
 
 // What the relation `name` reads, as spelled (C-43 B3: the exact source

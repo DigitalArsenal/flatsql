@@ -886,6 +886,7 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
     uint64_t lastTick = 0;
     int sizeTicks = 0;
     for (;;) {
+        e->rowCache->trim();
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
         for (;;) {
             MaintTask mt;
@@ -1041,19 +1042,30 @@ void slowLoop(Engine* e) {
             }
             for (Feed* f : fs) {
                 std::vector<std::shared_ptr<Stream>> gone;
-                std::lock_guard<std::mutex> g(f->smu);
-                if (f->retired && now >= f->retireAt && streamGenerationReleased(f, f->retired->gen)) {
-                    f->retired->drop.store(true);
-                    gone.push_back(std::move(f->retired));
-                    f->retiredBytes = 0;
-                    e->bump(kStUnlinked);
+                {
+                    std::lock_guard<std::mutex> g(f->smu);
+                    auto selectReleased = [&](const std::shared_ptr<Stream>& stream) {
+                        e->rowCache->dropPrefix(stream->path+"/"+std::to_string(stream->gen)+"/");
+                        if(stream.use_count()!=1 || !streamGenerationReleased(f,stream->gen)) return;
+                        stream->unlinking=true;
+                        gone.push_back(stream);
+                    };
+                    if(f->retired && now>=f->retireAt) selectReleased(f->retired);
+                    for(auto& retired:f->olderRetired) if(now>=retired.retireAt) selectReleased(retired.stream);
                 }
-                for (auto it = f->olderRetired.begin(); it != f->olderRetired.end();) {
-                    if (now < it->retireAt || !streamGenerationReleased(f, it->stream->gen)) { ++it; continue; }
-                    it->stream->drop.store(true);
-                    gone.push_back(std::move(it->stream));
-                    it = f->olderRetired.erase(it);
+                for(const auto& stream:gone) {
+                    // Directory synchronization occurs outside the stream lock.
+                    // Keep the entry and quota charge until removal succeeds.
+                    const auto removed=ioUnlink(stream->path);
+                    std::lock_guard<std::mutex> g(f->smu);
+                    stream->unlinking=false;
+                    if(removed!=FLATSQL_OK) continue;
+                    stream->drop.store(false);
                     e->bump(kStUnlinked);
+                    if(f->retired==stream) { f->retired.reset(); f->retiredBytes=0; }
+                    for(auto it=f->olderRetired.begin();it!=f->olderRetired.end();) {
+                        if(it->stream==stream) it=f->olderRetired.erase(it); else ++it;
+                    }
                 }
             }
             for (uint32_t fid : due) {

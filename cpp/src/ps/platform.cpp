@@ -2,6 +2,7 @@
 #include "flatsql/ps/platform.h"
 
 #include <cstring>
+#include <algorithm>
 #include <ctime>
 
 #if defined(__wasm__)
@@ -278,31 +279,43 @@ void sha256Block(uint32_t h[8], const uint8_t* block) {
 
 }  // namespace
 
-void sha256(const void* data, size_t len, uint8_t out[32]) {
-    uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+void Sha256::update(const void* data, size_t len) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
+    bytes_ += len;
     size_t rem = len;
+    if (pending_) {
+        const size_t take = std::min(rem, 64-pending_);
+        std::memcpy(tail_+pending_,p,take); pending_+=take; p+=take; rem-=take;
+        if (pending_==64) { sha256Block(h_,tail_); pending_=0; }
+    }
     while (rem >= 64) {
-        sha256Block(h, p);
+        sha256Block(h_, p);
         p += 64;
         rem -= 64;
     }
+    if (rem) { std::memcpy(tail_,p,rem); pending_=rem; }
+}
+
+void Sha256::finish(uint8_t out[32]) {
     uint8_t tail[128];
     std::memset(tail, 0, sizeof(tail));
-    if (rem) std::memcpy(tail, p, rem);
-    tail[rem] = 0x80;
-    const size_t tailLen = (rem + 1 + 8 <= 64) ? 64 : 128;
-    const uint64_t bits = uint64_t(len) * 8;
+    if (pending_) std::memcpy(tail, tail_, pending_);
+    tail[pending_] = 0x80;
+    const size_t tailLen = (pending_ + 1 + 8 <= 64) ? 64 : 128;
+    const uint64_t bits = bytes_ * 8;
     for (int i = 0; i < 8; i++) tail[tailLen - 1 - i] = uint8_t(bits >> (8 * i));
-    sha256Block(h, tail);
-    if (tailLen == 128) sha256Block(h, tail + 64);
+    sha256Block(h_, tail);
+    if (tailLen == 128) sha256Block(h_, tail + 64);
     for (int i = 0; i < 8; i++) {
-        out[4 * i] = uint8_t(h[i] >> 24);
-        out[4 * i + 1] = uint8_t(h[i] >> 16);
-        out[4 * i + 2] = uint8_t(h[i] >> 8);
-        out[4 * i + 3] = uint8_t(h[i]);
+        out[4 * i] = uint8_t(h_[i] >> 24);
+        out[4 * i + 1] = uint8_t(h_[i] >> 16);
+        out[4 * i + 2] = uint8_t(h_[i] >> 8);
+        out[4 * i + 3] = uint8_t(h_[i]);
     }
+}
+
+void sha256(const void* data, size_t len, uint8_t out[32]) {
+    Sha256 hash; hash.update(data,len); hash.finish(out);
 }
 
 // ---------------------------------------------------------------------------

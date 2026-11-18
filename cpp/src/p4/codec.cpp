@@ -268,11 +268,14 @@ int32_t parseConfig(const uint8_t* p, size_t n, Config* c, std::string* err) {
     setU64(48, &c->sandboxHeap);
     setU64(49, &c->sandboxRows);
     setU64(50, &c->sandboxBytes);
-    if(tlvU64(v,51,&u64,&bad)) c->conversionFeeds=u64;
+    if (tlvU64(v, 51, &u64, &bad)) c->conversionFeeds = u64;
+    setU64(52, &c->rowCacheBytes);
     if (bad) { *err = "config: a typed tag has the wrong length"; return FLATSQL_E_ARG; }
+    if (c->rowCacheBytes < 16384) { *err = "config: rowCacheBytes must be at least 16384"; return FLATSQL_E_ARG; }
     if (c->createMode > 3) { *err = "config: create mode must be 0, 1, 2 or 3 (convert a format-4 copy)"; return FLATSQL_E_ARG; }
-    if(c->createMode==3 && c->conversionFeeds==UINT64_MAX) {
-        *err="config: conversion requires the host's feed-index inventory (tag 51)"; return FLATSQL_E_ARG;
+    if (c->createMode == 3 && c->conversionFeeds == UINT64_MAX) {
+        *err = "config: conversion requires the host's feed-index inventory (tag 51)";
+        return FLATSQL_E_ARG;
     }
     if (c->writers == 0) {
         const uint32_t w = c->cores > 1 ? c->cores - 1 : 1;
@@ -401,6 +404,13 @@ int32_t ioAppend(const std::string& path, const uint8_t* p, size_t n) {
 
 int32_t ioUnlink(const std::string& path) {
     const int32_t rc = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_UNLINK);
+    return rc >= 0 || rc == FLATSQL_IO_ERR_NOENT ? FLATSQL_OK : FLATSQL_E_IO;
+}
+
+// UNLINK_IF_UNUSED makes the host sync the parent directory: an intent that a
+// failed operation withdraws must not reappear after a power loss and replay.
+int32_t ioUnlinkDurable(const std::string& path) {
+    const int32_t rc = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_UNLINK | FLATSQL_IO_UNLINK_IF_UNUSED);
     return rc >= 0 || rc == FLATSQL_IO_ERR_NOENT ? FLATSQL_OK : FLATSQL_E_IO;
 }
 

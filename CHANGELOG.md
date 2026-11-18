@@ -1,5 +1,28 @@
 # Changelog
 
+## 3.12.12
+
+- A type registered with type-spec tag 13 (`maxRows: 0` in JavaScript) has an
+  unlimited SQL relation: every stored record is visible to SQL, COUNT(*) and
+  raw output, not only the newest N. `flatsql_capabilities()` bit 0 advertises
+  it. The first unlimited registration promotes the store to layout 2 (stream
+  format 5 unchanged); an engine of 3.12.11 or older refuses a store at layout
+  2. See `docs/UNLIMITED-RELATIONS.md`.
+- Add explicit unlimited SQL relations with a recoverable layout-2 guard and
+  type-spec replacement; preserve the historical meaning of a zero bound.
+- Bound row-order pages and verification workspace, retain pinned generations,
+  and distinguish cache admission from statement budgets.
+- Isolate ingest-only schemas and count whole relations from live metadata.
+- A promotion whose STORE overwrite fails puts the layout-1 marker back and
+  withdraws its intent, so a registration that returned an error never takes
+  effect at the next open; withdrawn intents are removed durably (parent
+  directory synced), also for a rejected type-spec replacement.
+- Config tag 52 (`rowCacheBytes`) sets the shared row-order page cache budget
+  (default 32 MiB); a statement whose pages cannot be admitted fails with
+  `FLATSQL_E_CACHE_BUDGET` (-15), never a short result.
+- Includes 3.12.11 (the DAG cache in blocks of 24-byte frames).
+- The WASM artifact is rebuilt (`scripts/build-wasm.sh`).
+
 ## 3.12.11
 
 - A feed of more than 8,388,608 records no longer ends the engine with

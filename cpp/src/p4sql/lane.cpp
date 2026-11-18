@@ -10,8 +10,8 @@
 // the stream with RB1E after the hook returns (C-28), with the row count set
 // here (C-29).
 //
-// Every plan is bounded by construction (each relation reads at most its A18
-// bound), so format 2's interactive admission (index-bounded plans only) has
+// Execution budgets bound work even for unlimited relations. The SQL surface
+// uses the request's resource limits; format 2's index-only admission has
 // nothing left to refuse.
 //
 // Status mapping (all returned, never trapped):
@@ -493,6 +493,44 @@ bool match(const char* sql, size_t n, std::string* relation) {
 
 }  // namespace dscan
 
+// Recognize only an unfiltered aggregate of a complete type relation. Other
+// SQL, including parameters, aliases of sources and predicates, uses SQLite.
+bool metadataCount(LaneState* ls,const P4SqlRequest* req,Out& out,int32_t* status,std::string* msg) {
+    if(!req->sql || (req->flags & FLATSQL_SLOT_RAW)) return false;
+    std::vector<rb1::Cell> params;
+    if(!flatsql::query::parameters(req->params,req->paramsLen,&params) || !params.empty()) return false;
+    const char* p=req->sql; const char* end=p+req->sqlLen;
+    dscan::ws(p,end);
+    if(!dscan::keyword(p,end,"select")) return false;
+    const char* expression=p;
+    std::string function,column,name,label;
+    if(!dscan::ident(p,end,&function) || lower(function)!="count") return false;
+    dscan::ws(p,end); if(p==end || *p++!='(') return false;
+    dscan::ws(p,end);
+    if(p<end && *p=='*') p++;
+    else if(!dscan::ident(p,end,&column) || lower(column)!="_cid") return false;
+    dscan::ws(p,end); if(p==end || *p++!=')') return false;
+    label.assign(expression,p); dscan::ws(p,end);
+    if(dscan::keyword(p,end,"as")) {
+        if(!dscan::ident(p,end,&label)) return false;
+        dscan::ws(p,end);
+    }
+    if(!dscan::keyword(p,end,"from") || !dscan::ident(p,end,&name)) return false;
+    dscan::ws(p,end); if(p<end && *p==';') p++;
+    dscan::ws(p,end); if(p!=end) return false;
+    RelSpec rel; if(resolveRelation(ls,name,&rel,msg)!=1 || rel.kind!=kRelType) return false;
+    const auto* type=typeByName(ls,rel.type); if(!type) return false;
+    // Metadata-only relations require a trusted SQL caller.
+    int64_t count;
+    { EngineCall ec; count=p4_type_rows(ls->lane,type->name.c_str()); }
+    if(count==FLATSQL_E_BUSY) return false; // an in-flight sequence needs the reader's ceiling
+    out.header({label});
+    if(count<0) { *status=int32_t(count); *msg="metadata count unavailable"; return true; }
+    if(type->bound && uint64_t(count)>type->bound) count=int64_t(type->bound);
+    Cell cell; cell.type=SQLITE_INTEGER; cell.i=count;
+    *status=out.row({cell},msg); return true;
+}
+
 // Serves the statement when it is the A18 raw stream: true and *status set,
 // or false (the SQL path runs it).
 bool dataStream(LaneState* ls, const P4SqlRequest* req, Out& out, int32_t* status, std::string* msg) {
@@ -622,8 +660,13 @@ extern "C" int32_t p4sql_exec(P4Lane* lane, const P4SqlRequest* req) {
     st.sandbox = (req->flags & FLATSQL_SLOT_SANDBOX) != 0;
     Out out(ls, (req->flags & FLATSQL_SLOT_RAW) != 0, req->maxResultRows, req->maxResultBytes);
     std::string msg;
-    int32_t status = FLATSQL_OK;
-    if (dataStream(ls, req, out, &status, &msg)) {
+    int32_t status = loadTypes(ls,&msg);
+    if(status!=FLATSQL_OK) {
+        out.header({});
+        out.finish(&msg);
+        return reply(ls,status,msg);
+    }
+    if (metadataCount(ls, req, out, &status, &msg) || dataStream(ls, req, out, &status, &msg)) {
         const int32_t emitted = out.finish(&msg);
         return reply(ls, status != FLATSQL_OK ? status : emitted, msg);
     }
