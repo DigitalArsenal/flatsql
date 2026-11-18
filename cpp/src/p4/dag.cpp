@@ -29,7 +29,9 @@ uint64_t prefixOf(const Digest& d) {
 // moves or copies what it holds, and never needs one block the size of the
 // whole array (a doubling vector of 16,777,216 frames asked for 939,524,096
 // contiguous bytes of a 2 GiB heap while it still held the 469,762,048-byte
-// array it was replacing).
+// array it was replacing). The first block grows as a vector does, up to
+// 65,536 elements, so a small feed holds only what it uses (an engine holds
+// one of these per feed); every later block is allocated whole.
 template<class T> class Blocks {
 public:
     size_t size() const { return n_; }
@@ -39,13 +41,14 @@ public:
     T& back() { return (*this)[n_-1]; }
     const T& back() const { return (*this)[n_-1]; }
     void push_back(const T& v) {
-        if((n_>>kShift)==blocks_.size()) blocks_.emplace_back(new T[kSize]);
-        (*this)[n_++]=v;
+        if((n_>>kShift)==blocks_.size()) { blocks_.emplace_back(); if(n_) blocks_.back().reserve(kSize); }
+        blocks_.back().push_back(v); ++n_;
     }
     // Keeps the first n elements and frees the blocks past them.
     void truncate(size_t n) {
         if(n>=n_) return;
         n_=n; blocks_.resize((n_+kSize-1)>>kShift);
+        if(!blocks_.empty()) blocks_.back().resize(n_-((blocks_.size()-1)<<kShift));
     }
     // The first index whose element is not less than key.
     template<class K,class Less> size_t lowerBound(const K& key,Less less) const {
@@ -55,7 +58,7 @@ public:
     }
 private:
     static constexpr size_t kShift=16,kSize=size_t(1)<<kShift,kMask=kSize-1;
-    std::vector<std::unique_ptr<T[]>> blocks_; size_t n_=0;
+    std::vector<std::vector<T>> blocks_; size_t n_=0;
 };
 struct Large { std::string cid,node; std::vector<Digest> leaves; };
 // A derived dag-pb node: only its CID, encoded size and unit stay resident;

@@ -14,7 +14,8 @@
   frame's FMB in the stream when a unit node, a closure or a drop needs its
   CID; a frame's unit is found from the units' first frames. Frames and live
   rows are held in blocks of 65,536 entries, so growing them never moves
-  them and never needs one block the size of the whole array.
+  them and never needs one block the size of the whole array. The first
+  block grows as a vector does, so a small feed holds only what it uses.
 - Measured on a store of an OMM feed of 9,611,180 records and an MPE feed of
   12,112,720 records over 33,000 objects (the engine's operator-new bytes):
   3.12.10 failed at 8,323,252 frames of the first feed holding 636,388,684
