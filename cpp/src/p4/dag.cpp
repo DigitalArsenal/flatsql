@@ -18,7 +18,13 @@ struct Raw { uint64_t at=0; uint32_t length=0; Digest digest{}; };
 // which is read back from its unit's FMB when a CID is built (UnitDigests).
 struct Frame { uint64_t at=0; uint32_t length=0; uint32_t refs:31; uint32_t large:1; uint64_t prefix=0; Frame():refs(0),large(0) {} };
 static_assert(sizeof(Frame)==24,"a frame is 24 bytes");
-uint64_t prefixOf(const Digest& d) { uint64_t p; std::memcpy(&p,d.data(),sizeof p); return p; }
+uint64_t prefixOf(const Digest& d) {
+#if defined(FLATSQL_TEST_PREFIX_COLLIDE)
+    (void)d; return 0;  // test build only (flatsql_p4_collide_test): every frame's prefix is the same
+#else
+    uint64_t p; std::memcpy(&p,d.data(),sizeof p); return p;
+#endif
+}
 // An append-only array in fixed blocks of 65,536 elements: growing it never
 // moves or copies what it holds, and never needs one block the size of the
 // whole array (a doubling vector of 16,777,216 frames asked for 939,524,096
@@ -440,12 +446,18 @@ int32_t build(Feed* feed,Stream* stream,uint64_t previous,uint64_t end,DagSnapsh
     }
     if(s.last!=UINT64_MAX && at!=s.last) return FLATSQL_E_CORRUPT;
     UnitDigests digests(s,stream,end);
+    // apply() changes the cache before it can fail (a removal reads its
+    // frame's digest from the stream after earlier rows of the round were
+    // folded), and updateTree() rewrites unit nodes one by one. A failure
+    // in either drops the generation's cache: the next build replays the
+    // stream from its start, as after a reopen.
+    const auto discard=[&](int32_t rc) { feed->dagHistory->generations.erase(stream->gen); return rc; };
     for(auto it=tail.rbegin();it!=tail.rend();++it) {
         Meta m; int32_t rc=readMeta(stream,*it,end,&m); if(rc!=FLATSQL_OK) return rc;
-        rc=apply(s,m,&digests); if(rc!=FLATSQL_OK) return rc;
+        rc=apply(s,m,&digests); if(rc!=FLATSQL_OK) return discard(rc);
     }
-    if(!s.hasCheckpoint) return FLATSQL_E_CORRUPT;
-    if(const int32_t rc=updateTree(s,previous,&digests); rc!=FLATSQL_OK) return rc;
+    if(!s.hasCheckpoint) return discard(FLATSQL_E_CORRUPT);
+    if(const int32_t rc=updateTree(s,previous,&digests); rc!=FLATSQL_OK) return discard(rc);
     DagSnapshot result; result.through=previous; result.generation=stream->gen;
     const Link& commits=s.tree.back().front(); const Link segments=linkOf(segmentLinks(s),previous);
     s.commitRoots[previous]=commits.cid; while(s.commitRoots.size()>4096) s.commitRoots.erase(s.commitRoots.begin());
