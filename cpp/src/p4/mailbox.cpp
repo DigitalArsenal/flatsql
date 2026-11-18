@@ -1008,6 +1008,7 @@ int32_t engineStop(Engine* e, double deadlineMs) {
             t->fts = nullptr;
         }
     }
+    e->rowCache->trim(std::chrono::seconds(0));
     return checkpointStatus;
 }
 

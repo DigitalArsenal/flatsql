@@ -136,7 +136,7 @@ bool candidate(Stream* s,Feed* feed,uint64_t at,uint64_t size,CheckpointState* o
 }
 // stop: a commit already read (the walk ends there: the rows after it only).
 int32_t checkpointTailRows(Feed* feed,Stream* stream,const CheckpointState& checkpoint,uint64_t previous,std::vector<uint64_t>* rids,
-                          uint64_t* rowCount,int64_t* lastCommitAt,uint64_t stop) {
+                          uint64_t* rowCount,int64_t* lastCommitAt,uint64_t stop,uint64_t workspace) {
     rids->clear();
     if(rowCount) *rowCount=0;
     if(lastCommitAt) *lastCommitAt=0;
@@ -149,6 +149,14 @@ int32_t checkpointTailRows(Feed* feed,Stream* stream,const CheckpointState& chec
     bool seen=false;
     for(uint64_t at=previous;at!=UINT64_MAX;) {
         if(at==stop) { seen=true; break; }
+        if(workspace) {
+            if(at<checkpoint.appliedThrough && at!=checkpoint.offset) break;
+            std::string prefix;
+            const auto rc=streamReadRange(stream,int64_t(at),4,&prefix);
+            if(rc!=FLATSQL_OK) return rc;
+            if(prefix.size()!=4) return FLATSQL_E_CORRUPT;
+            if(uint64_t(ld32(reinterpret_cast<const uint8_t*>(prefix.data())))+4>workspace) return FLATSQL_E_CACHE_BUDGET;
+        }
         Frame f;
         if(!readFrame(stream,at,size,&f) || !commitHeader(&f,feed)) return FLATSQL_E_CORRUPT;
         if(at==checkpoint.offset) {
@@ -157,6 +165,7 @@ int32_t checkpointTailRows(Feed* feed,Stream* stream,const CheckpointState& chec
         } else if(!std::memcmp(f.data()+4,"$FMB",4)) {
             if(f.end<=checkpoint.appliedThrough) break;
             const auto* batch=GetFMB(f.data());
+            if(workspace && batch->ROWS() && uint64_t(rids->size())+batch->ROWS()->size()>workspace/sizeof(uint64_t)) return FLATSQL_E_CACHE_BUDGET;
             if(rowCount && batch->ROWS()) *rowCount+=batch->ROWS()->size();
             if(lastCommitAt) *lastCommitAt=std::max(*lastCommitAt,batch->COMMITTED_AT());
             if(batch->ROWS()) for(const auto* row:*batch->ROWS()) {

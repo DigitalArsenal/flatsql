@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <deque>
 #include <memory>
 
@@ -95,15 +96,21 @@ int32_t loadTypes(LaneState* ls, std::string* err) {
     }
     for (uint32_t i = 0; i < n; i++) {
         const P4TypeInfo& ti = ts[i];
-        if (!ti.name || allZero(ti.fid)) continue;   // format 1 routes only types with a file identifier
+        // CID-only registrations retain durable access without a SQL relation.
+        if (!ti.name || allZero(ti.fid) || !ti.bfbsLen) continue;
         const std::string key = lower(ti.name);
-        if (ls->types.count(key)) continue;
+        auto cached=ls->types.find(key);
+        if(cached!=ls->types.end()) { cached->second.bound=ti.a18Bound; continue; }
         TypeEntry t;
         t.name = ti.name;
         std::memcpy(t.fid, ti.fid, 4);
         t.bound = ti.a18Bound;
         std::string e;
-        if (!schemaColumns(t.name, ti.bfbs, ti.bfbsLen, &t.cols, &e)) continue;   // not queryable
+        if(!schemaColumns(t.name, ti.bfbs, ti.bfbsLen, &t.cols, &e)) {
+            if(p4_report_hidden_once(ls->lane,ti.name))
+                std::fprintf(stderr,"FlatSQL: SQL relation %s hidden: %s\n",t.name.c_str(),e.c_str());
+            continue;
+        }
         mapCols(&t, rulesOf(ti));
         ls->types.emplace(key, std::move(t));
     }
@@ -242,6 +249,7 @@ int relBestIndex(sqlite3_vtab* v, sqlite3_index_info* info) {
         else if (col >= 0 && col == vt->t->col0) target = 'A';
         else if (col >= 0 && col == vt->t->col1 && op == '=') target = 'B';
         else if (col == vt->meta(kSource) && op == '=') target = 'R';
+        else if (col == vt->meta(kCid) && op == '=' && std::strcmp(sqlite3_vtab_collation(info,i),"BINARY")==0) target = 'C';
         if (!target) continue;
         info->aConstraintUsage[i].argvIndex = ++argc;
         info->aConstraintUsage[i].omit = search ? 1 : 0;
@@ -392,10 +400,12 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
             EngineCall ec;
             n = p4_type_rows(vt->ls->lane, vt->t->name.c_str());
         }
-        if (n < 0) return fail(c, FLATSQL_E_NOTYPE, "type not registered");
-        if (vt->t->bound && uint64_t(n) > vt->t->bound) n = int64_t(vt->t->bound);  // A18: the newest N
-        c->scan.openCounted(n);
-        return SQLITE_OK;
+        if (n < 0 && n != FLATSQL_E_BUSY) return fail(c, int32_t(n), "metadata count unavailable");
+        if(n>=0) {
+            if (vt->t->bound && uint64_t(n) > vt->t->bound) n = int64_t(vt->t->bound);
+            c->scan.openCounted(n);
+            return SQLITE_OK;
+        }
     }
 
     // Constraints.
@@ -441,6 +451,14 @@ int relFilter(sqlite3_vtab_cursor* cur, int idxNum, const char* idxStr, int argc
                     else if (op == ')') col0Lo = std::max(col0Lo, iv);
                     else if (op == '<') col0Hi = std::min(col0Hi, iv == INT64_MIN ? iv : iv - 1);
                     else if (op == '(') col0Hi = std::min(col0Hi, iv);
+                }
+                break;
+            case 'C':
+                if(sqlite3_value_type(v)==SQLITE_TEXT) {
+                    const std::string text(reinterpret_cast<const char*>(sqlite3_value_text(v)),size_t(sqlite3_value_bytes(v)));
+                    uint8_t parsed[36];
+                    if(p4_cid_parse(text.data(),uint32_t(text.size()),parsed)) args.cid=text;
+                    else seq.empty=true;
                 }
                 break;
             case 'B':   // COL1 is `str`, trimmed, empty = absent: push untrimmed non-empty text only
@@ -735,6 +753,7 @@ int32_t RelScan::open(LaneState* ls, const TypeEntry& t, const RelSpec& rel, con
     }
     std::memset(&spec_, 0, sizeof(spec_));
     spec_.type = t.name.c_str();
+    if(!a.cid.empty() && p4_cid_parse(a.cid.data(),uint32_t(a.cid.size()),cid_)) spec_.cid=cid_;
     spec_.seqAfter = a.seqAfter;
     spec_.seqThrough = a.seqThrough;
     spec_.preds = preds_.empty() ? nullptr : preds_.data();

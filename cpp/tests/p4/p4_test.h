@@ -171,6 +171,7 @@ std::string cidText(const uint8_t cid[36]);
 // ---- the engine and its client ---------------------------------------------------------------------
 struct Result {
     int32_t status = 0;
+    std::vector<uint8_t> raw;
     std::string err;
     std::vector<std::string> cols;
     std::vector<std::vector<Cell>> rows;

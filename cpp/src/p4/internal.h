@@ -1,4 +1,5 @@
 #include "flatsql/query_page.h"
+#include "page_cache.h"
 // FlatSQL store format 5 ("p4"): engine internals. FORMAT.md defines the bytes.
 //
 // One source feed x standard is one feed (CONTRACT C-37, C-38, owner layout of
@@ -212,11 +213,12 @@ enum Stat : int {
     kStWalBytes, kStRebuilds, kStUnlinked, kStQuotaFiles, kStReads, kStReadErrors, kStBusy,
     kStWriterConns, kStReaderConns, kStTwoPhase, kStHeap, kStHeapPeak, kStPendingBytes,
     kStLiveFiles, kStTypes, kStPartitions, kStQuarantined, kStSqlStatements, kStSqlBudgetTrips,
-    kStMaxInflight, kStFtsRows, kStCount
+    kStMaxInflight, kStFtsRows, kStRowCacheBytes, kStRowCachePeak, kStRowCacheBudget, kStCount
 };
 
 // ---- config (§3.3) -------------------------------------------------------------------------
 struct Config {
+    uint64_t rowCacheBytes = 32ull << 20;  // tag 52: shared row-order page and verified-metadata budget
     std::string root;
     uint8_t createMode = 0;
     uint64_t conversionFeeds = UINT64_MAX; // tag 51: host inventory of format-4 feed indexes
@@ -459,6 +461,7 @@ struct Stream {
     uint32_t gen = 0;
     int32_t h = -1;
     std::atomic<bool> drop{false};
+    bool unlinking=false; // Feed::smu; prevents a new pin during retirement I/O
     ~Stream();
 };
 
@@ -516,12 +519,11 @@ struct Feed {
     bool checkpointPreparing = false;
     uint64_t checkpointRetryAt = 0;  // after a failed preparation (monoNs)
     std::shared_ptr<CheckpointState> checkpoint; // immutable checkpoint state, Type::mu
-    // The FlatBuffer row orders (fsg.cpp; fsgMu): the current view, and the
-    // ROWS_BY_* segments read so far, by (generation, offset).
+    // Current row-order views (fsg.cpp; fsgMu). Cache admission owns their
+    // descriptors; these weak references cannot pin inactive feed views.
     std::mutex fsgMu;
-    std::shared_ptr<const FsgView> fsg[2];
+    std::weak_ptr<const FsgView> fsg[2];
     bool fsgVerifying = false;  // queued on the checkpoint worker
-    std::map<std::pair<uint32_t,uint64_t>,std::shared_ptr<const FsgRun>> fsgSegments;
     uint64_t checkpointOpenNs = 0, rowIndexRebuildNs = 0;
     uint64_t checkpointRows = 0, checkpointAt = 0; // rows since checkpoint; last commit monoNs
     int64_t metadataBytes = 0;  // committed non-record frame bytes
@@ -593,6 +595,7 @@ struct Type {
     // The type index exists (the type has had a write, or it was on disk at
     // open). Set once, under openMu; readers check it first.
     std::atomic<bool> hasFiles{false};
+    std::atomic<bool> sqlHiddenReported{false};
     std::mutex openMu;
     std::shared_ptr<const Spec> spec_;  // mu
     std::shared_ptr<const Spec> spec() {
@@ -792,6 +795,8 @@ struct MaintTask {
 // ---- the engine (opaque P4Engine in p4_reader.h) ------------------------------------------
 struct P4Engine {
     flatsql::p4::Config cfg;
+    std::shared_ptr<flatsql::p4::PageCache> rowCache=std::make_shared<flatsql::p4::PageCache>();
+    std::atomic<bool> unlimitedRelations{false};
     flatsql::p4::Markers markers;
     std::atomic<uint64_t> stat[flatsql::p4::kStCount];
     std::atomic<uint64_t> quota{0};
@@ -917,7 +922,7 @@ namespace p4 {
 
 // ---- store.cpp ----------------------------------------------------------------------------------
 int32_t engineInit(P4Engine* e, const uint8_t* cfg, size_t n, std::string* err);
-int32_t engineRegisterType(P4Engine* e, const uint8_t* spec, size_t n, std::string* err);
+int32_t engineRegisterType(P4Engine* e, const uint8_t* spec, size_t n, std::string* err, bool validateOnly = false);
 int32_t engineActivate(P4Engine* e, std::string* err);
 int32_t engineStop(P4Engine* e, double deadlineMs);
 int32_t engineStats(P4Engine* e, uint8_t* out, int32_t cap);

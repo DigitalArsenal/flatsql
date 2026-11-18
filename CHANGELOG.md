@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add explicit unlimited SQL relations with a recoverable layout-2 guard and
+  type-spec replacement; preserve the historical meaning of a zero bound.
+- Bound row-order pages and verification workspace, retain pinned generations,
+  and distinguish cache admission from statement budgets.
+- Isolate ingest-only schemas and count whole relations from live metadata.
+
 ## 3.12.10
 
 - The engine no longer aborts when its host cannot give it a thread.

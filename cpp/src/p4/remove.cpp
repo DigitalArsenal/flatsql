@@ -1049,6 +1049,11 @@ void compactWork(Engine* e, Type* t, Internal* in) {
         f->streamMoves.clear();
         f->streamTokens = std::move(compactTokens);
     }
+    {
+        std::lock_guard<std::mutex> g(f->fsgMu);
+        f->fsg[0].reset(); f->fsg[1].reset();
+    }
+    e->rowCache->dropPrefix(old->path+"/"+std::to_string(old->gen)+"/");
     // The registry follows (a missing index's rebuild reads it; open also
     // tries the generation after the registered one).
     if (t->idx) {

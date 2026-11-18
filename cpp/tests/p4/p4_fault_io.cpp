@@ -37,6 +37,7 @@
 #include "p4/p4_test.h"
 #include "p4/frame_walk.h"
 #include "ps/io_fault.h"
+#include "QRP/main_generated.h"
 
 using namespace p4t;
 namespace fp = flatsql::p4;
@@ -45,6 +46,7 @@ using flatsql::ps::test::FaultFs;
 namespace flatsql {
 namespace p4 {
 const std::string& lastError();
+P4Engine* currentEngine();
 }
 }  // namespace flatsql
 
@@ -53,6 +55,7 @@ namespace {
 // retain the seeded random operation schedule and all five device modes.
 std::atomic<int> stateFaultKind{0};
 std::atomic<int> stateFaultHits{0};
+std::atomic<int> specFailureMode{0},specFailureHandle{-1};
 FaultFs& faultFs() {
     static FaultFs* fs = new FaultFs(true);
     return *fs;
@@ -75,9 +78,15 @@ bool p4ListStreams(const std::string& directory, std::vector<std::string>* names
 } }  // namespace flatsql::p4
 
 extern "C" {
-int32_t flatsql_io_open(const char* path, int32_t pathLen, int32_t flags) { return faultFs().open(path, pathLen, flags); }
+int32_t flatsql_io_open(const char* path, int32_t pathLen, int32_t flags) {
+    const int32_t h=faultFs().open(path,pathLen,flags);
+    const std::string name(path,size_t(pathLen));
+    if(specFailureMode.load() && name.size()>=5 && name.compare(name.size()-5,5,".spec")==0 && (flags&FLATSQL_IO_TRUNC)) specFailureHandle.store(h);
+    return h;
+}
 int32_t flatsql_io_read(int32_t h, void* dst, int32_t len, double off) { return faultFs().read(h, dst, len, off); }
 int32_t flatsql_io_write(int32_t h, const void* src, int32_t len, double off) {
+    if(h==specFailureHandle.load() && specFailureMode.load()==1) { specFailureMode.store(0); return FLATSQL_IO_ERR_IO; }
     const int kind=stateFaultKind.load();
     const auto* p=static_cast<const uint8_t*>(src);
     if(kind && off>0 && len>=12 && !std::memcmp(p+8,kind==1?"$FSG":"$FCK",4) && stateFaultKind.exchange(0)==kind) {
@@ -91,7 +100,10 @@ int32_t flatsql_io_write(int32_t h, const void* src, int32_t len, double off) {
     return faultFs().write(h, src, len, off);
 }
 int32_t flatsql_io_truncate(int32_t h, double size) { return faultFs().truncate(h, size); }
-int32_t flatsql_io_sync(int32_t h) { return faultFs().sync(h); }
+int32_t flatsql_io_sync(int32_t h) {
+    if(h==specFailureHandle.load() && specFailureMode.load()==2) { specFailureMode.store(0); return FLATSQL_IO_ERR_IO; }
+    return faultFs().sync(h);
+}
 double flatsql_io_size(int32_t h) { return faultFs().size(h); }
 int32_t flatsql_io_close(int32_t h) { return faultFs().close(h); }
 }
@@ -392,4 +404,125 @@ FLATSQL_SLOW_TEST(t_power_loss) {
     }
     std::printf("  t_power_loss: %d pass, %d fail of %d rounds\n", pass, fail, pass + fail);
     CHECK_EQ(fail, 0, "every round");
+}
+
+FLATSQL_TEST(t_rejected_spec_does_not_recover) {
+    auto& fs=faultFs();
+    for(int mode=0;mode<3;mode++) {
+        const auto root="/rejected-spec/"+std::to_string(mode);
+        auto type=faultType(); type.a18=2; type.fullText=false;
+        REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+        REQUIRE(registerType(type)==FLATSQL_OK,"original registration");
+        if(mode==0) fs.failSyncs(".spec.intent",1);
+        else specFailureMode.store(mode);
+        type.a18=3;
+        CHECK_EQ(registerType(type),FLATSQL_E_IO,"injected replacement error");
+        CHECK(!fs.exists(root+"/T/PNM.spec.intent"),"rejected intent removed");
+        REQUIRE(closeEngine()==FLATSQL_OK,"close");
+        REQUIRE(openEngine(root)==FLATSQL_OK,"reopen");
+        CHECK_EQ(fp::currentEngine()->findType("PNM")->spec()->a18Bound,2u,"rejected policy never becomes effective");
+        REQUIRE(closeEngine()==FLATSQL_OK,"close recovered");
+    }
+}
+
+FLATSQL_TEST(t_unlimited_promotion_power_loss) {
+    auto& fs=faultFs();
+    uint64_t boundaries=0;
+    int cases=0;
+    for(int mode=0;mode<FaultFs::kModeCount;mode++) {
+        for(uint64_t boundary=0;boundary<=boundaries || boundary==0;boundary++) {
+            const auto root="/promotion/"+std::to_string(mode)+"/"+std::to_string(boundary);
+            auto type=faultType(); type.a18=2; type.fullText=false;
+            REQUIRE(openEngine(root)==FLATSQL_OK,"open bounded store");
+            REQUIRE(registerType(type)==FLATSQL_OK,"bounded registration");
+            Batch batch; batch.type="PNM";
+            for(int i=1;i<=8;i++) { In row; row.frame=faultFrame(i); batch.recs.push_back(std::move(row)); }
+            REQUIRE(put(batch).status==FLATSQL_OK,"acknowledged baseline");
+            REQUIRE(closeEngine()==FLATSQL_OK,"settle baseline");
+            REQUIRE(openEngine(root)==FLATSQL_OK,"reopen baseline");
+            const auto start=fs.mutatingOps();
+            fs.armCrashAtOp(boundary?start+boundary:0);
+            type.a18=0;
+            const auto status=registerType(type);
+            if(!boundary) {
+                REQUIRE(status==FLATSQL_OK,"control promotion");
+                boundaries=fs.mutatingOps()-start;
+                REQUIRE(boundaries>0,"observed mutating boundaries");
+            } else CHECK(fs.frozen(),"fault boundary reached");
+            fs.freeze();
+            closeEngine(10000);
+            fs.crash(FaultFs::CrashMode(mode),mode*100+boundary);
+            REQUIRE(openEngine(root)==FLATSQL_OK,"unattended recovery");
+            REQUIRE(registerType(type)==FLATSQL_OK,"complete unlimited registration");
+            std::vector<std::vector<uint8_t>> cids;
+            for(const auto& row:batch.recs) { uint8_t cid[36]; cidOf(row.frame,cid); cids.emplace_back(cid,cid+36); }
+            auto records=get("PNM",cids,true);
+            CHECK_EQ(records.status,FLATSQL_OK,records.err);
+            CHECK_EQ(records.rows.size(),size_t(8),"all acknowledged records");
+            TlvW scan; scan.text(1,"PNM").u8(5,FLATSQL_ORDER_SEQ_ASC).u64(3,100);
+            auto rows=call(FLATSQL_OPC_SCAN,scan.b);
+            REQUIRE(rows.status==FLATSQL_OK && rows.rows.size()==8,"complete scan");
+            for(size_t i=0;i<8;i++) CHECK_EQ(rows.i(i,"seq"),int64_t(i+1),"no gap or duplicate");
+            REQUIRE(closeEngine()==FLATSQL_OK,"close recovered store");
+            cases++;
+        }
+    }
+    std::printf("  promotion: %llu mutation boundaries, five device modes, %d recovered cases\n",
+                (unsigned long long)boundaries,cases);
+}
+
+FLATSQL_TEST(t_unlimited_transition_power_loss) {
+    auto& fs=faultFs();
+    auto query=[](const std::string& text) {
+        flatbuffers::FlatBufferBuilder b;
+        auto sql=b.CreateString(text); QRPBuilder q(b); q.add_SQL(sql); q.add_REPRESENTATION(qrpRepresentation_FlatBuffer);
+        FinishSizePrefixedQRPBuffer(b,q.Finish());
+        return call(FLATSQL_OPC_SQL,std::vector<uint8_t>(b.GetBufferPointer(),b.GetBufferPointer()+b.GetSize()));
+    };
+    const char* names[]={"ingest","checkpoint-close","compaction"};
+    for(int op=0;op<3;op++) {
+        uint64_t boundaries=0; int cases=0;
+        for(int mode=0;mode<FaultFs::kModeCount;mode++) for(uint64_t cut=0;cut<=boundaries || !cut;cut++) {
+            const auto root="/transition/"+std::to_string(op)+"/"+std::to_string(mode)+"/"+std::to_string(cut);
+            auto type=faultType(); type.a18=0; type.fullText=false;
+            REQUIRE(openEngine(root)==FLATSQL_OK,"open baseline");
+            REQUIRE(registerType(type)==FLATSQL_OK,"unlimited registration");
+            Batch base; base.type="PNM";
+            for(int i=1;i<=8;i++) { In r; r.frame=faultFrame(i); base.recs.push_back(std::move(r)); }
+            REQUIRE(put(base).status==FLATSQL_OK,"acknowledged baseline");
+            REQUIRE(closeEngine()==FLATSQL_OK,"settle baseline");
+            REQUIRE(openEngine(root)==FLATSQL_OK,"reopen baseline");
+            Batch extra; extra.type="PNM";
+            for(int i=9;i<=12;i++) { In r; r.frame=faultFrame(i); extra.recs.push_back(std::move(r)); }
+            if(op==1) REQUIRE(put(extra).status==FLATSQL_OK,"acknowledged checkpoint input");
+            auto* e=fp::currentEngine(); auto* t=e->findType("PNM");
+            uint32_t fid=0;
+            { std::lock_guard<std::mutex> g(t->mu); for(auto& f:t->feeds) if(f->created) fid=f->fid; }
+            const auto start=fs.mutatingOps(); fs.armCrashAtOp(cut?start+cut:0);
+            int32_t status=FLATSQL_OK;
+            if(op==0) status=put(extra).status;
+            if(op==1) status=closeEngine(10000);
+            if(op==2) { fp::Internal in; in.what=fid; in.force=true; status=fp::runOnWriter(e,t,fp::kOpCompact,&in); }
+            if(!cut) { REQUIRE(status==FLATSQL_OK,"control operation"); boundaries=fs.mutatingOps()-start; REQUIRE(boundaries>0,"operation boundaries"); }
+            else CHECK(fs.frozen(),"boundary reached");
+            fs.freeze(); if(op!=1) closeEngine(10000);
+            fs.crash(FaultFs::CrashMode(mode),op*10000+mode*1000+cut);
+            REQUIRE(openEngine(root)==FLATSQL_OK,"automatic recovery");
+            auto rows=query("SELECT _seq,_cid,_data FROM PNM ORDER BY _seq");
+            REQUIRE(rows.status==FLATSQL_OK,rows.err);
+            const size_t count=rows.rows.size();
+            CHECK(count==8 || (op!=2 && count==12),"unacknowledged batch absent or complete");
+            if(op==1 || (op==0 && status==FLATSQL_OK)) CHECK_EQ(count,size_t(12),"acknowledged input survived");
+            auto total=query("SELECT COUNT(*) AS n FROM PNM");
+            CHECK_EQ(total.status,FLATSQL_OK,total.err); CHECK_EQ(total.i(0,"n"),int64_t(count),"COUNT equals scan");
+            for(size_t i=0;i<count;i++) {
+                auto frame=faultFrame(i+1); uint8_t cid[36]; cidOf(frame,cid);
+                CHECK_EQ(rows.i(i,"_seq"),int64_t(i+1),"no gap or duplicate");
+                CHECK(rows.s(i,"_cid")==cidText(cid),"exact CID");
+                CHECK(rows.s(i,"_data")==std::string(reinterpret_cast<const char*>(frame.data()+4),frame.size()-4),"no half-visible payload");
+            }
+            REQUIRE(closeEngine()==FLATSQL_OK,"close recovered store"); cases++;
+        }
+        std::printf("  %s: %llu mutation boundaries, five device modes, %d cases\n",names[op],(unsigned long long)boundaries,cases);
+    }
 }

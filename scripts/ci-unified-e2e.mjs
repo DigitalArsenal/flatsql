@@ -137,6 +137,18 @@ try {
   assert.equal(rows(await db.execute(request('SELECT COUNT(*) FROM GJN')))[0][0].INT_VALUE,0);
 
   await db.close(); db=null;
+  {
+    const uroot=path.join(root,'unlimited');
+    let udb=await FlatSQL.open({root:uroot,rowCacheBytes:65536});
+    assert.deepEqual(await udb.capabilities(),{unlimitedRelations:true});
+    await udb.registerSchema({name:'GJN',fileIdentifier:'$GJN',bfbs,maxRows:0});
+    await udb.ingest('GJN',record,{source:'unlimited-check',provider:'external-flatc'});
+    await udb.close();
+    udb=await FlatSQL.open({root:uroot,rowCacheBytes:65536});
+    assert.equal(rows(await udb.execute(request('SELECT COUNT(*) FROM GJN')))[0][0].INT_VALUE,1);
+    await assert.rejects(udb.registerSchema({name:'GJN',fileIdentifier:'$GJN',bfbs,maxRows:100}),e=>e.status===-5);
+    await udb.close();
+  }
   if(packageRoot) {
     const cli=path.join(packageRoot,'bin/flatsql.mjs');
     const cliRoot=path.join(root,'cli'),schemaFile=path.join(root,'GJN.bfbs');
