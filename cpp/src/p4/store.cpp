@@ -152,8 +152,9 @@ int32_t writeSpec(const std::string& path, const std::vector<uint8_t>& bytes) {
         ioUnlink(intent);
         return FLATSQL_OK;
     }
-    // A returned error must not leave a complete roll-forward intent.
-    const int32_t removed=ioUnlink(intent);
+    // A returned error must not leave a complete roll-forward intent, also
+    // after a power loss: the removal is made durable.
+    const int32_t removed=ioUnlinkDurable(intent);
     const int32_t restored=existed?ioWriteNew(path,previous.data(),previous.size()):ioUnlink(path);
     if (removed!=FLATSQL_OK || restored!=FLATSQL_OK) return FLATSQL_E_IO;
     return rc;
@@ -288,21 +289,38 @@ bool markersActivated(const Markers& m) {
 
 int32_t promoteUnlimitedStore(Engine* e, std::string* err) {
     if (!e->markers.storeValid || e->markers.layout >= 2) return FLATSQL_OK;
-    std::vector<uint8_t> marker;
+    std::vector<uint8_t> marker, original;
     const auto path = pathJoin(e->cfg.root, "STORE");
     if (ioReadAll(path, &marker) != FLATSQL_OK || marker.size() != 64) {
         *err = "unlimited relation guard could not read the STORE marker";
         return FLATSQL_E_IO;
     }
+    original = marker;
     st16(marker.data() + 6, 2);
     st32(marker.data() + 56, ps::crc32c(marker.data(), 56));
     // The synced intent retains the complete marker across a torn overwrite.
     // It precedes STORE and every unlimited type spec; recovery is idempotent.
     const auto intent = pathJoin(e->cfg.root, "STORE.unlimited");
     int32_t rc = ioWriteNew(intent, marker.data(), marker.size());
-    if (rc != FLATSQL_OK) { *err = "unlimited relation intent write failed"; return rc; }
+    if (rc != FLATSQL_OK) {
+        // An incomplete intent is discarded at open beside the intact STORE.
+        ioUnlinkDurable(intent);
+        *err = "unlimited relation intent write failed";
+        return rc;
+    }
     rc = ioWriteNew(path, marker.data(), marker.size());
-    if (rc != FLATSQL_OK) { *err = "unlimited relation guard write failed"; return rc; }
+    if (rc != FLATSQL_OK) {
+        // The truncating overwrite failed (EIO, a full device). A returned
+        // error must not take effect at the next open: put the layout-1
+        // marker back, then drop the intent. When STORE cannot be restored,
+        // the intent is the store's only complete marker: it stays, and the
+        // next open completes the promotion (and logs it).
+        *err = "unlimited relation guard write failed";
+        const bool restored = ioWriteNew(path, original.data(), original.size()) == FLATSQL_OK;
+        if (!restored || ioUnlinkDurable(intent) != FLATSQL_OK)
+            *err += "; the promotion was not withdrawn: the next open completes it from STORE.unlimited";
+        return rc;
+    }
     e->markers.layout = 2;
     return ioUnlink(intent);
 }

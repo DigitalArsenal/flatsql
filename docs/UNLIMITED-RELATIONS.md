@@ -28,7 +28,11 @@ the layout requirement. Promotion first syncs the complete new marker in
 automatically completes a valid intent whose UUID matches MIGRATED. A torn
 intent is discarded only beside an intact activated marker pair. UUID and
 sequence-floor conflicts fail explicitly. No unlimited specification precedes
-the durable layout guard.
+the durable layout guard. When the STORE overwrite fails (an I/O error, a full
+device), the layout-1 marker is written back and the intent removed, so the
+failed registration does not take effect at the next open; only when STORE
+cannot be restored does the intent stay, and the next open completes the
+promotion. An intent a failed operation withdraws is removed durably.
 
 Type-spec replacement syncs a complete CRC-protected `.spec.intent` before
 overwriting `.spec`. Open completes a valid intent and discards an incomplete

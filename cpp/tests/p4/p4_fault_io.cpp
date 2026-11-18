@@ -56,6 +56,7 @@ namespace {
 std::atomic<int> stateFaultKind{0};
 std::atomic<int> stateFaultHits{0};
 std::atomic<int> specFailureMode{0},specFailureHandle{-1};
+std::atomic<int> storeFailureWrites{0},storeFailureHandle{-1},storeFailureCode{FLATSQL_IO_ERR_IO};
 FaultFs& faultFs() {
     static FaultFs* fs = new FaultFs(true);
     return *fs;
@@ -82,11 +83,17 @@ int32_t flatsql_io_open(const char* path, int32_t pathLen, int32_t flags) {
     const int32_t h=faultFs().open(path,pathLen,flags);
     const std::string name(path,size_t(pathLen));
     if(specFailureMode.load() && name.size()>=5 && name.compare(name.size()-5,5,".spec")==0 && (flags&FLATSQL_IO_TRUNC)) specFailureHandle.store(h);
+    if(storeFailureWrites.load()>0 && name.size()>=6 && name.compare(name.size()-6,6,"/STORE")==0 && (flags&FLATSQL_IO_TRUNC)) storeFailureHandle.store(h);
     return h;
 }
 int32_t flatsql_io_read(int32_t h, void* dst, int32_t len, double off) { return faultFs().read(h, dst, len, off); }
 int32_t flatsql_io_write(int32_t h, const void* src, int32_t len, double off) {
     if(h==specFailureHandle.load() && specFailureMode.load()==1) { specFailureMode.store(0); return FLATSQL_IO_ERR_IO; }
+    // The STORE overwrite fails (EIO or a full device) after its truncation.
+    if(h==storeFailureHandle.load() && storeFailureWrites.load()>0) {
+        storeFailureWrites--; storeFailureHandle.store(-1);
+        return storeFailureCode.load();
+    }
     const int kind=stateFaultKind.load();
     const auto* p=static_cast<const uint8_t*>(src);
     if(kind && off>0 && len>=12 && !std::memcmp(p+8,kind==1?"$FSG":"$FCK",4) && stateFaultKind.exchange(0)==kind) {
@@ -525,4 +532,149 @@ FLATSQL_TEST(t_unlimited_transition_power_loss) {
         }
         std::printf("  %s: %llu mutation boundaries, five device modes, %d cases\n",names[op],(unsigned long long)boundaries,cases);
     }
+}
+
+namespace {
+uint16_t storeLayout(const std::vector<uint8_t>& marker) {
+    return marker.size()==64 ? uint16_t(marker[6]|(marker[7]<<8)) : 0;
+}
+// A bounded PNM store holding eight acknowledged records, reopened.
+void boundedEightRecords(const std::string& root) {
+    auto type=faultType(); type.a18=2; type.fullText=false;
+    REQUIRE(openEngine(root)==FLATSQL_OK,"open bounded store");
+    REQUIRE(registerType(type)==FLATSQL_OK,"bounded registration");
+    Batch batch; batch.type="PNM";
+    for(int i=1;i<=8;i++) { In row; row.frame=faultFrame(i); batch.recs.push_back(std::move(row)); }
+    REQUIRE(put(batch).status==FLATSQL_OK,"acknowledged baseline");
+    REQUIRE(closeEngine()==FLATSQL_OK,"settle baseline");
+    REQUIRE(openEngine(root)==FLATSQL_OK,"reopen baseline");
+}
+void requireEightRecords(const char* what) {
+    std::vector<std::vector<uint8_t>> cids;
+    for(int i=1;i<=8;i++) { uint8_t cid[36]; cidOf(faultFrame(i),cid); cids.emplace_back(cid,cid+36); }
+    auto records=get("PNM",cids,true);
+    CHECK_EQ(records.status,FLATSQL_OK,records.err);
+    CHECK_EQ(records.rows.size(),size_t(8),what);
+}
+}  // namespace
+
+// Review of stack #651: the STORE overwrite of a promotion fails after the
+// intent is durable (EIO, or a full copy-on-write device). The registration
+// returns the error, so it must not take effect at the next open, and the
+// running store must not be left with a truncated marker. When the original
+// marker cannot be restored either, the intent is the only complete marker:
+// it stays, and the next open completes the promotion.
+FLATSQL_TEST(t_unlimited_promotion_store_write_failure) {
+    auto& fs=faultFs();
+    for(int variant=0;variant<3;variant++) {
+        const auto root="/promotion-store-failure/"+std::to_string(variant);
+        boundedEightRecords(root);
+        const auto original=fs.contents(root+"/STORE");
+        REQUIRE(storeLayout(original)==1,"bounded layout");
+        storeFailureCode.store(variant==1?FLATSQL_IO_ERR_NOSPACE:FLATSQL_IO_ERR_IO);
+        storeFailureWrites.store(variant==2?2:1);
+        auto type=faultType(); type.a18=0; type.fullText=false;
+        const auto status=registerType(type);
+        storeFailureWrites.store(0); storeFailureHandle.store(-1);
+        CHECK(status!=FLATSQL_OK,"injected STORE failure is reported");
+        const auto running=fs.contents(root+"/STORE");
+        if(variant<2) {
+            CHECK(running==original,"running store keeps its complete layout-1 marker");
+            CHECK(!fs.exists(root+"/STORE.unlimited"),"rejected promotion leaves no intent");
+        } else {
+            CHECK(fs.exists(root+"/STORE.unlimited"),"an unrestorable marker keeps the complete intent");
+        }
+        REQUIRE(closeEngine()==FLATSQL_OK,"close");
+        fs.crash(FaultFs::kDropAll,uint64_t(variant));
+        REQUIRE(openEngine(root)==FLATSQL_OK,"reopen after the failed promotion");
+        CHECK_EQ(storeLayout(fs.contents(root+"/STORE")),uint16_t(variant<2?1:2),
+                 variant<2?"a promotion that returned an error never takes effect":"the intent completes the promotion");
+        CHECK(!fs.exists(root+"/STORE.unlimited"),"no intent after reopen");
+        CHECK_EQ(fp::currentEngine()->findType("PNM")->spec()->a18Bound,2u,"spec stays bounded");
+        requireEightRecords("all acknowledged records after the failed promotion");
+        REQUIRE(registerType(type)==FLATSQL_OK,"a later promotion succeeds");
+        CHECK_EQ(storeLayout(fs.contents(root+"/STORE")),uint16_t(2),"promoted");
+        REQUIRE(closeEngine()==FLATSQL_OK,"close promoted");
+    }
+}
+
+// Review of stack #651: t_rejected_spec_does_not_recover with a power loss
+// after the rejected replacement. The withdrawn intent must not come back
+// (a non-durable unlink does after a power loss) and replay the rejected
+// policy at the next open.
+FLATSQL_TEST(t_rejected_spec_power_loss) {
+    auto& fs=faultFs();
+    for(int mode=1;mode<3;mode++) {
+        const auto root="/rejected-spec-power-loss/"+std::to_string(mode);
+        auto type=faultType(); type.a18=2; type.fullText=false;
+        REQUIRE(openEngine(root)==FLATSQL_OK,"open");
+        REQUIRE(registerType(type)==FLATSQL_OK,"original registration");
+        REQUIRE(closeEngine()==FLATSQL_OK,"settle");
+        REQUIRE(openEngine(root)==FLATSQL_OK,"reopen");
+        specFailureMode.store(mode);
+        type.a18=3;
+        CHECK_EQ(registerType(type),FLATSQL_E_IO,"injected replacement error");
+        specFailureMode.store(0);
+        CHECK(!fs.exists(root+"/T/PNM.spec.intent"),"rejected intent removed");
+        REQUIRE(closeEngine()==FLATSQL_OK,"close");
+        fs.crash(FaultFs::kDropAll,uint64_t(mode));
+        REQUIRE(openEngine(root)==FLATSQL_OK,"reopen after the power loss");
+        CHECK(!fs.exists(root+"/T/PNM.spec.intent"),"no intent after reopen");
+        CHECK_EQ(fp::currentEngine()->findType("PNM")->spec()->a18Bound,2u,"rejected policy never becomes effective after a power loss");
+        REQUIRE(closeEngine()==FLATSQL_OK,"close recovered");
+    }
+}
+
+// Review of stack #651: a promotion interrupted by a power loss, and the
+// recovery of that promotion interrupted by a second power loss at each of
+// its mutation boundaries. Every store opens, keeps every acknowledged
+// record, completes the unlimited registration and leaves no intent.
+FLATSQL_TEST(t_unlimited_promotion_interrupted_twice) {
+    auto& fs=faultFs();
+    uint64_t promotionOps=0;
+    int cases=0,secondCrashes=0;
+    const FaultFs::CrashMode modes[]={FaultFs::kDropAll,FaultFs::kTearLast,FaultFs::kKeepAll};
+    for(const auto mode:modes) {
+        for(uint64_t first=0;first<=promotionOps || first==0;first++) {
+            for(uint64_t second=1;;second++) {
+                const auto root="/promotion-twice/"+std::to_string(int(mode))+"/"+std::to_string(first)+"/"+std::to_string(second);
+                boundedEightRecords(root);
+                auto type=faultType(); type.a18=0; type.fullText=false;
+                const auto start=fs.mutatingOps();
+                fs.armCrashAtOp(first?start+first:0);
+                const auto status=registerType(type);
+                if(!first) {
+                    REQUIRE(status==FLATSQL_OK,"control promotion");
+                    promotionOps=fs.mutatingOps()-start;
+                    REQUIRE(closeEngine()==FLATSQL_OK,"close control");
+                    break;
+                }
+                fs.freeze(); closeEngine(10000);
+                fs.crash(mode,uint64_t(mode)*100000+first*100+second);
+                const auto reopen=fs.mutatingOps();
+                fs.armCrashAtOp(reopen+second);
+                const int32_t opened=openEngine(root);
+                const bool interrupted=fs.frozen();
+                if(!interrupted) {
+                    // The recovery open finished before the second boundary.
+                    fs.armCrashAtOp(0);
+                    REQUIRE(opened==FLATSQL_OK,"recovery open");
+                } else {
+                    secondCrashes++;
+                    fs.freeze(); closeEngine(10000);
+                    fs.crash(mode,uint64_t(mode)*100000+first*100+second+50);
+                    REQUIRE(openEngine(root)==FLATSQL_OK,"open after the second power loss");
+                }
+                REQUIRE(registerType(type)==FLATSQL_OK,"complete unlimited registration");
+                CHECK_EQ(storeLayout(fs.contents(root+"/STORE")),uint16_t(2),"layout 2");
+                CHECK(!fs.exists(root+"/STORE.unlimited"),"no intent left");
+                requireEightRecords("all acknowledged records after two power losses");
+                REQUIRE(closeEngine()==FLATSQL_OK,"close");
+                cases++;
+                if(!interrupted || second>64) break;
+            }
+        }
+    }
+    std::printf("  promotion: %llu boundaries; %d cases, %d with a second power loss during recovery\n",
+                (unsigned long long)promotionOps,cases,secondCrashes);
 }

@@ -7,6 +7,10 @@
 - Bound row-order pages and verification workspace, retain pinned generations,
   and distinguish cache admission from statement budgets.
 - Isolate ingest-only schemas and count whole relations from live metadata.
+- A promotion whose STORE overwrite fails puts the layout-1 marker back and
+  withdraws its intent, so a registration that returned an error never takes
+  effect at the next open; withdrawn intents are removed durably (parent
+  directory synced), also for a rejected type-spec replacement.
 
 ## 3.12.10
 

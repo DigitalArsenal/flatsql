@@ -407,6 +407,13 @@ int32_t ioUnlink(const std::string& path) {
     return rc >= 0 || rc == FLATSQL_IO_ERR_NOENT ? FLATSQL_OK : FLATSQL_E_IO;
 }
 
+// UNLINK_IF_UNUSED makes the host sync the parent directory: an intent that a
+// failed operation withdraws must not reappear after a power loss and replay.
+int32_t ioUnlinkDurable(const std::string& path) {
+    const int32_t rc = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_UNLINK | FLATSQL_IO_UNLINK_IF_UNUSED);
+    return rc >= 0 || rc == FLATSQL_IO_ERR_NOENT ? FLATSQL_OK : FLATSQL_E_IO;
+}
+
 int64_t ioSize(const std::string& path) {
     const int32_t h = flatsql_io_open(path.data(), int32_t(path.size()), FLATSQL_IO_READ);
     if (h < 0) return -1;

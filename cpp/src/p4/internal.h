@@ -263,6 +263,7 @@ int32_t ioReadAll(const std::string& path, std::vector<uint8_t>* out);  // FLATS
 int32_t ioWriteNew(const std::string& path, const uint8_t* p, size_t n);  // CREATE|TRUNC|CREATE_PARENTS, write, sync
 int32_t ioAppend(const std::string& path, const uint8_t* p, size_t n);    // append, sync
 int32_t ioUnlink(const std::string& path);                                 // absent is fine
+int32_t ioUnlinkDurable(const std::string& path);  // absent is fine; the removal survives a power loss (parent synced)
 int64_t ioSize(const std::string& path);                                   // -1 absent
 
 // ---- SQLite connections --------------------------------------------------------------------
