@@ -34,6 +34,26 @@ struct Pace {
     }
 };
 
+// The file-size and quota passes open every type's files (about 600 opens
+// in a store of 300 types). Each runs at most once a second, counted from
+// the END of the previous pass, so a pass slower than a second (a
+// background-priority process, throttled I/O) never runs back to back. A
+// pass runs only when the store's files have changed since the previous one
+// (Engine::fileWork), and at least once every kHousekeepFloorNs regardless.
+constexpr uint64_t kHousekeepEveryNs = 1000ull * 1000 * 1000;
+constexpr uint64_t kHousekeepFloorNs = 60ull * 1000 * 1000 * 1000;
+struct Housekeep {
+    uint64_t endedAt = 0, work = 0;
+    bool ran = false;
+    bool due(Engine* e, uint64_t now) const {
+        if (!ran) return true;
+        if (now - endedAt < kHousekeepEveryNs) return false;
+        return e->fileWork() != work || now - endedAt >= kHousekeepFloorNs;
+    }
+    void begin(Engine* e) { work = e->fileWork(); }
+    void end() { endedAt = monoNs(); ran = true; }
+};
+
 namespace {
 
 struct MaintState {
@@ -900,8 +920,9 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
     tThread = thread;
     Bell& b = e->bells[thread];
     MaintState m;
-    uint64_t lastTick = 0, lastSizes = 0;
+    uint64_t lastTick = 0;
     Pace pace;
+    Housekeep sizes;
     for (;;) {
         e->rowCache->trim();
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
@@ -979,10 +1000,10 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
                     e->maintQ.push_back(mt);
                 }
             }
-            const std::vector<Type*> types = typesWithFiles(e);
-            if (now - lastSizes >= 1000ull * 1000 * 1000) {  // the T/ files' sizes for SUMMARY 4, at most once a second
-                lastSizes = now;
-                for (Type* t : types) typeFileBytes(t);
+            if (sizes.due(e, now)) {  // the T/ files' sizes for SUMMARY 4 (Housekeep)
+                sizes.begin(e);
+                for (Type* t : typesWithFiles(e)) typeFileBytes(t);
+                sizes.end();
             }
         }
         b.state.store(0, std::memory_order_seq_cst);
@@ -1002,11 +1023,13 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
 }
 
 // The long work: REBUILD and QUOTA_GC slots in arrival order, then on each
-// tick (100 ms busy, 2 s idle: Pace) the full-text catch-up and at most once a
-// second the configured quota.
+// tick (100 ms busy, 2 s idle: Pace) the full-text catch-up and, when the
+// store's files have changed (Housekeep), the configured quota.
 void slowLoop(Engine* e) {
-    uint64_t lastTick = 0, lastQuota = 0;
+    uint64_t lastTick = 0;
     Pace pace;
+    Housekeep quota;
+    uint64_t quotaSeen = 0;
     for (;;) {
         uint32_t slot = 0;
         bool have = false;
@@ -1096,10 +1119,12 @@ void slowLoop(Engine* e) {
             }
         }
         const uint64_t q = e->quota.load();
-        if (q && now - lastQuota >= 1000ull * 1000 * 1000) {  // at most once a second
-            lastQuota = now;
+        if (q && (q != quotaSeen || quota.due(e, now))) {  // Housekeep, or a new quota
+            quotaSeen = q;
+            quota.begin(e);
             int64_t a, bb;
             quotaGc(e, q, &a, &bb, true);
+            quota.end();
         }
     }
 }

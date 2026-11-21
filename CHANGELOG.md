@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.12.14
+
+- The file-size pass (the T/ files' sizes for SUMMARY 4) and the quota pass
+  run only when the store's files have changed since the previous pass
+  (`Engine::fileWork`: writes, deletes, supersedes, stream syncs, index merges,
+  WAL checkpoints, rebuilds, unlinked generations, full-text rows), and at least
+  once a minute regardless. A new quota also starts a quota pass. Each pass opens
+  every type's files, about 600 opens in a store of 300 types.
+- The one-second spacing between passes now counts from the end of the previous
+  pass. In 3.12.13 it counted from the start, so a pass that took more than a
+  second ran again at once. That happens in a background-priority process with
+  throttled I/O, such as a launchd agent with `ProcessType` Background.
+- Result: on such an agent, an idle SDN node on 3.12.13 used about twice the CPU
+  of 3.12.12 (40 % of a core against 20 %). 3.12.12 ran the passes every tenth
+  tick (stack issue 987).
+
 ## 3.12.13
 
 - An idle engine sleeps instead of polling. An idle writer or lane waits on its
