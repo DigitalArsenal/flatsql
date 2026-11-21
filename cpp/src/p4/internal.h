@@ -895,6 +895,17 @@ struct P4Engine {
             n += stat[s].load(std::memory_order_relaxed);
         return n;
     }
+    // Work that changes the store's files: writes, deletes, supersedes,
+    // stream syncs, index merges, WAL checkpoints, rebuilds, unlinked
+    // generations, full-text rows. Reads and statements are not counted.
+    // While it stands still the file sizes and the quota cannot have
+    // changed, so their housekeeping passes are skipped (kHousekeepFloorNs).
+    uint64_t fileWork() const {
+        uint64_t n = 0;
+        for (int s : {flatsql::p4::kStPuts, flatsql::p4::kStDeletes, flatsql::p4::kStSupersedeRecords, flatsql::p4::kStGroupCommits, flatsql::p4::kStJournalSyncs, flatsql::p4::kStIndexFlushes, flatsql::p4::kStPassive, flatsql::p4::kStRestart, flatsql::p4::kStTruncate, flatsql::p4::kStRebuilds, flatsql::p4::kStUnlinked, flatsql::p4::kStFtsRows})
+            n += stat[s].load(std::memory_order_relaxed);
+        return n;
+    }
     void wake(uint32_t thread);
     void kickMaintenance();
     flatsql::p4::Type* findType(const std::string& name);
