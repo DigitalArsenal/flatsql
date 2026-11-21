@@ -23,6 +23,11 @@
 namespace flatsql {
 namespace p4 {
 
+// An idle writer or lane waits on its doorbell, which every new call rings
+// (state 0 is published before the wait and the doorbell checked again), so the
+// timeout is only a safety net: one second, not a 50 ms poll.
+constexpr uint64_t kIdleDoorbellNs = 1000ull * 1000 * 1000;
+
 thread_local uint32_t tThread = 0;
 
 // ---- queues -------------------------------------------------------------------------------------
@@ -604,8 +609,12 @@ void indexerLoop(Engine* e, uint32_t wi) {
         int32_t poison;
         {
             // Units, or (staged rows waiting) a look at the merges every 250 ms.
+            // With nothing staged there is nothing to merge: sleep until a unit
+            // or the stop arrives (both notify icv).
             std::unique_lock<std::mutex> g(ws.imu);
-            ws.icv.wait_for(g, std::chrono::milliseconds(250), [&] { return !ws.iq.empty() || ws.istop; });
+            const auto ready = [&] { return !ws.iq.empty() || ws.istop; };
+            if (e->stagedRows.load(std::memory_order_relaxed) > 0) ws.icv.wait_for(g, std::chrono::milliseconds(250), ready);
+            else ws.icv.wait(g, ready);
             if (ws.iq.empty() && ws.istop) break;
             round.assign(ws.iq.begin(), ws.iq.end());
             ws.iq.clear();
@@ -702,7 +711,7 @@ void writerLoop(Engine* e, uint32_t wi) {
         if (idle && e->queues[0].empty()) checkpointWriter(e, wi, true, false);
         b.state.store(0, std::memory_order_seq_cst);
         if (idle && e->queues[0].empty() && b.doorbell.load(std::memory_order_acquire) == seq)
-            ps::waitU32(&b.doorbell, seq, 50ull * 1000 * 1000);
+            ps::waitU32(&b.doorbell, seq, kIdleDoorbellNs);
         b.state.store(1, std::memory_order_seq_cst);
     }
     {
@@ -838,7 +847,7 @@ void laneLoop(Engine* e, uint32_t ti, uint32_t cls) {
         if (e->stopping.load()) break;
         b.state.store(0, std::memory_order_seq_cst);
         if (q.empty() && b.doorbell.load(std::memory_order_acquire) == seq)
-            ps::waitU32(&b.doorbell, seq, 50ull * 1000 * 1000);
+            ps::waitU32(&b.doorbell, seq, kIdleDoorbellNs);
         b.state.store(1, std::memory_order_seq_cst);
     }
     p4sql_lane_free(&L);
