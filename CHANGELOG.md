@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.12.13
+
+- An idle engine sleeps instead of polling. An idle writer or lane waits on its
+  doorbell with a one-second safety timeout (was 50 ms): every new call rings
+  it. An indexer with no staged rows waits for a unit or the stop with no
+  timeout (was 250 ms). The maintenance and slow loops tick every 100 ms while
+  the engine works or holds staged rows and every 2 s once it has been still
+  for 2 s; file sizes and the quota run at most once a second, as before. On a
+  WasmEdge node an idle engine's share of a core fell from 7.9 % to 4.6 %
+  (stack issue 987).
+
 ## 3.12.12
 
 - A type registered with type-spec tag 13 (`maxRows: 0` in JavaScript) has an

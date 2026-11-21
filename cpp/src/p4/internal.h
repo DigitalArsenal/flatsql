@@ -885,6 +885,16 @@ struct P4Engine {
     uint8_t* slotReq(uint32_t i) { return reinterpret_cast<uint8_t*>(slot(i)) + FLATSQL_SLOT_HEADER; }
     uint8_t* slotRing(uint32_t i) { return slotReq(i) + reqBytes[poolOf(i)]; }
     void bump(int s, uint64_t n = 1) { stat[s].fetch_add(n, std::memory_order_relaxed); }
+    // Work the engine has done, by its counters (calls, reads, commits,
+    // merges, generations unlinked, rebuilds, statements). The periodic loops
+    // tick every 100 ms while it moves and back off to kIdleTickNs once it has
+    // been still for kIdleAfterNs: an idle engine sleeps instead of polling.
+    uint64_t activity() const {
+        uint64_t n = 0;
+        for (int s : {flatsql::p4::kStPuts, flatsql::p4::kStReads, flatsql::p4::kStDeletes, flatsql::p4::kStGroupCommits, flatsql::p4::kStIndexFlushes, flatsql::p4::kStUnlinked, flatsql::p4::kStRebuilds, flatsql::p4::kStSqlStatements})
+            n += stat[s].load(std::memory_order_relaxed);
+        return n;
+    }
     void wake(uint32_t thread);
     void kickMaintenance();
     flatsql::p4::Type* findType(const std::string& name);

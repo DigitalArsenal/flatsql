@@ -17,6 +17,23 @@
 namespace flatsql {
 namespace p4 {
 
+// The periodic loops' tick: 100 ms while the engine works or holds staged
+// rows, kIdleTickNs once it has been still for kIdleAfterNs. Work wakes the
+// loops through their doorbell or condition variable, so the idle tick only
+// paces housekeeping (WAL totals, file sizes, full-text catch-up, retired
+// generations, the quota), none of which changes while nothing happens.
+constexpr uint64_t kBusyTickNs = 100ull * 1000 * 1000;
+constexpr uint64_t kIdleTickNs = 2000ull * 1000 * 1000;
+constexpr uint64_t kIdleAfterNs = 2000ull * 1000 * 1000;
+struct Pace {
+    uint64_t seen = 0, movedAt = 0;
+    uint64_t tick(Engine* e, uint64_t now) {
+        const uint64_t a = e->activity();
+        if (a != seen || e->stagedRows.load(std::memory_order_relaxed) > 0) { seen = a; movedAt = now; }
+        return now - movedAt < kIdleAfterNs ? kBusyTickNs : kIdleTickNs;
+    }
+};
+
 namespace {
 
 struct MaintState {
@@ -883,8 +900,8 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
     tThread = thread;
     Bell& b = e->bells[thread];
     MaintState m;
-    uint64_t lastTick = 0;
-    int sizeTicks = 0;
+    uint64_t lastTick = 0, lastSizes = 0;
+    Pace pace;
     for (;;) {
         e->rowCache->trim();
         const uint32_t seq = b.doorbell.load(std::memory_order_acquire);
@@ -931,7 +948,8 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
         }
         if (e->stopping.load()) break;
         const uint64_t now = monoNs();
-        if (now - lastTick >= 100ull * 1000 * 1000) {
+        const uint64_t tickNs = pace.tick(e, now);
+        if (now - lastTick >= tickNs) {
             lastTick = now;
             // Over the WAL total with files that no longer commit (their
             // hook never fires again): the largest WALs, down to half the total.
@@ -962,8 +980,8 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
                 }
             }
             const std::vector<Type*> types = typesWithFiles(e);
-            if (++sizeTicks >= 10) {  // the T/ files' sizes for SUMMARY 4, once a second
-                sizeTicks = 0;
+            if (now - lastSizes >= 1000ull * 1000 * 1000) {  // the T/ files' sizes for SUMMARY 4, at most once a second
+                lastSizes = now;
                 for (Type* t : types) typeFileBytes(t);
             }
         }
@@ -975,7 +993,7 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
                 continue;
             }
         }
-        if (b.doorbell.load(std::memory_order_acquire) == seq) ps::waitU32(&b.doorbell, seq, 100ull * 1000 * 1000);
+        if (b.doorbell.load(std::memory_order_acquire) == seq) ps::waitU32(&b.doorbell, seq, pace.tick(e, monoNs()));
         b.state.store(1, std::memory_order_seq_cst);
     }
     for (auto& kv : m.conns) delete kv.second;
@@ -983,11 +1001,12 @@ void maintenanceLoop(Engine* e, uint32_t thread) {
     b.state.store(2);
 }
 
-// The long work: REBUILD and QUOTA_GC slots in arrival order, then every
-// 100 ms the full-text catch-up and once a second the configured quota.
+// The long work: REBUILD and QUOTA_GC slots in arrival order, then on each
+// tick (100 ms busy, 2 s idle: Pace) the full-text catch-up and at most once a
+// second the configured quota.
 void slowLoop(Engine* e) {
-    uint64_t lastTick = 0;
-    int quotaTicks = 0;
+    uint64_t lastTick = 0, lastQuota = 0;
+    Pace pace;
     for (;;) {
         uint32_t slot = 0;
         bool have = false;
@@ -995,8 +1014,9 @@ void slowLoop(Engine* e) {
         {
             std::unique_lock<std::mutex> g(e->slowMu);
             if (e->slowQ.empty() && !e->slowStop) {
-                const uint64_t elapsed = monoNs() - lastTick;
-                constexpr uint64_t tickNs = 100ull * 1000 * 1000;
+                const uint64_t now = monoNs();
+                const uint64_t elapsed = now - lastTick;
+                const uint64_t tickNs = pace.tick(e, now);
                 if (elapsed < tickNs) e->slowCv.wait_for(g, std::chrono::nanoseconds(tickNs - elapsed));
             }
             if (e->slowStop) {
@@ -1024,7 +1044,7 @@ void slowLoop(Engine* e) {
         }
         if (e->stopping.load()) continue;  // stop drains the queue, then returns
         const uint64_t now = monoNs();
-        if (now - lastTick < 100ull * 1000 * 1000) continue;
+        if (now - lastTick < pace.tick(e, now)) continue;
         lastTick = now;
         for (Type* t : typesWithFiles(e)) ftsTick(e, t);
         // Streams: a generation a compaction replaced goes once its grace is
@@ -1076,8 +1096,8 @@ void slowLoop(Engine* e) {
             }
         }
         const uint64_t q = e->quota.load();
-        if (q && ++quotaTicks >= 10) {
-            quotaTicks = 0;
+        if (q && now - lastQuota >= 1000ull * 1000 * 1000) {  // at most once a second
+            lastQuota = now;
             int64_t a, bb;
             quotaGc(e, q, &a, &bb, true);
         }
